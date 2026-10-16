@@ -1,0 +1,202 @@
+/*
+ * sr_wg.api - SR-WG Binary API 定义
+ */
+
+option version = "1.0.0";
+
+import "vnet/ip/ip_types.api";
+import "vnet/interface_types.api";
+
+/* ==================== 类型定义 ==================== */
+
+typedef sr_wg_segment
+{
+  vl_api_ip4_address_t ip;
+  u16 port;
+};
+
+typedef sr_wg_path
+{
+  u16 path_id;
+  u16 hmac_id;
+  u8 seg_count;
+  u8 active;
+  vl_api_sr_wg_segment_t segments[8];
+};
+
+/* ==================== Service 定义 ==================== */
+
+service {
+  rpc sr_wg_path_add_del returns sr_wg_path_add_del_reply;
+  rpc sr_wg_path_dump returns stream sr_wg_path_details;
+  rpc sr_wg_key_set returns sr_wg_key_set_reply;
+  rpc sr_wg_key_del returns sr_wg_key_del_reply;
+  rpc sr_wg_key_dump returns stream sr_wg_key_details;
+  rpc sr_wg_transit_enable returns sr_wg_transit_enable_reply;
+  rpc sr_wg_transit_disable returns sr_wg_transit_disable_reply;
+  rpc sr_wg_tunnel_set_path returns sr_wg_tunnel_set_path_reply;
+  rpc sr_wg_tunnel_dump returns stream sr_wg_tunnel_details;
+  rpc sr_wg_encap_enable returns sr_wg_encap_enable_reply;
+  rpc sr_wg_stats_get returns sr_wg_stats_get_reply;
+  rpc sr_wg_stats_clear returns sr_wg_stats_clear_reply;
+};
+
+/* ==================== Path API ==================== */
+
+autoreply define sr_wg_path_add_del
+{
+  u32 client_index;
+  u32 context;
+  u8 is_add;               /* 1=add/update, 0=delete */
+  u16 path_id;
+  u16 hmac_id;
+  u8 seg_count;
+  u8 active;
+  vl_api_sr_wg_segment_t segments[8];
+};
+
+define sr_wg_path_dump
+{
+  u32 client_index;
+  u32 context;
+  u16 path_id;            /* 0 = dump all */
+};
+
+define sr_wg_path_details
+{
+  u32 context;
+  u16 path_id;
+  u16 hmac_id;
+  u8 seg_count;
+  u8 active;
+  vl_api_sr_wg_segment_t segments[8];
+};
+
+/* ==================== Key API ==================== */
+
+autoreply define sr_wg_key_set
+{
+  u32 client_index;
+  u32 context;
+  u16 hmac_id;
+  u8 key[16];             /* 128-bit P-Key */
+};
+
+autoreply define sr_wg_key_del
+{
+  u32 client_index;
+  u32 context;
+  u16 hmac_id;
+};
+
+define sr_wg_key_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+define sr_wg_key_details
+{
+  u32 context;
+  u16 hmac_id;
+};
+
+/* ==================== Transit API ==================== */
+
+autoreply define sr_wg_transit_enable
+{
+  u32 client_index;
+  u32 context;
+  u16 port;               /* transit UDP port */
+  vl_api_ip4_address_t local_ip;   /* 本机 transit IP */
+};
+
+autoreply define sr_wg_transit_disable
+{
+  u32 client_index;
+  u32 context;
+};
+
+/* ==================== Encap API ==================== */
+
+/** \brief 绑定 / 解绑 WG 隧道接口到 SR 路径
+    @param sw_if_index - WG 隧道接口的 sw_if_index
+    @param path_id     - 路径标识（必须已存在于路径表）
+    @param endpoint_ip - 可选：WG peer endpoint IPv4，非 0.0.0.0 时
+                         同时建立 endpoint -> path 的索引
+    @param is_add      - 1 = 绑定（并在 ip4-output arc 上自动启用
+                              sr-wg4-encap feature），0 = 解绑（同时禁用）
+*/
+autoreply define sr_wg_tunnel_set_path
+{
+  u32 client_index;
+  u32 context;
+  u8 is_add;
+  u32 sw_if_index;
+  u16 path_id;
+  vl_api_ip4_address_t endpoint_ip;
+};
+
+define sr_wg_tunnel_dump
+{
+  u32 client_index;
+  u32 context;
+  u32 sw_if_index;          /* ~0 = dump all */
+};
+
+define sr_wg_tunnel_details
+{
+  u32 context;
+  u32 sw_if_index;
+  u16 path_id;
+  vl_api_ip4_address_t endpoint_ip;
+  u8 feature_enabled;       /* sr-wg4-encap 在 ip4-output arc 上是否已启用 */
+};
+
+/** \brief 在 ip4-output arc 上启用 / 禁用 sr-wg4-encap feature
+    @param sw_if_index - WG 隧道接口的 sw_if_index
+    @param enable      - 1 = 启用，0 = 禁用
+*/
+autoreply define sr_wg_encap_enable
+{
+  u32 client_index;
+  u32 context;
+  u32 sw_if_index;
+  u8 enable;
+};
+
+/* ==================== Stats API ==================== */
+
+define sr_wg_stats_get
+{
+  u32 client_index;
+  u32 context;
+};
+
+define sr_wg_stats_get_reply
+{
+  u32 context;
+  i32 retval;
+  u64 encap_ok;
+  u64 encap_no_path;
+  u64 encap_hmac_fail;
+  u64 encap_bypass;
+  u64 encap_no_headroom;
+  u64 transit_ok;
+  u64 transit_hmac_fail;
+  u64 transit_seg_exhausted;
+  u64 transit_bad_magic;
+  u64 transit_bad_ver;
+  u64 transit_bad_len;
+  u64 decap_ok;
+  u64 decap_hmac_fail;
+  u64 decap_seg_not_zero;
+  u64 decap_bypass;
+  u64 drop_total;
+};
+
+autoreply define sr_wg_stats_clear
+{
+  u32 client_index;
+  u32 context;
+};

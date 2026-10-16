@@ -1,0 +1,102 @@
+services:
+  # 首节点 - VPN 隧道起点
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: srwg-dev:latest
+    container_name: srwg-node1
+    hostname: node1
+    privileged: true
+    tty: true
+    stdin_open: true
+    networks:
+      net_a:
+        ipv4_address: 10.10.1.2
+      net_ctrl:
+        ipv4_address: 10.10.0.2
+    volumes:
+      - ../../vpp-plugin:/workspace/vpp-plugin
+      - ../../test:/workspace/test
+      - node1_run:/run/vpp
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    sysctls:
+      - net.ipv4.ip_forward=1
+
+  # 中转节点 - 只转发不解密
+  transit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: srwg-dev:latest
+    container_name: srwg-transit
+    hostname: transit
+    privileged: true
+    tty: true
+    stdin_open: true
+    networks:
+      net_a:
+        ipv4_address: 10.10.1.3
+      net_b:
+        ipv4_address: 10.10.2.3
+      net_ctrl:
+        ipv4_address: 10.10.0.3
+    volumes:
+      - ../../vpp-plugin:/workspace/vpp-plugin
+      - ../../test:/workspace/test
+      - transit_run:/run/vpp
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    sysctls:
+      - net.ipv4.ip_forward=1
+
+  # 末节点 - VPN 隧道终点
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: srwg-dev:latest
+    container_name: srwg-node2
+    hostname: node2
+    privileged: true
+    tty: true
+    stdin_open: true
+    networks:
+      net_b:
+        ipv4_address: 10.10.2.2
+      net_ctrl:
+        ipv4_address: 10.10.0.4
+    volumes:
+      - ../../vpp-plugin:/workspace/vpp-plugin
+      - ../../test:/workspace/test
+      - node2_run:/run/vpp
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    sysctls:
+      - net.ipv4.ip_forward=1
+
+networks:
+  net_a:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+  net_b:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+  net_ctrl:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+
+volumes:
+  node1_run:
+  transit_run:
+  node2_run:

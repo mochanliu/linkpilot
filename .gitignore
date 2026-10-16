@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+*.so
+*.a
+build/
+# Go
+controller/vendor/
+# IDE
+.idea/
+.vscode/
+*.swp
+# OS
+.DS_Store
+# VPP
+*.pyc
