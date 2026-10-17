@@ -104,6 +104,10 @@ type InterfaceParams struct {
 type PeerParams struct {
 	PublicKey  []byte // wgKeyLen 字节 X25519 公钥
 	EndpointIP net.IP
+	// Port 是**封装前**那个 WG 包的外层目的端口。走 SR 时必须填租户的 vpn_port：
+	// encap 节点只处理 udp dst==vpn_port 的包（sr_wg4_encap.c:302-308），而真正
+	// 落地的端口是它之后用 SR 段改写的（同文件 387-389）。填成 NAT 映射端口的话
+	// 包根本不会被加 SR 头，计数器上是 encap_bypass —— 不报错，但源路由没了。
 	Port       uint16
 	Keepalive  uint16
 	TableID    uint32
@@ -259,8 +263,14 @@ func (c *Client) DeleteInterface(ctx context.Context, swIfIndex uint32) error {
 
 // AddPeer 装一个 WG peer，返回 peer_index。
 //
-// 按公钥去重：同公钥再加一次回 -116 ENTRY_ALREADY_EXISTS，换 endpoint 也救不回来。
-// 所以对端地址变了要先 RemovePeer 再 AddPeer（见 RemovePeer）。
+// 按公钥去重，而且**去重键不含接口**：同公钥再加一次回 -116 ENTRY_ALREADY_EXISTS，
+// 换 endpoint 救不回来，换一张接口装它同样救不回来（真机在两张接口上试同一把公钥，
+// 第二次 -116）。所以对端地址变了要先 RemovePeer 再 AddPeer；而"别的接口上已经有
+// 这个人"不是本函数能自愈的事，调用方只能把那张接口指出来交给人判。
+//
+// AllowedIPs 不能为空：实测 VPP 回 -7 INVALID_VALUE。Keepalive 给 0 是合法的
+// （VPP 不拦），但 0 意味着没有探针 —— 定案 1 把 WG 的 persistent keepalive 当
+// NAT 保活/观测探针用，所以必须由调用方给一个非 0 值，别指望数据面兜底。
 func (c *Client) AddPeer(ctx context.Context, p PeerParams) (uint32, error) {
 	if len(p.PublicKey) != wgKeyLen {
 		return 0, fmt.Errorf("vppapi: peer 公钥必须 %d 字节，给了 %d", wgKeyLen, len(p.PublicKey))

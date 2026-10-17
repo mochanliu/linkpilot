@@ -1,6 +1,7 @@
 package vppapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
@@ -56,8 +57,10 @@ const (
 //  4. SR 路径/隧道绑定/encap 挂点这一整套能配进真数据面，且 API 读回与
 //     `vppctl show sr-wg` 读到的是同一张表、同一段序（[0]=终点、[n-1]=首跳）；
 //  5. peer 与路径的**重复下发语义**（agent 重启与 NAT 重绑全靠它）：同公钥
-//     重复 add peer 回 -116 且换 endpoint 也一样、删不存在的 peer 回 -6、
-//     同 path_id 再 AddPath 是原地替换、但绑定的 endpoint 不会跟着段走。
+//     重复 add peer 回 -116 且**跨接口也回 -116**（去重键不含接口，换 endpoint
+//     也救不回来）、0 条 allowed_ip 回 -7、删不存在的 peer 回 -6、
+//     同 path_id 再 AddPath 是原地替换、但绑定的 endpoint 不会跟着段走、
+//     DelPath 会静默级联解掉引用它的绑定。
 //
 // 号段全部走 9001/9002 与 51998/51999，路径段地址一律 TEST-NET-1，跑完自己
 // 删干净：这台节点是和别的会话共用的，不能留下任何会影响真实流量的配置。
@@ -184,6 +187,21 @@ func TestLiveAgainstVPP(t *testing.T) {
 			return
 		}
 		t.Logf("wireguard_peer_add 返回 peer_index=%d", peerIdx)
+
+		// 没有 allowed_ip 的 peer VPP **不收**：实测 -7 = INVALID_VALUE。
+		// 这条对上层不是细节而是硬门槛 —— 契约里现在还没有 overlay 地址
+		// （见 internal/wire：PeerInfo 没有任何隧道 IP 字段），所以 agent 在
+		// 拿到地址之前根本装不出 peer，"配好隧道"必须等这个字段落地。
+		_, err = c.AddPeer(ctx, PeerParams{
+			PublicKey:  mustRand(t, wgKeyLen),
+			EndpointIP: net.IPv4(10, 10, 2, 9),
+			Port:       51820,
+			SWIfIndex:  idx,
+		})
+		var noIPs APIError
+		if !errors.As(err, &noIPs) || noIPs.Retval != -7 {
+			t.Fatalf("空 allowed_ips 应该被 VPP 拒掉（-7 INVALID_VALUE），got: %v", err)
+		}
 
 		// 同公钥再加一次，**换 endpoint 也不行**：实测 -116 =
 		// VNET_API_ERROR_ENTRY_ALREADY_EXISTS（对照 /usr/include/vnet/error.h）。
@@ -580,6 +598,65 @@ func TestLiveAgainstVPP(t *testing.T) {
 			t.Error("删掉被引用的路径之后，隧道绑定居然还在 —— 数据面应当级联清掉")
 		}
 		t.Log("实测：DelPath 会连带清掉引用它的隧道绑定，且不报错")
+	})
+
+	// WG peer 的去重键**不含接口**：同一把公钥装到第二张接口上，VPP 回 -116。
+	// 这条划定了上层能自愈的边界 —— "这把公钥已经有人装了"可能是别的接口上的
+	// 现成 peer（操作员手配的 wg0、同机第二个 agent），删它等于拆别人的隧道。
+	t.Run("peer_dedup_spans_interfaces", func(t *testing.T) {
+		pub := mustRand(t, wgKeyLen)
+		mk := func(inst uint32, port uint16) uint32 {
+			idx, err := c.CreateInterface(ctx, InterfaceParams{
+				UserInstance: inst, ListenPort: port,
+				PrivateKeys: mustRand(t, wgKeyLen), SrcIP: src})
+			if err != nil {
+				t.Fatalf("CreateInterface(%d): %v", inst, err)
+			}
+			t.Cleanup(func() {
+				cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := c.DeleteInterface(cctx, idx); err != nil {
+					t.Errorf("清理接口 idx=%d 失败: %v（手工 vppctl wireguard delete）", idx, err)
+				}
+				if err := c.RebindPorts(cctx); err != nil {
+					t.Errorf("RebindPorts: %v", err)
+				}
+			})
+			return idx
+		}
+		a := mk(liveInstance, livePort)
+		b := mk(liveInstance2, livePort2)
+
+		if _, err := c.AddPeer(ctx, PeerParams{
+			PublicKey: pub, EndpointIP: net.ParseIP("192.0.2.77"), Port: 51820,
+			Keepalive: 25, SWIfIndex: a,
+			AllowedIPs: []Prefix{{IP: net.IPv4(10, 200, 1, 1), Len: 32}}}); err != nil {
+			t.Fatalf("接口 %d 装 peer: %v", a, err)
+		}
+		_, err := c.AddPeer(ctx, PeerParams{
+			PublicKey: pub, EndpointIP: net.ParseIP("192.0.2.78"), Port: 51820,
+			Keepalive: 25, SWIfIndex: b,
+			AllowedIPs: []Prefix{{IP: net.IPv4(10, 200, 1, 2), Len: 32}}})
+		var dup APIError
+		if !errors.As(err, &dup) || dup.Retval != -116 {
+			t.Fatalf("跨接口同公钥应当 -116，got: %v", err)
+		}
+		t.Logf("实测：接口 %d 上已持有这把公钥时，接口 %d 装它回 %d（去重键不含接口）",
+			a, b, dup.Retval)
+
+		peers, err := c.Peers(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, p := range peers {
+			if bytes.Equal(p.PublicKey, pub) {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("这把公钥在数据面里有 %d 份，期望 1 份（第二次被拒了就不该有第二条）", n)
+		}
 	})
 
 	t.Logf("被丢弃的帧计数 Drops=%d（异步通知会计进来，不该持续增长）", c.Drops())
