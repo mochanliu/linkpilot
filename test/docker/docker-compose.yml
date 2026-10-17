@@ -18,6 +18,7 @@ services:
     volumes:
       - ../../vpp-plugin:/workspace/vpp-plugin
       - ../../test:/workspace/test
+      - ../../controller:/workspace/controller
       - node1_run:/run/vpp
     cap_add:
       - NET_ADMIN
@@ -46,6 +47,7 @@ services:
     volumes:
       - ../../vpp-plugin:/workspace/vpp-plugin
       - ../../test:/workspace/test
+      - ../../controller:/workspace/controller
       - transit_run:/run/vpp
     cap_add:
       - NET_ADMIN
@@ -72,6 +74,7 @@ services:
     volumes:
       - ../../vpp-plugin:/workspace/vpp-plugin
       - ../../test:/workspace/test
+      - ../../controller:/workspace/controller
       - node2_run:/run/vpp
     cap_add:
       - NET_ADMIN

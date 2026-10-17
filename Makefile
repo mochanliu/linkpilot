@@ -1,6 +1,6 @@
 # SD-WAN CPE Data Plane - Top Level Makefile
 
-.PHONY: all plugin controller test clean docker
+.PHONY: all plugin controller test test-vbond clean docker
 
 VPP_PLUGIN_DIR = vpp-plugin
 CONTROLLER_DIR = controller
@@ -25,6 +25,10 @@ test-unit:
 test-integration:
 	@echo "Running integration tests..."
 	cd $(TEST_DIR)/docker && docker-compose up -d && sleep 5 && ../scripts/run-tests.sh
+
+# vBOND 控制面 acceptance（复用 srwg-* 容器所在的 docker_net_ctrl）
+test-vbond:
+	@controller/test/scripts/test-vbond.sh
 
 docker:
 	@echo "Building Docker environment..."
