@@ -48,13 +48,16 @@ const (
 //	SRWG_VPP_SOCK=/run/vpp/api.sock SRWG_UNDERLAY_IP=10.10.1.2 \
 //	  go test ./internal/vppapi -run TestLive -v
 //
-// 它证明的是这个包最要紧的四件事，全部用真 VPP 而不是假端：
+// 它证明的是这个包最要紧的五件事，全部用真 VPP 而不是假端：
 //  1. 握手、消息尺寸与 CRC 校验对得上真实注册表（假端只能锁住我们自己抄的格式）；
 //  2. 定案 3：agent 自己生成的 X25519 私钥能原样装进 VPP —— dump 回来的私钥
 //     逐字节等于装进去的那把，公钥等于本地用 crypto/ecdh 推算的那把；
 //  3. 观测表为空时返回空切片而不是报错（VPP 的 dump 对空结果一帧都不发）；
 //  4. SR 路径/隧道绑定/encap 挂点这一整套能配进真数据面，且 API 读回与
-//     `vppctl show sr-wg` 读到的是同一张表、同一段序（[0]=终点、[n-1]=首跳）。
+//     `vppctl show sr-wg` 读到的是同一张表、同一段序（[0]=终点、[n-1]=首跳）；
+//  5. peer 与路径的**重复下发语义**（agent 重启与 NAT 重绑全靠它）：同公钥
+//     重复 add peer 回 -116 且换 endpoint 也一样、删不存在的 peer 回 -6、
+//     同 path_id 再 AddPath 是原地替换、但绑定的 endpoint 不会跟着段走。
 //
 // 号段全部走 9001/9002 与 51998/51999，路径段地址一律 TEST-NET-1，跑完自己
 // 删干净：这台节点是和别的会话共用的，不能留下任何会影响真实流量的配置。
@@ -456,6 +459,127 @@ func TestLiveAgainstVPP(t *testing.T) {
 		if err := c.EnableEncap(ctx, idx, false); err != nil {
 			t.Errorf("EnableEncap(off): %v", err)
 		}
+	})
+
+	t.Run("path_replace_and_binding_cascade", func(t *testing.T) {
+		// 这一段钉的是 agent 的 reconcile 算法能不能这么写，全部是真机测出来的：
+		//   a) 同 path_id 再 AddPath 是**原地替换**段列表，不报错 —— 所以换地址
+		//      不需要先删路径（先删反而会把隧道绑定一起带走，见 d）；
+		//   b) 替换段之后，隧道绑定**还在**，但它记的 endpoint 仍是旧的 —— 这正
+		//      是"隧道起来了但不通"的形态，所以改路径必须 path 与 tunnel 成对重设；
+		//   c) encap 挂点开关幂等，agent 每次启动都可以无条件调用；
+		//   d) DelPath 一条被隧道引用的路径会**级联解绑**且 retval=0 —— 静默。
+		key := mustRand(t, pKeyLen)
+		if err := c.SetPKey(ctx, liveHmacID, key); err != nil {
+			t.Fatalf("SetPKey: %v", err)
+		}
+		idx, err := c.CreateInterface(ctx, InterfaceParams{
+			UserInstance: liveInstance,
+			ListenPort:   livePort,
+			PrivateKeys:  mustRand(t, wgKeyLen),
+			SrcIP:        src,
+		})
+		if err != nil {
+			t.Fatalf("CreateInterface: %v", err)
+		}
+		t.Cleanup(func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = c.ClearTunnel(cctx, idx)
+			_ = c.DelPath(cctx, livePathID)
+			_ = c.DelPKey(cctx, liveHmacID)
+			if err := c.DeleteInterface(cctx, idx); err != nil {
+				t.Errorf("清理 WG 接口 idx=%d: %v", idx, err)
+			}
+			if err := c.RebindPorts(cctx); err != nil {
+				t.Errorf("RebindPorts: %v", err)
+			}
+		})
+
+		add := func(ip string) {
+			if err := c.AddPath(ctx, PathParams{PathID: livePathID, HmacID: liveHmacID, Active: true,
+				Segments: []Segment{{IP: net.ParseIP(ip).To4(), Port: 51820}}}); err != nil {
+				t.Fatalf("AddPath(%s): %v", ip, err)
+			}
+		}
+		pathSeg := func() net.IP {
+			ps, err := c.Paths(ctx, livePathID)
+			if err != nil || len(ps) == 0 {
+				t.Fatalf("Paths(%d) = %v, %v", livePathID, ps, err)
+			}
+			if len(ps) != 1 {
+				t.Fatalf("按 path_id 过滤应该只剩 1 条，实际 %d 条", len(ps))
+			}
+			return ps[0].Segments[0].IP
+		}
+		boundEP := func() (net.IP, bool) {
+			ts, err := c.Tunnels(ctx, idx)
+			if err != nil {
+				t.Fatalf("Tunnels: %v", err)
+			}
+			if len(ts) == 0 {
+				return nil, false
+			}
+			if len(ts) != 1 {
+				t.Fatalf("我这个接口上应该只有一条绑定，实际 %d 条", len(ts))
+			}
+			return ts[0].EndpointIP, true
+		}
+
+		old := net.ParseIP("192.0.2.10")
+		fresh := net.ParseIP("192.0.2.11")
+		add(old.String())
+		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idx, PathID: livePathID, EndpointIP: old.To4()}); err != nil {
+			t.Fatalf("SetTunnel: %v", err)
+		}
+		if got, ok := boundEP(); !ok || !got.Equal(old.To4()) {
+			t.Fatalf("绑定初值不对: %v %v", got, ok)
+		}
+
+		// a) 原地替换
+		add(fresh.String())
+		if got := pathSeg(); !got.Equal(fresh.To4()) {
+			t.Errorf("同 path_id 再 AddPath 没替换段：dump 回来 %v，期望 %v", got, fresh)
+		}
+		// b) 绑定还在，但 endpoint 停在旧值 —— agent 必须成对重设
+		if got, ok := boundEP(); !ok {
+			t.Error("替换段之后绑定消失了：DelPath 才该解绑，AddPath 不该")
+		} else if !got.Equal(old.To4()) {
+			t.Errorf("绑定 endpoint 被替换成了 %v（数据面不会自己跟着段走，agent 得重设）", got)
+		} else {
+			t.Logf("实测：替换段后绑定仍指向旧 endpoint=%v，新段=%v —— 改地址必须 path+tunnel 成对下发", got, fresh)
+		}
+		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idx, PathID: livePathID, EndpointIP: fresh.To4()}); err != nil {
+			t.Fatalf("SetTunnel(新): %v", err)
+		}
+		if got, _ := boundEP(); !got.Equal(fresh.To4()) {
+			t.Errorf("重设之后绑定 = %v，期望 %v", got, fresh)
+		}
+
+		// c) encap 幂等：无条件重复调用不能报错，也不能出现 FEATURE_ALREADY_* 那种
+		//  retval —— agent 每次启动都调一次，报一次错就等于每次都要人工判读。
+		for i := 0; i < 2; i++ {
+			if err := c.EnableEncap(ctx, idx, true); err != nil {
+				t.Errorf("EnableEncap(on) 第 %d 次: %v", i+1, err)
+			}
+		}
+		for i := 0; i < 2; i++ {
+			if err := c.EnableEncap(ctx, idx, false); err != nil {
+				t.Errorf("EnableEncap(off) 第 %d 次: %v", i+1, err)
+			}
+		}
+		if err := c.EnableEncap(ctx, idx, true); err != nil {
+			t.Fatalf("EnableEncap 收尾: %v", err)
+		}
+
+		// d) 级联解绑，且 retval 是 0
+		if err := c.DelPath(ctx, livePathID); err != nil {
+			t.Fatalf("DelPath: %v", err)
+		}
+		if _, ok := boundEP(); ok {
+			t.Error("删掉被引用的路径之后，隧道绑定居然还在 —— 数据面应当级联清掉")
+		}
+		t.Log("实测：DelPath 会连带清掉引用它的隧道绑定，且不报错")
 	})
 
 	t.Logf("被丢弃的帧计数 Drops=%d（异步通知会计进来，不该持续增长）", c.Drops())
