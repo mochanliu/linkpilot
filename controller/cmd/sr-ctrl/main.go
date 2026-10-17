@@ -5,7 +5,13 @@
 //
 //  1. zero-touch enrollment (claim code -> device cert -> tenant identity)
 //  2. the endpoint registry / rendezvous table (who is where, pushed on change)
-//  3. STUN-style mapping discovery (reflector) feeding the above
+//  3. address discovery with TWO witnesses, because they answer different
+//     questions: the STUN reflector says what a third party saw (enough to send
+//     the first packet), and a node's own dataplane says what a peer's traffic
+//     looked like when it arrived here (the only address that is actually a path
+//     back under a symmetric NAT). The /v1/observe path is that second witness.
+//  4. the tenant's dataplane facts: which UDP function ports to use, and the
+//     hop-MAC key ring the SR header is signed with.
 //
 // What this deliberately is NOT yet (each is a named follow-up, doc 11 §6):
 //
@@ -48,6 +54,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,14 +83,23 @@ type NodeRecord struct {
 	EnrolledAt int64  `json:"enrolled_at_unix"`
 	Stale      bool   `json:"stale"`
 
-	// SrouIP is this node's LABEL address, assigned at enrollment from the
-	// tenant's pool. Persisted so it is stable across restarts: a label that
-	// changes would invalidate every peer's already-compiled paths.
-	SrouIP string `json:"srou_ip"`
+	// VpnPort / TransitPort are what this node's dataplane says it listens on.
+	// Seeded from the tenant's pushed values at enrollment, then overwritten by
+	// the node's own report -- because a node that had to rebind is reachable
+	// only at the port it actually holds.
+	VpnPort     uint16 `json:"vpn_port"`
+	TransitPort uint16 `json:"transit_port"`
+
+	// LocalAddrs is what the node declared as its own interface addresses. It is
+	// the lookup table for attributing an observed outer source (see
+	// attributeLocked): the controller may only name a source some node has
+	// claimed over its authenticated channel.
+	LocalAddrs []string `json:"local_addrs,omitempty"`
 
 	// Binding is the device's attested X25519 key (verified before storage --
-	// see applyBinding). The controller stores and relays it; it can check it
-	// but it can never produce one, because it does not hold the device's
+	// see applyBinding), and per the wire contract that key IS the node's
+	// WireGuard static public key. The controller stores and relays it; it can
+	// check it but can never produce one, because it does not hold the device's
 	// identity key.
 	Binding *keybinding.Binding `json:"key_binding,omitempty"`
 	KeyGen  uint32              `json:"key_gen,omitempty"`
@@ -96,16 +112,13 @@ type State struct {
 	NextNodeID map[string]uint16      `json:"next_node_id"` // per tenant
 	Epoch      uint32                 `json:"epoch"`        // monotonic, survives restart
 	Claims     map[string]string      `json:"claims"`       // claim_code -> tenant_id
-	// Roots holds each tenant's E_root (hex, 16 bytes). This is the DOMAIN key:
-	// the controller issues it because every node has to verify every other
-	// node's hop MAC, so it cannot be per-pair. The per-pair O-key is the one
-	// the controller must never see, and it is derived by the endpoints, not
-	// here -- note this file contains no code that could compute one.
-	Roots map[string]string `json:"tenant_roots"`
-	// TenantIndex gives each tenant a stable small number, used to place its
-	// label addresses in their own pool range.
-	TenantIndex map[string]uint8 `json:"tenant_index"`
-	NextTenant  uint8            `json:"next_tenant"`
+	// PKeyRings holds each tenant's hop-MAC key ring. This is DOMAIN material:
+	// shared across the tenant on purpose, because a node has to verify headers
+	// signed by nodes it never talked to (a transit hop). What is NOT here is any
+	// per-pair material -- the tunnel key is negotiated by the endpoints from the
+	// bindings this controller only relays, and nothing in this file could
+	// compute one.
+	PKeyRings map[string][]wire.PKey `json:"p_key_rings"`
 }
 
 // Store is the persistence seam. F1 (Postgres) implements this and nothing
@@ -121,10 +134,9 @@ func (f *fileStore) Load() (*State, error) {
 	b, err := os.ReadFile(f.path)
 	if os.IsNotExist(err) {
 		return &State{
-			Nodes:       map[string]*NodeRecord{},
-			NextNodeID:  map[string]uint16{},
-			Roots:       map[string]string{},
-			TenantIndex: map[string]uint8{},
+			Nodes:      map[string]*NodeRecord{},
+			NextNodeID: map[string]uint16{},
+			PKeyRings:  map[string][]wire.PKey{},
 			// Seeded so the harness proves multi-tenancy out of the box.
 			Claims: map[string]string{
 				"claim-a": "tenant-a",
@@ -149,11 +161,8 @@ func (f *fileStore) Load() (*State, error) {
 	if s.Claims == nil {
 		s.Claims = map[string]string{}
 	}
-	if s.Roots == nil {
-		s.Roots = map[string]string{}
-	}
-	if s.TenantIndex == nil {
-		s.TenantIndex = map[string]uint8{}
+	if s.PKeyRings == nil {
+		s.PKeyRings = map[string][]wire.PKey{}
 	}
 	return &s, nil
 }
@@ -194,10 +203,51 @@ type server struct {
 	caKey   ed25519.PrivateKey
 	dataDir string
 
-	// opcodeBase is the tenant-wide instruction-port base (doc 23). Pushed to
-	// every node rather than configured per node, so a label can be composed
-	// from a peer's label address alone.
-	opcodeBase uint16
+	// vpnPort / transitPort are the tenant-wide function ports pushed at
+	// enrollment. Constraint (2) of the design makes the destination UDP port the
+	// dataplane's multiplexing key, so the controller owns the answer and no node
+	// gets to invent one.
+	vpnPort     uint16
+	transitPort uint16
+
+	// obs is the observation store: per (tenant, OBSERVER), the attributed outer
+	// sources that observer reported. Deliberately NOT part of State, and
+	// therefore not persisted: an observation is only a fact while it is fresh
+	// (the dataplane table it came from ages out on its own), so resurrecting one
+	// after a controller restart would advertise a dead address as current.
+	// Keyed by observer rather than by target because there is no target-wide
+	// answer: under a symmetric NAT every observer sees a different port.
+	obs map[string]observerView
+
+	// pendingObs holds reported sources nothing could be matched to yet, kept per
+	// observer so that a node which declares its addresses AFTER the observation
+	// arrived still gets attributed. Two CPEs enrolling at once makes that ordering
+	// real, not hypothetical.
+	pendingObs map[string]map[string]*pendingObs
+}
+
+// pendingObs is an observation the controller could not name yet, kept with the
+// time it arrived (so it expires like an attributed row instead of lingering until
+// some future node happens to claim the address) and the reason it is still
+// unnamed, which is what the reporter was told.
+type pendingObs struct {
+	ob     wire.Observation
+	reason string
+	seenAt int64
+}
+
+// observerView is one observer's attributed rows, keyed by the TARGET node.
+type observerView map[uint16]*attributedObs
+
+// attributedObs is the controller's answer to "where did node X's traffic look
+// like it came from, as seen by me".
+type attributedObs struct {
+	mapping  string
+	dstPort  uint16
+	verified bool
+	hits     uint64
+	ageSec   uint64
+	seenAt   int64 // controller clock, at report time -- used for expiry
 }
 
 func (s *server) save() {
@@ -445,10 +495,13 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.PublicKey = base64.StdEncoding.EncodeToString(pub)
 	rec.AgentVer = req.AgentVersion
-	if rec.SrouIP == "" {
-		// Assigned once and kept. A label address that moved would invalidate
-		// every peer's already-compiled paths, so re-enrollment must not move it.
-		rec.SrouIP = s.assignSrouIP(tenant, rec.NodeID)
+	if rec.VpnPort == 0 {
+		// Seeded with the tenant's pushed ports, then overwritten by the node's
+		// own mapping report if it had to rebind. Only on first sight: peers may
+		// already be sending to the port this node reported, and enrollment is not
+		// a licence to move it.
+		rec.VpnPort = s.vpnPort
+		rec.TransitPort = s.transitPort
 	}
 
 	certPEM, err := signDevice(s.caCert, s.caKey, ed25519.PublicKey(pub), tenant, rec.NodeID)
@@ -458,7 +511,6 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.CertPEM = certPEM
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
-	root := s.tenantRoot(tenant)
 	s.save()
 
 	json.NewEncoder(w).Encode(wire.EnrollResponse{
@@ -470,9 +522,9 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		UDPReflector: s.udpAddrs,
 		HeartbeatSec: s.hbSec,
 		Epoch:        s.advanceEpoch(),
-		RootKey:      root,
-		OpcodeBase:   s.opcodeBase,
-		SrouIP:       rec.SrouIP,
+		VpnPort:      s.vpnPort,
+		TransitPort:  s.transitPort,
+		PKeys:        s.tenantKeyRing(tenant),
 	})
 }
 
@@ -521,7 +573,7 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Coming back from stale, or offering key material peers have not seen, are
 	// both events peers need: their view of this node just changed.
 	if wasStale || keyChanged {
-		s.broadcastLocked(tenant, wire.WatchEvent{Type: "update", Peer: toPeerInfo(rec, false), SentAt: time.Now().Unix()})
+		s.broadcastLocked(tenant, wire.WatchEvent{Type: "update", Peer: s.toPeerInfoLocked(rec, 0), SentAt: time.Now().Unix()})
 	}
 	json.NewEncoder(w).Encode(wire.HeartbeatResponse{
 		Epoch:      s.advanceEpoch(),
@@ -557,15 +609,41 @@ func (s *server) handleMapping(w http.ResponseWriter, r *http.Request) {
 	rec.LastSeen = time.Now().Unix()
 	rec.Reach = "unknown"
 
+	// The node's own ports win over the pushed ones, but only when it reports
+	// them: a zero means "I am on what enrollment told me", and overwriting a
+	// known port with 0 would point every peer at port 0.
+	if rep.VpnPort != 0 && rep.VpnPort != rec.VpnPort {
+		rec.VpnPort = rep.VpnPort
+		changed = true
+	}
+	if rep.TransitPort != 0 && rep.TransitPort != rec.TransitPort {
+		rec.TransitPort = rep.TransitPort
+		changed = true
+	}
+	// Declared addresses are the attribution table. Store the node's own sorted
+	// list so a change is detectable: an unsorted compare would report "changed"
+	// on every report that merely reordered the same set.
+	if addrs := normaliseAddrs(rep.LocalAddrs); len(addrs) > 0 && !equalStrings(addrs, rec.LocalAddrs) {
+		rec.LocalAddrs = addrs
+		// Rows that arrived before this node knew its own addresses may now have
+		// an owner. Re-running attribution is what makes the enroll-vs-observe
+		// race resolve on its own instead of needing a fixed order.
+		reattributed := s.reattributeLocked(tenant)
+		if reattributed > 0 {
+			changed = true
+			log.Printf("mapping: %d pending observation(s) now attributable to %s", reattributed, tenant)
+		}
+	}
+
 	var bindingErr string
 	keyChanged, err := s.applyBinding(rec, rep.Binding)
 	if err != nil {
 		bindingErr = err.Error()
 		log.Printf("binding REJECTED tenant=%s node=%d: %v", tenant, nodeID, err)
 	} else if keyChanged {
-		// A new binding is itself a reason to push. Peers must derive the new
-		// O-key BEFORE they try to talk; discovering it by packet loss would
-		// make a rotation look like a link failure.
+		// A new binding is itself a reason to push. Peers must install the new
+		// WireGuard key BEFORE they try to talk; discovering it by packet loss
+		// would make a rotation look like a link failure.
 		changed = true
 		log.Printf("pushing new key binding for %s/%d to peers", tenant, nodeID)
 	}
@@ -576,10 +654,290 @@ func (s *server) handleMapping(w http.ResponseWriter, r *http.Request) {
 		// the registry notices and pushes. No dataplane change is needed.
 		log.Printf("mapping CHANGED tenant=%s node=%d -> %q (local_port=%d symmetric=%v)",
 			tenant, nodeID, rep.UDPMapping, rep.LocalPort, rep.SymmetricNAT)
-		s.broadcastLocked(tenant, wire.WatchEvent{Type: "update", Peer: toPeerInfo(rec, false), SentAt: time.Now().Unix()})
+		s.broadcastLocked(tenant, wire.WatchEvent{Type: "update", Peer: s.toPeerInfoLocked(rec, 0), SentAt: time.Now().Unix()})
 	}
 	s.mu.Unlock()
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "binding_err": bindingErr})
+}
+
+// handleObserve is the SECOND WITNESS of a node's address: not what a reflector
+// saw the node send from, but what the node's traffic looked like when it ARRIVED
+// at a peer. That distinction is the entire reason this endpoint exists -- under a
+// symmetric NAT the reflector's answer is not a usable return path, and only the
+// receiver of the first packet can name the port the reverse direction must use.
+//
+// The reply is synchronous and there is deliberately no broadcast: what an
+// observation changes is the REPORTER's own view of a peer, which no other node
+// can use (each has its own vantage). The reporter acts on this response; its
+// later registry/watch rows carry the same values re-rendered per reader.
+func (s *server) handleObserve(w http.ResponseWriter, r *http.Request) {
+	tenant, nodeID, err := peerTenantFromCert(r)
+	if err != nil {
+		http.Error(w, err.Error(), 401)
+		return
+	}
+	var rep wire.ObserveReport
+	if err := json.NewDecoder(r.Body).Decode(&rep); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	if rep.NodeID != nodeID {
+		// Same iron rule as the heartbeat: a certificate for node 5 may not
+		// report observations as node 7.
+		http.Error(w, "node id does not match certificate", 403)
+		return
+	}
+
+	s.mu.Lock()
+	if _, ok := s.state.Nodes[key(tenant, nodeID)]; !ok {
+		s.mu.Unlock()
+		http.Error(w, "unknown node", 404)
+		return
+	}
+	viewKey := key(tenant, nodeID)
+	now := time.Now()
+	if rep.Reset {
+		// The agent cleared its dataplane table before dumping, so a source that
+		// is absent really is gone. Without this flag the controller could only
+		// ever learn additions, and would keep publishing a path that stopped
+		// working the first time it was reported.
+		delete(s.obs, viewKey)
+		delete(s.pendingObs, viewKey)
+	}
+	if s.obs == nil {
+		s.obs = map[string]observerView{}
+	}
+	if s.obs[viewKey] == nil {
+		s.obs[viewKey] = observerView{}
+	}
+	view := s.obs[viewKey]
+
+	resp := wire.ObserveResponse{}
+	for _, ob := range rep.Observations {
+		mapping := net.JoinHostPort(ob.SrcIP, strconv.FormatUint(uint64(ob.SrcPort), 10))
+		target, reason, retry := s.attributeLocked(tenant, nodeID, ob)
+		if target == 0 {
+			resp.Unattributed = append(resp.Unattributed,
+				wire.Attribution{Mapping: mapping, DstPort: ob.DstPort, Reason: reason})
+			if !retry {
+				continue
+			}
+			if s.pendingObs == nil {
+				s.pendingObs = map[string]map[string]*pendingObs{}
+			}
+			if s.pendingObs[viewKey] == nil {
+				s.pendingObs[viewKey] = map[string]*pendingObs{}
+			}
+			s.pendingObs[viewKey][mapping] = &pendingObs{ob: ob, reason: reason, seenAt: now.Unix()}
+			continue
+		}
+		if prev := view[target]; prev != nil && prev.mapping != mapping {
+			log.Printf("observe: %s moved node %d from %s to %s (as seen by %d)",
+				tenant, target, prev.mapping, mapping, nodeID)
+		}
+		v := ob.Verified
+		if prev := view[target]; prev != nil && prev.mapping == mapping && prev.verified {
+			// Upgrade-only, mirroring the dataplane's own rule: a later row that
+			// happened to land on an unverified packet must not erase the fact
+			// that this source once carried a validly signed header.
+			v = true
+		}
+		view[target] = &attributedObs{
+			mapping:  mapping,
+			dstPort:  ob.DstPort,
+			verified: v,
+			hits:     ob.Hits,
+			ageSec:   ob.AgeSec,
+			seenAt:   now.Unix(),
+		}
+		delete(s.pendingObs[viewKey], mapping)
+		resp.Accepted++
+		resp.Attributed = append(resp.Attributed,
+			wire.Attribution{Mapping: mapping, DstPort: ob.DstPort, NodeID: target, Reason: reason})
+	}
+	// Epoch is READ here. Observations are a per-node dataplane poll and carry no
+	// tenant-wide change; burning an epoch on each one would make the counter mean
+	// "somebody dumped a table" instead of "the registry view moved".
+	resp.Epoch = s.epoch()
+	s.mu.Unlock()
+
+	if len(resp.Attributed) > 0 {
+		log.Printf("observe: node %d (%s) reported %d row(s), %d attributed",
+			nodeID, tenant, len(rep.Observations), resp.Accepted)
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// attributeLocked names the node a reported outer source belongs to.
+//
+// It is a LOOKUP, not a guess. The only evidence is an address some node declared
+// about itself over its authenticated channel, plus the mapping a reflector
+// observed for it. No candidate means "nobody claims that address"; more than one
+// means "ambiguous" and the controller refuses to pick. The refusal is the point:
+// an observed source is NOT authenticated by the SR header (sr_hmac.c covers
+// ver_flags through the segments, never the outer IP), so a wrong attribution
+// would not fail -- it would quietly hand a peer a path to somebody else's box.
+//
+// Returns the target node (0 when undetermined), a human-readable reason, and
+// whether the row is worth keeping for a later retry.
+//
+// Must be called with s.mu held.
+func (s *server) attributeLocked(tenant string, observer uint16, ob wire.Observation) (uint16, string, bool) {
+	if ob.SrcIP == "" || ob.SrcPort == 0 {
+		return 0, "malformed source", false
+	}
+	mine := s.state.Nodes[key(tenant, observer)]
+	if mine == nil {
+		return 0, "observer is not enrolled", false
+	}
+	// Role check first. A packet that arrived on a port which is neither of this
+	// node's dataplane ports did not come from a tunnel this controller runs --
+	// and the destination port is exactly the field that says which role answered,
+	// so it gets used rather than logged and ignored.
+	if ob.DstPort != mine.VpnPort && ob.DstPort != mine.TransitPort {
+		return 0, fmt.Sprintf("arrived at port %d, not this node's vpn=%d/transit=%d",
+			ob.DstPort, mine.VpnPort, mine.TransitPort), false
+	}
+	var hits []uint16
+	for _, rec := range s.state.Nodes {
+		if rec.TenantID != tenant {
+			continue
+		}
+		// A node never attributes a source to ITSELF. This is not pedantry: a
+		// docker bridge that rewrites sources makes an observer's own gateway
+		// address show up as a "peer", and answering that with "that was me"
+		// would tell the node to open a tunnel to its own box.
+		if rec.NodeID == observer {
+			continue
+		}
+		if claimsAddr(rec, ob.SrcIP) {
+			hits = append(hits, rec.NodeID)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return 0, fmt.Sprintf("no node in %s claims %s", tenant, ob.SrcIP), true
+	case 1:
+		return hits[0], "unique", false
+	default:
+		return 0, fmt.Sprintf("%d nodes claim %s: refusing to guess", len(hits), ob.SrcIP), true
+	}
+}
+
+// claimsAddr reports whether `ip` is one of this node's own addresses: either
+// declared by the node itself, or the address a reflector saw it send from.
+// Both are legitimate and they are not the same evidence -- the first is a claim
+// the node made under its certificate, the second is a third party's observation
+// of the node. Either is enough to name a source; neither is enough to trust the
+// payload, which is what the key binding is for.
+func claimsAddr(rec *NodeRecord, ip string) bool {
+	for _, a := range rec.LocalAddrs {
+		if a == ip {
+			return true
+		}
+	}
+	if rec.UDPMapping != "" {
+		if host, _, err := net.SplitHostPort(rec.UDPMapping); err == nil && host == ip {
+			return true
+		}
+	}
+	return false
+}
+
+// reattributeLocked retries the rows that arrived before their owner declared an
+// address, and returns how many found one. Must be called with s.mu held.
+func (s *server) reattributeLocked(tenant string) int {
+	prefix := tenant + "|"
+	fixed := 0
+	for viewKey, pending := range s.pendingObs {
+		if !strings.HasPrefix(viewKey, prefix) {
+			continue
+		}
+		var observer uint16
+		if _, err := fmt.Sscanf(viewKey, prefix+"%d", &observer); err != nil {
+			continue
+		}
+		for mapping, p := range pending {
+			target, reason, _ := s.attributeLocked(tenant, observer, p.ob)
+			if target == 0 {
+				p.reason = reason // the reporter asked why; keep the latest answer
+				continue
+			}
+			if s.obs[viewKey] == nil {
+				s.obs[viewKey] = observerView{}
+			}
+			s.obs[viewKey][target] = &attributedObs{
+				mapping: mapping, dstPort: p.ob.DstPort, verified: p.ob.Verified,
+				hits: p.ob.Hits, ageSec: p.ob.AgeSec, seenAt: p.seenAt,
+			}
+			delete(pending, mapping)
+			fixed++
+			log.Printf("observe: late attribution %s -> node %d (as seen by %d)", mapping, target, observer)
+		}
+		if len(pending) == 0 {
+			delete(s.pendingObs, viewKey)
+		}
+	}
+	return fixed
+}
+
+// expireObservationsLocked drops rows the observers have stopped re-reporting. An
+// observation is a claim about a NAT binding that was true a minute ago; the
+// registry must not carry it past that. Must be called with s.mu held.
+func (s *server) expireObservationsLocked() {
+	cutoff := time.Now().Add(-observationTTL).Unix()
+	for viewKey, view := range s.obs {
+		for target, o := range view {
+			if o.seenAt < cutoff {
+				log.Printf("observe: dropping stale row for node %d (seen by %s)", target, viewKey)
+				delete(view, target)
+			}
+		}
+		if len(view) == 0 {
+			delete(s.obs, viewKey)
+		}
+	}
+	for viewKey, pending := range s.pendingObs {
+		for mapping, p := range pending {
+			if p.seenAt < cutoff {
+				delete(pending, mapping)
+			}
+		}
+		if len(pending) == 0 {
+			delete(s.pendingObs, viewKey)
+		}
+	}
+}
+
+// forgetTargetLocked removes every observer's row about one node -- used when the
+// node goes stale, because a stale node's last-seen address is the kind of thing
+// a peer would happily hole-punch toward and then sit on.
+//
+// Must be called with s.mu held.
+func (s *server) forgetTargetLocked(tenant string, target uint16) {
+	prefix := tenant + "|"
+	for viewKey, view := range s.obs {
+		if strings.HasPrefix(viewKey, prefix) {
+			delete(view, target)
+		}
+	}
+	// A pending row has no owner yet, so it cannot be matched by node id; the best
+	// available test is "is this source one of the addresses the node that just
+	// lapsed declared?", which is exactly what would have attributed it.
+	targetRec := s.state.Nodes[key(tenant, target)]
+	if targetRec == nil {
+		return
+	}
+	for viewKey, pending := range s.pendingObs {
+		if !strings.HasPrefix(viewKey, prefix) {
+			continue
+		}
+		for mapping, _ := range pending {
+			if host, _, err := net.SplitHostPort(mapping); err == nil && claimsAddr(targetRec, host) {
+				delete(pending, mapping)
+			}
+		}
+	}
 }
 
 func (s *server) handleReach(w http.ResponseWriter, r *http.Request) {
@@ -698,56 +1056,98 @@ func writeEvent(w http.ResponseWriter, ev wire.WatchEvent) error {
 
 func key(tenant string, nodeID uint16) string { return fmt.Sprintf("%s|%d", tenant, nodeID) }
 
-// ------------------------------------------------------------------ tenant facts
-
-// tenantRoot returns the tenant's E_root, generating it on first use.
+// normaliseAddrs turns a node's declared address list into a comparable form:
+// prefixes are cut (an agent enumerates interfaces and gets "10.10.1.2/24", the
+// attribution lookup needs "10.10.1.2"), blanks and duplicates are dropped, and
+// the result is sorted so a report that merely reordered the same set is not
+// mistaken for a change.
 //
-// E_root is the D-key domain root: the key every node of the tenant derives its
-// hop MAC from. It is deliberately SHARED across the tenant (unlike the O-key)
-// because a node has to verify hops that were signed by nodes it never talked
-// to. The controller issuing it is what makes "every node can verify every
-// other node's MAC" true without any pairwise setup.
-//
-// Must be called with s.mu held.
-func (s *server) tenantRoot(tenant string) string {
-	if k, ok := s.state.Roots[tenant]; ok {
-		return k
+// Validation is deliberately light: the list is only ever used as a match table,
+// and a malformed entry can then match nothing. Rejecting an entire report
+// because one interface line parsed oddly would throw away the entries that
+// would have attributed real peers.
+func normaliseAddrs(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, a := range in {
+		a = strings.TrimSpace(a)
+		if i := strings.IndexByte(a, '/'); i >= 0 {
+			a = a[:i]
+		}
+		if a == "" || seen[a] {
+			continue
+		}
+		seen[a] = true
+		out = append(out, a)
 	}
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		// Generating a weak or empty root key would silently weaken every MAC in
-		// the tenant, so refuse rather than degrade.
-		log.Fatalf("tenant root key: entropy unavailable: %v", err)
-	}
-	k := hex.EncodeToString(buf)
-	s.state.Roots[tenant] = k
-	log.Printf("tenant %s: issued E_root %s… (new)", tenant, k[:8])
-	return k
+	sort.Strings(out)
+	return out
 }
 
-// srouPoolBase is the label-address pool. These addresses are NAMES, not routes
-// (doc 24 §3.2): they must be tenant-unique but need not be reachable, so they
-// live in a range that is never routed and never collides with a customer LAN.
-const srouPoolBase = "10.255."
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
-// assignSrouIP places (tenant, nodeID) in the tenant's own /24 inside the pool.
+const (
+	// pKeyLen is SR_PKEY_LEN in vpp-plugin/sr_hmac.h: 128-bit hop-MAC key. The
+	// two numbers must agree, and the dataplane is the one that decides.
+	pKeyLen = 16
+	// firstHmacID is the key identifier every path uses until rotation lands.
+	// Starting at 1 rather than 0 keeps "no key selected" distinguishable in the
+	// header, which is the same reason the plugin treats a 0 path id carefully.
+	firstHmacID = 1
+
+	// observationTTL is how long an attributed observation stays usable. It is a
+	// controller-side deadline on TOP of the dataplane's own aging, because the
+	// two clocks answer different questions: age_sec says "this node stopped
+	// seeing that source at T-40s", seenAt says "and nobody has re-reported it to
+	// me since". Comfortably more than a few heartbeat intervals so a normal poll
+	// never looks like a disappearance; short enough that a mapping which really
+	// died is not advertised for hours.
+	observationTTL = 90 * time.Second
+)
+
+// ------------------------------------------------------------------ tenant facts
+
+// tenantKeyRing returns the tenant's hop-MAC key ring, issuing it on first use.
 //
-// Per-tenant index instead of a global counter on purpose: with a global
-// counter, decommissioning a tenant would leave its range unused, and two nodes
-// of one tenant could end up in different /24s -- making the tenant's namespace
-// non-contiguous for no reason. The /24 gives 254 nodes per tenant, which is
-// the phase-2 envelope; the scheme is a placeholder that a future pool
-// allocator replaces without touching anything else.
+// The ring is DOMAIN material: the plugin keys the SR header's per-hop MAC with
+// a p-key selected by the hmac_id written in the header, and a node has to verify
+// headers signed by nodes it never talked to (a transit hop signs, the endpoint
+// checks). So the key must be shared tenant-wide -- that is what makes "any node
+// can verify any other node's header" true with no pairwise setup, and it is why
+// the controller holds it at all.
+//
+// Exactly one entry today. Adding a second hmac_id is how rotation starts, but
+// rotation has real ordering requirements (install before any path cites it, and
+// the plugin refuses to drop a key a path still references), so the ring is left
+// single-entry rather than pretending.
 //
 // Must be called with s.mu held.
-func (s *server) assignSrouIP(tenant string, nodeID uint16) string {
-	idx, ok := s.state.TenantIndex[tenant]
-	if !ok {
-		s.state.NextTenant++
-		idx = s.state.NextTenant
-		s.state.TenantIndex[tenant] = idx
+func (s *server) tenantKeyRing(tenant string) []wire.PKey {
+	if r, ok := s.state.PKeyRings[tenant]; ok && len(r) > 0 {
+		return r
 	}
-	return fmt.Sprintf("%s%d.%d", srouPoolBase, idx, nodeID)
+	buf := make([]byte, pKeyLen)
+	if _, err := rand.Read(buf); err != nil {
+		// A weak or empty key would silently weaken every MAC in the tenant, so
+		// refuse rather than degrade.
+		log.Fatalf("tenant key ring: entropy unavailable: %v", err)
+	}
+	ring := []wire.PKey{{HmacID: firstHmacID, Key: hex.EncodeToString(buf)}}
+	s.state.PKeyRings[tenant] = ring
+	// Logged without the key itself: this line ends up in container logs, which
+	// are not where tenant domain material belongs.
+	log.Printf("tenant %s: issued p-key ring (hmac_id=%d, %d bytes)", tenant, firstHmacID, pKeyLen)
+	return ring
 }
 
 // applyBinding authenticates and stores a node's X25519 key binding.
@@ -797,31 +1197,50 @@ func (s *server) applyBinding(rec *NodeRecord, b *keybinding.Binding) (changed b
 	return true, nil
 }
 
-func toPeerInfo(rec *NodeRecord, self bool) wire.PeerInfo {
-	return wire.PeerInfo{
+// toPeerInfoLocked renders one registry row AS SEEN BY A READER.
+//
+// Two of the fields are properties of the reader rather than of the row: IsSelf,
+// and the observed address (which is "what your traffic looked like when I
+// received it", and under a symmetric NAT every observer gets a different
+// answer). So a fan-out to subscribers must build the row per subscriber -- a
+// single row cannot carry everyone's vantage.
+//
+// Must be called with s.mu held.
+func (s *server) toPeerInfoLocked(rec *NodeRecord, reader uint16) wire.PeerInfo {
+	pi := wire.PeerInfo{
 		NodeID:      rec.NodeID,
 		Serial:      rec.Serial,
 		UDPMapping:  rec.UDPMapping,
-		SrouIP:      rec.SrouIP,
+		VpnPort:     rec.VpnPort,
+		TransitPort: rec.TransitPort,
 		Reach:       rec.Reach,
 		LastSeen:    rec.LastSeen,
 		AgentVer:    rec.AgentVer,
-		IsSelf:      self,
+		IsSelf:      rec.NodeID == reader,
 		Stale:       rec.Stale,
 		SymmetricNA: rec.Symmetric,
 		CertPEM:     rec.CertPEM,
 		Binding:     rec.Binding,
 		KeyGen:      rec.KeyGen,
 	}
+	if o := s.obs[key(rec.TenantID, reader)][rec.NodeID]; o != nil {
+		pi.ObservedMapping = o.mapping
+		pi.ObservedVerified = o.verified
+		// age_sec came out of the observer's dataplane, measured against the
+		// observer's own uptime; the controller's wait since that dump is added so
+		// a reader never sees an age that got YOUNGER by sitting in a registry.
+		pi.ObservedAgeSec = o.ageSec + uint64(time.Since(time.Unix(o.seenAt, 0)).Seconds())
+	}
+	return pi
 }
 
-func (s *server) peersLocked(tenant string, self uint16) []wire.PeerInfo {
+func (s *server) peersLocked(tenant string, reader uint16) []wire.PeerInfo {
 	out := []wire.PeerInfo{}
 	for _, rec := range s.state.Nodes {
 		if rec.TenantID != tenant {
 			continue
 		}
-		out = append(out, toPeerInfo(rec, rec.NodeID == self))
+		out = append(out, s.toPeerInfoLocked(rec, reader))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
@@ -840,7 +1259,10 @@ func (s *server) peersLocked(tenant string, self uint16) []wire.PeerInfo {
 //
 // IsSelf is also set per SUBSCRIBER: a node must recognise "this is about me"
 // (that is how NAT rebinding is detected), and a producer-side flag cannot
-// know who is reading.
+// know who is reading. So is the observed address -- which is why the row is
+// RE-RENDERED per subscriber instead of copied: the producer's copy carries the
+// node id, and everything reader-dependent is filled from the reader's own
+// observation view.
 func (s *server) broadcastLocked(tenant string, ev wire.WatchEvent) {
 	ev.TenantID = tenant
 	for _, sub := range s.subs {
@@ -848,7 +1270,13 @@ func (s *server) broadcastLocked(tenant string, ev wire.WatchEvent) {
 			continue
 		}
 		out := ev
-		out.Peer.IsSelf = (ev.Peer.NodeID == sub.nodeID)
+		if rec, ok := s.state.Nodes[key(tenant, ev.Peer.NodeID)]; ok {
+			out.Peer = s.toPeerInfoLocked(rec, sub.nodeID)
+		} else {
+			// The row is gone (a removal): there is nothing left to render, but
+			// the reader still needs to be told it was about itself.
+			out.Peer.IsSelf = (ev.Peer.NodeID == sub.nodeID)
+		}
 		select {
 		case sub.ch <- out:
 		default: // slow consumer: drop rather than stall the registry
@@ -881,12 +1309,17 @@ func (s *server) ttlSweeper(ctx context.Context) {
 					rec.Stale = true
 					log.Printf("ttl: node %d (tenant %s) stale after %ds idle",
 						rec.NodeID, rec.TenantID, now-rec.LastSeen)
+					// Its address stops being a fact the moment its agent stops
+					// answering: whatever a peer saw 40 seconds ago describes a
+					// binding that may already be gone.
+					s.forgetTargetLocked(rec.TenantID, rec.NodeID)
 					s.broadcastLocked(rec.TenantID, wire.WatchEvent{
-						Type: "stale", Peer: toPeerInfo(rec, false),
+						Type: "stale", Peer: s.toPeerInfoLocked(rec, 0),
 						SentAt: now, Message: "heartbeat lapsed",
 					})
 				}
 			}
+			s.expireObservationsLocked()
 			s.save()
 			s.mu.Unlock()
 		}
@@ -897,24 +1330,39 @@ func (s *server) ttlSweeper(ctx context.Context) {
 
 func main() {
 	var (
-		dataDir  = flag.String("data", "./ctrl-data", "state directory (CA, certs, registry)")
-		listen   = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
+		dataDir = flag.String("data", "./ctrl-data", "state directory (CA, certs, registry)")
+		listen  = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
 		// 这两个地址只用于**公布给 agent**：reflector 由独立进程提供服务
 		// （controller/test/stun_reflector.py，真 RFC 5389）。控制器自己不监听 UDP。
 		udpAddr  = flag.String("udp", "0.0.0.0:3478", "advertised UDP reflector #1 address (served by stun_reflector.py)")
 		udpAddr2 = flag.String("udp2", "0.0.0.0:3479", "advertised UDP reflector #2 — a SECOND address is what makes symmetric-NAT detection possible")
 		hbSec    = flag.Int("hb", 5, "heartbeat interval advertised to agents")
 		extraSAN = flag.String("tls-san", "", "comma-separated extra SANs for the server certificate")
-		opcode   = flag.Uint("opcode-base", 51820, "tenant instruction-port base: POP=base+0, DELIVER=base+1 (doc 23)")
+		// The two dataplane function ports, pushed to every node at enrollment.
+		// Separate flags rather than one base: the plugin's VPN role (deliver into
+		// the tunnel) and transit role (verify, rewrite dst, pop a segment) are not
+		// an arithmetic pair, and the two codebases this project grew out of
+		// assigned base+0/base+1 to them in OPPOSITE orders. A node should not have
+		// to remember which convention it was born under to get its ports right.
+		vpnPort     = flag.Uint("vpn-port", 51820, "UDP port the dataplane delivers into the VPN (constraint: dst port = function key)")
+		transitPort = flag.Uint("transit-port", 51821, "UDP port the dataplane transits SR segments on")
 	)
 	flag.Parse()
 
-	if *opcode == 0 || *opcode > 65535-1 {
-		// base+1 is DELIVER, so base must leave room for it. Zero is excluded
-		// because a port of 0 means "any" to bind(2) and would silently become
-		// a random port -- the exact class of quiet mismatch this project keeps
-		// rooting out.
-		log.Fatalf("--opcode-base must be in 1..65534 (got %d)", *opcode)
+	checkPort := func(name string, p uint) uint16 {
+		// Zero is excluded because a port of 0 means "any" to bind(2) and would
+		// silently become a random port -- the exact class of quiet mismatch this
+		// project keeps rooting out.
+		if p == 0 || p > 65535 {
+			log.Fatalf("--%s must be in 1..65535 (got %d)", name, p)
+		}
+		return uint16(p)
+	}
+	vpn, transit := checkPort("vpn-port", *vpnPort), checkPort("transit-port", *transitPort)
+	if vpn == transit {
+		// They are the multiplexing key: equal values would make the two roles
+		// indistinguishable at the one place that distinguishes them.
+		log.Fatalf("--vpn-port and --transit-port must differ (both %d)", vpn)
 	}
 	if err := os.MkdirAll(*dataDir, 0700); err != nil {
 		log.Fatal(err)
@@ -941,16 +1389,19 @@ func main() {
 	}
 
 	s := &server{
-		state:      st,
-		store:      store,
-		subs:       map[int]*subscriber{},
-		hbSec:      *hbSec,
-		tlsAddrs:   []string{*listen},
-		udpAddrs:   []string{*udpAddr, *udpAddr2},
-		caCert:     ca,
-		caKey:      caKey,
-		dataDir:    *dataDir,
-		opcodeBase: uint16(*opcode),
+		state:       st,
+		store:       store,
+		subs:        map[int]*subscriber{},
+		hbSec:       *hbSec,
+		tlsAddrs:    []string{*listen},
+		udpAddrs:    []string{*udpAddr, *udpAddr2},
+		caCert:      ca,
+		caKey:       caKey,
+		dataDir:     *dataDir,
+		vpnPort:     vpn,
+		transitPort: transit,
+		obs:         map[string]observerView{},
+		pendingObs:  map[string]map[string]*pendingObs{},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -960,6 +1411,7 @@ func main() {
 	mux.HandleFunc("/v1/enroll", s.handleEnroll)
 	mux.HandleFunc("/v1/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/v1/mapping", s.handleMapping)
+	mux.HandleFunc("/v1/observe", s.handleObserve)
 	mux.HandleFunc("/v1/reach", s.handleReach)
 	mux.HandleFunc("/v1/registry", s.handleRegistry)
 	mux.HandleFunc("/v1/watch", s.handleWatch)

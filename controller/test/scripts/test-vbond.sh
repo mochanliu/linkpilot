@@ -17,6 +17,13 @@
 #   8. STUN：客户端解码出的映射 == reflector 自己记下的观测源（两个证人）
 #      固定源端口时映射端口即源端口；两个 reflector 给出同一端口 ⇒ 非对称 NAT 判定为 false
 #   9. 映射上报后，同租户对端在注册表和 watch 流里都能看到
+#  10. 数据面事实下发：vpn_port/transit_port 两个显式端口 + 租户 p-key 环（hmac_id/16 字节）；
+#      旧协议版本（v2）被明确拒绝，不是"接受了但字段没人看"
+#  11. WG 静态公钥的设备身份担保（keybinding）：控制器验签后存储并 relay 原文；
+#      签名正确但覆盖对象不对（拿别人的 tenant/node 签）必须被拒
+#  12. 观测回报 /v1/observe：按"我看到的源"归因到具体节点，逐读者渲染；
+#      陌生人地址不猜、落在非数据面端口的不算、node_id 冒充被拒、
+#      先观测到后申报地址的迟到归因、reset 让消失的源真的消失
 #
 # 用法：test-vbond.sh [--keep]     --keep：跑完保留 srwg-ctrl 容器与日志
 set -u
@@ -81,7 +88,10 @@ else
 fi
 BIN=$(dx "$CTRL" 'cd /workspace/controller && go build -o /tmp/sr-ctrl ./cmd/sr-ctrl && go build -o /tmp/sr-stunprobe ./cmd/sr-stunprobe && echo BIN_OK')
 [ "$BIN" = "BIN_OK" ] && ok "两个二进制产出（sr-ctrl / sr-stunprobe）" || { bad "二进制构建失败：$BIN"; exit 1; }
-dx "$N1" 'mkdir -p /opt/vbond' >/dev/null
+# 客户端状态目录必须每轮清空：srwg-node1 是常驻容器，上一轮的 dev*.bind.json /
+# *.key 会留在里面，而 mapping 会"有 bind.json 就带上"。上一轮的合法 binding
+# 混进本轮，就能把"这一轮伪造的 binding 没进注册表"验证成假阳性/假阴性。
+dx "$N1" 'rm -rf /opt/vbond && mkdir -p /opt/vbond' >/dev/null
 docker cp "$CTRL:/tmp/sr-stunprobe" "$TMP/sr-stunprobe" >/dev/null && \
 docker cp "$TMP/sr-stunprobe" "$N1:/opt/vbond/sr-stunprobe" >/dev/null
 docker cp "$CTRL_DIR/test/scripts/vbond-client.sh" "$N1:/opt/vbond-client.sh" >/dev/null
@@ -95,7 +105,8 @@ dxd "$CTRL" "python3 /workspace/controller/test/stun_reflector.py 3479 >/tmp/ref
 # 注意 --udp/--udp2 现在是"对外公布的地址"，控制器自己不再监听 UDP：
 # 公布 0.0.0.0 会让 agent 拿到一个没法用的地址，所以这里必须给真实 IP。
 dxd "$CTRL" "/tmp/sr-ctrl --data /tmp/ctrl-data --listen 0.0.0.0:8444 \
-    --udp $CTRL_IP:3478 --udp2 $CTRL_IP:3479 --hb 3 >/tmp/sr-ctrl.log 2>&1"
+    --udp $CTRL_IP:3478 --udp2 $CTRL_IP:3479 --hb 10 \
+    --vpn-port 51820 --transit-port 51821 >/tmp/sr-ctrl.log 2>&1"
 sleep 2
 
 if dx "$CTRL" 'pgrep -f stun_reflector >/dev/null && pgrep -f sr-ctrl >/dev/null && echo UP' | grep -q UP; then
@@ -127,8 +138,18 @@ echo "$E1" | grep -q "tenant=tenant-a node_id=1" && ok "claim-a 解析到 tenant
 CERT_OK=$(dx "$N1" 'openssl verify -CAfile /opt/vbond/ca.pem /opt/vbond/dev1.pem')
 echo "$CERT_OK" | grep -q "OK" && ok "设备证书能用 CA 验证通过（链到租户）" \
     || bad "证书链验证失败：$CERT_OK"
-echo "$E1" | grep -qE "root_key_len=32" && ok "响应带 16 字节租户密钥（hex 32）+ 反射器地址" \
-    || bad "root_key 长度不对：$(echo "$E1" | grep root_key_len)"
+echo "$E1" | grep -q "vpn_port=51820 transit_port=51821" \
+    && ok "两个数据面功能端口显式下发（不再有 base+1 那种隐含算术）" \
+    || bad "端口下发不对：$(echo "$E1" | grep vpn_port)"
+echo "$E1" | grep -qE "p_key hmac_id=1 key_hex_len=32" \
+    && ok "下发租户 p-key 环：hmac_id=1、16 字节（hex 32），形状就是 sr-wg key set 的入参" \
+    || bad "p-key 环不对：$(echo "$E1" | grep p_key)"
+echo "$E1" | grep -q "reflectors=" && ok "响应带反射器地址" || bad "响应里没有反射器地址"
+
+# 旧协议必须被拒，而不是"接受了但字段没人看"：v2 agent 不发端口也不发观测。
+E1V2=$(dx "$N1" 'VBOND_PROTVER=2 /opt/vbond-client.sh enroll devv2 claim-a CPE-001')
+echo "$E1V2" | grep -q "http=400" && ok "protocol_ver=2 被 400 明确拒绝（不静默兼容）" \
+    || bad "旧版本没被拒：$(echo "$E1V2" | head -1)"
 
 E1b=$(cli enroll dev1 claim-a CPE-001)
 if echo "$E1b" | grep -q "tenant=tenant-a node_id=1"; then
@@ -210,7 +231,7 @@ MAP="$N1_IP:41780"
 docker exec "$N1" /opt/vbond-client.sh watch dev1 6 > "$TMP/watch.txt" 2>&1 &
 WPID=$!
 sleep 1
-M=$(cli mapping dev2 "$MAP" 41780 "$CTRL_IP:3478")
+M=$(cli mapping dev2 "$MAP" 41780 "$CTRL_IP:3478" "10.99.2.2")
 echo "$M" | sed 's/^/    /'
 echo "$M" | grep -q '"ok":true' && ok "dev2 上报映射被接受" || bad "映射上报失败：$M"
 wait $WPID || true
@@ -223,6 +244,111 @@ echo "$W" | grep -q "update" && ok "watch 流收到 update 事件（映射变更
     || bad "watch 流没有 update 事件"
 echo "$W" | grep -q "snapshot" && ok "watch 建连即发 snapshot，无需额外的'发现对端'往返" \
     || bad "watch 没有 snapshot"
+
+# ==================================================================
+say "9. WG 静态公钥的设备身份担保（覆盖项 11）"
+# 用 dev2 的身份私钥签一个"声称 tenant-b / node 1"的 binding：签名本身是真的，
+# 覆盖的对象是假的。控制器如果只检查"有没有签名字段"就会收下，然后把它 relay 给
+# 对端 —— 这一条就是用来区分"验签"和"验了个格式"。
+cli bind dev2 tenant-b 1 1 >/dev/null || { bad "bind 失败（openssl pkeyutl -rawin 可用？）"; }
+FB=$(cli mapping dev2 "10.99.2.2:41780" 41780 "$CTRL_IP:3478" "10.99.2.2")
+echo "$FB" | sed 's/^/    /'
+echo "$FB" | grep -q '"binding_err":"[^"]' \
+    && ok "签名正确但对象不对（冒充 tenant-b/node1）→ 拒绝并报出原因" \
+    || bad "伪造的 binding 被接受了：$FB"
+# 控制器不能顺手清掉上一次的正确存储：dev2 此刻应当仍然没有可用 binding（第一次就是伪造）。
+R2a=$(cli registry dev2)
+echo "$R2a" | grep -A1 "node=2 " | grep -q "binding=无" \
+    && ok "被拒的 binding 没有进注册表（node2 仍是无担保状态）" \
+    || bad "被拒的 binding 出现在注册表里：$R2a"
+
+# 现在换成真身份：tenant-a / node 2。
+X2=$(cli bind dev2 | sed -n 's/.*x25519=\([^ ]*\).*/\1/p')
+MB=$(cli mapping dev2 "10.99.2.2:41780" 41780 "$CTRL_IP:3478" "10.99.2.2")
+echo "$MB" | grep -q '"binding_err":""' && ok "同租户同 node 的 binding 通过校验（binding_err 空）" \
+    || bad "正当 binding 被拒：$MB"
+# 先重新取一份注册表快照，再取文件：docker cp 拿到的是容器里上一轮的旧 JSON，
+# 拿它比对会得出"公钥没 relay"的假结论（本轮就差点被这个坑骗过去）。
+cli registry dev2 >/dev/null
+docker cp "$N1:/opt/vbond/dev2.reg.json" "$TMP/dev2.reg.json" >/dev/null
+RELAY=$(python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+for p in d["peers"]:
+    if p["node_id"] == 2:
+        b = p.get("key_binding") or {}
+        print(b.get("x25519_pub",""))' "$TMP/dev2.reg.json")
+[ -n "$X2" ] && [ "$RELAY" = "$X2" ] \
+    && ok "注册表 relay 的就是那把 X25519 公钥原文（逐字节一致，控制器没换钥匙）" \
+    || bad "relay 的公钥对不上：客户端=$X2 注册表=$RELAY"
+
+# ==================================================================
+say "10. 观测回报与归因（覆盖项 12）"
+# 归因只看"这个源地址被某个节点在认证信道上申报过"。这里用两个合成的 underlay
+# 地址（10.99.x.x）代表两台 CPE 的数据面地址 —— 本段证明的是控制器契约，
+# 数据面到控制器的搬运在 e2e（#13）里接。
+cli hb dev1 >/dev/null; cli hb dev2 >/dev/null          # 别让 30s TTL 把节点熬成 stale
+M1=$(cli mapping dev1 "$N1_IP:41781" 41781 "$CTRL_IP:3478" "10.99.1.1")
+echo "$M1" | grep -q '"ok":true' && ok "dev1 上报映射并申报自己的地址 10.99.1.1" || bad "dev1 映射上报失败：$M1"
+
+O1=$(cli observe dev2 0 "10.99.1.1:41781:51820:1")
+echo "$O1" | sed 's/^/    /'
+echo "$O1" | grep -q "accepted=1" && ok "观测回报被接收（accepted=1）" || bad "观测没被接受：$O1"
+echo "$O1" | grep -qE '10\.99\.1\.1:41781 +-> node 1 +unique' \
+    && ok "按申报地址唯一归因到 node 1（不是猜的：只有它声称过这个源）" \
+    || bad "归因结果不对：$O1"
+# 逐读者：dev2 看 dev1 有 seen，dev1 看 dev2 必须没有（dev1 从没观测过 dev2）。
+cli registry dev1 >/dev/null
+docker cp "$N1:/opt/vbond/dev1.reg.json" "$TMP/dev1.reg.json" >/dev/null
+R2=$(cli registry dev2)
+PEER2=$(python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((p.get("observed_mapping","") for p in d["peers"] if p["node_id"]==2), "X"))' "$TMP/dev1.reg.json")
+[ -z "$PEER2" ] && ok "dev1 的注册表里 dev2 没有 seen 值：观测按读者渲染，不是一份共享账本" \
+    || bad "观测跨读者泄漏：dev1 看到了 dev2 的 seen=$PEER2"
+echo "$R2" | grep -q "seen=10.99.1.1:41781" && ok "dev2 的注册表里 dev1 带上了我看到的源" \
+    || bad "对端注册表没有观测值：$R2"
+
+# 三个"不许答"的情形。
+O2=$(cli observe dev2 0 "198.51.100.9:5555:51820")
+echo "$O2" | grep -qE '198\.51\.100\.9:5555 +-> \?' \
+    && ok "陌生人地址（没人申报过）不认领，只挂账" || bad "陌生人地址被归因了：$O2"
+O3=$(cli observe dev2 0 "10.99.1.1:41781:443")
+echo "$O3" | grep -q "accepted=0" && ok "落在非数据面端口(443)的观测不作为隧道证据" \
+    || bad "外层目的端口没当角色键用：$O3"
+# 冒充：拿 dev1 的证书以 node 99 的身份回报观测。
+O403=$(dx "$N1" 'curl -sS -o /dev/null -w "%{http_code}" --cacert /opt/vbond/ca.pem \
+    --cert /opt/vbond/dev1.pem --key /opt/vbond/dev1.key -X POST https://ctrl:8444/v1/observe \
+    -d "{\"node_id\":99,\"reset\":false,\"observations\":[]}"')
+[ "$O403" = "403" ] && ok "node_id 与证书不符的观测回报被 403 拒绝" || bad "冒充 node99 回报观测：http=$O403"
+O401=$(dx "$N1" 'curl -sS -o /dev/null -w "%{http_code}" --cacert /opt/vbond/ca.pem \
+    -X POST https://ctrl:8444/v1/observe -d "{\"node_id\":1,\"observations\":[]}"')
+[ "$O401" = "401" ] && ok "无证书的观测回报被 401 拒绝" || bad "无证书回报观测：http=$O401"
+
+# 迟到归因：先看到一个源，事后才有主人申报地址 —— 两台 CPE 同时入网就是这个次序。
+E4=$(cli enroll dev4 claim-a CPE-004)
+N4=$(echo "$E4" | sed -n 's/.*node_id=\([0-9]*\).*/\1/p')
+O5=$(cli observe dev2 0 "10.99.4.4:41790:51820")
+echo "$O5" | grep -qE '10\.99\.4\.4:41790 +-> \?' && ok "dev4 还没申报地址时，它的源先挂账不认领" \
+    || bad "没有主人时就把地址认了：$O5"
+cli mapping dev4 "10.99.4.4:41790" 41790 "$CTRL_IP:3478" "10.99.4.4" >/dev/null
+cli registry dev2 >/dev/null
+docker cp "$N1:/opt/vbond/dev2.reg.json" "$TMP/dev2.reg2.json" >/dev/null
+LATE=$(python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((p.get("observed_mapping","") for p in d["peers"] if p["node_id"]==int(sys.argv[2])), ""))' \
+    "$TMP/dev2.reg2.json" "${N4:-0}")
+[ "$LATE" = "10.99.4.4:41790" ] \
+    && ok "dev4 事后申报地址后，挂账的观测被补归因（入网与回报谁先到都行）" \
+    || bad "迟到归因没生效：node$N4 observed=$LATE"
+
+# reset：清空后消失的源必须真的消失（否则控制器只会做加法，把死地址当活的发布）。
+O6=$(cli observe dev2 1)
+echo "$O6" | grep -q "accepted=0" && ok "reset=1 且空表：本轮以清空为准" || bad "reset 回报异常：$O6"
+R2c=$(cli registry dev2)
+echo "$R2c" | grep -q "seen=10.99.1.1" && bad "reset 之后旧观测还在" || ok "reset 之后旧观测确实被摘掉"
 
 # ==================================================================
 echo

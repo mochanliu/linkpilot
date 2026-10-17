@@ -1,12 +1,12 @@
 // Package keybinding attests a node's X25519 (key-agreement) public key with
 // the Ed25519 identity key inside its controller-issued certificate.
 //
-// The problem it solves. The controller is a MEDIATOR for the pairwise payload
-// key (O-key, doc 24 §5.1): it carries each node's key-agreement material to
-// the other side, and must never be able to substitute it. Without an
-// attestation, "the controller handed me B's X25519 public key" is an
-// unverifiable claim, and a controller that swaps in a key it owns sits in the
-// middle of every payload.
+// The problem it solves. The controller is a MEDIATOR for each node's
+// WireGuard STATIC public key: it carries that key-agreement material to the
+// other side, where the peer installs it verbatim as a wireguard peer, and it
+// must never be able to substitute it. Without an attestation, "the controller
+// handed me B's X25519 public key" is an unverifiable claim, and a controller
+// that swaps in a key it owns sits in the middle of every payload.
 //
 // With the attestation the key material is ATTRIBUTABLE: verifying a binding
 // proves that the named device signed this exact public key, and only that
