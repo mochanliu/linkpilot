@@ -6,41 +6,54 @@
  * WireGuard 插件导出的符号全部是 hidden（无法 dlsym 直接调用），因此
  * SR-WG 与 WG 的集成只能通过 VPP 的 feature arc / graph node 串联完成。
  *
- * 实测（VPP 26.06-release，`show features` / `show interface features wg0`）：
- *   - 不存在名为 "ip4-output" 的 graph node，只存在同名的 feature **arc**；
- *   - 该 arc 的 start_nodes 是 ip4-midchain / ip4-mcast-midchain，
- *     arc 末尾是 adj-midchain-tx（负责父邻接的 L2 rewrite）；
- *   - WireGuard 插件自己把 "wg4-output-tun" 注册为该 arc 上的 feature，
- *     并在每个 wg 接口上启用：
- *         ip4-output:
- *           wg4-output-tun
+ * 实测（VPP 26.06-release）结论：**wg4-output-tun 不参与 feature 链**。
+ *   - `show interface features wg0` 显示 ip4-output: wg4-output-tun,
+ *     sr-wg4-encap —— arc 顺序是对的，feature 也确实注册成了 wg4-output-tun
+ *     的 next-index 5；
+ *   - 但 `show node wg4-output-tun` 显示 adj-midchain-tx=54 vectors、
+ *     sr-wg4-encap=0 vectors。原因在 wireguard_output_tun.c 里
+ *     `next_out0 = WG_OUTPUT_NEXT_INTERFACE_OUTPUT` 被硬编码为
+ *     adj-midchain-tx，且整个文件 0 次调用 vnet_feature_next()。
+ *     所以挂在 wg0 的 ip4-output arc 上是结构性死挂点，加密后的包永远
+ *     不会经过我们（这不是配置问题，改配置无解）。
  *
- * 所以 sr-wg4-encap 的正确挂点是同一个 arc、同一个（wg）接口，且必须
- * runs_after wg4-output-tun。完整数据流：
+ * 可用的挂点是 **underlay 出口接口**（本例 host-eth0）的同名 arc：
+ * libvnet 在 ip4_forward.c 把 "ip4-output" arc 声明为
+ *     .start_nodes = VNET_FEATURES ("ip4-rewrite", "ip4-midchain", "ip4-dvr-dpo")
+ *     .last_in_arc = "interface-output"
+ * 即 ip4-rewrite 也是该 arc 的起点。WG 加密后的外层包必然走：
  *
- *   内网包 → ip4-lookup → FIB(vpn route) → ip4-midchain(tx=wg0, features)
+ *   内网包 → ip4-lookup(vpn route) → ip4-midchain(tx=wg0)
  *          → wg4-output-tun（WG 加密 + 外层 IP4/UDP/WG-transport）
- *          → sr-wg4-encap（插入 SR Header + 改写外层 dst 为第一跳）
+ *          → adj-midchain-tx → ip4-load-balance → ip4-rewrite（外层 L2）
+ *          → sr-wg4-encap（插 SR Header + 改写外层 dst 为第一跳）   ← 挂点
  *          → ip4-lookup（外层重新查表，得到第一跳对应的父邻接）
  *          → ip4-rewrite → interface-output → 物理网卡
  *
- * 未绑定 SR 路径时 sr-wg4-encap 用 vnet_feature_next() 直通，包继续沿
- * arc 走 adj-midchain-tx → ip4-rewrite，WG 直连模式完全不受影响。
+ * 已由 `set sr-wg encap enable <underlay>` 实测验证：4 个 overlay ping
+ * 精确产生 4 vectors 进入 sr-wg4-encap，arc 直通路径（bypass）不破坏原包。
+ *
+ * 未绑定 SR 路径时 sr-wg4-encap 用 vnet_feature_next() 直通，包继续沿 arc
+ * 走 interface-output → 网卡，WG 直连模式完全不受影响。
  *
  * ==================== 节点处的缓冲区布局 ====================
  *
- * 由于 arc 起点 ip4-midchain 传下来的是纯 L3 包（L2 rewrite 由 arc 末尾
- * 的 adj-midchain-tx 负责），在 sr-wg4-encap 处 vlib_buffer_get_current(b)
- * 指向 **外层 IP4 头**，其后紧跟 UDP 头和 WG transport header：
+ * 挂点在 ip4-rewrite **之后**，L2 头已经写好，所以 vlib_buffer_get_current(b)
+ * 指向以太网头：
  *
- *   current → [ outer IP4 | outer UDP | WG transport hdr | 加密载荷 ]
+ *   current → [ ETH | outer IP4 | outer UDP | WG transport hdr | 加密载荷 ]
  *
- * 目标线格式（SR Header 插在 UDP 头与 WG 载荷之间）：
+ * 目标线格式（SR Header 插在 UDP 头与 WG 载荷之间），且交给 ip4-lookup 的
+ * 必须是纯 L3 包：
  *
  *   current → [ outer IP4 | outer UDP | SR Header | WG transport hdr | 载荷 ]
  *
- * 因此只需把 current 前移 sr_len 字节，再把原来的 outer_len(=ip4_len+8)
- * 字节整体前移，腾出的空间写入 SR Header；WG 载荷原地不动。
+ * 因此三步走，且**全部放在"决定封装"之后**（bypass 分支绝不改包）：
+ *   1) advance(+l2_len)  —— 剥掉 L2，current 落到外层 IP4 头
+ *   2) advance(-sr_len)  —— 抢 headroom，[IP][UDP] 逻辑位置后移 sr_len
+ *   3) memmove(p, p+sr_len, ip4_len+8) —— 把 [IP][UDP] 拉回包首，
+ *      腾出的 [ip4_len+8, ip4_len+8+sr_len) 正好落在 WG transport 头之前，
+ *      WG 载荷一个字节都不用动。
  *
  * ==================== 段列表 / seg_left 语义 ====================
  *
@@ -68,6 +81,7 @@
 
 #include <vnet/udp/udp_packet.h>
 #include <vnet/ip/format.h>
+#include <vnet/ethernet/packet.h>
 
 /* ==================== Trace 定义 ==================== */
 
@@ -78,10 +92,11 @@ typedef struct {
   u8  seg_count;
   u8  seg_left;
   u16 sr_len;
+  u8  l2_len;              /* 入口时嗅到的 L2 头长度（0=无 L2） */
   ip4_address_t orig_dst;      /* 原外层 dst（WG peer endpoint） */
   ip4_address_t first_hop_ip;  /* 改写后的外层 dst */
   u16 first_hop_port;
-  i16 current_data;            /* 用于观测 headroom 余量 */
+  i16 current_data;            /* 封装后 current_data，用于观测 headroom */
   u8  error;
   u8  bypass;
 } sr_wg4_encap_trace_t;
@@ -100,9 +115,9 @@ format_sr_wg4_encap_trace (u8 *s, va_list *args)
                 t->error, t->next_index);
   else
     s = format (s, "SR-WG-ENCAP: path_id=%u seg_count=%u seg_left=%u "
-                   "sr_len=%u orig_dst=%U -> first_hop=%U:%u "
+                   "sr_len=%u l2_len=%u orig_dst=%U -> first_hop=%U:%u "
                    "cd=%d err=%u next=%u",
-                t->path_id, t->seg_count, t->seg_left, t->sr_len,
+                t->path_id, t->seg_count, t->seg_left, t->sr_len, t->l2_len,
                 format_ip4_address, &t->orig_dst,
                 format_ip4_address, &t->first_hop_ip, t->first_hop_port,
                 t->current_data, t->error, t->next_index);
@@ -151,6 +166,8 @@ VLIB_REGISTER_NODE (sr_wg4_encap_node) = {
   .vector_size = sizeof (u32),
   .format_trace = format_sr_wg4_encap_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
+  /* 打开 per-node trace，`trace add sr-wg4-encap 10` 才可用（排障全靠它） */
+  .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
   .n_errors = SR_WG4_ENCAP_N_ERROR,
   .error_strings = sr_wg4_encap_error_strings,
   .n_next_nodes = SR_WG4_ENCAP_N_NEXT,
@@ -161,18 +178,19 @@ VLIB_REGISTER_NODE (sr_wg4_encap_node) = {
 };
 
 /*
- * 注册为 "ip4-output" arc 上的 feature，排在 wg4-output-tun 之后。
+ * 注册为 "ip4-output" arc 上的 feature，显式排在 arc 终点 interface-output
+ * 之前（与 ipsec4-output-feature 的写法一致）。挂点在 underlay 接口上，
+ * 所以这里排在 wg4-output-tun 之后毫无意义（WG 根本不参与 arc 链），
+ * 用 runs_before interface-output 才表达真实意图：包在离开本机前最后
+ * 一次可改写外层的机会。
  *
  * 不要在这里声明 VNET_FEATURE_ARC_INIT —— "ip4-output" arc 已由 libvnet
  * 注册，重复注册会在 vnet_feature_arc_init() 报 duplicate arc。
- *
- * 若 wireguard 插件未加载（"wg4-output-tun" 未注册为 feature），
- * runs_after 约束不会匹配到任何对象，排序时被忽略，不会报错。
  */
 VNET_FEATURE_INIT (sr_wg4_encap_feat, static) = {
   .arc_name = SR_WG_ENCAP_ARC,
   .node_name = SR_WG_ENCAP_NODE,
-  .runs_after = VNET_FEATURES ("wg4-output-tun"),
+  .runs_before = VNET_FEATURES ("interface-output"),
 };
 
 /* ==================== Node Function ==================== */
@@ -201,6 +219,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       ip4_header_t *ip4;
       udp_header_t *udp;
       u8 *payload;
+      u8 *cur;
       sr_wg_tunnel_bind_t *bind;
       sr_path_config_t *path = NULL;
       sr_segment_t *first_hop;
@@ -214,7 +233,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       u8 *p;
       u32 tx_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_TX];
       u32 next_index = SR_WG4_ENCAP_NEXT_DROP;
-      u32 ip4_len = 0, outer_len = 0, sr_len = 0;
+      u32 ip4_len = 0, outer_len = 0, sr_len = 0, l2_len = 0;
       u16 path_id = 0;
       u8 seg_count = 0, seg_left = 0;
       u8 error = SR_WG4_ENCAP_ERROR_NONE;
@@ -223,14 +242,36 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       clib_memset (&orig_dst, 0, sizeof (orig_dst));
       clib_memset (&srh, 0, sizeof (srh));
 
-      ip4 = (ip4_header_t *) vlib_buffer_get_current (b);
+      cur = vlib_buffer_get_current (b);
 
-      /* Step 1: 长度下限——至少要能放下 outer IP4 + UDP + 1 字节载荷 */
+      /* Step 1: 长度下限——至少要能放下外层 IP4 + UDP + 1 字节载荷，
+       * 也保证下面嗅探 ethertype / 版本 nibble 不会读越界 */
       if (PREDICT_FALSE (b->current_length <
                          sizeof (ip4_header_t) + sizeof (udp_header_t) + 1))
         goto done;
 
-      /* Step 2: 外层必须是 IPv4 + UDP（WG 隧道包） */
+      /*
+       * Step 2: 挂点在 ip4-rewrite 之后，L2 头已经写好，所以 current 指向
+       * 以太网头。判据用「ethertype==0x0800 且紧随其后的版本 nibble==4」，
+       * 单嗅一个字节会被 MAC 首字节撞出假阳性。判据不成立时退回按
+       * 「无 L2」解析（万一 arc 挂点或 underlay 形态变了仍可用）。
+       * 带 VLAN tag(0x8100) 的 underlay 不在 v1 范围内：会走"无 L2"分支、
+       * 版本 nibble 检查失败、安全 bypass。
+       */
+      if (clib_net_to_host_u16 (((ethernet_header_t *) cur)->type) ==
+          ETHERNET_TYPE_IP4 &&
+          (((ip4_header_t *) (cur +
+                sizeof (ethernet_header_t)))->ip_version_and_header_length >>
+           4) == 4)
+        l2_len = sizeof (ethernet_header_t);
+
+      ip4 = (ip4_header_t *) (cur + l2_len);
+
+      /* 外层必须是 IPv4 */
+      if (PREDICT_FALSE ((ip4->ip_version_and_header_length >> 4) != 4))
+        goto done;
+
+      /* 外层必须是 UDP（WG 隧道包） */
       if (PREDICT_FALSE (ip4->protocol != IP_PROTOCOL_UDP))
         goto done;
 
@@ -240,7 +281,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (PREDICT_FALSE (ip4_len < sizeof (ip4_header_t)))
         goto done;
       outer_len = ip4_len + sizeof (udp_header_t);
-      if (PREDICT_FALSE (b->current_length < outer_len + 1))
+      if (PREDICT_FALSE (b->current_length < l2_len + outer_len + 1))
         goto done;
 
       udp = (udp_header_t *) ((u8 *) ip4 + ip4_len);
@@ -249,8 +290,9 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       /*
        * Step 3: 环路守卫。载荷首字节已是 SR_MAGIC 说明本包已经封装过
-       * SR Header（例如误把 feature 同时启用在 underlay 物理接口上），
-       * 直接直通，避免二次封装。
+       * SR Header。本节点改写外层 dst 后会交回 ip4-lookup，重查表的包
+       * 会**第二次**经过本节点（同一张 underlay 网卡），这条判据 + Step 4
+       * 的端口判据一起保证第二次只走直通，不会二次封装。
        * 该判据安全：WG transport header 首字节是消息类型（1/2/3/4），
        * 永不等于 0x53。
        */
@@ -259,15 +301,17 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       /*
        * Step 4: 只处理 WG VPN 流量。SR-WG 约定 peer 端口固定为 51820
-       * （SR_PORT_VPN），非该端口的包直通。
+       * （SR_PORT_VPN），非该端口的包直通。封装后端口改成 51821，
+       * 所以这一条同时也是"第二次经过本节点时直通"的第二重保险。
        */
       if (PREDICT_FALSE (udp->dst_port != vpn_port_net))
         goto done;
 
-      /* Step 5: 查绑定（sw_if_index 优先，外层 dst IP 回退）。
-       * 注意 ip4-output arc 上的 sw_if_index[VLIB_TX] 对隔道而言可能
-       * 是父接口而不是 wg0，故绑定时建议同时下发 endpoint，让
-       * endpoint_path 回退索引兼底。 */
+      /* Step 5: 查绑定（外层 dst IP 优先，sw_if_index 兜底）。
+       * 挂点在 underlay 接口，tx_sw_if_index 是物理/宿主接口而不是 wg0，
+       * 所以实际生效的是 endpoint_path（外层 dst = WG peer endpoint）。
+       * 绑定时必须下发 endpoint，否则本步查不到 → 静默直通 → 流量绕过
+       * SR 路径直发 peer。`show sr-wg tunnels` 会把这种配错显式标出来。 */
       bind = sr_wg_bind_lookup (sm, tx_sw_if_index, orig_dst);
       if (PREDICT_FALSE (bind == NULL))
         goto done;   /* 未绑定 → 普通 WG 隧道，直通 */
@@ -307,11 +351,12 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
        * Step 9: headroom 守卫。
        * vlib_buffer_get_current() = b->data + b->current_data，
        * 可用 headroom = b->current_data + VLIB_BUFFER_PRE_DATA_SIZE。
-       * wg4-output-tun 已消耗 44B（IP4+UDP+WG transport）rewrite 空间，
-       * 26.06 的 VLIB_BUFFER_PRE_DATA_SIZE = 128，剩余约 84B，
-       * 足以容纳最大 SR Header（72B），但仍需运行时校验。
+       * 此处 current 仍指向 L2 头，Step 10 会先剥掉 l2_len 再抢 sr_len，
+       * 所以 l2_len 要计入可用余量。26.06 的 VLIB_BUFFER_PRE_DATA_SIZE=128，
+       * ip4-rewrite 掉 14B 后仍余 >100B，容得下最大 SR Header（72B），
+       * 但外层带 IP options 时余量会变，故保留运行时校验。
        */
-      if (PREDICT_FALSE ((i32) b->current_data +
+      if (PREDICT_FALSE ((i32) b->current_data + (i32) l2_len +
                            (i32) VLIB_BUFFER_PRE_DATA_SIZE <
                          (i32) sr_len))
         {
@@ -322,7 +367,13 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           goto done;
         }
 
-      /* Step 10: 腾出 SR Header 空间，并把外层 IP4/UDP 整体前移 */
+      /*
+       * Step 10: 剥 L2 → 抢 headroom → 把外层 IP4/UDP 拉回包首。
+       * 顺序不能颠倒：先剥 L2 才有 l2_len 字节的余量给 sr_len，
+       * 且交给 ip4-lookup 的包必须是纯 L3。
+       */
+      if (l2_len)
+        vlib_buffer_advance (b, (int) l2_len);
       vlib_buffer_advance (b, -(int) sr_len);
       p = (u8 *) vlib_buffer_get_current (b);
       clib_memmove (p, p + sr_len, outer_len);
@@ -353,9 +404,27 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       udp->checksum = 0;
       ip4->checksum = ip4_header_checksum (ip4);
 
-      /* Step 15: 外层 dst 已变，必须重新查 FIB 才能拿到第一跳对应的
-       * 父邻接 L2 rewrite（arc 默认的 adj-midchain-tx 用的是原 peer
-       * endpoint 的父邻接，其 dst MAC 与第一跳不匹配）。 */
+      /*
+       * Step 15: 交回 ip4-lookup 重新查表。
+       *
+       * ip4-lookup 的入参约定（vnet/ip/ip4_forward.c 的 @node ip4-lookup 文档）
+       * 是 **复用 sw_if_index[VLIB_TX] 当 FIB index**：
+       *   - 该字段 == ~0    → 在"收包接口所挂的 FIB"里做 LPM；
+       *   - 该字段 != ~0    → 直接把它当作 FIB index（0/1/2…），不是接口索引。
+       * 进到本节点时，VLIB_TX 已被 ip4-rewrite/adj-midchain-tx 写成 underlay
+       * 出口**接口索引**（本实验里是 1），若不覆盖就会被当成"FIB 1"去 LPM，
+       * 查不到 10.10.1.3 → Drop 邻接 → error-drop。这正是之前黑洞的根因，
+       * 也是"改了 fib_index 却仍然丢包"的原因：本版本 ip4-lookup 读的是
+       * VLIB_TX，不是 ip.fib_index。
+       *
+       * 因此这里显式把 VLIB_TX 写成 encap_fib_index，让 `set sr-wg encap
+       * fib-index <n>` 真正生效；adj_index[VLIB_TX] 是本节点进入前留下的
+       * 旧父邻接，一并清掉，避免下游（trace/错误路径）读到过期邻接。
+       * ip4-lookup 会用查表结果重写这两个字段，ip4-rewrite 随后把 VLIB_TX
+       * 覆盖成真正的出口接口索引，interface-output 拿到的是正确值。
+       */
+      vnet_buffer (b)->sw_if_index[VLIB_TX] = fib_index;
+      vnet_buffer (b)->ip.adj_index[VLIB_TX] = ~0;
       vnet_buffer (b)->ip.fib_index = fib_index;
       next_index = SR_WG4_ENCAP_NEXT_IP4_LOOKUP;
       bypass = 0;
@@ -382,6 +451,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           tr->seg_count = seg_count;
           tr->seg_left = seg_left;
           tr->sr_len = (u16) sr_len;
+          tr->l2_len = (u8) l2_len;
           tr->orig_dst = orig_dst;
           tr->current_data = b->current_data;
           tr->error = error;
@@ -418,6 +488,8 @@ sr_wg_encap_init (sr_wg_main_t *sm)
     sm->tunnel_path = hash_create (0, sizeof (uword));
   if (!sm->endpoint_path)
     sm->endpoint_path = hash_create (0, sizeof (uword));
+  if (!sm->encap_enabled_ifs)
+    sm->encap_enabled_ifs = hash_create (0, sizeof (uword));
   if (!sm->binds)
     pool_alloc (sm->binds, 64);
 }
@@ -427,12 +499,18 @@ sr_wg_bind_lookup (sr_wg_main_t *sm, u32 sw_if_index, ip4_address_t dst)
 {
   uword *p;
 
-  p = hash_get (sm->tunnel_path, (uword) sw_if_index);
+  /*
+   * 先查 endpoint（外层 dst = WG peer），再查 sw_if_index。
+   * 挂点在 underlay 接口，sw_if_index 命中的只能是"整张 underlay 网卡
+   * 一条默认路径"这种粗粒度配法，所以更具体的 endpoint 必须优先，
+   * 否则一张 underlay 网卡上的所有 WG 隧道会被默认路径全部接管。
+   */
+  p = hash_get (sm->endpoint_path,
+                (uword) clib_net_to_host_u32 (dst.as_u32));
   if (p && p[0] != 0)
     return pool_elt_at_index (sm->binds, p[0] - 1);
 
-  p = hash_get (sm->endpoint_path,
-                (uword) clib_net_to_host_u32 (dst.as_u32));
+  p = hash_get (sm->tunnel_path, (uword) sw_if_index);
   if (p && p[0] != 0)
     return pool_elt_at_index (sm->binds, p[0] - 1);
 
@@ -465,7 +543,6 @@ sr_wg_tunnel_set_path (sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
   sr_wg_tunnel_bind_t *bind;
   uword *p;
   u32 bi;
-  int rv;
 
   sr_wg_encap_init (sm);
 
@@ -482,12 +559,13 @@ sr_wg_tunnel_set_path (sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
       bi = p[0] - 1;
       bind = pool_elt_at_index (sm->binds, bi);
 
-      /* 先关掉 feature，再摘表项，避免数据面看到悬空绑定 */
-      sr_wg_encap_enable_disable (sm, sw_if_index, 0);
-
       sr_wg_bind_unset_endpoint (sm, bind->endpoint);
       hash_unset (sm->tunnel_path, (uword) sw_if_index);
       pool_put_index (sm->binds, bi);
+      /*
+       * 不动 feature：underlay 接口上的 sr-wg4-encap 是全局开关，可能还有
+       * 别的绑定依赖它；没绑定时节点本身走 bypass，不改变任何包。
+       */
       return 0;
     }
 
@@ -517,12 +595,6 @@ sr_wg_tunnel_set_path (sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
     bind->endpoint = *endpoint;
   sr_wg_bind_set_endpoint (sm, bind, bi);
 
-  /* 绑定时自动在 ip4-output arc 上启用 sr-wg4-encap（与 wg4-output-tun
-   * 同接口同 arc）。也可用 `set sr-wg encap <sw_if_index> disable` 单独关闭。 */
-  rv = sr_wg_encap_enable_disable (sm, sw_if_index, 1);
-  if (rv != 0)
-    return rv;
-
   return 0;
 }
 
@@ -530,7 +602,6 @@ int
 sr_wg_encap_enable_disable (sr_wg_main_t *sm, u32 sw_if_index, int enable)
 {
   vnet_main_t *vnm = vnet_get_main ();
-  uword *p;
   int rv;
 
   sr_wg_encap_init (sm);
@@ -543,9 +614,24 @@ sr_wg_encap_enable_disable (sr_wg_main_t *sm, u32 sw_if_index, int enable)
   if (rv != 0)
     return rv;
 
-  p = hash_get (sm->tunnel_path, (uword) sw_if_index);
-  if (p && p[0] != 0)
-    pool_elt_at_index (sm->binds, p[0] - 1)->feature_on = enable ? 1 : 0;
+  if (enable)
+    {
+      if (!hash_get (sm->encap_enabled_ifs, (uword) sw_if_index))
+        sm->encap_enabled_count++;
+      hash_set (sm->encap_enabled_ifs, (uword) sw_if_index, 1);
+    }
+  else
+    {
+      if (hash_get (sm->encap_enabled_ifs, (uword) sw_if_index))
+        sm->encap_enabled_count--;
+      hash_unset (sm->encap_enabled_ifs, (uword) sw_if_index);
+    }
 
   return 0;
+}
+
+int
+sr_wg_encap_is_enabled (sr_wg_main_t *sm, u32 sw_if_index)
+{
+  return hash_get (sm->encap_enabled_ifs, (uword) sw_if_index) != 0;
 }

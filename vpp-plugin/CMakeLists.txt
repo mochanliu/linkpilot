@@ -15,8 +15,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # 查找 VPP 构建基础设施
 find_package(VPP REQUIRED)
 
-# OpenSSL (用于 HMAC-SHA256)
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+# 签名算法为内置 SipHash-2-4，不依赖 OpenSSL
 
 ##############################################################################
 # 输出目录
@@ -43,6 +42,7 @@ set(SR_WG_PLUGIN_SOURCES
   sr_wg_api.c
   sr_wg_cli.c
   sr_hmac.c
+  sr_siphash.c
   sr_path.c
 )
 
@@ -62,9 +62,8 @@ add_vpp_plugin(sr_wg
   INSTALL_HEADERS
     sr_header.h
     sr_hmac.h
+    sr_siphash.h
     sr_path.h
     sr_counters.h
     sr_wg.h
-  LINK_LIBRARIES
-    OpenSSL::Crypto
 )

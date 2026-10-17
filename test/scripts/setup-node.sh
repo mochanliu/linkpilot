@@ -16,6 +16,7 @@
 #     peer <peer_pubkey>    添加 WG peer + 配置 SR path + 绑定隧道 + 启用 encap
 #     transit [local-ip]    启用 SR transit（transit 角色专用）
 #     stats                 以 key=value 形式打印 SR-WG 计数器（供宿主机断言）
+#     clear-stats           清零 SR-WG 计数器
 #     dump                  打印排障信息
 #
 # 拓扑（与 test/docker/docker-compose.yml 一致）:
@@ -32,6 +33,46 @@
 #   encap  -> 外层 dst 改写为 10.10.1.3:51821，seg_left = seg_count-1 = 1
 #   transit-> next_hop = segments[0] = 10.10.2.2:51820，seg_left 1 -> 0
 #   node2  -> sr-wg4-input 见 seg_left==0，剥 SR 头后交给 wg4-input 解密
+#
+# ==================== 手工等价配置（想自己敲 vppctl 复现时照抄） ====================
+# 前提：容器已由 test/docker/docker-compose.yml 起好，VPP 由
+# test/docker/start-node.sh 起好（VPP 没有 PTY 会静默退出，别直接 nohup vpp）。
+# underlay 口交给 VPP 时必须「先建 VIF+配 IP+同步 MAC，再摘掉内核上的同一个 IP」，
+# 否则内核和 VPP 都收包，内核会抢答 ARP 并回 ICMP port-unreachable。
+#
+#   # ---- underlay（node1 为例；transit 两口、node2 同理换地址） ----
+#   ip addr add 10.10.1.2/24 dev eth1                  # 若内核上已被摘掉
+#   vppctl create host-interface name eth1
+#   vppctl set interface mac address host-eth1 $(ip link show eth1 | awk '/link\/ether/{print $2}')
+#   vppctl set interface state host-eth1 up
+#   vppctl set interface ip address host-eth1 10.10.1.2/24
+#   ip addr del 10.10.1.2/24 dev eth1
+#
+#   # ---- 三台都要：下发 SR 路径密钥（P-Key） ----
+#   vppctl sr-wg key set 1 00112233445566778899aabbccddeeff
+#
+#   # ---- node1：encap 侧 ----
+#   vppctl ip route add 10.10.2.0/24 via 10.10.1.3
+#   vppctl wireguard create listen-port 51820 generate-key src 10.10.1.2
+#   vppctl set interface ip address wg0 192.168.99.1/24
+#   vppctl set interface state wg0 up
+#   vppctl set sr-wg rebind-ports        # 必须在 wg-create 之后：建 WG 接口会
+#                                        # 把 51820 重新注册给 wg4-input
+#   vppctl wireguard peer add wg0 public-key <node2_pub> endpoint 10.10.2.2 \
+#          allowed-ip 192.168.99.2/32 dst-port 51820 persistent-keepalive 5
+#   vppctl ip route add 192.168.99.2/32 via wg0        # WG 不会自动下发路由
+#   vppctl sr-wg path add 1 via 10.10.2.2:51820 via 10.10.1.3:51821 hmac-id 1
+#   vppctl set sr-wg tunnel 2 path 1 endpoint 10.10.2.2   # 2 = wg0 的 sw_if_index
+#   vppctl set sr-wg encap enable 1                         # 1 = host-eth1
+#   vppctl ping 192.168.99.2 source wg0 repeat 5            # 期望 0% loss；首轮可能全丢（握手要跑满一个 keepalive 周期）
+#   vppctl show sr-wg stats ; vppctl show wireguard peer    # peer flags:2 = ESTABLISHED
+#
+#   # ---- transit：只转发不解密 ----
+#   host-eth1 10.10.1.3/24 + host-eth2 10.10.2.3/24，两口 up
+#   vppctl set sr-wg transit enable port 51821
+#
+#   # ---- node2：不配 path/tunnel/encap，用来验证 WG 直连旁路 ----
+#   同 node1 的 underlay + wg-create + peer，收到 SR 包由 sr-wg4-input 剥头交给 wg4-input。
 set -u
 
 ROLE=${1:-}
@@ -39,7 +80,10 @@ CMD=${2:-}
 shift 2 2>/dev/null || true
 
 [ -n "${ROLE}" ] && [ -n "${CMD}" ] || {
-    sed -n '2,32p' "$0"
+    # 打印到「手工等价配置」小节之前的用法+拓扑说明，行号变化无需再改这里
+    awk 'NR > 1 { if ($0 ~ /^# =+ 手工等价配置/) exit; print }' "$0"
+    echo
+    echo "手工复现（自己敲 vppctl）的完整命令序列见本文件头部「手工等价配置」一节。"
     exit 2
 }
 
@@ -89,13 +133,36 @@ ifname_for_ip() {
         awk -v want="$1" '{split($4,a,"/"); if (a[1]==want) {print $2; exit}}'
 }
 
+# ensure_host_interface 会把 underlay IP 从内核摘掉，于是下一轮重跑时
+# ifname_for_ip 再也找不到这块网卡 —— `--keep` 之后重复跑 e2e 会直接死在
+# "no kernel interface holds 10.10.1.2"。把 IP->网卡 记在容器内 /tmp：它的
+# 生命周期恰好等于"内核 IP 已被摘走"的周期（容器重建会带回内核 IP）。
+UNDERLAY_STATE=${UNDERLAY_STATE:-/tmp/srwg-underlay.state}
+
+underlay_hint() {   # $1=want_ip -> 打印上次记录的内核网卡名（无记录则空）
+    [ -f "${UNDERLAY_STATE}" ] &&
+        awk -v w="$1" '$1==w {print $2; exit}' "${UNDERLAY_STATE}"
+}
+
+underlay_record() { # $1=want_ip $2=ifname $3=pfx
+    grep -q "^$1 " "${UNDERLAY_STATE}" 2>/dev/null ||
+        printf '%s %s %s\n' "$1" "$2" "$3" >> "${UNDERLAY_STATE}"
+}
+
 # 幂等地把宿主网卡交给 VPP 并配好 IP，回显 VPP 接口名
 # 注意：vppctl show interface <name> 即使接口不存在也返回 exit 0，
 #       必须 grep 输出内容来判断接口是否存在。
 ensure_host_interface() {
     local want_ip=$1 pfx=$2 hif vif kmac
     hif=$(ifname_for_ip "${want_ip}")
-    [ -n "${hif}" ] || die "no kernel interface holds ${want_ip}"
+    if [ -z "${hif}" ]; then
+        hif=$(underlay_hint "${want_ip}")
+        [ -n "${hif}" ] ||
+            die "no kernel interface holds ${want_ip} (且 ${UNDERLAY_STATE} 无记录)"
+        ip addr add "${want_ip}/${pfx}" dev "${hif}" 2>/dev/null ||
+            die "cannot restore ${want_ip}/${pfx} on ${hif}"
+        log "restored ${want_ip}/${pfx} on ${hif} (上一轮已摘)"
+    fi
     vif="host-${hif}"
     if ! vppctl show interface 2>/dev/null | grep -q "${vif}"; then
         vppctl create host-interface name "${hif}" >/dev/null ||
@@ -115,12 +182,23 @@ ensure_host_interface() {
     # 删除内核上同一 IP，避免内核抢先响应 ARP 和发送 ICMP port-unreachable
     # （AF_PACKET 会让内核和 VPP 同时收到包，内核无对应 socket 时会回 ICMP 错误）
     ip addr del "${want_ip}/${pfx}" dev "${hif}" 2>/dev/null || true
+    underlay_record "${want_ip}" "${hif}" "${pfx}"
     echo "${vif}"
 }
 
 sw_if_index_of() {
     vppctl show interface "$1" 2>/dev/null |
         awk -v n="$1" '$1==n {print $2; exit}'
+}
+
+# 按 VPP 侧配置的 IPv4 反查接口名。
+# 不能用宿主的 `ip addr` —— cmd_init 已把 underlay IP 从内核摘掉（避免内核
+# 抢答 ARP），此时只有 VPP 知道这个地址挂在哪张口上。
+vpp_ifname_for_ip() {
+    vppctl show interface addr 2>/dev/null |
+        awk -v want="$1" '
+            /:[[:space:]]*$/      { n=$1; next }
+            index($0, "L3 "want"/") { print n; exit }'
 }
 
 wg_public_key() {
@@ -130,7 +208,10 @@ wg_public_key() {
 }
 
 srwg_stat() {   # $1 = <section>_<name>，例如 Encap_ok
-    vppctl show sr-wg stats 2>/dev/null | awk -v want="$1" '
+    # vppctl 输出行尾是 \r\n。不脱掉 \r 的话 $1 会是 "Encap:\r"，下面的
+    # sub(/:$/,"") 匹配不上，每个计数都会被当成 0 —— 断言全部假阴性，
+    # 而"期望为 0"的断言还会假阳性通过。
+    vppctl show sr-wg stats 2>/dev/null | tr -d '\r' | awk -v want="$1" '
         /^  [A-Za-z]+:/ { sec=$1; sub(/:$/,"",sec); next }
         /^    [a-z_]+:/ { nm=$1; sub(/:$/,"",nm);
                           if (sec"_"nm == want) { print $2; found=1 } }
@@ -139,25 +220,34 @@ srwg_stat() {   # $1 = <section>_<name>，例如 Encap_ok
 
 # ==================== 命令实现 ====================
 
+# die/exit 在命令替换的子 shell 里只能杀掉子 shell，父进程只会拿到空串，
+# 所以 ensure_host_interface 的每个调用点都必须自己验空。
+host_if_or_die() {
+    local vif
+    vif=$(ensure_host_interface "$1" "$2")
+    [ -n "${vif}" ] || die "ensure_host_interface($1) failed"
+    echo "${vif}"
+}
+
 cmd_init() {
     log "installing SR P-Key (hmac_id=${SR_HMAC_ID})"
     vppctl sr-wg key set "${SR_HMAC_ID}" "${SR_KEY_HEX}" || die "sr-wg key set failed"
 
     case "${ROLE}" in
       node1)
-        VIF=$(ensure_host_interface "${SELF_UNDERLAY}" "${NET_A_PFX}")
+        VIF=$(host_if_or_die "${SELF_UNDERLAY}" "${NET_A_PFX}")
         log "underlay ${VIF} = ${SELF_UNDERLAY}/${NET_A_PFX}"
         # node1 与 node2 不同二层，去 node2 的 underlay 要经过 transit
         vppctl ip route add "${N2_UNDERLAY}/32" via "${TRANSIT_A}" || true
         vppctl ip route add 10.10.2.0/"${NET_B_PFX}" via "${TRANSIT_A}" || true
         ;;
       transit)
-        VIF_A=$(ensure_host_interface "${TRANSIT_A}" "${NET_A_PFX}")
-        VIF_B=$(ensure_host_interface "${TRANSIT_B}" "${NET_B_PFX}")
+        VIF_A=$(host_if_or_die "${TRANSIT_A}" "${NET_A_PFX}")
+        VIF_B=$(host_if_or_die "${TRANSIT_B}" "${NET_B_PFX}")
         log "underlay ${VIF_A} = ${TRANSIT_A}, ${VIF_B} = ${TRANSIT_B}"
         ;;
       node2)
-        VIF=$(ensure_host_interface "${SELF_UNDERLAY}" "${NET_B_PFX}")
+        VIF=$(host_if_or_die "${SELF_UNDERLAY}" "${NET_B_PFX}")
         log "underlay ${VIF} = ${SELF_UNDERLAY}/${NET_B_PFX}"
         vppctl ip route add "${N1_UNDERLAY}/32" via "${TRANSIT_B}" || true
         vppctl ip route add 10.10.1.0/"${NET_A_PFX}" via "${TRANSIT_B}" || true
@@ -203,6 +293,19 @@ cmd_peer() {
                persistent-keepalive "${KEEPALIVE}" || die "wireguard peer add failed"
     log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=${PEER_OVERLAY}/32"
 
+    # WireGuard 有 endpoint roaming：对端只要从另一个地址发来**签名有效**的报文，
+    # 静态配的 endpoint 就会被改写。本实验环境里 docker 网桥会 SNAT 一部分跨网段
+    # 流量，实测把 node1 的 peer endpoint 改成了 10.10.1.1:<随机端口>，之后 encap
+    # 的外层 dst 永远不等于绑定端点 → 整条 SR 路径静默旁路（Encap ok=0）。
+    # 上面的 add 带「已存在就跳过」守卫，救不回被污染的老 peer，所以这里显式校验。
+    ep=$(vppctl show wireguard peer 2>/dev/null | tr -d '\r' |
+         sed -n 's/.*->\([0-9.]*:[0-9]*\)\].*/\1/p' | head -1)
+    if [ "${ep}" != "${PEER_UNDERLAY}:${VPN_PORT}" ]; then
+        log "WARNING: wg peer endpoint drifted: got '${ep}', want '${PEER_UNDERLAY}:${VPN_PORT}'"
+        log "         repair: vppctl wireguard peer remove <[N] in show wireguard peer>,"
+        log "                  then $0 ${ROLE} peer ${peer_pub}${no_sr:+ ${no_sr}}"
+    fi
+
     # VPP WireGuard 不会自动为 allowed-ip 安装 FIB 路由，需要手动添加
     vppctl ip route add "${PEER_OVERLAY}/32" via "${WG_IF}" 2>/dev/null || true
 
@@ -223,12 +326,25 @@ cmd_peer() {
     [ -n "${swidx}" ] || die "cannot resolve sw_if_index of ${WG_IF}"
     vppctl set sr-wg tunnel "${swidx}" path "${SR_PATH_ID}" \
            endpoint "${PEER_UNDERLAY}" || die "set sr-wg tunnel failed"
-    log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID}"
+    log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID} endpoint=${PEER_UNDERLAY}"
 
-    # 校验 feature 顺序：ip4-output arc 上 sr-wg4-encap 必须排在 wg4-output-tun 之后
-    log "ip4-output features on ${WG_IF}:"
-    vppctl show interface features "${WG_IF}" 2>/dev/null |
+    # encap 的挂点是 **underlay 出口接口**，不是 wg0：VPP 26.06 的
+    # wg4-output-tun 把 next 硬编码为 adj-midchain-tx，从不走 feature 链，
+    # 挂在 wg0 上 0 vectors（已实测）。
+    local uvif uidx
+    uvif=$(vpp_ifname_for_ip "${SELF_UNDERLAY}")
+    [ -n "${uvif}" ] || die "cannot find VPP interface holding ${SELF_UNDERLAY}"
+    uidx=$(sw_if_index_of "${uvif}")
+    [ -n "${uidx}" ] || die "cannot resolve sw_if_index of ${uvif}"
+    vppctl set sr-wg encap enable "${uidx}" >/dev/null ||
+        die "set sr-wg encap enable ${uidx} (${uvif}) failed"
+    log "sr-wg4-encap enabled on underlay ${uvif}(sw_if_index=${uidx})"
+
+    # 校验：feature 确实挂在 underlay 口的 ip4-output arc 上，且绑定可命中
+    log "ip4-output features on ${uvif}:"
+    vppctl show interface features "${uvif}" 2>/dev/null |
         awk '/^ip4-output:/{f=1;next} f&&/^$/{exit} f{print "    "$0}' >&2
+    vppctl show sr-wg tunnels 2>/dev/null | grep -E "WARNING|usable" >&2
 }
 
 cmd_transit() {

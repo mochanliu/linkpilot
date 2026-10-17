@@ -63,12 +63,80 @@ def parse_segment(s):
     return parse_ip(ip_str) + parse_port(port_str)
 
 
+_U64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _rotl64(x, b):
+    return ((x << b) | (x >> (64 - b))) & _U64
+
+
+def _sipround(v0, v1, v2, v3):
+    v0 = (v0 + v1) & _U64
+    v1 = _rotl64(v1, 13)
+    v1 ^= v0
+    v0 = _rotl64(v0, 32)
+    v2 = (v2 + v3) & _U64
+    v3 = _rotl64(v3, 16)
+    v3 ^= v2
+    v0 = (v0 + v3) & _U64
+    v3 = _rotl64(v3, 21)
+    v3 ^= v0
+    v2 = (v2 + v1) & _U64
+    v1 = _rotl64(v1, 17)
+    v1 ^= v2
+    v2 = _rotl64(v2, 32)
+    return v0, v1, v2, v3
+
+
+def siphash24(msg, key):
+    """SipHash-2-4，与 vpp-plugin/sr_siphash.c 逐位一致。
+
+    key 与消息均按字节小端组装为 u64（与主机字节序无关）。
+    init 常量来自论文里的 "somepseudorandomlygeneratedbytes"，
+    v3 = 'tedbytes' 的大端拼法 = 0x7465646279746573。
+    """
+    assert len(key) == 16, "SipHash key must be 16 bytes"
+    k0 = int.from_bytes(key[0:8], 'little')
+    k1 = int.from_bytes(key[8:16], 'little')
+    v0 = k0 ^ 0x736F6D6570736575
+    v1 = k1 ^ 0x646F72616E646F6D
+    v2 = k0 ^ 0x6C7967656E657261
+    v3 = k1 ^ 0x7465646279746573
+
+    n = len(msg)
+    off = 0
+    while n - off >= 8:
+        m = int.from_bytes(msg[off:off + 8], 'little')
+        v3 ^= m
+        for _ in range(2):
+            v0, v1, v2, v3 = _sipround(v0, v1, v2, v3)
+        v0 ^= m
+        off += 8
+
+    b = (n & 0xFF) << 56
+    tail = msg[off:]
+    for i, byte in enumerate(tail):
+        b |= byte << (8 * i)
+
+    v3 ^= b
+    for _ in range(2):
+        v0, v1, v2, v3 = _sipround(v0, v1, v2, v3)
+    v0 ^= b
+    v2 ^= 0xFF
+    for _ in range(4):
+        v0, v1, v2, v3 = _sipround(v0, v1, v2, v3)
+    return (v0 ^ v1 ^ v2 ^ v3) & _U64
+
+
 def compute_hmac(header_bytes, seg_count, key_bytes):
     """
-    计算 SR Header 的 HMAC-SHA256（截断 8 字节）。
+    计算 SR Header 的完整性签名（SipHash-2-4，64 位 tag）。
     覆盖范围：ver_flags(1) || hdr_len(1) || seg_count(1) || reserved(2) ||
               hmac_id(2) || path_id(2) || timestamp(4) || segments[0..N-1](N*6)
     排除：magic(offset 0), seg_left(offset 3), action(offset 5)
+
+    tag 按大端（网络序）写入 8 字节 HMAC 字段，与 sr_hmac.c 的
+    sr_hmac_store_tag() 一致。
     """
     # header_bytes 是完整的 SR header（不含 HMAC 部分，或 HMAC 为零）
     # 按字段提取覆盖范围
@@ -83,8 +151,7 @@ def compute_hmac(header_bytes, seg_count, key_bytes):
 
     msg = ver_flags + hdr_len + seg_count_b + reserved + hmac_id + path_id + timestamp + segments
 
-    digest = hmac_mod.new(key_bytes, msg, hashlib.sha256).digest()
-    return digest[:SR_HMAC_LEN]
+    return struct.pack('>Q', siphash24(msg, key_bytes))
 
 
 def build_sr_header(seg_count, seg_left, hmac_id, path_id, timestamp, segments, key_bytes):

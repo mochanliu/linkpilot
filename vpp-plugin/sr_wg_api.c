@@ -284,7 +284,12 @@ vl_api_sr_wg_tunnel_dump_t_handler (vl_api_sr_wg_tunnel_dump_t *mp)
       rmp->sw_if_index = clib_host_to_net_u32 (bind->sw_if_index);
       rmp->path_id = clib_host_to_net_u16 (bind->path_id);
       clib_memcpy_fast (rmp->endpoint_ip, &bind->endpoint, 4);
-      rmp->feature_enabled = bind->feature_on;
+      /*
+       * underlay 挂点上只有 endpoint_path 能命中 wg0 维度的绑定，且必须
+       * 至少有一个 underlay 接口启用了 sr-wg4-encap，否则流量静默旁路。
+       */
+      rmp->is_effective =
+        (bind->endpoint.as_u32 != 0 && sm->encap_enabled_count > 0) ? 1 : 0;
 
       vl_api_send_msg (reg, (u8 *) rmp);
     }

@@ -1,111 +1,91 @@
 /*
- * sr_hmac.c - SR Header HMAC-SHA256（截断 64 位）实现
+ * sr_hmac.c - SR Header 完整性签名（SipHash-2-4）
  *
- * 覆盖范围按线格式字段顺序，使用 HMAC_Update 分段输入，
+ * 覆盖范围按线格式字段顺序拼成连续字节缓冲后一次性哈希，
  * 显式跳过 magic(offset 0)、seg_left(offset 3)、action(offset 5)。
  *
  * 覆盖字节序列：
  *   ver_flags(1) || hdr_len(1) || seg_count(1) || reserved(2) ||
  *   hmac_id(2) || path_id(2) || timestamp(4) || segments[0..N-1](N*6)
+ * 最大长度 = 13 + SR_MAX_SEGS * SR_SEG_SIZE = 61
+ *
+ * tag 为大端（网络序）写入 8 字节 HMAC 字段，与头部其余多字节字段一致。
  */
 #include "sr_hmac.h"
 
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
+#include "sr_siphash.h"
 
-/* HMAC-SHA256 完整输出长度 */
-#define SR_HMAC_SHA256_LEN  32
+/* 覆盖字段固定部分字节数 */
+#define SR_HMAC_COVER_FIXED  13
+#define SR_HMAC_COVER_MAX    (SR_HMAC_COVER_FIXED + SR_MAX_SEGS * SR_SEG_SIZE)
 
-/*
- * 对头部覆盖字段计算 HMAC-SHA256，输出完整 32 字节到 out。
- * 返回 0 成功，-1 失败。
- */
 static int sr_hmac_compute(const sr_header_t *h,
                            const uint8_t pkey[SR_PKEY_LEN],
-                           uint8_t out[SR_HMAC_SHA256_LEN])
+                           uint64_t *tag_out)
 {
-    HMAC_CTX *ctx = NULL;
-    unsigned int out_len = 0;
-    int ret = -1;
+    uint8_t buf[SR_HMAC_COVER_MAX];
+    size_t off = 0;
 
-    if (!h || !pkey || !out)
+    if (!h || !pkey || !tag_out)
         return -1;
     if (h->seg_count == 0 || h->seg_count > SR_MAX_SEGS)
         return -1;
 
-    ctx = HMAC_CTX_new();
-    if (!ctx)
-        goto done;
+    buf[off++] = h->ver_flags;
+    buf[off++] = h->hdr_len;
+    buf[off++] = h->seg_count;
+    memcpy(buf + off, h->reserved, 2);  off += 2;
+    memcpy(buf + off, h->hmac_id, 2);   off += 2;
+    memcpy(buf + off, h->path_id, 2);   off += 2;
+    memcpy(buf + off, h->timestamp, 4); off += 4;
+    memcpy(buf + off, (const uint8_t *)h->segments,
+           (size_t)h->seg_count * SR_SEG_SIZE);
+    off += (size_t)h->seg_count * SR_SEG_SIZE;
 
-    if (HMAC_Init_ex(ctx, pkey, SR_PKEY_LEN, EVP_sha256(), NULL) != 1)
-        goto done;
+    *tag_out = sr_siphash24(buf, off, pkey);
+    return 0;
+}
 
-    /* 逐字段输入覆盖范围，跳过 magic / seg_left / action */
-    if (HMAC_Update(ctx, &h->ver_flags, 1) != 1)   /* ver_flags */
-        goto done;
-    if (HMAC_Update(ctx, &h->hdr_len, 1) != 1)      /* hdr_len */
-        goto done;
-    if (HMAC_Update(ctx, &h->seg_count, 1) != 1)    /* seg_count */
-        goto done;
-    if (HMAC_Update(ctx, h->reserved, 2) != 1)      /* reserved */
-        goto done;
-    if (HMAC_Update(ctx, h->hmac_id, 2) != 1)       /* hmac_id */
-        goto done;
-    if (HMAC_Update(ctx, h->path_id, 2) != 1)       /* path_id */
-        goto done;
-    if (HMAC_Update(ctx, h->timestamp, 4) != 1)     /* timestamp */
-        goto done;
-    /* segments[0..seg_count-1]，仅覆盖实际使用的段 */
-    if (HMAC_Update(ctx, (const uint8_t *)h->segments,
-                    (size_t)h->seg_count * SR_SEG_SIZE) != 1)
-        goto done;
-
-    if (HMAC_Final(ctx, out, &out_len) != 1)
-        goto done;
-    if (out_len != SR_HMAC_SHA256_LEN)
-        goto done;
-
-    ret = 0;
-
-done:
-    HMAC_CTX_free(ctx);
-    return ret;
+/* 64 位 tag 按大端写入 */
+static void sr_hmac_store_tag(uint8_t dst[SR_HMAC_LEN], uint64_t tag)
+{
+    int i;
+    for (i = 0; i < SR_HMAC_LEN; i++)
+        dst[i] = (uint8_t)(tag >> (56 - i * 8));
 }
 
 int sr_hmac_sign(sr_header_t *h, const uint8_t pkey[SR_PKEY_LEN])
 {
-    uint8_t digest[SR_HMAC_SHA256_LEN];
-    uint8_t *hmac_field;
+    uint64_t tag;
 
     if (!h)
         return -1;
-
-    if (sr_hmac_compute(h, pkey, digest) != 0)
+    if (sr_hmac_compute(h, pkey, &tag) != 0)
         return -1;
 
-    /* 截断：取前 SR_HMAC_LEN(8) 字节写入头部 */
-    hmac_field = sr_hdr_get_hmac(h);
-    memcpy(hmac_field, digest, SR_HMAC_LEN);
+    sr_hmac_store_tag(sr_hdr_get_hmac(h), tag);
     return 0;
 }
 
 int sr_hmac_verify(const sr_header_t *h, const uint8_t pkey[SR_PKEY_LEN])
 {
-    uint8_t digest[SR_HMAC_SHA256_LEN];
-    const uint8_t *hmac_field;
+    uint8_t expected[SR_HMAC_LEN];
+    const uint8_t *actual;
+    uint64_t tag;
     uint8_t diff = 0;
     int i;
 
     if (!h)
         return -1;
-
-    if (sr_hmac_compute(h, pkey, digest) != 0)
+    if (sr_hmac_compute(h, pkey, &tag) != 0)
         return -1;
 
+    sr_hmac_store_tag(expected, tag);
+
     /* 常量时间比较，防止 timing attack */
-    hmac_field = sr_hdr_get_hmac_c(h);
+    actual = sr_hdr_get_hmac_c(h);
     for (i = 0; i < SR_HMAC_LEN; i++)
-        diff |= (uint8_t)(digest[i] ^ hmac_field[i]);
+        diff |= (uint8_t)(expected[i] ^ actual[i]);
 
     return (diff == 0) ? 0 : -1;
 }

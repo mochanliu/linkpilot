@@ -3,7 +3,8 @@
 ## 概述
 
 SR（Source Routing）路径头插入在 UDP Header 和 WireGuard 加密数据之间，
-为数据包提供显式路径信息。路径头是明文的，通过 HMAC-SHA256 保护完整性。
+为数据包提供显式路径信息。路径头是明文的，通过 SipHash-2-4（128-bit 密钥）
+保护完整性。线上字段与代码接口仍沿用 `hmac` 命名。
 
 ## 包结构
 
@@ -45,11 +46,11 @@ SR（Source Routing）路径头插入在 UDP Header 和 WireGuard 加密数据�
 
 每段 6 字节，共 seg_count 段。
 
-### HMAC（8 字节）
+### hmac 字段（8 字节）
 
 | 偏移 | 长度 | 字段名 | 说明 |
 |------|------|--------|------|
-| 16+N*6 | 8B | hmac | HMAC-SHA256 截断为 64 位 |
+| 16+N*6 | 8B | hmac | SipHash-2-4 的 64 位 tag，大端（网络序）写入 |
 
 ### 长度计算公式
 
@@ -57,10 +58,13 @@ SR（Source Routing）路径头插入在 UDP Header 和 WireGuard 加密数据�
 hdr_len = 16 + seg_count * 6 + 8 = 24 + seg_count * 6
 ```
 
-## HMAC 覆盖范围
+## 签名覆盖范围（hmac 字段）
 
 包含：ver_flags, hdr_len, seg_count, reserved, hmac_id, path_id, timestamp, segments[0..N-1]
 排除：magic（固定值）, seg_left（每跳变）, action（每跳可能变）
+
+上述字段按线格式顺序拼成连续字节缓冲（最长 13 + 8*6 = 61 字节）作为
+SipHash-2-4 的输入，密钥为 hmac_id 对应的 128-bit P-Key。
 
 ## 段列表语义
 

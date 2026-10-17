@@ -76,6 +76,8 @@ VLIB_REGISTER_NODE (sr_wg4_transit_node) = {
   .vector_size = sizeof (u32),
   .format_trace = format_sr_wg4_transit_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
+  /* 不置这个 flag 时 `trace add sr-wg4-transit N` 直接报不支持 */
+  .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
   .n_errors = SR_WG4_TRANSIT_N_ERROR,
   .error_strings = sr_wg4_transit_error_strings,
   .n_next_nodes = SR_WG4_TRANSIT_N_NEXT,
@@ -189,14 +191,29 @@ VLIB_NODE_FN (sr_wg4_transit_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (sm->local_ip4.as_u32 != 0)
         ip4->src_address = sm->local_ip4;
 
-      /* Step 11: 改写 UDP src_port = transit_port */
-      udp->src_port = clib_host_to_net_u16 (sm->transit_port);
+      /*
+       * Step 11: **不改写** UDP src_port。
+       * SR 的 function 区分靠的是外层 dst port，transit 只需要把 dst port
+       * 换成下一跳段口的 51820/51821。若把 src port 也改成 51821，对端
+       * WireGuard 看到的源五元组就变成 10.10.1.2:51821，与其配置的 peer
+       * endpoint（10.10.1.2:51820）不一致：wg4-input 报 "Interface error"
+       * 丢弃，同时把 peer 的动态 endpoint 污染成错误地址，回包发往错误的
+       * 端口 —— 隧道永远建不起来。保持原 src port 才能让 SR 路径与 WG
+       * 直连路径在对端看起来完全一样（回程也复用同一对端口）。
+       */
 
       /* Step 12: 重算 UDP 长度（SR Header 长度不变，但为保险起见） */
       /* udp->length 已经正确（payload 未变） */
 
       /* Step 13: UDP checksum 置 0（WG 惯例） */
       udp->checksum = 0;
+
+      /*
+       * Step 13.5: **不动外层 TTL。**
+       * TTL 递减与 ttl<=1 的丢弃/ICMP-time-exceeded 由下一跳的 ip4-lookup
+       * 负责（实测：本节点再减一次会变成每跳减 2，traceroute 跳数翻倍，
+       * 且 loop 已被 ip4-lookup 的减到 0 即丢兜住）。
+       */
 
       /* Step 14: 重算 IP4 checksum */
       ip4->checksum = ip4_header_checksum (ip4);

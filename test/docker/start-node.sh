@@ -39,4 +39,6 @@ fi
 sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
 
 echo "[${NODE_NAME}] starting VPP (conf=${VPP_CONF}) ..."
-exec script -qefc "vpp -c ${VPP_CONF}" /dev/null
+# typescript 落盘而不是 /dev/null：容器里没有 rsyslog，插件的 clib_warning
+# 只能从 VPP 的 stdout 里捞（排障时必须能看到）。
+exec script -qefc "vpp -c ${VPP_CONF}" "${VPP_OUT_LOG:-/var/log/vpp/vpp-stdout.log}"

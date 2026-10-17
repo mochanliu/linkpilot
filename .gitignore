@@ -13,3 +13,5 @@ controller/vendor/
 .DS_Store
 # VPP
 *.pyc
+# 单元测试可执行文件（test/unit/Makefile 的 TARGET）
+test/unit/test_srwg

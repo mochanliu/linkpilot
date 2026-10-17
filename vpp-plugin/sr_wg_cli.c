@@ -15,7 +15,7 @@
  *   set sr-wg transit enable port <port> local-ip <ip>
  *   set sr-wg transit disable
  *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>] [del]
- *   set sr-wg encap enable <sw_if_index> | disable <sw_if_index>
+ *   set sr-wg encap enable <underlay sw_if_index|name> | disable <…>
  *                   | fib-index <n>
  */
 #include "sr_wg.h"
@@ -99,18 +99,52 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
 {
   sr_wg_main_t *sm = &sr_wg_main;
   vnet_main_t *vnm = vnet_get_main ();
-  u32 bi, n = 0;
+  u32 bi, n = 0, n_usable = 0;
 
-  vlib_cli_output (vm, "encap fib-index=%u", sm->encap_fib_index);
+  /*
+   * 挂点在 underlay 出口接口（不是 wg0），所以绑定能不能生效取决于两件事：
+   *   (1) 至少一个 underlay 接口启用了 sr-wg4-encap feature
+   *   (2) 该绑定带 endpoint —— underlay 挂点上 tx_sw_if_index 是物理口，
+   *       只有 endpoint_path 能命中 wg0 维度的绑定
+   * 任一条不满足，流量都会静默旁路直发 peer，破坏源路由语义，必须显式提示。
+   */
+  vlib_cli_output (vm, "encap fib-index=%u, encap enabled on %u interface(s):",
+                   sm->encap_fib_index, sm->encap_enabled_count);
+
+  if (sm->encap_enabled_count == 0)
+    vlib_cli_output (
+      vm, "  !! WARNING: sr-wg4-encap 未启用在任何接口上，"
+          "所有 SR 路径都不会生效。"
+          "请执行 `set sr-wg encap enable <underlay sw_if_index>`");
+  else
+    {
+      uword key, val;
+      /* *INDENT-OFF* */
+      hash_foreach (key, val, sm->encap_enabled_ifs, ({
+        vlib_cli_output (vm, "  %U (sw_if_index=%u)",
+                         format_vnet_sw_if_index_name, vnm, (u32) key,
+                         (u32) key);
+      }));
+      /* *INDENT-ON* */
+    }
 
   for (bi = 0; sm->binds && bi < vec_len (sm->binds); bi++)
     {
       sr_wg_tunnel_bind_t *bind;
+      const char *state;
 
       if (pool_is_free_index (sm->binds, bi))
         continue;
 
       bind = pool_elt_at_index (sm->binds, bi);
+
+      if (bind->endpoint.as_u32 != 0)
+        {
+          state = "usable";
+          n_usable++;
+        }
+      else
+        state = "!! NO ENDPOINT, never matches";
 
       /*
        * 26.06 的 vnet_sw_interface_t 已无 name 字段，必须用格式化函数取名。
@@ -124,22 +158,21 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (vnet_get_sw_interface_or_null (vnm, bind->sw_if_index))
         vlib_cli_output (vm,
                          "  [%u] sw_if_index=%u (%U) path_id=%u endpoint=%U "
-                         "feature=%s",
+                         "%s",
                          bi, bind->sw_if_index, format_vnet_sw_if_index_name,
                          vnm, bind->sw_if_index, (u32) bind->path_id,
-                         format_ip4_address, &bind->endpoint,
-                         bind->feature_on ? "on" : "off");
+                         format_ip4_address, &bind->endpoint, state);
       else
         vlib_cli_output (vm,
                          "  [%u] sw_if_index=%u (<deleted>) path_id=%u "
-                         "endpoint=%U feature=%s",
+                         "endpoint=%U %s",
                          bi, bind->sw_if_index, (u32) bind->path_id,
-                         format_ip4_address, &bind->endpoint,
-                         bind->feature_on ? "on" : "off");
+                         format_ip4_address, &bind->endpoint, state);
       n++;
     }
 
-  vlib_cli_output (vm, "%u tunnel binding(s) configured.", n);
+  vlib_cli_output (vm, "%u tunnel binding(s) configured, %u usable.", n,
+                   n_usable);
   return 0;
 }
 
@@ -325,21 +358,19 @@ VLIB_CLI_COMMAND (sr_wg_path_command, static) = {
 /* ==================== sr-wg key ==================== */
 
 /*
- * P-Key CLI。密钥以 32 位十六进制字符串（128-bit）给出，长度不足时
- * 高位补零（左侧补零，即右对齐），超过 16 字节报错。
+ * P-Key CLI。SipHash-2-4 的密钥固定 128-bit，因此只接受恰好 32 位十六进制。
+ * 不做长度补齐：SHA 时代的"短密钥左侧补零"会静默把用户以为的密钥强度
+ * 缩到实际熵，且让同一条配置在换原语后含义改变。
  */
 static int
 sr_wg_parse_hex_key (const u8 *s, uword len, u8 *out)
 {
-  uword i, off;
+  uword i;
 
-  clib_memset (out, 0, SR_PKEY_LEN);
-
-  if (len == 0 || len > 2 * SR_PKEY_LEN || (len & 1))
+  if (len != 2 * SR_PKEY_LEN)
     return -1;
 
-  /* 右对齐：短密钥左侧补零 */
-  off = SR_PKEY_LEN - len / 2;
+  clib_memset (out, 0, SR_PKEY_LEN);
 
   for (i = 0; i < len; i++)
     {
@@ -354,7 +385,7 @@ sr_wg_parse_hex_key (const u8 *s, uword len, u8 *out)
       else
         return -1;
 
-      out[off + i / 2] |= (u8) (v << ((i & 1) ? 0 : 4));
+      out[i / 2] |= (u8) (v << ((i & 1) ? 0 : 4));
     }
   return 0;
 }
@@ -399,7 +430,8 @@ sr_wg_key_command_fn (vlib_main_t *vm, unformat_input_t *input,
     {
       vec_free (key_hex);
       return clib_error_return (0,
-                                "bad key: expect 2..%d hex chars",
+                                "bad key: expect exactly %d hex chars "
+                                "(128-bit SipHash key)",
                                 2 * SR_PKEY_LEN);
     }
   vec_free (key_hex);
@@ -487,8 +519,12 @@ VLIB_CLI_COMMAND (sr_wg_set_transit_command, static) = {
  *
  *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>] [del]
  *
- * 绑定成功后会自动在 "ip4-output" arc 上为该接口启用 sr-wg4-encap
- * feature（排在 wg4-output-tun 之后），无需再手动 enable。
+ * 本命令**只写绑定表**，不启用 feature。encap 的挂点在 underlay 出口接口
+ * （wg4-output-tun 不参与 feature 链，详见 sr_wg.h），必须另外执行
+ * `set sr-wg encap enable <underlay sw_if_index>`。
+ *
+ * underlay 挂点上数据面按外层 dst 查绑定，所以 add 时 [endpoint] 实际必填；
+ * 缺失时这里仍接受配置但立刻告警，避免"配了却没生效"要抓包才发现。
  */
 static clib_error_t *
 sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -531,19 +567,27 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
     return clib_error_return (0, "sr-wg tunnel set path failed (rv=%d)", rv);
 
   if (is_del)
-    vlib_cli_output (vm, "SR-WG tunnel %u unbound, encap feature disabled.",
-                     sw_if_index);
-  else if (have_endpoint)
+    {
+      vlib_cli_output (vm, "SR-WG tunnel %u unbound.", sw_if_index);
+      return 0;
+    }
+
+  if (have_endpoint)
     vlib_cli_output (vm,
-                     "SR-WG tunnel %u bound to path_id=%u endpoint=%U, "
-                     "encap feature enabled on arc '%s'.",
+                     "SR-WG tunnel %u bound to path_id=%u endpoint=%U.",
                      sw_if_index, (u32) (u16) path_id,
-                     format_ip4_address, &endpoint, SR_WG_ENCAP_ARC);
+                     format_ip4_address, &endpoint);
   else
     vlib_cli_output (vm,
                      "SR-WG tunnel %u bound to path_id=%u, "
-                     "encap feature enabled on arc '%s'.",
-                     sw_if_index, (u32) (u16) path_id, SR_WG_ENCAP_ARC);
+                     "!! WARNING: 未指定 endpoint，本绑定在 underlay 挂点上"
+                     "永远不会命中，流量将直发 peer。",
+                     sw_if_index, (u32) (u16) path_id);
+
+  if (sm->encap_enabled_count == 0)
+    vlib_cli_output (vm,
+                     "!! WARNING: sr-wg4-encap 尚未在任何接口上启用，"
+                     "请执行 `set sr-wg encap enable <underlay sw_if_index>`。");
 
   return 0;
 }
@@ -565,12 +609,17 @@ VLIB_CLI_COMMAND (sr_wg_set_tunnel_command, static) = {
  *   set sr-wg encap fib-index <n>
  *
  * 也接受 "set sr-wg encap <sw_if_index> enable|disable" 的词序。
+ *
+ * <sw_if_index> 必须是 **underlay 出口接口**（`show interface` 里物理/宿主
+ * 网卡那一项，如 host-eth0），不是 wg0：wg4-output-tun 不进入 feature 链，
+ * 挂在 wg0 上收不到任何包。
  */
 static clib_error_t *
 sr_wg_set_encap_command_fn (vlib_main_t *vm, unformat_input_t *input,
                             vlib_cli_command_t *cmd)
 {
   sr_wg_main_t *sm = &sr_wg_main;
+  vnet_main_t *vnm = vnet_get_main ();
   u32 sw_if_index = (u32) ~0;
   u32 fib_index = (u32) ~0;
   u8 enable = 0, disable = 0, have_fib = 0;
@@ -585,6 +634,9 @@ sr_wg_set_encap_command_fn (vlib_main_t *vm, unformat_input_t *input,
       else if (unformat (input, "fib-index %u", &fib_index))
         have_fib = 1;
       else if (unformat (input, "%u", &sw_if_index))
+        ;
+      else if (unformat (input, "%U", unformat_vnet_sw_interface, vnm,
+                         &sw_if_index))
         ;
       else
         break;
@@ -612,9 +664,10 @@ sr_wg_set_encap_command_fn (vlib_main_t *vm, unformat_input_t *input,
                               enable ? "enable" : "disable", SR_WG_ENCAP_NODE,
                               SR_WG_ENCAP_ARC, sw_if_index, rv);
 
-  vlib_cli_output (vm, "%s %s on sw_if_index %u (arc %s).",
+  vlib_cli_output (vm, "%s %s on %U (sw_if_index=%u, arc %s).",
                    enable ? "Enabled" : "Disabled", SR_WG_ENCAP_NODE,
-                   sw_if_index, SR_WG_ENCAP_ARC);
+                   format_vnet_sw_if_index_name, vnm, sw_if_index, sw_if_index,
+                   SR_WG_ENCAP_ARC);
   return 0;
 }
 

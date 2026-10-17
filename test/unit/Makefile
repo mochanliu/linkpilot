@@ -1,7 +1,7 @@
 # Makefile - SR Header 核心库单元测试
 #
-# 直接编译被测源码（sr_hmac.c / sr_path.c）与测试源码，
-# 链接 OpenSSL libcrypto（HMAC-SHA256）。sr_header.h 为纯头文件
+# 直接编译被测源码（sr_hmac.c / sr_siphash.c / sr_path.c）与测试源码。
+# 签名使用内置 SipHash-2-4，无外部依赖；sr_header.h 为纯头文件
 # （inline 函数），无需单独编译。
 #
 # 目标：
@@ -16,11 +16,11 @@ TARGET     := test_srwg
 
 CFLAGS   := -Wall -Wextra -std=c11 -g -O0 -I$(PLUGIN_DIR)
 LDFLAGS  :=
-LDLIBS   := -lcrypto
+LDLIBS   :=
 
 # 测试源码 + 被测库源码
-TEST_SRCS := test_main.c test_sr_header.c test_sr_hmac.c test_sr_path.c
-LIB_SRCS  := $(PLUGIN_DIR)/sr_hmac.c $(PLUGIN_DIR)/sr_path.c
+TEST_SRCS := test_main.c test_sr_header.c test_sr_hmac.c test_sr_siphash.c test_sr_path.c
+LIB_SRCS  := $(PLUGIN_DIR)/sr_hmac.c $(PLUGIN_DIR)/sr_siphash.c $(PLUGIN_DIR)/sr_path.c
 SRCS      := $(TEST_SRCS) $(LIB_SRCS)
 
 # 所有 .o 统一放入 build/（用 notdir 避免路径冲突）
@@ -30,6 +30,7 @@ OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(notdir $(SRCS)))
 HDRS := test_framework.h \
         $(PLUGIN_DIR)/sr_header.h \
         $(PLUGIN_DIR)/sr_hmac.h \
+        $(PLUGIN_DIR)/sr_siphash.h \
         $(PLUGIN_DIR)/sr_path.h
 
 .PHONY: all test clean

@@ -83,6 +83,8 @@ VLIB_REGISTER_NODE (sr_wg4_input_node) = {
   .vector_size = sizeof (u32),
   .format_trace = format_sr_wg4_input_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
+  /* 不置这个 flag 时 `trace add sr-wg4-input N` 直接报不支持 */
+  .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
   .n_errors = SR_WG4_INPUT_N_ERROR,
   .error_strings = sr_wg4_input_error_strings,
   .n_next_nodes = SR_WG4_INPUT_N_NEXT,
@@ -112,9 +114,12 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
     {
       vlib_buffer_t *b = buf_ptr[0];
       sr_header_t *srh;
+      ip4_header_t *outer;
+      udp_header_t *udp;
       sr_wg_key_entry_t *key_entry;
       u16 hmac_id;
       u16 sr_hdr_len;
+      u32 pay_len;
       u32 next_index = SR_WG4_INPUT_NEXT_DROP;
       u8 error = SR_WG4_INPUT_ERROR_NONE;
       u8 bypass = 0;
@@ -180,13 +185,37 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           goto done;
         }
 
-      /* Step 5: 剥离 SR Header */
+      /*
+       * Step 5: 剥离 SR Header。
+       *
+       * 这里绝不能用 vlib_buffer_advance()。advance 只移动指针，SR Header 留下的
+       * 空洞还在 UDP 头和 WG 报文之间，而 wg4-input 是从 current_data 往回取
+       * 8 字节 UDP 头来定位本端接口的，取到的会是 SR Header 的尾部，于是整包
+       * 报 "Interface error"（实测：encap/transit/decap 计数都正常涨了，
+       * 但 wg4-input 全拒）。正确做法是把 WG 报文整体左移覆盖掉 SR Header，
+       * 让它紧贴在 UDP 头之后，current_data 保持原位。
+       *
+       * 位移之后 datagram 真的变短了，所以外层 ip4->length / udp->length 必须
+       * 同步减回 sr_hdr_len（encap Step 13 加过），否则 wg4-input 会按虚高的
+       * 长度去解析越界数据。本包是我们自己封装的 WG 包，IP 头固定 20 字节
+       * （与 sr-wg4-transit 同一假设）。
+       */
       sr_hdr_len = sr_hdr_total_len (srh->seg_count);
-      vlib_buffer_advance (b, (int) sr_hdr_len);
+      pay_len = b->current_length - sr_hdr_len;
 
-      /* 此时 current_data 指向 WG transport header */
-      /* wg4-input 期望 current_data 指向 UDP payload (即 WG transport header) */
-      /* 我们正好在正确位置 */
+      outer = (ip4_header_t *) ((u8 *) srh - SR_OUTER_HDR_LEN);
+      udp = (udp_header_t *) ((u8 *) outer + sizeof (ip4_header_t));
+      udp->length =
+        clib_host_to_net_u16 (clib_net_to_host_u16 (udp->length) - sr_hdr_len);
+      outer->length =
+        clib_host_to_net_u16 (clib_net_to_host_u16 (outer->length) -
+                              sr_hdr_len);
+      outer->checksum = ip4_header_checksum (outer);
+
+      clib_memmove (srh, (u8 *) srh + sr_hdr_len, pay_len);
+      b->current_length = pay_len;
+
+      /* current_data 仍指向原 SR Header 位置 = 现在的 WG transport header */
 
       sm->counters.decap_ok++;
       next_index = SR_WG4_INPUT_NEXT_WG4_INPUT;

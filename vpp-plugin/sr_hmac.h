@@ -1,7 +1,8 @@
 /*
- * sr_hmac.h - SR Header HMAC 签名/验证接口
+ * sr_hmac.h - SR Header 签名/验证接口
  *
- * 使用 HMAC-SHA256 截断为 64 位保护 SR Header 完整性。
+ * 使用 SipHash-2-4（128-bit key → 64-bit tag）保护 SR Header 完整性，
+ * 无 OpenSSL 依赖。
  * P-Key：128-bit 预共享路径密钥（每条路径独立）。
  *
  * HMAC 覆盖范围：
@@ -22,12 +23,12 @@ extern "C" {
 #define SR_PKEY_LEN  16   /* 128-bit 预共享路径密钥 */
 
 /*
- * 计算并写入 HMAC（签名）。
+ * 计算并写入签名（64 位 SipHash-2-4 tag，大端写入 8 字节字段）。
  * 覆盖范围：ver_flags, hdr_len, seg_count, reserved, hmac_id, path_id,
  *           timestamp, segments[0..seg_count-1]
  * 排除：magic, seg_left, action
  *
- * 返回：0 成功，-1 失败（参数非法或 OpenSSL 错误）
+ * 返回：0 成功，-1 失败（参数非法或段数越界）
  */
 int sr_hmac_sign(sr_header_t *h, const uint8_t pkey[SR_PKEY_LEN]);
 

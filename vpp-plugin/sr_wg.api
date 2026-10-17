@@ -122,10 +122,12 @@ autoreply define sr_wg_transit_disable
 /** \brief 绑定 / 解绑 WG 隧道接口到 SR 路径
     @param sw_if_index - WG 隧道接口的 sw_if_index
     @param path_id     - 路径标识（必须已存在于路径表）
-    @param endpoint_ip - 可选：WG peer endpoint IPv4，非 0.0.0.0 时
-                         同时建立 endpoint -> path 的索引
-    @param is_add      - 1 = 绑定（并在 ip4-output arc 上自动启用
-                              sr-wg4-encap feature），0 = 解绑（同时禁用）
+    @param endpoint_ip - WG peer 的外层 endpoint IPv4。encap 挂点在 underlay
+                         出口接口，数据面按外层 dst 查绑定，故 underlay 形态
+                         下这是必填项；不传则本绑定永远不会命中
+    @param is_add      - 1 = 绑定，0 = 解绑
+                         注意：不会自动启用 feature，需另发
+                         sr_wg_encap_enable 到 underlay 接口
 */
 autoreply define sr_wg_tunnel_set_path
 {
@@ -150,11 +152,13 @@ define sr_wg_tunnel_details
   u32 sw_if_index;
   u16 path_id;
   vl_api_ip4_address_t endpoint_ip;
-  u8 feature_enabled;       /* sr-wg4-encap 在 ip4-output arc 上是否已启用 */
+  u8 is_effective;          /* endpoint 已配 且 至少一个 underlay 接口
+                               启用了 sr-wg4-encap；0 = 会静默旁路 */
 };
 
 /** \brief 在 ip4-output arc 上启用 / 禁用 sr-wg4-encap feature
-    @param sw_if_index - WG 隧道接口的 sw_if_index
+    @param sw_if_index - **underlay 出口接口** 的 sw_if_index（不是 wg0：
+                          wg4-output-tun 不进入 feature 链，挂 wg0 收不到包）
     @param enable      - 1 = 启用，0 = 禁用
 */
 autoreply define sr_wg_encap_enable

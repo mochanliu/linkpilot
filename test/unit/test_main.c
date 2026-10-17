@@ -1,7 +1,7 @@
 /*
  * test_main.c - SR Header 核心库单元测试统一入口
  *
- * 定义全局测试计数器，依次运行三个测试套件，输出 PASS/FAIL 统计。
+ * 定义全局测试计数器，依次运行四个测试套件，输出 PASS/FAIL 统计。
  * 退出码：全部通过返回 0，存在失败返回 1（便于 CI 集成）。
  */
 #include "test_framework.h"
@@ -13,6 +13,7 @@ int tests_failed = 0;
 
 /* 各测试套件入口 */
 extern void test_suite_sr_header(void);
+extern void test_suite_sr_siphash(void);
 extern void test_suite_sr_hmac(void);
 extern void test_suite_sr_path(void);
 
@@ -23,6 +24,7 @@ int main(void)
     printf("====================================\n");
 
     test_suite_sr_header();
+    test_suite_sr_siphash();
     test_suite_sr_hmac();
     test_suite_sr_path();
 

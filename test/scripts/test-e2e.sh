@@ -12,7 +12,7 @@
 #   node1 ping 192.168.99.2
 #     -> ip4-lookup -> ip4-midchain(wg0) -> wg4-output-tun (WG 加密 + 外层 IP4/UDP)
 #     -> sr-wg4-encap (插 SR Header, 外层 dst 改成 transit:51821, seg_left=1)
-#     -> ip4-lookup -> host-eth0
+#     -> ip4-lookup -> host-eth1 (underlay 出口)
 #     -> transit: udp4-local -> sr-wg4-transit (验 HMAC, seg_left 1->0,
 #                 外层 dst 改成 node2:51820) -> ip4-lookup -> host-eth(net_b)
 #     -> node2: udp4-local -> sr-wg4-input (验 HMAC, seg_left==0, 剥 SR 头)
@@ -44,6 +44,10 @@ C_NODE1=srwg-node1
 C_TRANSIT=srwg-transit
 C_NODE2=srwg-node2
 ALL_CONTAINERS="${C_NODE1} ${C_TRANSIT} ${C_NODE2}"
+
+# node1 的 underlay 地址（与 setup-node.sh 默认值一致）。
+# encap 挂在承载该地址的 underlay 出口接口上，不是 wg0。
+N1_UNDERLAY=${N1_UNDERLAY:-10.10.1.2}
 
 KEEP=0
 SKIP_BUILD=0
@@ -194,27 +198,16 @@ for c in ${ALL_CONTAINERS}; do
 done
 
 echo
-info "ASSERT: sr-wg4-encap is registered on the ip4-output arc, after wg4-output-tun"
+info "ASSERT: sr-wg4-encap is registered on the ip4-output arc"
 dx "${C_NODE1}" 'vppctl show features' | tr -d '\r' |
     awk '/^ip4-output:/{f=1;next} f&&/^[^ ]/{exit} f&&NF{print}' |
     grep -n . > /tmp/srwg-arc.txt
 cat /tmp/srwg-arc.txt | sed 's/^/    /'
-WGN=$(grep -c "wg4-output-tun" /tmp/srwg-arc.txt || true)
 ENCN=$(grep -c "sr-wg4-encap" /tmp/srwg-arc.txt || true)
-IDX_WG=$(awk '/wg4-output-tun/{print NR; exit}' /tmp/srwg-arc.txt)
-IDX_EN=$(awk '/sr-wg4-encap/{print NR; exit}' /tmp/srwg-arc.txt)
 [ "${ENCN}" = "1" ] && ok "sr-wg4-encap present on ip4-output arc" ||
     bad "sr-wg4-encap missing from ip4-output arc"
-if [ -n "${IDX_WG}" ] && [ -n "${IDX_EN}" ] && [ "${IDX_EN}" -gt "${IDX_WG}" ]; then
-    ok "ordering: wg4-output-tun (#${IDX_WG}) -> sr-wg4-encap (#${IDX_EN})"
-else
-    bad "ordering wrong: wg4-output-tun=#${IDX_WG:-none} sr-wg4-encap=#${IDX_EN:-none}"
-fi
-
-if [ "${UP_ONLY}" = "1" ]; then
-    info "--up-only: environment is ready, skipping dataplane assertions"
-    exit 0
-fi
+# 挂点是 underlay 出口接口（wg4-output-tun 不进 feature 链），
+# 所以不再断言它排在 wg4-output-tun 之后，改断言启用在正确的接口上（step 3 之后）。
 
 # ==================================================================
 info "step 3: configure nodes"
@@ -242,14 +235,25 @@ echo "  -- node2: peer (no SR path => plain WireGuard direct mode)"
 setup_node node2 peer "${PUB1}" nosr >&2 || { echo "node2 peer failed" >&2; dump_all; cleanup; exit 1; }
 
 echo
-info "ASSERT: encap feature is enabled on node1's wg0"
-FEAT=$(dx "${C_NODE1}" 'vppctl show interface features wg0' | tr -d '\r' |
-       awk '/^ip4-output:/{f=1;next} f&&/^$/{exit} f&&NF{print}')
+info "ASSERT: encap feature is enabled on node1's UNDERLAY egress interface"
+# 挂点必须在承载 underlay IP 的物理口上：VPP 26.06 的 wg4-output-tun 把
+# next 硬编码成 adj-midchain-tx，从不走 feature 链，挂 wg0 收不到任何包。
+UVIF=$(dx "${C_NODE1}" 'vppctl show interface addr' | tr -d '\r' |
+       awk -v want="${N1_UNDERLAY}" '
+           /:[[:space:]]*$/ { n=$1; next }
+           index($0, "L3 "want"/") { print n; exit }')
+[ -n "${UVIF}" ] && ok "underlay egress interface = ${UVIF}" ||
+    bad "cannot find the VPP interface holding ${N1_UNDERLAY}"
+FEAT=$(dx "${C_NODE1}" "vppctl show interface features ${UVIF}" | tr -d '\r' |
+       awk '/^ip4-output:/{f=1;next} f&&/^[^ ]/{exit} f&&NF{print}')
 echo "${FEAT}" | sed 's/^/    /'
-echo "${FEAT}" | grep -q "sr-wg4-encap" && ok "sr-wg4-encap enabled on wg0" ||
-    bad "sr-wg4-encap NOT enabled on wg0"
-echo "${FEAT}" | grep -q "wg4-output-tun" && ok "wg4-output-tun enabled on wg0" ||
-    bad "wg4-output-tun NOT enabled on wg0 (no peer?)"
+echo "${FEAT}" | grep -q "sr-wg4-encap" &&
+    ok "sr-wg4-encap enabled on ${UVIF} (ip4-output arc)" ||
+    bad "sr-wg4-encap NOT enabled on ${UVIF}"
+dx "${C_NODE1}" 'vppctl show sr-wg tunnels' | grep -q ", 1 usable" &&
+    ok "binding is usable (endpoint set + encap interface enabled)" ||
+    bad "binding is NOT usable: $(dx "${C_NODE1}" 'vppctl show sr-wg tunnels' |
+                                  grep -E 'WARNING|usable' | tr '\n' ' ')"
 
 echo
 info "ASSERT: node1 bound wg0 to SR path 1"
@@ -259,6 +263,11 @@ dx "${C_NODE1}" 'vppctl show sr-wg tunnels' | grep -q "path_id=1" &&
 dx "${C_NODE2}" 'vppctl show sr-wg tunnels' | grep -q "0 tunnel binding" &&
     ok "node2 has no binding (WG direct mode preserved)" ||
     bad "node2 unexpectedly has a binding"
+
+if [ "${UP_ONLY}" = "1" ]; then
+    info "--up-only: environment configured, skipping dataplane assertions"
+    exit 0
+fi
 
 # ==================================================================
 info "step 4: generate traffic"
@@ -275,7 +284,7 @@ done
 
 # 抓一份 trace 作为证据（不影响断言）
 echo "  -- capturing a trace on node1"
-dx "${C_NODE1}" 'vppctl clear trace; vppctl trace add wg4-output-tun 16;
+dx "${C_NODE1}" 'vppctl clear trace; vppctl trace add sr-wg4-encap 16;
                  vppctl ping 192.168.99.2 source wg0 repeat 3 >/dev/null 2>&1;
                  sleep 1; vppctl show trace max 3' > /tmp/srwg-trace-node1.txt 2>&1
 echo "  -- capturing a trace on transit"
@@ -338,16 +347,26 @@ else
 fi
 
 echo
-info "SOFT: overlay connectivity (node1 -> 192.168.99.2 over WireGuard)"
+info "ASSERT: overlay connectivity (node1 -> 192.168.99.2 over WireGuard)"
 PING_OUT=$(dx "${C_NODE1}" 'vppctl ping 192.168.99.2 source wg0 repeat 8' 2>&1)
 echo "${PING_OUT}" | tail -3 | sed 's/^/    /'
-if echo "${PING_OUT}" | grep -qE "sent 8, received [1-9]"; then
-    ok "overlay ping succeeded"
+# VPP 的统计行格式是 "N sent, M received"，不是 "sent N, received M"，
+# 原来的匹配串永不命中，把真的通了的说成没通。
+# 冷启动时首轮 ping 可能全丢（WireGuard 握手要跑完一个 keepalive 周期），
+# 所以最多重试 3 次，任一轮拿到回包即判定隧道可用。
+OVERLAY_OK=0
+for _try in 1 2 3; do
+    if echo "${PING_OUT}" | grep -qE "[0-9]+ sent, [1-9][0-9]* received"; then
+        OVERLAY_OK=1; break
+    fi
+    sleep 4
+    PING_OUT=$(dx "${C_NODE1}" 'vppctl ping 192.168.99.2 source wg0 repeat 8' 2>&1)
+    echo "${PING_OUT}" | tail -2 | sed 's/^/    /'
+done
+if [ "${OVERLAY_OK}" = "1" ]; then
+    ok "overlay ping got replies through the SR tunnel"
 else
-    echo "     [INFO] overlay ping did not get replies."
-    echo "            SR counters are the authoritative result; the WireGuard"
-    echo "            session may not have established inside the test window"
-    echo "            (transit rewrites the outer UDP src port to ${TRANSIT_PORT:-51821})."
+    bad "overlay ping got 0 replies - WireGuard session never established"
 fi
 
 # ==================================================================

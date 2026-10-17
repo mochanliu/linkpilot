@@ -34,14 +34,18 @@ if [ ${VPP_FOUND} -eq 0 ]; then
 fi
 
 mkdir -p ${BUILD_DIR}
-cd ${BUILD_DIR}
 
 if [ ${VPP_FOUND} -eq 1 ]; then
     echo "Using VPP CMake build system..."
-    cmake ${PLUGIN_DIR} \
+    # 不要 cd 进 BUILD_DIR：宿主是 macOS，/workspace 是 bind mount（VirtioFS）。
+    # 上层脚本会先 `rm -rf build` 再由这里 `mkdir build`，同一进程里紧接着
+    # cd + cmake 时新目录的 dentry 可能还没就绪，cmake 会在 getcwd() 上直接报
+    # "Current working directory cannot be established" 并退出。
+    # 用 -S/-B 显式传源码/构建目录，进程 cwd 保持在稳定路径即可绕开该竞态。
+    cmake -S "${PLUGIN_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
         -G Ninja
-    ninja
+    cmake --build "${BUILD_DIR}"
     echo "=== Build complete ==="
     echo "Plugin artifacts in ${BUILD_DIR}/lib/vpp_plugins"
     # add_vpp_plugin 把产物放在 ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/vpp_plugins，
