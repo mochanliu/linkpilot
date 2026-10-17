@@ -31,6 +31,8 @@
 #             —— 用 AF_PACKET 原始包注入，真实 WG 流量造不出畸形头
 #   step 7    中转绝不改写外层源（控制面无 local-ip 开关 + transit 自身 trace 佐证）
 #   step 8    密钥轮换（key set 刷新路径里的 P-Key 副本）后隧道必须仍然可用
+#   step 9    外层源观测表（vBOND 地址发现）：三处采集点的证据 + verified 分档
+#             + clear 生效
 #
 # 用法:
 #   test/scripts/test-e2e.sh [--keep] [--skip-build] [--no-tamper] [--up-only]
@@ -564,6 +566,93 @@ fi
 
 echo "  -- restoring the lab key"
 rotate_key "${SR_KEY_HEX}"
+
+# ==================================================================
+echo
+info "step 9: 外层源观测表（vBOND 地址发现的数据面证据）"
+# ==================================================================
+# 定案 1：探针不再另开 socket，观测点就是数据面自己 —— 谁收到包，谁才知道
+# NAT 把对方的 socket 改成了什么。这一步断言三处采集点各自的行为，尤其是
+# verified 的分档：只有过了 SR HMAC 的包才算认证过的外层源。
+obs_of() { dx "$1" 'vppctl show sr-wg observed' | tr -d '\r'; }
+
+for c in ${ALL_CONTAINERS}; do
+    dx "${c}" 'vppctl clear sr-wg observed' >/dev/null 2>&1
+done
+OBS_EMPTY=$(obs_of "${C_TRANSIT}" | grep -c "0 observed tuple(s)")
+if [ "${OBS_EMPTY}" = "1" ]; then
+    ok "clear sr-wg observed 生效（transit 表已空）"
+else
+    bad "clear 后 transit 观测表非空: $(obs_of "${C_TRANSIT}" | tail -2 | tr '\n' ' ')"
+fi
+
+# 造一轮真实流量：node1 -> (SR/WG) -> transit -> node2，回程 node2 直发 WG
+dx "${C_NODE1}" 'vppctl ping 192.168.99.2 source wg0 repeat 5' >/dev/null 2>&1
+sleep 4
+
+OBS_T=$(obs_of "${C_TRANSIT}")
+OBS_N2=$(obs_of "${C_NODE2}")
+OBS_N1=$(obs_of "${C_NODE1}")
+echo "${OBS_T}" | sed 's/^/     transit: /'
+echo "${OBS_N2}" | sed 's/^/     node2:   /'
+echo "${OBS_N1}" | sed 's/^/     node1:   /'
+
+# (a) transit 必须看到 node1 的真实外层源，且落在 transit_port 上、verified=1
+if echo "${OBS_T}" | grep -qE "^ *${N1_UNDERLAY}:[0-9]+ -> :${TRANSIT_PORT} .*verified=1$"; then
+    ok "transit 观测到 ${N1_UNDERLAY} 打在 transit_port=${TRANSIT_PORT}，verified=1（过了 SR HMAC）"
+else
+    bad "transit 未观测到 ${N1_UNDERLAY}:${TRANSIT_PORT} 的已认证条目"
+fi
+
+# (b) 终点 CPE 也要看到打在自己 vpn_port 上的已认证条目。
+#     不断言具体源 IP：docker 网桥对跨网段帧做 SNAT（见 step 7 同款陷阱），
+#     node2 实际看到的 src 是 net_b 的网关而不是 10.10.1.2，这是 lab 的现象，
+#     不是数据面的错。观测本来就是"我看到的源"，lab 里就得按看到的记。
+if echo "${OBS_N2}" | grep -qE " -> :${VPN_PORT} .*verified=1$"; then
+    ok "node2 观测到 vpn_port=${VPN_PORT} 上的已认证外层源（解封装成功路径）"
+else
+    bad "node2 观测表里没有 verified=1 的 vpn_port 条目"
+fi
+
+# (c) node1 收到的是 node2 的普通 WG 直发包（无 SR 头）=> 必须有 verified=0
+if echo "${OBS_N1}" | grep -qE " -> :${VPN_PORT} .*verified=0$"; then
+    ok "node1 把旁路的普通 WG 包记成 verified=0（外层源未认证，只能当候选映射）"
+else
+    bad "node1 未记录 verified=0 的旁路观测（反向 WG 直连流量没进观测表）"
+fi
+
+# (d) 正常规模下不该互相淘汰：本 lab 每台只有一个 peer
+OBS_EV=$(echo "${OBS_T}" | awk -F'evictions=' '/evictions=/{print $2+0; exit}')
+if [ "${OBS_EV}" = "0" ]; then
+    ok "transit evictions=0（单 peer 场景下没有槽冲突）"
+else
+    bad "transit evictions=${OBS_EV}（正常规模就淘汰，哈希或表长有问题）"
+fi
+
+# (e) hits/age 可用：hits 至少随 keepalive/数据增长，age 是个位数秒
+OBS_HITS=$(echo "${OBS_T}" | grep -oE "hits=[0-9]+" | head -1 | cut -d= -f2)
+OBS_AGE=$(echo "${OBS_T}" | grep -oE "age=[0-9]+ s" | head -1 | cut -d= -f2 | cut -d' ' -f1)
+if [ -n "${OBS_HITS}" ] && [ "${OBS_HITS}" -gt 1 ] 2>/dev/null &&
+   [ -n "${OBS_AGE}" ] && [ "${OBS_AGE}" -lt 60 ] 2>/dev/null; then
+    ok "观测条目带 hits=${OBS_HITS} / age=${OBS_AGE}s（可用作映射新鲜度）"
+else
+    bad "观测条目计数异常: hits=${OBS_HITS} age=${OBS_AGE}"
+fi
+
+# (f) 清空后重新观测：证明表不是只写不删的死结构
+dx "${C_NODE1}" 'vppctl clear sr-wg observed' >/dev/null 2>&1
+if obs_of "${C_NODE1}" | grep -q "0 observed tuple(s)"; then
+    ok "clear 后 node1 表空"
+else
+    bad "clear 后 node1 仍有残留条目"
+fi
+dx "${C_NODE1}" 'vppctl ping 192.168.99.2 source wg0 repeat 3' >/dev/null 2>&1
+sleep 3
+if obs_of "${C_NODE1}" | grep -qE "^ *[0-9.]+:[0-9]+ -> :${VPN_PORT}"; then
+    ok "清空后继续观测（反向 WG 包重新入表）"
+else
+    bad "清空后没有重新观测到任何 vpn_port 条目"
+fi
 
 # ==================================================================
 echo

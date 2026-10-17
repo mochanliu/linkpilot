@@ -44,6 +44,7 @@ set(SR_WG_PLUGIN_SOURCES
   sr_hmac.c
   sr_siphash.c
   sr_path.c
+  sr_obs.c
 )
 
 ##############################################################################
@@ -64,6 +65,7 @@ add_vpp_plugin(sr_wg
     sr_hmac.h
     sr_siphash.h
     sr_path.h
+    sr_obs.h
     sr_counters.h
     sr_wg.h
 )

@@ -1,9 +1,9 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -O2 -I.
 
-SRCS = sr_hmac.c sr_siphash.c sr_path.c
+SRCS = sr_hmac.c sr_siphash.c sr_path.c sr_obs.c
 OBJS = $(SRCS:.c=.o)
-DEPS = sr_header.h sr_hmac.h sr_siphash.h sr_path.h sr_counters.h
+DEPS = sr_header.h sr_hmac.h sr_siphash.h sr_path.h sr_obs.h sr_counters.h
 LIB  = libsrwg.a
 
 BUILD_DIR = build

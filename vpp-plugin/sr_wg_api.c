@@ -452,7 +452,65 @@ vl_api_sr_wg_config_dump_t_handler (vl_api_sr_wg_config_dump_t *mp)
 
   rmp->n_enabled_ifs = clib_host_to_net_u32 (n);
 
+  /* 观测表规模与干扰计数：控制器据此判断"有没有人在往观测表灌假源" */
+  rmp->obs_count = clib_host_to_net_u32 (sm->obs.count);
+  rmp->obs_records = clib_host_to_net_u64 (sm->obs.records);
+  rmp->obs_evictions = clib_host_to_net_u64 (sm->obs.evictions);
+
   vl_api_send_msg (reg, (u8 *) rmp);
+}
+
+/* ==================== 外层源观测 API Handlers ==================== */
+
+static void
+vl_api_sr_wg_obs_dump_t_handler (vl_api_sr_wg_obs_dump_t *mp)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  vl_api_sr_wg_obs_details_t *rmp;
+  vl_api_registration_t *reg;
+  sr_obs_entry_t e;
+  u32 cursor = 0;
+  const u64 now_sec = (u64) vlib_time_now (vlib_get_main ());
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  while (sr_obs_next (&sm->obs, &cursor, &e))
+    {
+      u32 src_net;
+
+      rmp = vl_msg_api_alloc (sizeof (*rmp));
+      clib_memset (rmp, 0, sizeof (*rmp));
+      rmp->_vl_msg_id =
+        clib_host_to_net_u16 (VL_API_SR_WG_OBS_DETAILS + sm->msg_id_base);
+      rmp->context = mp->context;
+      /* 表里存的是主机序 u32（便于比较/单测），API 要的是地址字节序 */
+      src_net = clib_host_to_net_u32 (e.src_ip);
+      clib_memcpy_fast (rmp->src_ip, &src_net, 4);
+      rmp->src_port = clib_host_to_net_u16 (e.src_port);
+      rmp->dst_port = clib_host_to_net_u16 (e.dst_port);
+      rmp->rx_if = clib_host_to_net_u32 (e.rx_if);
+      rmp->hits = clib_host_to_net_u32 (e.hits);
+      /* 只给相对时间：插件时钟是"相对 VPP 启动"的，绝对值对控制器无意义 */
+      rmp->age_sec = clib_host_to_net_u32 (
+        e.last_seen <= now_sec ? (u32) (now_sec - e.last_seen) : 0);
+      rmp->verified = e.verified;
+
+      vl_api_send_msg (reg, (u8 *) rmp);
+    }
+}
+
+static void
+vl_api_sr_wg_obs_clear_t_handler (vl_api_sr_wg_obs_clear_t *mp)
+{
+  vl_api_sr_wg_obs_clear_reply_t *rmp;
+  sr_wg_main_t *sm = &sr_wg_main;
+  int rv = 0;
+
+  sr_obs_clear (&sm->obs);
+
+  REPLY_MACRO (VL_API_SR_WG_OBS_CLEAR_REPLY);
 }
 
 /* ==================== API 消息注册 ==================== */

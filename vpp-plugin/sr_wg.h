@@ -19,6 +19,7 @@
 #include "sr_hmac.h"
 #include "sr_path.h"
 #include "sr_counters.h"
+#include "sr_obs.h"
 
 #define SR_WG_PLUGIN_NAME  "sr_wg"
 #define SR_WG_MAX_KEYS     64
@@ -130,6 +131,16 @@ typedef struct {
 
   /* 计数器 */
   sr_counters_t counters;
+
+  /*
+   * 外层源观测表（vBOND 地址发现的数据面依据，见 sr_obs.h）。
+   * 采集点三处：sr-wg4-input 的解封装成功路径（verified=1，发送者持有 p-key，
+   * 但地址本身不在签名覆盖范围内）、sr-wg4-input 的旁路路径（verified=0，普通 WG 的
+   * handshake-init/keepalive，入网阶段只能靠它），以及 sr-wg4-transit 的
+   * 转发路径（verified=1，dst_port = transit_port，hub 形态下最自然的证人）。
+   * 地址发现的信号量就是 keepalive，不再另开探针 socket 去量。
+   */
+  sr_obs_table_t obs;
 
   /* Node indices（缓存） */
   u32 transit_node_index;

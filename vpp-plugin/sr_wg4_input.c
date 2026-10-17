@@ -10,6 +10,11 @@
  * 向后兼容：本节点接管了 51820 的全部流量，包括未启用 SR-WG 的
  * 普通 WireGuard 包。对这类包（载荷首字节不是 SR_MAGIC）直接旁路
  * 到 wg4-input，保证 WG 直连模式不受影响。
+ *
+ * vBOND 观测：本节点同时是**外层源观测**的采集点。凡是我们接受并交给
+ * wg4-input 的包（旁路的普通 WG 包 + 解封装成功的 SR 包），都记下它的
+ * 外层源 (ip:port) 与本机目的端口 —— 这就是"NAT 把那台 CPE 的隧道 socket
+ * 改成了什么"的唯一现场证据。丢包不记（见 Step 6 的注释）。
  */
 #include "sr_wg.h"
 
@@ -107,6 +112,13 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
   vlib_buffer_t **buf_ptr = bufs;
   u16 *next_ptr = nexts;
   sr_wg_main_t *sm = &sr_wg_main;
+  /*
+   * 每批取一次时钟：观测表只需要秒级粒度（keepalive 几秒一轮），
+   * 逐包读 rdtsc 是白给的热路径开销。
+   * 注意 vlib_time_now 是**相对 VPP 启动**的单调秒数，不是墙钟；
+   * dump 出去的时间戳由 agent 换算成 UTC 再上报控制器。
+   */
+  const u64 now_sec = (u64) vlib_time_now (vm);
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
@@ -126,6 +138,16 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       /* current_data 指向 SR Header（udp4-local 已剥掉 eth/ip4/udp） */
       srh = (sr_header_t *) vlib_buffer_get_current (b);
+
+      /*
+       * 外层头反推：udp4-local 只是推进 current_data，缓冲区里的 IP/UDP 字节
+       * 还在，所以从 SR Header 往回退 SR_OUTER_HDR_LEN 就取得到外层头。
+       * Step 5 的长度修正与 done: 的观测记录都要用它，故在此一次算好。
+       * 前提与 sr-wg4-transit 一致：外层 IPv4 头固定 20 字节（无选项）。
+       * 旁路包同样成立 —— 它的 current_data 也是 UDP payload 起点。
+       */
+      outer = (ip4_header_t *) ((u8 *) srh - SR_OUTER_HDR_LEN);
+      udp = (udp_header_t *) ((u8 *) outer + sizeof (ip4_header_t));
 
       /*
        * Step 0: WG 直连兼容旁路。
@@ -197,14 +219,12 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
        *
        * 位移之后 datagram 真的变短了，所以外层 ip4->length / udp->length 必须
        * 同步减回 sr_hdr_len（encap Step 13 加过），否则 wg4-input 会按虚高的
-       * 长度去解析越界数据。本包是我们自己封装的 WG 包，IP 头固定 20 字节
-       * （与 sr-wg4-transit 同一假设）。
+       * 长度去解析越界数据。outer/udp 已在循环开头反推，memmove 不动
+       * current_data，所以那两个指针此刻依然有效。
        */
       sr_hdr_len = sr_hdr_total_len (srh->seg_count);
       pay_len = b->current_length - sr_hdr_len;
 
-      outer = (ip4_header_t *) ((u8 *) srh - SR_OUTER_HDR_LEN);
-      udp = (udp_header_t *) ((u8 *) outer + sizeof (ip4_header_t));
       udp->length =
         clib_host_to_net_u16 (clib_net_to_host_u16 (udp->length) - sr_hdr_len);
       outer->length =
@@ -222,6 +242,28 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
     done:
       b->error = error ? node->errors[error] : 0;
+
+      /*
+       * Step 6: 外层源观测（vBOND 地址发现）。
+       *
+       * 只在**接受**（交给 wg4-input）时记录：HMAC 失败/无密钥/seg_left 非 0
+       * 的包不是"某个 peer 的 socket 到了"的证据，记进表只会让陌生人挤掉
+       * 真条目（表仅 SR_OBS_SLOTS 槽、冲突即覆盖；evictions 会暴露这种干扰）。
+       *
+       * verified 的取值必须如实：**只有走完 SR HMAC 校验的解封装包**才算被
+       * 认证（持有 p-key 的一方才签得出来；签名不覆盖外层 IP 头，认的是发送者
+       * 而不是地址）。旁路的普通 WG 包此刻没有任何本地可验证的凭据 —— initiator
+       * 的 static key 在密文里，wg4-input 要到我们之后才解密 —— 所以记 verified=0，
+       * 控制器只能把它当候选映射，靠该节点自己的上报或"用它建隧道后握手真成功"
+       * 来追认。
+       */
+      if (PREDICT_TRUE (next_index == SR_WG4_INPUT_NEXT_WG4_INPUT))
+        sr_obs_record (&sm->obs,
+                       clib_net_to_host_u32 (outer->src_address.as_u32),
+                       clib_net_to_host_u16 (udp->src_port),
+                       clib_net_to_host_u16 (udp->dst_port),
+                       (u16) vnet_buffer (b)->sw_if_index[VLIB_RX], now_sec,
+                       bypass ? 0 : 1);
 
       if (PREDICT_FALSE (b->flags & VLIB_BUFFER_IS_TRACED))
         {

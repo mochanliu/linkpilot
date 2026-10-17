@@ -6,7 +6,9 @@
  *   show sr-wg keys
  *   show sr-wg tunnels
  *   show sr-wg stats
+ *   show sr-wg observed
  *   clear sr-wg stats
+ *   clear sr-wg observed
  *   sr-wg path add <path_id> via <ip>:<port> [via <ip>:<port> ...]
  *                  [hmac-id <n>] [inactive]
  *   sr-wg path del <path_id>
@@ -241,6 +243,83 @@ VLIB_CLI_COMMAND (sr_wg_clear_stats_command, static) = {
   .path = "clear sr-wg stats",
   .short_help = "clear sr-wg stats",
   .function = sr_wg_clear_stats_command_fn,
+};
+
+/* ==================== show / clear sr-wg observed ==================== */
+
+/*
+ * vBOND 地址发现的现场证据：本节点看到的每个外层源元组。
+ *
+ * 时间只报"多少秒前最后一次看到"，不报绝对时间戳 —— 插件的时钟是相对 VPP
+ * 启动的秒数，把它打印成日期会误导排障（要绝对时间请让 agent 打自己的墙钟）。
+ *
+ * verified 一列是本命令的关键：0 表示这条观测来自旁路的普通 WG 包，外层源
+ * 无法在本节点认证（观测点在 WireGuard 解密之前），只能当候选映射；1 表示
+ * 至少有一次观测来自 SR HMAC 校验通过的包。看到 evictions 在涨就说明有人在
+ * 往这个端口灌伪造源。
+ */
+static clib_error_t *
+sr_wg_show_observed_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                               vlib_cli_command_t *cmd)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  sr_obs_entry_t e;
+  u32 cursor = 0, n = 0, n_verified = 0;
+  const u64 now_sec = (u64) vlib_time_now (vm);
+
+  while (sr_obs_next (&sm->obs, &cursor, &e))
+    {
+      ip4_address_t src;
+      u64 age = e.last_seen <= now_sec ? now_sec - e.last_seen : 0;
+
+      src.as_u32 = clib_host_to_net_u32 (e.src_ip);
+      n++;
+      n_verified += e.verified ? 1 : 0;
+
+      vlib_cli_output (vm, "  %U:%u -> :%u on %U age=%llu s hits=%u verified=%u",
+                       format_ip4_address, &src, (u32) e.src_port,
+                       (u32) e.dst_port, format_vnet_sw_if_index_name, vnm,
+                       (u32) e.rx_if, age, e.hits, e.verified);
+    }
+
+  vlib_cli_output (vm,
+                   "%u observed tuple(s), %u verified / %u unverified. "
+                   "records=%llu evictions=%llu",
+                   n, n_verified, n - n_verified, sm->obs.records,
+                   sm->obs.evictions);
+
+  if (n == 0)
+    vlib_cli_output (
+      vm, "  (空表。确认 vpn_port=%u 已注册到 sr-wg4-input："
+          "`set sr-wg rebind-ports` 必须在建 WG 接口之后执行)",
+      sm->vpn_port);
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_show_observed_command, static) = {
+  .path = "show sr-wg observed",
+  .short_help = "show sr-wg observed",
+  .function = sr_wg_show_observed_command_fn,
+};
+
+static clib_error_t *
+sr_wg_clear_observed_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                                vlib_cli_command_t *cmd)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+
+  sr_obs_clear (&sm->obs);
+  vlib_cli_output (vm, "SR-WG observation table cleared.");
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_clear_observed_command, static) = {
+  .path = "clear sr-wg observed",
+  .short_help = "clear sr-wg observed",
+  .function = sr_wg_clear_observed_command_fn,
 };
 
 /* ==================== sr-wg path ==================== */

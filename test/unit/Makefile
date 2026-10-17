@@ -1,6 +1,6 @@
 # Makefile - SR Header 核心库单元测试
 #
-# 直接编译被测源码（sr_hmac.c / sr_siphash.c / sr_path.c）与测试源码。
+# 直接编译被测源码（sr_hmac.c / sr_siphash.c / sr_path.c / sr_obs.c）与测试源码。
 # 签名使用内置 SipHash-2-4，无外部依赖；sr_header.h 为纯头文件
 # （inline 函数），无需单独编译。
 #
@@ -19,8 +19,8 @@ LDFLAGS  :=
 LDLIBS   :=
 
 # 测试源码 + 被测库源码
-TEST_SRCS := test_main.c test_sr_header.c test_sr_hmac.c test_sr_siphash.c test_sr_path.c
-LIB_SRCS  := $(PLUGIN_DIR)/sr_hmac.c $(PLUGIN_DIR)/sr_siphash.c $(PLUGIN_DIR)/sr_path.c
+TEST_SRCS := test_main.c test_sr_header.c test_sr_hmac.c test_sr_siphash.c test_sr_path.c test_sr_obs.c
+LIB_SRCS  := $(PLUGIN_DIR)/sr_hmac.c $(PLUGIN_DIR)/sr_siphash.c $(PLUGIN_DIR)/sr_path.c $(PLUGIN_DIR)/sr_obs.c
 SRCS      := $(TEST_SRCS) $(LIB_SRCS)
 
 # 所有 .o 统一放入 build/（用 notdir 避免路径冲突）
@@ -31,7 +31,8 @@ HDRS := test_framework.h \
         $(PLUGIN_DIR)/sr_header.h \
         $(PLUGIN_DIR)/sr_hmac.h \
         $(PLUGIN_DIR)/sr_siphash.h \
-        $(PLUGIN_DIR)/sr_path.h
+        $(PLUGIN_DIR)/sr_path.h \
+        $(PLUGIN_DIR)/sr_obs.h
 
 .PHONY: all test clean
 all: $(TARGET)

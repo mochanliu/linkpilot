@@ -40,6 +40,8 @@ service {
   rpc sr_wg_encap_fib_set returns sr_wg_encap_fib_set_reply;
   rpc sr_wg_rebind_ports returns sr_wg_rebind_ports_reply;
   rpc sr_wg_config_dump returns stream sr_wg_config_details;
+  rpc sr_wg_obs_dump returns stream sr_wg_obs_details;
+  rpc sr_wg_obs_clear returns sr_wg_obs_clear_reply;
   rpc sr_wg_stats_get returns sr_wg_stats_get_reply;
   rpc sr_wg_stats_clear returns sr_wg_stats_clear_reply;
 };
@@ -270,4 +272,48 @@ define sr_wg_config_details
   u32 enabled_ifs[32];            /* 已启用 sr-wg4-encap 的 underlay 接口 */
   u8  path_count;
   u8  key_count;
+  u32 obs_count;                  /* 观测表当前条目数 */
+  u64 obs_records;                /* 累计记录次数（含命中已有槽位） */
+  u64 obs_evictions;              /* 槽冲突挤掉旧条目次数：上涨=有人在灌假源 */
+};
+
+/* ==================== 外层源观测 API（vBOND 地址发现） ==================== */
+
+/** \brief dump 本节点观测到的外层源元组
+    @note 时间只给 **age_sec**（dump 时刻减去最后一次看到它的秒数），不给绝对
+          时间戳：插件里的时钟是"相对 VPP 启动"的，绝对值对控制器毫无意义。
+          agent 上报时给自己的墙钟时间戳即可。
+    @note verified=0 的条目是**候选**映射，不是结论（见 sr_obs.h：观测点在
+          WireGuard 解密之前，旁路包的外层源无法本地认证）。控制器要么用该
+          节点自己的上报交叉确认，要么用"按它建隧道后握手真成功"追认。
+    @note verified=1 认证的也不是地址：SR HMAC 只覆盖 ver_flags..segments，
+          外层 IP 头不在签名里，链路上的 NAT 照样会改写源地址。它证明的是
+          "有一个持有 p-key 的对端此刻在用这个 (ip:port) 发包"。
+*/
+define sr_wg_obs_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+define sr_wg_obs_details
+{
+  u32 context;
+  vl_api_ip4_address_t src_ip;    /* 观测到的外层源 IPv4 */
+  u16 src_port;
+  u16 dst_port;                   /* 本机被观测到的目的端口 = 本节点 vpn_port */
+  u32 rx_if;                      /* 收包接口 sw_if_index */
+  u32 hits;
+  u32 age_sec;                    /* 距最后一次看到本元组过了多少秒 */
+  u8  verified;                   /* 1 = 至少一次观测来自 SR HMAC 校验通过的包 */
+};
+
+/** \brief 清空观测表（"从这里开始重新观测"，records/evictions 一并归零，
+           由 config_dump 读回）
+    @note 归属重做发现时用；不清也行——表是有界的直接映射，旧条目会被挤掉。
+*/
+autoreply define sr_wg_obs_clear
+{
+  u32 client_index;
+  u32 context;
 };
