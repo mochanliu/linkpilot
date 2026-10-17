@@ -182,6 +182,25 @@ func TestLiveAgainstVPP(t *testing.T) {
 		}
 		t.Logf("wireguard_peer_add 返回 peer_index=%d", peerIdx)
 
+		// 同公钥再加一次，**换 endpoint 也不行**：实测 -116 =
+		// VNET_API_ERROR_ENTRY_ALREADY_EXISTS（对照 /usr/include/vnet/error.h）。
+		// 去重键是公钥而不是 (公钥, endpoint)，所以"对端换了 NAT 端口"这件事
+		// 在数据面只能靠先 remove 再 add 完成 —— agent 的 reconcile 必须这么写，
+		// 否则它会以为 add 失败是自己没配好，隧道永远停在旧地址上。
+		_, err = c.AddPeer(ctx, PeerParams{
+			PublicKey:  peerPub,
+			EndpointIP: net.IPv4(10, 10, 2, 3),
+			Port:       51821,
+			Keepalive:  25,
+			SWIfIndex:  idx,
+			AllowedIPs: []Prefix{{IP: net.IPv4(192, 168, 99, 4), Len: 32}},
+		})
+		var dup APIError
+		if !errors.As(err, &dup) || dup.Retval != -116 {
+			t.Fatalf("重复 add（换 endpoint）应该回 -116 ENTRY_ALREADY_EXISTS，got: %v", err)
+		}
+		t.Logf("同公钥换 endpoint 再 add = %v（去重键是公钥，只能先删后加）", err)
+
 		// peer 的读回是 agent 重启时"认回已有隧道"的唯一依据：认不回来就会
 		// 第二次 add 撞上 -31，或者更糟——把旧 endpoint 当成新的一直不去改。
 		// 这里按公钥找（不是按下标），因为 VPP 的 peer_index 会回收复用，

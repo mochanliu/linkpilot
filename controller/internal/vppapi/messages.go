@@ -258,6 +258,9 @@ func (c *Client) DeleteInterface(ctx context.Context, swIfIndex uint32) error {
 }
 
 // AddPeer 装一个 WG peer，返回 peer_index。
+//
+// 按公钥去重：同公钥再加一次回 -116 ENTRY_ALREADY_EXISTS，换 endpoint 也救不回来。
+// 所以对端地址变了要先 RemovePeer 再 AddPeer（见 RemovePeer）。
 func (c *Client) AddPeer(ctx context.Context, p PeerParams) (uint32, error) {
 	if len(p.PublicKey) != wgKeyLen {
 		return 0, fmt.Errorf("vppapi: peer 公钥必须 %d 字节，给了 %d", wgKeyLen, len(p.PublicKey))
@@ -343,8 +346,10 @@ func (c *Client) Interfaces(ctx context.Context, showPrivate bool) ([]InterfaceI
 // WgPeer 是 wireguard_peers_dump 回来的一条 peer，即数据面**当下真正在用**的状态。
 //
 // 为什么非要有这条：agent 重启（或崩在配置中途）时，VPP 里的接口和 peer 并不会
-// 跟着消失，而 wireguard 插件对重复的 create/add 回的是错误（实测 -31 / EEXIST）。
-// 只会"从零配一遍"的 agent 第二次就起不来，只能人工去 vppctl 里删干净 —— 那不是
+// 跟着消失，而 wireguard 插件对重复的 create/add 回的是错误（接口实例号被占
+// 实测 -31 INVALID_REGISTRATION；同公钥重复 add peer 实测 -116 ENTRY_ALREADY_EXISTS，
+// 换 endpoint 也一样 —— 去重键是公钥）。只会"从零配一遍"的 agent 第二次就起不来，
+// 只能人工去 vppctl 里删干净 —— 那不是
 // 一个能长期跑的东西。另外外层 endpoint 变了要重装 peer，也得先知道旧的 peer_index。
 type WgPeer struct {
 	PeerIndex  uint32
