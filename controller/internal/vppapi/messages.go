@@ -43,6 +43,10 @@ var requiredVersions = map[string]string{
 	"wireguard_interface_details":      "0dd4865d",
 	"wireguard_peer_add":               "9b8aad61",
 	"wireguard_peer_add_reply":         "084a0cd3",
+	"wireguard_peer_remove":            "3b74607a",
+	"wireguard_peer_remove_reply":      "e8d4e804",
+	"wireguard_peers_dump":             "3b74607a",
+	"wireguard_peers_details":          "6a9f6bc3",
 	"sr_wg_path_add_del":               "f1579105",
 	"sr_wg_path_add_del_reply":         "e8d4e804",
 	"sr_wg_path_dump":                  "e7177ea0",
@@ -334,6 +338,87 @@ func (c *Client) Interfaces(ctx context.Context, showPrivate bool) ([]InterfaceI
 	return out, nil
 }
 
+// ==================== WG peer 的读回与删除 ====================
+
+// WgPeer 是 wireguard_peers_dump 回来的一条 peer，即数据面**当下真正在用**的状态。
+//
+// 为什么非要有这条：agent 重启（或崩在配置中途）时，VPP 里的接口和 peer 并不会
+// 跟着消失，而 wireguard 插件对重复的 create/add 回的是错误（实测 -31 / EEXIST）。
+// 只会"从零配一遍"的 agent 第二次就起不来，只能人工去 vppctl 里删干净 —— 那不是
+// 一个能长期跑的东西。另外外层 endpoint 变了要重装 peer，也得先知道旧的 peer_index。
+type WgPeer struct {
+	PeerIndex  uint32
+	PublicKey  []byte
+	EndpointIP net.IP
+	Port       uint16
+	Keepalive  uint16
+	TableID    uint32
+	SWIfIndex  uint32
+	Flags      uint8
+	AllowedIPs []Prefix
+}
+
+// wgPeerBaseLen 是 vl_api_wireguard_peer_t 去掉变长尾部后的定长部分（67 字节，
+// 含 flags 这一字节 —— flags 在 vapi 的头文件里是 enum，但 VPP 实际按 u8 发送：
+// 实测一条带 1 个 allowed_ip 的 details 帧长 91 = 帧头 6 + 67 + 18）。
+const (
+	wgPeerBaseLen = 67
+	prefixLen     = 18 // vl_api_prefix_t = address(17) + len(1)
+)
+
+// Peers 读回全部 WG peer。VPP 的过滤字段是 peer_index（~0 为全量），接口维度
+// 的筛选在调用方按 SWIfIndex 做 —— 少一个会骗人的参数比多一个用不上的参数好。
+func (c *Client) Peers(ctx context.Context) ([]WgPeer, error) {
+	frames, err := c.dump(ctx, "wireguard_peers_dump", "wireguard_peers_details",
+		appendU32(nil, ^uint32(0)))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WgPeer, 0, len(frames))
+	for i, f := range frames {
+		if len(f) < 6+wgPeerBaseLen {
+			return nil, fmt.Errorf("vppapi: wireguard_peers_details[%d] 太短 (%d B)，插件结构变了", i, len(f))
+		}
+		p := WgPeer{
+			PeerIndex:  binary.BigEndian.Uint32(f[6:10]),
+			PublicKey:  append([]byte(nil), f[10:42]...),
+			Port:       binary.BigEndian.Uint16(f[42:44]),
+			Keepalive:  binary.BigEndian.Uint16(f[44:46]),
+			TableID:    binary.BigEndian.Uint32(f[46:50]),
+			EndpointIP: readAddress(f[50:67]),
+			SWIfIndex:  binary.BigEndian.Uint32(f[67:71]),
+			Flags:      f[71],
+		}
+		n := int(f[72])
+		if len(f) < 73+n*prefixLen {
+			return nil, fmt.Errorf("vppapi: wireguard_peers_details[%d] 的 allowed_ips 被截断 (声明 %d 条，帧只有 %d B)", i, n, len(f))
+		}
+		for j := 0; j < n; j++ {
+			at := 73 + j*prefixLen
+			p.AllowedIPs = append(p.AllowedIPs, Prefix{
+				IP:  readAddress(f[at : at+17]),
+				Len: f[at+17],
+			})
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// RemovePeer 按 peer_index 摘掉一个 peer。VPP 没有"改 peer 的 endpoint"这条消息
+// （26.06 的 wireguard.api 只有 add/remove/dump），所以外层地址变了只能先删再加。
+//
+// peer_index 不存在时回 -6（VNET_API_ERROR_NO_SUCH_ENTRY，真机实测），不是静默成功：
+// reconcile 路径要用 errors.As 认出它、当"已经不在了"继续往下走，其它错误不能吞。
+func (c *Client) RemovePeer(ctx context.Context, peerIndex uint32) error {
+	frame, err := c.call(ctx, "wireguard_peer_remove", "wireguard_peer_remove_reply",
+		appendU32(nil, peerIndex))
+	if err != nil {
+		return err
+	}
+	return c.retval("wireguard_peer_remove", frame)
+}
+
 // ==================== SR 路径 / 隧道绑定 / 挂点 ====================
 
 // 段的字节数：vl_api_sr_wg_segment_t = ip4(4) + port(2)，且数组是**固定 8 项**
@@ -613,4 +698,17 @@ func appendAddress(b []byte, ip net.IP) []byte {
 	}
 	copy(pad, ip.To16())
 	return append(append(b, apiAddressFamilyIP6), pad...)
+}
+
+// readAddress 读回 vl_api_address_t（17 字节）。af 不是 v4/v6 时返回 nil：
+// VPP 用"没有地址"和"地址是 0.0.0.0"表达两件事，把它们读成同一个值，
+// 调用方就没法判断 peer 到底有没有 endpoint 了。
+func readAddress(f []byte) net.IP {
+	switch f[0] {
+	case apiAddressFamilyIP4:
+		return net.IP(append([]byte(nil), f[1:5]...))
+	case apiAddressFamilyIP6:
+		return net.IP(append([]byte(nil), f[1:17]...))
+	}
+	return nil
 }

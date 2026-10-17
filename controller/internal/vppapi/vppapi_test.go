@@ -1,8 +1,10 @@
 package vppapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +34,8 @@ type fakeVPP struct {
 	ifDetails   int
 	pathDetails int
 	tunDetails  int
+	peerDetails int
+	peersRaw    [][]byte // 非空时按原样发这些 details 载荷（用来回放真 VPP 抓到的帧）
 	requests    chan request
 }
 
@@ -164,7 +168,7 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 
 	switch name {
 	case "sr_wg_key_set", "sr_wg_rebind_ports", "sr_wg_obs_clear",
-		"wireguard_interface_delete",
+		"wireguard_interface_delete", "wireguard_peer_remove",
 		"sr_wg_path_add_del", "sr_wg_tunnel_set_path", "sr_wg_encap_enable",
 		"sr_wg_transit_enable", "sr_wg_transit_disable":
 		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
@@ -183,6 +187,16 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "wireguard_interface_dump":
 		for i := 0; i < f.ifDetails; i++ {
 			f.sendFrameOf(conn, "wireguard_interface_details", reqCtx, ifDetailBytes(i))
+		}
+	case "wireguard_peers_dump":
+		if len(f.peersRaw) > 0 {
+			for _, raw := range f.peersRaw {
+				f.sendFrameOf(conn, "wireguard_peers_details", reqCtx, raw)
+			}
+			break
+		}
+		for i := 0; i < f.peerDetails; i++ {
+			f.sendFrameOf(conn, "wireguard_peers_details", reqCtx, peerDetailBytes(i))
 		}
 	case "sr_wg_path_dump":
 		for i := 0; i < f.pathDetails; i++ {
@@ -272,6 +286,27 @@ func tunDetailBytes(i int) []byte {
 	binary.BigEndian.PutUint16(b[4:6], uint16(1+i))
 	copy(b[6:10], []byte{10, 10, 2, 2})
 	b[10] = 1
+	return b
+}
+
+// peerDetailBytes 造一条 wireguard_peers_details 的载荷：基体 67 字节 + 2 条
+// prefix（各 18）。字段与数值刻意取成那次真机探针的同一组，这样这一层与 live
+// 层对的是同一份实测布局。
+func peerDetailBytes(i int) []byte {
+	b := make([]byte, 0, wgPeerBaseLen+2*prefixLen)
+	b = appendU32(b, uint32(1+i))
+	b = append(b, bytes.Repeat([]byte{byte(0xa0 + i)}, wgKeyLen)...)
+	b = appendU16(b, 51820) // 外层目的端口
+	b = appendU16(b, 25)    // persistent_keepalive
+	b = appendU32(b, 0)     // table_id
+	b = appendAddress(b, net.IPv4(192, 0, 2, 7))
+	b = appendU32(b, 3) // sw_if_index
+	b = append(b, 0)    // flags
+	b = append(b, 2)    // n_allowed_ips
+	b = appendAddress(b, net.IPv4(198, 51, 100, 1))
+	b = append(b, 32)
+	b = appendAddress(b, net.IPv4(198, 51, 100, 2))
+	b = append(b, 24)
 	return b
 }
 
@@ -847,6 +882,115 @@ func TestEncapAndTransitEncoding(t *testing.T) {
 	if len(r.body) != 0 {
 		t.Errorf("transit_disable 不该带字段，got %x", r.body)
 	}
+}
+
+// ==================== WG peer 读回 / 删除 ====================
+
+func TestRemovePeerEncoding(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	if err := c.RemovePeer(context.Background(), 17); err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	if r.name != "wireguard_peer_remove" {
+		t.Fatalf("请求名 = %s", r.name)
+	}
+	if len(r.body) != 4 || binary.BigEndian.Uint32(r.body) != 17 {
+		t.Errorf("peer_remove 只该带 peer_index，got %x", r.body)
+	}
+}
+
+func TestPeersParsesDump(t *testing.T) {
+	f := newFake(t)
+	f.peerDetails = 2
+	c := f.dial(t)
+	peers, err := c.Peers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 2 {
+		t.Fatalf("peer %d 条", len(peers))
+	}
+	p := peers[1]
+	if p.PeerIndex != 2 || p.SWIfIndex != 3 {
+		t.Errorf("索引不对: %+v", p)
+	}
+	if !equalBytes(p.PublicKey, bytes.Repeat([]byte{0xa1}, 32)) {
+		t.Errorf("公钥不对: %x", p.PublicKey)
+	}
+	// 端口/keepalive/endpoint/allowed_ips 是 agent 判断"这条 peer 现在打到哪"的
+	// 全部依据，读错一个字段，重启后就会把旧 endpoint 当成新的而跳过真正的变化。
+	if p.Port != 51820 || p.Keepalive != 25 {
+		t.Errorf("port=%d keepalive=%d", p.Port, p.Keepalive)
+	}
+	if !p.EndpointIP.Equal(net.IPv4(192, 0, 2, 7)) {
+		t.Errorf("endpoint = %v", p.EndpointIP)
+	}
+	if len(p.AllowedIPs) != 2 || p.AllowedIPs[0].Len != 32 ||
+		!p.AllowedIPs[1].IP.Equal(net.IPv4(198, 51, 100, 2)) || p.AllowedIPs[1].Len != 24 {
+		t.Errorf("allowed_ips 不对: %+v", p.AllowedIPs)
+	}
+}
+
+func TestPeersDecodesFrameFromRealVPP(t *testing.T) {
+	frame, err := hex.DecodeString(realPeersFrame())
+	if err != nil {
+		t.Fatalf("夹具本身写坏了: %v", err)
+	}
+	if len(frame) != 109 {
+		t.Fatalf("帧长 = %d，期望 109（帧头 6 + 基体 67 + 2 条 prefix）", len(frame))
+	}
+	f := newFake(t)
+	f.peersRaw = [][]byte{frame[6:]}
+	c := f.dial(t)
+	peers, err := c.Peers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("peer %d 条", len(peers))
+	}
+	p := peers[0]
+	if p.PeerIndex != 1 || p.SWIfIndex != 3 || p.Port != 51820 || p.Keepalive != 25 {
+		t.Errorf("头部字段不对: %+v", p)
+	}
+	if !equalBytes(p.PublicKey, bytes.Repeat([]byte{0xaa}, 32)) {
+		t.Errorf("公钥不对: %x", p.PublicKey)
+	}
+	if !p.EndpointIP.Equal(net.IPv4(192, 0, 2, 7)) {
+		t.Errorf("endpoint = %v", p.EndpointIP)
+	}
+	if len(p.AllowedIPs) != 2 ||
+		!p.AllowedIPs[0].IP.Equal(net.IPv4(198, 51, 100, 1)) || p.AllowedIPs[0].Len != 32 ||
+		!p.AllowedIPs[1].IP.Equal(net.IPv4(198, 51, 100, 2)) || p.AllowedIPs[1].Len != 24 {
+		t.Errorf("allowed_ips 不对: %+v", p.AllowedIPs)
+	}
+	if p.Flags != 0 {
+		t.Logf("flags=%d（VPP 的内部状态位，本客户端只透传不解释）", p.Flags)
+	}
+}
+
+// realPeersFrame 是从 srwg-node1（VPP 26.06）抓回来的**一帧原文**：先用
+// wireguard_peer_add 装一个 port=51820 / keepalive=25 / endpoint=192.0.2.7 /
+// sw_if_index=3 / 两条 allowed_ip 的 peer，再用 wireguard_peers_dump 读回来。
+// 拿它当夹具，是因为这些偏移只要有一个字节错，我自己写的编码器会跟着一起错，
+// 只有真机的字节才能证明"读的是同一种格式"。分段写是为了让每个字段能被单独数清
+// —— 一长串 hex 抄错一位，这个测试就会变成假证据。
+func realPeersFrame() string {
+	zero12 := strings.Repeat("00", 12)
+	return "07f400000033" + // msg_id=2036, context
+		"00000001" + // peer_index
+		strings.Repeat("aa", 32) + // public_key
+		"ca6c" + // port 51820
+		"0019" + // keepalive 25
+		"00000000" + // table_id
+		"00" + "c0000207" + zero12 + // endpoint: af=IP4 + 192.0.2.7
+		"00000003" + // sw_if_index
+		"00" + // flags
+		"02" + // n_allowed_ips
+		"00" + "c6336401" + zero12 + "20" + // 198.51.100.1/32
+		"00" + "c6336402" + zero12 + "18" // 198.51.100.2/24
 }
 
 // ==================== 错帧与噪声 ====================

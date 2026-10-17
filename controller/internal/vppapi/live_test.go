@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -179,6 +181,96 @@ func TestLiveAgainstVPP(t *testing.T) {
 			return
 		}
 		t.Logf("wireguard_peer_add 返回 peer_index=%d", peerIdx)
+
+		// peer 的读回是 agent 重启时"认回已有隧道"的唯一依据：认不回来就会
+		// 第二次 add 撞上 -31，或者更糟——把旧 endpoint 当成新的一直不去改。
+		// 这里按公钥找（不是按下标），因为 VPP 的 peer_index 会回收复用，
+		// 只有公钥是"这条 peer 是谁"的稳定答案。
+		peers, err := c.Peers(ctx)
+		if err != nil {
+			t.Fatalf("Peers: %v", err)
+		}
+		var got *WgPeer
+		onMine := 0
+		for i := range peers {
+			if equalBytes(peers[i].PublicKey, peerPub) {
+				got = &peers[i]
+			}
+			if peers[i].SWIfIndex == idx {
+				onMine++
+			}
+		}
+		if got == nil {
+			t.Fatalf("刚装的 peer 不在 dump 里（共 %d 条 peer）", len(peers))
+		}
+		if got.PeerIndex != peerIdx {
+			t.Errorf("peer_index 对不上：add 回 %d，dump 回 %d", peerIdx, got.PeerIndex)
+		}
+		if got.SWIfIndex != idx {
+			t.Errorf("挂在别的接口上：want %d, got %d", idx, got.SWIfIndex)
+		}
+		if onMine != 1 {
+			t.Errorf("我这个接口上应该有且只有 1 条 peer，dump 出 %d 条（dump 不带接口过滤，客户端按 SWIfIndex 筛）", onMine)
+		}
+		// endpoint / port / keepalive 三个字段读错，agent 就会判定"没变化"而
+		// 不重配 —— 那正是"NAT 重绑之后隧道再也不通"的成因。
+		if !got.EndpointIP.Equal(net.IPv4(10, 10, 2, 2)) {
+			t.Errorf("endpoint = %v，want 10.10.2.2", got.EndpointIP)
+		}
+		if got.Port != 51821 || got.Keepalive != 25 {
+			t.Errorf("port=%d keepalive=%d，want 51821/25", got.Port, got.Keepalive)
+		}
+		if len(got.AllowedIPs) != 1 || !got.AllowedIPs[0].IP.Equal(net.IPv4(192, 168, 99, 3)) ||
+			got.AllowedIPs[0].Len != 32 {
+			t.Errorf("allowed_ips = %+v，want 192.168.99.3/32", got.AllowedIPs)
+		}
+		t.Logf("peer 读回：index=%d endpoint=%v:%d keepalive=%d allowed=%v",
+			got.PeerIndex, got.EndpointIP, got.Port, got.Keepalive, got.AllowedIPs)
+
+		// CLI 是第二只眼睛：show wireguard peer 打的是十六进制公钥。
+		if out, err := vppctl(ctx, "show", "wireguard", "peer"); err == nil {
+			line := cliLine(out, hex.EncodeToString(peerPub))
+			if line == "" {
+				t.Errorf("CLI 里看不到这条 peer（API 与 CLI 读的是同一张表）:\n%s", out)
+			} else if !strings.Contains(line, "public key:") {
+				t.Errorf("CLI 那行不像公钥行: %q", line)
+			} else {
+				t.Logf("CLI 佐证: %s", strings.TrimSpace(line))
+			}
+		} else {
+			t.Logf("没有 vppctl，跳过 CLI 佐证: %v", err)
+		}
+
+		// VPP 26.06 没有"改 peer endpoint"这条消息，只有 add/remove/dump，
+		// 所以换 endpoint 必须是先删后加。删除走不通的话，这条路径整个不成立。
+		if err := c.RemovePeer(ctx, got.PeerIndex); err != nil {
+			t.Fatalf("RemovePeer(%d): %v", got.PeerIndex, err)
+		}
+		peers, err = c.Peers(ctx)
+		if err != nil {
+			t.Fatalf("删除后 Peers: %v", err)
+		}
+		for _, p := range peers {
+			if equalBytes(p.PublicKey, peerPub) {
+				t.Fatalf("删掉了 yet dump 里还在: %+v", p)
+			}
+		}
+		if out, err := vppctl(ctx, "show", "wireguard", "peer"); err == nil {
+			if l := cliLine(out, hex.EncodeToString(peerPub)); l != "" {
+				t.Errorf("CLI 里这条 peer 还在: %q", l)
+			}
+		}
+
+		// 删不存在的 peer：VPP 不会当成成功。把 retval 钉成测试，是因为 agent 的
+		// reconcile 逻辑必须区分"这条 peer 已经不在了"（良性，继续 add）和
+		// "连接/参数出错了"（不能忽略）。-6 = VNET_API_ERROR_NO_SUCH_ENTRY，
+		// 由 /usr/include/vnet/error.h 的 foreach_vnet_error 对照实测值得出。
+		err = c.RemovePeer(ctx, peerIdx)
+		var apiErr APIError
+		if !errors.As(err, &apiErr) || apiErr.Retval != -6 {
+			t.Fatalf("重复删除应该回 -6 NO_SUCH_ENTRY，got: %v", err)
+		}
+		t.Logf("重复 RemovePeer(%d) = %v（agent 要把这个当良性）", peerIdx, err)
 	})
 
 	t.Run("path_tunnel_binding", func(t *testing.T) {
