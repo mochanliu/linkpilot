@@ -10,6 +10,23 @@
 
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
+
+/*
+ * REPLY_MACRO 发出的是 `本地枚举值 + REPLY_MSG_ID_BASE`，而
+ * api_helper_macros.h 在插件没定义它时把 REPLY_MSG_ID_BASE 默认成 0
+ * （#ifndef 兜底，不报错、不警告）。sr_wg.api_enum.h 的枚举从 0 开始，
+ * 所以漏掉这一行的后果是 reply 带着**插件内部下标**上线：实测
+ * sr_wg_key_set 的应答 msg_id = 5、sr_wg_key_del = 7，正好等于枚举里
+ * _REPLY 的下标；而 5 和 7 在全局表里是 rx_thread_exit 与
+ * memclnt_read_timeout，客户端于是把应答当成异步通知丢掉，rpc 永远超时
+ * ——本机的观测证据：数据面确实执行了（key_dump 随后能 dump 出那把钥匙），
+ * 但应答认不出来。
+ *
+ * CLI 走不到这条路（vppctl 的 sr-wg 命令是本插件自己的 CLI），所以只有
+ * 二进制客户端会撞上。手工发送点（*_details、stats_get_reply）都写了
+ * `+ sm->msg_id_base`，唯独 REPLY_MACRO 这条少了一个 base 定义。
+ */
+#define REPLY_MSG_ID_BASE sr_wg_main.msg_id_base
 #include <vlibapi/api_helper_macros.h>
 
 /*
