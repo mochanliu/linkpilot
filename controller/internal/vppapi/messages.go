@@ -43,6 +43,20 @@ var requiredVersions = map[string]string{
 	"wireguard_interface_details":      "0dd4865d",
 	"wireguard_peer_add":               "9b8aad61",
 	"wireguard_peer_add_reply":         "084a0cd3",
+	"sr_wg_path_add_del":               "f1579105",
+	"sr_wg_path_add_del_reply":         "e8d4e804",
+	"sr_wg_path_dump":                  "e7177ea0",
+	"sr_wg_path_details":               "e4624a51",
+	"sr_wg_tunnel_set_path":            "2a437a14",
+	"sr_wg_tunnel_set_path_reply":      "e8d4e804",
+	"sr_wg_tunnel_dump":                "529cb13f",
+	"sr_wg_tunnel_details":             "a6acdfbb",
+	"sr_wg_encap_enable":               "a36fadc0",
+	"sr_wg_encap_enable_reply":         "e8d4e804",
+	"sr_wg_transit_enable":             "42bb04c5",
+	"sr_wg_transit_enable_reply":       "e8d4e804",
+	"sr_wg_transit_disable":            "51077d14",
+	"sr_wg_transit_disable_reply":      "e8d4e804",
 }
 
 func checkVersions(ids map[string]uint16, crcs map[string]string, want map[string]string) error {
@@ -320,6 +334,246 @@ func (c *Client) Interfaces(ctx context.Context, showPrivate bool) ([]InterfaceI
 	return out, nil
 }
 
+// ==================== SR 路径 / 隧道绑定 / 挂点 ====================
+
+// 段的字节数：vl_api_sr_wg_segment_t = ip4(4) + port(2)，且数组是**固定 8 项**
+// 的 segments[8]，不是变长。少写了未用那几项的填充，请求就短于 VPP 注册的结构，
+// 而 VPP 对短请求只留一行 Truncated message 便丢弃。
+const (
+	segmentLen    = 6
+	maxSegments   = 8
+	pathBodyLen   = 1 + 2 + 2 + 1 + 1 + segmentLen*maxSegments // 55
+	pathDetailLen = 2 + 4 + 2 + 2 + 1 + 1 + segmentLen*maxSegments
+)
+
+// Segment 是 SR 路径上的一跳外层地址。
+//
+// 段的顺序照数据面的约定（vpp-plugin/sr_wg4_encap.c 头部注释）：
+//
+//	Segments[0]      = 最终目的节点（打它的 VPN 端口 51820）
+//	Segments[n-1]    = 第一跳中转（"首跳免费"，由外层 IP/UDP 承载）
+//
+// 也就是**倒序**，与 sr-wg CLI 的 `via` 顺序一致。写反了不会报错：包照样发出去，
+// 只是发往错误的第一跳，症状是"路径配上了但隧道不通"。
+type Segment struct {
+	IP   net.IP // 只支持 IPv4：vl_api_ip4_address_t 就是 4 字节
+	Port uint16
+}
+
+// PathParams 是一条 SR 路径。HmacID 引用的 P-Key **必须已经装进密钥表**，
+// 否则 VPP 回 NO_SUCH_ENTRY —— 路径存的是密钥副本，缺钥匙时若用全零密钥建路径，
+// 包能正常发出去但对端一律验签失败，控制器完全看不出来。
+type PathParams struct {
+	PathID   uint16
+	HmacID   uint16
+	Active   bool
+	Segments []Segment
+}
+
+// PathInfo 是 sr_wg_path_dump 回来的一条路径。
+type PathInfo struct {
+	PathID   uint16
+	HmacID   uint16
+	Active   bool
+	Segments []Segment
+}
+
+// AddPath 新增或按 PathID 覆盖一条路径（is_add=1）。
+func (c *Client) AddPath(ctx context.Context, p PathParams) error {
+	if len(p.Segments) == 0 || len(p.Segments) > maxSegments {
+		return fmt.Errorf("vppapi: 路径段数必须 1..%d，给了 %d", maxSegments, len(p.Segments))
+	}
+	for i, s := range p.Segments {
+		if s.IP.To4() == nil {
+			return fmt.Errorf("vppapi: segments[%d] 地址 %v 不是 IPv4，SR 段只支持 IPv4", i, s.IP)
+		}
+	}
+	body := make([]byte, 0, pathBodyLen)
+	body = append(body, 1) // is_add
+	body = appendU16(body, p.PathID)
+	body = appendU16(body, p.HmacID)
+	body = append(body, byte(len(p.Segments)))
+	if p.Active {
+		body = append(body, 1)
+	} else {
+		body = append(body, 0)
+	}
+	body = appendSegments(body, p.Segments)
+	frame, err := c.call(ctx, "sr_wg_path_add_del", "sr_wg_path_add_del_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_path_add_del", frame)
+}
+
+// DelPath 删一条路径。**指向该路径的隧道绑定会被一并摘除**：若只删路径而留着
+// 绑定，收包时只会按 encap_no_path 静默丢包，看不出是谁的问题。
+func (c *Client) DelPath(ctx context.Context, pathID uint16) error {
+	body := make([]byte, pathBodyLen)
+	// body[0] = is_add = 0；只有 path_id 有意义，其余补零凑满注册结构。
+	binary.BigEndian.PutUint16(body[1:3], pathID)
+	frame, err := c.call(ctx, "sr_wg_path_add_del", "sr_wg_path_add_del_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_path_add_del", frame)
+}
+
+// Paths 读回路径表；pathID 传 ^uint16(0) 表示全量。
+// 0 是合法 path_id，所以"全量"只能靠这个哨兵值表达。
+func (c *Client) Paths(ctx context.Context, pathID uint16) ([]PathInfo, error) {
+	frames, err := c.dump(ctx, "sr_wg_path_dump", "sr_wg_path_details", appendU16(nil, pathID))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PathInfo, 0, len(frames))
+	for _, f := range frames {
+		if len(f) < pathDetailLen {
+			return nil, fmt.Errorf("vppapi: sr_wg_path_details 太短 (%d B)，插件结构变了", len(f))
+		}
+		out = append(out, PathInfo{
+			PathID:   binary.BigEndian.Uint16(f[6:8]),
+			HmacID:   binary.BigEndian.Uint16(f[8:10]),
+			Active:   f[11] != 0,
+			Segments: readSegments(f[12:], f[10]),
+		})
+	}
+	return out, nil
+}
+
+// TunnelBinding 把一条 WG 隧道接口绑到一条 SR 路径上。
+//
+// EndpointIP 是 WG peer 的**外层** IPv4：encap 挂点挂在 underlay 出口接口上，
+// 数据面按外层目的地址查绑定，所以漏了它这条绑定永远不会命中 —— 而"没命中"在
+// 计数器上表现为 encap_bypass，看起来像"配置根本没生效"。
+type TunnelBinding struct {
+	SWIfIndex  uint32
+	PathID     uint16
+	EndpointIP net.IP
+}
+
+// TunnelInfo 是 sr_wg_tunnel_dump 回来的一条绑定。Effective=false 意味着
+// endpoint 配了但 underlay 上没启用 sr-wg4-encap：包会静默旁路 SR 头。
+type TunnelInfo struct {
+	SWIfIndex  uint32
+	PathID     uint16
+	EndpointIP net.IP
+	Effective  bool
+}
+
+// SetTunnel 绑定隧道到路径（is_add=1）。它**不会**自动启用 feature，
+// 那是 EnableEncap 的活儿；两步都做完才是"这条隧道走 SR"。
+func (c *Client) SetTunnel(ctx context.Context, b TunnelBinding) error {
+	if b.EndpointIP.To4() == nil {
+		return fmt.Errorf("vppapi: 隧道绑定的 endpoint %v 不是 IPv4", b.EndpointIP)
+	}
+	body := make([]byte, 0, 11)
+	body = append(body, 1)
+	body = appendU32(body, b.SWIfIndex)
+	body = appendU16(body, b.PathID)
+	body = appendIP4(body, b.EndpointIP)
+	frame, err := c.call(ctx, "sr_wg_tunnel_set_path", "sr_wg_tunnel_set_path_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_tunnel_set_path", frame)
+}
+
+// ClearTunnel 解绑某接口上的隧道绑定（路径仍在表里，只是不再被这条隧道引用）。
+func (c *Client) ClearTunnel(ctx context.Context, swIfIndex uint32) error {
+	body := make([]byte, 11)
+	binary.BigEndian.PutUint32(body[1:5], swIfIndex) // body[0] = is_add = 0
+	frame, err := c.call(ctx, "sr_wg_tunnel_set_path", "sr_wg_tunnel_set_path_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_tunnel_set_path", frame)
+}
+
+// Tunnels 读回隧道绑定；swIfIndex 传 ^uint32(0) 表示全量。
+func (c *Client) Tunnels(ctx context.Context, swIfIndex uint32) ([]TunnelInfo, error) {
+	frames, err := c.dump(ctx, "sr_wg_tunnel_dump", "sr_wg_tunnel_details", appendU32(nil, swIfIndex))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TunnelInfo, 0, len(frames))
+	for _, f := range frames {
+		// msg_id(2) context(4) sw_if_index(4) path_id(2) endpoint_ip(4) is_effective(1)
+		if len(f) < 17 {
+			return nil, fmt.Errorf("vppapi: sr_wg_tunnel_details 太短 (%d B)，插件结构变了", len(f))
+		}
+		out = append(out, TunnelInfo{
+			SWIfIndex:  binary.BigEndian.Uint32(f[6:10]),
+			PathID:     binary.BigEndian.Uint16(f[10:12]),
+			EndpointIP: net.IP(append([]byte(nil), f[12:16]...)),
+			Effective:  f[16] != 0,
+		})
+	}
+	return out, nil
+}
+
+// EnableEncap 在 **underlay 出口接口**上启/停 ip4-output 的 sr-wg4-encap。
+//
+// 传 wg0 是错的，而且是静默的：wg4-output-tun 不进入 feature 链，挂 wg0 收不到
+// 任何包，症状是"启用成功了但一个包都没被 encap"。sw_if_index 必须是 host-eth1
+// 这类真正的出口。
+func (c *Client) EnableEncap(ctx context.Context, swIfIndex uint32, enable bool) error {
+	body := make([]byte, 5)
+	binary.BigEndian.PutUint32(body, swIfIndex)
+	if enable {
+		body[4] = 1
+	}
+	frame, err := c.call(ctx, "sr_wg_encap_enable", "sr_wg_encap_enable_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_encap_enable", frame)
+}
+
+// SetTransit 让本机按 transit 角色收 SR 包：只验签 + 弹一段 + 改外层目的，
+// 不解密、**绝不改外层源**。port 是租户的 transit 端口（定案 2 下发的那个），
+// 改端口会同时重注册 UDP 分发表。
+func (c *Client) SetTransit(ctx context.Context, port uint16) error {
+	frame, err := c.call(ctx, "sr_wg_transit_enable", "sr_wg_transit_enable_reply", appendU16(nil, port))
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_transit_enable", frame)
+}
+
+// ClearTransit 关掉本机中转。
+func (c *Client) ClearTransit(ctx context.Context) error {
+	frame, err := c.call(ctx, "sr_wg_transit_disable", "sr_wg_transit_disable_reply", nil)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_transit_disable", frame)
+}
+
+// appendSegments 写满定长数组 segments[8]：未用的槽位补零。
+func appendSegments(b []byte, segs []Segment) []byte {
+	for _, s := range segs {
+		b = appendIP4(b, s.IP)
+		b = appendU16(b, s.Port)
+	}
+	return append(b, make([]byte, segmentLen*(maxSegments-len(segs)))...)
+}
+
+func readSegments(raw []byte, count uint8) []Segment {
+	if int(count) > maxSegments {
+		count = maxSegments
+	}
+	out := make([]Segment, 0, count)
+	for i := 0; i < int(count); i++ {
+		at := raw[i*segmentLen : i*segmentLen+segmentLen]
+		out = append(out, Segment{
+			IP:   net.IP(append([]byte(nil), at[:4]...)),
+			Port: binary.BigEndian.Uint16(at[4:6]),
+		})
+	}
+	return out
+}
+
 // ==================== 编码小工具 ====================
 
 func appendU16(b []byte, v uint16) []byte {
@@ -339,6 +593,13 @@ func appendU32(b []byte, v uint32) []byte {
 // 表现为"配置成功了但隧道不通"——那正是本项目最贵的一类故障。
 func isAPIAddress(ip net.IP) bool {
 	return ip != nil && (ip.To4() != nil || len(ip) == net.IPv6len)
+}
+
+// appendIP4 写 vl_api_ip4_address_t：就是裸的 4 字节，没有 af 前缀。
+// 本插件的路径段与隧道 endpoint 用的都是它（vpp-plugin/sr_wg.api），
+// 所以 IPv6 地址在这里是错误，不是"另一种写法"。调用方须先验过 To4()。
+func appendIP4(b []byte, ip net.IP) []byte {
+	return append(b, ip.To4()...)
 }
 
 // appendAddress 写 vl_api_address_t：u8 af + union{ip4[4], ip6[16]} = 17 字节。

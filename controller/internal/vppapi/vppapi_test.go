@@ -30,6 +30,8 @@ type fakeVPP struct {
 	retvals     map[string]int32 // 让某条请求回非 0 retval
 	obsDetails  int
 	ifDetails   int
+	pathDetails int
+	tunDetails  int
 	requests    chan request
 }
 
@@ -162,7 +164,9 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 
 	switch name {
 	case "sr_wg_key_set", "sr_wg_rebind_ports", "sr_wg_obs_clear",
-		"wireguard_interface_delete":
+		"wireguard_interface_delete",
+		"sr_wg_path_add_del", "sr_wg_tunnel_set_path", "sr_wg_encap_enable",
+		"sr_wg_transit_enable", "sr_wg_transit_disable":
 		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
 	case "sr_wg_stats_get":
 		// 真实尺寸 138 = msg_id(2)+context(4)+retval(4)+16 个 u64
@@ -179,6 +183,14 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "wireguard_interface_dump":
 		for i := 0; i < f.ifDetails; i++ {
 			f.sendFrameOf(conn, "wireguard_interface_details", reqCtx, ifDetailBytes(i))
+		}
+	case "sr_wg_path_dump":
+		for i := 0; i < f.pathDetails; i++ {
+			f.sendFrameOf(conn, "sr_wg_path_details", reqCtx, pathDetailBytes(i))
+		}
+	case "sr_wg_tunnel_dump":
+		for i := 0; i < f.tunDetails; i++ {
+			f.sendFrameOf(conn, "sr_wg_tunnel_details", reqCtx, tunDetailBytes(i))
 		}
 	}
 	// 未知请求：不回。客户端应当超时，而不是永远挂着。
@@ -234,6 +246,32 @@ func ifDetailBytes(i int) []byte {
 	}
 	binary.BigEndian.PutUint16(b[72:74], uint16(51999+i))
 	copy(b[75:79], []byte{10, 10, 1, 2})
+	return b
+}
+
+// vl_api_sr_wg_path_details_t 净体 = path_id(2) hmac_id(2) seg_count(1) active(1)
+// segments[8](48)。段的顺序是数据面那套倒序：[0]=终点 VPN 口，[n-1]=首跳中转口。
+func pathDetailBytes(i int) []byte {
+	b := make([]byte, 54)
+	binary.BigEndian.PutUint16(b[0:2], uint16(1+i))
+	binary.BigEndian.PutUint16(b[2:4], 1) // hmac_id
+	b[4] = 2                              // seg_count
+	b[5] = 1                              // active
+	copy(b[6:10], []byte{10, 10, 2, 2})
+	binary.BigEndian.PutUint16(b[10:12], 51820)
+	copy(b[12:16], []byte{10, 10, 1, 3})
+	binary.BigEndian.PutUint16(b[16:18], 51821)
+	return b
+}
+
+// vl_api_sr_wg_tunnel_details_t 净体 = sw_if_index(4) path_id(2) endpoint_ip(4)
+// is_effective(1)。is_effective=0 是"绑了但 underlay 没启 encap"的静默旁路态。
+func tunDetailBytes(i int) []byte {
+	b := make([]byte, 11)
+	binary.BigEndian.PutUint32(b[0:4], uint32(2+i))
+	binary.BigEndian.PutUint16(b[4:6], uint16(1+i))
+	copy(b[6:10], []byte{10, 10, 2, 2})
+	b[10] = 1
 	return b
 }
 
@@ -581,6 +619,233 @@ func TestInterfacesShowPrivate(t *testing.T) {
 	}
 	if len(ifs[0].PrivateKey) != 32 || !ifs[0].SrcIP.Equal(net.IPv4(10, 10, 1, 2)) {
 		t.Errorf("私钥/源地址解码错了: %+v", ifs[0])
+	}
+}
+
+// ==================== SR 路径 / 隧道绑定 / 挂点 ====================
+
+func TestAddPathEncoding(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	err := c.AddPath(context.Background(), PathParams{
+		PathID: 1, HmacID: 7, Active: true,
+		Segments: []Segment{
+			{IP: net.IPv4(10, 10, 2, 2), Port: 51820}, // [0] = 终点，打 VPN 口
+			{IP: net.IPv4(10, 10, 1, 3), Port: 51821}, // [n-1] = 首跳，打中转口
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	// 体长必须是 55：段数组是定长 8 项。写"实际有几段发几段"会得到一个短请求，
+	// VPP 只在日志留一行 Truncated message 就丢掉，运行期表现为莫名超时。
+	if len(r.body) != pathBodyLen {
+		t.Fatalf("path_add_del 体长 = %d，期望 %d", len(r.body), pathBodyLen)
+	}
+	if r.body[0] != 1 {
+		t.Errorf("is_add = %d", r.body[0])
+	}
+	if got := binary.BigEndian.Uint16(r.body[1:3]); got != 1 {
+		t.Errorf("path_id = %d", got)
+	}
+	if got := binary.BigEndian.Uint16(r.body[3:5]); got != 7 {
+		t.Errorf("hmac_id = %d", got)
+	}
+	if r.body[5] != 2 {
+		t.Errorf("seg_count = %d，期望 2", r.body[5])
+	}
+	if r.body[6] != 1 {
+		t.Errorf("active = %d，期望 1", r.body[6])
+	}
+	// 段的起点在 is_add(1)+path_id(2)+hmac_id(2)+seg_count(1)+active(1) = 7。
+	if !equalBytes(r.body[7:11], []byte{10, 10, 2, 2}) || binary.BigEndian.Uint16(r.body[11:13]) != 51820 {
+		t.Errorf("segments[0] 不对: %x（数据面约定 [0]=终点）", r.body[7:13])
+	}
+	if !equalBytes(r.body[13:17], []byte{10, 10, 1, 3}) || binary.BigEndian.Uint16(r.body[17:19]) != 51821 {
+		t.Errorf("segments[1] 不对: %x", r.body[13:19])
+	}
+	for i := 19; i < len(r.body); i++ {
+		if r.body[i] != 0 {
+			t.Fatalf("未用的段槽位没补零（offset %d = %d）", i, r.body[i])
+		}
+	}
+}
+
+func TestAddPathRejectsBadSegmentsBeforeSend(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	cases := []struct {
+		why  string
+		segs []Segment
+	}{
+		{"零段路径", nil},
+		{"超过 8 段", make([]Segment, maxSegments+1)},
+		// SR 段是 vl_api_ip4_address_t（4 字节），IPv6 不是"另一种写法"，编不出来。
+		{"IPv6 段", []Segment{{IP: net.ParseIP("2001:db8::1"), Port: 51820}}},
+		{"空地址段", []Segment{{Port: 51820}}},
+	}
+	for _, tc := range cases {
+		if err := c.AddPath(context.Background(), PathParams{Segments: tc.segs}); err == nil {
+			t.Errorf("%s 必须在发出前报错", tc.why)
+		}
+	}
+	select {
+	case r := <-f.requests:
+		t.Fatalf("校验失败却发出了请求: %s", r.name)
+	default:
+	}
+}
+
+func TestDelPathStillSendsFullStruct(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	if err := c.DelPath(context.Background(), 0x1234); err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	if len(r.body) != pathBodyLen || r.body[0] != 0 {
+		t.Fatalf("删除也要发满结构: 体长 %d is_add %d", len(r.body), r.body[0])
+	}
+	if got := binary.BigEndian.Uint16(r.body[1:3]); got != 0x1234 {
+		t.Errorf("path_id = %x", got)
+	}
+}
+
+func TestAddPathPropagatesNoSuchEntry(t *testing.T) {
+	// 路径存的是密钥副本：hmac_id 不在密钥表里时 VPP 回 NO_SUCH_ENTRY。
+	// 若这里吞掉 retval，调用方会以为路径建好了，实际发出去的包对端一律验签失败。
+	f := newFake(t)
+	f.retvals["sr_wg_path_add_del"] = -8 // VNET_API_ERROR_NO_SUCH_ENTRY
+	c := f.dial(t)
+	err := c.AddPath(context.Background(), PathParams{
+		PathID: 1, HmacID: 99, Segments: []Segment{{IP: net.IPv4(10, 10, 2, 2), Port: 51820}},
+	})
+	var apiErr APIError
+	if !errors.As(err, &apiErr) || apiErr.Retval != -8 {
+		t.Fatalf("期望 APIError(-8)，got %T %v", err, err)
+	}
+}
+
+func TestPathsParsesDetails(t *testing.T) {
+	f := newFake(t)
+	f.pathDetails = 2
+	c := f.dial(t)
+	paths, err := c.Paths(context.Background(), ^uint16(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("路径 %d 条", len(paths))
+	}
+	p := paths[0]
+	if p.PathID != 1 || p.HmacID != 1 || !p.Active {
+		t.Errorf("头部字段不对: %+v", p)
+	}
+	if len(p.Segments) != 2 ||
+		!equalBytes(p.Segments[0].IP, net.IPv4(10, 10, 2, 2).To4()) || p.Segments[0].Port != 51820 ||
+		p.Segments[1].Port != 51821 {
+		t.Errorf("段解析不对: %+v", p.Segments)
+	}
+	// 全量查询的哨兵值要真的发出去：0 是合法 path_id，不能用 0 表示"全部"。
+	r := f.lastRequest(t)
+	if len(r.body) != 2 || binary.BigEndian.Uint16(r.body) != ^uint16(0) {
+		t.Errorf("path_dump 没带全量哨兵: %x", r.body)
+	}
+}
+
+func TestSetTunnelEncoding(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	err := c.SetTunnel(context.Background(), TunnelBinding{
+		SWIfIndex: 2, PathID: 1, EndpointIP: net.IPv4(10, 10, 2, 2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	if len(r.body) != 11 {
+		t.Fatalf("tunnel_set_path 体长 = %d，期望 11", len(r.body))
+	}
+	if r.body[0] != 1 {
+		t.Errorf("is_add = %d", r.body[0])
+	}
+	if got := binary.BigEndian.Uint32(r.body[1:5]); got != 2 {
+		t.Errorf("sw_if_index = %d", got)
+	}
+	if got := binary.BigEndian.Uint16(r.body[5:7]); got != 1 {
+		t.Errorf("path_id = %d", got)
+	}
+	// endpoint 是数据面查绑定的唯一线索：漏了它这条绑定永远不命中，
+	// 而计数器只会显示 encap_bypass。
+	if !equalBytes(r.body[7:11], net.IPv4(10, 10, 2, 2).To4()) {
+		t.Errorf("endpoint_ip = %x，期望按裸 4 字节写", r.body[7:11])
+	}
+
+	if err := c.SetTunnel(context.Background(), TunnelBinding{SWIfIndex: 2}); err == nil {
+		t.Error("endpoint 为空也必须先拦住")
+	}
+	if err := c.ClearTunnel(context.Background(), 5); err != nil {
+		t.Fatal(err)
+	}
+	r = f.lastRequest(t)
+	if len(r.body) != 11 || r.body[0] != 0 || binary.BigEndian.Uint32(r.body[1:5]) != 5 {
+		t.Errorf("解绑请求不对: %x", r.body)
+	}
+}
+
+func TestTunnelsParsesEffective(t *testing.T) {
+	f := newFake(t)
+	f.tunDetails = 1
+	c := f.dial(t)
+	tuns, err := c.Tunnels(context.Background(), ^uint32(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tuns) != 1 {
+		t.Fatalf("绑定 %d 条", len(tuns))
+	}
+	tn := tuns[0]
+	if tn.SWIfIndex != 2 || tn.PathID != 1 || !tn.Effective {
+		t.Errorf("绑定解析不对: %+v", tn)
+	}
+	if !equalBytes(tn.EndpointIP, net.IPv4(10, 10, 2, 2).To4()) {
+		t.Errorf("endpoint = %v", tn.EndpointIP)
+	}
+}
+
+func TestEncapAndTransitEncoding(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+
+	if err := c.EnableEncap(context.Background(), 3, true); err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	if len(r.body) != 5 || binary.BigEndian.Uint32(r.body[0:4]) != 3 || r.body[4] != 1 {
+		t.Errorf("encap_enable 编码不对: %x", r.body)
+	}
+	if err := c.EnableEncap(context.Background(), 3, false); err != nil {
+		t.Fatal(err)
+	}
+	if r = f.lastRequest(t); r.body[4] != 0 {
+		t.Errorf("停用 encap 时 enable 字节 = %d", r.body[4])
+	}
+
+	if err := c.SetTransit(context.Background(), 51821); err != nil {
+		t.Fatal(err)
+	}
+	r = f.lastRequest(t)
+	if len(r.body) != 2 || binary.BigEndian.Uint16(r.body) != 51821 {
+		t.Errorf("transit_enable 端口不对: %x", r.body)
+	}
+
+	if err := c.ClearTransit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r = f.lastRequest(t)
+	if len(r.body) != 0 {
+		t.Errorf("transit_disable 不该带字段，got %x", r.body)
 	}
 }
 

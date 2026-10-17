@@ -88,10 +88,12 @@ vl_api_sr_wg_path_add_del_t_handler (vl_api_sr_wg_path_add_del_t *mp)
       for (i = 0; i < cfg.seg_count; i++)
         {
           clib_memcpy_fast (cfg.segments[i].ip, mp->segments[i].ip, 4);
-          /* port: API 传递为 host order u16, 转为网络序存储 */
-          u16 port_net = clib_host_to_net_u16 (
-            clib_net_to_host_u16 (mp->segments[i].port));
-          clib_memcpy_fast (cfg.segments[i].port, &port_net, 2);
+          /*
+           * 消息里 port 两字节按网络序来，路径表按网络序存 —— 直通即可。
+           * （旧写法是 host_to_net(net_to_host(x))，两次 swap 互为恒等，
+           * 结果一样但读起来像在漏一次字节序转换。）
+           */
+          clib_memcpy_fast (cfg.segments[i].port, &mp->segments[i].port, 2);
         }
 
       /* 从密钥表查找 P-Key 并填入路径配置 */
@@ -163,10 +165,17 @@ vl_api_sr_wg_path_dump_t_handler (vl_api_sr_wg_path_dump_t *mp)
 
       for (j = 0; j < cfg->seg_count; j++)
         {
+          /*
+           * 段里的 ip 与 port 在路径表中**本来就是网络序**，所以两字节原样搬进
+           * 消息即符合 VPP 的 API 约定（消息字段一律网络序）。
+           *
+           * 这里原先写的是 `rmp->segments[j].port = clib_net_to_host_u16 (…)`：
+           * 对已经是网络序的值又 swap 一次，x86 上以小端落进消息 —— 同一个端口在
+           * path_add_del（请求，大端）和 path_details（应答，小端）里字节序不一致。
+           * Go 客户端实测：装进 51820，dump 回 27850 (= 0x6CCA)。
+           */
           clib_memcpy_fast (rmp->segments[j].ip, cfg->segments[j].ip, 4);
-          u16 port_net;
-          clib_memcpy_fast (&port_net, cfg->segments[j].port, 2);
-          rmp->segments[j].port = clib_net_to_host_u16 (port_net);
+          clib_memcpy_fast (&rmp->segments[j].port, cfg->segments[j].port, 2);
         }
 
       vl_api_send_msg (reg, (u8 *) rmp);
