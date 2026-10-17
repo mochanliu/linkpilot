@@ -83,13 +83,25 @@ services:
       - net.ipv4.ip_forward=1
 
 networks:
+  # net_a / net_b 必须关掉网桥的 IP masquerade。
+  # Docker 在 VM 里给每张桥都装了 MASQUERADE，并且 br_netfilter 让「二层转发」的
+  # IP 报文也走 POSTROUTING：transit 的 VPP 明明原样保留外层源（step 7 用它自己的
+  # trace 证明过），出桥时内核却把 10.10.1.2 改写成网桥网关 10.10.2.1。
+  # WireGuard 的 endpoint roaming 于是把两端静态配的 peer endpoint 全部污染成网关
+  # 地址（实测 node1 -> 10.10.1.1:<随机端口>），encap 的外层 dst 再也对不上绑定
+  # 端点，整条 SR 路径静默旁路（Encap ok=0，overlay 0 回包），隧道时好时坏。
+  # net_ctrl 保留 masquerade：容器编译时要装 python3-ply 等包，得留着出网通道。
   net_a:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
     ipam:
       config:
         - subnet: 10.10.1.0/24
   net_b:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
     ipam:
       config:
         - subnet: 10.10.2.0/24

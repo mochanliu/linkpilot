@@ -58,12 +58,15 @@
 #   vppctl set interface state wg0 up
 #   vppctl set sr-wg rebind-ports        # 必须在 wg-create 之后：建 WG 接口会
 #                                        # 把 51820 重新注册给 wg4-input
-#   vppctl wireguard peer add wg0 public-key <node2_pub> endpoint 10.10.2.2 \
-#          allowed-ip 192.168.99.2/32 dst-port 51820 persistent-keepalive 5
-#   vppctl ip route add 192.168.99.2/32 via wg0        # WG 不会自动下发路由
 #   vppctl sr-wg path add 1 via 10.10.2.2:51820 via 10.10.1.3:51821 hmac-id 1
 #   vppctl set sr-wg tunnel 2 path 1 endpoint 10.10.2.2   # 2 = wg0 的 sw_if_index
 #   vppctl set sr-wg encap enable 1                         # 1 = host-eth1
+#   # ↑ SR 三件套必须排在 peer add 之前：peer 一加 wireguard 立刻发
+#   # handshake-init，encap 还没挂上时这个包会走 docker 网桥被 SNAT，
+#   # 回包外层源变成网关地址，把 peer 的 endpoint 污染掉（见 cmd_peer 注释）。
+#   vppctl wireguard peer add wg0 public-key <node2_pub> endpoint 10.10.2.2 \
+#          allowed-ip 192.168.99.2/32 dst-port 51820 persistent-keepalive 5
+#   vppctl ip route add 192.168.99.2/32 via wg0        # WG 不会自动下发路由
 #   vppctl ping 192.168.99.2 source wg0 repeat 5            # 期望 0% loss；首轮可能全丢（握手要跑满一个 keepalive 周期）
 #   vppctl show sr-wg stats ; vppctl show wireguard peer    # peer flags:2 = ESTABLISHED
 #
@@ -207,6 +210,66 @@ wg_public_key() {
               {sub(/^public-key:/,"",$i); print $i; exit}}'
 }
 
+# peer 的动态 endpoint，即 "endpoint:[本端->对端]" 里的对端
+wg_peer_endpoint() {
+    vppctl show wireguard peer 2>/dev/null | tr -d '\r' |
+        sed -n 's/.*->\([0-9.]*:[0-9]*\)\].*/\1/p' | head -1
+}
+
+# 按公钥找回 peer 的 [N] 索引（`wireguard peer remove <N>` 用）
+wg_peer_index_of() {
+    vppctl show wireguard peer 2>/dev/null | tr -d '\r' |
+        awk -v k="$1" '
+            /^\[[0-9]+\]/ { idx=$1; gsub(/[][]/,"",idx); next }
+            /public-key:/ { if (index($0, k)) { print idx; exit } }'
+}
+
+wg_add_peer() {
+    local peer_pub=$1
+    vppctl show wireguard peer 2>/dev/null | grep -q "${peer_pub}" ||
+        vppctl wireguard peer add "${WG_IF}" \
+               public-key "${peer_pub}" \
+               endpoint "${PEER_UNDERLAY}" \
+               allowed-ip "${PEER_OVERLAY}/32" \
+               dst-port "${VPN_PORT}" \
+               persistent-keepalive "${KEEPALIVE}" || die "wireguard peer add failed"
+    log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=${PEER_OVERLAY}/32"
+}
+
+# WireGuard 有 endpoint roaming：对端只要从另一个地址发来**签名有效**的报文，
+# 静态配的 endpoint 就会被改写。本实验环境里 docker 网桥会 SNAT 一部分跨网段
+# 流量，实测把 node1 的 peer endpoint 改成了 10.10.1.1:<随机端口>，之后 encap
+# 的外层 dst 永远不等于绑定端点 → 整条 SR 路径静默旁路（Encap ok=0）。
+# add 带「已存在就跳过」守卫，救不回被污染的老 peer，所以这里显式校验，
+# 污染了就摘掉重建一次 —— 调用点已保证 encap 先配好，重建后的 handshake
+# 第一跳就走 SR 路径，不会再被网桥改写。
+wg_ensure_endpoint() {
+    local peer_pub=$1 ep idx want="${PEER_UNDERLAY}:${VPN_PORT}"
+    ep=$(wg_peer_endpoint)
+    if [ "${ep}" = "${want}" ]; then
+        log "wg peer endpoint ok: ${ep}"
+        return 0
+    fi
+    log "WARNING: wg peer endpoint drifted: got '${ep}', want '${want}' -> rebuild peer"
+    idx=$(wg_peer_index_of "${peer_pub}")
+    if [ -z "${idx}" ]; then
+        log "         cannot locate peer [N] for ${peer_pub}, skip rebuild"
+        return 1
+    fi
+    vppctl wireguard peer remove "${idx}" >/dev/null 2>&1 || true
+    sleep 1
+    wg_add_peer "${peer_pub}"
+    sleep 3
+    ep=$(wg_peer_endpoint)
+    if [ "${ep}" = "${want}" ]; then
+        log "wg peer endpoint repaired: ${ep}"
+    else
+        log "WARNING: wg peer endpoint still '${ep}' (want '${want}')"
+        log "         manual repair: vppctl wireguard peer remove ${idx},"
+        log "                        then $0 ${ROLE} peer <peer_pubkey>"
+    fi
+}
+
 srwg_stat() {   # $1 = <section>_<name>，例如 Encap_ok
     # vppctl 输出行尾是 \r\n。不脱掉 \r 的话 $1 会是 "Encap:\r"，下面的
     # sub(/:$/,"") 匹配不上，每个计数都会被当成 0 —— 断言全部假阴性，
@@ -284,67 +347,54 @@ cmd_peer() {
     local no_sr=${2:-}
     [ -n "${peer_pub}" ] || die "usage: setup-node.sh ${ROLE} peer <peer_pubkey> [nosr]"
 
-    vppctl show wireguard peer 2>/dev/null | grep -q "${peer_pub}" ||
-        vppctl wireguard peer add "${WG_IF}" \
-               public-key "${peer_pub}" \
-               endpoint "${PEER_UNDERLAY}" \
-               allowed-ip "${PEER_OVERLAY}/32" \
-               dst-port "${VPN_PORT}" \
-               persistent-keepalive "${KEEPALIVE}" || die "wireguard peer add failed"
-    log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=${PEER_OVERLAY}/32"
-
-    # WireGuard 有 endpoint roaming：对端只要从另一个地址发来**签名有效**的报文，
-    # 静态配的 endpoint 就会被改写。本实验环境里 docker 网桥会 SNAT 一部分跨网段
-    # 流量，实测把 node1 的 peer endpoint 改成了 10.10.1.1:<随机端口>，之后 encap
-    # 的外层 dst 永远不等于绑定端点 → 整条 SR 路径静默旁路（Encap ok=0）。
-    # 上面的 add 带「已存在就跳过」守卫，救不回被污染的老 peer，所以这里显式校验。
-    ep=$(vppctl show wireguard peer 2>/dev/null | tr -d '\r' |
-         sed -n 's/.*->\([0-9.]*:[0-9]*\)\].*/\1/p' | head -1)
-    if [ "${ep}" != "${PEER_UNDERLAY}:${VPN_PORT}" ]; then
-        log "WARNING: wg peer endpoint drifted: got '${ep}', want '${PEER_UNDERLAY}:${VPN_PORT}'"
-        log "         repair: vppctl wireguard peer remove <[N] in show wireguard peer>,"
-        log "                  then $0 ${ROLE} peer ${peer_pub}${no_sr:+ ${no_sr}}"
-    fi
-
     # VPP WireGuard 不会自动为 allowed-ip 安装 FIB 路由，需要手动添加
     vppctl ip route add "${PEER_OVERLAY}/32" via "${WG_IF}" 2>/dev/null || true
 
-    # 如果传入 nosr，跳过 SR 路径绑定（用于 WG 直连模式测试）
+    # 顺序很重要：先配 SR（path / tunnel / encap），**最后**才加 peer。
+    # peer 一加，wireguard 立刻发 handshake-init；那时 encap 还没挂上，这个包
+    # 走的是 docker 网桥而不是 transit，被网桥 SNAT 之后对端回包的外层源就成了
+    # 网关地址，endpoint roaming 把本端静态 endpoint 改掉 → encap 永远不命中 →
+    # 整条 SR 路径静默旁路（Encap ok=0，overlay 0 回包）。实测踩过。
     if [ "${no_sr}" = "nosr" ]; then
-        log "skipping SR path setup (nosr mode)"
-        return 0
+        log "nosr mode: skip SR path setup (WG direct endpoint)"
+    else
+        # SR 路径：segments[0]=最终目的(peer:51820)，segments[1]=第一跳(transit:51821)
+        vppctl sr-wg path add "${SR_PATH_ID}" \
+               via "${PEER_UNDERLAY}:${VPN_PORT}" \
+               via "${FIRST_HOP}:${TRANSIT_PORT}" \
+               hmac-id "${SR_HMAC_ID}" || die "sr-wg path add failed"
+
+        local swidx
+        swidx=$(sw_if_index_of "${WG_IF}")
+        [ -n "${swidx}" ] || die "cannot resolve sw_if_index of ${WG_IF}"
+        vppctl set sr-wg tunnel "${swidx}" path "${SR_PATH_ID}" \
+               endpoint "${PEER_UNDERLAY}" || die "set sr-wg tunnel failed"
+        log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID} endpoint=${PEER_UNDERLAY}"
+
+        # encap 的挂点是 **underlay 出口接口**，不是 wg0：VPP 26.06 的
+        # wg4-output-tun 把 next 硬编码为 adj-midchain-tx，从不走 feature 链，
+        # 挂在 wg0 上 0 vectors（已实测）。
+        local uvif uidx
+        uvif=$(vpp_ifname_for_ip "${SELF_UNDERLAY}")
+        [ -n "${uvif}" ] || die "cannot find VPP interface holding ${SELF_UNDERLAY}"
+        uidx=$(sw_if_index_of "${uvif}")
+        [ -n "${uidx}" ] || die "cannot resolve sw_if_index of ${uvif}"
+        vppctl set sr-wg encap enable "${uidx}" >/dev/null ||
+            die "set sr-wg encap enable ${uidx} (${uvif}) failed"
+        log "sr-wg4-encap enabled on underlay ${uvif}(sw_if_index=${uidx})"
     fi
 
-    # SR 路径：segments[0]=最终目的(peer:51820)，segments[1]=第一跳(transit:51821)
-    vppctl sr-wg path add "${SR_PATH_ID}" \
-           via "${PEER_UNDERLAY}:${VPN_PORT}" \
-           via "${FIRST_HOP}:${TRANSIT_PORT}" \
-           hmac-id "${SR_HMAC_ID}" || die "sr-wg path add failed"
+    wg_add_peer "${peer_pub}"
 
-    local swidx
-    swidx=$(sw_if_index_of "${WG_IF}")
-    [ -n "${swidx}" ] || die "cannot resolve sw_if_index of ${WG_IF}"
-    vppctl set sr-wg tunnel "${swidx}" path "${SR_PATH_ID}" \
-           endpoint "${PEER_UNDERLAY}" || die "set sr-wg tunnel failed"
-    log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID} endpoint=${PEER_UNDERLAY}"
+    if [ "${no_sr}" != "nosr" ]; then
+        wg_ensure_endpoint "${peer_pub}"
 
-    # encap 的挂点是 **underlay 出口接口**，不是 wg0：VPP 26.06 的
-    # wg4-output-tun 把 next 硬编码为 adj-midchain-tx，从不走 feature 链，
-    # 挂在 wg0 上 0 vectors（已实测）。
-    local uvif uidx
-    uvif=$(vpp_ifname_for_ip "${SELF_UNDERLAY}")
-    [ -n "${uvif}" ] || die "cannot find VPP interface holding ${SELF_UNDERLAY}"
-    uidx=$(sw_if_index_of "${uvif}")
-    [ -n "${uidx}" ] || die "cannot resolve sw_if_index of ${uvif}"
-    vppctl set sr-wg encap enable "${uidx}" >/dev/null ||
-        die "set sr-wg encap enable ${uidx} (${uvif}) failed"
-    log "sr-wg4-encap enabled on underlay ${uvif}(sw_if_index=${uidx})"
-
-    # 校验：feature 确实挂在 underlay 口的 ip4-output arc 上，且绑定可命中
-    log "ip4-output features on ${uvif}:"
-    vppctl show interface features "${uvif}" 2>/dev/null |
-        awk '/^ip4-output:/{f=1;next} f&&/^$/{exit} f{print "    "$0}' >&2
-    vppctl show sr-wg tunnels 2>/dev/null | grep -E "WARNING|usable" >&2
+        # 校验：feature 确实挂在 underlay 口的 ip4-output arc 上，且绑定可命中
+        log "ip4-output features on $(vpp_ifname_for_ip "${SELF_UNDERLAY}"):"
+        vppctl show interface features "$(vpp_ifname_for_ip "${SELF_UNDERLAY}")" 2>/dev/null |
+            awk '/^ip4-output:/{f=1;next} f&&/^$/{exit} f{print "    "$0}' >&2
+        vppctl show sr-wg tunnels 2>/dev/null | grep -E "WARNING|usable" >&2
+    fi
 }
 
 cmd_transit() {
