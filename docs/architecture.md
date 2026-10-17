@@ -7,12 +7,12 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Go Controller (sr-ctrl)                 │
+│                    vBOND Controller (sr-ctrl)                 │
 │  ┌──────────┐  ┌──────────────┐  ┌───────────────────────┐  │
-│  │ Path Comp│  │ VPP API Client│  │ Northbound REST/gRPC │  │
+│  │Enroll/CA │  │Registry+Watch│  │  Tunnel Param Push    │  │
 │  └────┬─────┘  └──────┬───────┘  └───────────────────────┘  │
 └───────┼────────────────┼────────────────────────────────────┘
-        │                │ (Binary API / Shared Memory)
+        │                │ (mTLS JSON / vppctl)
         ▼                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                         VPP Data Plane                        │
@@ -40,12 +40,32 @@
 使用 VPP 内置或第三方 WG 插件完成 Noise IK 握手与数据加密。
 SR Header 位于 WG 加密载荷之外（明文），保证中转节点可路由但不可篡改（HMAC 保护）。
 
-### 3. Go Controller（controller/）
+### 3. Go Controller（controller/）—— 项目内简称 vBOND
 
-- **cmd/sr-ctrl/**：控制器入口，启动 gRPC/REST 服务
-- **internal/path/**：路径计算引擎（最短路径、策略路由、故障切换）
-- **internal/vppapi/**：封装 VPP Binary API，下发转发表项与 SR 策略
-- **internal/api/**：北向接口，对接编排系统或 CLI
+独立 Go 模块 `sdwan/controller`，**零第三方依赖**（VPP 侧走 vppctl，不引 govpp）。
+职责 = CPE 安全入网 + NAT 地址发现 + 隧道参数下发，协议是 JSON over mTLS：
+
+- **cmd/sr-ctrl/**：控制器。自建 CA → claim code 入网签发设备证书 → 注册表 + watch 推送。
+- **cmd/sr-stunprobe/**：内核 socket 的 RFC 5389 探针，只用于验证协议与 reflector，
+  **不代表数据面 socket 的映射**。
+- **internal/wire/**：控制面协议类型的唯一来源（服务端与 agent 共用，字段不可能两侧漂移）。
+- **internal/keybinding/**：Ed25519 设备身份 + "这把 X25519 公钥是我的"的签名接缝。
+- **internal/stun/**：RFC 5389 Binding Request/Success 编解码，不含收发路径。
+- **test/scripts/test-vbond.sh**：acceptance harness（复用数据面实验室的 `docker_net_ctrl`）。
+- **test/scripts/vbond-client.sh**：openssl+curl 的手工客户端，不依赖 agent。
+
+#### vBOND 的三条定案（2026-10-17）
+
+1. **地址发现不另开探针 socket**：探针就是 WG 自己的 persistent-keepalive。CPE 把已入网的
+   观测节点配成一个 WG peer，keepalive 从数据面真正要用的那个 socket 出去；观测节点记录
+   收到的外层源 `(ip:port)` 并回报控制器。理由：控制器要的是"隧道将来实际会被 NAT 成什么"，
+   用另一个 socket 量到的映射是另一件事。（与思科 vBond 的观测方式一致。）
+2. **UDP 端口按动作显式下发**：`vpn_port=51820`、`transit_port=51821`，控制器下发两个显式
+   端口而不是 `opcode_base`，新增一种 action 就再下发一个端口。`srou_ip` 这类"标签地址"
+   不需要——SR 段列表存的就是真实 underlay `ip:port`。
+3. **WG 密钥由 agent 生成、装入 VPP**：`wireguard` API 收 `private_key`，所以私钥由 agent
+   产生后交给数据面持有；公钥用设备身份密钥签名后随 heartbeat/mapping 上报，对端拿
+   pinned CA 自己验链。这样密钥担保不依赖控制器诚实。
 
 ### 4. 测试框架（test/）
 
