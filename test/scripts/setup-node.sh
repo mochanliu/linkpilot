@@ -14,7 +14,7 @@
 #     wg-create             创建 wg0（generate-key）并配置 overlay 地址；
 #                           stdout 最后一行输出本机 WireGuard public key
 #     peer <peer_pubkey>    添加 WG peer + 配置 SR path + 绑定隧道 + 启用 encap
-#     transit [local-ip]    启用 SR transit（transit 角色专用）
+#     transit               启用 SR transit（transit 角色专用；中转不改外层源）
 #     stats                 以 key=value 形式打印 SR-WG 计数器（供宿主机断言）
 #     clear-stats           清零 SR-WG 计数器
 #     dump                  打印排障信息
@@ -348,17 +348,10 @@ cmd_peer() {
 }
 
 cmd_transit() {
-    local local_ip=${1:-}
-    if [ -n "${local_ip}" ]; then
-        vppctl set sr-wg transit enable port "${TRANSIT_PORT}" \
-               local-ip "${local_ip}" || die "set sr-wg transit failed"
-    else
-        # 不设 local-ip：transit 保留原始 src IP（node1 的 underlay 地址），
-        # 这样对端看到的 src 仍是配置好的 peer endpoint，WireGuard 握手不会
-        # 因为「源地址漂移」而回错方向。
-        vppctl set sr-wg transit enable port "${TRANSIT_PORT}" \
-               || die "set sr-wg transit failed"
-    fi
+    # 中转不改写外层源（IP 和端口都不动）：目的端 wg4-input 按 peer endpoint
+    # 校验外层源，改源会让对端丢包并把 peer 的动态 endpoint 污染到中转。
+    vppctl set sr-wg transit enable port "${TRANSIT_PORT}" \
+           || die "set sr-wg transit failed"
     log "transit enabled on port ${TRANSIT_PORT}"
 }
 

@@ -54,6 +54,21 @@ int sr_path_del(sr_path_table_t *t, uint16_t path_id);
 sr_path_config_t *sr_path_lookup(sr_path_table_t *t, uint16_t path_id);
 
 /*
+ * 统计引用了该 hmac_id 的路径条数（含 active=0）。
+ * 路径里存的是 P-Key 的**副本**，所以"删了密钥但路径还在用旧副本签名"
+ * 是控制面看不见的状态 —— 删密钥前必须先问这个。
+ */
+int sr_path_count_using_hmac_id(const sr_path_table_t *t, uint16_t hmac_id);
+
+/*
+ * 把新密钥刷进所有引用该 hmac_id 的路径副本，返回刷新条数。
+ * 密钥轮换靠它生效：否则 `key set` 之后旧路径仍按旧密钥签名，
+ * 对端验签失败，现象是"密钥换了隧道就断了"。
+ */
+int sr_path_replace_pkey(sr_path_table_t *t, uint16_t hmac_id,
+                         const uint8_t *pkey);
+
+/*
  * 根据路径配置填充 SR Header（初始化 + 设置各字段 + HMAC 签名）。
  * timestamp 为主机序秒级时间戳。
  * 返回 0 成功，-1 失败。

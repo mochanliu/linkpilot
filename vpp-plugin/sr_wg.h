@@ -128,9 +128,6 @@ typedef struct {
    */
   u32 encap_fib_index;
 
-  /* 本机地址（transit 改写外层 src 用） */
-  ip4_address_t local_ip4;
-
   /* 计数器 */
   sr_counters_t counters;
 
@@ -183,6 +180,22 @@ int sr_wg_encap_is_enabled(sr_wg_main_t *sm, u32 sw_if_index);
 /* 查找绑定条目；未绑定返回 NULL。数据面热路径使用。 */
 sr_wg_tunnel_bind_t *sr_wg_bind_lookup(sr_wg_main_t *sm, u32 sw_if_index,
                                        ip4_address_t dst);
+
+/*
+ * 删除路径时清理仍指向它的隧道绑定，返回清理条数。
+ * 悬空绑定不会立刻报错，只会在收包时按 encap_no_path 静默丢包，
+ * 所以 sr_path_del 必须把绑定一起摘掉，控制面才不会出现"路径没了、
+ * 流量还在悄悄旁路"的状态。
+ */
+u32 sr_wg_binds_drop_for_path(sr_wg_main_t *sm, u16 path_id);
+
+/*
+ * 按当前 vpn_port / transit_port 重新注册 UDP 目的端口。
+ * 建 WireGuard 接口会把 51820 重新注册给 wg4-input，transit 换端口也必须
+ * 重注册 —— 端口就是数据面的功能多路复用键，注册表和配置不一致时
+ * 包根本进不到我们的节点。
+ */
+void sr_wg_ports_rebind(sr_wg_main_t *sm);
 
 /* ==================== Node 声明 ==================== */
 

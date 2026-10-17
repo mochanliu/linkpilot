@@ -37,12 +37,24 @@ service {
   rpc sr_wg_tunnel_set_path returns sr_wg_tunnel_set_path_reply;
   rpc sr_wg_tunnel_dump returns stream sr_wg_tunnel_details;
   rpc sr_wg_encap_enable returns sr_wg_encap_enable_reply;
+  rpc sr_wg_encap_fib_set returns sr_wg_encap_fib_set_reply;
+  rpc sr_wg_rebind_ports returns sr_wg_rebind_ports_reply;
+  rpc sr_wg_config_dump returns stream sr_wg_config_details;
   rpc sr_wg_stats_get returns sr_wg_stats_get_reply;
   rpc sr_wg_stats_clear returns sr_wg_stats_clear_reply;
 };
 
 /* ==================== Path API ==================== */
 
+/** \brief 增/改/删一条 SR 路径
+    @param is_add      - 1 = 新增或按 path_id 覆盖，0 = 删除
+    @param hmac_id     - 签名密钥标识。**密钥表里必须已有这把钥匙**，
+                         否则本请求返回 NO_SUCH_ENTRY：路径存的是密钥副本，
+                         缺钥匙时若用全零密钥建路径，包能正常发出去但对端
+                         一律验签失败，控制器完全看不出来。
+    @note              - is_add=0 时，指向该路径的隧道绑定会被一并摘除
+                         （悬空绑定只会在收包时按 encap_no_path 静默丢包）
+*/
 autoreply define sr_wg_path_add_del
 {
   u32 client_index;
@@ -59,7 +71,7 @@ define sr_wg_path_dump
 {
   u32 client_index;
   u32 context;
-  u16 path_id;            /* 0 = dump all */
+  u16 path_id;            /* ~0 (0xffff) = dump all；path_id 0 是合法值 */
 };
 
 define sr_wg_path_details
@@ -74,6 +86,11 @@ define sr_wg_path_details
 
 /* ==================== Key API ==================== */
 
+/** \brief 下发/轮换一把 P-Key
+    @note 路径表里存的是密钥**副本**。本请求会把新值同步刷进所有引用该
+          hmac_id 的路径，因此轮换密钥只需一次 key_set，不需要重建路径；
+          换密钥请直接用 key_set，不要先 key_del 再 key_set。
+*/
 autoreply define sr_wg_key_set
 {
   u32 client_index;
@@ -82,6 +99,9 @@ autoreply define sr_wg_key_set
   u8 key[16];             /* 128-bit P-Key */
 };
 
+/** \brief 删除一把 P-Key
+    @note 仍有路径引用该 hmac_id 时返回 INVALID_VALUE（不是静默删除）
+*/
 autoreply define sr_wg_key_del
 {
   u32 client_index;
@@ -103,12 +123,16 @@ define sr_wg_key_details
 
 /* ==================== Transit API ==================== */
 
+/** \brief 启用 SR 中转（只验签 + 弹一段 + 改外层 dst，不解密）
+    @param port - 本机收 SR 包的目的 UDP 端口；改端口会同时重注册 UDP 分发表
+    @note 中转**绝不改写外层源 IP/端口**：目的端 wg4-input 按 peer endpoint
+          校验外层源，改源会让对端丢包并把 peer 的动态 endpoint 污染到中转。
+*/
 autoreply define sr_wg_transit_enable
 {
   u32 client_index;
   u32 context;
   u16 port;               /* transit UDP port */
-  vl_api_ip4_address_t local_ip;   /* 本机 transit IP */
 };
 
 autoreply define sr_wg_transit_disable
@@ -203,4 +227,47 @@ autoreply define sr_wg_stats_clear
 {
   u32 client_index;
   u32 context;
+};
+
+/* ==================== 端口/挂点配置 API ==================== */
+
+/** \brief 按当前 vpn_port / transit_port 重新注册 UDP 目的端口
+    @note 建 WireGuard 接口时 wireguard 插件会把 51820 重新注册给自己的
+          wg4-input，把 sr-wg4-input 的旁路入口摘掉；等价于 CLI
+          `set sr-wg rebind-ports`。控制器必须在**创建 WG 接口之后**调用它。
+*/
+autoreply define sr_wg_rebind_ports
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief 设置 encap 改写外层 dst 之后重新查表用的 FIB index
+    @note 等价于 CLI `set sr-wg encap fib-index <n>`；缺省 0 = main table。
+*/
+autoreply define sr_wg_encap_fib_set
+{
+  u32 client_index;
+  u32 context;
+  u32 fib_index;
+};
+
+/** \brief 读回插件全局配置（控制器对账用；路径/密钥/绑定另有各自的 dump） */
+define sr_wg_config_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+define sr_wg_config_details
+{
+  u32 context;
+  u16 vpn_port;
+  u16 transit_port;
+  u8  transit_enabled;
+  u32 encap_fib_index;
+  u32 n_enabled_ifs;              /* 下面数组的有效长度，最多 32 */
+  u32 enabled_ifs[32];            /* 已启用 sr-wg4-encap 的 underlay 接口 */
+  u8  path_count;
+  u8  key_count;
 };

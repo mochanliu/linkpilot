@@ -41,6 +41,12 @@ sr_wg_key_add (sr_wg_main_t *sm, u16 hmac_id, const u8 *key)
         {
           clib_memcpy_fast (sm->keys[i].key, key, SR_PKEY_LEN);
           sm->keys[i].active = 1;
+          /*
+           * 路径表里存的是密钥**副本**（热路径不再查表）。轮换密钥时必须把
+           * 新值刷进所有引用该 hmac_id 的路径，否则 `key set` 之后旧路径
+           * 仍按旧密钥签名，对端验签失败 —— 现象就是"一换密钥隧道就断"。
+           */
+          sr_path_replace_pkey (&sm->path_table, hmac_id, key);
           return 0;
         }
     }
@@ -53,6 +59,7 @@ sr_wg_key_add (sr_wg_main_t *sm, u16 hmac_id, const u8 *key)
   clib_memcpy_fast (sm->keys[sm->key_count].key, key, SR_PKEY_LEN);
   sm->keys[sm->key_count].active = 1;
   sm->key_count++;
+  sr_path_replace_pkey (&sm->path_table, hmac_id, key);
   return 0;
 }
 

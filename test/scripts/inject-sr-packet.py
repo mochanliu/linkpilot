@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-inject-sr-packet.py - 构造有效的 SR 封装 UDP 包并通过原始套接字发送。
+inject-sr-packet.py - 构造 SR 封装 UDP 包并通过原始套接字发送。
 
-用于在 WireGuard 握手不可用时验证 SR 数据面（transit / decap 路径）。
-支持两种输出模式：
+用于不经 WireGuard 握手直接驱动 SR 数据面（transit / decap 路径），
+也可注入畸形头部做负向测试。支持两种输出模式：
   1. --send: 通过 AF_PACKET 原始套接字直接发送（需要 root + 容器内执行）
   2. 默认: 写入 pcap 文件
 
@@ -14,6 +14,9 @@ inject-sr-packet.py - 构造有效的 SR 封装 UDP 包并通过原始套接字�
 
   # 生成 pcap 文件:
   python3 inject-sr-packet.py output.pcap --mode transit
+
+  # 注入畸形头部（签名后篡改，验证 transit 的分类计数与丢弃）:
+  python3 inject-sr-packet.py --send --mode transit --corrupt magic
 
 模式:
   transit  - 生成发往中转节点 (port 51821) 的包，seg_left=1
@@ -193,6 +196,23 @@ def build_sr_header(seg_count, seg_left, hmac_id, path_id, timestamp, segments, 
     return bytes(h)
 
 
+def corrupt_sr_header(hdr, kind):
+    """
+    在 HMAC 已签名之后篡改固定字段，用于验证 transit 的头部校验分类。
+    transit 在验签**之前**就做这些检查，所以篡改后必然命中对应分支。
+    """
+    h = bytearray(hdr)
+    if kind == 'magic':
+        h[0] = 0x00                      # != SR_MAGIC -> transit_bad_magic
+    elif kind == 'ver':
+        h[1] |= 0xF0                     # 版本高 4 位 != 0x1 -> transit_bad_ver
+    elif kind == 'len':
+        h[2] = (h[2] + SR_SEG_SIZE) & 0xFF  # hdr_len 与 seg_count 不符 -> bad_len
+    else:
+        raise ValueError(f"unknown corrupt kind: {kind}")
+    return bytes(h)
+
+
 def build_ip4(src_ip, dst_ip, payload_len, protocol=17, ttl=64):
     """构建 IPv4 头（20 bytes，无选项），自动计算 checksum"""
     version_ihl = (4 << 4) | 5
@@ -355,6 +375,9 @@ def main():
                         help='Number of packets to generate')
     parser.add_argument('--payload-size', type=int, default=64,
                         help='Dummy payload size (simulates WG transport)')
+    parser.add_argument('--corrupt', choices=['magic', 'ver', 'len'], default=None,
+                        help='Tamper the signed SR header to trigger transit '
+                             'validation errors (negative tests)')
 
     args = parser.parse_args()
 
@@ -402,6 +425,8 @@ def main():
         # SR Header
         sr_hdr = build_sr_header(seg_count, seg_left, args.hmac_id,
                                  args.path_id, ts, seg_list, key_bytes)
+        if args.corrupt:
+            sr_hdr = corrupt_sr_header(sr_hdr, args.corrupt)
 
         # Dummy payload (模拟 WG transport header + 加密数据)
         # WG transport 首字节 = 4 (type=transport-data), 不等于 SR_MAGIC(0x53)
@@ -430,7 +455,8 @@ def main():
 
     print(f"  mode={args.mode} dst={args.dst_ip}:{dst_port} seg_left={seg_left} "
           f"seg_count={seg_count} sr_hdr_len={sr_hdr_len(seg_count)}")
-    print(f"  HMAC key={args.key_hex} hmac_id={args.hmac_id} path_id={args.path_id}")
+    print(f"  HMAC key={args.key_hex} hmac_id={args.hmac_id} path_id={args.path_id}"
+          f" corrupt={args.corrupt or 'none'}")
     print(f"  segments: {args.segments}")
     print(f"  src_mac={src_mac} dst_mac={dst_mac}")
 

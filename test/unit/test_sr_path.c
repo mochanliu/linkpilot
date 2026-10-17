@@ -2,7 +2,7 @@
  * test_sr_path.c - 路径表管理（sr_path.c）单元测试
  *
  * 覆盖：初始化、添加、覆盖、删除、删除不存在、fill_header 生成、
- *       表满溢出。
+ *       表满溢出、hmac_id 引用计数、密钥轮换刷新路径副本。
  */
 #include "test_framework.h"
 #include "sr_header.h"
@@ -229,6 +229,89 @@ static void test_path_table_full(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* test_path_count_using_hmac_id：删密钥前必须先确认没有路径在引用        */
+/* ------------------------------------------------------------------ */
+static void test_path_count_using_hmac_id(void)
+{
+    sr_path_table_t t;
+    sr_path_config_t cfg;
+
+    TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
+    TEST_ASSERT_EQ(sr_path_count_using_hmac_id(&t, 0x0007), 0, "空表应为 0");
+    TEST_ASSERT_EQ(sr_path_count_using_hmac_id(NULL, 0x0007), 0, "t=NULL 应返回 0");
+
+    make_path_cfg(&cfg, 0x1001, 1);          /* hmac_id 0x0007 */
+    sr_path_add(&t, &cfg);
+    make_path_cfg(&cfg, 0x1002, 1);
+    cfg.hmac_id = 0x0008;
+    sr_path_add(&t, &cfg);
+    make_path_cfg(&cfg, 0x1003, 1);
+    cfg.hmac_id = 0x0007;
+    cfg.active = 0;                          /* inactive 仍占着密钥副本 */
+    sr_path_add(&t, &cfg);
+
+    TEST_ASSERT_EQ(sr_path_count_using_hmac_id(&t, 0x0007), 2,
+                   "应统计到 2 条（含 inactive）");
+    TEST_ASSERT_EQ(sr_path_count_using_hmac_id(&t, 0x0008), 1, "应为 1 条");
+    TEST_ASSERT_EQ(sr_path_count_using_hmac_id(&t, 0x9999), 0, "未被引用应为 0");
+
+    /* 删掉一条后计数随之下降 —— 这是 key_del 放行的依据 */
+    TEST_ASSERT_EQ(sr_path_del(&t, 0x1003), 0, "删除应成功");
+    TEST_ASSERT_EQ(sr_path_count_using_hmac_id(&t, 0x0007), 1, "删除后应为 1 条");
+}
+
+/*
+ * test_key_rotation：密钥轮换后，路径里的 P-Key 副本必须被刷新，
+ * 且签出的头部只能用新密钥验通过（旧密钥应失败）。
+ * 这正是 sr_wg_key_add 调 sr_path_replace_pkey 要解决的问题。
+ */
+static void test_key_rotation(void)
+{
+    sr_path_table_t t;
+    sr_path_config_t cfg;
+    sr_path_config_t *p1, *p7;
+    sr_header_t h;
+    uint8_t newkey[SR_PKEY_LEN];
+    int i;
+
+    for (i = 0; i < SR_PKEY_LEN; i++)
+        newkey[i] = (uint8_t)(0x5cu + i);
+
+    TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
+
+    make_path_cfg(&cfg, 0x1001, 2);          /* hmac_id = 0x0007 */
+    sr_path_add(&t, &cfg);
+    make_path_cfg(&cfg, 0x1002, 2);
+    cfg.hmac_id = 0x0008;                    /* 另一把密钥，不应被动 */
+    sr_path_add(&t, &cfg);
+
+    TEST_ASSERT_EQ(sr_path_replace_pkey(&t, 0x0007, newkey), 1,
+                   "只应刷新 1 条引用 hmac_id=7 的路径");
+
+    p1 = sr_path_lookup(&t, 0x1001);
+    p7 = sr_path_lookup(&t, 0x1002);
+    TEST_ASSERT_NOT_NULL(p1, "0x1001 应存在");
+    TEST_ASSERT_NOT_NULL(p7, "0x1002 应存在");
+    TEST_ASSERT_MEM_EQ(p1->pkey, newkey, SR_PKEY_LEN, "轮换后 pkey 副本应为新值");
+    TEST_ASSERT_MEM_EQ(p7->pkey, g_pkey, SR_PKEY_LEN,
+                       "其他 hmac_id 的路径副本不应被改");
+
+    /* 新密钥签出的头：新密钥验通过，旧密钥验失败 */
+    TEST_ASSERT_EQ(sr_path_fill_header(p1, &h, 0x62000001u), 0, "fill_header 应成功");
+    TEST_ASSERT_EQ(sr_hmac_verify(&h, newkey), 0, "新密钥应验证通过");
+    TEST_ASSERT_NEQ(sr_hmac_verify(&h, g_pkey), 0, "旧密钥不应验证通过");
+
+    /* 旧路径（未刷新）用旧密钥仍有效 → 说明「不刷新」确实会导致断链 */
+    TEST_ASSERT_EQ(sr_path_fill_header(p7, &h, 0x62000002u), 0, "fill_header 应成功");
+    TEST_ASSERT_EQ(sr_hmac_verify(&h, g_pkey), 0, "未轮换的路径仍用旧密钥签名");
+
+    /* 参数非法 */
+    TEST_ASSERT_EQ(sr_path_replace_pkey(NULL, 0x0007, newkey), 0, "t=NULL 应返回 0");
+    TEST_ASSERT_EQ(sr_path_replace_pkey(&t, 0x0007, NULL), 0, "pkey=NULL 应返回 0");
+    TEST_ASSERT_EQ(sr_path_replace_pkey(&t, 0x9999, newkey), 0, "无引用应返回 0");
+}
+
+/* ------------------------------------------------------------------ */
 /* 套件入口                                                             */
 /* ------------------------------------------------------------------ */
 void test_suite_sr_path(void)
@@ -241,5 +324,7 @@ void test_suite_sr_path(void)
     RUN_TEST(test_path_del_nonexist);
     RUN_TEST(test_path_fill_header);
     RUN_TEST(test_path_table_full);
+    RUN_TEST(test_path_count_using_hmac_id);
+    RUN_TEST(test_key_rotation);
     TEST_SUITE_END();
 }

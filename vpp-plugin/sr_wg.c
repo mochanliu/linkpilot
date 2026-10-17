@@ -24,6 +24,26 @@ VLIB_PLUGIN_REGISTER () = {
   .description = "SR-WG: Segment Routing over WireGuard transit/encap/decap",
 };
 
+/* ==================== UDP 端口注册（功能多路复用键） ====================
+ *
+ * 两个端口都指向本插件的节点：
+ *   vpn_port     -> sr-wg4-input（decap）。它对 magic != 0x53 的包直接旁路到
+ *                   wg4-input，所以没启用 SR-WG 的普通 WireGuard 隧道仍然正常。
+ *   transit_port -> sr-wg4-transit（只验签转发，不解密）。
+ *
+ * 建 WireGuard 接口时 wireguard 插件会把 51820 重新注册给自己的 wg4-input，
+ * 把我们的旁路入口摘掉；因此 WG 建完之后、以及 transit 换端口之后，
+ * 都必须重新调用本函数。CLI `set sr-wg rebind-ports` 就是它的手工入口。
+ */
+void
+sr_wg_ports_rebind (sr_wg_main_t *sm)
+{
+  udp_register_dst_port (sm->vlib_main, (udp_dst_port_t) sm->vpn_port,
+                         sr_wg4_input_node.index, /* is_ipv4 */ 1);
+  udp_register_dst_port (sm->vlib_main, (udp_dst_port_t) sm->transit_port,
+                         sr_wg4_transit_node.index, /* is_ipv4 */ 1);
+}
+
 /* ==================== 初始化 ==================== */
 
 static clib_error_t *
@@ -62,26 +82,12 @@ sr_wg_init (vlib_main_t *vm)
   sr_wg_encap_init (sm);
   sm->encap_fib_index = 0;   /* 默认在 main FIB 重新查外层第一跳 */
 
-  /* 本机地址清零（未配置） */
-  clib_memset (&sm->local_ip4, 0, sizeof (sm->local_ip4));
-
   /* 缓存 node indices */
   sm->transit_node_index = sr_wg4_transit_node.index;
   sm->input_node_index = sr_wg4_input_node.index;
   sm->encap_node_index = sr_wg4_encap_node.index;
 
-  /* 注册 UDP 端口 -> transit node */
-  udp_register_dst_port (vm, (udp_dst_port_t) SR_PORT_TRANSIT,
-                         sr_wg4_transit_node.index, /* is_ipv4 */ 1);
-
-  /*
-   * 注册 UDP 端口 -> input (decap) node。
-   * sr-wg4-input 取代了 wg4-input 在 51820 上的注册，但它对
-   * 非 SR 包（magic != 0x53）会直接旁路到 wg4-input，
-   * 因此未启用 SR-WG 的普通 WireGuard 隧道仍然正常工作。
-   */
-  udp_register_dst_port (vm, (udp_dst_port_t) SR_PORT_VPN,
-                         sr_wg4_input_node.index, /* is_ipv4 */ 1);
+  sr_wg_ports_rebind (sm);
 
   /* API hookup */
   sr_wg_api_hookup (vm);

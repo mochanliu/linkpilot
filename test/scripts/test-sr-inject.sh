@@ -1,12 +1,18 @@
 #!/bin/bash
 # test-sr-inject.sh - 使用原始包注入验证 SR 数据面（绕过 WireGuard 握手）
 #
-# 背景：VPP 26.06 的 WireGuard 在 Docker AF_PACKET 环境中无法完成握手
-# （"Peer error"），这是 VPP/WG 的基础性问题，与 SR-WG 插件无关。
+# ⚠ 现状（2026-10-17）：权威端到端用例是 test/scripts/test-e2e.sh（真 WG 握手 +
+#   encap/transit/decap 全链，24 道断言）。本脚本仍可用于「不经 WG 的原始包注入」
+#   这条负向路径，但下面两处口径已过期，不要据此判断功能是否落地：
+#     (1) "WG 握手在本 Docker 环境不可用" 已被推翻 —— 装上 test/docker/crypto_openssl
+#         后握手正常，encap 数据面能端到端跑通（test-e2e.sh 的 encap_ok/overlay ping）。
+#     (2) step 7 断言的「绑定后 sr-wg4-encap 自动启用到 wg0」是早期挂点假设；现在挂点
+#         在 **underlay 出口接口**，必须显式 `set sr-wg encap enable <underlay>`。
+#
 # 本脚本通过 AF_PACKET 原始套接字注入手工构造的 SR 封装 UDP 包来验证：
-#   1. sr-wg4-transit 节点（HMAC 验证 + 段弹出 + 外层改写）
-#   2. sr-wg4-input 节点（HMAC 验证 + seg_left==0 检查 + SR 头剥离）
-#   3. sr-wg4-encap 节点（通过 VXLAN 隧道触发 ip4-output arc）
+#   1. sr-wg4-transit 节点（HMAC 验证 + 段弹出 + 外层目的改写，绝不动外层源）
+#   2. sr-wg4-input 节点（HMAC 验证 + seg_left==0 检查 + SR 头剥离压实）
+#   3. 负向路径：错误密钥 / 坏 magic / 坏版本 / 坏长度必须被计数并丢弃
 #
 # 用法: test/scripts/test-sr-inject.sh [--keep]
 set -u
@@ -220,7 +226,7 @@ done
 echo "  HMAC key installed on all nodes"
 
 # Transit 启用 SR transit
-dx "${C_TRANSIT}" "vppctl set sr-wg transit enable port ${TRANSIT_PORT} local-ip ${TRANSIT_A}" >/dev/null 2>&1
+dx "${C_TRANSIT}" "vppctl set sr-wg transit enable port ${TRANSIT_PORT}" >/dev/null 2>&1
 echo "  transit enabled on ${C_TRANSIT}:${TRANSIT_PORT}"
 
 # 重新绑定端口

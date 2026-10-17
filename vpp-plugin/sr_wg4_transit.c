@@ -3,7 +3,12 @@
  *
  * 处理流程：
  *   udp4-local dispatch -> sr_wg4_transit (current_data 指向 SR Header)
- *   验证 SR Header -> HMAC 校验 -> seg_left-- -> 改写外层 IP/UDP -> ip4-lookup
+ *   验证 SR Header -> HMAC 校验 -> seg_left-- -> 改写外层目的 IP/UDP dst_port
+ *   -> ip4-lookup
+ *
+ * 中转只动「目的」，绝不动外层源 IP/端口：中转不参与 WireGuard（不解密），
+ * 而目的端 wg4-input 按 peer endpoint 校验外层源，改源会让对端丢包并把
+ * peer 的动态 endpoint 污染到中转。
  */
 #include "sr_wg.h"
 #include <vnet/udp/udp_packet.h>
@@ -41,6 +46,7 @@ format_sr_wg4_transit_trace (u8 *s, va_list *args)
 
 #define foreach_sr_wg4_transit_error                                     \
   _ (NONE, "no error")                                                   \
+  _ (DISABLED, "sr-wg transit is not enabled")                           \
   _ (BAD_MAGIC, "bad magic byte")                                        \
   _ (BAD_VER, "unsupported version")                                     \
   _ (BAD_LEN, "header length mismatch")                                  \
@@ -118,16 +124,37 @@ VLIB_NODE_FN (sr_wg4_transit_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       /* current_data 指向 SR Header（udp4-local 已剥掉 eth/ip4/udp） */
       srh = (sr_header_t *) vlib_buffer_get_current (b);
 
+      /*
+       * Step 0: `set sr-wg transit disable` 必须真的停下转发。
+       * 端口->节点的 UDP 注册在 init 时就做掉了，disable 只能靠这个开关
+       * 生效；否则 disable 之后本机仍会继续替别人转发 SR 流量。
+       */
+      if (PREDICT_FALSE (sm->transit_enabled == 0))
+        {
+          error = SR_WG4_TRANSIT_ERROR_DISABLED;
+          sm->counters.drop_total++;
+          goto done;
+        }
+
       /* Step 1: 验证 SR Header 基础字段 */
       if (sr_hdr_validate (srh, b->current_length) != 0)
         {
-          /* 细分错误类型 */
+          /* 细分错误类型：计数器供控制器/e2e 断言，不能只落在 error 串上 */
           if (b->current_length < SR_FIXED_HDR_LEN || srh->magic != SR_MAGIC)
-            error = SR_WG4_TRANSIT_ERROR_BAD_MAGIC;
+            {
+              error = SR_WG4_TRANSIT_ERROR_BAD_MAGIC;
+              sm->counters.transit_bad_magic++;
+            }
           else if ((srh->ver_flags & SR_VER_MASK) != (SR_VERSION << 4))
-            error = SR_WG4_TRANSIT_ERROR_BAD_VER;
+            {
+              error = SR_WG4_TRANSIT_ERROR_BAD_VER;
+              sm->counters.transit_bad_ver++;
+            }
           else
-            error = SR_WG4_TRANSIT_ERROR_BAD_LEN;
+            {
+              error = SR_WG4_TRANSIT_ERROR_BAD_LEN;
+              sm->counters.transit_bad_len++;
+            }
           sm->counters.drop_total++;
           goto done;
         }
@@ -187,19 +214,15 @@ VLIB_NODE_FN (sr_wg4_transit_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       /* Step 9: 改写外层 UDP dst_port = next_hop.port */
       clib_memcpy_fast (&udp->dst_port, next_hop->port, 2);
 
-      /* Step 10: 可选改写 src IP（如果本机地址已配置） */
-      if (sm->local_ip4.as_u32 != 0)
-        ip4->src_address = sm->local_ip4;
-
       /*
-       * Step 11: **不改写** UDP src_port。
-       * SR 的 function 区分靠的是外层 dst port，transit 只需要把 dst port
-       * 换成下一跳段口的 51820/51821。若把 src port 也改成 51821，对端
-       * WireGuard 看到的源五元组就变成 10.10.1.2:51821，与其配置的 peer
-       * endpoint（10.10.1.2:51820）不一致：wg4-input 报 "Interface error"
-       * 丢弃，同时把 peer 的动态 endpoint 污染成错误地址，回包发往错误的
-       * 端口 —— 隧道永远建不起来。保持原 src port 才能让 SR 路径与 WG
-       * 直连路径在对端看起来完全一样（回程也复用同一对端口）。
+       * Step 10: **外层源（IP 和端口）一个字节都不动。**
+       * 中转不解密、不参与 WireGuard，只做「验签 + 弹一段 + 改外层 dst」；
+       * 但目的端的 wg4-input 会按 peer 配置的 endpoint 校验外层源，
+       * 一旦把源改成中转自己的地址，对端看到的源五元组就和配置不一致：
+       * 包被丢，同时 peer 的动态 endpoint 会被污染到中转，回程发错方向，
+       * 隧道永远建不起来（本轮在 lab 里实测过这一类失败）。
+       * 代价是已知的：若中间网络开了 uRPF/BCP38 入口过滤，头节点的 underlay
+       * 源可能在外人设备上被丢 —— 那是网络前提问题，不在中转里偷偷改源解决。
        */
 
       /* Step 12: 重算 UDP 长度（SR Header 长度不变，但为保险起见） */

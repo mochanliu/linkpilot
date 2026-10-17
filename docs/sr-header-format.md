@@ -66,17 +66,27 @@ hdr_len = 16 + seg_count * 6 + 8 = 24 + seg_count * 6
 上述字段按线格式顺序拼成连续字节缓冲（最长 13 + 8*6 = 61 字节）作为
 SipHash-2-4 的输入，密钥为 hmac_id 对应的 128-bit P-Key。
 
+## 密钥模型与轮换
+
+- encap 签名读的是**路径配置里的 P-Key 副本**（热路径不回查密钥表）。
+- `sr-wg key set <hmac_id> <hex32>` 会同时刷新所有引用该 hmac_id 的路径副本；
+  轮换密钥只用 key set，**不要** del+set（del 会被拒绝，见下）。
+- 密钥仍被路径引用时不允许删除：CLI 与 API 都会拒绝，避免「表里没密钥、
+  路径里还留着旧副本」这种控制面看不见的状态。
+
 ## 段列表语义
 
 - segments[0] = 最终目的节点（locator:vpn_port）
 - segments[seg_count-1] = 外层 UDP dst 之后的第一个中转
 - 外层 UDP dst = segments[seg_count-1] 的 IP:Port（首跳免费）
-- 中转处理：取 segments[seg_left-1] 作为新外层 dst，seg_left--
+- 中转处理：取 segments[seg_left-1] 作为**新外层目的** IP:Port，seg_left--；
+  外层**源** IP 与源端口一律不动（中转不参与 WireGuard，它不解密），
+  TTL 递减交给 ip4-lookup
 
 ## UDP 端口分配
 
 | 端口 | 用途 | 行为 |
 |------|------|------|
 | 51820 | VPN 隧道 | Encap/Decap |
-| 51821 | 中转 | Transit（只改外层头，不解密） |
+| 51821 | 中转 | Transit（只改外层**目的** IP/端口，绝不动外层源，不解密） |
 | 51822+ | 预留 | 未来 service-chain 等 |

@@ -87,6 +87,37 @@ sr_path_config_t *sr_path_lookup(sr_path_table_t *t, uint16_t path_id)
     return &t->paths[idx];
 }
 
+int sr_path_count_using_hmac_id(const sr_path_table_t *t, uint16_t hmac_id)
+{
+    int i, n = 0;
+
+    if (!t)
+        return 0;
+
+    for (i = 0; i < t->count; i++) {
+        if (t->paths[i].hmac_id == hmac_id)
+            n++;
+    }
+    return n;
+}
+
+int sr_path_replace_pkey(sr_path_table_t *t, uint16_t hmac_id,
+                         const uint8_t *pkey)
+{
+    int i, n = 0;
+
+    if (!t || !pkey)
+        return 0;
+
+    for (i = 0; i < t->count; i++) {
+        if (t->paths[i].hmac_id != hmac_id)
+            continue;
+        memcpy(t->paths[i].pkey, pkey, SR_PKEY_LEN);
+        n++;
+    }
+    return n;
+}
+
 int sr_path_fill_header(const sr_path_config_t *cfg, sr_header_t *h,
                         uint32_t timestamp)
 {

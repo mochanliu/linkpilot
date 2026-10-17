@@ -598,6 +598,42 @@ sr_wg_tunnel_set_path (sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
   return 0;
 }
 
+u32
+sr_wg_binds_drop_for_path (sr_wg_main_t *sm, u16 path_id)
+{
+  u32 n = 0, bi;
+
+  sr_wg_encap_init (sm);
+
+  /*
+   * pool_put_index 只置自由位、不缩 vec_len，所以边遍历边摘是安全的。
+   * 悬空绑定不会立刻报错，只会在收包时按 encap_no_path 静默丢包 ——
+   * 删路径必须把指向它的绑定一起摘掉，控制面才不会看到"路径没了但流量
+   * 还在悄悄旁路"这种状态。
+   */
+  for (bi = 0; bi < vec_len (sm->binds); bi++)
+    {
+      sr_wg_tunnel_bind_t *bind;
+      uword *p;
+
+      if (pool_is_free_index (sm->binds, bi))
+        continue;
+
+      bind = pool_elt_at_index (sm->binds, bi);
+      if (bind->path_id != path_id)
+        continue;
+
+      sr_wg_bind_unset_endpoint (sm, bind->endpoint);
+      p = hash_get (sm->tunnel_path, (uword) bind->sw_if_index);
+      if (p && p[0] == bi + 1)
+        hash_unset (sm->tunnel_path, (uword) bind->sw_if_index);
+      pool_put_index (sm->binds, bi);
+      n++;
+    }
+
+  return n;
+}
+
 int
 sr_wg_encap_enable_disable (sr_wg_main_t *sm, u32 sw_if_index, int enable)
 {

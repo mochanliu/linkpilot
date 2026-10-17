@@ -12,11 +12,12 @@
  *   sr-wg path del <path_id>
  *   sr-wg key set <hmac_id> <hex32>
  *   sr-wg key del <hmac_id>
- *   set sr-wg transit enable port <port> local-ip <ip>
+ *   set sr-wg transit enable port <port>
  *   set sr-wg transit disable
  *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>] [del]
  *   set sr-wg encap enable <underlay sw_if_index|name> | disable <…>
  *                   | fib-index <n>
+ *   set sr-wg rebind-ports        （建 WG 接口后必做，见 sr_wg.c）
  */
 #include "sr_wg.h"
 #include <vnet/ip/format.h>
@@ -310,10 +311,16 @@ sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (del)
     {
+      u32 n_binds;
+
       rv = sr_path_del (&sm->path_table, (u16) path_id);
       if (rv != 0)
         return clib_error_return (0, "path %u not found", path_id);
-      vlib_cli_output (vm, "SR-WG path %u deleted.", path_id);
+
+      /* 指向它的隧道绑定一起摘掉：留着就是收包时按 encap_no_path 静默丢包 */
+      n_binds = sr_wg_binds_drop_for_path (sm, (u16) path_id);
+      vlib_cli_output (vm, "SR-WG path %u deleted (%u tunnel bind(s) dropped).",
+                       path_id, n_binds);
       return 0;
     }
 
@@ -329,13 +336,12 @@ sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
   /* 与 API handler 一致：从密钥表取 P-Key 填入路径配置 */
   {
     sr_wg_key_entry_t *key = sr_wg_key_lookup (sm, cfg.hmac_id);
-    if (key)
-      clib_memcpy_fast (cfg.pkey, key->key, SR_PKEY_LEN);
-    else
-      vlib_cli_output (vm,
-                       "warning: no active key for hmac_id=%u, "
-                       "SR headers will be signed with a zero P-Key",
-                       cfg.hmac_id);
+    if (!key)
+      return clib_error_return (
+        0, "no active key for hmac_id=%u; run `sr-wg key set %u <hex>` first "
+           "(建一条全零密钥的路径 = 包发得出去但对端一律验签失败)",
+        cfg.hmac_id, cfg.hmac_id);
+    clib_memcpy_fast (cfg.pkey, key->key, SR_PKEY_LEN);
   }
 
   rv = sr_path_add (&sm->path_table, &cfg);
@@ -415,6 +421,14 @@ sr_wg_key_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (del)
     {
+      int n_paths = sr_path_count_using_hmac_id (&sm->path_table,
+                                                 (u16) hmac_id);
+      if (n_paths > 0)
+        return clib_error_return (
+          0, "hmac_id=%u still used by %d path(s); 换密钥请用 "
+             "`sr-wg key set %u <hex>`（会自动刷新路径里的密钥副本）",
+          hmac_id, n_paths, hmac_id);
+
       rv = sr_wg_key_del (sm, (u16) hmac_id);
       if (rv != 0)
         return clib_error_return (0, "key hmac_id=%u not found", hmac_id);
@@ -460,10 +474,6 @@ sr_wg_set_transit_command_fn (vlib_main_t *vm, unformat_input_t *input,
   u8 enable = 0;
   u8 disable = 0;
   u32 port = 0;
-  ip4_address_t local_ip;
-  int have_ip = 0;
-
-  clib_memset (&local_ip, 0, sizeof (local_ip));
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -473,9 +483,6 @@ sr_wg_set_transit_command_fn (vlib_main_t *vm, unformat_input_t *input,
         disable = 1;
       else if (unformat (input, "port %u", &port))
         ;
-      else if (unformat (input, "local-ip %U", unformat_ip4_address,
-                         &local_ip))
-        have_ip = 1;
       else
         break;
     }
@@ -485,16 +492,19 @@ sr_wg_set_transit_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (port == 0)
         port = SR_PORT_TRANSIT;
       sm->transit_port = (u16) port;
-      if (have_ip)
-        sm->local_ip4 = local_ip;
       sm->transit_enabled = 1;
-      vlib_cli_output (vm, "SR-WG transit enabled: port=%u local-ip=%U",
-                       sm->transit_port, format_ip4_address, &sm->local_ip4);
+
+      /* 端口就是功能多路复用键：改了端口必须重注册，否则包进不到 transit 节点 */
+      sr_wg_ports_rebind (sm);
+
+      vlib_cli_output (vm,
+                       "SR-WG transit enabled: port=%u "
+                       "(外层源 IP/端口不改写，中转不参与 WireGuard)",
+                       sm->transit_port);
     }
   else if (disable)
     {
       sm->transit_enabled = 0;
-      clib_memset (&sm->local_ip4, 0, sizeof (sm->local_ip4));
       vlib_cli_output (vm, "SR-WG transit disabled.");
     }
   else
@@ -507,7 +517,7 @@ sr_wg_set_transit_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
 VLIB_CLI_COMMAND (sr_wg_set_transit_command, static) = {
   .path = "set sr-wg transit",
-  .short_help = "set sr-wg transit enable port <port> local-ip <ip> | "
+  .short_help = "set sr-wg transit enable port <port> | "
                 "set sr-wg transit disable",
   .function = sr_wg_set_transit_command_fn,
 };
@@ -693,10 +703,7 @@ sr_wg_rebind_ports_command_fn (vlib_main_t *vm, unformat_input_t *input,
 {
   sr_wg_main_t *sm = &sr_wg_main;
 
-  udp_register_dst_port (vm, (udp_dst_port_t) sm->vpn_port,
-                         sr_wg4_input_node.index, /* is_ipv4 */ 1);
-  udp_register_dst_port (vm, (udp_dst_port_t) sm->transit_port,
-                         sr_wg4_transit_node.index, /* is_ipv4 */ 1);
+  sr_wg_ports_rebind (sm);
 
   vlib_cli_output (vm, "SR-WG ports rebound: %u -> sr-wg4-input, %u -> sr-wg4-transit",
                    sm->vpn_port, sm->transit_port);

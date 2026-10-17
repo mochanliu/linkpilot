@@ -79,8 +79,17 @@ vl_api_sr_wg_path_add_del_t_handler (vl_api_sr_wg_path_add_del_t *mp)
 
       /* 从密钥表查找 P-Key 并填入路径配置 */
       sr_wg_key_entry_t *key = sr_wg_key_lookup (sm, cfg.hmac_id);
-      if (key)
-        clib_memcpy_fast (cfg.pkey, key->key, SR_PKEY_LEN);
+      if (!key)
+        {
+          /*
+           * 查不到密钥就必须报错，不能让 cfg.pkey 保持全零继续建路径：
+           * 全零密钥的路径会正常签名并发包，但对端一律验签失败，
+           * 现象是"配置都下发成功了、隧道就是不通"，控制器极难定位。
+           */
+          rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+          goto reply;
+        }
+      clib_memcpy_fast (cfg.pkey, key->key, SR_PKEY_LEN);
 
       rv = sr_path_add (&sm->path_table, &cfg);
       if (rv != 0)
@@ -92,6 +101,9 @@ vl_api_sr_wg_path_add_del_t_handler (vl_api_sr_wg_path_add_del_t *mp)
       rv = sr_path_del (&sm->path_table, path_id);
       if (rv != 0)
         rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+      else
+        /* 路径没了，指向它的隧道绑定必须一起摘掉，否则留下悬空绑定 */
+        sr_wg_binds_drop_for_path (sm, path_id);
     }
 
 reply:
@@ -118,7 +130,8 @@ vl_api_sr_wg_path_dump_t_handler (vl_api_sr_wg_path_dump_t *mp)
       sr_path_config_t *cfg = &sm->path_table.paths[i];
       int j;
 
-      if (filter_path_id != 0 && cfg->path_id != filter_path_id)
+      /* ~0 = 全量；path_id 0 是合法值，不能当"全部"的哨兵用 */
+      if (filter_path_id != 0xffff && cfg->path_id != filter_path_id)
         continue;
 
       rmp = vl_msg_api_alloc (sizeof (*rmp));
@@ -168,10 +181,22 @@ vl_api_sr_wg_key_del_t_handler (vl_api_sr_wg_key_del_t *mp)
   u16 hmac_id = clib_net_to_host_u16 (mp->hmac_id);
   int rv;
 
+  /*
+   * 还有路径引用这把钥匙时拒绝删除：路径里存的是副本，删了表项路径照旧
+   * 签名，但对端已经不再持有这把钥匙 —— 一个"看不见的密钥漂移"。
+   * 换密钥请直接用 key set（会同步刷新路径副本），不要先删再建。
+   */
+  if (sr_path_count_using_hmac_id (&sm->path_table, hmac_id) > 0)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto reply;
+    }
+
   rv = sr_wg_key_del (sm, hmac_id);
   if (rv != 0)
     rv = VNET_API_ERROR_NO_SUCH_ENTRY;
 
+reply:
   REPLY_MACRO (VL_API_SR_WG_KEY_DEL_REPLY);
 }
 
@@ -210,8 +235,10 @@ vl_api_sr_wg_transit_enable_t_handler (vl_api_sr_wg_transit_enable_t *mp)
   int rv = 0;
 
   sm->transit_port = clib_net_to_host_u16 (mp->port);
-  clib_memcpy_fast (&sm->local_ip4, mp->local_ip, 4);
   sm->transit_enabled = 1;
+
+  /* 端口是数据面的功能多路复用键：改了端口必须重新注册，否则包根本进不来 */
+  sr_wg_ports_rebind (sm);
 
   REPLY_MACRO (VL_API_SR_WG_TRANSIT_ENABLE_REPLY);
 }
@@ -224,7 +251,6 @@ vl_api_sr_wg_transit_disable_t_handler (vl_api_sr_wg_transit_disable_t *mp)
   int rv = 0;
 
   sm->transit_enabled = 0;
-  clib_memset (&sm->local_ip4, 0, sizeof (sm->local_ip4));
 
   REPLY_MACRO (VL_API_SR_WG_TRANSIT_DISABLE_REPLY);
 }
@@ -364,6 +390,69 @@ vl_api_sr_wg_stats_clear_t_handler (vl_api_sr_wg_stats_clear_t *mp)
   clib_memset (&sm->counters, 0, sizeof (sm->counters));
 
   REPLY_MACRO (VL_API_SR_WG_STATS_CLEAR_REPLY);
+}
+
+/* ==================== 端口 / 挂点配置 API Handlers ==================== */
+
+static void
+vl_api_sr_wg_rebind_ports_t_handler (vl_api_sr_wg_rebind_ports_t *mp)
+{
+  vl_api_sr_wg_rebind_ports_reply_t *rmp;
+  sr_wg_main_t *sm = &sr_wg_main;
+  int rv = 0;
+
+  sr_wg_ports_rebind (sm);
+
+  REPLY_MACRO (VL_API_SR_WG_REBIND_PORTS_REPLY);
+}
+
+static void
+vl_api_sr_wg_encap_fib_set_t_handler (vl_api_sr_wg_encap_fib_set_t *mp)
+{
+  vl_api_sr_wg_encap_fib_set_reply_t *rmp;
+  sr_wg_main_t *sm = &sr_wg_main;
+  int rv = 0;
+
+  sm->encap_fib_index = clib_net_to_host_u32 (mp->fib_index);
+
+  REPLY_MACRO (VL_API_SR_WG_ENCAP_FIB_SET_REPLY);
+}
+
+static void
+vl_api_sr_wg_config_dump_t_handler (vl_api_sr_wg_config_dump_t *mp)
+{
+  vl_api_sr_wg_config_details_t *rmp;
+  vl_api_registration_t *reg;
+  sr_wg_main_t *sm = &sr_wg_main;
+  uword key, val;
+  u32 n = 0;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  rmp = vl_msg_api_alloc (sizeof (*rmp));
+  clib_memset (rmp, 0, sizeof (*rmp));
+  rmp->_vl_msg_id =
+    clib_host_to_net_u16 (VL_API_SR_WG_CONFIG_DETAILS + sm->msg_id_base);
+  rmp->context = mp->context;
+  rmp->vpn_port = clib_host_to_net_u16 (sm->vpn_port);
+  rmp->transit_port = clib_host_to_net_u16 (sm->transit_port);
+  rmp->transit_enabled = sm->transit_enabled;
+  rmp->encap_fib_index = clib_host_to_net_u32 (sm->encap_fib_index);
+  rmp->path_count = sm->path_table.count;
+  rmp->key_count = sm->key_count;
+
+  /* *INDENT-OFF* */
+  hash_foreach (key, val, sm->encap_enabled_ifs, ({
+    if (n < ARRAY_LEN (rmp->enabled_ifs))
+      rmp->enabled_ifs[n++] = clib_host_to_net_u32 ((u32) key);
+  }));
+  /* *INDENT-ON* */
+
+  rmp->n_enabled_ifs = clib_host_to_net_u32 (n);
+
+  vl_api_send_msg (reg, (u8 *) rmp);
 }
 
 /* ==================== API 消息注册 ==================== */

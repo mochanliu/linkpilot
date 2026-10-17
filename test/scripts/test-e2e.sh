@@ -23,6 +23,15 @@
 #     -> sr-wg4-input 见 magic != 0x53 -> 旁路到 wg4-input（decap_bypass++）
 #   这条路径专门用来验证「未配置 SR path 时 WireGuard 直连模式不受影响」。
 #
+# 覆盖的断言：
+#   step 1-3  插件加载 / ip4-output arc 挂点 / encap 绑定可用
+#   step 4    encap -> transit -> decap 计数器 + 反向 WG 直连旁路 + overlay 连通
+#   step 5    HMAC 篡改（换错密钥后必须全部拒绝）
+#   step 6    SR 头部格式负向（magic/ver/len 分类计数）+ transit disable 门控
+#             —— 用 AF_PACKET 原始包注入，真实 WG 流量造不出畸形头
+#   step 7    中转绝不改写外层源（控制面无 local-ip 开关 + transit 自身 trace 佐证）
+#   step 8    密钥轮换（key set 刷新路径里的 P-Key 副本）后隧道必须仍然可用
+#
 # 用法:
 #   test/scripts/test-e2e.sh [--keep] [--skip-build] [--no-tamper] [--up-only]
 #
@@ -39,6 +48,7 @@ COMPOSE_FILE="${ROOT}/test/docker/docker-compose.yml"
 SETUP_C="/workspace/test/scripts/setup-node.sh"
 BUILD_C="/workspace/test/docker/build-plugin.sh"
 START_C="/workspace/test/docker/start-node.sh"
+INJECT_C="/workspace/test/scripts/inject-sr-packet.py"
 
 C_NODE1=srwg-node1
 C_TRANSIT=srwg-transit
@@ -48,6 +58,12 @@ ALL_CONTAINERS="${C_NODE1} ${C_TRANSIT} ${C_NODE2}"
 # node1 的 underlay 地址（与 setup-node.sh 默认值一致）。
 # encap 挂在承载该地址的 underlay 出口接口上，不是 wg0。
 N1_UNDERLAY=${N1_UNDERLAY:-10.10.1.2}
+TRANSIT_A=${TRANSIT_A:-10.10.1.3}
+TRANSIT_B=${TRANSIT_B:-10.10.2.3}
+N2_UNDERLAY=${N2_UNDERLAY:-10.10.2.2}
+VPN_PORT=${VPN_PORT:-51820}
+TRANSIT_PORT=${TRANSIT_PORT:-51821}
+SR_KEY_HEX=${SR_KEY_HEX:-00112233445566778899aabbccddeeff}
 
 KEEP=0
 SKIP_BUILD=0
@@ -59,7 +75,7 @@ for a in "$@"; do
       --skip-build)  SKIP_BUILD=1 ;;
       --no-tamper)   DO_TAMPER=0 ;;
       --up-only)     UP_ONLY=1 ;;
-      -h|--help)     sed -n '2,40p' "$0"; exit 0 ;;
+      -h|--help)     awk 'NR>1 { if ($0=="set -u") exit; sub(/^# ?/,""); print }' "$0"; exit 0 ;;
       *)             echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
@@ -282,17 +298,26 @@ for round in 1 2 3; do
     sleep 4
 done
 
-# 抓一份 trace 作为证据（不影响断言）
+# 抓一份 trace 作为证据（不影响断言）。
+# 必须 trace **af-packet-input**：VPP 只在输入节点给 buffer 打
+# VLIB_BUFFER_IS_TRACED，只 `trace add sr-wg4-*` 永远不会有任何包进
+# trace buffer（早期版本踩过这个坑，三个 trace 文件全是空的）。
+trace_to() {   # trace_to <container> <outfile> <extra-node>
+    local c=$1 out=$2 node=$3
+    dx "${c}" "vppctl \"clear trace\";
+               vppctl \"trace add af-packet-input 60\";
+               vppctl \"trace add ${node} 60\"" >/dev/null 2>&1
+    dx "${C_NODE1}" 'vppctl ping 192.168.99.2 source wg0 repeat 2 >/dev/null 2>&1'
+    sleep 4
+    dx "${c}" 'vppctl "show trace max 200"' > "${out}" 2>&1
+    dx "${c}" 'vppctl "clear trace"' >/dev/null 2>&1
+}
 echo "  -- capturing a trace on node1"
-dx "${C_NODE1}" 'vppctl clear trace; vppctl trace add sr-wg4-encap 16;
-                 vppctl ping 192.168.99.2 source wg0 repeat 3 >/dev/null 2>&1;
-                 sleep 1; vppctl show trace max 3' > /tmp/srwg-trace-node1.txt 2>&1
+trace_to "${C_NODE1}"   /tmp/srwg-trace-node1.txt   sr-wg4-encap
 echo "  -- capturing a trace on transit"
-dx "${C_TRANSIT}" 'vppctl clear trace; vppctl trace add sr-wg4-transit 16;
-                   sleep 6; vppctl show trace max 3' > /tmp/srwg-trace-transit.txt 2>&1
+trace_to "${C_TRANSIT}" /tmp/srwg-trace-transit.txt sr-wg4-transit
 echo "  -- capturing a trace on node2"
-dx "${C_NODE2}" 'vppctl clear trace; vppctl trace add sr-wg4-input 16;
-                 sleep 6; vppctl show trace max 3' > /tmp/srwg-trace-node2.txt 2>&1
+trace_to "${C_NODE2}"   /tmp/srwg-trace-node2.txt   sr-wg4-input
 
 # ==================================================================
 echo
@@ -395,9 +420,156 @@ if [ "${DO_TAMPER}" = "1" ]; then
 fi
 
 # ==================================================================
+# 原始包注入：不经 WireGuard，直接喂给 sr-wg4-transit。
+# 头部格式校验（magic/ver/len）与 transit_enabled 门控只能这样测——
+# 真实 WG 流量永远由 encap 生成合法头部，造不出畸形包。
+# ==================================================================
+echo
+info "step 6: SR header format negatives (raw injection -> transit classification)"
+
+KIF=${UVIF#host-}                     # host-eth1 -> eth1（内核侧注入用）
+N1_MAC=$(dx "${C_NODE1}" "vppctl show hardware-interfaces ${UVIF}" | tr -d '\r' |
+         awk '/Ethernet address/{print $3; exit}')
+TRANSIT_MAC=$(dx "${C_NODE1}" "vppctl show ip neighbor" | tr -d '\r' |
+              awk -v ip="${TRANSIT_A}" '$0 ~ ip {
+                  for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-f][0-9a-f]:/) {print $i; exit}}')
+echo "     inject via ${KIF}: src-mac=${N1_MAC:-?} dst-mac=${TRANSIT_MAC:-?}"
+
+inject_transit() {   # inject_transit <corrupt-kind|''> <count>
+    local corr=""
+    [ -n "$1" ] && corr="--corrupt $1"
+    dx "${C_NODE1}" "python3 ${INJECT_C} --send --iface ${KIF} --mode transit \
+        --src-ip ${N1_UNDERLAY} --dst-ip ${TRANSIT_A} --dst-port ${TRANSIT_PORT} \
+        --key-hex ${SR_KEY_HEX} --hmac-id 1 --path-id 1 \
+        --seg-count 2 --seg-left 1 \
+        --segments '${N2_UNDERLAY}:${VPN_PORT},${TRANSIT_A}:${TRANSIT_PORT}' \
+        --src-mac ${N1_MAC} --dst-mac ${TRANSIT_MAC} \
+        --count $2 --delay 0.3 ${corr}" >/dev/null 2>&1
+}
+
+if [ -z "${N1_MAC}" ] || [ -z "${TRANSIT_MAC}" ]; then
+    bad "cannot resolve injection MACs; skipping header-negative tests"
+else
+    for kind in magic ver len; do
+        setup_node transit clear-stats >/dev/null 2>&1
+        inject_transit "${kind}" 4
+        sleep 2
+        CTR=$(counter "${C_TRANSIT}" "Transit_bad_${kind}")
+        DRP=$(counter "${C_TRANSIT}" "General_drop_total")
+        if [ "${CTR}" -ge 4 ] 2>/dev/null; then
+            ok "corrupt-${kind}: Transit_bad_${kind}=${CTR} (>=4), drop_total=${DRP}"
+        else
+            bad "corrupt-${kind}: Transit_bad_${kind}=${CTR} (expected >=4)"
+        fi
+    done
+
+    # ---- transit_enabled 门控：disable 之后必须一个包都不处理 ----
+    # 这一步是确定性的：关掉中转后连 WG keepalive 的 SR 包也走同一条
+    # error 分支，所以 Transit_ok 必须恒为 0（没有别的来源能把它们计成 ok）。
+    info "step 6b: set sr-wg transit disable must stop all transit processing"
+    dx "${C_TRANSIT}" 'vppctl set sr-wg transit disable' >/dev/null 2>&1
+    setup_node transit clear-stats >/dev/null 2>&1
+    inject_transit "" 3
+    dx "${C_NODE1}" 'vppctl ping 192.168.99.2 source wg0 repeat 2 >/dev/null 2>&1'
+    sleep 3
+    T_OK_OFF=$(counter "${C_TRANSIT}" Transit_ok)
+    T_DROP_OFF=$(counter "${C_TRANSIT}" General_drop_total)
+    ERR_OFF=$(dx "${C_TRANSIT}" 'vppctl show errors' | tr -d '\r' |
+              grep -c "sr-wg transit is not enabled")
+    if [ "${T_OK_OFF}" = "0" ] && [ "${T_DROP_OFF}" -ge 3 ] 2>/dev/null; then
+        ok "transit disabled: Transit_ok=0, drop_total=${T_DROP_OFF}"
+    else
+        bad "transit disabled but Transit_ok=${T_OK_OFF}, drop_total=${T_DROP_OFF}"
+    fi
+    if [ "${ERR_OFF}" -ge 1 ] 2>/dev/null; then
+        ok "transit disabled: error reason 'sr-wg transit is not enabled' counted ${ERR_OFF}x"
+    else
+        bad "transit disabled but no 'not enabled' error shown"
+    fi
+
+    echo "  -- re-enabling transit"
+    dx "${C_TRANSIT}" "vppctl set sr-wg transit enable port ${TRANSIT_PORT}" >/dev/null 2>&1
+    dx "${C_TRANSIT}" 'vppctl set sr-wg rebind-ports' >/dev/null 2>&1
+    setup_node transit clear-stats >/dev/null 2>&1
+    inject_transit "" 3
+    sleep 2
+    T_OK_ON=$(counter "${C_TRANSIT}" Transit_ok)
+    if [ "${T_OK_ON}" -ge 3 ] 2>/dev/null; then
+        ok "transit re-enabled: Transit_ok=${T_OK_ON} (>=3)"
+    else
+        bad "transit re-enabled but Transit_ok=${T_OK_ON}"
+    fi
+fi
+
+# ==================================================================
+echo
+info "step 7: 中转绝不改写外层源（IP 与端口）"
+# ==================================================================
+# (a) 控制面已经没有任何「改源」开关：local-ip 关键字必须被 CLI 拒绝。
+LI_OUT=$(dx "${C_TRANSIT}" "vppctl set sr-wg transit enable port ${TRANSIT_PORT} local-ip ${TRANSIT_B}" 2>&1)
+if echo "${LI_OUT}" | grep -qiE "unknown input|error|not found"; then
+    ok "transit enable 不再接受 local-ip（改源开关已删除）"
+else
+    bad "transit enable 仍接受 local-ip，外层源可能被改写: ${LI_OUT}"
+fi
+
+# (b) 数据面证据：看 transit 自己的 trace —— 转发后的包在 host-*-tx 上
+#     外层源仍是 node1 的 underlay IP，目的才改成 node2。
+#     为什么不用 node2 侧 tcpdump：docker 网桥对跨网段的帧会做 SNAT
+#     （实测 src 变成 10.10.2.1），在线上抓到的包已不是 transit 发出的原样。
+trace_to "${C_TRANSIT}" /tmp/srwg-transit-src.txt sr-wg4-transit
+if ! grep -q "sr-wg4-transit" /tmp/srwg-transit-src.txt; then
+    bad "transit trace 为空（trace add 未生效），无法证明外层源"
+else
+    PRESERVED=$(grep -c "UDP: ${N1_UNDERLAY} -> ${N2_UNDERLAY}" /tmp/srwg-transit-src.txt)
+    REWRITTEN=$(grep -c "UDP: ${TRANSIT_A} -> ${N2_UNDERLAY}\|UDP: ${TRANSIT_B} -> ${N2_UNDERLAY}" \
+                 /tmp/srwg-transit-src.txt)
+    if [ "${PRESERVED}" -ge 1 ] && [ "${REWRITTEN}" = "0" ]; then
+        ok "外层源保持 ${N1_UNDERLAY}（tx 侧 ${PRESERVED} 条），无改源痕迹"
+    else
+        bad "外层源异常：preserved=${PRESERVED}, rewritten=${REWRITTEN}"
+        grep -E "UDP: 10\.10\.|host-eth[0-9]-tx" /tmp/srwg-transit-src.txt | head -8 | sed 's/^/    /'
+    fi
+fi
+
+# ==================================================================
+echo
+info "step 8: 密钥轮换不能断隧道（key set 必须刷新路径里的 P-Key 副本）"
+# ==================================================================
+# 路径表存的是 P-Key 的**副本**，encap 签名走 sr_path_fill_header(cfg) 只读
+# 副本。若 `key set` 只更新密钥表，node1 会继续用旧签名而对端已换新密钥，
+# 现象就是「一换密钥隧道就断」。这里用真 WG 流量验证副本被同步刷新。
+NEW_KEY=aabbccddeeff00112233445566778899
+rotate_key() { for c in ${ALL_CONTAINERS}; do dx "${c}" "vppctl sr-wg key set 1 $1" >/dev/null 2>&1; done; }
+
+rotate_key "${NEW_KEY}"
+# 换钥瞬间在途的旧签名包会被对端拒掉，先把这段噪声放干净再开始计量
+sleep 3
+for c in ${ALL_CONTAINERS}; do setup_node "$(role_of "${c}")" clear-stats >/dev/null 2>&1; done
+PING8=$(dx "${C_NODE1}" 'vppctl ping 192.168.99.2 source wg0 repeat 5' 2>&1)
+sleep 4
+R_EH=$(counter "${C_NODE1}"   Encap_hmac_fail)
+R_TH=$(counter "${C_TRANSIT}" Transit_hmac_fail)
+R_DH=$(counter "${C_NODE2}"   Decap_hmac_fail)
+R_DOK=$(counter "${C_NODE2}"  Decap_ok)
+echo "     encap_hmac_fail=${R_EH} transit_hmac_fail=${R_TH} decap_hmac_fail=${R_DH} decap_ok=${R_DOK}"
+if [ "${R_EH}" = "0" ] && [ "${R_TH}" = "0" ] && [ "${R_DH}" = "0" ] &&
+   [ "${R_DOK}" -gt 0 ] 2>/dev/null &&
+   echo "${PING8}" | grep -qE "[0-9]+ sent, [1-9][0-9]* received"; then
+    ok "轮换密钥后隧道仍通（路径里的 P-Key 副本已刷新）"
+else
+    bad "密钥轮换破坏了隧道 (encap_hm=${R_EH} transit_hm=${R_TH} decap_hm=${R_DH} decap_ok=${R_DOK})"
+    echo "${PING8}" | tail -2 | sed 's/^/    /'
+fi
+
+echo "  -- restoring the lab key"
+rotate_key "${SR_KEY_HEX}"
+
+# ==================================================================
 echo
 echo "=========================================================="
 echo " traces: /tmp/srwg-trace-node1.txt /tmp/srwg-trace-transit.txt /tmp/srwg-trace-node2.txt"
+echo "         /tmp/srwg-transit-src.txt (外层源保持的证据)"
 echo " build log: /tmp/srwg-build.log"
 echo " RESULT: ${PASS} passed, ${FAIL} failed"
 echo "=========================================================="
