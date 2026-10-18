@@ -23,6 +23,10 @@
 #   4. 隧道路径 MTU 预算：外层 = 内层 + WG(80) + SR(16+6*seg+8)。underlay veth 是
 #      1500，VPP 侧接口却报 9000，不会分片、直接被内核丢。所以给终端的路由加
 #      `mtu ${PATH_MTU}`（默认 1360）把内层压到预算内。
+#   5. af-packet 的 TX 楔死：show errors 里出现 `host-*-tx tx sendto fatal/temporary
+#      failure`。症状很误导人——VPP 主动 ping 终端是通的（RX 还活着），但转发方向
+#      全丢，终端只收到「Destination Host Unreachable」。自愈办法就是本脚本第 4 步
+#      的 delete + create host-interface，所以自检会把这条报错单独打印出来。
 #
 # 用法:
 #   test/scripts/perf-rig.sh            # 搭台 + 连通性自检
@@ -82,6 +86,10 @@ ensure_term() { # $1=name $2=edge net $3=ip
 ensure_term "${TERM_A}" "${EDGE_A_NET}" "${TERM_A_IP}"
 ensure_term "${TERM_B}" "${EDGE_B_NET}" "${TERM_B_IP}"
 
+# CPE 也要接上 edge 网段。docker network connect 是「运行时附加」，不在
+# docker-compose.yml 里，容器 restart / compose 重建后就掉了；更坑的是 Docker 的
+# 「已附加」视图可能还在、容器里的网卡却没有地址。统一交给 deliver_edge 判断。
+
 # 终端的 edge 口在容器里叫什么：按 IP 反查，别写死 eth1
 term_edge_if() { # $1=container $2=ip
     docker exec "$1" bash -c "ip -o -4 addr show | awk '/$2/ {print \$2; exit}'"
@@ -102,31 +110,46 @@ prep_term() { # $1=container $2=if $3=via $4=remote net
 prep_term "${TERM_A}" "${A_IF}" "${CPE_A_EDGE_IP}" "${EDGE_B_SUBNET}"
 prep_term "${TERM_B}" "${B_IF}" "${CPE_B_EDGE_IP}" "${EDGE_A_SUBNET}"
 
-# ---- 4. CPE 的 edge 口交给 VPP（顺序必须是 先配 VPP 再摘内核 IP）----
-hand_edge_to_vpp() { # $1=container $2=edge ip $3=remote net $4=overlay next-hop
+# ---- 4. CPE 的 edge 口交给 VPP ----
+# 顺序必须是「先建 VIF + 同步 MAC + 配 IP，再摘掉内核上的同一个 IP」，否则内核和
+# VPP 同时持有地址：内核抢答 ARP，VPP 的 host-*-tx 报 tx sendto fatal failure。
+# 每轮都 delete + create：docker 重插网卡会换掉 netdev，VPP 里旧 VIF 仍绑着已消失
+# 的 netdev，收发全哑。edge 口上没有 SR 绑定，删重建不影响隧道。
+deliver_edge_once() { # $1=container $2=edge ip $3=remote net $4=overlay next-hop
     docker exec "$1" bash -c "
         set -e
-        # 上一轮已经把这个 IP 交给 VPP 了：内核查不到网卡，但 VPP 的接口地址表里有
-        if vppctl show interface address | grep -q '$2/'; then
-            vppctl ip route add $3 via $4 wg0 >/dev/null 2>&1 || true
-            exit 0
+        HIF=\$(ip -o -4 addr show | awk -v ip='$2' '\$0 ~ ip\"/\" {print \$2; exit}')
+        if [ -z \"\${HIF}\" ]; then
+            # 内核不持有：多半是上一轮已经交给了 VPP。反查 VPP 用的是哪块网卡，
+            # 把地址临时加回内核，再走完整的 delete+create 流程自愈。
+            VIF=\$(vppctl show interface address |
+                   awk -v ip='$2' '/^host-/{n=\$1} \$0 ~ ip\"/\" {print n; exit}')
+            [ -n \"\${VIF}\" ] || { echo 'nobody holds $2' >&2; exit 3; }
+            HIF=\${VIF#host-}
+            ip link show \"\${HIF}\" >/dev/null 2>&1 || { echo \"netdev \${HIF} gone\" >&2; exit 4; }
+            ip addr add $2/24 dev \"\${HIF}\"
         fi
-        HIF=\$(ip -o -4 addr show | awk '/$2/ {print \$2; exit}')
-        [ -n \"\${HIF}\" ] || { echo 'kernel iface for $2 not found' >&2; exit 1; }
+        vppctl delete host-interface name \"\${HIF}\" >/dev/null 2>&1 || true
+        vppctl create host-interface name \"\${HIF}\" >/dev/null
         VIF=host-\${HIF}
-        vppctl show interface | grep -q \"\${VIF}\" || vppctl create host-interface name \"\${HIF}\" >/dev/null
         KMAC=\$(ip link show \"\${HIF}\" | awk '/link\/ether/{print \$2}')
         vppctl set interface mac address \"\${VIF}\" \"\${KMAC}\" >/dev/null 2>&1 || true
         vppctl set interface state \"\${VIF}\" up
-        vppctl show interface \"\${VIF}\" | grep -q '$2/' ||
-            vppctl set interface ip address \"\${VIF}\" $2/24
-        ip addr del $2/24 dev \"\${HIF}\" >/dev/null 2>&1 || true
+        vppctl set interface ip address \"\${VIF}\" $2/24
+        ip addr del $2/24 dev \"\${HIF}\"
         # dpo 必须指向 overlay 下一跳，见文件头坑 1
         vppctl ip route add $3 via $4 wg0 >/dev/null 2>&1 || true
-    " || die "CPE $1 的 edge 口交付失败"
+    "
 }
-hand_edge_to_vpp "${CPE_A}" "${CPE_A_EDGE_IP}" "${EDGE_B_SUBNET}" "${OVERLAY_B}"
-hand_edge_to_vpp "${CPE_B}" "${CPE_B_EDGE_IP}" "${EDGE_A_SUBNET}" "${OVERLAY_A}"
+deliver_edge() { # $1=container $2=net $3=edge ip $4=remote net $5=overlay next-hop
+    deliver_edge_once "$1" "$3" "$4" "$5" && return 0
+    # exit 3/4 = 地址谁也不持有或 netdev 已消失：让 docker 重新插一次网卡再来
+    docker network disconnect "$2" "$1" >/dev/null 2>&1 || true
+    docker network connect --ip "$3" "$2" "$1"
+    deliver_edge_once "$1" "$3" "$4" "$5" || die "CPE $1 的 edge 口交付失败"
+}
+deliver_edge "${CPE_A}" "${EDGE_A_NET}" "${CPE_A_EDGE_IP}" "${EDGE_B_SUBNET}" "${OVERLAY_B}"
+deliver_edge "${CPE_B}" "${EDGE_B_NET}" "${CPE_B_EDGE_IP}" "${EDGE_A_SUBNET}" "${OVERLAY_A}"
 
 # ---- 5. peer allowed-ip 恒 0.0.0.0/0（定案，见文件头坑 2）----
 # 对端公钥从本机 peer 表里读，并和「本机自己的接口公钥」比对，防止上一轮把
@@ -148,11 +171,27 @@ force_wildcard_allowed_ip "${CPE_B}" 10.10.1.2
 sleep 5
 
 # ---- 6. 自检 ----
-docker exec "${CPE_A}" vppctl show wireguard peer | grep -q 'flags: 2' ||
-    log "警告：node1 WG peer 还没 ESTABLISHED，握手可能未完成"
+# peer 是刚重加的，握手要跑满一个 keepalive 周期；先等 flags:2，再连打两轮
+# （第一轮全丢是冷启动的正常现象，不能当故障）。
+for c in "${CPE_A}" "${CPE_B}"; do
+    for i in 1 2 3 4 5 6; do
+        docker exec "$c" vppctl show wireguard peer 2>/dev/null | grep -q 'flags: 2' && break
+        sleep 5
+    done
+    docker exec "$c" vppctl show wireguard peer | grep -q 'flags: 2' ||
+        log "警告：$c 的 WG peer 未 ESTABLISHED"
+done
+docker exec "${TERM_A}" bash -c "ping -c 3 -W 2 ${TERM_B_IP} >/dev/null 2>&1" || true
 RT=$(docker exec "${TERM_A}" bash -c "ping -c 4 -W 2 ${TERM_B_IP} 2>&1 | tail -2 | head -1")
 log "term-a -> term-b: ${RT}"
+echo "${RT}" | grep -q '0% packet loss' ||
+    log "注意：第一轮已发过探测包，若仍不通请检查 CPE 上 host-*-tx 的 sendto 报错"
 docker exec "${TERM_A}" bash -c "ping -c 2 -W 2 ${TERM_B_IP} >/dev/null 2>&1"
+# 见文件头坑 5：TX 楔死时光看 ping 结果不够，必须单独查 sendto 报错
+for c in "${CPE_A}" "${CPE_B}"; do
+    WEDGE=$(docker exec "$c" vppctl show errors 2>/dev/null | grep -E 'tx sendto' | head -2)
+    [ -z "${WEDGE}" ] || log "警告：${c} 的 af-packet TX 有 sendto 报错 -> ${WEDGE}"
+done
 TA=$(docker exec "${CPE_A}" vppctl show sr-wg stats | awk '/Encap:/{f=1} f && /ok:/{print $2; exit}')
 log "node1 Encap ok 累计=${TA}（>0 说明转发流量真的走了 SR 全链）"
 
