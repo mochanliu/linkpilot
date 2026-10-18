@@ -12,6 +12,10 @@
 # node1/node2 的 edge 口交给 VPP，终端之间的包是「被转发」的，因此会真的走过
 # sr-wg4-encap -> transit -> sr-wg4-input 全链（终端自己不参与隧道）。
 #
+# 另外还会把两台终端挂到一条不经 VPP 的直连桥 srwg_direct（10.30.0.0/24）上，
+# 供 perf-bench.sh 的控制组用：同终端、同载荷、隧道不掺和，先量出台子的余量，
+# 才能说「跑不上去」不是 iperf3/终端的锅。
+#
 # 两个必须写死的坑（本轮实测踩到）：
 #   1. `ip route add <net> via wg0` 会得到 dpo-drop（WireGuard 的 adj 解析不出来），
 #      必须写 `via <对端 overlay IP> <wg 接口>`，例如 `via 192.168.99.2 wg0`。
@@ -40,6 +44,10 @@ CPE_A_EDGE_IP=10.20.1.2; TERM_A_IP=10.20.1.3
 CPE_B_EDGE_IP=10.20.2.2; TERM_B_IP=10.20.2.3
 CPE_A=srwg-node1; CPE_B=srwg-node2
 TERM_A=srwg-term-a; TERM_B=srwg-term-b
+# 直连控制桥：只把两台终端连起来、不经 VPP，给 perf-bench.sh 的控制组用。
+# Docker 把子网的 .1 保留成网关，所以 term-b 只能往后面挑（实测 10.30.0.2）。
+DIRECT_NET=srwg_direct; DIRECT_SUBNET=10.30.0.0/24
+DIRECT_A_IP=10.30.0.11; DIRECT_B_IP=10.30.0.2
 OVERLAY_A=192.168.99.1; OVERLAY_B=192.168.99.2
 PATH_MTU=${PATH_MTU:-1360}
 CPE_CPUS=${CPE_CPUS:-2}; CPE_MEM=${CPE_MEM:-2g}
@@ -54,7 +62,7 @@ die() { printf '[perf-rig] FATAL: %s\n' "$*" >&2; exit 1; }
 
 if [ "${TEARDOWN}" = "1" ]; then
     docker rm -f "${TERM_A}" "${TERM_B}" >/dev/null 2>&1 || true
-    docker network rm "${EDGE_A_NET}" "${EDGE_B_NET}" >/dev/null 2>&1 || true
+    docker network rm "${EDGE_A_NET}" "${EDGE_B_NET}" "${DIRECT_NET}" >/dev/null 2>&1 || true
     log "teardown done (主 lab 未动)"
     exit 0
 fi
@@ -86,6 +94,18 @@ ensure_term() { # $1=name $2=edge net $3=ip
 ensure_term "${TERM_A}" "${EDGE_A_NET}" "${TERM_A_IP}"
 ensure_term "${TERM_B}" "${EDGE_B_NET}" "${TERM_B_IP}"
 
+# ---- 2b. 直连控制桥（不经 VPP 的那一条，perf-bench.sh 控制组要用）----
+# 没有它，控制组只能走 edge 网段——那条路一定经过 node1 的 af-packet，
+# 「终端不是瓶颈」就没法证明了。
+docker network inspect "${DIRECT_NET}" >/dev/null 2>&1 ||
+    docker network create --driver bridge --subnet "${DIRECT_SUBNET}" "${DIRECT_NET}" >/dev/null
+attach_direct() { # $1=container $2=ip
+    docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$1" |
+        grep -qx "${DIRECT_NET}" || docker network connect --ip "$2" "${DIRECT_NET}" "$1"
+}
+attach_direct "${TERM_A}" "${DIRECT_A_IP}"
+attach_direct "${TERM_B}" "${DIRECT_B_IP}"
+
 # CPE 也要接上 edge 网段。docker network connect 是「运行时附加」，不在
 # docker-compose.yml 里，容器 restart / compose 重建后就掉了；更坑的是 Docker 的
 # 「已附加」视图可能还在、容器里的网卡却没有地址。统一交给 deliver_edge 判断。
@@ -109,6 +129,11 @@ prep_term() { # $1=container $2=if $3=via $4=remote net
 }
 prep_term "${TERM_A}" "${A_IF}" "${CPE_A_EDGE_IP}" "${EDGE_B_SUBNET}"
 prep_term "${TERM_B}" "${B_IF}" "${CPE_B_EDGE_IP}" "${EDGE_A_SUBNET}"
+
+# 控制组的 iperf3 服务端常驻在 term-b（要等上一步装好 iperf3）。--daemon 重复起会
+# 报错，所以先探活；perf-bench.sh 里还有一份同样的兜底。
+docker exec "${TERM_B}" sh -c 'pgrep -x iperf3 >/dev/null || iperf3 -s -p 5201 --daemon' \
+    >/dev/null 2>&1 || true
 
 # ---- 4. CPE 的 edge 口交给 VPP ----
 # 顺序必须是「先建 VIF + 同步 MAC + 配 IP，再摘掉内核上的同一个 IP」，否则内核和
@@ -181,6 +206,8 @@ for c in "${CPE_A}" "${CPE_B}"; do
     docker exec "$c" vppctl show wireguard peer | grep -q 'flags: 2' ||
         log "警告：$c 的 WG peer 未 ESTABLISHED"
 done
+RT=$(docker exec "${TERM_A}" bash -c "ping -c 4 -W 2 ${DIRECT_B_IP} 2>&1 | tail -2 | head -1")
+log "直连桥（不经 VPP，控制组走这条路）: ${RT}"
 docker exec "${TERM_A}" bash -c "ping -c 3 -W 2 ${TERM_B_IP} >/dev/null 2>&1" || true
 RT=$(docker exec "${TERM_A}" bash -c "ping -c 4 -W 2 ${TERM_B_IP} 2>&1 | tail -2 | head -1")
 log "term-a -> term-b: ${RT}"
