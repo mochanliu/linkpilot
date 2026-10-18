@@ -200,6 +200,20 @@ END{
         else       printf "  %-14s %-12s %.2f 核 / %8.0f pps  零流量对照，差分≈0 即方法可信\n", who[i], cn[i], c[cn[i]], q
     }
 }'
+echo "--- 按「VPP 收到的包」归一化的成本（对拓扑不敏感，用来跨配置比：无 WG / 纯 WG / SR+WG）---"
+echo "$J" | awk -F'\t' -v m="$MHZ" -v A="$CPE_A" -v TR="$TRANSIT" -v B="$CPE_B" -v L="${LABEL:-}" '
+$5-$3 > 0.05 { R[$1] = ($4-$2)/($5-$3) }
+/^核;/       { split($1,k,";"); c[k[2]] = ($4-$2)/1e6/($5-$3) }
+END{
+    printf "  标签 %s\n", L
+    n[1]="node1 收包"; cn[1]=A; k[1]="if;"A";host-eth2;rx"
+    n[2]="中转 收包";  cn[2]=TR; k[2]="if;"TR";host-eth0;rx"
+    n[3]="node2 收包"; cn[3]=B; k[3]="if;"B";host-eth0;rx"
+    for(i=1;i<=3;i++){ q=R[k[i]]
+        if(q>1000) printf "  COST %-10s %-12s %8.0f pps  %.2f 核  %.3e 周期/包\n", n[i], cn[i], q, c[cn[i]], c[cn[i]]*m*1e6/q
+        else       printf "  COST %-10s %-12s 收包差分≈0，这一轮没有流量\n", n[i], cn[i]
+    }
+}'
 echo "--- 实收（客户端自报，覆盖整条流而非只覆盖采样窗）---"
 if [ "${TRAFFIC:-1}" = "1" ]; then
     for i in $(seq 1 $((D + 20))); do

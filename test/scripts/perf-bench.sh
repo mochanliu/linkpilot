@@ -54,6 +54,23 @@
 #           所以 208 Mbit/s 只能当**下限**：按实测 3.1e4 周期/包，2 核配额的理论上限
 #           约 2x3.2e9/3.1e4 ≈ 2.0e5 pps ≈ 2 Gbit/s@1200B，是实测的 10 倍。
 #           attr-cpu.sh 的「内核侧」两行就是专门用来钉死这件事的。
+#
+# 2026-10-18 追加：到底是 WG 本身的开销，还是我们加的 SR 代码？（同容器同配额，
+#   固定无损负载 200M/1200B ≈20.8k pps，各 2 轮，attr-cpu.sh 的 COST 行；口径是
+#   占核差分 ÷ VPP 实际收到的 pps，对拓扑不敏感）
+#     node1(出口)  纯转发 3.19e4 → +WG 3.63e4 → +SR+WG 3.99e4 周期/包
+#     node2(入口)  纯转发 3.83e4 → +WG 4.23e4 → +SR+WG 4.21e4 周期/包
+#     中转         普通 UDP 转发 2.52e4 → +SR transit 2.54e4 周期/包
+#   拆出来的边际成本：原版 WireGuard ≈ +0.4e4~0.44e4（+12~14%），我们的 SR 头
+#   ≈ +0.36e4（出口 +10%）、入口与中转 ≈ 0（噪声内，中转与 show runtime 的 250
+#   周期/包一致）。而**什么都不加的纯 VPP 转发就已经要 3.2e4 周期/包**，占整条
+#   出口的 80% —— 那部分是 af-packet + ip4/arp/midchain 的台子开销，不是加密、
+#   也不是我们的代码。摘掉 SR 绑定跑纯 WG 的洪泛对照（4x400M）：node1 进 VPP
+#   34.2k pps vs 带 SR 的 28.3k，端到端 190 vs 196 Mbit/s（SR 包更大所以比特持平），
+#   即原版 WG 在这台台子上也快不了多少，同一个上限形态。
+#   复现：`vppctl set sr-wg tunnel 2 del` → 测 → `set sr-wg tunnel 2 path 1 endpoint
+#   10.10.2.2` 绑回；无 WG 那一档要把 node1/node2 的 10.20.x/24 路由先 del 再指到
+#   underlay 下一跳（VPP 的 ip route add 是**追加路径**，不 del 会变成 ECMP 分半）。
 set -u
 
 TERM_A=${TERM_A:-srwg-term-a}
