@@ -5,6 +5,7 @@
  *   show sr-wg paths
  *   show sr-wg keys
  *   show sr-wg tunnels
+ *   show sr-wg ports
  *   show sr-wg stats
  *   show sr-wg observed
  *   clear sr-wg stats
@@ -14,9 +15,11 @@
  *   sr-wg path del <path_id>
  *   sr-wg key set <hmac_id> <hex32>
  *   sr-wg key del <hmac_id>
+ *   set sr-wg port add|del vpn|transit <port>
  *   set sr-wg transit enable port <port>
  *   set sr-wg transit disable
- *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>] [del]
+ *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>]
+ *                   [dst-port <port>] [del]
  *   set sr-wg encap enable <underlay sw_if_index|name> | disable <…>
  *                   | fib-index <n>
  *   set sr-wg rebind-ports        （建 WG 接口后必做，见 sr_wg.c）
@@ -25,6 +28,33 @@
 #include <vnet/ip/format.h>
 #include <vnet/interface_funcs.h>
 #include <vnet/vnet.h>
+
+/* ==================== 共用格式化 ==================== */
+
+/*
+ * 把端口集合打印成 "51820,51830"。%U 的实参是 clib_bitmap_t *（== uword *）。
+ * 空集合打 "<none>"：agent 对账时"一个端口都没注册"和"读不到表"必须能分辨。
+ */
+static u8 *
+format_sr_wg_port_set (u8 *s, va_list *args)
+{
+  clib_bitmap_t *bitmap = va_arg (*args, clib_bitmap_t *);
+  uword port;
+  u8 first = 1;
+
+  /* *INDENT-OFF* */
+  clib_bitmap_foreach (port, bitmap)
+    {
+      s = format (s, "%s%u", first ? "" : ",", (u32) port);
+      first = 0;
+    }
+  /* *INDENT-ON* */
+
+  if (first)
+    s = format (s, "<none>");
+
+  return s;
+}
 
 /* ==================== show sr-wg paths ==================== */
 
@@ -143,7 +173,11 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
       if (bind->endpoint.as_u32 != 0)
         {
-          state = "usable";
+          /*
+           * 端口通配（dst_port==0）也能命中，但它把这个 IP 上的**所有**隧道
+           * 都拽进同一条路径 —— 多隧道场景下这是配漏了 dst-port，标出来。
+           */
+          state = bind->dst_port ? "usable" : "usable, !! 端口通配";
           n_usable++;
         }
       else
@@ -160,17 +194,19 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
        */
       if (vnet_get_sw_interface_or_null (vnm, bind->sw_if_index))
         vlib_cli_output (vm,
-                         "  [%u] sw_if_index=%u (%U) path_id=%u endpoint=%U "
-                         "%s",
+                         "  [%u] sw_if_index=%u (%U) path_id=%u "
+                         "endpoint=%U:%u %s",
                          bi, bind->sw_if_index, format_vnet_sw_if_index_name,
                          vnm, bind->sw_if_index, (u32) bind->path_id,
-                         format_ip4_address, &bind->endpoint, state);
+                         format_ip4_address, &bind->endpoint,
+                         (u32) bind->dst_port, state);
       else
         vlib_cli_output (vm,
                          "  [%u] sw_if_index=%u (<deleted>) path_id=%u "
-                         "endpoint=%U %s",
+                         "endpoint=%U:%u %s",
                          bi, bind->sw_if_index, (u32) bind->path_id,
-                         format_ip4_address, &bind->endpoint, state);
+                         format_ip4_address, &bind->endpoint,
+                         (u32) bind->dst_port, state);
       n++;
     }
 
@@ -183,6 +219,36 @@ VLIB_CLI_COMMAND (sr_wg_show_tunnels_command, static) = {
   .path = "show sr-wg tunnels",
   .short_help = "show sr-wg tunnels",
   .function = sr_wg_show_tunnels_command_fn,
+};
+
+/* ==================== show sr-wg ports ==================== */
+
+static clib_error_t *
+sr_wg_show_ports_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                             vlib_cli_command_t *cmd)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+
+  vlib_cli_output (vm, "vpn     %2u 个端口 -> sr-wg4-input : %U",
+                   sr_wg_port_count (sm, SR_WG_PORT_VPN),
+                   format_sr_wg_port_set, sm->vpn_ports);
+  vlib_cli_output (vm, "transit %2u 个端口 -> sr-wg4-transit: %U (%s)",
+                   sr_wg_port_count (sm, SR_WG_PORT_TRANSIT),
+                   format_sr_wg_port_set, sm->transit_ports,
+                   sm->transit_enabled ? "已启用" : "未启用，收到也丢");
+
+  if (sr_wg_port_count (sm, SR_WG_PORT_VPN) == 0)
+    vlib_cli_output (
+      vm, "  !! WARNING: vpn 端口集合是空的，任何隧道都进不到 sr-wg4-input，"
+          "encap 的端口判据也一律直通。用 `set sr-wg port add vpn <port>` 补。");
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_show_ports_command, static) = {
+  .path = "show sr-wg ports",
+  .short_help = "show sr-wg ports",
+  .function = sr_wg_show_ports_command_fn,
 };
 
 /* ==================== show sr-wg stats ==================== */
@@ -291,9 +357,10 @@ sr_wg_show_observed_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (n == 0)
     vlib_cli_output (
-      vm, "  (空表。确认 vpn_port=%u 已注册到 sr-wg4-input："
-          "`set sr-wg rebind-ports` 必须在建 WG 接口之后执行)",
-      sm->vpn_port);
+      vm, "  (空表。确认隧道端口在 vpn 集合 %U 里、且已注册到 sr-wg4-input："
+          "`set sr-wg port add vpn <port>` 与建 WG 接口之后的 "
+          "`set sr-wg rebind-ports`)",
+      format_sr_wg_port_set, sm->vpn_ports);
 
   return 0;
 }
@@ -543,6 +610,79 @@ VLIB_CLI_COMMAND (sr_wg_key_command, static) = {
   .function = sr_wg_key_command_fn,
 };
 
+/* ==================== set sr-wg port ==================== */
+
+/*
+ *   set sr-wg port add vpn <port>
+ *   set sr-wg port del vpn <port>
+ *   set sr-wg port add transit <port>
+ *
+ * 每隧道一个监听端口（定案 2）：同一对 CPE 可以开多条 WG 隧道，端口就是数据面
+ * 认隧道的身份。add/del **立刻**作用到 UDP 分发表，不需要另外 rebind-ports；
+ * rebind 是"WG 建接口把端口抢回 wg4-input 之后"的修复动作。
+ *
+ * 删 vpn 端口会把端口交回 wg4-input（那条隧道还能当普通 WG 用），
+ * 删 transit 端口直接反注册。
+ */
+static clib_error_t *
+sr_wg_set_port_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                           vlib_cli_command_t *cmd)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  u8 is_add = 0, is_del = 0, have_kind = 0, is_vpn = 0;
+  u32 port = 0;
+  u8 kind;
+  int rv;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "add"))
+        is_add = 1;
+      else if (unformat (input, "del"))
+        is_del = 1;
+      else if (unformat (input, "vpn"))
+        {
+          have_kind = 1;
+          is_vpn = 1;
+        }
+      else if (unformat (input, "transit"))
+        {
+          have_kind = 1;
+          is_vpn = 0;
+        }
+      else if (unformat (input, "%u", &port))
+        ;
+      else
+        break;
+    }
+
+  if (is_add == is_del)
+    return clib_error_return (0, "specify 'add' or 'del'");
+  if (!have_kind)
+    return clib_error_return (0, "specify 'vpn' or 'transit'");
+  if (port == 0)
+    return clib_error_return (0, "<port> must be 1..65535");
+
+  kind = is_vpn ? SR_WG_PORT_VPN : SR_WG_PORT_TRANSIT;
+  rv = sr_wg_port_add_del (sm, kind, (u16) port, is_add ? 1 : 0);
+  if (rv != 0)
+    return clib_error_return (0, "sr_wg_port_add_del failed (rv=%d)", rv);
+
+  vlib_cli_output (vm,
+                   "SR-WG %s port %u %s；集合现有 %u 个端口: %U",
+                   is_vpn ? "vpn" : "transit", port,
+                   is_add ? "已加入并重挂" : "已移出并交回",
+                   sr_wg_port_count (sm, kind), format_sr_wg_port_set,
+                   is_vpn ? sm->vpn_ports : sm->transit_ports);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_set_port_command, static) = {
+  .path = "set sr-wg port",
+  .short_help = "set sr-wg port add|del vpn|transit <port>",
+  .function = sr_wg_set_port_command_fn,
+};
+
 /* ==================== set sr-wg transit ==================== */
 
 static clib_error_t *
@@ -568,18 +708,22 @@ sr_wg_set_transit_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (enable && !disable)
     {
+      int rv;
+
       if (port == 0)
         port = SR_PORT_TRANSIT;
-      sm->transit_port = (u16) port;
+
+      /* 端口是集合：一台中转可以服务多个租户/多条通道，各占一个 transit 端口。
+       * sr_wg_port_add_del 内部已经重注册，这里只再置启用标志。 */
+      rv = sr_wg_port_add_del (sm, SR_WG_PORT_TRANSIT, (u16) port, 1);
+      if (rv != 0)
+        return clib_error_return (0, "sr_wg_port_add_del failed (rv=%d)", rv);
       sm->transit_enabled = 1;
 
-      /* 端口就是功能多路复用键：改了端口必须重注册，否则包进不到 transit 节点 */
-      sr_wg_ports_rebind (sm);
-
       vlib_cli_output (vm,
-                       "SR-WG transit enabled: port=%u "
-                       "(外层源 IP/端口不改写，中转不参与 WireGuard)",
-                       sm->transit_port);
+                       "SR-WG transit enabled: port=%u（集合 %U）"
+                       "，外层源 IP/端口不改写，中转不参与 WireGuard",
+                       port, format_sr_wg_port_set, sm->transit_ports);
     }
   else if (disable)
     {
@@ -606,14 +750,17 @@ VLIB_CLI_COMMAND (sr_wg_set_transit_command, static) = {
 /*
  * 绑定 / 解绑 WG 隧道接口到 SR 路径。
  *
- *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>] [del]
+ *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>]
+ *                  [dst-port <port>] [del]
  *
  * 本命令**只写绑定表**，不启用 feature。encap 的挂点在 underlay 出口接口
  * （wg4-output-tun 不参与 feature 链，详见 sr_wg.h），必须另外执行
  * `set sr-wg encap enable <underlay sw_if_index>`。
  *
- * underlay 挂点上数据面按外层 dst 查绑定，所以 add 时 [endpoint] 实际必填；
- * 缺失时这里仍接受配置但立刻告警，避免"配了却没生效"要抓包才发现。
+ * underlay 挂点上数据面按外层 (dst IP, 封装前 dst 端口) 查绑定，所以 add 时
+ * [endpoint] 实际必填；缺失时这里仍接受配置但立刻告警，避免"配了却没生效"要
+ * 抓包才发现。[dst-port] 不给就是通配（该 IP 上不分行数全走本路径）：单隧道
+ * 可以用，同对端开多条隧道时必须给，否则第二条会被第一条的路径接管。
  */
 static clib_error_t *
 sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -623,7 +770,8 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
   ip4_address_t endpoint;
   u32 sw_if_index = (u32) ~0;
   u32 path_id = 0;
-  u8 have_path = 0, is_del = 0, have_endpoint = 0;
+  u32 dst_port = 0;
+  u8 have_path = 0, is_del = 0, have_endpoint = 0, have_dst_port = 0;
   int rv;
 
   clib_memset (&endpoint, 0, sizeof (endpoint));
@@ -636,6 +784,8 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
         have_path = 1;
       else if (unformat (input, "endpoint %U", unformat_ip4_address, &endpoint))
         have_endpoint = 1;
+      else if (unformat (input, "dst-port %u", &dst_port))
+        have_dst_port = 1;
       else if (unformat (input, "del"))
         is_del = 1;
       else if (unformat (input, "delete"))
@@ -651,7 +801,14 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   rv = sr_wg_tunnel_set_path (sm, sw_if_index, (u16) path_id,
                               have_endpoint ? &endpoint : NULL,
-                              is_del ? 0 : 1);
+                              (u16) dst_port, is_del ? 0 : 1);
+  if (rv == VNET_API_ERROR_ENTRY_ALREADY_EXISTS)
+    return clib_error_return (
+      0,
+      "endpoint=%U:%u 已经被另一条隧道的绑定占着 —— 同一对 CPE 的多条隧道"
+      "必须各自一个 dst-port，否则前一条会被静默旁路。全表见 "
+      "`show sr-wg tunnels`。",
+      format_ip4_address, &endpoint, dst_port);
   if (rv != 0)
     return clib_error_return (0, "sr-wg tunnel set path failed (rv=%d)", rv);
 
@@ -663,9 +820,11 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (have_endpoint)
     vlib_cli_output (vm,
-                     "SR-WG tunnel %u bound to path_id=%u endpoint=%U.",
+                     "SR-WG tunnel %u bound to path_id=%u endpoint=%U:%u%s",
                      sw_if_index, (u32) (u16) path_id,
-                     format_ip4_address, &endpoint);
+                     format_ip4_address, &endpoint, (u32) dst_port,
+                     have_dst_port ? "" : "  !! 未指定 dst-port：本绑定对端点"
+                     "IP 上的**所有**隧道生效（通配），多隧道场景请补 dst-port");
   else
     vlib_cli_output (vm,
                      "SR-WG tunnel %u bound to path_id=%u, "
@@ -684,7 +843,7 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
 VLIB_CLI_COMMAND (sr_wg_set_tunnel_command, static) = {
   .path = "set sr-wg tunnel",
   .short_help = "set sr-wg tunnel <sw_if_index> path <path_id> "
-                "[endpoint <ip>] [del]",
+                "[endpoint <ip>] [dst-port <port>] [del]",
   .function = sr_wg_set_tunnel_command_fn,
 };
 
@@ -771,10 +930,10 @@ VLIB_CLI_COMMAND (sr_wg_set_encap_command, static) = {
 /* ==================== set sr-wg rebind-ports ==================== */
 
 /*
- * WireGuard 在创建接口时会重新注册 listen-port（udp_register_dst_port），
- * 覆盖 SR-WG 插件在 init 阶段对 51820 的注册。此命令重新把
- * 51820 → sr-wg4-input、51821 → sr-wg4-transit 注册回来。
- * 必须在所有 WireGuard 接口创建完成后调用。
+ * WireGuard 在创建接口时会把**该接口的** listen-port 重新注册给 wg4-input
+ * （udp_register_dst_port），覆盖 SR-WG 之前挂上去的注册 —— 每隧道一个端口
+ * 之后，被覆盖的是那一条隧道的端口，不是全局 51820。所以每张 WG 接口建完
+ * 都要 rebind 一次，把端口集合里所有端口重新挂回本插件的节点。
  */
 static clib_error_t *
 sr_wg_rebind_ports_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -784,8 +943,11 @@ sr_wg_rebind_ports_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   sr_wg_ports_rebind (sm);
 
-  vlib_cli_output (vm, "SR-WG ports rebound: %u -> sr-wg4-input, %u -> sr-wg4-transit",
-                   sm->vpn_port, sm->transit_port);
+  vlib_cli_output (vm,
+                   "SR-WG ports rebound: vpn %U -> sr-wg4-input, "
+                   "transit %U -> sr-wg4-transit",
+                   format_sr_wg_port_set, sm->vpn_ports,
+                   format_sr_wg_port_set, sm->transit_ports);
   return 0;
 }
 

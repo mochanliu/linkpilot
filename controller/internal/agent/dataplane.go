@@ -34,8 +34,14 @@ import (
 //  4. **动手前先确认这张绑定表装得下**。插件的绑定表按 sw_if_index 建索引、
 //     每个接口只有一条（见 ErrSingleBind），所以并发的 reconcile 与"第二个 peer"
 //     都必须显式处理，否则会静默覆盖前一个人的外层地址。
+//  5. **一条隧道一个监听端口，端口是集合不是标量**（定案 2）。所以建接口之后
+//     必须先把这个端口 AddPort 进 vpn 集合，再 RebindPorts —— 插件的集合里
+//     默认只有 51820，51830 那条隧道不登记就永远没人给它加 SR 头。
 type DataPlane interface {
 	SetPKey(ctx context.Context, hmacID uint16, key []byte) error
+	AddPort(ctx context.Context, kind uint8, port uint16) error
+	DelPort(ctx context.Context, kind uint8, port uint16) error
+	Ports(ctx context.Context) ([]vppapi.PortInfo, error)
 	RebindPorts(ctx context.Context) error
 
 	CreateInterface(ctx context.Context, p vppapi.InterfaceParams) (uint32, error)
@@ -83,9 +89,12 @@ type LinkConfig struct {
 
 	// Instance 是 WG 的 user_instance；用 node_id 最合适，因为它 enroll 之后才
 	// 存在、租户内唯一、且和 VPP 的 sw_if_index 无关（那个会被别的接口占掉）。
+	// 一台设备上多开一条隧道就要再让一个号（例如 node_id*16 + 隧道序号）——
+	// VPP 对重复的 user_instance 实测回 -31，不是覆盖。
 	Instance uint32
-	// ListenPort 是租户下发的 vpn_port —— 在这个数据面里 WG 的监听端口就是
-	// 功能分用键（定案 2），不是两个独立参数。
+	// ListenPort 是**这条隧道自己的** vpn_port —— 在这个数据面里 WG 的监听端口就是
+	// 功能+隧道分用键（定案 2），不是两个独立参数。同一对 CPE 开第二条隧道就是再建
+	// 一个 Link，换一个端口；Open 会把它 AddPort 进数据面的 vpn 端口集合。
 	ListenPort uint16
 	// SrcIP 是 underlay 上发包用的源地址（agent 从本地地址集里选出来那个）。
 	// 只能是 IPv4：SR 头里的段地址就是 4 字节。
@@ -106,6 +115,10 @@ type LinkConfig struct {
 	// PathIDBase 把 agent 用的 path_id 整体抬高，避开操作者手敲 CLI 时从 1
 	// 开始的那批。用户明确要"我手动敲配置也可以做一些测试"，而路径表是**全局**
 	// 的：node_id=1 的 agent 若直接用 1，就会覆盖同节点上手配的 path_id=1。
+	//
+	// 同一台 CPE 上的**每条隧道都要一个自己的 base**：path_id 只由 (base, 对端
+	// node_id) 决定，两条隧道到同一个人若共用 base 就会抢同一条路径 —— 后写的
+	// 把前一条的段列表换掉，症状是"第一条隧道忽然不中转了"。
 	PathIDBase uint16
 }
 
@@ -258,10 +271,11 @@ func (l *Link) Open(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("agent: 实例 %d 被占用（VPP 回 -31），但 WG dump 里没有身份相符的接口：%w",
 			want.UserInstance, err)
 	}
-	// 建 WG 接口会让 wireguard 插件把这些端口重新注册回它自己的 wg4-input，
-	// 必须立刻把本插件的挂点补回来，否则 SR 旁路口子就少了（见 RebindPorts）。
-	if err := l.dp.RebindPorts(ctx); err != nil {
-		return false, fmt.Errorf("agent: 建接口后重挂 UDP 端口: %w", err)
+	// 建 WG 接口会让 wireguard 插件把**这个接口的**监听端口重新注册回它自己的
+	// wg4-input，必须先把这个端口登记进 vpn 集合、再把整组端口挂回本插件，
+	// 否则这条 SR 隧道会静默退化成普通 WG（见 claimListenPort）。
+	if err := l.claimListenPort(ctx); err != nil {
+		return false, err
 	}
 	// 新建的接口也要过一遍 underlay 挂点：这台机器上第一个 agent 建接口时
 	// feature 可能还没启用。
@@ -276,11 +290,11 @@ func (l *Link) Open(ctx context.Context) (bool, error) {
 
 // adopt 在已存在的接口里找本机的身份；找不到返回 (false, nil)。
 //
-// 认回之后要补的两步和新建时一样（重挂端口 + 开 encap）：VPP 重启、或 wireguard
+// 认回之后要补的两步和新建时一样（登记端口 + 开 encap）：VPP 重启、或 wireguard
 // 插件在别的接口创建过程中把端口抢回去，都会让 SR 挂点失效，而症状是"隧道在、没流量"。
-// RebindPorts 是无条件执行的：它只是把"当前 vpn_port/transit_port 归 sr-wg 节点"
-// 这件事再声明一遍，幂等；在这个数据面里 UDP 端口就是功能分用键（定案 2），
-// 所以"把端口从 plain WG 输入抢回来"正是设计意图，不是副作用。
+// claimListenPort 是无条件执行的：它只是把"这个 vpn 端口归 sr-wg 节点"这件事再声明
+// 一遍，幂等；在这个数据面里 UDP 端口就是功能分用键（定案 2），所以"把端口从 plain
+// WG 输入抢回来"正是设计意图，不是副作用。
 func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, error) {
 	ifs, err := l.dp.Interfaces(ctx, false)
 	if err != nil {
@@ -300,8 +314,8 @@ func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, er
 				"agent: 实例 %d 上那张接口在监听 %d，而租户现在要的是 %d；改端口要删接口（会连带清掉它的 peers），请人工处理",
 				ifi.UserInstance, ifi.Port, want.ListenPort)
 		}
-		if err := l.dp.RebindPorts(ctx); err != nil {
-			return false, fmt.Errorf("agent: 认回接口 %d 后重挂 UDP 端口: %w", ifi.SWIfIndex, err)
+		if err := l.claimListenPort(ctx); err != nil {
+			return false, err
 		}
 		if err := l.dp.EnableEncap(ctx, l.cfg.EncapIfIndex, true); err != nil {
 			return false, fmt.Errorf("agent: 认回接口 %d 后在 underlay %d 上开 encap: %w",
@@ -313,6 +327,24 @@ func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, er
 		return true, nil
 	}
 	return false, nil
+}
+
+// claimListenPort 把本条隧道的监听端口登记进数据面的 vpn 端口集合，然后把
+// **整个集合**重挂回 sr-wg 节点。两步都必要，而且都是幂等的，所以 Open 与 adopt
+// 两条路径都无条件走一遍。
+//
+// AddPort 解决"这条隧道的端口插件根本没听说过"：集合里默认只有 51820，第二条隧道
+// （比如 51830）不登记就永远没人给它加 SR 头 —— 症状照样是 encap_bypass，不是报错。
+// RebindPorts 解决"挂点被别人抢走"：建 WG 接口时 wireguard 插件把**那个接口的**
+// 监听端口注册回 wg4-input，同一台 CPE 上另一个 agent 建接口时抢走的可能是我的端口。
+func (l *Link) claimListenPort(ctx context.Context) error {
+	if err := l.dp.AddPort(ctx, vppapi.PortKindVPN, l.cfg.ListenPort); err != nil {
+		return fmt.Errorf("agent: 把监听端口 %d 登记进 vpn 端口集合: %w", l.cfg.ListenPort, err)
+	}
+	if err := l.dp.RebindPorts(ctx); err != nil {
+		return fmt.Errorf("agent: 重挂 UDP 端口集合: %w", err)
+	}
+	return nil
 }
 
 // SWIfIndex 是本机的 WG 接口号，Open 之后才有意义。
@@ -378,16 +410,16 @@ const (
 
 // ErrSingleBind：插件的隧道绑定表**每个 sw_if_index 只有一条**，装不下第二个 peer。
 //
-// 收包侧确实是按外层目的地址优先查的（sr_wg4_encap.c:508-515 先查 endpoint_path，
-// 再退回 tunnel_path），可**配置侧不是**：sr_wg_tunnel_set_path
-// （vpp-plugin/sr_wg4_encap.c:538-593）先按 sw_if_index 查 tunnel_path，命中就走
-// "更新"分支 —— 改的是同一条 bind 的 path_id 与 endpoint，并把它的旧 endpoint
-// 从 endpoint_path 里 hash_unset 掉。所以一张 WG 接口上的第二个 peer 不是"多一条
-// 绑定"，而是把第一个人的外层地址整条删掉再换上自己的：症状是"配了 B，A 突然不通"，
-// 而且 retval=0。
+// 收包侧确实是按外层目的地址优先查的（sr_wg4_encap.c 的 sr_wg_bind_lookup：先查
+// endpoint_path，再退回 tunnel_path），可**配置侧不是**：sr_wg_tunnel_set_path
+// 先按 sw_if_index 查 tunnel_path，命中就走"更新"分支 —— 改的是同一条 bind 的
+// path_id 与 endpoint，并把它的旧 (endpoint, dst_port) 键从 endpoint_path 里
+// hash_unset 掉。所以一张 WG 接口上的第二个 peer 不是"多一条绑定"，而是把第一个
+// 人的外层地址整条删掉再换上自己的：症状是"配了 B，A 突然不通"，而且 retval=0。
 //
 // 这里选择**在动手写之前**就报错，而不是写下去再靠日志猜。多 peer 要能用，得先
-// 改插件让 bind 按 endpoint 建槽 —— 那是数据面的活儿，不该由 agent 假装修好了。
+// 改插件让配置侧也按 (endpoint, dst_port) 建槽 —— 收包侧已经是这个键了，配置侧
+// 仍是一接口一槽。那是数据面的活儿，不该由 agent 假装修好了。
 var ErrSingleBind = errors.New("agent: 这台 CPE 的隧道绑定表每个接口只有一条，装不下第二个 peer")
 
 // ApplyPeer 配好一个对端：验身份 → 选地址 → 建路径 → 绑隧道 → 装 WG peer。
@@ -442,20 +474,32 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 		SWIfIndex:  l.swIfIndex,
 		PathID:     pathID,
 		EndpointIP: ep.IP,
+		// 绑定身份是 (外层 dst IP, 封装前的 dst 端口)。同一对 CPE 开第二条隧道时
+		// 两条流的目的 IP 是同一个，只有端口能分清"这一包属于哪条隧道"；漏填
+		// （=0 通配）会把第二条隧道也拽进这条路径，而第二条隧道的 agent 再来一次
+		// 就把它抢走 —— 全是静默的 encap_bypass。
+		DstPort: l.cfg.ListenPort,
 	}); err != nil {
-		return "", fmt.Errorf("agent: 节点 %d 的隧道绑定（interface %d → path %d）: %w",
-			p.NodeID, l.swIfIndex, pathID, err)
+		// -116：同一个 (外层 IP, 本隧道端口) 已经被另一张接口占了。两张接口抢一个
+		// 身份意味着"这个包到底走哪条路径"要看谁后写，插件选择直接拒绝，所以这里
+		// 不能重试，只能由人看出是哪一张（show sr-wg tunnels 全表可查）。
+		if hasRetval(err, -116) {
+			return "", fmt.Errorf("agent: 节点 %d：到 %s 的端口 %d 这个隧道身份已被别的接口占着：%w；"+
+				"本接口 %d 不能再抢，请用 show sr-wg tunnels 查出占着它的是哪一条",
+				p.NodeID, ep.IP, l.cfg.ListenPort, err, l.swIfIndex)
+		}
+		return "", fmt.Errorf("agent: 节点 %d 的隧道绑定（interface %d → path %d, 端口 %d）: %w",
+			p.NodeID, l.swIfIndex, pathID, l.cfg.ListenPort, err)
 	}
 
 	want := vppapi.PeerParams{
 		PublicKey:  wgPub,
 		EndpointIP: ep.IP,
-		// **这里必须是 vpn_port，不是观测到的映射端口。**
-		// encap 节点在 Step 4 只处理 udp 目的端口==vpn_port 的包
-		// （vpp-plugin/sr_wg4_encap.c:302-308），Step 12 才把目的端口改写成段端口
-		// （同文件 387-389）。所以 peer 端口填映射端口的话，包在出口上根本不会被
-		// 加 SR 头，直接以普通 WG 发出去 —— 计数器上是 encap_bypass，隧道"通"但
-		// 没走源路由。映射端口只进段列表。
+		// **这里必须是本条隧道的 vpn_port，不是观测到的映射端口。**
+		// encap 节点在 Step 4 只处理 udp 目的端口命中 vpn_ports 集合的包，Step 12
+		// 才把目的端口改写成段端口（vpp-plugin/sr_wg4_encap.c）。所以 peer 端口填
+		// 映射端口的话，包在出口上根本不会被加 SR 头，直接以普通 WG 发出去 ——
+		// 计数器上是 encap_bypass，隧道"通"但没走源路由。映射端口只进段列表。
 		Port:       l.cfg.ListenPort,
 		Keepalive:  l.keepalive,
 		SWIfIndex:  l.swIfIndex,
@@ -548,8 +592,8 @@ func (l *Link) checkSingleBind(ctx context.Context, nodeID, pathID uint16) error
 			continue
 		}
 		return fmt.Errorf("%w：接口 %d 当前绑的是 path_id=%d（本次要给节点 %d 用 path_id=%d）。"+
-			"插件的绑定表按 sw_if_index 一槽，后写的人会覆盖前一个人的外层地址；"+
-			"要么先把那条绑定清掉，要么等插件改成按 endpoint 索引",
+			"插件的绑定表配置侧按 sw_if_index 一槽，后写的人会覆盖前一个人的外层地址；"+
+			"要么先把那条绑定清掉，要么等配置侧也改成按 (endpoint, 端口) 建槽",
 			ErrSingleBind, l.swIfIndex, b.PathID, nodeID, pathID)
 	}
 	return nil

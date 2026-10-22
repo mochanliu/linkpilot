@@ -66,7 +66,9 @@
 #   # 回包外层源变成网关地址，把 peer 的 endpoint 污染掉（见 cmd_peer 注释）。
 #   vppctl wireguard peer add wg0 public-key <node2_pub> endpoint 10.10.2.2 \
 #          allowed-ip 192.168.99.2/32 dst-port 51820 persistent-keepalive 5
-#   vppctl ip route add 192.168.99.2/32 via wg0        # WG 不会自动下发路由
+#   vppctl ip route add 192.168.99.2/32 via wg0        # WG 不会自动下发路由；
+#       必须排在 peer add **之后**：先加路由会留下一条 unresolved 的
+#       attached-nexthop（转发放到 dpo-drop，overlay 全丢但没有任何报错）。
 #   vppctl ping 192.168.99.2 source wg0 repeat 5            # 期望 0% loss；首轮可能全丢（握手要跑满一个 keepalive 周期）
 #   vppctl show sr-wg stats ; vppctl show wireguard peer    # peer flags:2 = ESTABLISHED
 #
@@ -110,6 +112,8 @@ SR_PATH_ID=${SR_PATH_ID:-1}
 SR_HMAC_ID=${SR_HMAC_ID:-1}
 WG_IF=${WG_IF:-wg0}
 KEEPALIVE=${KEEPALIVE:-5}
+# 绑定键的第二半（封装前的外层目的端口）。空=通配，沿用单隧道配法。
+TUN_DST_PORT=${TUN_DST_PORT:-}
 
 log() { echo "[setup:${ROLE}] $*" >&2; }
 die() { echo "[setup:${ROLE}] FATAL: $*" >&2; exit 1; }
@@ -204,16 +208,25 @@ vpp_ifname_for_ip() {
             index($0, "L3 "want"/") { print n; exit }'
 }
 
+# 本节点自己那个 WG 接口的公钥。必须按接口名过滤：同对端开第二条隧道时
+# `show wireguard interface` 有多行，取第一行会把 wg0 的密钥当成 wg1 的交换出去。
 wg_public_key() {
     vppctl show wireguard interface 2>/dev/null |
-        awk '{for(i=1;i<=NF;i++) if ($i ~ /^public-key:/)
-              {sub(/^public-key:/,"",$i); print $i; exit}}'
+        awk -v ifn="${WG_IF}" '
+            $2==ifn { for(i=1;i<=NF;i++) if ($i ~ /^public-key:/)
+                      {sub(/^public-key:/,"",$i); print $i; exit} }'
 }
 
-# peer 的动态 endpoint，即 "endpoint:[本端->对端]" 里的对端
-wg_peer_endpoint() {
+# peer 的动态 endpoint，即 "endpoint:[本端->对端]" 里的对端。
+# 同样按公钥定位到具体的 peer：两个 WG 接口各有一个 peer 时，
+# "第一行" 属于哪个接口是不确定的。
+wg_peer_endpoint() {   # $1 = peer 公钥
     vppctl show wireguard peer 2>/dev/null | tr -d '\r' |
-        sed -n 's/.*->\([0-9.]*:[0-9]*\)\].*/\1/p' | head -1
+        awk -v k="$1" '
+            /^\[[0-9]+\]/ { hdr=$0; next }
+            /public key:/ { if (index($0,k))
+                            { sub(/.*->/,"",hdr); sub(/\].*/,"",hdr);
+                              print hdr; exit } }'
 }
 
 # 按公钥找回 peer 的 [N] 索引（`wireguard peer remove <N>` 用）
@@ -245,7 +258,7 @@ wg_add_peer() {
 # 第一跳就走 SR 路径，不会再被网桥改写。
 wg_ensure_endpoint() {
     local peer_pub=$1 ep idx want="${PEER_UNDERLAY}:${VPN_PORT}"
-    ep=$(wg_peer_endpoint)
+    ep=$(wg_peer_endpoint "${peer_pub}")
     if [ "${ep}" = "${want}" ]; then
         log "wg peer endpoint ok: ${ep}"
         return 0
@@ -260,7 +273,7 @@ wg_ensure_endpoint() {
     sleep 1
     wg_add_peer "${peer_pub}"
     sleep 3
-    ep=$(wg_peer_endpoint)
+    ep=$(wg_peer_endpoint "${peer_pub}")
     if [ "${ep}" = "${want}" ]; then
         log "wg peer endpoint repaired: ${ep}"
     else
@@ -268,6 +281,29 @@ wg_ensure_endpoint() {
         log "         manual repair: vppctl wireguard peer remove ${idx},"
         log "                        then $0 ${ROLE} peer <peer_pubkey>"
     fi
+}
+
+# overlay 路由的"加了但没解析"是个静默故障，这里复核并在坏掉时重建。
+#
+# 实测（26.06）：`ip route add <peer>/32 via wg1` 排在 `wireguard peer add` 之前
+# 时，FIB 里留下的是 attached-nexthop **unresolved**，转发放到 dpo-drop —— 接口
+# up、peer established、SR 绑定全都正常，只有 overlay 100% 丢包。删掉重加就变
+# resolved。单隧道时 cmd_peer 每次都会重跑、老路由早已被解析过，所以 e2e 一直没
+# 暴露；第二条隧道是全新的路由，第一次加就撞上这个顺序问题。
+ensure_overlay_route() {   # $1 = 对端 overlay 地址
+    local dst=$1
+    if vppctl show ip fib "${dst}" 2>/dev/null | tr -d '\r' | grep -q "unresolved"; then
+        log "overlay 路由 ${dst}/32 via ${WG_IF} 未解析 -> 删掉重加"
+        vppctl ip route del "${dst}/32" via "${WG_IF}" >/dev/null 2>&1 || true
+        sleep 1
+        vppctl ip route add "${dst}/32" via "${WG_IF}" ||
+            die "重建 overlay 路由 ${dst}/32 失败"
+    fi
+    if vppctl show ip fib "${dst}" 2>/dev/null | tr -d '\r' | grep -q "dpo-drop"; then
+        log "WARNING: ${dst}/32 仍指向 dpo-drop，overlay 包不会被转发"
+        return 1
+    fi
+    return 0
 }
 
 srwg_stat() {   # $1 = <section>_<name>，例如 Encap_ok
@@ -364,12 +400,16 @@ cmd_peer() {
                via "${FIRST_HOP}:${TRANSIT_PORT}" \
                hmac-id "${SR_HMAC_ID}" || die "sr-wg path add failed"
 
-        local swidx
+        local swidx dst_port_args=""
         swidx=$(sw_if_index_of "${WG_IF}")
         [ -n "${swidx}" ] || die "cannot resolve sw_if_index of ${WG_IF}"
+        # TUN_DST_PORT 非空时按 (endpoint, dst_port) 精确绑定。同对端开第二条
+        # 隧道必须给：留空就是通配，会把另一条隧道的包也拽进这条路径。
+        [ -z "${TUN_DST_PORT}" ] || dst_port_args="dst-port ${TUN_DST_PORT}"
         vppctl set sr-wg tunnel "${swidx}" path "${SR_PATH_ID}" \
-               endpoint "${PEER_UNDERLAY}" || die "set sr-wg tunnel failed"
-        log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID} endpoint=${PEER_UNDERLAY}"
+               endpoint "${PEER_UNDERLAY}" ${dst_port_args} \
+            || die "set sr-wg tunnel failed"
+        log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID} endpoint=${PEER_UNDERLAY}${TUN_DST_PORT:+:${TUN_DST_PORT}}"
 
         # encap 的挂点是 **underlay 出口接口**，不是 wg0：VPP 26.06 的
         # wg4-output-tun 把 next 硬编码为 adj-midchain-tx，从不走 feature 链，
@@ -385,6 +425,10 @@ cmd_peer() {
     fi
 
     wg_add_peer "${peer_pub}"
+
+    # peer 加完才有 peer 邻接，此时才可能把 overlay 路由解析出来。
+    ensure_overlay_route "${PEER_OVERLAY}" ||
+        log "WARNING: overlay 路由 ${PEER_OVERLAY}/32 复核未通过"
 
     if [ "${no_sr}" != "nosr" ]; then
         wg_ensure_endpoint "${peer_pub}"
@@ -403,6 +447,26 @@ cmd_transit() {
     vppctl set sr-wg transit enable port "${TRANSIT_PORT}" \
            || die "set sr-wg transit failed"
     log "transit enabled on port ${TRANSIT_PORT}"
+}
+
+cmd_port() {
+    # 每隧道一个监听端口（定案 2）：vpn 集合决定 sr-wg4-input 收哪些端口，
+    # transit 集合决定 sr-wg4-transit 中转哪些端口。插件里 add/del 立刻作用到
+    # UDP 分发表，所以建完第二个 WG 接口必须把它的端口加进来，否则这条隧道的
+    # 包没人加 SR 头（不报错，只是 encap_bypass）。
+    local op=${1:-} kind=${2:-} port=${3:-}
+    case "${op}" in
+      add|del) ;;
+      *) die "usage: $0 ${ROLE} port add|del vpn|transit <port>" ;;
+    esac
+    case "${kind}" in
+      vpn|transit) ;;
+      *) die "port kind must be vpn|transit, got '${kind}'" ;;
+    esac
+    [ -n "${port}" ] || die "port <port> required"
+    vppctl set sr-wg port "${op}" "${kind}" "${port}" ||
+        die "set sr-wg port ${op} ${kind} ${port} failed"
+    log "port ${op} ${kind} ${port}"
 }
 
 cmd_stats() {
@@ -433,6 +497,8 @@ cmd_dump() {
     vppctl show sr-wg keys
     echo "===== [${ROLE}] show sr-wg tunnels ====="
     vppctl show sr-wg tunnels
+    echo "===== [${ROLE}] show sr-wg ports ====="
+    vppctl show sr-wg ports
     echo "===== [${ROLE}] show sr-wg stats ====="
     vppctl show sr-wg stats
     echo "===== [${ROLE}] show features ip4-output ====="
@@ -448,8 +514,9 @@ case "${CMD}" in
   wg-create)     cmd_wg_create "$@" ;;
   peer)          cmd_peer "$@" ;;
   transit)       cmd_transit "$@" ;;
+  port)          cmd_port "$@" ;;
   stats)         cmd_stats "$@" ;;
   clear-stats)   cmd_clear_stats "$@" ;;
   dump)          cmd_dump "$@" ;;
-  *)             die "unknown command '${CMD}' (init|wg-create|peer|transit|stats|clear-stats|dump)" ;;
+  *)             die "unknown command '${CMD}' (init|wg-create|peer|transit|port|stats|clear-stats|dump)" ;;
 esac

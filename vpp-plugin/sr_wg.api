@@ -36,6 +36,8 @@ service {
   rpc sr_wg_transit_disable returns sr_wg_transit_disable_reply;
   rpc sr_wg_tunnel_set_path returns sr_wg_tunnel_set_path_reply;
   rpc sr_wg_tunnel_dump returns stream sr_wg_tunnel_details;
+  rpc sr_wg_port_add_del returns sr_wg_port_add_del_reply;
+  rpc sr_wg_port_dump returns stream sr_wg_port_details;
   rpc sr_wg_encap_enable returns sr_wg_encap_enable_reply;
   rpc sr_wg_encap_fib_set returns sr_wg_encap_fib_set_reply;
   rpc sr_wg_rebind_ports returns sr_wg_rebind_ports_reply;
@@ -126,7 +128,8 @@ define sr_wg_key_details
 /* ==================== Transit API ==================== */
 
 /** \brief 启用 SR 中转（只验签 + 弹一段 + 改外层 dst，不解密）
-    @param port - 本机收 SR 包的目的 UDP 端口；改端口会同时重注册 UDP 分发表
+    @param port - 本机收 SR 包的目的 UDP 端口。**加入** transit 端口集合并重注册，
+                  所以一台中转可以同时服务多个端口（多租户各一个）。
     @note 中转**绝不改写外层源 IP/端口**：目的端 wg4-input 按 peer endpoint
           校验外层源，改源会让对端丢包并把 peer 的动态 endpoint 污染到中转。
 */
@@ -151,6 +154,10 @@ autoreply define sr_wg_transit_disable
     @param endpoint_ip - WG peer 的外层 endpoint IPv4。encap 挂点在 underlay
                          出口接口，数据面按外层 dst 查绑定，故 underlay 形态
                          下这是必填项；不传则本绑定永远不会命中
+    @param dst_port    - **封装前**的外层 UDP 目的端口 = 该隧道 peer 的 vpn_port。
+                         同一对 CPE 开多条隧道时，(endpoint_ip, dst_port) 才是
+                         "哪条隧道"的完整身份；传 0 = 通配（该 IP 上不分行数全走
+                         本路径），只适合单隧道。两个接口抢同一个身份直接拒绝。
     @param is_add      - 1 = 绑定，0 = 解绑
                          注意：不会自动启用 feature，需另发
                          sr_wg_encap_enable 到 underlay 接口
@@ -162,6 +169,7 @@ autoreply define sr_wg_tunnel_set_path
   u8 is_add;
   u32 sw_if_index;
   u16 path_id;
+  u16 dst_port;
   vl_api_ip4_address_t endpoint_ip;
 };
 
@@ -177,6 +185,7 @@ define sr_wg_tunnel_details
   u32 context;
   u32 sw_if_index;
   u16 path_id;
+  u16 dst_port;             /* 0 = 端口通配 */
   vl_api_ip4_address_t endpoint_ip;
   u8 is_effective;          /* endpoint 已配 且 至少一个 underlay 接口
                                启用了 sr-wg4-encap；0 = 会静默旁路 */
@@ -233,10 +242,12 @@ autoreply define sr_wg_stats_clear
 
 /* ==================== 端口/挂点配置 API ==================== */
 
-/** \brief 按当前 vpn_port / transit_port 重新注册 UDP 目的端口
-    @note 建 WireGuard 接口时 wireguard 插件会把 51820 重新注册给自己的
-          wg4-input，把 sr-wg4-input 的旁路入口摘掉；等价于 CLI
-          `set sr-wg rebind-ports`。控制器必须在**创建 WG 接口之后**调用它。
+/** \brief 按当前**端口集合**重新注册 UDP 目的端口（vpn_ports -> sr-wg4-input，
+           transit_ports -> sr-wg4-transit）
+    @note 建 WireGuard 接口时 wireguard 插件会把**该接口的** listen-port 重新
+          注册给自己的 wg4-input，把 sr-wg4-input 的旁路入口摘掉；每隧道一个
+          端口之后被覆盖的是那一条隧道的端口。等价于 CLI `set sr-wg
+          rebind-ports`。控制器必须在**创建 WG 接口之后**调用它。
 */
 autoreply define sr_wg_rebind_ports
 {
@@ -254,7 +265,43 @@ autoreply define sr_wg_encap_fib_set
   u32 fib_index;
 };
 
-/** \brief 读回插件全局配置（控制器对账用；路径/密钥/绑定另有各自的 dump） */
+/** \brief 增/删一个 UDP 目的端口（每隧道一个端口，定案 2）
+    @param kind  - 0 = vpn（WG 隧道监听端口 -> sr-wg4-input）
+                  1 = transit（中转收 SR 包的端口 -> sr-wg4-transit）
+    @param port  - 1..65535，0 直接 INVALID_VALUE
+    @note add 是**幂等**的且每次都会把端口重挂回本插件的节点：建 WG 接口时
+          wireguard 会把该接口的 listen-port 抢回 wg4-input，所以 agent 的
+          正确顺序是 CreateInterface -> 本请求 -> sr_wg_rebind_ports。
+    @note del 一个 vpn 端口会把端口**交回 wg4-input**（那条隧道仍可当普通 WG
+          用），不是简单反注册；del transit 端口才反注册。
+*/
+autoreply define sr_wg_port_add_del
+{
+  u32 client_index;
+  u32 context;
+  u8 is_add;
+  u8 kind;
+  u16 port;
+};
+
+/** \brief dump 本节点登记的 UDP 端口集合（vpn 与 transit 各一条） */
+define sr_wg_port_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+define sr_wg_port_details
+{
+  u32 context;
+  u8 kind;                  /* 同 sr_wg_port_add_del.kind */
+  u16 port;
+};
+
+/** \brief 读回插件全局配置（控制器对账用；路径/密钥/绑定另有各自的 dump）
+    @note 端口是**集合**（每隧道一个端口），这里只给数量；端口内容由
+          sr_wg_port_dump 逐条读 —— 一张 CPE 上几十条隧道时定长数组放不下。
+*/
 define sr_wg_config_dump
 {
   u32 client_index;
@@ -264,8 +311,8 @@ define sr_wg_config_dump
 define sr_wg_config_details
 {
   u32 context;
-  u16 vpn_port;
-  u16 transit_port;
+  u16 vpn_port_count;
+  u16 transit_port_count;
   u8  transit_enabled;
   u32 encap_fib_index;
   u32 n_enabled_ifs;              /* 下面数组的有效长度，最多 32 */

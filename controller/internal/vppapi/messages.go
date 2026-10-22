@@ -21,7 +21,9 @@ const (
 // 此时必须拒绝继续，因为尺寸不对的请求会被 VPP 静默丢弃（只在日志里留一行
 // Truncated message），运行期表现为莫名其妙地超时。
 //
-// 值取自 srwg-node1（VPP 26.06 + sr_wg 1.0.0）的实测注册表。
+// 值取自 srwg-node1（VPP 26.06 + sr_wg 1.0.0）的实测注册表；改过 .api 之后可以
+// 离线重算：插件构建产出的 build/sr_wg.api.c 里有
+// vl_api_add_msg_name_crc("sr_wg_xxx_<crc>", …)，那就是 VPP 运行期登记的同一个值。
 var requiredVersions = map[string]string{
 	"sr_wg_key_set":                    "e7289514",
 	"sr_wg_key_set_reply":              "e8d4e804",
@@ -51,10 +53,14 @@ var requiredVersions = map[string]string{
 	"sr_wg_path_add_del_reply":         "e8d4e804",
 	"sr_wg_path_dump":                  "e7177ea0",
 	"sr_wg_path_details":               "e4624a51",
-	"sr_wg_tunnel_set_path":            "2a437a14",
+	"sr_wg_tunnel_set_path":            "75d015ec",
 	"sr_wg_tunnel_set_path_reply":      "e8d4e804",
 	"sr_wg_tunnel_dump":                "529cb13f",
-	"sr_wg_tunnel_details":             "a6acdfbb",
+	"sr_wg_tunnel_details":             "dbfc98ee",
+	"sr_wg_port_add_del":               "5495c953",
+	"sr_wg_port_add_del_reply":         "e8d4e804",
+	"sr_wg_port_dump":                  "51077d14",
+	"sr_wg_port_details":               "ed9c3dfd",
 	"sr_wg_encap_enable":               "a36fadc0",
 	"sr_wg_encap_enable_reply":         "e8d4e804",
 	"sr_wg_transit_enable":             "42bb04c5",
@@ -99,14 +105,14 @@ type InterfaceParams struct {
 }
 
 // PeerParams 是一个 WG peer。Port 就是 vl_api_wireguard_peer_t.port，注释写的是
-// "destination port"，即外层 UDP 目的端口：51820 打对端 CPE，51821 打中转
-// （定案 2 显式下发的那两个端口）。
+// "destination port"，即外层 UDP 目的端口 —— 它是**本条隧道的** vpn_port
+// （定案 2：每隧道一个端口，所以这个值来自隧道自己，不是一个全局常数）。
 type PeerParams struct {
 	PublicKey  []byte // wgKeyLen 字节 X25519 公钥
 	EndpointIP net.IP
 	// Port 是**封装前**那个 WG 包的外层目的端口。走 SR 时必须填租户的 vpn_port：
-	// encap 节点只处理 udp dst==vpn_port 的包（sr_wg4_encap.c:302-308），而真正
-	// 落地的端口是它之后用 SR 段改写的（同文件 387-389）。填成 NAT 映射端口的话
+	// encap 节点在 Step 4 只处理 udp dst 命中 vpn_ports 集合的包，Step 12 才把
+	// 目的端口改写成段端口（vpp-plugin/sr_wg4_encap.c）。填成 NAT 映射端口的话
 	// 包根本不会被加 SR 头，计数器上是 encap_bypass —— 不报错，但源路由没了。
 	Port       uint16
 	Keepalive  uint16
@@ -168,11 +174,13 @@ func (c *Client) DelPKey(ctx context.Context, hmacID uint16) error {
 	return c.retval("sr_wg_key_del", frame)
 }
 
-// RebindPorts 按当前 vpn_port / transit_port 重新注册 UDP 目的端口。
+// RebindPorts 把**当前端口集合**（vpn_ports + transit_ports）重新注册给本插件的
+// 输入节点。
 //
-// 必须在**创建 WG 接口之后**调用：建接口时 wireguard 插件会把 51820 重新注册给
-// 自己的 wg4-input，把本插件的旁路入口摘掉。这是数据面挂点的顺序约束，不是可选
-// 优化 —— 漏掉它，SR 隧道会静默退化成普通 WG。
+// 必须在**创建 WG 接口之后**调用：建接口时 wireguard 插件会把那个接口的
+// listen-port 重新注册给自己的 wg4-input，把本插件的旁路入口摘掉 ——
+// 每隧道一个端口之后，被覆盖的是那一条隧道的端口，其余不受影响。
+// 这是数据面挂点的顺序约束，不是可选优化：漏掉它，SR 隧道会静默退化成普通 WG。
 func (c *Client) RebindPorts(ctx context.Context) error {
 	frame, err := c.call(ctx, "sr_wg_rebind_ports", "sr_wg_rebind_ports_reply", nil)
 	if err != nil {
@@ -546,31 +554,47 @@ func (c *Client) Paths(ctx context.Context, pathID uint16) ([]PathInfo, error) {
 // EndpointIP 是 WG peer 的**外层** IPv4：encap 挂点挂在 underlay 出口接口上，
 // 数据面按外层目的地址查绑定，所以漏了它这条绑定永远不会命中 —— 而"没命中"在
 // 计数器上表现为 encap_bypass，看起来像"配置根本没生效"。
+// DstPort 是**封装前**那个 WG 包的外层 UDP 目的端口，也就是这条隧道的 vpn_port。
+// 一对 CPE 可以开多条隧道（定案 2：每隧道一个端口），此时 endpoint IP 相同、
+// 只有端口能区分"哪条隧道"，所以绑定身份是 (EndpointIP, DstPort)。填 0 表示
+// 端口通配 = 该 IP 上所有隧道共用这一条路径，只在单隧道时才是安全写法。
 type TunnelBinding struct {
 	SWIfIndex  uint32
 	PathID     uint16
 	EndpointIP net.IP
+	DstPort    uint16
 }
 
 // TunnelInfo 是 sr_wg_tunnel_dump 回来的一条绑定。Effective=false 意味着
 // endpoint 配了但 underlay 上没启用 sr-wg4-encap：包会静默旁路 SR 头。
+// DstPort=0 是通配绑定（见 TunnelBinding）。
 type TunnelInfo struct {
 	SWIfIndex  uint32
 	PathID     uint16
 	EndpointIP net.IP
+	DstPort    uint16
 	Effective  bool
 }
 
+// tunnelBodyLen 是 sr_wg_tunnel_set_path 的请求体长度：
+// is_add(1) sw_if_index(4) path_id(2) dst_port(2) endpoint_ip(4)。
+const tunnelBodyLen = 1 + 4 + 2 + 2 + 4
+
 // SetTunnel 绑定隧道到路径（is_add=1）。它**不会**自动启用 feature，
 // 那是 EnableEncap 的活儿；两步都做完才是"这条隧道走 SR"。
+//
+// 同一个 (endpoint, dst_port) 身份已被别的接口占用时 VPP 回 ENTRY_ALREADY_EXISTS
+// 而不是覆盖：两条绑定抢同一个包，"哪条隧道走哪条路径"就变成非确定的，
+// 调用方必须把它当错误处理。
 func (c *Client) SetTunnel(ctx context.Context, b TunnelBinding) error {
 	if b.EndpointIP.To4() == nil {
 		return fmt.Errorf("vppapi: 隧道绑定的 endpoint %v 不是 IPv4", b.EndpointIP)
 	}
-	body := make([]byte, 0, 11)
+	body := make([]byte, 0, tunnelBodyLen)
 	body = append(body, 1)
 	body = appendU32(body, b.SWIfIndex)
 	body = appendU16(body, b.PathID)
+	body = appendU16(body, b.DstPort)
 	body = appendIP4(body, b.EndpointIP)
 	frame, err := c.call(ctx, "sr_wg_tunnel_set_path", "sr_wg_tunnel_set_path_reply", body)
 	if err != nil {
@@ -581,7 +605,7 @@ func (c *Client) SetTunnel(ctx context.Context, b TunnelBinding) error {
 
 // ClearTunnel 解绑某接口上的隧道绑定（路径仍在表里，只是不再被这条隧道引用）。
 func (c *Client) ClearTunnel(ctx context.Context, swIfIndex uint32) error {
-	body := make([]byte, 11)
+	body := make([]byte, tunnelBodyLen)
 	binary.BigEndian.PutUint32(body[1:5], swIfIndex) // body[0] = is_add = 0
 	frame, err := c.call(ctx, "sr_wg_tunnel_set_path", "sr_wg_tunnel_set_path_reply", body)
 	if err != nil {
@@ -598,16 +622,77 @@ func (c *Client) Tunnels(ctx context.Context, swIfIndex uint32) ([]TunnelInfo, e
 	}
 	out := make([]TunnelInfo, 0, len(frames))
 	for _, f := range frames {
-		// msg_id(2) context(4) sw_if_index(4) path_id(2) endpoint_ip(4) is_effective(1)
-		if len(f) < 17 {
+		// msg_id(2) context(4) sw_if_index(4) path_id(2) dst_port(2) endpoint_ip(4) is_effective(1)
+		if len(f) < 19 {
 			return nil, fmt.Errorf("vppapi: sr_wg_tunnel_details 太短 (%d B)，插件结构变了", len(f))
 		}
 		out = append(out, TunnelInfo{
 			SWIfIndex:  binary.BigEndian.Uint32(f[6:10]),
 			PathID:     binary.BigEndian.Uint16(f[10:12]),
-			EndpointIP: net.IP(append([]byte(nil), f[12:16]...)),
-			Effective:  f[16] != 0,
+			DstPort:    binary.BigEndian.Uint16(f[12:14]),
+			EndpointIP: net.IP(append([]byte(nil), f[14:18]...)),
+			Effective:  f[18] != 0,
 		})
+	}
+	return out, nil
+}
+
+// ==================== UDP 端口集合（定案 2：每隧道一个端口） ====================
+
+// 端口集合的种类，值即 sr_wg_port_add_del.kind。
+const (
+	PortKindVPN     uint8 = 0
+	PortKindTransit uint8 = 1
+)
+
+// PortInfo 是 sr_wg_port_dump 回来的一个端口。
+type PortInfo struct {
+	Kind uint8
+	Port uint16
+}
+
+// AddPort 把一个 UDP 目的端口加入集合并挂到本插件的输入节点。
+//
+// 幂等，而且每次都会重挂 —— 这正是它必须跟在 CreateInterface 之后的原因：
+// 建 WG 接口时 wireguard 插件会把**那个接口的** listen-port 抢回 wg4-input，
+// 漏掉这一步，那条隧道会静默退化成普通 WG（计数器上全是 encap_bypass）。
+func (c *Client) AddPort(ctx context.Context, kind uint8, port uint16) error {
+	return c.portAddDel(ctx, 1, kind, port)
+}
+
+// DelPort 从集合里去掉一个端口。VPN 端口是被**交回 wg4-input** 的（那条隧道
+// 退化成普通 WG 仍可用），不是单纯反注册；del transit 端口才反注册。
+func (c *Client) DelPort(ctx context.Context, kind uint8, port uint16) error {
+	return c.portAddDel(ctx, 0, kind, port)
+}
+
+func (c *Client) portAddDel(ctx context.Context, isAdd uint8, kind uint8, port uint16) error {
+	if port == 0 {
+		return errors.New("vppapi: UDP 端口不能是 0")
+	}
+	body := make([]byte, 0, 4)
+	body = append(body, isAdd, kind)
+	body = appendU16(body, port)
+	frame, err := c.call(ctx, "sr_wg_port_add_del", "sr_wg_port_add_del_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_port_add_del", frame)
+}
+
+// Ports 读回本节点登记的 UDP 端口集合（vpn 与 transit 混在一条流里，按 Kind 分）。
+func (c *Client) Ports(ctx context.Context) ([]PortInfo, error) {
+	frames, err := c.dump(ctx, "sr_wg_port_dump", "sr_wg_port_details", nil)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PortInfo, 0, len(frames))
+	for _, f := range frames {
+		// msg_id(2) context(4) kind(1) port(2)
+		if len(f) < 9 {
+			return nil, fmt.Errorf("vppapi: sr_wg_port_details 太短 (%d B)，插件结构变了", len(f))
+		}
+		out = append(out, PortInfo{Kind: f[6], Port: binary.BigEndian.Uint16(f[7:9])})
 	}
 	return out, nil
 }

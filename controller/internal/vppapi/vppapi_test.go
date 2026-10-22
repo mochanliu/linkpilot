@@ -34,6 +34,7 @@ type fakeVPP struct {
 	ifDetails   int
 	pathDetails int
 	tunDetails  int
+	portDetails int
 	peerDetails int
 	peersRaw    [][]byte // 非空时按原样发这些 details 载荷（用来回放真 VPP 抓到的帧）
 	requests    chan request
@@ -170,7 +171,7 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "sr_wg_key_set", "sr_wg_rebind_ports", "sr_wg_obs_clear",
 		"wireguard_interface_delete", "wireguard_peer_remove",
 		"sr_wg_path_add_del", "sr_wg_tunnel_set_path", "sr_wg_encap_enable",
-		"sr_wg_transit_enable", "sr_wg_transit_disable":
+		"sr_wg_port_add_del", "sr_wg_transit_enable", "sr_wg_transit_disable":
 		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
 	case "sr_wg_stats_get":
 		// 真实尺寸 138 = msg_id(2)+context(4)+retval(4)+16 个 u64
@@ -205,6 +206,10 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "sr_wg_tunnel_dump":
 		for i := 0; i < f.tunDetails; i++ {
 			f.sendFrameOf(conn, "sr_wg_tunnel_details", reqCtx, tunDetailBytes(i))
+		}
+	case "sr_wg_port_dump":
+		for i := 0; i < f.portDetails; i++ {
+			f.sendFrameOf(conn, "sr_wg_port_details", reqCtx, portDetailBytes(i))
 		}
 	}
 	// 未知请求：不回。客户端应当超时，而不是永远挂着。
@@ -278,14 +283,27 @@ func pathDetailBytes(i int) []byte {
 	return b
 }
 
-// vl_api_sr_wg_tunnel_details_t 净体 = sw_if_index(4) path_id(2) endpoint_ip(4)
-// is_effective(1)。is_effective=0 是"绑了但 underlay 没启 encap"的静默旁路态。
+// vl_api_sr_wg_tunnel_details_t 净体 = sw_if_index(4) path_id(2) dst_port(2)
+// endpoint_ip(4) is_effective(1)。is_effective=0 是"绑了但 underlay 没启 encap"的
+// 静默旁路态；dst_port=0 表示端口通配（该 IP 上不分隧道全走这条路径）。
 func tunDetailBytes(i int) []byte {
-	b := make([]byte, 11)
+	b := make([]byte, 13)
 	binary.BigEndian.PutUint32(b[0:4], uint32(2+i))
 	binary.BigEndian.PutUint16(b[4:6], uint16(1+i))
-	copy(b[6:10], []byte{10, 10, 2, 2})
-	b[10] = 1
+	binary.BigEndian.PutUint16(b[6:8], uint16(51820+i))
+	copy(b[8:12], []byte{10, 10, 2, 2})
+	b[12] = 1
+	return b
+}
+
+// vl_api_sr_wg_port_details_t 净体 = kind(1) port(2)。前两条当成 vpn 端口、
+// 第三条当成 transit 端口，正好覆盖"集合里两种端口混在一条流里"这件事。
+func portDetailBytes(i int) []byte {
+	b := make([]byte, 3)
+	if i >= 2 {
+		b[0] = 1 // kind = transit
+	}
+	binary.BigEndian.PutUint16(b[1:3], uint16(51820+i))
 	return b
 }
 
@@ -793,14 +811,14 @@ func TestSetTunnelEncoding(t *testing.T) {
 	f := newFake(t)
 	c := f.dial(t)
 	err := c.SetTunnel(context.Background(), TunnelBinding{
-		SWIfIndex: 2, PathID: 1, EndpointIP: net.IPv4(10, 10, 2, 2),
+		SWIfIndex: 2, PathID: 1, EndpointIP: net.IPv4(10, 10, 2, 2), DstPort: 51830,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := f.lastRequest(t)
-	if len(r.body) != 11 {
-		t.Fatalf("tunnel_set_path 体长 = %d，期望 11", len(r.body))
+	if len(r.body) != tunnelBodyLen {
+		t.Fatalf("tunnel_set_path 体长 = %d，期望 %d", len(r.body), tunnelBodyLen)
 	}
 	if r.body[0] != 1 {
 		t.Errorf("is_add = %d", r.body[0])
@@ -811,10 +829,15 @@ func TestSetTunnelEncoding(t *testing.T) {
 	if got := binary.BigEndian.Uint16(r.body[5:7]); got != 1 {
 		t.Errorf("path_id = %d", got)
 	}
+	// dst_port 是绑定身份的另一半：同一对 CPE 开第二条隧道时只有端口能说出
+	// "这一包属于哪条隧道"，漏了它两条隧道会抢同一条路径。
+	if got := binary.BigEndian.Uint16(r.body[7:9]); got != 51830 {
+		t.Errorf("dst_port = %d，期望 51830", got)
+	}
 	// endpoint 是数据面查绑定的唯一线索：漏了它这条绑定永远不命中，
 	// 而计数器只会显示 encap_bypass。
-	if !equalBytes(r.body[7:11], net.IPv4(10, 10, 2, 2).To4()) {
-		t.Errorf("endpoint_ip = %x，期望按裸 4 字节写", r.body[7:11])
+	if !equalBytes(r.body[9:13], net.IPv4(10, 10, 2, 2).To4()) {
+		t.Errorf("endpoint_ip = %x，期望按裸 4 字节写", r.body[9:13])
 	}
 
 	if err := c.SetTunnel(context.Background(), TunnelBinding{SWIfIndex: 2}); err == nil {
@@ -824,8 +847,60 @@ func TestSetTunnelEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 	r = f.lastRequest(t)
-	if len(r.body) != 11 || r.body[0] != 0 || binary.BigEndian.Uint32(r.body[1:5]) != 5 {
+	if len(r.body) != tunnelBodyLen || r.body[0] != 0 ||
+		binary.BigEndian.Uint32(r.body[1:5]) != 5 {
 		t.Errorf("解绑请求不对: %x", r.body)
+	}
+}
+
+func TestPortAddDelAndDumpEncoding(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+
+	if err := c.AddPort(context.Background(), PortKindVPN, 51830); err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	// is_add(1) kind(1) port(2)
+	if len(r.body) != 4 || r.body[0] != 1 || r.body[1] != PortKindVPN ||
+		binary.BigEndian.Uint16(r.body[2:4]) != 51830 {
+		t.Errorf("port_add_del(is_add) = %x", r.body)
+	}
+	if err := c.DelPort(context.Background(), PortKindTransit, 51821); err != nil {
+		t.Fatal(err)
+	}
+	r = f.lastRequest(t)
+	if r.body[0] != 0 || r.body[1] != PortKindTransit ||
+		binary.BigEndian.Uint16(r.body[2:4]) != 51821 {
+		t.Errorf("port_add_del(del) = %x", r.body)
+	}
+	// 端口 0 不是"另一个端口"，是"没填"：VPP 会当 INVALID_VALUE 拒掉，
+	// 但宁可在这里就说清是哪条调用没给端口。
+	if err := c.AddPort(context.Background(), PortKindVPN, 0); err == nil {
+		t.Error("端口 0 必须被拦住")
+	}
+
+	f.portDetails = 3
+	ports, err := c.Ports(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ports) != 3 {
+		t.Fatalf("端口 %d 条", len(ports))
+	}
+	for i, p := range ports {
+		if want := uint16(51820 + i); p.Port != want {
+			t.Errorf("ports[%d] = %+v，期望端口 %d", i, p, want)
+		}
+	}
+	if ports[0].Kind != PortKindVPN || ports[1].Kind != PortKindVPN ||
+		ports[2].Kind != PortKindTransit {
+		t.Errorf("kind 分错了: %+v", ports)
+	}
+	// dump 没有过滤字段：全量就是零长度请求体（VPP 用栅栏判定发完）。
+	r = f.lastRequest(t)
+	if len(r.body) != 0 {
+		t.Errorf("port_dump 不该带参数: %x", r.body)
 	}
 }
 
@@ -843,6 +918,11 @@ func TestTunnelsParsesEffective(t *testing.T) {
 	tn := tuns[0]
 	if tn.SWIfIndex != 2 || tn.PathID != 1 || !tn.Effective {
 		t.Errorf("绑定解析不对: %+v", tn)
+	}
+	// dst_port 读不回来就没法判断这条绑定是"某条隧道的"还是"通配"的，
+	// 而通配绑定正是多条隧道互相抢路径的那个坑。
+	if tn.DstPort != 51820 {
+		t.Errorf("dst_port = %d，期望 51820", tn.DstPort)
 	}
 	if !equalBytes(tn.EndpointIP, net.IPv4(10, 10, 2, 2).To4()) {
 		t.Errorf("endpoint = %v", tn.EndpointIP)

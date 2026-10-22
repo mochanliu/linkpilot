@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -598,6 +599,169 @@ func TestLiveAgainstVPP(t *testing.T) {
 			t.Error("删掉被引用的路径之后，隧道绑定居然还在 —— 数据面应当级联清掉")
 		}
 		t.Log("实测：DelPath 会连带清掉引用它的隧道绑定，且不报错")
+	})
+
+	// 每隧道一个监听端口（定案 2：UDP 端口既分功能也分隧道）。这里钉的是 agent 的
+	// claimListenPort 与 ApplyPeer 直接依赖的四件真机行为：
+	//   a) AddPort 幂等、每次都把端口挂回 sr-wg 节点；Ports 原样读回两种 kind；
+	//      DelPort 也幂等（不在集合里删除不是错误）；
+	//   b) 同一个外层 IP 上的**两条**隧道（端口不同）各有各的绑定，互不覆盖 ——
+	//      改之前绑定只按 IP 建键，第二条会把第一条拽进自己的路径；
+	//   c) 别的接口来抢同一个 (endpoint, 端口) 身份时回 -116，而不是静默抢走；
+	//   d) 被拒的那次一个字都没改（前一条绑定仍是原样）。
+	t.Run("per_tunnel_ports_and_bind_identity", func(t *testing.T) {
+		const (
+			instA   = uint32(9003)
+			instB   = uint32(9004)
+			portA   = uint16(51995)
+			portB   = uint16(51994)
+			pathA   = uint16(9011)
+			pathB   = uint16(9012)
+			probe   = uint16(51993)
+			shared  = "192.0.2.20"
+			hmacID  = uint16(9011)
+			bindIP1 = 9013 // 抢身份那一次用的 path_id
+		)
+		// a) 端口集合。
+		for i := 0; i < 2; i++ {
+			if err := c.AddPort(ctx, PortKindVPN, probe); err != nil {
+				t.Fatalf("AddPort(%d) 第 %d 次: %v", probe, i+1, err)
+			}
+		}
+		portsOf := func(kind uint8) []uint16 {
+			ps, err := c.Ports(ctx)
+			if err != nil {
+				t.Fatalf("Ports: %v", err)
+			}
+			var out []uint16
+			for _, p := range ps {
+				if p.Kind == kind {
+					out = append(out, p.Port)
+				}
+			}
+			return out
+		}
+		contains := func(list []uint16, v uint16) bool {
+			for _, x := range list {
+				if x == v {
+					return true
+				}
+			}
+			return false
+		}
+		if got := portsOf(PortKindVPN); !contains(got, probe) {
+			t.Errorf("AddPort 之后 vpn 集合里没有 %d: %v", probe, got)
+		}
+		if out, err := vppctl(ctx, "show", "sr-wg", "ports"); err == nil {
+			if !strings.Contains(out, strconv.Itoa(int(probe))) {
+				t.Errorf("`show sr-wg ports` 里没有 %d:\n%s", probe, out)
+			}
+		} else {
+			t.Logf("跳过 CLI 交叉核对（vppctl 不可用）: %v", err)
+		}
+		if err := c.DelPort(ctx, PortKindVPN, probe); err != nil {
+			t.Fatalf("DelPort: %v", err)
+		}
+		if err := c.DelPort(ctx, PortKindVPN, probe); err != nil {
+			t.Errorf("重复 DelPort 应当幂等: %v", err)
+		}
+		if got := portsOf(PortKindVPN); contains(got, probe) {
+			t.Errorf("DelPort 之后 %d 还在集合里: %v", probe, got)
+		}
+
+		// b)/c)/d) 两条隧道打在同一个外层 IP 上。
+		if err := c.SetPKey(ctx, hmacID, mustRand(t, pKeyLen)); err != nil {
+			t.Fatalf("SetPKey: %v", err)
+		}
+		ep := net.ParseIP(shared).To4()
+		mkPath := func(pathID uint16) {
+			if err := c.AddPath(ctx, PathParams{PathID: pathID, HmacID: hmacID, Active: true,
+				Segments: []Segment{{IP: ep, Port: portA}}}); err != nil {
+				t.Fatalf("AddPath(%d): %v", pathID, err)
+			}
+		}
+		mkIface := func(inst uint32, port uint16) uint32 {
+			idx, err := c.CreateInterface(ctx, InterfaceParams{
+				UserInstance: inst, ListenPort: port,
+				PrivateKeys: mustRand(t, wgKeyLen), SrcIP: src})
+			if err != nil {
+				t.Fatalf("CreateInterface(%d): %v", inst, err)
+			}
+			t.Cleanup(func() {
+				cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := c.DeleteInterface(cctx, idx); err != nil {
+					t.Errorf("清理接口 idx=%d: %v", idx, err)
+				}
+				// 建/删接口都会动 UDP 挂点，收尾把集合重新声明一遍。
+				if err := c.RebindPorts(cctx); err != nil {
+					t.Errorf("RebindPorts: %v", err)
+				}
+			})
+			return idx
+		}
+		mkPath(pathA)
+		mkPath(pathB)
+		mkPath(bindIP1)
+		t.Cleanup(func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			for _, id := range []uint16{pathA, pathB, bindIP1} {
+				if err := c.DelPath(cctx, id); err != nil {
+					t.Errorf("清理路径 %d: %v", id, err)
+				}
+			}
+			if err := c.DelPKey(cctx, hmacID); err != nil {
+				t.Errorf("清理 P-Key %d: %v", hmacID, err)
+			}
+		})
+		idxA, idxB := mkIface(instA, portA), mkIface(instB, portB)
+
+		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxA, PathID: pathA, EndpointIP: ep, DstPort: portA}); err != nil {
+			t.Fatalf("SetTunnel(A): %v", err)
+		}
+		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxB, PathID: pathB, EndpointIP: ep, DstPort: portB}); err != nil {
+			t.Fatalf("第二条隧道（同 IP、不同端口）配不上: %v", err)
+		}
+		tuns, err := c.Tunnels(ctx, ^uint32(0))
+		if err != nil {
+			t.Fatalf("Tunnels: %v", err)
+		}
+		bindOf := func(idx uint32) *TunnelInfo {
+			for i := range tuns {
+				if tuns[i].SWIfIndex == idx {
+					return &tuns[i]
+				}
+			}
+			return nil
+		}
+		// 只比本会话自己那两条：这台节点和别的会话共用，全表断言会读到别人的现场。
+		if b := bindOf(idxA); b == nil || b.PathID != pathA || b.DstPort != portA || !b.EndpointIP.Equal(ep) {
+			t.Errorf("第一条绑定被第二条改了: %+v（期望 path=%d port=%d）", b, pathA, portA)
+		}
+		if b := bindOf(idxB); b == nil || b.PathID != pathB || b.DstPort != portB || !b.EndpointIP.Equal(ep) {
+			t.Errorf("第二条绑定不对: %+v（期望 path=%d port=%d）", b, pathB, portB)
+		}
+
+		// c) 抢身份：把 (shared, portA) 再绑一次到接口 B 上，必须被拒。
+		steal := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxB, PathID: bindIP1, EndpointIP: ep, DstPort: portA})
+		var apiErr APIError
+		if steal == nil || !errors.As(steal, &apiErr) || apiErr.Retval != -116 {
+			t.Errorf("抢同一个 (endpoint, 端口) 身份应当回 -116，got: %v", steal)
+		} else {
+			t.Logf("实测：抢身份被拒（%v）", steal)
+		}
+		// d) 被拒之后 A 的绑定、以及 B 自己的绑定都还是原样。
+		tuns, err = c.Tunnels(ctx, ^uint32(0))
+		if err != nil {
+			t.Fatalf("Tunnels(复核): %v", err)
+		}
+		if b := bindOf(idxA); b == nil || b.PathID != pathA || b.DstPort != portA {
+			t.Errorf("被拒的那次动了一条绑定: %+v", b)
+		}
+		if b := bindOf(idxB); b == nil || b.PathID != pathB || b.DstPort != portB {
+			t.Errorf("被拒的那次把 B 自己的绑定也改了: %+v", b)
+		}
 	})
 
 	// WG peer 的去重键**不含接口**：同一把公钥装到第二张接口上，VPP 回 -116。

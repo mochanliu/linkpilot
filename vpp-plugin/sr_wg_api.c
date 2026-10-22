@@ -258,13 +258,16 @@ vl_api_sr_wg_transit_enable_t_handler (vl_api_sr_wg_transit_enable_t *mp)
 {
   vl_api_sr_wg_transit_enable_reply_t *rmp;
   sr_wg_main_t *sm = &sr_wg_main;
+  u16 port = clib_net_to_host_u16 (mp->port);
   int rv = 0;
 
-  sm->transit_port = clib_net_to_host_u16 (mp->port);
-  sm->transit_enabled = 1;
+  if (port == 0)
+    port = SR_PORT_TRANSIT;
 
-  /* 端口是数据面的功能多路复用键：改了端口必须重新注册，否则包根本进不来 */
-  sr_wg_ports_rebind (sm);
+  /* 端口是数据面的功能多路复用键：add 内部就重注册，不必另外 rebind。
+   * 集合语义让一台中转可以同时服务多个 transit 端口。 */
+  rv = sr_wg_port_add_del (sm, SR_WG_PORT_TRANSIT, port, 1);
+  sm->transit_enabled = 1;
 
   REPLY_MACRO (VL_API_SR_WG_TRANSIT_ENABLE_REPLY);
 }
@@ -297,6 +300,7 @@ vl_api_sr_wg_tunnel_set_path_t_handler (vl_api_sr_wg_tunnel_set_path_t *mp)
 
   rv = sr_wg_tunnel_set_path (sm, sw_if_index, path_id,
                               endpoint.as_u32 ? &endpoint : NULL,
+                              clib_net_to_host_u16 (mp->dst_port),
                               mp->is_add ? 1 : 0);
 
   REPLY_MACRO (VL_API_SR_WG_TUNNEL_SET_PATH_REPLY);
@@ -335,6 +339,7 @@ vl_api_sr_wg_tunnel_dump_t_handler (vl_api_sr_wg_tunnel_dump_t *mp)
       rmp->context = mp->context;
       rmp->sw_if_index = clib_host_to_net_u32 (bind->sw_if_index);
       rmp->path_id = clib_host_to_net_u16 (bind->path_id);
+      rmp->dst_port = clib_host_to_net_u16 (bind->dst_port);
       clib_memcpy_fast (rmp->endpoint_ip, &bind->endpoint, 4);
       /*
        * underlay 挂点上只有 endpoint_path 能命中 wg0 维度的绑定，且必须
@@ -432,6 +437,60 @@ vl_api_sr_wg_rebind_ports_t_handler (vl_api_sr_wg_rebind_ports_t *mp)
   REPLY_MACRO (VL_API_SR_WG_REBIND_PORTS_REPLY);
 }
 
+/*
+ * 增/删一个隧道监听端口或中转端口（定案 2「每隧道一个端口」）。
+ * add 是幂等的并且总会把端口重挂回本插件 —— agent 建完 WG 接口之后发的就是它，
+ * 因为 wireguard 会把新建接口的 listen-port 抢回 wg4-input。
+ */
+static void
+vl_api_sr_wg_port_add_del_t_handler (vl_api_sr_wg_port_add_del_t *mp)
+{
+  vl_api_sr_wg_port_add_del_reply_t *rmp;
+  sr_wg_main_t *sm = &sr_wg_main;
+  u16 port = clib_net_to_host_u16 (mp->port);
+  int rv;
+
+  rv = sr_wg_port_add_del (sm, mp->kind, port, mp->is_add ? 1 : 0);
+
+  REPLY_MACRO (VL_API_SR_WG_PORT_ADD_DEL_REPLY);
+}
+
+/* 逐条 dump 端口集合：一张 CPE 上可能几十条隧道，定长数组装不下。 */
+static void
+vl_api_sr_wg_port_dump_t_handler (vl_api_sr_wg_port_dump_t *mp)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  vl_api_sr_wg_port_details_t *rmp;
+  vl_api_registration_t *reg;
+  uword kind;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  for (kind = 0; kind <= SR_WG_PORT_TRANSIT; kind++)
+    {
+      clib_bitmap_t *bitmap = kind == SR_WG_PORT_TRANSIT ? sm->transit_ports
+                                                        : sm->vpn_ports;
+      uword port;
+
+      /* *INDENT-OFF* */
+      clib_bitmap_foreach (port, bitmap)
+        {
+          rmp = vl_msg_api_alloc (sizeof (*rmp));
+          clib_memset (rmp, 0, sizeof (*rmp));
+          rmp->_vl_msg_id =
+            clib_host_to_net_u16 (VL_API_SR_WG_PORT_DETAILS + sm->msg_id_base);
+          rmp->context = mp->context;
+          rmp->kind = (u8) kind;
+          rmp->port = clib_host_to_net_u16 ((u16) port);
+
+          vl_api_send_msg (reg, (u8 *) rmp);
+        }
+      /* *INDENT-ON* */
+    }
+}
+
 static void
 vl_api_sr_wg_encap_fib_set_t_handler (vl_api_sr_wg_encap_fib_set_t *mp)
 {
@@ -462,8 +521,14 @@ vl_api_sr_wg_config_dump_t_handler (vl_api_sr_wg_config_dump_t *mp)
   rmp->_vl_msg_id =
     clib_host_to_net_u16 (VL_API_SR_WG_CONFIG_DETAILS + sm->msg_id_base);
   rmp->context = mp->context;
-  rmp->vpn_port = clib_host_to_net_u16 (sm->vpn_port);
-  rmp->transit_port = clib_host_to_net_u16 (sm->transit_port);
+  /*
+   * 端口是集合（每隧道一个端口），这里只给数量；端口本身由
+   * sr_wg_port_dump 逐条 dump —— 一张 CPE 上几十条隧道时定长数组放不下。
+   */
+  rmp->vpn_port_count = clib_host_to_net_u16 (
+    sr_wg_port_count (sm, SR_WG_PORT_VPN));
+  rmp->transit_port_count = clib_host_to_net_u16 (
+    sr_wg_port_count (sm, SR_WG_PORT_TRANSIT));
   rmp->transit_enabled = sm->transit_enabled;
   rmp->encap_fib_index = clib_host_to_net_u32 (sm->encap_fib_index);
   rmp->path_count = sm->path_table.count;

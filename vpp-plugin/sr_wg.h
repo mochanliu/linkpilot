@@ -12,6 +12,7 @@
 #include <vnet/udp/udp_local.h>
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/feature/feature.h>
+#include <vppinfra/bitmap.h>
 #include <vppinfra/hash.h>
 #include <vppinfra/pool.h>
 
@@ -60,17 +61,22 @@ typedef struct {
 } sr_wg_key_entry_t;
 
 /*
- * Encap 绑定表条目：隧道接口 / 端点 IP -> SR path_id
+ * Encap 绑定表条目：隧道 -> SR path_id
  *
  * 单独用结构体是为了让 CLI / API dump 可以遍历展示。
  *
- * 挂点在 underlay 出口接口，所以数据面真正生效的键是 **endpoint**
- * （外层 dst = WG peer endpoint）。sw_if_index 只在"把 underlay 接口
- * 整体绑到一条路径"这种场景下才命中，保留它是为了兼容旧的按隧道配置。
+ * 挂点在 underlay 出口接口，所以数据面真正生效的键是 **(外层 dst IP,
+ * 封装前的外层 dst 端口)**：同一对 CPE 之间可以开多条 WG 隧道（每隧道一个
+ * 监听端口，定案 2），只按 IP 会把第二条隧道也拽进第一条的路径。
+ * dst_port = 0 表示"这个 IP 上不分行数全部走本路径"（通配），只为兼容
+ * 单隧道配法保留，热路径先查精确键、查不到再查通配键。
+ * sw_if_index 只在"把 underlay 接口整体绑到一条路径"这种场景下才命中，
+ * 保留它是为了兼容旧的按隧道配置。
  */
 typedef struct {
   u32 sw_if_index;        /* WG 隧道接口 sw_if_index（tunnel_path 表用） */
   ip4_address_t endpoint; /* WG peer endpoint IPv4（endpoint_path 表用，必配） */
+  u16 dst_port;           /* 封装前的外层 UDP 目的端口；0 = 通配 */
   u16 path_id;
 } sr_wg_tunnel_bind_t;
 
@@ -86,17 +92,35 @@ typedef struct {
   sr_wg_key_entry_t keys[SR_WG_MAX_KEYS];
   u32 key_count;
 
-  /* Transit 配置 */
-  u16 transit_port;       /* 默认 51821 */
-  u16 vpn_port;           /* 默认 51820 */
+  /* ==================== UDP 目的端口集合（功能多路复用键） ====================
+   *
+   * 定案 2："未来扩展的所有 function 都是通过 udp 端口来区分"，而且**每隧道一个
+   * 端口**：同一对 CPE 可以开多条 WG 隧道，各自绑不同监听端口。所以这里必须是
+   * 集合，不能是单个 vpn_port —— 单个端口时，第二条隧道的包既进不到 sr-wg4-input
+   * （不解密、不进观测表），也过不了 encap 的端口判据（Step 4），结果是
+   * "隧道建起来了、SR 静默没生效"。
+   *
+   *   vpn_ports     -> sr-wg4-input   （解封装；magic != 0x53 旁路给 wg4-input）
+   *   transit_ports -> sr-wg4-transit （验签 + 弹一段，不解密）
+   *
+   * 用 clib_bitmap（≤64K 位，按需增长）而不是向量：encap Step 4 在热路径上要按
+   * 包里的目的端口判成员，bitmap 取值是 O(1)；用向量就得每个包线性扫一遍。
+   * 两个集合都缺省带一个种子端口（51820 / 51821），使既有单隧道配置不改也能跑。
+   *
+   * 类型注意：VPP 的 `typedef uword clib_bitmap_t`，位图变量必须写成指针
+   * （clib_bitmap_t *  ==  uword *），vec_new / clib_bitmap_set 都按这个来。
+   */
+  clib_bitmap_t *vpn_ports;
+  clib_bitmap_t *transit_ports;
   u8  transit_enabled;
 
   /* ==================== Encap 配置 ==================== */
 
   /*
    * 隧道-路径绑定表（两种索引，指向同一份 sr_wg_tunnel_bind_t 池）：
-   *   endpoint_path : key = 外层 dst IPv4（主机序 as_u32），
-   *                   **underlay 挂点下真正生效的索引**，优先级最高
+   *   endpoint_path : key = (外层 dst IPv4 << 16) | 封装前的外层 dst 端口，
+   *                   **underlay 挂点下真正生效的索引**，优先级最高；
+   *                   端口 0 = 通配，精确键查不到才落到它
    *   tunnel_path   : key = sw_if_index。挂点看到的是 underlay 接口，
    *                   故它是"整张网卡一条默认路径"的粗粒度配法，
    *                   仅在 endpoint 未命中时兜底；绑定 wg0 的条目
@@ -173,10 +197,14 @@ void sr_wg_encap_init(sr_wg_main_t *sm);
  *              <underlay>`（或对应 API）单独打开。
  *   endpoint : WG peer 的外层地址。underlay 挂点下这是唯一能命中绑定的键，
  *              不传则该绑定永远不会生效（CLI 会给出警告）。
+ *   dst_port : **封装前**的外层 UDP 目的端口 = 该隧道 peer 的 vpn_port。
+ *              同一个 endpoint 上多条隧道就靠它区分；传 0 = 通配（该 IP 不分行数
+ *              全走本路径，单隧道的旧配法）。
  * 返回 0 成功，非 0 为 VNET_API_ERROR_* 错误码。
  */
 int sr_wg_tunnel_set_path(sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
-                          const ip4_address_t *endpoint, int is_add);
+                          const ip4_address_t *endpoint, u16 dst_port,
+                          int is_add);
 
 /*
  * 在 ip4-output arc 上为指定 **underlay 出口接口** 启用 / 禁用
@@ -188,9 +216,13 @@ int sr_wg_encap_enable_disable(sr_wg_main_t *sm, u32 sw_if_index, int enable);
 /* 指定接口上是否已启用 sr-wg4-encap（控制面/CLI 校验用，非热路径）。 */
 int sr_wg_encap_is_enabled(sr_wg_main_t *sm, u32 sw_if_index);
 
-/* 查找绑定条目；未绑定返回 NULL。数据面热路径使用。 */
+/*
+ * 查找绑定条目；未绑定返回 NULL。数据面热路径使用。
+ * dst_port 是**封装前**的外层目的端口（主机序）：先查 (dst, port) 精确键，
+ * 查不到再落到 (dst, 0) 通配键，最后按 sw_if_index 兜底。
+ */
 sr_wg_tunnel_bind_t *sr_wg_bind_lookup(sr_wg_main_t *sm, u32 sw_if_index,
-                                       ip4_address_t dst);
+                                       ip4_address_t dst, u16 dst_port);
 
 /*
  * 删除路径时清理仍指向它的隧道绑定，返回清理条数。
@@ -201,12 +233,34 @@ sr_wg_tunnel_bind_t *sr_wg_bind_lookup(sr_wg_main_t *sm, u32 sw_if_index,
 u32 sr_wg_binds_drop_for_path(sr_wg_main_t *sm, u16 path_id);
 
 /*
- * 按当前 vpn_port / transit_port 重新注册 UDP 目的端口。
- * 建 WireGuard 接口会把 51820 重新注册给 wg4-input，transit 换端口也必须
- * 重注册 —— 端口就是数据面的功能多路复用键，注册表和配置不一致时
- * 包根本进不到我们的节点。
+ * 按当前端口集合重新注册 UDP 目的端口：vpn_ports 全部 -> sr-wg4-input，
+ * transit_ports 全部 -> sr-wg4-transit。
+ * 建 WireGuard 接口会把它自己的 listen-port 重新注册给 wg4-input（覆盖 51820
+ * 以及任何一条隧道的端口），transit 换端口也一样 —— 端口就是数据面的功能
+ * 多路复用键，注册表和配置不一致时包根本进不到我们的节点。
  */
 void sr_wg_ports_rebind(sr_wg_main_t *sm);
+
+/* ==================== UDP 端口集合（每隧道一个端口） ==================== */
+
+/* 端口种类：与 vl_api_sr_wg_port_* 的 kind 字段同值，避免两处各数一遍。 */
+#define SR_WG_PORT_VPN     0
+#define SR_WG_PORT_TRANSIT 1
+
+/*
+ * 增/删一个 UDP 目的端口。**两个调用都会立刻作用到 UDP 分发表**，
+ * 不需要另外 rebind：漏一次 rebind 就是"配置说端口归我们、包却进了 wg4-input"
+ * 这种最难查的静默状态。
+ *   port = 0            -> VNET_API_ERROR_INVALID_VALUE
+ *   重复 add / 删不存在的端口 -> 幂等，返回 0（控制器对账时不必先 dump）
+ * 删除 vpn 端口时把端口交回 wg4-input（它是 WG 接口的 listen-port，交回之后
+ * 那条隧道仍能当普通 WG 用）；删除 transit 端口时直接反注册（那端口本就不
+ * 属于 wireguard）。
+ */
+int sr_wg_port_add_del(sr_wg_main_t *sm, u8 kind, u16 port, int is_add);
+
+/* 集合大小（CLI/API 汇报用；不是热路径，走 popcount）。 */
+u32 sr_wg_port_count(sr_wg_main_t *sm, u8 kind);
 
 /* ==================== Node 声明 ==================== */
 
