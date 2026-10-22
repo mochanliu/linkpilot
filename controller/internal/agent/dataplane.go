@@ -15,12 +15,13 @@ import (
 
 	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/vppapi"
+	"sdwan/controller/internal/wire"
 )
 
 // 这一层是"CPE 的数据面"：控制器说"有个对端"，这里就把它变成 VPP 里的三样东西
 // —— 一条 SR 路径、一个隧道绑定、一个 WireGuard peer。
 //
-// 四条规则贯穿全文件，都能追溯到实测或插件源码，而不是设计偏好：
+// 六条规则贯穿全文件，都能追溯到实测或插件源码，而不是设计偏好：
 //
 //  1. **声明式，且每次读真值**。VPP 才是事实来源，本层不缓存 peer/path 状态，
 //     每个动作前先 dump 一遍。缓存换来的那点性能，代价是"agent 以为自己配过了"
@@ -37,6 +38,19 @@ import (
 //  5. **一条隧道一个监听端口，端口是集合不是标量**（定案 2）。所以建接口之后
 //     必须先把这个端口 AddPort 进 vpn 集合，再 RebindPorts —— 插件的集合里
 //     默认只有 51820，51830 那条隧道不登记就永远没人给它加 SR 头。
+//  6. **两个 MTU 都由数据面执行，但执行的是"分片"，不是"拒发"**。2026-10-22 实测
+//     （node1 `ping size 1400` ⇒ 内层 1436 > wg0 记的 1360）：VPP 在 WG 出口按
+//     隧道 MTU 把**内层**切成 1356+100 两片，两片各自独立封 WG 头 + SR 头，外层
+//     1452 / 196 都不超 underlay 的 1500 —— 于是 sr-wg4-input 永远只见到完整包
+//     （收端 Decap_hmac_fail 增量 0，内层由 ip4-local-full-reassembly 拼回 1436）。
+//     它既不回 ICMP frag-needed 也不丢包，所以这个值仍是"预算基准 + 上报 + 让
+//     LAN 侧按它配置"，只是不能再当成"数据面不生效的数"。此前记的"wg0 记 1360
+//     照样放过 1436"量的是**手建 WG 接口的出生状态**：四个槽全 0 = 没有 MTU
+//     记录，无从执行 —— 正是 applyMTUs 必须写一个非 0 值的理由。
+//     underlay 那一条才是硬约束：VPP 给 af-packet 口默认记 9000，内核网卡 1500，
+//     于是 VPP 不分片、直接把超长外层帧交给 sendto()，内核静默失败，这张网卡从此
+//     只收不发。2026-10-18 的带宽基线那次卡死就是这个，本轮做 MTU 测量时又在
+//     node2 上复现了一次（host-eth0-tx tx sendto failure ×5）。
 type DataPlane interface {
 	SetPKey(ctx context.Context, hmacID uint16, key []byte) error
 	AddPort(ctx context.Context, kind uint8, port uint16) error
@@ -46,6 +60,7 @@ type DataPlane interface {
 
 	CreateInterface(ctx context.Context, p vppapi.InterfaceParams) (uint32, error)
 	Interfaces(ctx context.Context, showPrivate bool) ([]vppapi.InterfaceInfo, error)
+	SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU uint16) error
 	EnableEncap(ctx context.Context, swIfIndex uint32, enable bool) error
 
 	AddPeer(ctx context.Context, p vppapi.PeerParams) (uint32, error)
@@ -72,6 +87,11 @@ var _ DataPlane = (*vppapi.Client)(nil)
 // 但 0 就没有探针了），也要小于常见 NAT 的 UDP 映射超时 —— 25 秒与实验室手工
 // 配置一致。
 const defaultKeepaliveSec = 25
+
+// 隧道 MTU 的合法区间用契约包里的 wire.MinTunnelMTU / MaxTunnelMTU，本层不另立
+// 一套数：控制器下发前与 agent 落地前必须拿同一把尺子，否则"控制器能发、agent
+// 拒收"这个缺口会在 enroll 之后才暴露。VPP 自己什么都不校验（实测连 `packet 0`
+// 都照单收下），所以校验只能在这两处做。
 
 // Key 是一条 hop-MAC 密钥（对应 wire.PKey 的字节形态；hex 解析留给调用方）。
 type Key struct {
@@ -109,7 +129,27 @@ type LinkConfig struct {
 	// 但一个 SR 头都不会加（vpp-plugin/sr_wg_cli.c 的 set sr-wg encap 注释记了同一条）。
 	// 本层用的是 VPP 的 API 客户端、还没有 core 的 sw_interface_dump，算不出"哪张是
 	// 默认出口"，所以这个号由调用方从本机路由表/配置文件里给。
+	//
+	// 填错号时有一条兜底，但不是全覆盖：给了 UnderlayMTU，applyMTUs 会往这个号写
+	// MTU，实测不存在的 sw_if_index 当场回 retval=-2；UnderlayMTU 未知时不写
+	// underlay（见那个字段的注释），这个号就仍只被 EnableEncap 检验，而它对
+	// "挂错接口"是静默的。
 	EncapIfIndex uint32
+
+	// TunnelMTU 是这条隧道在 overlay 上允许的 IP 包长度，来自控制器下发的
+	// wire.EnrollResponse.TunnelMTU；0 = 用 wire.DefaultTunnelMTU（1360）。
+	// 数据面**会**执行它，执行方式是按它切内层分片而不是拒发（见本文件规则 6）；
+	// 不执行的是"超长就丢"，所以它同时还是"预算基准 + 上报 + 让 LAN 侧按它配置"。
+	// 手建的 WG 接口四个 MTU 槽全是 0，也就是根本没有记录可执行 —— 这一格必须写。
+	TunnelMTU uint16
+
+	// UnderlayMTU 是 EncapIfIndex 那张网卡真实的链路 MTU，0 = 调用方不知道。
+	// 它做两件事：把 underlay 接口的 MTU 写对（VPP 给 af-packet 口默认记 9000，
+	// 真实网卡常是 1500，这个差值就是超长外层帧打到 sendto 上静默失败的原因），
+	// 以及把 TunnelMTU 卡在 wire.TunnelMTUBudget 之内。core 的
+	// sw_interface_dump 落地之前（任务 #17），这个值只能和 EncapIfIndex 一样
+	// 由调用方给。
+	UnderlayMTU uint16
 
 	KeepaliveSec uint16
 	// PathIDBase 把 agent 用的 path_id 整体抬高，避开操作者手敲 CLI 时从 1
@@ -177,6 +217,34 @@ func NewLink(cfg LinkConfig) (*Link, error) {
 	if cfg.SrcIP == nil || cfg.SrcIP.To4() == nil {
 		return nil, fmt.Errorf("agent: underlay 源地址必须是 IPv4，给了 %v", cfg.SrcIP)
 	}
+	// 隧道 MTU：0 = 控制器没下发，落到契约里的默认值。这里就把**算出来的那个值**
+	// 存回 cfg，后面 Open/adopt 与任何上报用的都是它，不再各自判一次 0。
+	mtu := cfg.TunnelMTU
+	if mtu == 0 {
+		mtu = wire.DefaultTunnelMTU
+	}
+	if mtu < wire.MinTunnelMTU || mtu > wire.MaxTunnelMTU {
+		return nil, fmt.Errorf("agent: 隧道 MTU %d 出界，可用区间 %d..%d",
+			mtu, wire.MinTunnelMTU, wire.MaxTunnelMTU)
+	}
+	// 知道 underlay MTU 就必须卡住预算，因为超预算**不会报错**：这条口按自己记着的
+	// MTU 切内层分片照样封装发走（2026-10-22 实测 overlay 1436 过 1360 的口 → 两片
+	// 1356+100，一片不丢），所以配错的人只会看到"隧道通了，大包时好时坏"。
+	// 超预算坏在哪：每个内层分片都要再背一份自己的 WG+SR 头，于是外层撑破 underlay，
+	// 分片之上又套一层分片；中间设备常丢单片 UDP，而收端若不先重组就派发，本插件
+	// 拿到的是半截 SR 头。实验室里 VPP 在 ip4-input 之前把外层拼回来了（这一路
+	// Decap_hmac_fail 增 0），公网不保证这一点，所以宁可在这里拒绝。
+	//
+	// 按**最多段数**算，不是按当前段数：段列表由控制器随时重组，而 MTU 是接口级
+	// 的、一条隧道只有一个值。取最坏的那个，长路径就不会在某一天把外层撑破。
+	if cfg.UnderlayMTU != 0 {
+		if budget := wire.TunnelMTUBudget(cfg.UnderlayMTU, wire.MaxSRSegments); mtu > budget {
+			return nil, fmt.Errorf("agent: 隧道 MTU %d 超出预算：underlay %d、最多 %d 段时上限是 %d；"+
+				"超出去不会被 VPP 拒绝，只会静默分片（外层还要再分一层），请把 tunnel_mtu 调小或缩短路径",
+				mtu, cfg.UnderlayMTU, wire.MaxSRSegments, budget)
+		}
+	}
+	cfg.TunnelMTU = mtu
 	k, err := ecdh.X25519().NewPrivateKey(cfg.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("agent: WG 私钥不合法: %w", err)
@@ -282,6 +350,9 @@ func (l *Link) Open(ctx context.Context) (bool, error) {
 	if err := l.dp.EnableEncap(ctx, l.cfg.EncapIfIndex, true); err != nil {
 		return false, fmt.Errorf("agent: 在 underlay 接口 %d 上开 encap: %w", l.cfg.EncapIfIndex, err)
 	}
+	if err := l.applyMTUs(ctx, idx); err != nil {
+		return false, err
+	}
 	l.swIfIndex = idx
 	l.adopted = false
 	l.ready = true
@@ -321,6 +392,12 @@ func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, er
 			return false, fmt.Errorf("agent: 认回接口 %d 后在 underlay %d 上开 encap: %w",
 				ifi.SWIfIndex, l.cfg.EncapIfIndex, err)
 		}
+		// 认回的接口同样要过一遍 MTU：VPP 的接口配置只活在进程里，而"agent 重启
+		// 时 VPP 也重启了"和"VPP 没重启"这两种情况从 dump 里长得一模一样
+		// （MTU 这个字段 core 的 dump 我们还读不到，见任务 #17）。重复设置幂等。
+		if err := l.applyMTUs(ctx, ifi.SWIfIndex); err != nil {
+			return false, err
+		}
 		l.swIfIndex = ifi.SWIfIndex
 		l.adopted = true
 		l.ready = true
@@ -343,6 +420,32 @@ func (l *Link) claimListenPort(ctx context.Context) error {
 	}
 	if err := l.dp.RebindPorts(ctx); err != nil {
 		return fmt.Errorf("agent: 重挂 UDP 端口集合: %w", err)
+	}
+	return nil
+}
+
+// applyMTUs 把两张口的 MTU 记录写成配置里的值。
+//
+// 隧道口（tunnelSwIfIndex）写 cfg.TunnelMTU —— NewLink 已经把 0 换成了默认值，
+// 这里不会再看到 0。数据面确实执行它：实测记 1360 的 wg0 发出 1436 的内层时，
+// VPP 在 WG 出口把内层切成 1356+100 两片分别封装（见本文件规则 6）。执行的是
+// 分片不是拒发，所以这个数同时还是"预算、上报、LAN 侧该配多大"的基准。
+//
+// underlay 出口只在调用方给了 UnderlayMTU 时才动，而且给多大写多大：猜一张物理
+// 网卡的 MTU 比重复设置危险得多 —— 写大了 VPP 就不分片，超长外层帧照样交给
+// sendto()，内核静默失败、这张口从此只收不发（本文件规则 6 的现场）；写小了
+// 只是多分片，不会静默。两个设置都是幂等的，所以 Open 与 adopt 都无条件走一遍。
+func (l *Link) applyMTUs(ctx context.Context, tunnelSwIfIndex uint32) error {
+	if err := l.dp.SetInterfaceMTU(ctx, tunnelSwIfIndex, l.cfg.TunnelMTU); err != nil {
+		return fmt.Errorf("agent: 给隧道接口 %d 设 MTU=%d: %w",
+			tunnelSwIfIndex, l.cfg.TunnelMTU, err)
+	}
+	if l.cfg.UnderlayMTU == 0 {
+		return nil
+	}
+	if err := l.dp.SetInterfaceMTU(ctx, l.cfg.EncapIfIndex, l.cfg.UnderlayMTU); err != nil {
+		return fmt.Errorf("agent: 给 underlay 接口 %d 设 MTU=%d: %w",
+			l.cfg.EncapIfIndex, l.cfg.UnderlayMTU, err)
 	}
 	return nil
 }

@@ -210,6 +210,18 @@ type server struct {
 	vpnPort     uint16
 	transitPort uint16
 
+	// tunnelMTU is the overlay MTU pushed at enrollment, in bytes of overlay
+	// packet. Like the two ports the controller owns the answer: it is a budget
+	// over the tenant's underlay MTU and the longest path this controller is
+	// willing to compose, and a node can only guess at both. The dataplane does
+	// act on it, but the action is fragmentation, not refusal -- an oversize
+	// overlay packet is cut into pieces at the WireGuard output, each piece
+	// separately SR-encapsulated (measured on the lab dataplane 2026-10-22; see
+	// wire.EnrollResponse.TunnelMTU). So the controller's job is to push a number
+	// that keeps the OUTER frame inside the underlay, which is what
+	// wire.TunnelMTUBudget computes.
+	tunnelMTU uint16
+
 	// obs is the observation store: per (tenant, OBSERVER), the attributed outer
 	// sources that observer reported. Deliberately NOT part of State, and
 	// therefore not persisted: an observation is only a fact while it is fresh
@@ -524,6 +536,7 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		Epoch:        s.advanceEpoch(),
 		VpnPort:      s.vpnPort,
 		TransitPort:  s.transitPort,
+		TunnelMTU:    s.tunnelMTU,
 		PKeys:        s.tenantKeyRing(tenant),
 	})
 }
@@ -1346,6 +1359,14 @@ func main() {
 		// to remember which convention it was born under to get its ports right.
 		vpnPort     = flag.Uint("vpn-port", 51820, "UDP port the dataplane delivers into the VPN (constraint: dst port = function key)")
 		transitPort = flag.Uint("transit-port", 51821, "UDP port the dataplane transits SR segments on")
+		// The overlay MTU pushed to every node. It is a flag, not a per-node
+		// setting, for the same reason the two ports above are: the CPE cannot
+		// derive it -- the budget depends on the tenant's underlay MTU and on the
+		// longest path this controller is willing to compose, and only the
+		// controller knows both. The default is the worst-case-safe value on a
+		// 1500-byte underlay (wire.DefaultTunnelMTU); a smaller underlay needs a
+		// smaller number here, and wire.TunnelMTUBudget says how much smaller.
+		tunnelMTU = flag.Uint("tunnel-mtu", uint(wire.DefaultTunnelMTU), "overlay MTU pushed at enrollment; must be <= wire.TunnelMTUBudget(underlayMTU, longest path)")
 	)
 	flag.Parse()
 
@@ -1363,6 +1384,15 @@ func main() {
 		// They are the multiplexing key: equal values would make the two roles
 		// indistinguishable at the one place that distinguishes them.
 		log.Fatalf("--vpn-port and --transit-port must differ (both %d)", vpn)
+	}
+	// Reject an out-of-range MTU HERE rather than at each agent's NewLink: the
+	// bounds are the contract's (wire.MinTunnelMTU/MaxTunnelMTU), and a
+	// controller that happily hands out a value every agent refuses is a
+	// enrollment-time failure with N victims instead of one startup failure here.
+	mtu := uint16(*tunnelMTU)
+	if *tunnelMTU > 65535 || mtu < wire.MinTunnelMTU || mtu > wire.MaxTunnelMTU {
+		log.Fatalf("--tunnel-mtu must be in %d..%d (got %d); 0 is not accepted either -- it means \"no MTU record\" to VPP, and the agent must write a number, not clear the interface",
+			wire.MinTunnelMTU, wire.MaxTunnelMTU, *tunnelMTU)
 	}
 	if err := os.MkdirAll(*dataDir, 0700); err != nil {
 		log.Fatal(err)
@@ -1400,6 +1430,7 @@ func main() {
 		dataDir:     *dataDir,
 		vpnPort:     vpn,
 		transitPort: transit,
+		tunnelMTU:   mtu,
 		obs:         map[string]observerView{},
 		pendingObs:  map[string]map[string]*pendingObs{},
 	}

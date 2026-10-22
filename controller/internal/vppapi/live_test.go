@@ -50,7 +50,7 @@ const (
 //	SRWG_VPP_SOCK=/run/vpp/api.sock SRWG_UNDERLAY_IP=10.10.1.2 \
 //	  go test ./internal/vppapi -run TestLive -v
 //
-// 它证明的是这个包最要紧的五件事，全部用真 VPP 而不是假端：
+// 它证明的是这个包最要紧的六件事，全部用真 VPP 而不是假端：
 //  1. 握手、消息尺寸与 CRC 校验对得上真实注册表（假端只能锁住我们自己抄的格式）；
 //  2. 定案 3：agent 自己生成的 X25519 私钥能原样装进 VPP —— dump 回来的私钥
 //     逐字节等于装进去的那把，公钥等于本地用 crypto/ecdh 推算的那把；
@@ -61,7 +61,11 @@ const (
 //     重复 add peer 回 -116 且**跨接口也回 -116**（去重键不含接口，换 endpoint
 //     也救不回来）、0 条 allowed_ip 回 -7、删不存在的 peer 回 -6、
 //     同 path_id 再 AddPath 是原地替换、但绑定的 endpoint 不会跟着段走、
-//     DelPath 会静默级联解掉引用它的绑定。
+//     DelPath 会静默级联解掉引用它的绑定；
+//  6. core 的 sw_interface_set_mtu（MTU 唯一的写入口，实测三件事）：新建的 WG 接口
+//     带着 0/0/0/0 出生（所以"不写"不等于"有默认值"）；写 1360 得到 1360/0/0/0
+//     —— IP4 槽回落 L3，与 CLI `packet N` 同一形态；VPP 对值**毫不校验**（0 照收并
+//     清零四槽），但接口号写错会当场回 retval=-2，所以出口接口填错不会是静默的。
 //
 // 号段全部走 9001/9002 与 51998/51999，路径段地址一律 TEST-NET-1，跑完自己
 // 删干净：这台节点是和别的会话共用的，不能留下任何会影响真实流量的配置。
@@ -823,7 +827,154 @@ func TestLiveAgainstVPP(t *testing.T) {
 		}
 	})
 
+	t.Run("interface_mtu", func(t *testing.T) {
+		idx, err := c.CreateInterface(ctx, InterfaceParams{
+			UserInstance: liveInstance, ListenPort: livePort,
+			PrivateKeys: mustRand(t, wgKeyLen), SrcIP: src})
+		if err != nil {
+			t.Fatalf("CreateInterface: %v", err)
+		}
+		t.Cleanup(func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := c.DeleteInterface(cctx, idx); err != nil {
+				t.Errorf("清理接口 idx=%d 失败: %v（手工 vppctl wireguard delete）", idx, err)
+			}
+			if err := c.RebindPorts(cctx); err != nil {
+				t.Errorf("RebindPorts: %v", err)
+			}
+		})
+
+		// 读回只能用 CLI：本客户端还没有 core 的 sw_interface_dump（那是 #17），
+		// 而"MTU 到底写没写进去"必须看真记录，不能信 retval。
+		readBack := func(t *testing.T) string {
+			t.Helper()
+			out := showInterfaces(t)
+			m := mtuColumnOnIndexLine(out, idx)
+			if m == "" {
+				t.Fatalf("show interface 里没有 idx=%d 的 MTU 列：\n%s", idx, out)
+			}
+			return m
+		}
+
+		// 实测起点：手建的 wireguard 接口**没有 MTU 记录**（四个槽全 0）。
+		// 这就是"agent 什么都不写"时数据面的样子，也是 DefaultTunnelMTU 存在的理由。
+		before := readBack(t)
+		t.Logf("新建 WG 接口 idx=%d 的 MTU 记录（未写之前）= %s", idx, before)
+
+		if err := c.SetInterfaceMTU(ctx, idx, 1360); err != nil {
+			t.Fatalf("SetInterfaceMTU(1360): %v", err)
+		}
+		if got := readBack(t); got != "1360/0/0/0" {
+			t.Errorf("写 1360 之后 MTU 列应是 1360/0/0/0（IP4 回落到 L3），实际 %s", got)
+		}
+
+		// VPP **自己不校验**这个数。客户端把 0 拦在发出之前（单测锁住了那条），所以
+		// 这里只能走 CLI 去看 VPP 的真实态度：实测 `packet 0` 照单收下，并把四个槽位
+		// 一起清零 —— 那是"取消 MTU 记录"，不是"设成 0"。客户端那层拦截因此不是
+		// 多余的防御。实验用刚建的这张接口，跑完就删，不留痕迹。
+		name := interfaceNameOnIndex(showInterfaces(t), idx)
+		if name == "" {
+			t.Fatalf("show interface 里读不到 idx=%d 的接口名，无法做 CLI 侧的 0 值实验", idx)
+		}
+		out, err := vppctl(ctx, "set", "interface", "mtu", "packet", "0", name)
+		if err != nil || out != "" {
+			t.Logf("实测：VPP 的 CLI 拒了 MTU=0（out=%q err=%v）—— 上游补了校验，客户端那层可以退休", out, err)
+		} else if got := readBack(t); got != "0/0/0/0" {
+			t.Errorf("实测：CLI 写 0 之后 MTU 列 = %s，与\"四槽一起清零\"的既有观测不一致，请复核", got)
+		} else {
+			t.Logf("实测复现：%s 的 MTU=0 被照单收下并清零四个槽位（VPP 不校验，必须在客户端拦）", name)
+		}
+
+		// 接口号写错时会不会静默？这条必须有答案，因为 underlay 那个 sw_if_index 目前
+		// 是操作员给的（#17 之前算不出来），而"启用成功了但一个包都没动"是本项目的
+		// 老病。用一个绝不可能存在的号试，只看 VPP 回什么。
+		if err := c.SetInterfaceMTU(ctx, 0xFFFF, 1400); err != nil {
+			t.Logf("实测：不存在的接口号 65535 被拒绝（%v）—— 写错出口号会当场报错，不会静默", err)
+		} else {
+			t.Error("实测：VPP 收下了不存在接口号的改 MTU 请求（retval=0）—— " +
+				"agent 必须在写之前确认这个号来自真实的 dump，不能只信 retval")
+		}
+
+		// 出口接口（host-eth0）的 VIF 记录：这台机器上它是 af-packet 建的，实测默认
+		// 9000，而容器网卡只有 1500 —— 这个不一致就是 af-packet 发送侧卡死的根因。
+		// 这里只把它读出来记进日志，真正的同步由 test/scripts/test-mtu.sh 断言。
+		if hif := os.Getenv("SRWG_UNDERLAY_SW_IF_INDEX"); hif != "" {
+			n, err := strconv.ParseUint(hif, 10, 32)
+			if err != nil {
+				t.Fatalf("SRWG_UNDERLAY_SW_IF_INDEX 不是数字: %v", err)
+			}
+			hifIdx := uint32(n)
+			if err := c.SetInterfaceMTU(ctx, hifIdx, 1500); err != nil {
+				t.Errorf("给 underlay %d 写 1500: %v", hifIdx, err)
+			} else if got := mtuColumnOnIndexLine(showInterfaces(t), hifIdx); got != "1500/0/0/0" {
+				t.Errorf("underlay MTU 列应是 1500/0/0/0，实际 %s", got)
+			}
+		} else {
+			t.Log("未设 SRWG_UNDERLAY_SW_IF_INDEX，跳过 underlay 接口那条（由 test-mtu.sh 覆盖）")
+		}
+	})
+
 	t.Logf("被丢弃的帧计数 Drops=%d（异步通知会计进来，不该持续增长）", c.Drops())
+}
+
+// showInterfaces 取 `vppctl show interface` 全文，并在读不到时终结调用方。
+func showInterfaces(t *testing.T) string {
+	t.Helper()
+	out, err := vppctl(context.Background(), "show", "interface")
+	if err != nil {
+		t.Fatalf("vppctl show interface: %v", err)
+	}
+	return out
+}
+
+// mtuColumnOnIndexLine 从 `vppctl show interface` 的输出里取指定 sw_if_index 那行的
+// MTU 列（形如 1360/0/0/0），找不到返回 ""。
+//
+// 按"第 2 列是这个号"来定位而不是按接口名：API 只回给我 sw_if_index，而名字是操作员
+// 起的、别的会话也可能占同一个名。这张表的分页格式不规整（后面的列会折行成计数器
+// 行），所以不数第几列，直接找那唯一一个 "a/b/c/d" 形状的字段。
+func mtuColumnOnIndexLine(out string, swIfIndex uint32) string {
+	want := strconv.FormatUint(uint64(swIfIndex), 10)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[1] != want {
+			continue
+		}
+		for _, f := range fields {
+			if isMTUColumn(f) {
+				return f
+			}
+		}
+	}
+	return ""
+}
+
+// isMTUColumn 认 "a/b/c/d" 这种四段全数字的字段，即 show interface 的 MTU 列。
+func isMTUColumn(s string) bool {
+	parts := strings.Split(s, "/")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if _, err := strconv.ParseUint(p, 10, 32); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// interfaceNameOnIndex 取同一张表里那个号对应的接口名（第一列）。
+// 只有 CLI 需要名字，而写 MTU 的实验走 CLI 是因为客户端会先把非法值拦在发出之前。
+func interfaceNameOnIndex(out string, swIfIndex uint32) string {
+	want := strconv.FormatUint(uint64(swIfIndex), 10)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == want {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 // mustRand 取 n 个随机字节，失败直接终结测试。

@@ -67,6 +67,10 @@ var requiredVersions = map[string]string{
 	"sr_wg_transit_enable_reply":       "e8d4e804",
 	"sr_wg_transit_disable":            "51077d14",
 	"sr_wg_transit_disable_reply":      "e8d4e804",
+	// core（vnet/interface.api）也要核对：MTU 是 VPP 自己的消息，不是插件的，
+	// 值取自 srwg-node1 里装的 /usr/share/vpp/api/core/interface.api.json。
+	"sw_interface_set_mtu":       "5cbe85e5",
+	"sw_interface_set_mtu_reply": "e8d4e804",
 }
 
 func checkVersions(ids map[string]uint16, crcs map[string]string, want map[string]string) error {
@@ -733,6 +737,52 @@ func (c *Client) ClearTransit(ctx context.Context) error {
 		return err
 	}
 	return c.retval("sr_wg_transit_disable", frame)
+}
+
+// ==================== 接口 MTU（core 消息，不是插件的） ====================
+
+// vl_api_mtu_proto_t 的槽位下标：sw_interface_set_mtu 一次给四个值。
+const (
+	MTUSlotL3   = 0
+	MTUSlotIP4  = 1
+	MTUSlotIP6  = 2
+	MTUSlotMPLS = 3
+)
+
+// SetInterfaceMTU 设一张接口的 **L3** MTU，其余三个槽位写 0。
+//
+// 写 0 不是"不改"而是"回落到 L3"：实测 `set interface mtu ip4 1400 wg0` 之后
+// 再 `set interface mtu packet 1360 wg0`，VPP 显示的是 1360/0/0/0，IP4 那位被
+// 清零了。四个槽位一起发、只填 L3，就等于 CLI 的 `set interface mtu packet N`，
+// 这也是 VPP 对隧道接口约定的写法。真机复现见 live_test.go 的 interface_mtu。
+//
+// 0 要拦掉，而且要拦在**发出之前**：mtu[4] 全 0 等于取消这张口的 MTU 记录 ——
+// 实测 CLI 写 `packet 0` 被照单收下、显示 0/0/0/0，VPP 对值毫不校验，所以这层
+// 只能我们自己加。没有 MTU 记录的 underlay 拿不到分片依据；实验室里真实发生过
+// 的形态是 af-packet 的 VIF 记着 9000 而容器网卡只有 1500，大包在 sendto 上失败
+// 并把那个口的发送侧卡死、计数器不再动（2026-10-18 的带宽基线跑过一次，本轮做
+// MTU 测量时在 node2 又复现一次：host-eth0-tx 连报 5 次 tx sendto failure）。
+//
+// 接口号写错不会静默：实测不存在的 sw_if_index 当场回 retval=-2，所以操作员把
+// EncapIfIndex 填错时这里是报错，而不是"启用成功但一个包都没动"。
+//
+// 读不回：core 的 sw_interface_dump 还没实现（见任务 #17 的缺口），所以这个包
+// 只能"写"，验证得靠 vppctl show interface。幂等，重复设同一个值没有副作用。
+func (c *Client) SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU uint16) error {
+	if l3MTU == 0 {
+		return errors.New("vppapi: MTU 不能是 0（四个槽位全清零等于取消 MTU 记录）")
+	}
+	body := make([]byte, 0, 20)
+	body = appendU32(body, swIfIndex)
+	body = appendU32(body, uint32(l3MTU))
+	body = appendU32(body, 0) // IP4 → 回落 L3
+	body = appendU32(body, 0) // IP6
+	body = appendU32(body, 0) // MPLS
+	frame, err := c.call(ctx, "sw_interface_set_mtu", "sw_interface_set_mtu_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sw_interface_set_mtu", frame)
 }
 
 // appendSegments 写满定长数组 segments[8]：未用的槽位补零。

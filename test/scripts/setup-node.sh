@@ -45,6 +45,9 @@
 #   vppctl create host-interface name eth1
 #   vppctl set interface mac address host-eth1 $(ip link show eth1 | awk '/link\/ether/{print $2}')
 #   vppctl set interface state host-eth1 up
+#   vppctl set interface mtu packet 1500 host-eth1    # VPP 给 af-packet 口默认记 9000，
+#       而容器网卡只有 1500。这个差不表现为「大包被拒」，而是 sendto 失败并把这张口
+#       的发送侧卡死。取内核真实值：cat /sys/class/net/eth1/mtu
 #   vppctl set interface ip address host-eth1 10.10.1.2/24
 #   ip addr del 10.10.1.2/24 dev eth1
 #
@@ -56,6 +59,11 @@
 #   vppctl wireguard create listen-port 51820 generate-key src 10.10.1.2
 #   vppctl set interface ip address wg0 192.168.99.1/24
 #   vppctl set interface state wg0 up
+#   vppctl set interface mtu packet 1360 wg0           # 与 wire.DefaultTunnelMTU 一致。
+#       这条**会**被执行，执行方式是分片而不是拒发：实测 1436 的内层过记着 1360 的
+#       wg0，VPP 在 WG 出口把内层切成 1356+100 两片、各自封自己的 SR/WG 头，于是
+#       外层 1452 与 196 都不超 underlay。手建的 WG 接口四个 MTU 槽默认全 0（等于
+#       没有记录），不写这一行就等于这条隧道不做任何限制。
 #   vppctl set sr-wg rebind-ports        # 必须在 wg-create 之后：建 WG 接口会
 #                                        # 把 51820 重新注册给 wg4-input
 #   vppctl sr-wg path add 1 via 10.10.2.2:51820 via 10.10.1.3:51821 hmac-id 1
@@ -112,6 +120,23 @@ SR_PATH_ID=${SR_PATH_ID:-1}
 SR_HMAC_ID=${SR_HMAC_ID:-1}
 WG_IF=${WG_IF:-wg0}
 KEEPALIVE=${KEEPALIVE:-5}
+
+# 隧道 overlay MTU。默认值与契约里的 wire.DefaultTunnelMTU 一致，实验室 underlay
+# 是 1500、最多 8 段时预算 1368，所以这个数在任何路径长度下都不会把外层撑破。
+# 2026-10-22 复测纠正了一条早先的错判：这条**是**会被数据面执行的，执行动作是
+# "按它切内层分片"而不是"拒发"——实测 1436 的内层过记着 1360 的 wg0，出口切成
+# 1356+100 两片、各自封自己的 SR/WG 头，于是外层 1452/196 都不超 underlay，
+# 收端在 sr-wg4-input 之前就把内层拼回去了（分片包不会喂进插件，hmac_fail 增 0）。
+# 早先"记 1360 照样放过 1436"那次量的其实是手建接口的出生状态：四个槽全 0，
+# 没有记录也就无从执行 —— 断言见 test/scripts/test-mtu.sh。
+TUNNEL_MTU=${TUNNEL_MTU:-1360}
+# underlay VIF 的 MTU。留空 = 从内核网卡真实值同步；显式给值就用它。
+# 这一步是本轮真正有强制力的一条：VPP 给 af-packet 的 VIF 默认记 L3 9000，而容器
+# 网卡只有 1500，这个差值不会表现为"大包被拒"，而是 sendto 失败并把该口发送侧
+# 卡死、计数器不再动（2026-10-18 带宽基线卡死一次，本轮 MTU 测量在 node2 复现一次）。
+UNDERLAY_MTU=${UNDERLAY_MTU:-}
+
+
 # 绑定键的第二半（封装前的外层目的端口）。空=通配，沿用单隧道配法。
 TUN_DST_PORT=${TUN_DST_PORT:-}
 
@@ -156,6 +181,16 @@ underlay_record() { # $1=want_ip $2=ifname $3=pfx
         printf '%s %s %s\n' "$1" "$2" "$3" >> "${UNDERLAY_STATE}"
 }
 
+# underlay_mtu_of 回显这张 underlay 该用的 MTU：显式给了 UNDERLAY_MTU 就用它，
+# 否则读内核网卡的真实值（读不到回空，调用方按"不知道"处理）。
+underlay_mtu_of() {
+    if [ -n "${UNDERLAY_MTU}" ]; then
+        echo "${UNDERLAY_MTU}"
+        return
+    fi
+    cat "/sys/class/net/$1/mtu" 2>/dev/null || true
+}
+
 # 幂等地把宿主网卡交给 VPP 并配好 IP，回显 VPP 接口名
 # 注意：vppctl show interface <name> 即使接口不存在也返回 exit 0，
 #       必须 grep 输出内容来判断接口是否存在。
@@ -183,6 +218,19 @@ ensure_host_interface() {
         vppctl set interface mac address "${vif}" "${kmac}" 2>/dev/null || true
     fi
     vppctl set interface state "${vif}" up
+    # 把 VIF 的 MTU 记录改成内核网卡的真实值。VPP 给 af-packet 口默认记 L3 9000，
+    # 而容器网卡是 1500：这个差不会让 VPP 拒掉大包，而是让超长的外层帧打到 sendto
+    # 上失败并把这张口的发送侧卡死（实测：node2 的 host-eth0-tx 连报 tx sendto
+    # failure，计数器从此不动）。这一条是 MTU 相关写入里唯一真正被数据面执行的。
+    local want_mtu
+    want_mtu=$(underlay_mtu_of "${hif}")
+    if [ -n "${want_mtu}" ] && [ "${want_mtu}" != "0" ]; then
+        local mtu_out
+        mtu_out=$(vppctl set interface mtu packet "${want_mtu}" "${vif}" 2>&1 || true)
+        [ -n "${mtu_out}" ] && log "set interface mtu ${want_mtu} ${vif}: ${mtu_out}"
+    else
+        log "读不到 ${hif} 的 MTU，VIF 记录保持 VPP 的默认值（9000）—— 大包请谨慎"
+    fi
     if ! vppctl show interface "${vif}" 2>/dev/null | grep -q "${want_ip}/"; then
         vppctl set interface ip address "${vif}" "${want_ip}/${pfx}"
     fi
@@ -371,6 +419,13 @@ cmd_wg_create() {
     fi
     vppctl set interface ip address "${WG_IF}" "${SELF_OVERLAY}/${OVERLAY_PFX}" 2>/dev/null || true
     vppctl set interface state "${WG_IF}" up
+    # 隧道接口的 MTU 记录。手建的 WG 接口四个槽默认全是 0（= 没有记录，什么都不
+    # 限制），所以这一行是必须写的。它会被执行，动作是按它切内层分片、不是拒发
+    # （见上面 TUNNEL_MTU 的注释；断言在 test/scripts/test-mtu.sh）。public key
+    # 必须是 stdout 的最后一行，所以这里把 vppctl 的输出引到 stderr。
+    local mtu_out
+    mtu_out=$(vppctl set interface mtu packet "${TUNNEL_MTU}" "${WG_IF}" 2>&1 || true)
+    [ -n "${mtu_out}" ] && log "set interface mtu ${TUNNEL_MTU} ${WG_IF}: ${mtu_out}"
     # WireGuard 创建接口时会重新注册 listen-port，覆盖 SR-WG 的 51820 注册。
     # 必须在 WG 接口创建后重新绑定端口，让 sr-wg4-input 接管 51820 流量。
     vppctl set sr-wg rebind-ports 2>/dev/null || true

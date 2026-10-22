@@ -171,7 +171,10 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "sr_wg_key_set", "sr_wg_rebind_ports", "sr_wg_obs_clear",
 		"wireguard_interface_delete", "wireguard_peer_remove",
 		"sr_wg_path_add_del", "sr_wg_tunnel_set_path", "sr_wg_encap_enable",
-		"sr_wg_port_add_del", "sr_wg_transit_enable", "sr_wg_transit_disable":
+		"sr_wg_port_add_del", "sr_wg_transit_enable", "sr_wg_transit_disable",
+		// core 的改 MTU 应答只有一个 retval（vl_api_sw_interface_set_mtu_reply_t），
+		// 和上面这批同形；它是本文件里唯一一条**不是插件消息**的请求。
+		"sw_interface_set_mtu":
 		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
 	case "sr_wg_stats_get":
 		// 真实尺寸 138 = msg_id(2)+context(4)+retval(4)+16 个 u64

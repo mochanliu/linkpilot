@@ -103,12 +103,133 @@ type EnrollResponse struct {
 	// before any path references it, because the plugin refuses to delete a key a
 	// path still cites.
 	PKeys []PKey `json:"p_keys"`
+
+	// TunnelMTU is the overlay MTU every tunnel of this tenant gets. Like the
+	// two ports above it is PUSHED, not per-node config: the agent cannot derive
+	// it, because the budget depends on the tenant's underlay MTU and on the
+	// longest path its controller is willing to compose, and only the
+	// controller knows both. Zero means "use DefaultTunnelMTU" -- the agent
+	// applies the default rather than leaving VPP's interface MTU unset, so the
+	// value a CPE runs with is always one of the two, never VPP's own default of
+	// 0 (which is what a hand-created wireguard interface comes with).
+	//
+	// What the dataplane does with it, re-measured on the lab on 2026-10-22: VPP
+	// enforces the recorded tunnel MTU by FRAGMENTING the overlay packet at the
+	// WireGuard output. An overlay packet of 1436 through a wg0 recorded at 1360
+	// left as two WireGuard packets carrying 1356 + 100, each with its own SR
+	// header, so both outer frames (1452 + 196) stayed under the 1500 underlay
+	// and the receiver reassembled the overlay packet before sr-wg4-input ever
+	// saw a piece of it. What it does NOT do is refuse the packet or answer with
+	// ICMP "fragmentation needed" -- so this number is still the budget the
+	// controller composes paths against and the value the CPE reports, but it is
+	// enforced, whereas an interface left at 0 has no record to enforce at all.
+	TunnelMTU uint16 `json:"tunnel_mtu,omitempty"`
 }
 
 // PKey is one entry of the tenant's hop-MAC key ring.
 type PKey struct {
 	HmacID uint16 `json:"hmac_id"`
 	Key    string `json:"key"` // hex, 16 bytes (SR_PKEY_LEN)
+}
+
+// ---------------------------------------------------------------- tunnel MTU
+
+// The per-packet bytes this dataplane puts on the wire ON TOP of the overlay
+// packet. Every number here is measured against the lab dataplane (VPP 26.06 +
+// sr_wg), not taken from a document -- and it lives in ONE place because a
+// budget computed differently by the controller and the agent is a blackhole
+// with two owners. test/scripts/test-mtu.sh re-measures these and asserts them.
+//
+//	UDP payload    = overlay + WGDataOverheadBytes                    (bare WG)
+//	UDP payload    = overlay + WGDataOverheadBytes + SRHeaderBytes(N)  (SR path)
+//	outer IPv4 len = UDP payload + OuterUnderlayBytes
+//
+// Two traces of the same ping, node1 -> node2 over a 2-segment path: an overlay
+// packet of 136 B arrived as a 204 B UDP payload (136+32+36), and node2's reply
+// -- plain WireGuard, no SR header -- left as a 168 B UDP payload (136+32).
+const (
+	// WGDataOverheadBytes is a WireGuard transport-data packet minus the packet
+	// it carries. The protocol says 12 B header + 16 B tag = 28; VPP 26.06 puts
+	// 32 on the wire. The excess is constant across overlay sizes (measured 64
+	// through 176), so it is framing, not the kernel's 16-byte plaintext
+	// padding. Use the measured number: a budget built on the protocol's 28
+	// would let 4 bytes past the underlay MTU on every path.
+	WGDataOverheadBytes = 32
+
+	// SRFixedBytes is sr_header.h's SR_FIXED_HDR_LEN + SR_HMAC_LEN, and
+	// SRSegmentBytes is one segment (IPv4 + port). Together they are the
+	// plaintext header the design constraint puts in front of the ciphertext.
+	SRFixedBytes   = 24
+	SRSegmentBytes = 6
+	MaxSRSegments  = 8 // SR_MAX_SEGS
+
+	// OuterUnderlayBytes is the underlay's own IPv4 + UDP in front of the SR
+	// header, i.e. what the underlay interface's MTU has to pay for first.
+	OuterUnderlayBytes = 28
+)
+
+// DefaultTunnelMTU is the overlay MTU a tunnel gets when the controller pushes
+// none. It is chosen against the WORST case this dataplane can produce -- a
+// 1500-byte underlay and the maximum 8 segments -- whose exact budget is 1368:
+//
+//	1360 + 32 + (24 + 6*8) + 28 = 1492 <= 1500
+//
+// so a tenant that says nothing still cannot emit an oversized frame, on any
+// path length, and there are 8 bytes left for the unexpected. It is NOT safe on
+// a smaller underlay: 1450 (PPPoE, some CGNATs) budgets 1318 at 8 segments --
+// which is exactly why this is a pushed field and not only a constant.
+const DefaultTunnelMTU uint16 = 1360
+
+// The legal range for a pushed TunnelMTU. Both ends belong to the contract, not
+// to the agent: the controller must not be able to hand out a value its own
+// agent refuses to start with, and a pushed MTU is a config the CPE writes into
+// VPP without asking anyone.
+//
+// 576 is the smallest IPv4 reassembly size a conforming host guarantees -- below
+// it the tunnel cannot carry a legal packet at all. 9000 is a jumbo frame; above
+// it the number is simply wrong. The bounds exist because VPP validates neither:
+// it records whatever it is told, and `set interface mtu packet 0` is accepted
+// too (measured -- it clears all four slots, i.e. cancels the MTU record). A bad
+// value therefore fails silently and surfaces much later as "this tunnel
+// blackholes big packets".
+const (
+	MinTunnelMTU uint16 = 576
+	MaxTunnelMTU uint16 = 9000
+)
+
+// SRHeaderBytes is the on-wire length of the SR header for a path with segCount
+// segments (0 means "no SR header at all", i.e. plain WireGuard direct).
+func SRHeaderBytes(segCount uint8) int {
+	if segCount == 0 {
+		return 0
+	}
+	return SRFixedBytes + int(segCount)*SRSegmentBytes
+}
+
+// TunnelMTUBudget answers: given an underlay interface MTU and the worst
+// segment count a path on this tunnel may carry, how large may an overlay
+// packet be before the OUTER frame overruns the underlay?
+//
+// Over budget the packet is still not refused -- VPP cuts the OVERLAY packet at
+// the tunnel MTU instead (measured 2026-10-22: overlay 1436 through a wg0
+// recorded at 1360 left as two WireGuard packets carrying inner fragments
+// 1356 + 100, each with its own SR header, outer 1452 + 196, delivered). That
+// is why the budget matters rather than "the dataplane handles it anyway": a
+// tunnel configured ABOVE its budget puts the fragments on the underlay, where
+// they are the real hazard -- middleboxes drop lone UDP fragments, and although
+// the hop MAC protects the SR header, a header split across fragments is only
+// deliverable if the receiver reassembles before the UDP dispatch. VPP does
+// reassemble here (Decap_hmac_fail stayed 0 through the fragmented probe), but
+// a production WAN path is not obliged to. So the budget is what keeps the
+// tunnel from silently turning into "works until someone sends a big packet".
+// Returns 0 when no overlay packet can fit (the caller must then refuse the
+// configuration rather than install a tunnel that can only fragment).
+func TunnelMTUBudget(underlayMTU uint16, segCount uint8) uint16 {
+	budget := int(underlayMTU) - OuterUnderlayBytes - WGDataOverheadBytes - SRHeaderBytes(segCount)
+	if budget < 0 {
+		return 0
+	}
+	return uint16(budget)
 }
 
 // ------------------------------------------------------------------ runtime

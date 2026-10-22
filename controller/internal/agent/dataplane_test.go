@@ -41,6 +41,8 @@ type fakeVPP struct {
 	tunnels map[uint32]vppapi.TunnelInfo
 	keys    map[uint16][]byte
 	encap   map[uint32]bool
+	mtus    map[uint32]uint16
+	mtuErr  error
 	ports   []vppapi.PortInfo
 	rebinds int
 	obs     []vppapi.Observation
@@ -147,6 +149,22 @@ func (f *fakeVPP) Interfaces(ctx context.Context, showPrivate bool) ([]vppapi.In
 func (f *fakeVPP) EnableEncap(ctx context.Context, swIfIndex uint32, enable bool) error {
 	f.log("EnableEncap %d=%v", swIfIndex, enable)
 	f.encap[swIfIndex] = enable
+	return nil
+}
+
+// SetInterfaceMTU 照抄真机行为：**不做任何合理性判断**，只把数记下来。实测
+// `set interface mtu packet 0` 也照样接受（等于取消记录），所以这里对 0 与出界的
+// 值都不拦 —— 拦是 agent 在 NewLink 里做的（wire.MinTunnelMTU/MaxTunnelMTU +
+// 预算），本 fake 的意义正是"别让测试通过靠的是数据面替我们把关"。
+func (f *fakeVPP) SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU uint16) error {
+	f.log("SetInterfaceMTU %d=%d", swIfIndex, l3MTU)
+	if f.mtuErr != nil {
+		return f.mtuErr
+	}
+	if f.mtus == nil {
+		f.mtus = map[uint32]uint16{}
+	}
+	f.mtus[swIfIndex] = l3MTU
 	return nil
 }
 
