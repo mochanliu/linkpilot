@@ -43,6 +43,11 @@ type fakeVPP struct {
 	encap   map[uint32]bool
 	mtus    map[uint32]uint16
 	mtuErr  error
+	// swIfs 是 core 接口表里**非 WG** 的那几张（真机上还有 local0 之类，本测试
+	// 只关心 underlay 出口）。WG 那几张由 CreateInterface 的记账现算。
+	swIfs   []vppapi.SwInterface
+	dumpIfs []vppapi.SwInterface // 非空时 DumpInterfaces 原样回它：用来造"记录不符"
+	dumpErr error
 	ports   []vppapi.PortInfo
 	rebinds int
 	obs     []vppapi.Observation
@@ -61,6 +66,12 @@ func newFakeVPP() *fakeVPP {
 		encap:   map[uint32]bool{},
 		nextIdx: 1,
 		nextPi:  1,
+		// underlay 出口按真机的出生样子摆在这儿：af-packet 口 VPP 默认记 9000，
+		// 容器网卡只有 1500。这样"写完读回来"测的才是读回，而不是 map 里本来就对。
+		swIfs: []vppapi.SwInterface{{
+			SWIfIndex: encapIfIndex, Name: "host-eth0",
+			L3MTU: bornVIFMTU, AdminUp: true, LinkUp: true,
+		}},
 	}
 }
 
@@ -166,6 +177,43 @@ func (f *fakeVPP) SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU u
 	}
 	f.mtus[swIfIndex] = l3MTU
 	return nil
+}
+
+// bornVIFMTU 是 VPP 给 af-packet 口的默认 MTU 记录（实测 9000），而实验室的容器
+// 网卡只有 1500。规则 6 那条发送侧卡死就是这两个数不一致造成的。
+const bornVIFMTU = 9000
+
+// DumpInterfaces 回读"VPP 眼下的接口表"：非 WG 的那几张来自 swIfs，WG 的那几张由
+// CreateInterface 的记账现算，两张都叠上 SetInterfaceMTU 写过的值。
+//
+// 没写过的口保留出生值 —— 新建的 WG 接口四槽全 0（真机实测），underlay 是 9000。
+// 这样 verifyLanded 读到什么取决于 agent 有没有真的去写，而不是取决于 map 的初值。
+func (f *fakeVPP) DumpInterfaces(ctx context.Context) ([]vppapi.SwInterface, error) {
+	f.log("DumpInterfaces")
+	if f.dumpErr != nil {
+		return nil, f.dumpErr
+	}
+	if len(f.dumpIfs) > 0 {
+		return append([]vppapi.SwInterface(nil), f.dumpIfs...), nil
+	}
+	out := make([]vppapi.SwInterface, 0, len(f.swIfs)+len(f.ifaces))
+	for _, i := range f.swIfs {
+		if m, ok := f.mtus[i.SWIfIndex]; ok {
+			i.L3MTU = uint32(m)
+		}
+		out = append(out, i)
+	}
+	for _, i := range f.ifaces {
+		si := vppapi.SwInterface{
+			SWIfIndex: i.SWIfIndex, Name: fmt.Sprintf("wg%d", i.UserInstance),
+			AdminUp: true, LinkUp: true,
+		}
+		if m, ok := f.mtus[i.SWIfIndex]; ok {
+			si.L3MTU = uint32(m)
+		}
+		out = append(out, si)
+	}
+	return out, nil
 }
 
 func (f *fakeVPP) AddPeer(ctx context.Context, p vppapi.PeerParams) (uint32, error) {

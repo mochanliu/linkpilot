@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 
 	"sdwan/controller/internal/keybinding"
@@ -21,7 +22,7 @@ import (
 // 这一层是"CPE 的数据面"：控制器说"有个对端"，这里就把它变成 VPP 里的三样东西
 // —— 一条 SR 路径、一个隧道绑定、一个 WireGuard peer。
 //
-// 六条规则贯穿全文件，都能追溯到实测或插件源码，而不是设计偏好：
+// 七条规则贯穿全文件，都能追溯到实测或插件源码，而不是设计偏好：
 //
 //  1. **声明式，且每次读真值**。VPP 才是事实来源，本层不缓存 peer/path 状态，
 //     每个动作前先 dump 一遍。缓存换来的那点性能，代价是"agent 以为自己配过了"
@@ -51,6 +52,10 @@ import (
 //     于是 VPP 不分片、直接把超长外层帧交给 sendto()，内核静默失败，这张网卡从此
 //     只收不发。2026-10-18 的带宽基线那次卡死就是这个，本轮做 MTU 测量时又在
 //     node2 上复现了一次（host-eth0-tx tx sendto failure ×5）。
+//  7. **写完要读回来对一遍**。retval=0 在这条链上只说明"请求被收下"：encap 挂到
+//     隧道接口自己身上照样回成功，MTU 写完了表里却可能是别数（操作员手改同一台
+//     节点是明确支持的用法）。所以 Open/adopt 结尾用 core 的 sw_interface_dump
+//     核对出口是否存在、是不是隧道自己、两条 MTU 记录（verifyLanded）。
 type DataPlane interface {
 	SetPKey(ctx context.Context, hmacID uint16, key []byte) error
 	AddPort(ctx context.Context, kind uint8, port uint16) error
@@ -61,6 +66,7 @@ type DataPlane interface {
 	CreateInterface(ctx context.Context, p vppapi.InterfaceParams) (uint32, error)
 	Interfaces(ctx context.Context, showPrivate bool) ([]vppapi.InterfaceInfo, error)
 	SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU uint16) error
+	DumpInterfaces(ctx context.Context) ([]vppapi.SwInterface, error)
 	EnableEncap(ctx context.Context, swIfIndex uint32, enable bool) error
 
 	AddPeer(ctx context.Context, p vppapi.PeerParams) (uint32, error)
@@ -127,13 +133,12 @@ type LinkConfig struct {
 	// feature 只有挂在真正的出口网卡上才会改写包。挂在 WG 接口上是**静默无效**的
 	// —— wg4-output-tun 不在 ip4-output 的 feature 链里，EnableEncap 照样回 retval=0，
 	// 但一个 SR 头都不会加（vpp-plugin/sr_wg_cli.c 的 set sr-wg encap 注释记了同一条）。
-	// 本层用的是 VPP 的 API 客户端、还没有 core 的 sw_interface_dump，算不出"哪张是
-	// 默认出口"，所以这个号由调用方从本机路由表/配置文件里给。
+	// 这个号仍然由调用方给：本层没有 core 的 FIB dump，算不出"默认路由走哪张口"，
+	// 而且出口该由谁定是控制面的事（agent 不猜）。
 	//
-	// 填错号时有一条兜底，但不是全覆盖：给了 UnderlayMTU，applyMTUs 会往这个号写
-	// MTU，实测不存在的 sw_if_index 当场回 retval=-2；UnderlayMTU 未知时不写
-	// underlay（见那个字段的注释），这个号就仍只被 EnableEncap 检验，而它对
-	// "挂错接口"是静默的。
+	// 变化在于**填错不再是静默的**：Open/adopt 末尾的 verifyLanded 会用 core 的
+	// sw_interface_dump 读回整张接口表，号不存在、或者正好是隧道自己，都在开跑之前
+	// 报错退出。以前这两条只在"顺带写了 underlay MTU"时才被 retval=-2 兜住一半。
 	EncapIfIndex uint32
 
 	// TunnelMTU 是这条隧道在 overlay 上允许的 IP 包长度，来自控制器下发的
@@ -146,9 +151,13 @@ type LinkConfig struct {
 	// UnderlayMTU 是 EncapIfIndex 那张网卡真实的链路 MTU，0 = 调用方不知道。
 	// 它做两件事：把 underlay 接口的 MTU 写对（VPP 给 af-packet 口默认记 9000，
 	// 真实网卡常是 1500，这个差值就是超长外层帧打到 sendto 上静默失败的原因），
-	// 以及把 TunnelMTU 卡在 wire.TunnelMTUBudget 之内。core 的
-	// sw_interface_dump 落地之前（任务 #17），这个值只能和 EncapIfIndex 一样
-	// 由调用方给。
+	// 以及把 TunnelMTU 卡在 wire.TunnelMTUBudget 之内。
+	//
+	// 这个值必须由调用方给，**不能**改成从 VPP 读回来自己定：VPP 那张表记的就是
+	// 那个可能错的 9000，读它等于把自己的病灶当体检报告。真值只有内核知道
+	// （/sys/class/net/<if>/mtu，test/scripts/setup-node.sh 就是这么取的）。
+	// agent 现在会读回记录并核对是否等于写进去的数（verifyLanded），但记录"是不是
+	// 网卡的真值"这一层，本层无法知道。
 	UnderlayMTU uint16
 
 	KeepaliveSec uint16
@@ -353,6 +362,9 @@ func (l *Link) Open(ctx context.Context) (bool, error) {
 	if err := l.applyMTUs(ctx, idx); err != nil {
 		return false, err
 	}
+	if err := l.verifyLanded(ctx, idx); err != nil {
+		return false, err
+	}
 	l.swIfIndex = idx
 	l.adopted = false
 	l.ready = true
@@ -392,10 +404,13 @@ func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, er
 			return false, fmt.Errorf("agent: 认回接口 %d 后在 underlay %d 上开 encap: %w",
 				ifi.SWIfIndex, l.cfg.EncapIfIndex, err)
 		}
-		// 认回的接口同样要过一遍 MTU：VPP 的接口配置只活在进程里，而"agent 重启
-		// 时 VPP 也重启了"和"VPP 没重启"这两种情况从 dump 里长得一模一样
-		// （MTU 这个字段 core 的 dump 我们还读不到，见任务 #17）。重复设置幂等。
+		// 认回的接口同样要过一遍 MTU：接口是活的，可它身上的记录不一定是我们上次
+		// 写的那两个数（操作员手工改过、或这张口本就没有记录）。写完由 verifyLanded
+		// 读回来核对；重复设置幂等。
 		if err := l.applyMTUs(ctx, ifi.SWIfIndex); err != nil {
+			return false, err
+		}
+		if err := l.verifyLanded(ctx, ifi.SWIfIndex); err != nil {
 			return false, err
 		}
 		l.swIfIndex = ifi.SWIfIndex
@@ -424,7 +439,7 @@ func (l *Link) claimListenPort(ctx context.Context) error {
 	return nil
 }
 
-// applyMTUs 把两张口的 MTU 记录写成配置里的值。
+// applyMTUs 把两张口的 MTU 记录写成配置里的值。写完由 verifyLanded 读回来核对。
 //
 // 隧道口（tunnelSwIfIndex）写 cfg.TunnelMTU —— NewLink 已经把 0 换成了默认值，
 // 这里不会再看到 0。数据面确实执行它：实测记 1360 的 wg0 发出 1436 的内层时，
@@ -448,6 +463,58 @@ func (l *Link) applyMTUs(ctx context.Context, tunnelSwIfIndex uint32) error {
 			l.cfg.EncapIfIndex, l.cfg.UnderlayMTU, err)
 	}
 	return nil
+}
+
+// verifyLanded 读回接口表，确认这几件事真的落了地：出口号在 VPP 里存在、它不是
+// 隧道接口自己、两张口的 MTU 记录就是我们刚写进去的那两个数。
+//
+// 为什么值得多发一次 dump：retval=0 在这两处都不代表配对了。EnableEncap 把 encap
+// 挂到 WG 接口上照样回成功，而一个 SR 头都不会加（EncapIfIndex 的注释记的就是这条
+// 坑）；SetInterfaceMTU 只说"收下"，不说"记成了什么" —— 手敲配置的操作员在同一条
+// 链上写另一个值，agent 完全不晓得，症状照旧是"隧道在、小包通、大包没了"。
+// 这三个症状没有一个会自己冒出来，所以只能在这里主动核对。
+func (l *Link) verifyLanded(ctx context.Context, tunnelSwIfIndex uint32) error {
+	ifs, err := l.dp.DumpInterfaces(ctx)
+	if err != nil {
+		return fmt.Errorf("agent: 读回接口表（核对出口与 MTU 记录）: %w", err)
+	}
+
+	egress, ok := vppapi.FindInterface(ifs, l.cfg.EncapIfIndex)
+	if !ok {
+		return fmt.Errorf("agent: 配置里的 underlay 出口 %d 在 VPP 的接口表里不存在（现有 %s）",
+			l.cfg.EncapIfIndex, interfaceSummary(ifs))
+	}
+	if egress.SWIfIndex == tunnelSwIfIndex {
+		return fmt.Errorf("agent: underlay 出口 %d 就是隧道接口自己（%s）："+
+			"encap 挂在 WG 接口上会启用成功但一个包都不改写，请填真正的出口网卡",
+			l.cfg.EncapIfIndex, egress.Name)
+	}
+	tun, ok := vppapi.FindInterface(ifs, tunnelSwIfIndex)
+	if !ok {
+		return fmt.Errorf("agent: 隧道接口 %d 在 VPP 的接口表里读不到了（现有 %s）",
+			tunnelSwIfIndex, interfaceSummary(ifs))
+	}
+	if tun.L3MTU != uint32(l.cfg.TunnelMTU) {
+		return fmt.Errorf("agent: 隧道接口 %s(%d) 的 MTU 记录是 %d，我们要的是 %d："+
+			"数据面按这个数切内层分片，记错了就是大包黑洞（有别的人在改这张表？）",
+			tun.Name, tunnelSwIfIndex, tun.L3MTU, l.cfg.TunnelMTU)
+	}
+	// 没给 UnderlayMTU 就压根没写 underlay，读回来的记录自然不该由我们负责。
+	if l.cfg.UnderlayMTU != 0 && egress.L3MTU != uint32(l.cfg.UnderlayMTU) {
+		return fmt.Errorf("agent: underlay 出口 %s(%d) 的 MTU 记录是 %d，我们要的是 %d："+
+			"记大了 VPP 就不分片，超长外层帧在 sendto 上把这张口的发送侧卡死（规则 6）",
+			egress.Name, l.cfg.EncapIfIndex, egress.L3MTU, l.cfg.UnderlayMTU)
+	}
+	return nil
+}
+
+// interfaceSummary 把接口表压成一行，只用于报错时让操作员看见"VPP 到底有哪些口"。
+func interfaceSummary(ifs []vppapi.SwInterface) string {
+	out := make([]string, 0, len(ifs))
+	for _, i := range ifs {
+		out = append(out, fmt.Sprintf("%d:%s/%d", i.SWIfIndex, i.Name, i.L3MTU))
+	}
+	return strings.Join(out, " ")
 }
 
 // SWIfIndex 是本机的 WG 接口号，Open 之后才有意义。

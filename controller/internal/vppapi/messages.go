@@ -1,6 +1,7 @@
 package vppapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -71,6 +72,9 @@ var requiredVersions = map[string]string{
 	// 值取自 srwg-node1 里装的 /usr/share/vpp/api/core/interface.api.json。
 	"sw_interface_set_mtu":       "5cbe85e5",
 	"sw_interface_set_mtu_reply": "e8d4e804",
+	// 同一份 JSON 里的 dump/details：结构体一旦变，CRC 一定先于超时告诉我们。
+	"sw_interface_dump":    "aa610c27",
+	"sw_interface_details": "6c221fc7",
 }
 
 func checkVersions(ids map[string]uint16, crcs map[string]string, want map[string]string) error {
@@ -766,8 +770,9 @@ const (
 // 接口号写错不会静默：实测不存在的 sw_if_index 当场回 retval=-2，所以操作员把
 // EncapIfIndex 填错时这里是报错，而不是"启用成功但一个包都没动"。
 //
-// 读不回：core 的 sw_interface_dump 还没实现（见任务 #17 的缺口），所以这个包
-// 只能"写"，验证得靠 vppctl show interface。幂等，重复设同一个值没有副作用。
+// 读不回这一条已经补上了：core 的 sw_interface_dump 就是下面的 DumpInterfaces，
+// mtu[0] 正是 `show interface` 那一列，agent 在 Open/adopt 结尾会核对写进去的值真的
+// 落地（见 agent.verifyLanded）。幂等，重复设同一个值没有副作用。
 func (c *Client) SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU uint16) error {
 	if l3MTU == 0 {
 		return errors.New("vppapi: MTU 不能是 0（四个槽位全清零等于取消 MTU 记录）")
@@ -783,6 +788,88 @@ func (c *Client) SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU ui
 		return err
 	}
 	return c.retval("sw_interface_set_mtu", frame)
+}
+
+// SwInterface 是 core 的接口表里本数据面真正要用的那几项。
+//
+// L3MTU 就是 `show interface` 那个 MTU 列（mtu[0]，vl_api_mtu_proto_t 的 L3 槽）：
+// 写进去的 MTU 能不能读回来，看的就是它。
+type SwInterface struct {
+	SWIfIndex uint32
+	Name      string
+	L3MTU     uint32
+	AdminUp   bool
+	LinkUp    bool
+}
+
+// swInterfaceDetailsLen 是 vl_api_sw_interface_details_t 的字节数。
+//
+// 这个数和下面每个偏移都不是推的：取自 srwg-node1 里 VPP 自己生成的
+// /usr/include/vnet/interface.api_types.h（那张 packed 结构），并用容器里的 gcc
+// 打印 sizeof/offsetof 复核过 —— sizeof=295，interface_name 在 103。值得记一笔的是
+// flags/type/link_duplex/sub_if_flags **各占 4 字节**：VPP 的头文件只对 u8 枚举写
+// STATIC_ASSERT（direction、address_family 有），这几个没有，所以按 u8 算会把后面
+// 所有字段往前挪 6~10 字节 —— 症状是接口名读出来一串零、MTU 读出一个没见过的数。
+const swInterfaceDetailsLen = 295
+
+// DumpInterfaces 读回 VPP 的接口表，用来验证写下去的东西真的落了地。
+//
+// 为什么需要它：EnableEncap 对"挂错接口"是静默的（encap 挂到 WG 接口上照样
+// retval=0，一个包都不改写），而 MTU 写下去之后 VPP 从不回读。这两件事在
+// sw_interface_dump 之前只能靠操作员盯 vppctl，agent 自己看不见。
+//
+// 只发**无过滤**的 dump：sw_if_index=0xFFFFFFFF（全部）、name_filter_valid=0、
+// 变长串长度 0，请求体共 9 字节（帧共 19）。不用 VPP 侧的按名过滤有两个理由：
+// 一台 CPE 就几张口，全收回来在 Go 里筛更便宜；而 vl_api_string_t 后面要不要补零
+// 到 4 字节对齐，取决于 VPP 解码器版本，少发一个字节就是"超时且没有任何错误"。
+func (c *Client) DumpInterfaces(ctx context.Context) ([]SwInterface, error) {
+	body := make([]byte, 9)
+	binary.BigEndian.PutUint32(body[0:4], ^uint32(0)) // sw_if_index = all
+	// body[4] = name_filter_valid（0），body[5:9] = name_filter 的 u32 长度（0）。
+
+	frames, err := c.dump(ctx, "sw_interface_dump", "sw_interface_details", body)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SwInterface, 0, len(frames))
+	for _, f := range frames {
+		if len(f) < swInterfaceDetailsLen {
+			return nil, fmt.Errorf("vppapi: sw_interface_details 太短 (%d B < %d B)，core 的接口结构变了",
+				len(f), swInterfaceDetailsLen)
+		}
+		// 帧自带 msg_id(2)+context(4)，正好是那张 packed 结构的前 6 字节，
+		// 所以下面直接用头文件里的 offsetof，不再另加 6。
+		flags := binary.BigEndian.Uint32(f[20:24])
+		out = append(out, SwInterface{
+			SWIfIndex: binary.BigEndian.Uint32(f[6:10]),
+			Name:      fixedString(f[103:167]),
+			L3MTU:     binary.BigEndian.Uint32(f[38:42]),
+			AdminUp:   flags&0x1 != 0, // IF_STATUS_API_FLAG_ADMIN_UP
+			LinkUp:    flags&0x2 != 0, // IF_STATUS_API_FLAG_LINK_UP
+		})
+	}
+	return out, nil
+}
+
+// fixedString 读 API 里那种"定长数组、NUL 结尾"的字符串字段。
+func fixedString(b []byte) string {
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		return string(b[:i])
+	}
+	return string(b)
+}
+
+// FindInterface 在 DumpInterfaces 的结果里按号找一张口。
+//
+// 找不到就是找不到（false），调用方自己决定这是不是错误 —— 本包不去猜"这个号
+// 本该是谁"，因为出口接口该由谁定、按什么定，是 agent 那一层的事。
+func FindInterface(ifaces []SwInterface, swIfIndex uint32) (SwInterface, bool) {
+	for _, i := range ifaces {
+		if i.SWIfIndex == swIfIndex {
+			return i, true
+		}
+	}
+	return SwInterface{}, false
 }
 
 // appendSegments 写满定长数组 segments[8]：未用的槽位补零。

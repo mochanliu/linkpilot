@@ -36,7 +36,9 @@ type fakeVPP struct {
 	tunDetails  int
 	portDetails int
 	peerDetails int
+	swIfDetails int      // core 的 sw_interface_dump 回几条
 	peersRaw    [][]byte // 非空时按原样发这些 details 载荷（用来回放真 VPP 抓到的帧）
+	swIfRaw     [][]byte // 同上，但发给 sw_interface_dump
 	requests    chan request
 }
 
@@ -173,7 +175,8 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 		"sr_wg_path_add_del", "sr_wg_tunnel_set_path", "sr_wg_encap_enable",
 		"sr_wg_port_add_del", "sr_wg_transit_enable", "sr_wg_transit_disable",
 		// core 的改 MTU 应答只有一个 retval（vl_api_sw_interface_set_mtu_reply_t），
-		// 和上面这批同形；它是本文件里唯一一条**不是插件消息**的请求。
+		// 和上面这批插件消息同形。本文件里 core 的消息共两条：这条，和下面那条
+		// sw_interface_dump（走 details，不是 retval）。
 		"sw_interface_set_mtu":
 		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
 	case "sr_wg_stats_get":
@@ -213,6 +216,16 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "sr_wg_port_dump":
 		for i := 0; i < f.portDetails; i++ {
 			f.sendFrameOf(conn, "sr_wg_port_details", reqCtx, portDetailBytes(i))
+		}
+	case "sw_interface_dump":
+		if len(f.swIfRaw) > 0 {
+			for _, raw := range f.swIfRaw {
+				f.sendFrameOf(conn, "sw_interface_details", reqCtx, raw)
+			}
+			break
+		}
+		for i := 0; i < f.swIfDetails; i++ {
+			f.sendFrameOf(conn, "sw_interface_details", reqCtx, swInterfaceDetailBytes(i))
 		}
 	}
 	// 未知请求：不回。客户端应当超时，而不是永远挂着。
@@ -328,6 +341,35 @@ func peerDetailBytes(i int) []byte {
 	b = append(b, 32)
 	b = appendAddress(b, net.IPv4(198, 51, 100, 2))
 	b = append(b, 24)
+	return b
+}
+
+// fakeSwInterfaces 是假 VPP 的接口表，形态照着 srwg-node1 实测那三张口：local0 只有
+// ADMIN_UP 且没有 MTU 记录，host-eth0 是 underlay 出口，wg0 是隧道。
+var fakeSwInterfaces = []struct {
+	idx   uint32
+	name  string
+	mtu   uint32
+	flags uint32
+}{
+	{1, "local0", 0, 0x1},
+	{2, "host-eth0", 1500, 0x3},
+	{3, "wg0", 1360, 0x3},
+}
+
+// swInterfaceDetailBytes 造一条 core 的 sw_interface_details 净体。
+//
+// 偏移是"整帧 offsetof − 6"：sendFrameOf 发的是去掉 msg_id(2)+context(4) 之后的净体，
+// 而头文件里的 offsetof 把这两项算在内。这几个数（0/14/32/97）与 swInterfaceDetailsLen
+// 同源，都来自容器里 VPP 生成的 interface.api_types.h 加 gcc 的 sizeof/offsetof 实测。
+func swInterfaceDetailBytes(i int) []byte {
+	f := fakeSwInterfaces[i%len(fakeSwInterfaces)]
+	b := make([]byte, swInterfaceDetailsLen-6)
+	binary.BigEndian.PutUint32(b[0:4], f.idx)     // sw_if_index  @6
+	binary.BigEndian.PutUint32(b[4:8], 0)         // sup_sw_if_index @10
+	binary.BigEndian.PutUint32(b[14:18], f.flags) // flags        @20
+	binary.BigEndian.PutUint32(b[32:36], f.mtu)   // mtu[0] = L3  @38
+	copy(b[97:], f.name)                          // interface_name @103
 	return b
 }
 
@@ -1074,6 +1116,91 @@ func realPeersFrame() string {
 		"02" + // n_allowed_ips
 		"00" + "c6336401" + zero12 + "20" + // 198.51.100.1/32
 		"00" + "c6336402" + zero12 + "18" // 198.51.100.2/24
+}
+
+// ==================== core 接口表（写下去的东西能不能读回来） ====================
+
+func TestDumpInterfacesRequestIsUnfiltered(t *testing.T) {
+	// 请求体只有 9 字节：sw_if_index=全部、name_filter_valid=0、变长串长度 0。
+	// 长度本身就是契约 —— 少发那 4 字节的字符串长度，VPP 解码失败后**一帧都不回**，
+	// 客户端只表现为超时。
+	f := newFake(t)
+	f.swIfDetails = 0
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	if _, err := c.DumpInterfaces(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	if r.name != "sw_interface_dump" {
+		t.Fatalf("请求名 = %s，应当是 core 的 sw_interface_dump", r.name)
+	}
+	if len(r.body) != 9 {
+		t.Fatalf("体长 = %d，期望 9（sw_if_index 4 + name_filter_valid 1 + 变长串长度 4）", len(r.body))
+	}
+	if got := binary.BigEndian.Uint32(r.body[0:4]); got != ^uint32(0) {
+		t.Errorf("sw_if_index = %#x，期望 0xFFFFFFFF（全部）", got)
+	}
+	if r.body[4] != 0 {
+		t.Errorf("name_filter_valid = %d，期望 0（不用 VPP 侧过滤）", r.body[4])
+	}
+	if got := binary.BigEndian.Uint32(r.body[5:9]); got != 0 {
+		t.Errorf("name_filter 的长度 = %d，期望 0", got)
+	}
+}
+
+func TestDumpInterfacesParsesCoreLayout(t *testing.T) {
+	f := newFake(t)
+	f.swIfDetails = len(fakeSwInterfaces)
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	got, err := c.DumpInterfaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(fakeSwInterfaces) {
+		t.Fatalf("读了 %d 条，期望 %d", len(got), len(fakeSwInterfaces))
+	}
+	for i, g := range got {
+		want := fakeSwInterfaces[i]
+		if g.SWIfIndex != want.idx {
+			t.Errorf("[%d] sw_if_index = %d，期望 %d", i, g.SWIfIndex, want.idx)
+		}
+		if g.Name != want.name {
+			t.Errorf("[%d] 接口名 = %q，期望 %q（偏移错了的话这里会读出一串零）", i, g.Name, want.name)
+		}
+		if g.L3MTU != want.mtu {
+			t.Errorf("[%d] L3 MTU = %d，期望 %d", i, g.L3MTU, want.mtu)
+		}
+		if g.AdminUp != (want.flags&0x1 != 0) || g.LinkUp != (want.flags&0x2 != 0) {
+			t.Errorf("[%d] 状态位 = admin %v link %v，期望 flags=%#x", i, g.AdminUp, g.LinkUp, want.flags)
+		}
+	}
+	// local0 那条是"没有 MTU 记录"的样子：读回 0 必须原样是 0，
+	// 不能被谁在半路填成默认值 —— agent 就是靠这个 0 认出"这张口没记录"。
+	if got[0].L3MTU != 0 {
+		t.Errorf("local0 的 MTU = %d，期望 0", got[0].L3MTU)
+	}
+}
+
+func TestDumpInterfacesRejectsShortFrame(t *testing.T) {
+	// core 的结构比插件的更容易变（每次 VPP 升级都可能加长）。收短了必须报错，
+	// 不能返回一条名字为空、MTU 是垃圾的接口 —— 那会被 agent 当成"出口接口不存在"
+	// 或者更糟：当成存在。
+	f := newFake(t)
+	f.swIfRaw = [][]byte{make([]byte, swInterfaceDetailsLen-7)}
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	_, err := c.DumpInterfaces(ctx)
+	if err == nil {
+		t.Fatal("少 1 字节的 details 必须报错")
+	}
+	if !strings.Contains(err.Error(), "sw_interface_details") {
+		t.Errorf("错误要点名哪条消息，got: %v", err)
+	}
 }
 
 // ==================== 错帧与噪声 ====================

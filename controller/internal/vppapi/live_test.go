@@ -66,6 +66,10 @@ const (
 //     带着 0/0/0/0 出生（所以"不写"不等于"有默认值"）；写 1360 得到 1360/0/0/0
 //     —— IP4 槽回落 L3，与 CLI `packet N` 同一形态；VPP 对值**毫不校验**（0 照收并
 //     清零四槽），但接口号写错会当场回 retval=-2，所以出口接口填错不会是静默的。
+//  7. core 的 sw_interface_dump（写入口的对面）：接口名、mtu[0]、ADMIN_UP/LINK_UP
+//     能读回来，且与 `vppctl show interface` **逐条对上**。这一条是那份线布局的
+//     存在理由 —— 偏移照着 VPP 生成的头文件抄，只有拿另一个独立实现来对，才不是
+//     自证。CLI 清零 MTU 之后这里也必须读出 0，否则读的是缓存。
 //
 // 号段全部走 9001/9002 与 51998/51999，路径段地址一律 TEST-NET-1，跑完自己
 // 删干净：这台节点是和别的会话共用的，不能留下任何会影响真实流量的配置。
@@ -845,8 +849,8 @@ func TestLiveAgainstVPP(t *testing.T) {
 			}
 		})
 
-		// 读回只能用 CLI：本客户端还没有 core 的 sw_interface_dump（那是 #17），
-		// 而"MTU 到底写没写进去"必须看真记录，不能信 retval。
+		// CLI 那一份读法留着，不是历史包袱：它是**对面那个独立实现**眼里的值。
+		// API 这一侧的布局是照着 VPP 生成的头文件抄的，只有拿 CLI 来对才知道抄对了。
 		readBack := func(t *testing.T) string {
 			t.Helper()
 			out := showInterfaces(t)
@@ -869,14 +873,48 @@ func TestLiveAgainstVPP(t *testing.T) {
 			t.Errorf("写 1360 之后 MTU 列应是 1360/0/0/0（IP4 回落到 L3），实际 %s", got)
 		}
 
+		// ==================== core 的 sw_interface_dump（#17 落地） ====================
+		//
+		// 这一条是整个读回能力的存在理由，而它必须和 CLI 对，不能只跟自己一致：
+		// 偏移是照着 VPP 生成的 interface.api_types.h 抄的（sizeof/offsetof 用容器里
+		// 的 gcc 实测），CLI 走的是 VPP 内部结构 —— 两个完全独立的实现读出同一组
+		// 名字和数值，才算证明这份布局抄对了。自洽的解析器什么也说明不了：偏移错了
+		// 一样能稳定读出一个错值。
+		all, err := c.DumpInterfaces(ctx)
+		if err != nil {
+			t.Fatalf("DumpInterfaces: %v", err)
+		}
+		if len(all) < 2 {
+			t.Fatalf("接口表只有 %d 条，不像一张真的表（至少该有 local0 和刚建的 wg）", len(all))
+		}
+		cliOut := showInterfaces(t)
+		si, ok := FindInterface(all, idx)
+		if !ok {
+			t.Fatalf("接口表里读不到刚建的隧道 idx=%d（表: %s）", idx, dumpSummary(all))
+		}
+		if want := interfaceNameOnIndex(cliOut, idx); si.Name != want {
+			t.Errorf("接口名 API=%q 而 CLI=%q —— 偏移或枚举宽度抄错了通常读出一串零", si.Name, want)
+		}
+		if si.L3MTU != 1360 {
+			t.Errorf("API 读回的 L3 MTU = %d，CLI 那张表刚说是 1360/0/0/0", si.L3MTU)
+		}
+		// 整表逐条对：任何一条名字为空都是偏移错位，比单看那一条更严。
+		for _, i := range all {
+			if i.Name == "" {
+				t.Errorf("idx=%d 的接口名读成空串：线布局对不上", i.SWIfIndex)
+			}
+			if m := mtuColumnOnIndexLine(cliOut, i.SWIfIndex); m != "" &&
+				!strings.HasPrefix(m, fmt.Sprintf("%d/", i.L3MTU)) {
+				t.Errorf("idx=%d %s：API 记 %d，CLI 是 %s", i.SWIfIndex, i.Name, i.L3MTU, m)
+			}
+		}
+		t.Logf("接口表 %d 条：%s", len(all), dumpSummary(all))
+
 		// VPP **自己不校验**这个数。客户端把 0 拦在发出之前（单测锁住了那条），所以
 		// 这里只能走 CLI 去看 VPP 的真实态度：实测 `packet 0` 照单收下，并把四个槽位
 		// 一起清零 —— 那是"取消 MTU 记录"，不是"设成 0"。客户端那层拦截因此不是
 		// 多余的防御。实验用刚建的这张接口，跑完就删，不留痕迹。
-		name := interfaceNameOnIndex(showInterfaces(t), idx)
-		if name == "" {
-			t.Fatalf("show interface 里读不到 idx=%d 的接口名，无法做 CLI 侧的 0 值实验", idx)
-		}
+		name := si.Name
 		out, err := vppctl(ctx, "set", "interface", "mtu", "packet", "0", name)
 		if err != nil || out != "" {
 			t.Logf("实测：VPP 的 CLI 拒了 MTU=0（out=%q err=%v）—— 上游补了校验，客户端那层可以退休", out, err)
@@ -884,11 +922,22 @@ func TestLiveAgainstVPP(t *testing.T) {
 			t.Errorf("实测：CLI 写 0 之后 MTU 列 = %s，与\"四槽一起清零\"的既有观测不一致，请复核", got)
 		} else {
 			t.Logf("实测复现：%s 的 MTU=0 被照单收下并清零四个槽位（VPP 不校验，必须在客户端拦）", name)
+			// 清零之后 API 这一侧也必须读出 0 —— 否则 DumpInterfaces 只是在读缓存，
+			// 而 agent 的 verifyLanded 靠的就是"读回的是不是当下真记录"。
+			again, err := c.DumpInterfaces(ctx)
+			if err != nil {
+				t.Fatalf("清零后再 DumpInterfaces: %v", err)
+			}
+			if si2, ok := FindInterface(again, idx); !ok {
+				t.Errorf("清零之后接口表里连 %d 都读不到了", idx)
+			} else if si2.L3MTU != 0 {
+				t.Errorf("CLI 已经显示 0/0/0/0，API 却读回 %d：这一侧读的不是当下记录", si2.L3MTU)
+			}
 		}
 
-		// 接口号写错时会不会静默？这条必须有答案，因为 underlay 那个 sw_if_index 目前
-		// 是操作员给的（#17 之前算不出来），而"启用成功了但一个包都没动"是本项目的
-		// 老病。用一个绝不可能存在的号试，只看 VPP 回什么。
+		// 接口号写错时会不会静默？这条必须有答案，因为 underlay 那个 sw_if_index
+		// 仍是操作员给的（本层没有 FIB dump，算不出默认出口），而"启用成功了但一个
+		// 包都没动"是本项目的老病。用一个绝不可能存在的号试，只看 VPP 回什么。
 		if err := c.SetInterfaceMTU(ctx, 0xFFFF, 1400); err != nil {
 			t.Logf("实测：不存在的接口号 65535 被拒绝（%v）—— 写错出口号会当场报错，不会静默", err)
 		} else {
@@ -898,7 +947,7 @@ func TestLiveAgainstVPP(t *testing.T) {
 
 		// 出口接口（host-eth0）的 VIF 记录：这台机器上它是 af-packet 建的，实测默认
 		// 9000，而容器网卡只有 1500 —— 这个不一致就是 af-packet 发送侧卡死的根因。
-		// 这里只把它读出来记进日志，真正的同步由 test/scripts/test-mtu.sh 断言。
+		// 这里写成 1500 再两个实现各读一遍；真正的同步与断言由 test/scripts/test-mtu.sh 做。
 		if hif := os.Getenv("SRWG_UNDERLAY_SW_IF_INDEX"); hif != "" {
 			n, err := strconv.ParseUint(hif, 10, 32)
 			if err != nil {
@@ -909,6 +958,21 @@ func TestLiveAgainstVPP(t *testing.T) {
 				t.Errorf("给 underlay %d 写 1500: %v", hifIdx, err)
 			} else if got := mtuColumnOnIndexLine(showInterfaces(t), hifIdx); got != "1500/0/0/0" {
 				t.Errorf("underlay MTU 列应是 1500/0/0/0，实际 %s", got)
+			}
+			// API 这一侧同读一次，并顺带把这张口该具备的状态读出来记进日志：
+			// agent 挑不到出口（没有 FIB dump），但它已经能对操作员给的号说"这张口
+			// 在表里、不是隧道、记录是 1500、链路是 up"了。
+			if e, ok := FindInterface(mustDump(t, c, ctx), hifIdx); !ok {
+				t.Errorf("接口表里读不到 underlay %d —— agent 的 verifyLanded 会把这条配置判成错", hifIdx)
+			} else {
+				if e.L3MTU != 1500 {
+					t.Errorf("underlay %s API 读回 MTU=%d，期望 1500", e.Name, e.L3MTU)
+				}
+				if want := interfaceNameOnIndex(showInterfaces(t), hifIdx); e.Name != want {
+					t.Errorf("underlay 接口名 API=%q 而 CLI=%q", e.Name, want)
+				}
+				t.Logf("underlay %d = %s：MTU %d，admin=%v link=%v",
+					hifIdx, e.Name, e.L3MTU, e.AdminUp, e.LinkUp)
 			}
 		} else {
 			t.Log("未设 SRWG_UNDERLAY_SW_IF_INDEX，跳过 underlay 接口那条（由 test-mtu.sh 覆盖）")
@@ -926,6 +990,25 @@ func showInterfaces(t *testing.T) string {
 		t.Fatalf("vppctl show interface: %v", err)
 	}
 	return out
+}
+
+// mustDump 用 API 读回 core 的接口表；读不到直接终结调用方（读回失败没有下半段可测）。
+func mustDump(t *testing.T, c *Client, ctx context.Context) []SwInterface {
+	t.Helper()
+	ifs, err := c.DumpInterfaces(ctx)
+	if err != nil {
+		t.Fatalf("DumpInterfaces: %v", err)
+	}
+	return ifs
+}
+
+// dumpSummary 把接口表压成一行，只用于日志与报错里那句"表里到底有什么"。
+func dumpSummary(ifs []SwInterface) string {
+	parts := make([]string, 0, len(ifs))
+	for _, i := range ifs {
+		parts = append(parts, fmt.Sprintf("%d:%s/%d", i.SWIfIndex, i.Name, i.L3MTU))
+	}
+	return strings.Join(parts, " ")
 }
 
 // mtuColumnOnIndexLine 从 `vppctl show interface` 的输出里取指定 sw_if_index 那行的
