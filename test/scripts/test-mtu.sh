@@ -14,9 +14,13 @@
 #       自己封一份 WG+SR 头，于是每个外层都不撑破 underlay。
 #   (3) 收端在包进 sr-wg4-input **之前**就把分片拼回去了，所以插件永远只看到
 #       完整的 SR 头 —— 这条是安全属性，用 Decap_hmac_fail 增 0 来验。
+#   (4) 上面三条走的都是"可分片"路径。内层**带 DF 位**时是另一套语义：撞上记录
+#       不分片，丢弃并回 ICMP type 3/code 4，让发端自己降 PMTU。这一条 2026-10-24
+#       才第一次真测到（VPP 的 ping CLI 没有 DF 开关，得用 tap 接一台内核终端来造包）。
 #
 # 前置：**必须先跑过 test-e2e.sh --keep**（wg0@51820 单隧道已通、三个容器在跑）。
-# 本脚本只发探测包、只在 ASSERT F 里临时改一次 node1 的 wg0 记录并立刻改回来。
+# 本脚本只发探测包、只在 ASSERT F 里临时改一次 node1 的 wg0 记录并立刻改回来；
+# ASSERT I 会临时建一张 tap9 当"终端"再删掉。
 #
 # 用法:
 #   test/scripts/test-mtu.sh [--keep]
@@ -114,6 +118,14 @@ role_of() {
 stat_of() {   # <container> <Section>_<name> -> 计数
     dx "$1" "bash ${SETUP_C} $(role_of "$1") stats" 2>/dev/null |
         awk -F= -v k="$2" '$1==k {print $2; f=1} END{if(!f) print 0}'
+}
+
+# VPP 自带的错误计数：<container> <reason 子串> -> 累计值（没有这一行算 0）。
+# `show errors` 的行是 "<count> <node> <reason> <severity>"，reason 里带空格，
+# 所以按子串匹配整行，不按列取。
+err_of() {
+    vpp "$1" "show errors" |
+        awk -v p="$2" 'index($0,p){print $1; f=1} END{if(!f) print 0}' | head -1
 }
 
 # ping 通 = 任一轮拿到回包（冷启动握手要跑完一个 keepalive 周期）。
@@ -251,9 +263,13 @@ f_run() {   # <容器> <期望内层> <标签> <trace 文件> <repeat 次数>
 
 # WG 解封之后每个包自己在 trace 里报长度。只取 `Wireguard input:` 块里那一行
 # `Length: N`，输出一行一个数 —— 上层用 sum/count/max 算分片不变量，不能先去重。
-wg_lengths() {   # <trace 文件> -> 每行一个内层长度
-    awk '/Wireguard input:/{f=1;next}
-         f && /Length:/ {gsub(/[^0-9]/,"",$2); print $2; f=0}' "$1"
+wg_lengths() {   # <trace 文件> -> 每行一个内层长度（只算带载荷的数据包）
+    # "Wireguard input:" 块里混着三种包：真数据、keepalive（Type: Data, Length: 0）、
+    # 握手（Type: Handshake ..., Length: 148）。后两种跟这段的被测载荷无关，混进来会
+    # 让"片数 == REP"这种等式随机失败（2026-10-24 一次 ASSERT F 就这么假红过）。
+    awk '/Wireguard input:/{f=1; typ=""; next}
+         f && /Type:/ {typ=$0; next}
+         f && /Length:/ {gsub(/[^0-9]/,"",$2); if (typ ~ /Data/ && $2+0 > 0) print $2; f=0}' "$1"
 }
 len_stats() {   # <长度列表(每行一个)> -> "<个数> <总和> <最大值>"
     awk '{n++; s+=$1; if ($1+0>m) m=$1+0} END {print n+0, s+0, m+0}'
@@ -459,11 +475,109 @@ H2=$(stat_of "${C_NODE2}" Decap_hmac_fail)
     bad "复核阶段 hmac_fail 涨到 ${H2}（上一步 ${H1}）"
 ping_ok "${C_NODE1}" "${OVERLAY_N2}" "${IF1}" && ok "隧道 1 仍然通" || bad "跑完 MTU 测试隧道不通了"
 
+# ==================================================================
+info "ASSERT I: 内层 DF=1 撞上隧道记录 —— 丢弃 + 回 ICMP frag-needed，不分片"
+# ==================================================================
+# 前面 A~H 全部走"可分片"路径：VPP 的 ping CLI 根本没有 DF 开关（实测 `ping ... df`
+# 报 unknown input），所以内层 DF 位一次都没被真正测过。这里换注入路径：
+# `create tap` 会同时建出 VPP 侧和**同一容器 netns 里的 host 侧**设备，内核于是就是
+# 一台接在 CPE LAN 口的终端，`ping -M do` 能造出真带 DF 的内层包。
+#
+# 这条只判"发端 CPE 怎么处理一个它自己装不下的 DF 包"，不依赖回包：实验室里
+# 转发流量的**回程**还有一处未定位的问题（收端 wg4-input 把转发包 punt 给宿主，
+# 把本插件的 encap 关掉也一样复现，所以不是 SR 层的事），另记任务。
+DF_TAP=tap9
+DF_LAN=192.168.50
+vpp "${C_NODE1}" "delete tap ${DF_TAP}" >/dev/null 2>&1
+dx "${C_NODE1}" "ip route flush cache" >/dev/null 2>&1
+TAP_NEW=$(vpp "${C_NODE1}" "create tap if-name ${DF_TAP} host-if-name ${DF_TAP} host-ip4-addr ${DF_LAN}.1/24 host-mtu-size 1500")
+if [ "${TAP_NEW}" != "${DF_TAP}" ]; then
+    bad "建不出 ${DF_TAP}（'${TAP_NEW}'），DF 这条无法判定"
+else
+    vpp "${C_NODE1}" "set interface state ${DF_TAP} up"                   >/dev/null
+    vpp "${C_NODE1}" "set interface mtu 1500 ${DF_TAP}"                   >/dev/null
+    vpp "${C_NODE1}" "set interface ip address ${DF_TAP} ${DF_LAN}.2/24"  >/dev/null
+    dx "${C_NODE1}" "ip route add ${OVERLAY_N2}/32 via ${DF_LAN}.2 dev ${DF_TAP}" >/dev/null 2>&1
+    dx "${C_NODE1}" "ip route flush cache" >/dev/null 2>&1
+
+    # ---- 控制组：DF=1 且内层**正好**等于记录（Linux 的 -s 是 ICMP 数据，内层 = s + 28）----
+    SZ_FIT=$((MTU_LIVE - 28))
+    D0=$(stat_of "${C_NODE2}" Decap_ok)
+    vpp "${C_NODE1}" "clear trace" >/dev/null
+    vpp "${C_NODE1}" "trace add tap-input 200" >/dev/null
+    dx "${C_NODE1}" "ping -c ${REP} -W 2 -M do -s ${SZ_FIT} -I ${DF_TAP} ${OVERLAY_N2}" >/dev/null 2>&1
+    sleep 1
+    vpp "${C_NODE1}" "show trace max 300" > "${TRACE_DIR}/i-fit.txt" 2>&1
+    D1=$(stat_of "${C_NODE2}" Decap_ok)
+    NFIT=$(grep -c "ip4-frag" "${TRACE_DIR}/i-fit.txt")
+    DFI=$(grep -c "DONT_FRAGMENT" "${TRACE_DIR}/i-fit.txt")
+    # 外层头的分片行：只在 underlay 发送节点的块里取，避免把内层那一行算进来
+    OFI=$(awk -v n="${UNDERLAY_IF}-tx" 'index($0,n){f=1} f && /fragment id/{print; f=0}' "${TRACE_DIR}/i-fit.txt")
+    echo "      内层正好 ${MTU_LIVE}（DF=1）：node2 Decap_ok ${D0} -> ${D1}，ip4-frag 出现 ${NFIT} 次"
+    [ "${D1}" -gt "${D0}" ] && [ "${NFIT}" = "0" ] &&
+        ok "DF 的内层等于记录（${MTU_LIVE}）时仍然整包封出去，没有分片（Decap_ok +$((D1 - D0))）" ||
+        bad "DF 的内层等于记录却没整包出去（Decap_ok ${D0} -> ${D1}，ip4-frag ${NFIT}）"
+    [ "${DFI}" -ge 1 ] &&
+        ok "注入口看到内层 DF 位（${DFI} 行 DONT_FRAGMENT）：这条注入路径确实带 DF，不是空跑" ||
+        bad "trace 里内层没有 DONT_FRAGMENT：注入的包没带 DF，下面两组都作废"
+    if printf '%s' "${OFI}" | grep -q "flags"; then
+        bad "外层 IP 头带了 DF（${OFI}）：内层的 DF 漏到了 underlay"
+    else
+        ok "外层 IP 头没有 DF：内层 DF 不外溢，PMTUD 只在隧道内生效"
+    fi
+
+    # ---- 实验组：DF=1 且内层超记录 ----
+    # Linux 会按收到的 ICMP 缓存 PMTU，缓存住之后连包都不发（local error），
+    # 所以每轮先 flush cache，否则量到的是内核行为而不是 VPP 行为。
+    SZ_OVER=$((MTU_LIVE + 40))          # 内层 = 记录 + 68
+    dx "${C_NODE1}" "ip route flush cache" >/dev/null 2>&1
+    E0=$(err_of "${C_NODE1}" "ip4 MTU exceeded and DF set")
+    I0=$(err_of "${C_NODE1}" "destination unreachable response")
+    vpp "${C_NODE1}" "clear trace" >/dev/null
+    vpp "${C_NODE1}" "trace add tap-input 200" >/dev/null
+    OUT_OVER=$(dx "${C_NODE1}" "ping -c ${REP} -W 2 -M do -s ${SZ_OVER} -I ${DF_TAP} ${OVERLAY_N2} 2>&1")
+    sleep 1
+    vpp "${C_NODE1}" "show trace max 300" > "${TRACE_DIR}/i-over.txt" 2>&1
+    E1=$(err_of "${C_NODE1}" "ip4 MTU exceeded and DF set")
+    I1=$(err_of "${C_NODE1}" "destination unreachable response")
+    D2=$(stat_of "${C_NODE2}" Decap_ok)
+    NOVER=$(grep -c "ip4-frag" "${TRACE_DIR}/i-over.txt")
+    # "一个片都没进隧道"只能看 node1 自己有没有把包交给 WG/SR。node2 的 Decap_ok
+    # 不能当判据：WG 的 keepalive 走同一条路，随时会在这个窗口里 +1（第一次就撞上）。
+    NO_ENC=$(grep -cE "wg4-output-tun|sr-wg4-encap|${UNDERLAY_IF}-tx" "${TRACE_DIR}/i-over.txt")
+    echo "      DF 超记录（内层 $((SZ_OVER + 28)) > ${MTU_LIVE}）：ip4-input DF 丢弃 ${E0} -> ${E1}、ip4-icmp-error ${I0} -> ${I1}；node2 Decap_ok ${D1} -> ${D2}（含 keepalive，仅供参考）"
+    printf '%s\n' "${OUT_OVER}" | grep -q "Frag needed and DF set (mtu = ${MTU_LIVE})" &&
+        ok "发端真的收到 ICMP frag-needed，且报的 MTU 就是隧道记录 ${MTU_LIVE}（不是 underlay 的 ${UNDERLAY_LIVE}）" ||
+        bad "发端没收到 'Frag needed and DF set (mtu = ${MTU_LIVE})'：$(printf '%s' "${OUT_OVER}" | tail -2 | tr '\n' ' ')"
+    [ "${E1}" -gt "${E0}" ] &&
+        ok "VPP 丢弃了装不下的 DF 包（ip4-input: ip4 MTU exceeded and DF set +$((E1 - E0))）" ||
+        bad "DF 包没被计成 'MTU exceeded and DF set'（${E0} -> ${E1}）：它可能被分片了"
+    [ "${I1}" -gt "${I0}" ] &&
+        ok "VPP 发了 ICMP 目的不可达（ip4-icmp-error +$((I1 - I0))）：frag-needed 不是缺的" ||
+        bad "ip4-icmp-error 没涨（${I0} -> ${I1}）：发端看到的 ICMP 来源要复核"
+    [ "${NO_ENC}" = "0" ] &&
+        ok "node1 没有把包交给 WG/SR（trace 里 wg4-output-tun / sr-wg4-encap / ${UNDERLAY_IF}-tx 均为 0）：拒发在封装之前" ||
+        bad "trace 里出现封装或发送 ${NO_ENC} 行：DF 包被放进了隧道"
+    [ "${NOVER}" = "0" ] &&
+        ok "trace 里没有 ip4-frag：这是拒发，不是'切了再丢'" ||
+        bad "trace 出现 ip4-frag ${NOVER} 次：VPP 先分片了，DF 语义没被执行"
+
+    dx "${C_NODE1}" "ip route flush cache" >/dev/null 2>&1
+    vpp "${C_NODE1}" "delete tap ${DF_TAP}" >/dev/null 2>&1
+    if [ -z "$(swidx_of "${C_NODE1}" "${DF_TAP}")" ] && [ -z "$(dx "${C_NODE1}" "ip -o link show ${DF_TAP} 2>/dev/null")" ]; then
+        ok "实验结束 ${DF_TAP} 的 VPP 侧与内核侧都已删除"
+    else
+        bad "${DF_TAP} 有残留（sw_if_index='$(swidx_of "${C_NODE1}" "${DF_TAP}")'）：手工执行 vppctl delete tap ${DF_TAP}"
+    fi
+    ping_ok "${C_NODE1}" "${OVERLAY_N2}" "${IF1}" && ok "DF 实验之后隧道仍然通" || bad "DF 实验把隧道弄不通了"
+fi
+
 echo
 echo "=========================================================="
-echo " trace 证据: ${TRACE_DIR}/{c-exact,e-over,f-zero,e-transit}.txt"
+echo " trace 证据: ${TRACE_DIR}/{c-exact,e-over,f-zero,e-transit,i-fit,i-over}.txt"
 echo " 实测结论：内层 = ping size + 36；外层 = 内层 + 32 + (24+6*${SEGS}) + 28"
 echo "          隧道 MTU 由 VPP 执行，执行动作是按它切内层分片（不是拒发）"
+echo "          内层带 DF 时不切：丢弃 + 回 ICMP type3/code4，MTU 报的就是隧道记录"
 echo " RESULT: ${PASS} passed, ${FAIL} failed"
 echo "=========================================================="
 [ "${FAIL}" != "0" ] && { echo; info "dumping diagnostics (FAIL)"; dump_all; }
