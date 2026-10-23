@@ -73,7 +73,10 @@
 #   # handshake-init，encap 还没挂上时这个包会走 docker 网桥被 SNAT，
 #   # 回包外层源变成网关地址，把 peer 的 endpoint 污染掉（见 cmd_peer 注释）。
 #   vppctl wireguard peer add wg0 public-key <node2_pub> endpoint 10.10.2.2 \
-#          allowed-ip 192.168.99.2/32 dst-port 51820 persistent-keepalive 5
+#          allowed-ip 0.0.0.0/0 dst-port 51820 persistent-keepalive 5
+#   # ↑ allowed-ip 是常量 0.0.0.0/0：它不参与转发，但 wg4-input 用它过滤
+#   #   解密后的**内层源**。写对端 /32 会让本机转发的终端流量被 punt 到
+#   #   null-node（详见 wg_add_peer 的注释）。
 #   vppctl ip route add 192.168.99.2/32 via wg0        # WG 不会自动下发路由；
 #       必须排在 peer add **之后**：先加路由会留下一条 unresolved 的
 #       attached-nexthop（转发放到 dpo-drop，overlay 全丢但没有任何报错）。
@@ -287,14 +290,21 @@ wg_peer_index_of() {
 
 wg_add_peer() {
     local peer_pub=$1
+    # allowed-ip 必须是常量 0.0.0.0/0，**不是**对端 overlay 的 /32。
+    # 它不参与转发（VPP 不会据此装 FIB 路由，选路靠显式 `ip route ... via wgX`），
+    # 但 wg4-input **会**拿它过滤解密后的内层源地址：2026-10-24 实测，peer 写
+    # 对端 /32 时，本机转发的终端流量（内层源 192.168.50.1）在 node2 被
+    # `error-punt -> null-node` 黑洞掉，`show errors` 只涨 null-node blackholed，
+    # 而源地址恰好等于对端 /32 的隧道自测 ping 正常（这就是它长期没被发现的原因）。
+    # 改成 0.0.0.0/0 后同一转发 ping 3/3 通、punt 不涨；改回 /32 立即复现。
     vppctl show wireguard peer 2>/dev/null | grep -q "${peer_pub}" ||
         vppctl wireguard peer add "${WG_IF}" \
                public-key "${peer_pub}" \
                endpoint "${PEER_UNDERLAY}" \
-               allowed-ip "${PEER_OVERLAY}/32" \
+               allowed-ip 0.0.0.0/0 \
                dst-port "${VPN_PORT}" \
                persistent-keepalive "${KEEPALIVE}" || die "wireguard peer add failed"
-    log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=${PEER_OVERLAY}/32"
+    log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=0.0.0.0/0"
 }
 
 # WireGuard 有 endpoint roaming：对端只要从另一个地址发来**签名有效**的报文，

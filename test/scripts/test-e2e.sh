@@ -38,6 +38,9 @@
 #                `show sr-wg paths` 的真值 —— 转发计数全对而 trace 是垃圾，曾经真发生过；
 #             #25 在 loopback 上开 encap 再删掉那张口，挂点表里不许留 DELETED(n)，
 #                而真出口 host-eth0 必须还在（两头都判，防误清）。
+#             #26 用非 overlay 源（tap 后的 192.168.50.1）经隧道打到 node2，必须拿到
+#                回包且 node2 的 null-node blackholed 不增长 —— peer 的 allowed-ip
+#                写对端 /32 会把转发流量在内层源过滤上 punt 掉，隧道自测却全绿。
 #
 # 用法:
 #   test/scripts/test-e2e.sh [--keep] [--skip-build] [--no-tamper] [--up-only]
@@ -450,6 +453,46 @@ if [ "${OVERLAY_OK}" = "1" ]; then
     ok "overlay ping got replies through the SR tunnel"
 else
     bad "overlay ping got 0 replies - WireGuard session never established"
+fi
+
+echo
+info "ASSERT: 转发来的内层包不能在收端被 punt（#26，终端到终端）"
+# wg4-input 会拿 peer 的 allowed-ip 过滤**解密后的内层源地址**。peer 写对端
+# overlay /32 时，隧道自测 ping（源恰好就是那个 /32）正常，而本机转发的终端
+# 流量（源是 LAN 地址）在收端被 `error-punt -> null-node` 黑洞掉，`show errors`
+# 只涨 null-node blackholed。这就是"终端到终端不通、但隧道自测全绿"的真因
+# （2026-10-24 实测：/32 时 3 发 0 收 + punt+3；0.0.0.0/0 时 3 发 3 收、punt 不涨）。
+# 这里用一张 tap 造一个非 overlay 源，经 SR 隧道打到 node2；回程走 node2 的
+# 普通 WG 直连（它没有 SR path）。
+FWD_TAP=tap7
+FWD_NET=192.168.50
+punt_count() { dx "${C_NODE2}" 'vppctl "show errors"' 2>/dev/null |
+               awk '$2=="null-node"{print $1; exit}'; }
+PUNT_BEFORE=$(punt_count)
+dx "${C_NODE1}" "vppctl 'create tap if-name ${FWD_TAP} host-if-name ${FWD_TAP} \
+                  host-ip4-addr ${FWD_NET}.1/24 host-mtu-size 1500'" >/dev/null 2>&1
+dx "${C_NODE1}" "vppctl 'set interface state ${FWD_TAP} up'; \
+                 vppctl 'set interface mtu packet 1500 ${FWD_TAP}'; \
+                 vppctl 'set interface ip address ${FWD_TAP} ${FWD_NET}.2/24'" >/dev/null 2>&1
+dx "${C_NODE1}" "ip route add 192.168.99.2/32 via ${FWD_NET}.2 dev ${FWD_TAP}" >/dev/null 2>&1
+# 回程路由必须显式下发：allowed-ips 不装 FIB 路由。
+dx "${C_NODE2}" "vppctl 'ip route add ${FWD_NET}.0/24 via 192.168.99.1'" >/dev/null 2>&1
+FWD_OUT=$(dx "${C_NODE1}" "ping -c 4 -W 2 -M do -s 1272 -I ${FWD_NET}.1 192.168.99.2" 2>&1)
+echo "${FWD_OUT}" | tail -2 | sed 's/^/    /'
+PUNT_AFTER=$(punt_count)
+dx "${C_NODE2}" "vppctl 'ip route del ${FWD_NET}.0/24 via 192.168.99.1'" >/dev/null 2>&1
+dx "${C_NODE1}" "ip route del 192.168.99.2/32 via ${FWD_NET}.2 dev ${FWD_TAP}" >/dev/null 2>&1
+dx "${C_NODE1}" "vppctl 'delete tap ${FWD_TAP}'" >/dev/null 2>&1
+
+if echo "${FWD_OUT}" | grep -qE "[1-9][0-9]* received"; then
+    ok "转发流量穿过隧道拿到回包（内层源 ${FWD_NET}.1，不是 overlay 地址）"
+else
+    bad "转发流量 0 回包：$(echo "${FWD_OUT}" | tail -3 | tr '\n' ' ')"
+fi
+if [ "${PUNT_AFTER:-0}" -gt "${PUNT_BEFORE:-0}" ] 2>/dev/null; then
+    bad "node2 null-node blackholed ${PUNT_BEFORE} -> ${PUNT_AFTER}：内层源被 allowed-ips 过滤（peer 必须写 0.0.0.0/0）"
+else
+    ok "node2 null-node blackholed 未增长（${PUNT_BEFORE} -> ${PUNT_AFTER}）"
 fi
 
 # ==================================================================

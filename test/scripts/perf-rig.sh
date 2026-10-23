@@ -20,7 +20,11 @@
 #   1. `ip route add <net> via wg0` 会得到 dpo-drop（WireGuard 的 adj 解析不出来），
 #      必须写 `via <对端 overlay IP> <wg 接口>`，例如 `via 192.168.99.2 wg0`。
 #   2. peer 的 allowed-ip 只填 overlay /32 时，转发的 10.20.x 流量落在 drop 上；
-#      按定案把 allowed-ip 恒置 0.0.0.0/0（本轮实测：置成常量后 dpo 立刻变可用）。
+#      按定案把 allowed-ip 恒置 0.0.0.0/0。
+#      2026-10-24 定到根因：allowed-ips 不参与转发（不装路由），但 wg4-input
+#      拿它过滤**解密后的内层源地址**，不匹配就 error-punt 到 null-node
+#      （show errors 只涨 null-node blackholed）。隧道自测 ping 的源恰好就是对端
+#      /32，所以自测全绿、终端之间不通。setup-node.sh 已改成常量。
 #   3. 终端网卡默认开着 checksum offload + GSO，包经 af-packet 交给 VPP 转发后
 #      内层 TCP 校验和没算好，对端静默丢弃（ICMP 不受影响，TCP 全丢）。
 #      `ethtool -K eth1 tx off rx off tso off gso off gro off` 之后才通。
