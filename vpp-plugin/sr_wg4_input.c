@@ -132,6 +132,20 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       u16 hmac_id;
       u16 sr_hdr_len;
       u32 pay_len;
+      /*
+       * trace 要展示的四个字段必须在 memmove **之前**取快照。
+       *
+       * Step 5 用 clib_memmove 把 WG 报文整体左移覆盖掉 SR 头（那是本节点的
+       * 设计目标，不是缺陷：wg4-input 从 current_data 往回取 UDP 头，只 advance
+       * 会留空洞）。而 trace 块在 done: 之后才跑，那时 srh 指向的已经是 WG
+       * transport 报文 —— 实测解出来的 hmac_id 是 5120/1024/1280（=0x1400/0x0400/
+       * 0x0500，WG 报文小端的 type/receiver 被当大端读）、seg_count 是 87/101
+       * （=nonce 的随机字节），而同一批包的真值是 hmac_id=1 path_id=1 seg_count=2。
+       * err/next/bypass 一直是好的，因为它们来自局部变量，不看包 —— 这正是这个
+       * 缺陷能长期藏住的原因。
+       */
+      u16 tr_path_id = 0;
+      u8 tr_seg_left = 0, tr_seg_count = 0, hdr_seen = 0;
       u32 next_index = SR_WG4_INPUT_NEXT_DROP;
       u8 error = SR_WG4_INPUT_ERROR_NONE;
       u8 bypass = 0;
@@ -181,6 +195,10 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       /* Step 2: 查找 P-Key */
       hmac_id = sr_hdr_get_hmac_id (srh);
+      tr_path_id = sr_hdr_get_path_id (srh);
+      tr_seg_left = srh->seg_left;
+      tr_seg_count = srh->seg_count;
+      hdr_seen = 1;
       key_entry = sr_wg_key_lookup (sm, hmac_id);
       if (!key_entry)
         {
@@ -269,17 +287,22 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
         {
           sr_wg4_input_trace_t *tr =
             vlib_add_trace (vm, node, b, sizeof (*tr));
+          clib_memset (tr, 0, sizeof (*tr));
           tr->next_index = next_index;
           tr->sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
           tr->error = error;
           tr->bypass = bypass;
-          /* 旁路时 srh 指向的是 WG transport header，读 SR 字段无意义 */
-          if (srh && !bypass)
+          /*
+           * 读上面的快照，绝不回读 srh。旁路包（bypass）与 Step 1 就掉的包
+           * （magic/ver/len 不对）压根没读到过合法 SR 头，那三行保持全 0，
+           * format 函数按 bypass 打 "plain-wireguard"。
+           */
+          if (hdr_seen)
             {
-              tr->hmac_id = sr_hdr_get_hmac_id (srh);
-              tr->path_id = sr_hdr_get_path_id (srh);
-              tr->seg_left = srh->seg_left;
-              tr->seg_count = srh->seg_count;
+              tr->hmac_id = hmac_id;
+              tr->path_id = tr_path_id;
+              tr->seg_left = tr_seg_left;
+              tr->seg_count = tr_seg_count;
             }
         }
 

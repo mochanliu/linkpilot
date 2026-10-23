@@ -33,6 +33,9 @@
 #   step 8    密钥轮换（key set 刷新路径里的 P-Key 副本）后隧道必须仍然可用
 #   step 9    外层源观测表（vBOND 地址发现）：三处采集点的证据 + verified 分档
 #             + clear 生效
+#   观测自证  这类"观测"自己会不会骗人（断言都在计数器断言之后跑）：
+#             #24 node2 trace 解出的 hmac_id/path_id/seg_left 必须等于
+#                `show sr-wg paths` 的真值 —— 转发计数全对而 trace 是垃圾，曾经真发生过。
 #
 # 用法:
 #   test/scripts/test-e2e.sh [--keep] [--skip-build] [--no-tamper] [--up-only]
@@ -363,6 +366,29 @@ echo
 [ "${D_SN}" = "0" ] && ok "node2   decap_seg_not_zero=0 (transit popped the last segment)" ||
     bad "node2   decap_seg_not_zero=${D_SN} (transit did not decrement seg_left to 0)"
 [ "${DROP}" = "0" ] && ok "node1   drop_total=0"                 || bad "node1   drop_total=${DROP}"
+echo
+info "ASSERT: sr-wg4-input 的 trace 解码必须等于路径表里的真值（#24）"
+# 这条断言盯的是"观测在骗人"这一类故障：转发计数、外层 UDP 端口对、WG 解封后的
+# Length: 可以全对，而 trace 里的 hmac_id/path_id/seg_left 是别的字节。这里真的坏过：
+# Step 5 用 memmove 把 WG 报文覆盖到 SR 头的位置（那是设计目标，wg4-input 从
+# current_data 往回取 UDP 头），而 trace 块在 done: 之后才回读 srh —— 解出来的是 WG
+# 报文的小端字段（实测 hmac_id=5120/1024/1280，seg_count=87='W'/101='e'），同一时刻
+# 真值是 hmac_id=1 path_id=1 seg_count=2。
+# 真值不写死，从 node1 的路径表读：trace 和这张表必须说同一件事。
+P_TBL=$(dx "${C_NODE1}" 'vppctl "show sr-wg paths"' 2>/dev/null | head -4)
+R_PID=$(echo "${P_TBL}" | sed -n 's/.*path_id=\([0-9][0-9]*\).*/\1/p'  | head -1)
+R_HID=$(echo "${P_TBL}" | sed -n 's/.*hmac_id=\([0-9][0-9]*\).*/\1/p'   | head -1)
+R_SEG=$(echo "${P_TBL}" | sed -n 's/.*seg_count=\([0-9][0-9]*\).*/\1/p'  | head -1)
+TR_HIT=$(grep -c "SR-WG-INPUT: hmac_id=${R_HID} path_id=${R_PID} seg_left=0/${R_SEG} err=0" \
+         /tmp/srwg-trace-node2.txt 2>/dev/null)
+if [ -z "${R_PID}" ] || [ -z "${R_HID}" ] || [ -z "${R_SEG}" ]; then
+    bad "读不到 node1 的路径表（path=${R_PID} hmac=${R_HID} seg=${R_SEG}），这条断言无法判定"
+elif [ "${TR_HIT:-0}" -gt 0 ]; then
+    ok "node2 trace 解出 hmac_id=${R_HID} path_id=${R_PID} seg_left=0/${R_SEG}，与 show sr-wg paths 一致（${TR_HIT} 行）"
+else
+    bad "node2 trace 里没有一行等于路径表真值（期望 hmac_id=${R_HID} path_id=${R_PID} seg_left=0/${R_SEG}）；实际解到：$(grep -o 'SR-WG-INPUT:.*' /tmp/srwg-trace-node2.txt 2>/dev/null | sort -u | head -3 | tr '\n' ' ')"
+fi
+
 
 echo
 info "SOFT: WireGuard direct-mode compatibility (node1 received plain WG from node2)"
