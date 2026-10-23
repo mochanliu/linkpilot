@@ -732,3 +732,39 @@ sr_wg_encap_is_enabled (sr_wg_main_t *sm, u32 sw_if_index)
 {
   return hash_get (sm->encap_enabled_ifs, (uword) sw_if_index) != 0;
 }
+
+void
+sr_wg_encap_reconcile (sr_wg_main_t *sm)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  u32 *dead = 0;
+  u32 count = 0;
+  uword key, val;
+  int i;
+
+  if (!sm->encap_enabled_ifs)
+    return;
+
+  /*
+   * 判据取 VPP 自己的登记，不取我们的 hash：接口已删除（format_vnet_sw_if_index_name
+   * 只能打出 DELETED(n)），或者接口还在但 ip4-output 上已经没有这个 feature
+   * （含"号被别的接口复用而 arc 没跟着复用"这一种），两种都算这条挂点没了。
+   */
+  /* *INDENT-OFF* */
+  hash_foreach (key, val, sm->encap_enabled_ifs, ({
+    if (!vnet_get_sw_interface_or_null (vnm, (u32) key) ||
+        !vnet_feature_is_enabled (SR_WG_ENCAP_ARC, SR_WG_ENCAP_NODE,
+                                  (u32) key))
+      vec_add1 (dead, (u32) key);
+  }));
+  /* *INDENT-ON* */
+
+  for (i = 0; i < vec_len (dead); i++)
+    hash_unset (sm->encap_enabled_ifs, (uword) dead[i]);
+  vec_free (dead);
+
+  /* *INDENT-OFF* */
+  hash_foreach (key, val, sm->encap_enabled_ifs, ({ count++; }));
+  /* *INDENT-ON* */
+  sm->encap_enabled_count = count;
+}

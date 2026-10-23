@@ -217,6 +217,21 @@ int sr_wg_encap_enable_disable(sr_wg_main_t *sm, u32 sw_if_index, int enable);
 int sr_wg_encap_is_enabled(sr_wg_main_t *sm, u32 sw_if_index);
 
 /*
+ * 把 sm->encap_enabled_ifs / encap_enabled_count 对回 VPP 的真实登记，
+ * 摘掉接口已删除、或 ip4-output 上已经没有本 feature 的条目。
+ *
+ * 为什么需要：enable_disable 只在**写的时候**校验接口存在，接口后来被删除时没有任何
+ * 钩子来摘这条记录，而 `set sr-wg encap disable <已删的号>` 也会被同一处校验挡回
+ * INVALID_SW_IF_INDEX —— 于是实测出现过 `show sr-wg tunnels` 里的
+ * `DELETED (3) (sw_if_index=3)`，它会一直活到 VPP 重启。后果不是转发（本 feature 的
+ * 生效与否由 VPP 的 arc 决定），而是 **encap_enabled_count 虚高**：tunnel details 的
+ * is_effective 与 CLI 的 WARNING 都读这个数，"看起来开了其实没开"就是从这里来的。
+ * 所以所有读这张表的地方（CLI show / set tunnel 的告警 / API tunnel_details /
+ * config_dump）进来先 reconcile 一次。
+ */
+void sr_wg_encap_reconcile(sr_wg_main_t *sm);
+
+/*
  * 查找绑定条目；未绑定返回 NULL。数据面热路径使用。
  * dst_port 是**封装前**的外层目的端口（主机序）：先查 (dst, port) 精确键，
  * 查不到再落到 (dst, 0) 通配键，最后按 sw_if_index 兜底。

@@ -134,6 +134,9 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vnet_main_t *vnm = vnet_get_main ();
   u32 bi, n = 0, n_usable = 0;
 
+  /* 下面既要打印挂点表、又要用 encap_enabled_count 判 WARNING，先把表对回 VPP 的登记 */
+  sr_wg_encap_reconcile (sm);
+
   /*
    * 挂点在 underlay 出口接口（不是 wg0），所以绑定能不能生效取决于两件事：
    *   (1) 至少一个 underlay 接口启用了 sr-wg4-encap feature
@@ -832,6 +835,7 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
                      "永远不会命中，流量将直发 peer。",
                      sw_if_index, (u32) (u16) path_id);
 
+  sr_wg_encap_reconcile (sm);
   if (sm->encap_enabled_count == 0)
     vlib_cli_output (vm,
                      "!! WARNING: sr-wg4-encap 尚未在任何接口上启用，"

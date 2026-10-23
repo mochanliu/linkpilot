@@ -319,6 +319,9 @@ vl_api_sr_wg_tunnel_dump_t_handler (vl_api_sr_wg_tunnel_dump_t *mp)
   if (!reg)
     return;
 
+  /* 每条 details 的 is_effective 都要读 encap_enabled_count：先把它对回 VPP 的登记 */
+  sr_wg_encap_reconcile (sm);
+
   /* pool 就是带 free bitmap 的 vec，直接遍历 + 跳过空洞 */
   for (bi = 0; bi < vec_len (sm->binds); bi++)
     {
@@ -515,6 +518,9 @@ vl_api_sr_wg_config_dump_t_handler (vl_api_sr_wg_config_dump_t *mp)
   reg = vl_api_client_index_to_registration (mp->client_index);
   if (!reg)
     return;
+
+  /* 下面 enabled_ifs 这张表直接来自我们的 hash，先把它对回 VPP 的登记 */
+  sr_wg_encap_reconcile (sm);
 
   rmp = vl_msg_api_alloc (sizeof (*rmp));
   clib_memset (rmp, 0, sizeof (*rmp));

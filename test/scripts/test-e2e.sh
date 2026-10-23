@@ -33,9 +33,11 @@
 #   step 8    密钥轮换（key set 刷新路径里的 P-Key 副本）后隧道必须仍然可用
 #   step 9    外层源观测表（vBOND 地址发现）：三处采集点的证据 + verified 分档
 #             + clear 生效
-#   观测自证  这类"观测"自己会不会骗人（断言都在计数器断言之后跑）：
+#   观测自证  两条"观测会不会骗人"的断言（都在计数器断言之后跑）：
 #             #24 node2 trace 解出的 hmac_id/path_id/seg_left 必须等于
-#                `show sr-wg paths` 的真值 —— 转发计数全对而 trace 是垃圾，曾经真发生过。
+#                `show sr-wg paths` 的真值 —— 转发计数全对而 trace 是垃圾，曾经真发生过；
+#             #25 在 loopback 上开 encap 再删掉那张口，挂点表里不许留 DELETED(n)，
+#                而真出口 host-eth0 必须还在（两头都判，防误清）。
 #
 # 用法:
 #   test/scripts/test-e2e.sh [--keep] [--skip-build] [--no-tamper] [--up-only]
@@ -366,6 +368,7 @@ echo
 [ "${D_SN}" = "0" ] && ok "node2   decap_seg_not_zero=0 (transit popped the last segment)" ||
     bad "node2   decap_seg_not_zero=${D_SN} (transit did not decrement seg_left to 0)"
 [ "${DROP}" = "0" ] && ok "node1   drop_total=0"                 || bad "node1   drop_total=${DROP}"
+
 echo
 info "ASSERT: sr-wg4-input 的 trace 解码必须等于路径表里的真值（#24）"
 # 这条断言盯的是"观测在骗人"这一类故障：转发计数、外层 UDP 端口对、WG 解封后的
@@ -389,6 +392,33 @@ else
     bad "node2 trace 里没有一行等于路径表真值（期望 hmac_id=${R_HID} path_id=${R_PID} seg_left=0/${R_SEG}）；实际解到：$(grep -o 'SR-WG-INPUT:.*' /tmp/srwg-trace-node2.txt 2>/dev/null | sort -u | head -3 | tr '\n' ' ')"
 fi
 
+echo
+info "ASSERT: encap 挂点表不留僵尸条目（#25）"
+# 建一张 loopback、在它上面开 encap、然后删掉这张口。接口删除时插件的
+# encap_enabled_ifs 没有任何清理钩子，而 `set sr-wg encap disable <已删的号>` 也会被
+# 同一处"接口必须存在"的校验挡回 rv=-2（2026-10-23 在旧插件上实测复现：
+# `DELETED (3)` 一直留到 VPP 重启）。后果不是转发，而是 encap_enabled_count 虚高 ——
+# 隧道的 is_effective 和 CLI 的 WARNING 都读这个数，于是"看起来开了其实没开"。
+# 判据两头都要有：僵尸必须消失，真出口必须还在（防 reconcile 读错 VPP 登记把有效条目一起清掉）。
+LB_NAME=$(dx "${C_NODE1}" 'vppctl "create loopback interface"' 2>/dev/null |
+          sed -n 's/.*\(loop[0-9][0-9]*\).*/\1/p' | head -1)
+if [ -z "${LB_NAME}" ]; then
+    bad "建不出 loopback，僵尸条目这条无法判定"
+else
+    dx "${C_NODE1}" "vppctl 'set sr-wg encap enable ${LB_NAME}'" >/dev/null 2>&1
+    dx "${C_NODE1}" "vppctl 'delete loopback interface intfc ${LB_NAME}'" >/dev/null 2>&1
+    TUN_OUT=$(dx "${C_NODE1}" 'vppctl "show sr-wg tunnels"' 2>&1)
+    if echo "${TUN_OUT}" | grep -q 'DELETED'; then
+        bad "删掉接口之后挂点表里还有 DELETED（$(echo "${TUN_OUT}" | grep -c DELETED) 条），encap_enabled_count 虚高"
+    else
+        ok "接口删除后 ${LB_NAME} 那条已从挂点表里消失（表按 VPP 的真实登记重算过）"
+    fi
+    if echo "${TUN_OUT}" | grep -q 'host-eth0'; then
+        ok "真出口 host-eth0 仍在挂点表里（reconcile 没有误伤有效条目）"
+    else
+        bad "挂点表里连 host-eth0 都没了，reconcile 判据读错了 VPP 的登记：$(echo "${TUN_OUT}" | head -3 | tr '\n' ' ')"
+    fi
+fi
 
 echo
 info "SOFT: WireGuard direct-mode compatibility (node1 received plain WG from node2)"
