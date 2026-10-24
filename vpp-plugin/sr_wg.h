@@ -21,6 +21,7 @@
 #include "sr_path.h"
 #include "sr_counters.h"
 #include "sr_obs.h"
+#include "sr_wg_probe.h"
 
 #define SR_WG_PLUGIN_NAME  "sr_wg"
 #define SR_WG_MAX_KEYS     64
@@ -166,6 +167,12 @@ typedef struct {
    */
   sr_obs_table_t obs;
 
+  /*
+   * 隧道内质量探针（延迟/抖动/丢包）。可达性仍由 VPP core BFD 负责，
+   * 两套会话表在 CLI/北向合成一张视图（定案 2026-10-24 方案 C）。
+   */
+  sr_probe_main_t probe;
+
   /* Node indices（缓存） */
   u32 transit_node_index;
   u32 input_node_index;
@@ -282,6 +289,8 @@ u32 sr_wg_port_count(sr_wg_main_t *sm, u8 kind);
 extern vlib_node_registration_t sr_wg4_transit_node;
 extern vlib_node_registration_t sr_wg4_input_node;
 extern vlib_node_registration_t sr_wg4_encap_node;
+extern vlib_node_registration_t sr_wg4_probe_node;
+extern vlib_node_registration_t sr_wg_probe_process_node;
 
 /* ==================== API ==================== */
 

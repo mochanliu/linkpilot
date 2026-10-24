@@ -183,6 +183,16 @@ sr_wg_init (vlib_main_t *vm)
   sr_wg_encap_init (sm);
   sm->encap_fib_index = 0;   /* 默认在 main FIB 重新查外层第一跳 */
 
+  /*
+   * 探针：会话表 + UDP 51829 -> sr-wg4-probe。
+   * 端口不在 vpn/transit 集合里（那两个是 WireGuard/中转的功能多路键），
+   * 探针的内层目的地址已经是隧道 overlay /32，隧道身份由 IP 表达；
+   * wireguard 建接口不会碰这个端口，所以也不需要 rebind。
+   */
+  sr_probe_init (&sm->probe);
+  udp_register_dst_port (vm, (udp_dst_port_t) SR_PROBE_PORT,
+                         sr_wg4_probe_node.index, /* is_ipv4 */ 1);
+
   /* 缓存 node indices */
   sm->transit_node_index = sr_wg4_transit_node.index;
   sm->input_node_index = sr_wg4_input_node.index;

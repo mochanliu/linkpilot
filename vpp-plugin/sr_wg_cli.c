@@ -23,6 +23,10 @@
  *   set sr-wg encap enable <underlay sw_if_index|name> | disable <…>
  *                   | fib-index <n>
  *   set sr-wg rebind-ports        （建 WG 接口后必做，见 sr_wg.c）
+ *   set sr-wg probe <sw_if_index> peer <ip> [local <ip>]
+ *                   [interval <ms>] [timeout <ms>] | del
+ *   show sr-wg probe
+ *   sr-wg probe send <sw_if_index>
  */
 #include "sr_wg.h"
 #include <vnet/ip/format.h>
@@ -959,4 +963,212 @@ VLIB_CLI_COMMAND (sr_wg_rebind_ports_command, static) = {
   .path = "set sr-wg rebind-ports",
   .short_help = "set sr-wg rebind-ports",
   .function = sr_wg_rebind_ports_command_fn,
+};
+
+/* ==================== 隧道内探针（延迟/抖动/丢包） ==================== */
+
+/*
+ * 一条会话 = (本地隧道接口, 对端 overlay /32)。
+ *
+ *   set sr-wg probe <sw_if_index|name> peer <ip> [local <ip>]
+ *                   [interval <ms>] [timeout <ms>]
+ *   set sr-wg probe <sw_if_index|name> del
+ *
+ * 不给 local 时取该接口的第一个 IPv4 地址；interval 缺省 300ms，
+ * timeout 缺省 3×interval。探针从本机走**正常 FIB**（路由指向 wgX），
+ * 所以它能量到 SR 封装/中转/解封装整条路径，而不是裸 underlay 回声。
+ *
+ * 可达性仍由 VPP core BFD 负责；这里只有质量指标（定案 2026-10-24）。
+ */
+static clib_error_t *
+sr_wg_set_probe_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                            vlib_cli_command_t *cmd)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  ip4_address_t peer, local;
+  u32 sw_if_index = (u32) ~0;
+  u32 interval_ms = 0, timeout_ms = 0;
+  u8 have_peer = 0, is_del = 0;
+  int rv;
+
+  clib_memset (&peer, 0, sizeof (peer));
+  clib_memset (&local, 0, sizeof (local));
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "peer %U", unformat_ip4_address, &peer))
+        have_peer = 1;
+      else if (unformat (input, "local %U", unformat_ip4_address, &local))
+        ;
+      else if (unformat (input, "interval %u", &interval_ms))
+        ;
+      else if (unformat (input, "timeout %u", &timeout_ms))
+        ;
+      else if (unformat (input, "del") || unformat (input, "disable"))
+        is_del = 1;
+      else if (unformat (input, "%U", unformat_vnet_sw_interface, vnm,
+                         &sw_if_index))
+        ;
+      else if (unformat (input, "%u", &sw_if_index))
+        ;
+      else
+        break;
+    }
+
+  if (sw_if_index == (u32) ~0)
+    return clib_error_return (0, "missing <sw_if_index>");
+  if (!is_del && !have_peer)
+    return clib_error_return (0, "missing 'peer <ip>' (or use 'del')");
+
+  rv = sr_probe_set (&sm->probe, sw_if_index,
+                     clib_net_to_host_u32 (peer.as_u32),
+                     clib_net_to_host_u32 (local.as_u32),
+                     interval_ms, timeout_ms, is_del ? 0 : 1);
+
+  if (rv == VNET_API_ERROR_INVALID_SW_IF_INDEX)
+    return clib_error_return (0, "interface %u does not exist", sw_if_index);
+  if (rv == VNET_API_ERROR_ADDRESS_NOT_FOUND_FOR_INTERFACE)
+    return clib_error_return (0,
+                              "interface %u has no IPv4 address; "
+                              "specify 'local <ip>'", sw_if_index);
+  if (rv == VNET_API_ERROR_INVALID_VALUE)
+    return clib_error_return (0,
+                              "invalid parameters: peer must be non-zero, "
+                              "interval 10..60000ms, timeout >= interval");
+  if (rv != 0)
+    return clib_error_return (0, "sr_probe_set failed (rv=%d)", rv);
+
+  if (is_del)
+    {
+      vlib_cli_output (vm, "SR-WG probe on %U removed.",
+                       format_vnet_sw_if_index_name, vnm, sw_if_index);
+      return 0;
+    }
+
+  {
+    sr_probe_session_t *s = sr_probe_get (&sm->probe, sw_if_index);
+    ip4_address_t l, p;
+
+    l.as_u32 = clib_host_to_net_u32 (s->local_ip);
+    p.as_u32 = clib_host_to_net_u32 (s->peer_ip);
+    vlib_cli_output (vm,
+                     "SR-WG probe on %U: %U -> %U  interval=%ums "
+                     "timeout=%ums (udp port %u, node sr-wg4-probe)",
+                     format_vnet_sw_if_index_name, vnm, sw_if_index,
+                     format_ip4_address, &l, format_ip4_address, &p,
+                     s->interval_ms, s->timeout_ms, SR_PROBE_PORT);
+  }
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_set_probe_command, static) = {
+  .path = "set sr-wg probe",
+  .short_help = "set sr-wg probe <sw_if_index> peer <ip> [local <ip>] "
+                "[interval <ms>] [timeout <ms>] | "
+                "set sr-wg probe <sw_if_index> del",
+  .function = sr_wg_set_probe_command_fn,
+};
+
+/* ==================== show sr-wg probe ==================== */
+
+static clib_error_t *
+sr_wg_show_probe_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                             vlib_cli_command_t *cmd)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  sr_probe_main_t *pm = &sm->probe;
+  vnet_main_t *vnm = vnet_get_main ();
+  sr_probe_session_t *s;
+  u32 i;
+
+  vlib_cli_output (vm,
+                   "SR-WG probe: udp port %u, %u session(s), "
+                   "echoed=%llu unknown_replies=%llu alloc_fail=%llu",
+                   SR_PROBE_PORT, pm->count, pm->echoed,
+                   pm->unknown_replies, pm->alloc_fail);
+
+  /* *INDENT-OFF* */
+  pool_foreach_index (i, pm->sessions)
+    {
+      ip4_address_t l, p;
+      u32 permille;
+
+      s = pool_elt_at_index (pm->sessions, i);
+      l.as_u32 = clib_host_to_net_u32 (s->local_ip);
+      p.as_u32 = clib_host_to_net_u32 (s->peer_ip);
+      permille = sr_probe_loss_permille (s);
+
+      vlib_cli_output (vm,
+                       "  %U (sw_if_index=%u) %U -> %U  interval=%ums "
+                       "timeout=%ums %s",
+                       format_vnet_sw_if_index_name, vnm, s->sw_if_index,
+                       s->sw_if_index, format_ip4_address, &l,
+                       format_ip4_address, &p, s->interval_ms, s->timeout_ms,
+                       s->enabled ? "enabled" : "disabled");
+      vlib_cli_output (vm,
+                       "    tx=%llu rx=%llu lost=%llu late=%llu  "
+                       "loss=%u.%u%%  rtt last=%.3fms min=%.3fms "
+                       "avg=%.3fms max=%.3fms  jitter=%.3fms",
+                       s->tx, s->rx, s->lost, s->late_replies,
+                       permille / 10, permille % 10, s->last_rtt_ms,
+                       s->min_rtt_ms,
+                       s->n_rtt ? s->sum_rtt_ms / s->n_rtt : 0.0,
+                       s->max_rtt_ms, s->jitter_ms);
+    }
+  /* *INDENT-ON* */
+
+  if (pm->count == 0)
+    vlib_cli_output (vm,
+                     "  (none) —— 用 `set sr-wg probe <sw_if_index> "
+                     "peer <ip>` 建一条");
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_show_probe_command, static) = {
+  .path = "show sr-wg probe",
+  .short_help = "show sr-wg probe",
+  .function = sr_wg_show_probe_command_fn,
+};
+
+/* ==================== sr-wg probe send ==================== */
+
+static clib_error_t *
+sr_wg_probe_send_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                             vlib_cli_command_t *cmd)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  u32 sw_if_index = (u32) ~0;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "%U", unformat_vnet_sw_interface, vnm,
+                    &sw_if_index))
+        ;
+      else if (unformat (input, "%u", &sw_if_index))
+        ;
+      else
+        break;
+    }
+
+  if (sw_if_index == (u32) ~0)
+    return clib_error_return (0, "missing <sw_if_index>");
+
+  if (!sr_probe_send_now (&sm->probe, vm, sw_if_index))
+    return clib_error_return (0,
+                              "no enabled probe session on %U",
+                              format_vnet_sw_if_index_name, vnm, sw_if_index);
+
+  vlib_cli_output (vm, "SR-WG probe sent on %U (结果见 `show sr-wg probe`)",
+                   format_vnet_sw_if_index_name, vnm, sw_if_index);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_probe_send_command, static) = {
+  .path = "sr-wg probe send",
+  .short_help = "sr-wg probe send <sw_if_index>",
+  .function = sr_wg_probe_send_command_fn,
 };

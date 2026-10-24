@@ -39,6 +39,7 @@ set(SR_WG_PLUGIN_SOURCES
   sr_wg4_transit.c
   sr_wg4_input.c
   sr_wg4_encap.c
+  sr_wg_probe.c
   sr_wg_api.c
   sr_wg_cli.c
   sr_hmac.c
@@ -67,5 +68,6 @@ add_vpp_plugin(sr_wg
     sr_path.h
     sr_obs.h
     sr_counters.h
+    sr_wg_probe.h
     sr_wg.h
 )

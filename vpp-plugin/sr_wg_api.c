@@ -610,6 +610,112 @@ vl_api_sr_wg_obs_clear_t_handler (vl_api_sr_wg_obs_clear_t *mp)
   REPLY_MACRO (VL_API_SR_WG_OBS_CLEAR_REPLY);
 }
 
+/* ==================== 隧道内探针 API Handlers ==================== */
+
+/* 毫秒 -> 微秒（API 用整数微秒，避免在二进制接口里传浮点） */
+static u32
+sr_probe_ms_to_us (f64 ms)
+{
+  if (ms <= 0)
+    return 0;
+  if (ms > 4294967.0)
+    return (u32) ~0;
+  return (u32) (ms * 1000.0 + 0.5);
+}
+
+static void
+vl_api_sr_wg_probe_set_t_handler (vl_api_sr_wg_probe_set_t *mp)
+{
+  vl_api_sr_wg_probe_set_reply_t *rmp;
+  sr_wg_main_t *sm = &sr_wg_main;
+  ip4_address_t peer, local;
+  int rv;
+
+  clib_memcpy_fast (&peer, mp->peer_ip, 4);
+  clib_memcpy_fast (&local, mp->local_ip, 4);
+
+  rv = sr_probe_set (&sm->probe, clib_net_to_host_u32 (mp->sw_if_index),
+                     clib_net_to_host_u32 (peer.as_u32),
+                     clib_net_to_host_u32 (local.as_u32),
+                     clib_net_to_host_u32 (mp->interval_ms),
+                     clib_net_to_host_u32 (mp->timeout_ms),
+                     mp->is_add ? 1 : 0);
+
+  REPLY_MACRO (VL_API_SR_WG_PROBE_SET_REPLY);
+}
+
+static void
+vl_api_sr_wg_probe_dump_t_handler (vl_api_sr_wg_probe_dump_t *mp)
+{
+  sr_wg_main_t *sm = &sr_wg_main;
+  sr_probe_main_t *pm = &sm->probe;
+  vl_api_sr_wg_probe_details_t *rmp;
+  vl_api_registration_t *reg;
+  sr_probe_session_t *s;
+  u32 i;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  /* *INDENT-OFF* */
+  pool_foreach_index (i, pm->sessions)
+    {
+      u32 addr;
+
+      s = pool_elt_at_index (pm->sessions, i);
+
+      rmp = vl_msg_api_alloc (sizeof (*rmp));
+      clib_memset (rmp, 0, sizeof (*rmp));
+      rmp->_vl_msg_id =
+        clib_host_to_net_u16 (VL_API_SR_WG_PROBE_DETAILS + sm->msg_id_base);
+      rmp->context = mp->context;
+      rmp->sw_if_index = clib_host_to_net_u32 (s->sw_if_index);
+
+      addr = clib_host_to_net_u32 (s->peer_ip);
+      clib_memcpy_fast (rmp->peer_ip, &addr, 4);
+      addr = clib_host_to_net_u32 (s->local_ip);
+      clib_memcpy_fast (rmp->local_ip, &addr, 4);
+
+      rmp->interval_ms = clib_host_to_net_u32 (s->interval_ms);
+      rmp->timeout_ms = clib_host_to_net_u32 (s->timeout_ms);
+      rmp->enabled = s->enabled;
+      rmp->tx_packets = clib_host_to_net_u64 (s->tx);
+      rmp->rx_packets = clib_host_to_net_u64 (s->rx);
+      rmp->lost_packets = clib_host_to_net_u64 (s->lost);
+      rmp->late_replies = clib_host_to_net_u64 (s->late_replies);
+      rmp->last_rtt_us = clib_host_to_net_u32 (
+        sr_probe_ms_to_us (s->last_rtt_ms));
+      rmp->min_rtt_us = clib_host_to_net_u32 (
+        sr_probe_ms_to_us (s->min_rtt_ms));
+      rmp->max_rtt_us = clib_host_to_net_u32 (
+        sr_probe_ms_to_us (s->max_rtt_ms));
+      rmp->avg_rtt_us = clib_host_to_net_u32 (
+        sr_probe_ms_to_us (s->n_rtt ? s->sum_rtt_ms / s->n_rtt : 0));
+      rmp->jitter_us = clib_host_to_net_u32 (
+        sr_probe_ms_to_us (s->jitter_ms));
+      rmp->loss_permille = clib_host_to_net_u32 (
+        sr_probe_loss_permille (s));
+
+      vl_api_send_msg (reg, (u8 *) rmp);
+    }
+  /* *INDENT-ON* */
+}
+
+static void
+vl_api_sr_wg_probe_send_t_handler (vl_api_sr_wg_probe_send_t *mp)
+{
+  vl_api_sr_wg_probe_send_reply_t *rmp;
+  sr_wg_main_t *sm = &sr_wg_main;
+  u32 sw_if_index = clib_net_to_host_u32 (mp->sw_if_index);
+  int rv = 0;
+
+  if (!sr_probe_send_now (&sm->probe, vlib_get_main (), sw_if_index))
+    rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+
+  REPLY_MACRO (VL_API_SR_WG_PROBE_SEND_REPLY);
+}
+
 /* ==================== API 消息注册 ==================== */
 
 /* 包含自动生成的注册代码（提供 setup_message_id_table） */
