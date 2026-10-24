@@ -144,7 +144,7 @@ func TestLiveTelemetryAgainstVPP(t *testing.T) {
 				lastBFD = b
 			}
 		}
-		if lastProbe.Tx > 1 && lastProbe.Rx > 0 && (!withBFD || lastBFD.State != 0) {
+		if lastProbe.Tx >= 10 && lastProbe.Rx > 0 && (!withBFD || lastBFD.State != 0) {
 			break
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -170,8 +170,26 @@ func TestLiveTelemetryAgainstVPP(t *testing.T) {
 	if lastProbe.LastRTTus == 0 || lastProbe.LastRTTus > 500000 {
 		t.Errorf("RTT 不合理: last=%dus", lastProbe.LastRTTus)
 	}
-	if lastProbe.LossPermille > 1000 {
-		t.Errorf("丢包率越界: %d‰", lastProbe.LossPermille)
+	// 四项指标要互相自洽：last 是最近一次，必然落在 [min,max]；avg 也是同一个
+	// 会话的均值，必然落在同一区间。任一条破了都说明读回的字段错位，而不是"网络差"。
+	if lastProbe.MinRTTus > lastProbe.AvgRTTus || lastProbe.AvgRTTus > lastProbe.MaxRTTus {
+		t.Errorf("RTT 聚合不自洽: min=%dus avg=%dus max=%dus",
+			lastProbe.MinRTTus, lastProbe.AvgRTTus, lastProbe.MaxRTTus)
+	}
+	if lastProbe.LastRTTus < lastProbe.MinRTTus || lastProbe.LastRTTus > lastProbe.MaxRTTus {
+		t.Errorf("last RTT 落在 [min,max] 之外: last=%dus min=%dus max=%dus",
+			lastProbe.LastRTTus, lastProbe.MinRTTus, lastProbe.MaxRTTus)
+	}
+	// 健康直连链路上折返率应接近 1。留 80% 的余量给启动阶段：第一发探针
+	// 可能赶在对端插件就绪之前，那是真实丢包，不是缺陷。
+	if lastProbe.Rx*10 < lastProbe.Tx*8 {
+		t.Errorf("折返率过低: tx=%d rx=%d", lastProbe.Tx, lastProbe.Rx)
+	}
+	if lastProbe.LossPermille > 200 {
+		t.Errorf("丢包率过高: %d‰ (tx=%d rx=%d)", lastProbe.LossPermille, lastProbe.Tx, lastProbe.Rx)
+	}
+	if lastProbe.JitterUs > 50000 {
+		t.Errorf("抖动异常: %dus", lastProbe.JitterUs)
 	}
 
 	if withBFD {
