@@ -62,6 +62,9 @@ type DataPlane interface {
 	DelPort(ctx context.Context, kind uint8, port uint16) error
 	Ports(ctx context.Context) ([]vppapi.PortInfo, error)
 	RebindPorts(ctx context.Context) error
+	// SetTransit 让本机按 transit 角色收 SR 包（只验签 + 弹一段，不解密）。
+	// 端口由控制器下发（定案 2 的每隧道 transit 端口），本层不猜。
+	SetTransit(ctx context.Context, port uint16) error
 
 	CreateInterface(ctx context.Context, p vppapi.InterfaceParams) (uint32, error)
 	Interfaces(ctx context.Context, showPrivate bool) ([]vppapi.InterfaceInfo, error)
@@ -122,6 +125,11 @@ type LinkConfig struct {
 	// 功能+隧道分用键（定案 2），不是两个独立参数。同一对 CPE 开第二条隧道就是再建
 	// 一个 Link，换一个端口；Open 会把它 AddPort 进数据面的 vpn 端口集合。
 	ListenPort uint16
+	// TransitPort 是这条隧道在**本机**做 SR transit 时收包的 UDP 端口，同样由
+	// 控制器下发（定案 2：每隧道一个 transit 端口）。0 = 本机不做中转（纯端点的
+	// 合法形态）；非 0 时 Open 会调用 SetTransit 把它挂到 sr-wg4-transit。
+	// 它和 ListenPort 必须是两个端口：同一个端口既解 WG 又弹 SR 段没有定义。
+	TransitPort uint16
 	// SrcIP 是 underlay 上发包用的源地址（agent 从本地地址集里选出来那个）。
 	// 只能是 IPv4：SR 头里的段地址就是 4 字节。
 	SrcIP net.IP
@@ -208,6 +216,9 @@ func NewLink(cfg LinkConfig) (*Link, error) {
 		return nil, errors.New("agent: LinkConfig 没有 CA 池")
 	case cfg.ListenPort == 0:
 		return nil, errors.New("agent: 监听端口为 0：租户下发的 vpn_port 没拿到")
+	case cfg.TransitPort == cfg.ListenPort && cfg.ListenPort != 0:
+		return nil, fmt.Errorf("agent: vpn 端口与 transit 端口不能相同（都是 %d）："+
+			"一个端口不能既解 WG 又弹 SR 段", cfg.ListenPort)
 	case cfg.EncapIfIndex == 0:
 		// 0 在 VPP 里是 local0，永远不会是出口，所以当"没填"用正好。
 		return nil, errors.New("agent: 没给 underlay 出口接口的 sw_if_index：" +
@@ -350,8 +361,8 @@ func (l *Link) Open(ctx context.Context) (bool, error) {
 	}
 	// 建 WG 接口会让 wireguard 插件把**这个接口的**监听端口重新注册回它自己的
 	// wg4-input，必须先把这个端口登记进 vpn 集合、再把整组端口挂回本插件，
-	// 否则这条 SR 隧道会静默退化成普通 WG（见 claimListenPort）。
-	if err := l.claimListenPort(ctx); err != nil {
+	// 否则这条 SR 隧道会静默退化成普通 WG（见 claimPorts）。
+	if err := l.claimPorts(ctx); err != nil {
 		return false, err
 	}
 	// 新建的接口也要过一遍 underlay 挂点：这台机器上第一个 agent 建接口时
@@ -375,7 +386,7 @@ func (l *Link) Open(ctx context.Context) (bool, error) {
 //
 // 认回之后要补的两步和新建时一样（登记端口 + 开 encap）：VPP 重启、或 wireguard
 // 插件在别的接口创建过程中把端口抢回去，都会让 SR 挂点失效，而症状是"隧道在、没流量"。
-// claimListenPort 是无条件执行的：它只是把"这个 vpn 端口归 sr-wg 节点"这件事再声明
+// claimPorts 是无条件执行的：它只是把"这个 vpn 端口归 sr-wg 节点"这件事再声明
 // 一遍，幂等；在这个数据面里 UDP 端口就是功能分用键（定案 2），所以"把端口从 plain
 // WG 输入抢回来"正是设计意图，不是副作用。
 func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, error) {
@@ -397,7 +408,7 @@ func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, er
 				"agent: 实例 %d 上那张接口在监听 %d，而租户现在要的是 %d；改端口要删接口（会连带清掉它的 peers），请人工处理",
 				ifi.UserInstance, ifi.Port, want.ListenPort)
 		}
-		if err := l.claimListenPort(ctx); err != nil {
+		if err := l.claimPorts(ctx); err != nil {
 			return false, err
 		}
 		if err := l.dp.EnableEncap(ctx, l.cfg.EncapIfIndex, true); err != nil {
@@ -421,20 +432,27 @@ func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, er
 	return false, nil
 }
 
-// claimListenPort 把本条隧道的监听端口登记进数据面的 vpn 端口集合，然后把
-// **整个集合**重挂回 sr-wg 节点。两步都必要，而且都是幂等的，所以 Open 与 adopt
-// 两条路径都无条件走一遍。
+// claimPorts 把本条隧道用到的端口登记进数据面，然后把**整个集合**重挂回 sr-wg
+// 节点。两步都必要，而且都是幂等的，所以 Open 与 adopt 两条路径都无条件走一遍。
 //
 // AddPort 解决"这条隧道的端口插件根本没听说过"：集合里默认只有 51820，第二条隧道
 // （比如 51830）不登记就永远没人给它加 SR 头 —— 症状照样是 encap_bypass，不是报错。
 // RebindPorts 解决"挂点被别人抢走"：建 WG 接口时 wireguard 插件把**那个接口的**
 // 监听端口注册回 wg4-input，同一台 CPE 上另一个 agent 建接口时抢走的可能是我的端口。
-func (l *Link) claimListenPort(ctx context.Context) error {
+// SetTransit 只在控制器给了 transit 端口时调用：它同时把端口加进 transit 集合并
+// 打开 sr-wg4-transit 的启用位（插件的 transit_enabled 是全局开关，只加端口不够）。
+func (l *Link) claimPorts(ctx context.Context) error {
 	if err := l.dp.AddPort(ctx, vppapi.PortKindVPN, l.cfg.ListenPort); err != nil {
 		return fmt.Errorf("agent: 把监听端口 %d 登记进 vpn 端口集合: %w", l.cfg.ListenPort, err)
 	}
 	if err := l.dp.RebindPorts(ctx); err != nil {
 		return fmt.Errorf("agent: 重挂 UDP 端口集合: %w", err)
+	}
+	if l.cfg.TransitPort != 0 {
+		if err := l.dp.SetTransit(ctx, l.cfg.TransitPort); err != nil {
+			return fmt.Errorf("agent: 把 transit 端口 %d 挂到 sr-wg4-transit: %w",
+				l.cfg.TransitPort, err)
+		}
 	}
 	return nil
 }
@@ -560,13 +578,16 @@ type PeerTarget struct {
 	ObservedAddr     string // "ip:port"
 	ObservedVerified bool   // 这条观测的 SR 头通过了 hop-MAC 校验
 	ReflectorAddr    string // "ip:port"
-
-	// AllowedIPs 是这条隧道在 overlay 上该转发的地址。
-	// **不能为空**：实测 VPP 对 0 条 allowed_ip 的 peer 直接回 -7 INVALID_VALUE。
-	// 契约里现在还没有 overlay 地址（wire.PeerInfo 没有任何隧道 IP 字段），
-	// 所以这是入网之后、"GUI 一键批量配隧道"之前必须补上的那一项。
-	AllowedIPs []vppapi.Prefix
 }
+
+// allowedIPsAny 是每条隧道唯一合法的 allowed-ips（2026-10-18 定案 1）。
+//
+// 它**不参与选路**：VPP 不会据此装 FIB 路由，overlay 路由由控制面显式下发。
+// 但 `wg4-input` 会拿它过滤**解密后的内层源地址**，所以它不是"无害的占位符"：
+// 写对端 overlay /32 时，被本机转发的终端流量在收端被 error-punt 到 null-node，
+// 而源恰好等于那个 /32 的隧道自测 ping 照常通（2026-10-24 实测）。因此这里
+// 不接受调用方给前缀 —— 每条隧道都只会是 0.0.0.0/0。
+var allowedIPsAny = []vppapi.Prefix{{IP: net.IPv4zero, Len: 0}}
 
 // PeerChange 描述一次下发到底动了什么，调用方用它决定要不要记日志、要不要
 // 重新回报可达性。
@@ -605,10 +626,6 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 	}
 	if !l.hmacSet {
 		return "", errors.New("agent: 还没 InstallKeys，路径没有可用的 hop-MAC 密钥")
-	}
-	if len(p.AllowedIPs) == 0 {
-		return "", fmt.Errorf("agent: 节点 %d 没有 overlay 地址，VPP 会拒收这个 peer（实测 -7）；"+
-			"控制器契约里还没有隧道地址这一项", p.NodeID)
 	}
 	wgPub, err := l.authenticate(p)
 	if err != nil {
@@ -673,7 +690,7 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 		Port:       l.cfg.ListenPort,
 		Keepalive:  l.keepalive,
 		SWIfIndex:  l.swIfIndex,
-		AllowedIPs: canonPrefixes(p.AllowedIPs),
+		AllowedIPs: allowedIPsAny,
 	}
 	return l.installPeer(ctx, p.NodeID, ep, want)
 }
@@ -987,14 +1004,6 @@ func canonPrefix(pre vppapi.Prefix) vppapi.Prefix {
 		pre.IP = v4
 	}
 	return pre
-}
-
-func canonPrefixes(pres []vppapi.Prefix) []vppapi.Prefix {
-	out := make([]vppapi.Prefix, len(pres))
-	for i, pre := range pres {
-		out[i] = canonPrefix(pre)
-	}
-	return out
 }
 
 // samePrefixes 按**多重集**比较：只比"每个 a 里都能在 b 里找到"的话，

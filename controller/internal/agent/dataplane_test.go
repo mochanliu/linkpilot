@@ -50,7 +50,10 @@ type fakeVPP struct {
 	dumpErr error
 	ports   []vppapi.PortInfo
 	rebinds int
-	obs     []vppapi.Observation
+	// transitPort 是最后一次 SetTransit 的端口（真机的 transit_enabled 是全局开关，
+	// 只把端口加进集合不够，agent 必须显式打开）。
+	transitPort uint16
+	obs         []vppapi.Observation
 	nextIdx uint32
 	nextPi  uint32
 	// alreadyGone 让 RemovePeer **删掉的同时**回 -6：模拟"数据面里这条其实
@@ -88,6 +91,23 @@ func (f *fakeVPP) SetPKey(ctx context.Context, hmacID uint16, key []byte) error 
 func (f *fakeVPP) RebindPorts(ctx context.Context) error {
 	f.log("RebindPorts")
 	f.rebinds++
+	return nil
+}
+
+// SetTransit 的假语义照抄插件的 sr_wg_transit_enable：把端口加进 transit 集合
+// 并置启用位。
+func (f *fakeVPP) SetTransit(ctx context.Context, port uint16) error {
+	f.log("SetTransit port=%d", port)
+	if port == 0 {
+		return vppapi.APIError{Op: "sr_wg_transit_enable", Retval: -7}
+	}
+	f.transitPort = port
+	for _, p := range f.ports {
+		if p.Kind == vppapi.PortKindTransit && p.Port == port {
+			return nil
+		}
+	}
+	f.ports = append(f.ports, vppapi.PortInfo{Kind: vppapi.PortKindTransit, Port: port})
 	return nil
 }
 
@@ -458,7 +478,6 @@ func target(node uint16, certPEM string, b *keybinding.Binding, observed string,
 	return PeerTarget{
 		NodeID: node, Tenant: "t1", CertPEM: certPEM, Binding: b,
 		ObservedAddr: observed, ObservedVerified: verified, ReflectorAddr: reflector,
-		AllowedIPs: []vppapi.Prefix{{IP: net.IPv4(192, 168, 99, byte(node)), Len: 32}},
 	}
 }
 
@@ -490,6 +509,7 @@ func TestNewLinkRejectsBadInputs(t *testing.T) {
 		{"没有租户", func(c *LinkConfig) { c.Tenant = "" }},
 		{"没有 CA 池", func(c *LinkConfig) { c.CAPool = nil }},
 		{"端口 0", func(c *LinkConfig) { c.ListenPort = 0 }},
+		{"vpn 端口与 transit 端口相同", func(c *LinkConfig) { c.TransitPort = c.ListenPort }},
 		{"没给 underlay 出口接口", func(c *LinkConfig) { c.EncapIfIndex = 0 }},
 		{"私钥长度不对", func(c *LinkConfig) { c.PrivateKey = make([]byte, 31) }},
 		// 全零私钥在 Go 里合法（实测），推出来的公钥是定值：静默用它入网等于
@@ -569,6 +589,48 @@ func TestOpenCreatesThenAdopts(t *testing.T) {
 	}
 	if !f.encapOnUnderlayOnly() {
 		t.Errorf("encap 只应开在 underlay %d 上: %v", encapIfIndex, f.encap)
+	}
+}
+
+// transit 端口由控制器下发（#17）：非 0 就必须真的挂上 sr-wg4-transit —— 只把端口
+// 加进集合不够，插件的 transit_enabled 是全局开关；0 表示这台 CPE 只做端点，
+// 一个包都不中转。
+func TestOpenEnablesTransitOnlyWhenConfigured(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name        string
+		transitPort uint16
+		wantSet     bool
+	}{
+		{"控制器给了 transit 端口", 51821, true},
+		{"纯端点（没给）", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeVPP()
+			pki := newTestPKI(t)
+			cfg := testConfig(t, f, pki)
+			cfg.TransitPort = tc.transitPort
+			l, err := NewLink(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := l.InstallKeys(ctx, []Key{{HmacID: 9001, Key: randomBytes(t, 16)}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l.Open(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantSet {
+				if f.transitPort != tc.transitPort {
+					t.Errorf("transit 端口没挂上：SetTransit 收到 %d，期望 %d", f.transitPort, tc.transitPort)
+				}
+				if n := len(f.callWith("SetTransit port=51821")); n != 1 {
+					t.Errorf("SetTransit 应调用 1 次，实际 %d：%v", n, f.calls)
+				}
+			} else if f.transitPort != 0 || len(f.callWith("SetTransit")) != 0 {
+				t.Errorf("没配 transit 端口却打开了中转: %v", f.calls)
+			}
+		})
 	}
 }
 
@@ -917,19 +979,21 @@ func TestApplyPeerRefusesUnverifiedObservationInDataplane(t *testing.T) {
 	}
 }
 
-func TestApplyPeerRejectsEmptyAllowedIPs(t *testing.T) {
+// allowed-ips 是常量，不是调用方的输入：定案 1（2026-10-18）把它固定成
+// 0.0.0.0/0，因为 wg4-input 会拿它过滤解密后的内层源地址。写对端 /32 会让
+// 被转发的终端流量在收端 punt 到 null-node（2026-10-24 实测，见 #26）。
+func TestApplyPeerAlwaysSendsWildcardAllowedIPs(t *testing.T) {
 	f := newFakeVPP()
 	l, pki := newTestLink(t, f)
 	openLink(t, l)
 	cert, b, _ := peerMaterial(t, pki, "t1", 2)
-	pt := target(2, cert, b, "10.10.2.2:51820", true, "")
-	pt.AllowedIPs = nil
-	_, err := l.ApplyPeer(context.Background(), pt)
-	if err == nil {
-		t.Fatal("VPP 对 0 条 allowed_ip 回 -7，这里必须提前拦住")
+	if _, err := l.ApplyPeer(context.Background(),
+		target(2, cert, b, "10.10.2.2:51820", true, "")); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "overlay") {
-		t.Errorf("错误要点名缺的是契约里的 overlay 地址: %v", err)
+	got := f.peers[0].AllowedIPs
+	if len(got) != 1 || got[0].Len != 0 || !got[0].IP.Equal(net.IPv4zero) || len(got[0].IP) != 4 {
+		t.Fatalf("peer 的 allowed-ips 必须是唯一的 0.0.0.0/0（4 字节），实际 %+v", got)
 	}
 }
 
@@ -1154,7 +1218,7 @@ func TestApplyPeerNoticesKeepaliveAndPrefixChanges(t *testing.T) {
 		mutate func(*vppapi.WgPeer)
 	}{
 		{"keepalive 被数据面改掉", func(p *vppapi.WgPeer) { p.Keepalive = 1 }},
-		{"allowed_ips 少了一条", func(p *vppapi.WgPeer) {
+		{"allowed_ips 被改成对端 /32", func(p *vppapi.WgPeer) {
 			p.AllowedIPs = []vppapi.Prefix{{IP: net.IPv4(192, 168, 99, 250), Len: 32}}
 		}},
 		{"table_id 被改掉", func(p *vppapi.WgPeer) { p.TableID = 7 }},
@@ -1184,49 +1248,40 @@ func TestApplyPeerNoticesKeepaliveAndPrefixChanges(t *testing.T) {
 	}
 }
 
-// v4-mapped 写进去、VPP 归成 4 字节 /32 读回来：不归一的话每次 watch 推送都会被
-// 判成"变了"，隧道被反复删了重装。
-func TestApplyPeerTreatsV4MappedAndDuplicatePrefixes(t *testing.T) {
+// 常量写进去是 16 字节的 net.IPv4zero，VPP dump 回来是 4 字节 + /0：不归一的话
+// 每次 watch 推送都会被判成"变了"，隧道被反复删了重装。反过来，数据面上若有
+// 历史遗留的 /32，比较必须判出差异并重装成常量。
+func TestApplyPeerNormalizesWildcardAllowedIPs(t *testing.T) {
 	f := newFakeVPP()
 	l, pki := newTestLink(t, f)
 	openLink(t, l)
 	ctx := context.Background()
 	cert, b, _ := peerMaterial(t, pki, "t1", 3)
 	pt := target(3, cert, b, "10.10.2.3:51820", true, "")
-	pt.AllowedIPs = []vppapi.Prefix{
-		{IP: net.ParseIP("::ffff:192.168.99.3"), Len: 128},
-		{IP: net.IPv4(10, 200, 3, 0), Len: 24},
-	}
 	if _, err := l.ApplyPeer(ctx, pt); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.peers[0].AllowedIPs; got[0].Len != 32 || len(got[0].IP) != 4 {
-		t.Errorf("写进数据面的前缀没归一: %+v", got[0])
+	if got := f.peers[0].AllowedIPs; len(got) != 1 || got[0].Len != 0 || len(got[0].IP) != 4 {
+		t.Errorf("写进数据面的前缀没归一: %+v", got)
 	}
 	if _, err := l.ApplyPeer(ctx, pt); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(f.callWith("RemovePeer")); n != 0 {
-		t.Errorf("v4-mapped 写法被判成变化，重装了 peer（%d 次删除）", n)
+		t.Errorf("同一个常量被判成变化，重装了 peer（%d 次删除）", n)
 	}
 
-	// 重复条目是**多重集**语义：[10/24, 10/24] 不等于 [10/24]，
-	// 只比"有没有"的实现会把多出来那条永远修不掉。
-	f.peers[0].AllowedIPs = []vppapi.Prefix{
-		{IP: net.IPv4(10, 200, 3, 0), Len: 24},
-		{IP: net.IPv4(10, 200, 3, 0), Len: 24},
-	}
-	pt.AllowedIPs = []vppapi.Prefix{
-		{IP: net.IPv4(10, 200, 3, 0), Len: 24},
-		{IP: net.IPv4(10, 200, 3, 0), Len: 24},
-		{IP: net.ParseIP("::ffff:192.168.99.3"), Len: 128},
-	}
+	// 旧的 /32（本 bug 的历史形态）必须被纠正，而不是被"多重集相等"放过。
+	f.peers[0].AllowedIPs = []vppapi.Prefix{{IP: net.IPv4(192, 168, 99, 3), Len: 32}}
 	change, err := l.ApplyPeer(ctx, pt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if change != PeerReplaced {
-		t.Errorf("少一条前缀却判成 %q（期望 replaced）", change)
+		t.Errorf("数据面还是 /32，却判成 %q（期望 replaced）", change)
+	}
+	if got := f.peers[0].AllowedIPs; len(got) != 1 || got[0].Len != 0 {
+		t.Errorf("没有纠正回常量: %+v", got)
 	}
 }
 
