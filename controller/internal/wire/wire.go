@@ -600,3 +600,26 @@ type MetricsReport struct {
 	NodeID  uint16          `json:"node_id"`
 	Tunnels []TunnelMetrics `json:"tunnels"`
 }
+
+// NodeTelemetry is one node's most recent sampling window as the controller
+// holds it. AgeSec is filled at READ time -- a stored age would start lying the
+// moment it was written.
+type NodeTelemetry struct {
+	NodeID  uint16          `json:"node_id"`
+	SeenAt  int64           `json:"seen_at_unix"`
+	AgeSec  uint64          `json:"age_sec"`
+	Tunnels []TunnelMetrics `json:"tunnels"`
+}
+
+// TelemetryView is the northbound read of a tenant's in-tunnel telemetry.
+//
+// Rows are NOT joined across nodes, even when both ends report the same tunnel:
+// each end has its own BFD session and its own probe counters, and when a link
+// breaks the two ends usually say different things (one sees loss, the other
+// sees down). That disagreement IS the diagnosis, so the controller keeps the
+// two rows side by side instead of inventing a merged verdict.
+type TelemetryView struct {
+	TenantID string          `json:"tenant_id"`
+	Self     uint16          `json:"self"`
+	Nodes    []NodeTelemetry `json:"nodes"`
+}

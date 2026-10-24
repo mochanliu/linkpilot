@@ -236,6 +236,14 @@ type server struct {
 	// arrived still gets attributed. Two CPEs enrolling at once makes that ordering
 	// real, not hypothetical.
 	pendingObs map[string]map[string]*pendingObs
+
+	// tel holds each node's latest telemetry window, keyed by node key. Like obs
+	// it is NOT part of State: a metrics window is a statement about now, and a
+	// persisted one would come back after a restart claiming an "up" that stopped
+	// being true when the controller died. telTTLSec bounds how long a window
+	// outlives the report that produced it.
+	tel       map[string]*nodeTelemetry
+	telTTLSec int
 }
 
 // pendingObs is an observation the controller could not name yet, kept with the
@@ -1326,6 +1334,9 @@ func (s *server) ttlSweeper(ctx context.Context) {
 					// answering: whatever a peer saw 40 seconds ago describes a
 					// binding that may already be gone.
 					s.forgetTargetLocked(rec.TenantID, rec.NodeID)
+					// Telemetry describes the same box. If its heartbeats lapsed,
+					// its last window is not a fact any more either.
+					delete(s.tel, key(rec.TenantID, rec.NodeID))
 					s.broadcastLocked(rec.TenantID, wire.WatchEvent{
 						Type: "stale", Peer: s.toPeerInfoLocked(rec, 0),
 						SentAt: now, Message: "heartbeat lapsed",
@@ -1333,6 +1344,7 @@ func (s *server) ttlSweeper(ctx context.Context) {
 				}
 			}
 			s.expireObservationsLocked()
+			s.expireTelemetryLocked(now)
 			s.save()
 			s.mu.Unlock()
 		}
@@ -1367,6 +1379,12 @@ func main() {
 		// 1500-byte underlay (wire.DefaultTunnelMTU); a smaller underlay needs a
 		// smaller number here, and wire.TunnelMTUBudget says how much smaller.
 		tunnelMTU = flag.Uint("tunnel-mtu", uint(wire.DefaultTunnelMTU), "overlay MTU pushed at enrollment; must be <= wire.TunnelMTUBudget(underlayMTU, longest path)")
+		// How long a telemetry window stays readable after its last report. It is
+		// a read-side policy, not a dataplane setting: the probe cadence comes from
+		// TunnelTelemetry, while this number only decides when the controller stops
+		// showing the last good window -- the wrong answer here is a dead tunnel
+		// that still looks healthy.
+		metricsTTL = flag.Int("metrics-ttl", 30, "seconds a telemetry window stays readable after its last report")
 	)
 	flag.Parse()
 
@@ -1393,6 +1411,9 @@ func main() {
 	if *tunnelMTU > 65535 || mtu < wire.MinTunnelMTU || mtu > wire.MaxTunnelMTU {
 		log.Fatalf("--tunnel-mtu must be in %d..%d (got %d); 0 is not accepted either -- it means \"no MTU record\" to VPP, and the agent must write a number, not clear the interface",
 			wire.MinTunnelMTU, wire.MaxTunnelMTU, *tunnelMTU)
+	}
+	if *metricsTTL < 1 {
+		log.Fatalf("--metrics-ttl must be >= 1 (got %d); zero would expire every window before it could be read", *metricsTTL)
 	}
 	if err := os.MkdirAll(*dataDir, 0700); err != nil {
 		log.Fatal(err)
@@ -1433,6 +1454,8 @@ func main() {
 		tunnelMTU:   mtu,
 		obs:         map[string]observerView{},
 		pendingObs:  map[string]map[string]*pendingObs{},
+		tel:         map[string]*nodeTelemetry{},
+		telTTLSec:   *metricsTTL,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1443,6 +1466,7 @@ func main() {
 	mux.HandleFunc("/v1/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/v1/mapping", s.handleMapping)
 	mux.HandleFunc("/v1/observe", s.handleObserve)
+	mux.HandleFunc("/v1/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/reach", s.handleReach)
 	mux.HandleFunc("/v1/registry", s.handleRegistry)
 	mux.HandleFunc("/v1/watch", s.handleWatch)

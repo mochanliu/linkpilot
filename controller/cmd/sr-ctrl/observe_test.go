@@ -28,6 +28,8 @@ func newTestServer() *server {
 		hbSec:       5,
 		obs:         map[string]observerView{},
 		pendingObs:  map[string]map[string]*pendingObs{},
+		tel:         map[string]*nodeTelemetry{},
+		telTTLSec:   30,
 	}
 }
 
