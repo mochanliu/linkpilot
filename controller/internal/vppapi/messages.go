@@ -83,6 +83,23 @@ var requiredVersions = map[string]string{
 	"mss_clamp_get":                  "47250981",
 	"mss_clamp_get_reply":            "53b48f5d",
 	"mss_clamp_details":              "d3a4de61",
+	// 隧道内遥测：自研探针（插件自己注册的 3 对消息）。
+	"sr_wg_probe_set":        "6240a21d",
+	"sr_wg_probe_set_reply":  "e8d4e804",
+	"sr_wg_probe_send":       "529cb13f",
+	"sr_wg_probe_send_reply": "e8d4e804",
+	"sr_wg_probe_dump":       "51077d14",
+	"sr_wg_probe_details":    "46673557",
+	// 隧道内遥测：core BFD（vnet/bfd.api，VPP 自带）。同样取自 srwg-node1 的注册表。
+	// enable_multihop 不是可选项：不先调它，bfd_udp_add 一律回 -2（实测）。
+	"bfd_udp_enable_multihop":       "51077d14",
+	"bfd_udp_enable_multihop_reply": "e8d4e804",
+	"bfd_udp_add":                   "939cd26a",
+	"bfd_udp_add_reply":             "e8d4e804",
+	"bfd_udp_del":                   "dcb13a89",
+	"bfd_udp_del_reply":             "e8d4e804",
+	"bfd_udp_session_dump":          "51077d14",
+	"bfd_udp_session_details":       "09fb2f2d",
 }
 
 func checkVersions(ids map[string]uint16, crcs map[string]string, want map[string]string) error {

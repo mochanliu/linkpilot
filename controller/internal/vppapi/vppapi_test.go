@@ -40,6 +40,8 @@ type fakeVPP struct {
 	peersRaw    [][]byte // 非空时按原样发这些 details 载荷（用来回放真 VPP 抓到的帧）
 	swIfRaw     [][]byte // 同上，但发给 sw_interface_dump
 	mssDetails  [][]byte // mss_clamp_get 回的明细净体（不含 msg_id+context）
+	probeRaw    [][]byte // sr_wg_probe_dump 回的明细净体
+	bfdRaw      [][]byte // bfd_udp_session_dump 回的明细净体
 	requests    chan request
 }
 
@@ -225,6 +227,16 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "sr_wg_port_dump":
 		for i := 0; i < f.portDetails; i++ {
 			f.sendFrameOf(conn, "sr_wg_port_details", reqCtx, portDetailBytes(i))
+		}
+	case "sr_wg_probe_set", "sr_wg_probe_send", "bfd_udp_enable_multihop", "bfd_udp_add", "bfd_udp_del":
+		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
+	case "sr_wg_probe_dump":
+		for _, raw := range f.probeRaw {
+			f.sendFrameOf(conn, "sr_wg_probe_details", reqCtx, raw)
+		}
+	case "bfd_udp_session_dump":
+		for _, raw := range f.bfdRaw {
+			f.sendFrameOf(conn, "bfd_udp_session_details", reqCtx, raw)
 		}
 	case "sw_interface_dump":
 		if len(f.swIfRaw) > 0 {

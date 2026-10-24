@@ -483,3 +483,120 @@ type ObserveResponse struct {
 	Attributed   []Attribution `json:"attributed,omitempty"`
 	Unattributed []Attribution `json:"unattributed,omitempty"`
 }
+
+// -------------------------------------------------- in-tunnel telemetry
+
+// The telemetry split (settled 2026-10-18) exists because the two dataplane
+// mechanisms answer different questions and only one of them has numbers:
+//
+//   - Reachability comes from VPP's own BFD. It detects a dead tunnel in about
+//     a second at the lab's 50 ms interval, but exposes NO quality metrics at
+//     all -- neither bfd_udp_session_details nor the session struct carries rtt,
+//     jitter or loss (measured 2026-10-24).
+//   - Quality comes from the plugin's own probe (sr_wg_probe, UDP 51829): one
+//     packet type, echoed by the peer, giving RTT, RFC3550 jitter and a sliding
+//     window loss ratio. There is deliberately no bidirectional STAMP.
+//
+// The two tables do NOT share a session key, so the agent joins them and the
+// northbound only ever sees one row per tunnel:
+//   - the probe is per WG interface (sw_if_index), one session per tunnel;
+//   - BFD is a MULTIHOP session (sw_if_index = ~0) addressed by (local, peer).
+//     Interface-bound BFD must not be used: on a WG interface it replaces the
+//     overlay route's forwarding DPO with dpo-drop whenever the peer has no
+//     session, taking the tunnel down in both directions (measured 2026-10-24).
+// TunnelMetrics therefore carries sw_if_index as the identity while the agent
+// does the (local_ip, peer_ip) lookup internally.
+
+// Telemetry defaults live in the contract, not in the agent: the controller must
+// be able to say "you get 300 ms" and have the agent install exactly that, and
+// the two sides must agree on what a zero field means.
+const (
+	DefaultProbeIntervalMS uint32 = 300
+	// ProbeTimeoutMult is the plugin's rule for TimeoutMS=0: three intervals.
+	ProbeTimeoutMult uint32 = 3
+	// BFD defaults match the lab session that detected a dead WG interface in
+	// 1.5 s (2026-10-24). Detection time is detect_mult * max(tx, rx).
+	DefaultBFDMinTxUS    uint32 = 50000
+	DefaultBFDMinRxUS    uint32 = 50000
+	DefaultBFDDetectMult uint8  = 3
+)
+
+// TunnelTelemetry is the controller's per-tunnel telemetry configuration. It is
+// pushed, not derived: the probe interval is a controller policy knob (default
+// 300 ms) and BFD timers decide how fast a dead tunnel is noticed, which is also
+// a policy choice, not something an agent can guess from local state.
+type TunnelTelemetry struct {
+	// SwIfIndex names the tunnel's WG interface. The controller learns it from
+	// the agent's mapping report; it is not derived from node_id.
+	SwIfIndex  uint32 `json:"sw_if_index"`
+	PeerNodeID uint16 `json:"peer_node_id,omitempty"`
+	PeerIP     string `json:"peer_ip"`
+	// LocalIP is the local overlay /32 on this tunnel. Probe could auto-pick the
+	// interface's first IPv4, but BFD cannot: bfd_udp_add needs a concrete local
+	// address, and on a multi-tunnel node "first address of the interface" is
+	// exactly the kind of implicit choice that ends up binding the wrong /32.
+	LocalIP string `json:"local_ip"`
+
+	// IntervalMS is the probe interval; 0 means DefaultProbeIntervalMS (300).
+	// TimeoutMS 0 means "3 intervals" (the plugin's own default). A non-zero
+	// timeout shorter than the interval is refused: the probe would be declared
+	// lost before its reply could possibly arrive.
+	IntervalMS uint32 `json:"interval_ms,omitempty"`
+	TimeoutMS  uint32 `json:"timeout_ms,omitempty"`
+
+	// BFD timers in microseconds (VPP's native unit). Zero means the lab default
+	// (50 ms / 50 ms / x3). VPP does not clamp these: a 1000 us session is
+	// accepted as-is, so the values travel explicitly rather than being implied.
+	BFDMinTxUS    uint32 `json:"bfd_min_tx_us,omitempty"`
+	BFDMinRxUS    uint32 `json:"bfd_min_rx_us,omitempty"`
+	BFDDetectMult uint8  `json:"bfd_detect_mult,omitempty"`
+}
+
+// TunnelMetrics is one tunnel's merged telemetry row, as reported by the agent.
+//
+// ProbeTx/Rx/Lost/Late are DELTAS over WindowSec, not lifetime counters: a
+// dashboard that plots a lifetime counter shows a flat line forever, and a
+// controller that recomputes deltas from two reports cannot tell a counter
+// reset (session re-created) from real traffic. Window failures are therefore
+// computed by the only party that samples both ends of the window.
+//
+// RTT/jitter values are snapshots, not window aggregates: min/avg/max are the
+// probe session's lifetime scope (the plugin tracks them that way) and jitter is
+// its current RFC3550 EWMA. That difference is stated in the field comments
+// rather than hidden behind a single "rtt" number with ambiguous meaning.
+type TunnelMetrics struct {
+	SwIfIndex  uint32 `json:"sw_if_index"`
+	PeerNodeID uint16 `json:"peer_node_id,omitempty"`
+	PeerIP     string `json:"peer_ip"`
+	// Up is the BFD verdict. It is the only reachability signal here; a probe
+	// that stops replying is reported as loss, never as "down", because loss on
+	// a live path and a dead path need different operator responses.
+	Up       bool   `json:"up"`
+	BFDState string `json:"bfd_state"` // "up" | "init" | "down" | "admin-down" | "absent"
+
+	IntervalMS uint32 `json:"interval_ms"`
+	WindowSec  uint32 `json:"window_sec"`
+
+	ProbeTx   uint64 `json:"probe_tx"`
+	ProbeRx   uint64 `json:"probe_rx"`
+	ProbeLost uint64 `json:"probe_lost"`
+	ProbeLate uint64 `json:"probe_late"`
+	// LossPermille is the window loss ratio (probe_lost / probe_tx * 1000).
+	// When no probe was sent in the window it falls back to the plugin's
+	// sliding-window value, which still describes the recent past.
+	LossPermille uint32 `json:"loss_permille"`
+
+	RTTms    float64 `json:"rtt_ms"`     // most recent reply
+	MinRTTms float64 `json:"min_rtt_ms"` // lifetime minimum
+	AvgRTTms float64 `json:"avg_rtt_ms"` // lifetime mean
+	MaxRTTms float64 `json:"max_rtt_ms"` // lifetime maximum
+	JitterMs float64 `json:"jitter_ms"`  // RFC3550 EWMA, current
+}
+
+// MetricsReport carries one sampling window of in-tunnel telemetry. There is no
+// controller-side delta bookkeeping: the agent owns the window, so a report is
+// self-contained and a lost report does not corrupt the next one.
+type MetricsReport struct {
+	NodeID  uint16          `json:"node_id"`
+	Tunnels []TunnelMetrics `json:"tunnels"`
+}

@@ -169,6 +169,13 @@ func (c *Client) ReportReach(ctx context.Context, req wire.ReachReport) error {
 	return c.post(ctx, "/v1/reach", req, nil)
 }
 
+// ReportMetrics 上报一个采样窗口的隧道内遥测（BFD 状态 + 探针质量）。
+// 每个窗口自带增量，所以丢一次上报不会污染下一次。
+func (c *Client) ReportMetrics(ctx context.Context, req wire.MetricsReport) error {
+	req.NodeID = c.nodeID
+	return c.post(ctx, "/v1/metrics", req, nil)
+}
+
 // RegistryView 是 /v1/registry 的一次快照（也是仪表盘拓扑页读的同一份）。
 type RegistryView struct {
 	TenantID string          `json:"tenant_id"`
