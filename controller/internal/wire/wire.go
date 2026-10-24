@@ -197,6 +197,31 @@ const (
 	MaxTunnelMTU uint16 = 9000
 )
 
+// TCPOverheadBytes is what a TCP segment carries in front of its payload in an
+// IPv4 packet: 20 B IP + 20 B TCP. MSS = overlay MTU - this.
+const TCPOverheadBytes = 40
+
+// TCPMSSForTunnelMTU is the MSS a CPE must clamp TCP to on a tunnel of this
+// overlay MTU (2026-10-24 ruling: automatic, MTU - 40).
+//
+// Why clamp at all: a LAN terminal sits behind a 1500-byte interface and
+// negotiates MSS 1460, while the tunnel carries at most mtu bytes. VPP does
+// carry such a segment -- it fragments it at the WireGuard output (measured
+// 2026-10-22) -- but every piece then gets its own SR/WG header and the outer
+// fragments land on the underlay, the shape middleboxes drop. Clamping the MSS
+// the terminal sees stops it from producing those segments in the first place.
+//
+// In this lab the tunnel MTU already reaches the terminal because the kernel
+// route carries `mtu 1360`; a real LAN does not, so the CPE's clamp is the only
+// thing that tells both TCP endpoints the truth. test/scripts/test-mtu.sh
+// re-measures the clamp on the wire (ASSERT J).
+func TCPMSSForTunnelMTU(mtu uint16) uint16 {
+	if mtu <= TCPOverheadBytes {
+		return 0
+	}
+	return mtu - TCPOverheadBytes
+}
+
 // SRHeaderBytes is the on-wire length of the SR header for a path with segCount
 // segments (0 means "no SR header at all", i.e. plain WireGuard direct).
 func SRHeaderBytes(segCount uint8) int {

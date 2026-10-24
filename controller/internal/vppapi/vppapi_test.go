@@ -39,6 +39,7 @@ type fakeVPP struct {
 	swIfDetails int      // core 的 sw_interface_dump 回几条
 	peersRaw    [][]byte // 非空时按原样发这些 details 载荷（用来回放真 VPP 抓到的帧）
 	swIfRaw     [][]byte // 同上，但发给 sw_interface_dump
+	mssDetails  [][]byte // mss_clamp_get 回的明细净体（不含 msg_id+context）
 	requests    chan request
 }
 
@@ -179,6 +180,14 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 		// sw_interface_dump（走 details，不是 retval）。
 		"sw_interface_set_mtu":
 		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
+	case "mss_clamp_enable_disable":
+		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
+	case "mss_clamp_get":
+		for _, raw := range f.mssDetails {
+			f.sendFrameOf(conn, "mss_clamp_details", reqCtx, raw)
+		}
+		// 净体 = retval(4) cursor(4)；cursor 0 = 一页读完。
+		f.reply(conn, name, reqCtx, append(uint32Bytes(uint32(f.retvals[name])), uint32Bytes(0)...))
 	case "sr_wg_stats_get":
 		// 真实尺寸 138 = msg_id(2)+context(4)+retval(4)+16 个 u64
 		f.reply(conn, name, reqCtx, append(uint32Bytes(0), make([]byte, 128)...))
@@ -1200,6 +1209,94 @@ func TestDumpInterfacesRejectsShortFrame(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sw_interface_details") {
 		t.Errorf("错误要点名哪条消息，got: %v", err)
+	}
+}
+
+// ==================== TCP MSS 钳制 ====================
+
+func TestSetMSSClampEncodesRX(t *testing.T) {
+	// 净体 10 字节：sw_if_index(4) ipv4_mss(2) ipv6_mss(2) ipv4_dir(1) ipv6_dir(1)。
+	// 方向位必须是 RX=1 —— 配成 TX 时这个插件读回一切正常但一个包都不改（实测），
+	// 所以这里锁的是**字节**，不是"调用发生过"。
+	f := newFake(t)
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	if err := c.SetMSSClamp(ctx, 7, 1320); err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	if r.name != "mss_clamp_enable_disable" {
+		t.Fatalf("请求名 = %s", r.name)
+	}
+	if len(r.body) != 10 {
+		t.Fatalf("体长 = %d，期望 10", len(r.body))
+	}
+	if got := binary.BigEndian.Uint32(r.body[0:4]); got != 7 {
+		t.Errorf("sw_if_index = %d", got)
+	}
+	if got := binary.BigEndian.Uint16(r.body[4:6]); got != 1320 {
+		t.Errorf("ipv4_mss = %d", got)
+	}
+	if got := binary.BigEndian.Uint16(r.body[6:8]); got != 0 {
+		t.Errorf("ipv6_mss = %d，overlay 只有 IPv4，不该动它", got)
+	}
+	if r.body[8] != MSSClampDirRX {
+		t.Errorf("ipv4_direction = %d，期望 RX=%d（TX 在 wg0 上不生效）", r.body[8], MSSClampDirRX)
+	}
+	if r.body[9] != MSSClampDirNone {
+		t.Errorf("ipv6_direction = %d，期望 NONE", r.body[9])
+	}
+}
+
+func TestSetMSSClampRejectsZeroAndPropagatesRetval(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	if err := c.SetMSSClamp(ctx, 7, 0); err == nil {
+		t.Fatal("MSS=0 必须在发出之前拦掉")
+	}
+
+	f.retvals["mss_clamp_enable_disable"] = -2
+	if err := c.SetMSSClamp(ctx, 99, 1320); err == nil {
+		t.Fatal("retval 非 0 必须上报")
+	}
+}
+
+func TestMSSClampReadsBack(t *testing.T) {
+	// 明细净体 10 字节（消息头之外）：sw_if_index(4) ipv4_mss(2) ipv6_mss(2) 两个方向(1+1)。
+	detail := make([]byte, 10)
+	binary.BigEndian.PutUint32(detail[0:4], 7)
+	binary.BigEndian.PutUint16(detail[4:6], 1320)
+	binary.BigEndian.PutUint16(detail[6:8], 0)
+	detail[8] = MSSClampDirRX
+	detail[9] = MSSClampDirNone
+
+	f := newFake(t)
+	f.mssDetails = [][]byte{detail}
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	info, ok, err := c.MSSClamp(ctx, 7)
+	if err != nil || !ok {
+		t.Fatalf("读回失败: ok=%v err=%v", ok, err)
+	}
+	if info.SWIfIndex != 7 || info.IPv4MSS != 1320 || info.IPv4Dir != MSSClampDirRX {
+		t.Errorf("读回 = %+v", info)
+	}
+	r := f.lastRequest(t)
+	if r.name != "mss_clamp_get" || len(r.body) != 8 {
+		t.Fatalf("请求 = %s 体长 %d，期望 mss_clamp_get + 8（cursor 4 + sw_if_index 4）", r.name, len(r.body))
+	}
+	if got := binary.BigEndian.Uint32(r.body[4:8]); got != 7 {
+		t.Errorf("服务端过滤的 sw_if_index = %d，期望 7", got)
+	}
+
+	// 没有记录：ok=false，不是错误 —— 调用方（agent）把它当成"钳制没落地"来报。
+	info, ok, err = c.MSSClamp(ctx, 8)
+	if err != nil || ok {
+		t.Errorf("查一个没配过的接口应当 ok=false err=nil，得到 ok=%v err=%v info=%+v", ok, err, info)
 	}
 }
 

@@ -347,6 +347,60 @@ func (c *Client) call(ctx context.Context, name, replyName string, body []byte) 
 	}
 }
 
+// callStream 发一条"先流式回 details、最后回一条自带结束标记的 reply"的请求
+// （vpp 里带 cursor 的 get，例如 mss_clamp_get），把 details 与 reply 一起交出去。
+//
+// 和 dump 的区别：dump 没有结束标记，所以必须拿屏障消息当"发完了"；这里的 reply
+// 本身就是结束标记，多读一帧屏栅栏反而会和 cursor 分页打架。细节顺序是 VPP 保证
+// 的（同一请求的处理在单线程上跑完：先发完本页 details，再发 reply）。
+func (c *Client) callStream(ctx context.Context, name, detailName, replyName string, body []byte) ([][]byte, []byte, error) {
+	reqID, err := c.id(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	detailID, err := c.id(detailName)
+	if err != nil {
+		return nil, nil, err
+	}
+	replyID, err := c.id(replyName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctxVal := c.nextCtx.Add(1)
+	w := &waiter{ch: make(chan []byte, detailQueueLen),
+		want: map[uint16]bool{detailID: true, replyID: true}}
+	c.arm(ctxVal, w)
+	defer c.disarm(ctxVal)
+
+	if err := c.send(reqID, ctxVal, body); err != nil {
+		return nil, nil, c.sendErr(err)
+	}
+	var details [][]byte
+	for {
+		select {
+		case frame, ok := <-w.ch:
+			if !ok {
+				return details, nil, c.closedErr()
+			}
+			if len(frame) >= replyHeaderLen && binary.BigEndian.Uint16(frame[0:2]) == replyID {
+				return details, frame, nil
+			}
+			details = append(details, frame)
+		case <-c.rx:
+			return details, nil, c.closedErr()
+		case <-ctx.Done():
+			// 队列满时 reply 可能被丢掉 —— 那和"VPP 没回"要分开报，否则排障时会
+			// 去怀疑对端而真正的原因是本地缓冲不够。
+			if w.full.Load() {
+				return details, nil, fmt.Errorf("vppapi: %s 的结果多于 %d 条，已被截断: %w",
+					name, detailQueueLen, ctx.Err())
+			}
+			return details, nil, fmt.Errorf("vppapi: %s 的 details/reply 没读齐(超时/取消): %w", name, ctx.Err())
+		}
+	}
+}
+
 // dump 发一条 stream 请求，用 sr_wg_stats_get 当栅栏把 details 收齐。
 //
 // 为什么必须栅栏：VPP 的 dump 没有"发完了"这一帧，空结果干脆一帧不发。同一注册

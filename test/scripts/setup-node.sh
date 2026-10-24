@@ -64,6 +64,12 @@
 #       wg0，VPP 在 WG 出口把内层切成 1356+100 两片、各自封自己的 SR/WG 头，于是
 #       外层 1452 与 196 都不超 underlay。手建的 WG 接口四个 MTU 槽默认全 0（等于
 #       没有记录），不写这一行就等于这条隧道不做任何限制。
+#   vppctl set interface tcp-mss-clamp wg0 ip4 rx ip4-mss 1320 ip6 disable
+#       MSS = 隧道 MTU - 40（20 IP + 20 TCP），这里是 1360-40。**方向必须是 RX**：
+#       实测 WG 接口的 ip4-output arc 上 wg4-output-tun 排在 tcp-mss-clamping-ip4-out
+#       前面，TX 钳制一包都不改；收包侧（含从别的口转发进来的 SYN）则真的生效，
+#       所以两端的 CPE 各自钳自己收到的 SYN。缺了这条，LAN 终端按 1500 谈出 1460，
+#       内层超了隧道 MTU，VPP 在 WG 出口切片，每片再背一份 SR/WG 头。
 #   vppctl set sr-wg rebind-ports        # 必须在 wg-create 之后：建 WG 接口会
 #                                        # 把 51820 重新注册给 wg4-input
 #   vppctl sr-wg path add 1 via 10.10.2.2:51820 via 10.10.1.3:51821 hmac-id 1
@@ -436,6 +442,15 @@ cmd_wg_create() {
     local mtu_out
     mtu_out=$(vppctl set interface mtu packet "${TUNNEL_MTU}" "${WG_IF}" 2>&1 || true)
     [ -n "${mtu_out}" ] && log "set interface mtu ${TUNNEL_MTU} ${WG_IF}: ${mtu_out}"
+    # TCP MSS 钳制：MSS = 隧道 MTU - 40（20 IP + 20 TCP）。方向只能是 RX —— 实测
+    # WG 接口 ip4-output arc 上 wg4-output-tun 抢在 tcp-mss-clamping-ip4-out 前面，
+    # TX 配了也不改包；收包侧（包括从别的口转发进来的 SYN）才真正生效，两端各钳
+    # 自己收到的 SYN。ip6 目前是 disable：本套 overlay 只跑 IPv4，mss_clamp 的 CLI
+    # 又要求两口都写出来。
+    local mss=$((TUNNEL_MTU - 40))
+    local clamp_out
+    clamp_out=$(vppctl set interface tcp-mss-clamp "${WG_IF}" ip4 rx ip4-mss "${mss}" ip6 disable 2>&1 || true)
+    [ -n "${clamp_out}" ] && log "set interface tcp-mss-clamp ${WG_IF} ip4 rx ip4-mss ${mss}: ${clamp_out}"
     # WireGuard 创建接口时会重新注册 listen-port，覆盖 SR-WG 的 51820 注册。
     # 必须在 WG 接口创建后重新绑定端口，让 sr-wg4-input 接管 51820 流量。
     vppctl set sr-wg rebind-ports 2>/dev/null || true

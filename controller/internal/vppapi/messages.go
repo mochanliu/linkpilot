@@ -75,6 +75,14 @@ var requiredVersions = map[string]string{
 	// 同一份 JSON 里的 dump/details：结构体一旦变，CRC 一定先于超时告诉我们。
 	"sw_interface_dump":    "aa610c27",
 	"sw_interface_details": "6c221fc7",
+	// TCP MSS 钳制是 VPP 自带的 mss_clamp 插件（VPP 26.06 默认就装），同样不是
+	// sr_wg 的。值取自 srwg-node1 的 /usr/share/vpp/api/plugins/mss_clamp.api.json，
+	// 并与生成的 mss_clamp.api_types.h 里的 *_CRC 宏逐条对上。
+	"mss_clamp_enable_disable":       "d31b44e3",
+	"mss_clamp_enable_disable_reply": "e8d4e804",
+	"mss_clamp_get":                  "47250981",
+	"mss_clamp_get_reply":            "53b48f5d",
+	"mss_clamp_details":              "d3a4de61",
 }
 
 func checkVersions(ids map[string]uint16, crcs map[string]string, want map[string]string) error {
@@ -870,6 +878,118 @@ func FindInterface(ifaces []SwInterface, swIfIndex uint32) (SwInterface, bool) {
 		}
 	}
 	return SwInterface{}, false
+}
+
+// ==================== TCP MSS 钳制（mss_clamp 插件，不是 sr_wg 的） ====================
+
+// vl_api_mss_clamp_dir_t 是 enumflags(u8)：NONE=0、RX=1、TX=2。
+const (
+	MSSClampDirNone uint8 = 0
+	MSSClampDirRX   uint8 = 1
+	MSSClampDirTX   uint8 = 2
+)
+
+// SetMSSClamp 把这张接口的 IPv4 TCP MSS 钳到 mss，方向固定 **RX**。
+//
+// 为什么是 RX 而不是 TX（2026-10-24 在实验室按 A/B/A 实测）：
+//
+//   - RX 挂在 ip4-input 弧上，改的是**从隧道进来**的内层包。实测：node2 的 wg0
+//     设 ip4 RX 1320 后，node1 的终端发来的 SYN 到 node2 时 MSS 已从 1460 变 1320。
+//   - TX 挂在 ip4-output 弧上，而这张口的 ip4-output 弧会被 wg4-output-tun 先吃掉
+//     （`show interface features wg0` 的顺序就是 wg4-output-tun → tcp-mss-clamping-
+//     ip4-out；整条隧道路径的另一处实测也证明 wg0 的 ip4-output 不跑 feature 链）。
+//     实测同一台 node1 设 ip4 TX 1320 后，SYN 到 node2 仍是 1460 —— 配置读回来
+//     一切正常，包一个字节没改。**这正是本插件最容易配错的地方**。
+//
+// 两端都要设：RX 只管"我收到的那个 SYN/SYN-ACK"，所以 A 的 MSS 由 B 的 RX 钳、
+// B 的 MSS 由 A 的 RX 钳，各自改的都是对方要发给自己的段长。
+//
+// mss=0 在发出之前拦掉：钳到 0 等于把每个段的载荷压成 0，隧道看起来"通"但吞吐
+// 是每次一个纯 ACK 的量级。VPP 对这个值不做校验（和 MTU 一样）。
+func (c *Client) SetMSSClamp(ctx context.Context, swIfIndex uint32, mss uint16) error {
+	if mss == 0 {
+		return errors.New("vppapi: MSS 不能是 0（钳到 0 等于每个 TCP 段只能带纯 ACK）")
+	}
+	// vl_api_mss_clamp_enable_disable_t 净体 = sw_if_index(4) ipv4_mss(2)
+	// ipv6_mss(2) ipv4_direction(1) ipv6_direction(1)。
+	body := make([]byte, 0, 10)
+	body = appendU32(body, swIfIndex)
+	body = appendU16(body, mss)
+	body = appendU16(body, 0) // IPv6 不碰：overlay 至今只有 IPv4
+	body = append(body, MSSClampDirRX, MSSClampDirNone)
+	frame, err := c.call(ctx, "mss_clamp_enable_disable", "mss_clamp_enable_disable_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("mss_clamp_enable_disable", frame)
+}
+
+// MSSClampInfo 是一条 `mss_clamp_get` 明细（vl_api_mss_clamp_details_t）。
+type MSSClampInfo struct {
+	SWIfIndex uint32
+	IPv4MSS   uint16
+	IPv6MSS   uint16
+	IPv4Dir   uint8 // MSSClampDir* 的位组合
+	IPv6Dir   uint8
+}
+
+// MSSClampDetailsLen 是 vl_api_mss_clamp_details_t 的字节数：
+// msg_id(2)+context(4)+sw_if_index(4)+ipv4_mss(2)+ipv6_mss(2)+两个方向(1+1)。
+const MSSClampDetailsLen = 16
+
+// MSSClamp 读回一张接口的 MSS 钳制状态；没有记录返回 ok=false。
+//
+// 存在的理由和 DumpInterfaces 一样：mss_clamp_enable_disable 的 retval=0 只说明
+// "请求被收下"，读回来才知道方向真的是 RX、数真的是那个数。真机实测这个插件对
+// 值不做校验。
+//
+// 按 sw_if_index 服务端过滤（`mss_clamp_get` 的 sw_if_index 字段，不过滤是 ~0），
+// 所以一张口最多一条明细；cursor 循环照抄 VPP 的分页语义，避免"第一页没命中就
+// 报没有"的假阴性。
+func (c *Client) MSSClamp(ctx context.Context, swIfIndex uint32) (MSSClampInfo, bool, error) {
+	var out MSSClampInfo
+	found := false
+	cursor := uint32(0)
+	for {
+		body := make([]byte, 0, 8)
+		body = appendU32(body, cursor)
+		body = appendU32(body, swIfIndex)
+		frames, reply, err := c.callStream(ctx, "mss_clamp_get", "mss_clamp_details",
+			"mss_clamp_get_reply", body)
+		if err != nil {
+			return MSSClampInfo{}, false, err
+		}
+		// 应答净体 = retval(4) cursor(4)，接在 msg_id(2)+context(4) 之后。
+		if len(reply) < 14 {
+			return MSSClampInfo{}, false, fmt.Errorf("vppapi: mss_clamp_get_reply 太短 (%d B)", len(reply))
+		}
+		if rv := int32(binary.BigEndian.Uint32(reply[6:10])); rv != 0 {
+			return MSSClampInfo{}, false, APIError{Op: "mss_clamp_get", Retval: rv}
+		}
+		for _, f := range frames {
+			if len(f) < MSSClampDetailsLen {
+				return MSSClampInfo{}, false, fmt.Errorf(
+					"vppapi: mss_clamp_details 太短 (%d B < %d B)，mss_clamp 的结构变了",
+					len(f), MSSClampDetailsLen)
+			}
+			info := MSSClampInfo{
+				SWIfIndex: binary.BigEndian.Uint32(f[6:10]),
+				IPv4MSS:   binary.BigEndian.Uint16(f[10:12]),
+				IPv6MSS:   binary.BigEndian.Uint16(f[12:14]),
+				IPv4Dir:   f[14],
+				IPv6Dir:   f[15],
+			}
+			if info.SWIfIndex == swIfIndex {
+				out, found = info, true
+			}
+		}
+		next := binary.BigEndian.Uint32(reply[10:14])
+		// next <= cursor 防的是"永远回同一个 cursor"的坏实现把读回挂死。
+		if next == 0 || next <= cursor {
+			return out, found, nil
+		}
+		cursor = next
+	}
 }
 
 // appendSegments 写满定长数组 segments[8]：未用的槽位补零。

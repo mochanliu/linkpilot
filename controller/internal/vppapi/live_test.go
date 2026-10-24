@@ -979,6 +979,74 @@ func TestLiveAgainstVPP(t *testing.T) {
 		}
 	})
 
+	t.Run("mss_clamp", func(t *testing.T) {
+		// MSS 钳制是另一个插件（mss_clamp）的消息，不是本插件的。这一条要证明三件事：
+		// 线布局抄对了（和 vppctl 读同一张表）、方向真的是 RX、以及**读回能看见方向**
+		// —— 最后一条是 agent 拒绝"配成 TX"那个判断的前提。
+		idx, err := c.CreateInterface(ctx, InterfaceParams{
+			UserInstance: liveInstance, ListenPort: livePort,
+			PrivateKeys: mustRand(t, wgKeyLen), SrcIP: src})
+		if err != nil {
+			t.Fatalf("CreateInterface: %v", err)
+		}
+		name := interfaceNameOnIndex(showInterfaces(t), idx)
+		t.Cleanup(func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			// 先撤钳制再删接口：mss_clamp 插件在接口删除时**不**清自己的表（实测
+			// 留下 `DELETED (4)` 一条），而 disable 会真的把记录抹掉。不撤就删，
+			// 这条测试每跑一次就在 VPP 里留一条孤儿。
+			if _, err := vppctl(cctx, "set", "interface", "tcp-mss-clamp", name,
+				"ip4", "disable", "ip6", "disable"); err != nil {
+				t.Errorf("撤钳制: %v", err)
+			}
+			if err := c.DeleteInterface(cctx, idx); err != nil {
+				t.Errorf("清理接口 idx=%d 失败: %v（手工 vppctl wireguard delete）", idx, err)
+			}
+			if err := c.RebindPorts(cctx); err != nil {
+				t.Errorf("RebindPorts: %v", err)
+			}
+		})
+		// 新建的口没有明细：返回 ok=false 而不是一条全 0 的记录。
+		if info, ok, err := c.MSSClamp(ctx, idx); err != nil || ok {
+			t.Errorf("新接口不该有 MSS 明细: ok=%v err=%v info=%+v", ok, err, info)
+		}
+
+		if err := c.SetMSSClamp(ctx, idx, 1320); err != nil {
+			t.Fatalf("SetMSSClamp(1320): %v", err)
+		}
+		info, ok, err := c.MSSClamp(ctx, idx)
+		if err != nil || !ok {
+			t.Fatalf("读回 MSS: ok=%v err=%v", ok, err)
+		}
+		if info.IPv4MSS != 1320 || info.IPv4Dir != MSSClampDirRX || info.IPv6Dir != MSSClampDirNone {
+			t.Errorf("读回 = %+v，期望 ipv4 1320 RX / ipv6 不动", info)
+		}
+		out, err := vppctl(ctx, "show", "interface", "tcp-mss-clamp", name)
+		if err != nil {
+			t.Fatalf("vppctl show interface tcp-mss-clamp %s: %v", name, err)
+		}
+		if !strings.Contains(out, "ip4: 1320 [RX]") {
+			t.Errorf("CLI 眼里的钳制不是 ip4: 1320 [RX]：\n%s", out)
+		}
+
+		// 用 CLI 把它改成 TX：真机上这个状态**不报错也完全不生效**。API 必须原样读出
+		// TX，agent 的 verifyLanded 正是靠"方向含 RX"把这种状态判红。
+		if _, err := vppctl(ctx, "set", "interface", "tcp-mss-clamp", name,
+			"ip4", "tx", "ip4-mss", "1320", "ip6", "disable"); err != nil {
+			t.Fatalf("CLI 改 TX: %v", err)
+		}
+		info, ok, err = c.MSSClamp(ctx, idx)
+		if err != nil || !ok {
+			t.Fatalf("改 TX 后读回: ok=%v err=%v", ok, err)
+		}
+		if info.IPv4Dir&MSSClampDirRX != 0 || info.IPv4Dir&MSSClampDirTX == 0 {
+			t.Errorf("CLI 已改成 TX，API 读回方向 = %d（期望只含 TX）—— 读回看不见方向的话，"+
+				"agent 就没法拒绝那张不生效的配置", info.IPv4Dir)
+		}
+		t.Logf("%s：API 与 CLI 都读到 ip4 mss=1320；方向 TX 可读回（真机上 TX 不改任何包）", name)
+	})
+
 	t.Logf("被丢弃的帧计数 Drops=%d（异步通知会计进来，不该持续增长）", c.Drops())
 }
 

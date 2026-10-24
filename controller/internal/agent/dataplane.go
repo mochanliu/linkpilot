@@ -71,6 +71,11 @@ type DataPlane interface {
 	SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU uint16) error
 	DumpInterfaces(ctx context.Context) ([]vppapi.SwInterface, error)
 	EnableEncap(ctx context.Context, swIfIndex uint32, enable bool) error
+	// SetMSSClamp/MSSClamp 是隧道口上的 TCP MSS 钳制（mss_clamp 插件）。方向固定
+	// RX：TX 在 wg0 的 ip4-output 弧上被 wg4-output-tun 吃掉，实测配置成功但一个
+	// 字节都不改（见 vppapi.SetMSSClamp）。
+	SetMSSClamp(ctx context.Context, swIfIndex uint32, mss uint16) error
+	MSSClamp(ctx context.Context, swIfIndex uint32) (vppapi.MSSClampInfo, bool, error)
 
 	AddPeer(ctx context.Context, p vppapi.PeerParams) (uint32, error)
 	RemovePeer(ctx context.Context, peerIndex uint32) error
@@ -473,6 +478,16 @@ func (l *Link) applyMTUs(ctx context.Context, tunnelSwIfIndex uint32) error {
 		return fmt.Errorf("agent: 给隧道接口 %d 设 MTU=%d: %w",
 			tunnelSwIfIndex, l.cfg.TunnelMTU, err)
 	}
+	// 隧道 MTU 还要告诉 TCP 两端，否则 LAN 终端按自己的 1500 协商出 1460 的段，
+	// 这些段到 WG 出口被切成带各自 SR 头的分片、落到 underlay 上（规则 6）。
+	// 2026-10-24 定案：MSS 自动取隧道 MTU - 40，不接受调用方另给一个数。
+	// 钳制点必须是 RX（收到方向），TX 在这张口的 ip4-output 弧上不生效 —— 实测
+	// 见 vppapi.SetMSSClamp 的注释。
+	mss := wire.TCPMSSForTunnelMTU(l.cfg.TunnelMTU)
+	if err := l.dp.SetMSSClamp(ctx, tunnelSwIfIndex, mss); err != nil {
+		return fmt.Errorf("agent: 给隧道接口 %d 设 TCP MSS=%d（MTU %d - 40）: %w",
+			tunnelSwIfIndex, mss, l.cfg.TunnelMTU, err)
+	}
 	if l.cfg.UnderlayMTU == 0 {
 		return nil
 	}
@@ -516,6 +531,24 @@ func (l *Link) verifyLanded(ctx context.Context, tunnelSwIfIndex uint32) error {
 		return fmt.Errorf("agent: 隧道接口 %s(%d) 的 MTU 记录是 %d，我们要的是 %d："+
 			"数据面按这个数切内层分片，记错了就是大包黑洞（有别的人在改这张表？）",
 			tun.Name, tunnelSwIfIndex, tun.L3MTU, l.cfg.TunnelMTU)
+	}
+	// MSS 与 MTU 成对：只有 MTU 落地、MSS 没落地时，隧道会"能通"但每一条大段
+	// TCP 都在出口被切成带自己 SR 头的分片。读回同时核对数和方向 —— 方向配成 TX
+	// 时这个插件**什么都不报**（实测），只有读回能看出它到底是 RX 还是 TX。
+	wantMSS := wire.TCPMSSForTunnelMTU(l.cfg.TunnelMTU)
+	mss, ok, err := l.dp.MSSClamp(ctx, tunnelSwIfIndex)
+	if err != nil {
+		return fmt.Errorf("agent: 读回隧道接口 %s(%d) 的 TCP MSS 钳制: %w", tun.Name, tunnelSwIfIndex, err)
+	}
+	if !ok {
+		return fmt.Errorf("agent: 隧道接口 %s(%d) 上没有 TCP MSS 钳制记录（刚写进去的应是 %d）："+
+			"MTU 生效而 MSS 没生效时，LAN 终端会按自己的 1500 协商出要被切片的段",
+			tun.Name, tunnelSwIfIndex, wantMSS)
+	}
+	if mss.IPv4MSS != wantMSS || mss.IPv4Dir&vppapi.MSSClampDirRX == 0 {
+		return fmt.Errorf("agent: 隧道接口 %s(%d) 的 MSS 钳制读回是 ipv4 mss=%d dir=%d，"+
+			"我们要的是 %d 且方向含 RX（TX 在 wg0 的 ip4-output 弧上不生效）",
+			tun.Name, tunnelSwIfIndex, mss.IPv4MSS, mss.IPv4Dir, wantMSS)
 	}
 	// 没给 UnderlayMTU 就压根没写 underlay，读回来的记录自然不该由我们负责。
 	if l.cfg.UnderlayMTU != 0 && egress.L3MTU != uint32(l.cfg.UnderlayMTU) {

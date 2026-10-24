@@ -43,6 +43,11 @@ type fakeVPP struct {
 	encap   map[uint32]bool
 	mtus    map[uint32]uint16
 	mtuErr  error
+	// mssClamps 是 mss_clamp 插件那张表：写进去多少就记多少。mssDir 非 0 时
+	// MSSClamp 读回这个方向（用来造"配成了 TX"这种真机上完全不报错的坏状态）。
+	mssClamps map[uint32]uint16
+	mssDir    uint8
+	mssErr    error
 	// swIfs 是 core 接口表里**非 WG** 的那几张（真机上还有 local0 之类，本测试
 	// 只关心 underlay 出口）。WG 那几张由 CreateInterface 的记账现算。
 	swIfs   []vppapi.SwInterface
@@ -54,8 +59,8 @@ type fakeVPP struct {
 	// 只把端口加进集合不够，agent 必须显式打开）。
 	transitPort uint16
 	obs         []vppapi.Observation
-	nextIdx uint32
-	nextPi  uint32
+	nextIdx     uint32
+	nextPi      uint32
 	// alreadyGone 让 RemovePeer **删掉的同时**回 -6：模拟"数据面里这条其实
 	// 已经没了"（上次崩在中途、或对端刚被别的路径撤掉）。
 	alreadyGone bool
@@ -202,6 +207,34 @@ func (f *fakeVPP) SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU u
 // bornVIFMTU 是 VPP 给 af-packet 口的默认 MTU 记录（实测 9000），而实验室的容器
 // 网卡只有 1500。规则 6 那条发送侧卡死就是这两个数不一致造成的。
 const bornVIFMTU = 9000
+
+// SetMSSClamp 和真插件一样不校验值：合法性由 agent 从隧道 MTU 算出来，fake 只
+// 负责把"写下去了什么"记录下来，读回才能证明写的是不是那个数。
+func (f *fakeVPP) SetMSSClamp(ctx context.Context, swIfIndex uint32, mss uint16) error {
+	f.log("SetMSSClamp %d=%d", swIfIndex, mss)
+	if f.mssErr != nil {
+		return f.mssErr
+	}
+	if f.mssClamps == nil {
+		f.mssClamps = map[uint32]uint16{}
+	}
+	f.mssClamps[swIfIndex] = mss
+	return nil
+}
+
+// MSSClamp 按真插件的语义读回：没配过的接口没有明细（ok=false）。
+func (f *fakeVPP) MSSClamp(ctx context.Context, swIfIndex uint32) (vppapi.MSSClampInfo, bool, error) {
+	f.log("MSSClamp %d", swIfIndex)
+	mss, ok := f.mssClamps[swIfIndex]
+	if !ok {
+		return vppapi.MSSClampInfo{}, false, nil
+	}
+	dir := uint8(vppapi.MSSClampDirRX)
+	if f.mssDir != 0 {
+		dir = f.mssDir
+	}
+	return vppapi.MSSClampInfo{SWIfIndex: swIfIndex, IPv4MSS: mss, IPv4Dir: dir}, true, nil
+}
 
 // DumpInterfaces 回读"VPP 眼下的接口表"：非 WG 的那几张来自 swIfs，WG 的那几张由
 // CreateInterface 的记账现算，两张都叠上 SetInterfaceMTU 写过的值。

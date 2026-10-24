@@ -243,3 +243,114 @@ func TestOpenFailsWhenMTUWriteFails(t *testing.T) {
 		t.Errorf("重试后没补上隧道 MTU: %v", f.mtus)
 	}
 }
+
+// MSS 钳制是隧道 MTU 的函数（2026-10-24 定案：自动取 MTU - 40），调用方不再给
+// 第二个数。它只写在隧道口上 —— underlay 出口的外层是 UDP，钳 TCP MSS 毫无意义。
+func TestOpenSetsMSSClampFromTunnelMTU(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mtu  uint16
+		want uint16
+	}{
+		{"没下发时用契约默认", 0, wire.DefaultTunnelMTU - wire.TCPOverheadBytes},
+		{"显式 1200", 1200, 1160},
+		{"下界", wire.MinTunnelMTU, wire.MinTunnelMTU - wire.TCPOverheadBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeVPP()
+			cfg := testConfig(t, f, newTestPKI(t))
+			cfg.TunnelMTU = tc.mtu
+			l, err := NewLink(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			if err := l.InstallKeys(ctx, []Key{{HmacID: 9001, Key: randomBytes(t, 16)}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l.Open(ctx); err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			if got := f.mssClamps[l.SWIfIndex()]; got != tc.want {
+				t.Errorf("隧道接口 %d 的 MSS 应是 %d（MTU %d - 40），实际 %d",
+					l.SWIfIndex(), tc.want, f.mtus[l.SWIfIndex()], got)
+			}
+			if _, seen := f.mssClamps[encapIfIndex]; seen {
+				t.Errorf("不该在 underlay 出口 %d 上钳 MSS：那里只看得见外层 UDP", encapIfIndex)
+			}
+			// 顺序：先有 MTU 记录，才有"按它算出来"的 MSS。
+			iMTU := indexOfCallPrefix(f.calls, fmt.Sprintf("SetInterfaceMTU %d=", l.SWIfIndex()))
+			iMSS := indexOfCallPrefix(f.calls, fmt.Sprintf("SetMSSClamp %d=", l.SWIfIndex()))
+			if iMTU < 0 || iMSS < 0 || iMSS < iMTU {
+				t.Errorf("MSS 应在隧道 MTU 之后写，调用序列: %v", f.calls)
+			}
+		})
+	}
+}
+
+// 认回分支同样要补 MSS：mss_clamp 的表不随 WG 接口一起持久，VPP 重启或操作员
+// 清过之后，"接口还在"不等于"钳制还在"。
+func TestAdoptRewritesMSSClamp(t *testing.T) {
+	f := newFakeVPP()
+	l, _ := newTestLink(t, f)
+	ctx := context.Background()
+	if err := l.InstallKeys(ctx, []Key{{HmacID: 9001, Key: randomBytes(t, 16)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	l2 := restartLink(t, l)
+	if err := l2.InstallKeys(ctx, []Key{{HmacID: 9001, Key: randomBytes(t, 16)}}); err != nil {
+		t.Fatal(err)
+	}
+	f.mssClamps = nil // 模拟"表被清空"
+	f.calls = nil
+	adopted, err := l2.Open(ctx)
+	if err != nil || !adopted {
+		t.Fatalf("第二次 Open 应认回: adopted=%v err=%v", adopted, err)
+	}
+	want := wire.DefaultTunnelMTU - wire.TCPOverheadBytes
+	if got := f.mssClamps[l2.SWIfIndex()]; got != want {
+		t.Errorf("认回后应补上 MSS=%d，实际 %d", want, got)
+	}
+}
+
+func TestOpenFailsWhenMSSClampWriteFails(t *testing.T) {
+	f := newFakeVPP()
+	l, _ := newTestLink(t, f)
+	ctx := context.Background()
+	if err := l.InstallKeys(ctx, []Key{{HmacID: 9001, Key: randomBytes(t, 16)}}); err != nil {
+		t.Fatal(err)
+	}
+	f.mssErr = vppapi.APIError{Op: "mss_clamp_enable_disable", Retval: -7}
+	if _, err := l.Open(ctx); err == nil {
+		t.Fatal("MSS 钳制写失败必须让 Open 失败")
+	} else if !strings.Contains(err.Error(), "MSS") {
+		t.Errorf("报错要指明是 MSS: %v", err)
+	}
+	if _, err := l.ApplyPeer(ctx, PeerTarget{NodeID: 2}); err == nil ||
+		!strings.Contains(err.Error(), "还没 Open") {
+		t.Errorf("MSS 写失败后这条链路不该可用: %v", err)
+	}
+}
+
+// 读回方向是 TX：真机上不报错、配置显示正常，但包一个字节不改（实测）。所以
+// agent 必须自己把"读回来的方向"当判据，而不是信任写入的 retval。
+func TestOpenRejectsMSSClampThatLandedAsTX(t *testing.T) {
+	f := newFakeVPP()
+	f.mssDir = vppapi.MSSClampDirTX
+	l, _ := newTestLink(t, f)
+	ctx := context.Background()
+	if err := l.InstallKeys(ctx, []Key{{HmacID: 9001, Key: randomBytes(t, 16)}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := l.Open(ctx)
+	if err == nil {
+		t.Fatal("钳制方向落地为 TX 时必须报错")
+	}
+	if !strings.Contains(err.Error(), "RX") {
+		t.Errorf("报错要点名 RX 方向: %v", err)
+	}
+}

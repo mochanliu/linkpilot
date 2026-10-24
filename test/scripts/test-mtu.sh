@@ -20,7 +20,8 @@
 #
 # 前置：**必须先跑过 test-e2e.sh --keep**（wg0@51820 单隧道已通、三个容器在跑）。
 # 本脚本只发探测包、只在 ASSERT F 里临时改一次 node1 的 wg0 记录并立刻改回来；
-# ASSERT I 会临时建一张 tap9 当"终端"再删掉。
+# ASSERT I 会临时建一张 tap9 当"终端"再删掉，ASSERT J 会临时在两端各建一张
+# tap（tap10/tap11）和两条 192.168.50/60 的 VPP 路由，跑完删掉。
 #
 # 用法:
 #   test/scripts/test-mtu.sh [--keep]
@@ -572,9 +573,122 @@ else
     ping_ok "${C_NODE1}" "${OVERLAY_N2}" "${IF1}" && ok "DF 实验之后隧道仍然通" || bad "DF 实验把隧道弄不通了"
 fi
 
+# ==================================================================
+info "ASSERT J: TCP MSS 钳制 —— 两端 RX 钳制把穿隧道的 SYN 改成 隧道MTU-40"
+# ==================================================================
+# 这条补的是"MTU 记录怎么影响 TCP"的落点。内层超了记录时 VPP 会切片（ASSERT E），
+# 但 TCP 端点并不知道，LAN 终端按 1500 谈出 MSS=1460 才是最省事的路径，于是大包在
+# WG 出口被切，每片再背一份 SR/WG 头。真实 LAN 不会替 CPE 记住隧道 MTU，所以要么
+# 发端收到 ICMP frag-needed 自己降（ASSERT I），要么在入口把 MSS 改小 —— 后者就是
+# mss_clamp 插件，MSS = 隧道 MTU - 40（20 IP + 20 TCP）。
+#
+# 方向实测结论（2026-10-24，wg0 上 A/B/A 三轮）：TX 钳制**完全无效** —— WG 接口的
+# ip4-output arc 上 wg4-output-tun 排在 tcp-mss-clamping-ip4-out 之前，SYN 原样带着
+# 1460 出去；RX 钳制生效，**包括从别的接口转发进来的包**。所以正确配置是两端各自
+# 在自己 wg0 的 RX 上钳，setup-node.sh 的 wg-create 已经这么配了。
+#
+# 判据两条：
+#   (a) 配置：两端 wg0 的明细是 ip4: <MTU-40> [RX]（TX 或 disabled 都算红）；
+#   (b) 功能：在 node1 接一台内核"终端"发真 SYN，node2 接一台"终端"收 —— 出去时
+#       MSS 是 1460（终端按自己 1500 的 LAN 谈的），到 node2 已经是 1320。
+#       只断言收端等于 MTU-40 不够：如果 SYN 根本没走隧道，那条断言也会"通过"，
+#       所以必须同时看到发端那条更大的 MSS。
+J_TAP_A=tap10
+J_TAP_B=tap11
+J_LAN_A=192.168.50
+J_LAN_B=192.168.60
+MSS_EXPECT=$((MTU_LIVE - 40))
+J_A_OUT="${TRACE_DIR}/j-syn-a.txt"
+J_B_OUT="${TRACE_DIR}/j-syn-b.txt"
+
+# ---- (a) 两端的配置 ----
+for jc in "${C_NODE1}" "${C_NODE2}"; do
+    jl=$(vpp "${jc}" "show interface tcp-mss-clamp ${IF1}")
+    echo "      $(role_of "${jc}") ${IF1}: ${jl}"
+    printf '%s' "${jl}" | grep -q "ip4: ${MSS_EXPECT} \[RX\]" &&
+        ok "$(role_of "${jc}") ${IF1} 上配着 RX 钳制 ${MSS_EXPECT}（= ${MTU_LIVE} - 40）" ||
+        bad "$(role_of "${jc}") ${IF1} 的钳制不是 'ip4: ${MSS_EXPECT} [RX]'（'${jl}'）—— TX 方向实测不生效；手工修：vppctl set interface tcp-mss-clamp ${IF1} ip4 rx ip4-mss ${MSS_EXPECT} ip6 disable"
+done
+
+# ---- (b) 功能：真 SYN 穿隧道 ----
+# 判"路由本来就有没有"，只删自己加的那条，别把环境里的东西删掉。
+j_add_route() {   # <container> <prefix> <via> -> 0=本次新增
+    if vpp "$1" "show ip fib $2" | grep -q "CLI refs"; then return 1; fi
+    vpp "$1" "ip route add $2 via $3" >/dev/null 2>&1 || return 2
+    return 0
+}
+for jc in "${C_NODE1}" "${C_NODE2}"; do
+    vpp "${jc}" "delete tap ${J_TAP_A}" >/dev/null 2>&1
+    vpp "${jc}" "delete tap ${J_TAP_B}" >/dev/null 2>&1
+done
+TAPA_NEW=$(vpp "${C_NODE1}" "create tap if-name ${J_TAP_A} host-if-name ${J_TAP_A} host-ip4-addr ${J_LAN_A}.1/24 host-mtu-size 1500")
+TAPB_NEW=$(vpp "${C_NODE2}" "create tap if-name ${J_TAP_B} host-if-name ${J_TAP_B} host-ip4-addr ${J_LAN_B}.1/24 host-mtu-size 1500")
+if [ "${TAPA_NEW}" != "${J_TAP_A}" ] || [ "${TAPB_NEW}" != "${J_TAP_B}" ]; then
+    bad "建不出终端 tap（node1 '${TAPA_NEW}' / node2 '${TAPB_NEW}'），功能那条无法判定"
+else
+    for p in "${C_NODE1}:${J_TAP_A}:${J_LAN_A}.2" "${C_NODE2}:${J_TAP_B}:${J_LAN_B}.2"; do
+        jc=${p%%:*}; rest=${p#*:}; jt=${rest%%:*}; jip=${rest##*:}
+        vpp "${jc}" "set interface state ${jt} up" >/dev/null
+        vpp "${jc}" "set interface mtu 1500 ${jt}" >/dev/null
+        vpp "${jc}" "set interface ip address ${jt} ${jip}/24" >/dev/null
+    done
+    # 终端（内核侧 tap10）靠 .2 当网关。隧道里只能下**/32 主机路由**：WG 是点对点
+    # 接口、没有 ARP，`ip route add <前缀>/24 via wg0` 会被 VPP 建成 attached/glean，
+    # 转发时 dpo-drop（实测：包在 ip4-lookup 就丢，show ip fib 里是 dpo-drop，症状是
+    # 隧道 ping 不通但没有任何错误计数）。overlay 路由本来也是 /32，正好一致。
+    dx "${C_NODE1}" "ip route add ${J_LAN_B}.0/24 via ${J_LAN_A}.2 dev ${J_TAP_A}" >/dev/null 2>&1
+    dx "${C_NODE2}" "ip route add ${J_LAN_A}.0/24 via ${J_LAN_B}.2 dev ${J_TAP_B}" >/dev/null 2>&1
+    dx "${C_NODE1}" "ip route flush cache" >/dev/null 2>&1
+    dx "${C_NODE2}" "ip route flush cache" >/dev/null 2>&1
+    j_add_route "${C_NODE1}" "${J_LAN_B}.1/32" "${IF1}"; J_R1=$?
+    j_add_route "${C_NODE2}" "${J_LAN_A}.1/32" "${IF1}"; J_R2=$?
+    [ "${J_R1}" = "0" ] || bad "node1 加 ${J_LAN_B}.1/32 via ${IF1} 失败"
+    [ "${J_R2}" = "0" ] || bad "node2 加 ${J_LAN_A}.1/32 via ${IF1} 失败"
+
+    # 两端各抓一个 SYN：发端证明"终端确实按 1500 谈 MSS"，收端证明"到这一侧已被改写"。
+    # tcpdump 的 stdout 落到宿主上的 TRACE_DIR（与其余 trace 证据同一处），不是在容器里重定向。
+    dx "${C_NODE1}" "timeout 10 tcpdump -i ${J_TAP_A} -n -l -c 1 -v 'tcp[tcpflags] & tcp-syn != 0'" > "${J_A_OUT}" 2>/dev/null &
+    JPID_A=$!
+    dx "${C_NODE2}" "timeout 10 tcpdump -i ${J_TAP_B} -n -l -c 1 -v 'tcp[tcpflags] & tcp-syn != 0'" > "${J_B_OUT}" 2>/dev/null &
+    JPID_B=$!
+    sleep 1
+    # 内核终端发一个真 SYN：没有监听者，收到 RST 就结束。
+    dx "${C_NODE1}" "timeout 3 bash -c 'exec 3<>/dev/tcp/${J_LAN_B}.1/8080'" >/dev/null 2>&1
+    wait "${JPID_A}" 2>/dev/null
+    wait "${JPID_B}" 2>/dev/null
+
+    MSS_A=$(grep -o 'mss [0-9]*' "${J_A_OUT}" 2>/dev/null | awk '{print $2}' | head -1)
+    MSS_B=$(grep -o 'mss [0-9]*' "${J_B_OUT}" 2>/dev/null | awk '{print $2}' | head -1)
+    echo "      SYN 的 MSS：node1 发出 ${MSS_A:-<没抓到>} -> node2 收到 ${MSS_B:-<没抓到>}（期望 ${MTU_LIVE} 的 LAN 值是 1460、隧道值是 ${MSS_EXPECT}）"
+    if [ "${MSS_A:-0}" -gt "${MSS_EXPECT}" ] 2>/dev/null; then
+        ok "SYN 离开终端时 MSS=${MSS_A}（大于隧道值）：对照组成立，终端并不知道隧道 MTU"
+    else
+        bad "发端 SYN 的 MSS 是 '${MSS_A:-<没抓到>}'（应大于 ${MSS_EXPECT}）：抓包或注入路径有问题，下面收端那条不能单独作数"
+    fi
+    [ "${MSS_B:-0}" = "${MSS_EXPECT}" ] &&
+        ok "SYN 到 node2 时 MSS 已被 RX 钳制改成 ${MSS_B}（= ${MTU_LIVE} - 40）" ||
+        bad "SYN 到 node2 的 MSS 是 '${MSS_B:-<没抓到>}'，期望 ${MSS_EXPECT}：钳制没生效或方向配错了"
+
+    # ---- 收拾：只删自己加的 ----
+    dx "${C_NODE1}" "ip route del ${J_LAN_B}.0/24 via ${J_LAN_A}.2 dev ${J_TAP_A}" >/dev/null 2>&1
+    dx "${C_NODE2}" "ip route del ${J_LAN_A}.0/24 via ${J_LAN_B}.2 dev ${J_TAP_B}" >/dev/null 2>&1
+    [ "${J_R1}" = "0" ] && vpp "${C_NODE1}" "ip route del ${J_LAN_B}.1/32" >/dev/null 2>&1
+    [ "${J_R2}" = "0" ] && vpp "${C_NODE2}" "ip route del ${J_LAN_A}.1/32" >/dev/null 2>&1
+    vpp "${C_NODE1}" "delete tap ${J_TAP_A}" >/dev/null 2>&1
+    vpp "${C_NODE2}" "delete tap ${J_TAP_B}" >/dev/null 2>&1
+    if [ -z "$(swidx_of "${C_NODE1}" "${J_TAP_A}")" ] && [ -z "$(swidx_of "${C_NODE2}" "${J_TAP_B}")" ] &&
+       [ -z "$(dx "${C_NODE1}" "ip -o link show ${J_TAP_A} 2>/dev/null")" ] &&
+       [ -z "$(dx "${C_NODE2}" "ip -o link show ${J_TAP_B} 2>/dev/null")" ]; then
+        ok "实验结束 ${J_TAP_A}/${J_TAP_B} 的 VPP 侧与内核侧都已删除"
+    else
+        bad "终端 tap 有残留：手工执行 vppctl delete tap ${J_TAP_A}（node1）/ ${J_TAP_B}（node2）"
+    fi
+    ping_ok "${C_NODE1}" "${OVERLAY_N2}" "${IF1}" && ok "MSS 实验之后隧道仍然通" || bad "MSS 实验把隧道弄不通了"
+fi
+
 echo
 echo "=========================================================="
-echo " trace 证据: ${TRACE_DIR}/{c-exact,e-over,f-zero,e-transit,i-fit,i-over}.txt"
+echo " trace 证据: ${TRACE_DIR}/{c-exact,e-over,f-zero,e-transit,i-fit,i-over,j-syn-a,j-syn-b}.txt"
 echo " 实测结论：内层 = ping size + 36；外层 = 内层 + 32 + (24+6*${SEGS}) + 28"
 echo "          隧道 MTU 由 VPP 执行，执行动作是按它切内层分片（不是拒发）"
 echo "          内层带 DF 时不切：丢弃 + 回 ICMP type3/code4，MTU 报的就是隧道记录"
