@@ -61,6 +61,13 @@ type EnrollRequest struct {
 	UDPRelfectorN int    `json:"udp_reflectors"` // how many reflector addrs the agent can probe
 }
 
+// RRAddress names one route reflector. ID is for humans and session logs; Addr
+// is the TLS endpoint the CPE dials ("host:port").
+type RRAddress struct {
+	ID   string `json:"id"`
+	Addr string `json:"addr"`
+}
+
 // EnrollResponse hands back the device certificate plus everything the
 // agent needs to operate. Note what is NOT here: any per-peer secret. The
 // key ring below is the tenant-wide DOMAIN material, shared on purpose because
@@ -75,6 +82,13 @@ type EnrollResponse struct {
 	UDPReflector []string `json:"udp_reflector"` // STUN-equivalent reflector addresses
 	HeartbeatSec int      `json:"heartbeat_sec"`
 	Epoch        uint32   `json:"epoch"` // controller-assigned; devices never compute this themselves
+
+	// RRs are the route-reflector neighbours this CPE must keep. They are
+	// pushed, not configured: "CPE 和云端两个 RR 建邻居" makes the controller
+	// the only party that knows where they are and how many there are. The
+	// order is the failover preference -- the CPE serves its "bgp" table from
+	// the first RR it has synced with, so element 0 must be the preferred one.
+	RRs []RRAddress `json:"rrs"`
 
 	// VpnPort and TransitPort are the tenant's UDP function ports, pushed rather
 	// than configured per node. This is constraint (2) of the design -- the

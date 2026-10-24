@@ -198,6 +198,7 @@ type server struct {
 	hbSec    int
 	tlsAddrs []string
 	udpAddrs []string
+	rrs      []wire.RRAddress
 
 	caCert  *x509.Certificate
 	caKey   ed25519.PrivateKey
@@ -533,20 +534,28 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
 	s.save()
 
-	json.NewEncoder(w).Encode(wire.EnrollResponse{
+	json.NewEncoder(w).Encode(s.enrollResponse(tenant, rec, certPEM, string(caPEM)))
+}
+
+// enrollResponse is the contract the CPE actually consumes. Split out of the
+// handler so a test can pin the pushed fields (ports, MTU, key ring, RR list)
+// without standing up the CA and the claim flow.
+func (s *server) enrollResponse(tenant string, rec *NodeRecord, certPEM, caPEM string) wire.EnrollResponse {
+	return wire.EnrollResponse{
 		TenantID:     tenant,
 		NodeID:       rec.NodeID,
 		CertPEM:      certPEM,
-		CAPEM:        string(caPEM),
+		CAPEM:        caPEM,
 		TLSAddrs:     s.tlsAddrs,
 		UDPReflector: s.udpAddrs,
+		RRs:          s.rrs,
 		HeartbeatSec: s.hbSec,
 		Epoch:        s.advanceEpoch(),
 		VpnPort:      s.vpnPort,
 		TransitPort:  s.transitPort,
 		TunnelMTU:    s.tunnelMTU,
 		PKeys:        s.tenantKeyRing(tenant),
-	})
+	}
 }
 
 func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -1351,6 +1360,43 @@ func (s *server) ttlSweeper(ctx context.Context) {
 	}
 }
 
+// rrAddresses is the -rr flag value: "id=addr", repeatable. The order is the
+// failover preference handed to every CPE, so a duplicate would make that
+// order ambiguous -- rejected instead of silently deduped.
+type rrAddresses []wire.RRAddress
+
+func (l *rrAddresses) String() string {
+	parts := make([]string, 0, len(*l))
+	for _, e := range *l {
+		parts = append(parts, e.ID+"="+e.Addr)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (l *rrAddresses) Set(v string) error {
+	id, addr, ok := strings.Cut(v, "=")
+	if !ok {
+		return fmt.Errorf("want id=addr, got %q", v)
+	}
+	id, addr = strings.TrimSpace(id), strings.TrimSpace(addr)
+	if id == "" || addr == "" {
+		return fmt.Errorf("rr id and address must both be non-empty (got %q)", v)
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return fmt.Errorf("rr %s address %q must be host:port: %w", id, addr, err)
+	}
+	for _, e := range *l {
+		if e.ID == id {
+			return fmt.Errorf("rr id %q listed twice", id)
+		}
+		if e.Addr == addr {
+			return fmt.Errorf("rr address %q listed twice", addr)
+		}
+	}
+	*l = append(*l, wire.RRAddress{ID: id, Addr: addr})
+	return nil
+}
+
 // ------------------------------------------------------------------ main
 
 func main() {
@@ -1386,6 +1432,12 @@ func main() {
 		// that still looks healthy.
 		metricsTTL = flag.Int("metrics-ttl", 30, "seconds a telemetry window stays readable after its last report")
 	)
+
+	// The RR list is pushed to every CPE at enrollment. Repeatable so the
+	// operator's order IS the failover preference (first synced RR serves the
+	// table); duplicates are rejected rather than silently ordering one twice.
+	var rrs rrAddresses
+	flag.Var(&rrs, "rr", "route reflector as id=addr (repeatable; order = failover preference)")
 	flag.Parse()
 
 	checkPort := func(name string, p uint) uint16 {
@@ -1446,6 +1498,7 @@ func main() {
 		hbSec:       *hbSec,
 		tlsAddrs:    []string{*listen},
 		udpAddrs:    []string{*udpAddr, *udpAddr2},
+		rrs:         rrs,
 		caCert:      ca,
 		caKey:       caKey,
 		dataDir:     *dataDir,
