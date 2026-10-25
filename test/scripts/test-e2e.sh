@@ -416,10 +416,10 @@ else
     else
         ok "接口删除后 ${LB_NAME} 那条已从挂点表里消失（表按 VPP 的真实登记重算过）"
     fi
-    if echo "${TUN_OUT}" | grep -q 'host-eth0'; then
-        ok "真出口 host-eth0 仍在挂点表里（reconcile 没有误伤有效条目）"
+    if echo "${TUN_OUT}" | grep -q "${UVIF}"; then
+        ok "真出口 ${UVIF} 仍在挂点表里（reconcile 没有误伤有效条目）"
     else
-        bad "挂点表里连 host-eth0 都没了，reconcile 判据读错了 VPP 的登记：$(echo "${TUN_OUT}" | head -3 | tr '\n' ' ')"
+        bad "挂点表里连 ${UVIF} 都没了，reconcile 判据读错了 VPP 的登记：$(echo "${TUN_OUT}" | head -3 | tr '\n' ' ')"
     fi
 fi
 

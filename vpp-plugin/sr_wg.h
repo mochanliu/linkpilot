@@ -184,6 +184,9 @@ typedef struct {
 
 extern sr_wg_main_t sr_wg_main;
 
+/* 日志类别（sr_wg.c 中 VLIB_REGISTER_LOG_CLASS 定义） */
+extern vlib_log_class_registration_t sr_wg_log;
+
 /* ==================== 密钥管理 ==================== */
 
 int sr_wg_key_add(sr_wg_main_t *sm, u16 hmac_id, const u8 *key);
@@ -289,6 +292,8 @@ u32 sr_wg_port_count(sr_wg_main_t *sm, u8 kind);
 extern vlib_node_registration_t sr_wg4_transit_node;
 extern vlib_node_registration_t sr_wg4_input_node;
 extern vlib_node_registration_t sr_wg4_encap_node;
+extern vlib_node_registration_t sr_wg4_post_node;
+extern vlib_node_registration_t sr_wg4_mpls_out_node;
 extern vlib_node_registration_t sr_wg4_probe_node;
 extern vlib_node_registration_t sr_wg_probe_process_node;
 

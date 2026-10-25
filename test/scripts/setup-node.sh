@@ -304,14 +304,21 @@ wg_add_peer() {
     # `error-punt -> null-node` 黑洞掉，`show errors` 只涨 null-node blackholed，
     # 而源地址恰好等于对端 /32 的隧道自测 ping 正常（这就是它长期没被发现的原因）。
     # 改成 0.0.0.0/0 后同一转发 ping 3/3 通、punt 不涨；改回 /32 立即复现。
+    #
+    # ::/0 是 MPLS over WireGuard 的**必要条件**（2026-10-25 实测）：
+    # wg4-input 在按 nibble 分派**之前**做这个源地址检查，MPLS 包不满足
+    # is_ip4_header，于是被当 IPv6 读 8..24 字节（标签栈+载荷）当源地址，
+    # 只有 ::/0 覆盖得到。只配 0.0.0.0/0 时 MPLS 包在这里就 error-punt
+    # （实测 node2 的 null-node blackholed 计数 +1），根本到不了 sr-wg4-post。
     vppctl show wireguard peer 2>/dev/null | grep -q "${peer_pub}" ||
         vppctl wireguard peer add "${WG_IF}" \
                public-key "${peer_pub}" \
                endpoint "${PEER_UNDERLAY}" \
                allowed-ip 0.0.0.0/0 \
+               allowed-ip ::/0 \
                dst-port "${VPN_PORT}" \
                persistent-keepalive "${KEEPALIVE}" || die "wireguard peer add failed"
-    log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=0.0.0.0/0"
+    log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=0.0.0.0/0,::/0"
 }
 
 # WireGuard 有 endpoint roaming：对端只要从另一个地址发来**签名有效**的报文，
@@ -397,6 +404,14 @@ cmd_init() {
     log "installing SR P-Key (hmac_id=${SR_HMAC_ID})"
     vppctl sr-wg key set "${SR_HMAC_ID}" "${SR_KEY_HEX}" || die "sr-wg key set failed"
 
+    # 默认 MPLS 表 0 是入标签的查找表（VPN VRF 标签统一在表 0 里查）。
+    # VPP 26.06 不会自动建它：`set interface mpls` 会直接报
+    # "default MPLS table must be created first"（实测），接口 MPLS 开关
+    # 就永远打不开。重复 add 是幂等的（无输出）。
+    local mpls_out
+    mpls_out=$(vppctl mpls table add 0 2>&1)
+    [ -z "${mpls_out}" ] || die "mpls table add 0 failed: ${mpls_out}"
+
     case "${ROLE}" in
       node1)
         VIF=$(host_if_or_die "${SELF_UNDERLAY}" "${NET_A_PFX}")
@@ -436,6 +451,16 @@ cmd_wg_create() {
     fi
     vppctl set interface ip address "${WG_IF}" "${SELF_OVERLAY}/${OVERLAY_PFX}" 2>/dev/null || true
     vppctl set interface state "${WG_IF}" up
+    # MPLS 收包开关。解密后的 MPLS 包由 sr-wg4-post 引导进 mpls-input，
+    # 而 mpls-input 按**收包接口**（wg4-input 写入的 wg0）的 MPLS 开关放行，
+    # 未开时直接给 mpls-not-enabled。VPN VRF 路由一律带标签，所以这是隧道
+    # 接口的固定能力，与当下有没有 VPN 路由无关。
+    # 注意 vppctl 对 CLI 错误也返回 0（实测 enable 失败时 rc 仍为 0），
+    # 所以必须看输出而不是看退出码。
+    local mpls_out
+    mpls_out=$(vppctl set interface mpls "${WG_IF}" enable 2>&1)
+    [ -z "${mpls_out}" ] ||
+        die "set interface mpls ${WG_IF} enable failed: ${mpls_out}"
     # 隧道接口的 MTU 记录。手建的 WG 接口四个槽默认全是 0（= 没有记录，什么都不
     # 限制），所以这一行是必须写的。它会被执行，动作是按它切内层分片、不是拒发
     # （见上面 TUNNEL_MTU 的注释；断言在 test/scripts/test-mtu.sh）。public key
@@ -443,12 +468,13 @@ cmd_wg_create() {
     local mtu_out
     mtu_out=$(vppctl set interface mtu packet "${TUNNEL_MTU}" "${WG_IF}" 2>&1 || true)
     [ -n "${mtu_out}" ] && log "set interface mtu ${TUNNEL_MTU} ${WG_IF}: ${mtu_out}"
-    # TCP MSS 钳制：MSS = 隧道 MTU - 40（20 IP + 20 TCP）。方向只能是 RX —— 实测
-    # WG 接口 ip4-output arc 上 wg4-output-tun 抢在 tcp-mss-clamping-ip4-out 前面，
-    # TX 配了也不改包；收包侧（包括从别的口转发进来的 SYN）才真正生效，两端各钳
-    # 自己收到的 SYN。ip6 目前是 disable：本套 overlay 只跑 IPv4，mss_clamp 的 CLI
-    # 又要求两口都写出来。
-    local mss=$((TUNNEL_MTU - 40))
+    # TCP MSS 钳制：MSS = 隧道 MTU - 44（20 IP + 20 TCP + 4 B MPLS 标签；VPN VRF
+    # 路由会在内层再压一个 4 B 标签，不把这一层算进来大包就会超隧道 MTU）。方向
+    # 只能是 RX —— 实测 WG 接口 ip4-output arc 上 wg4-output-tun 抢在
+    # tcp-mss-clamping-ip4-out 前面，TX 配了也不改包；收包侧（包括从别的口转发进来
+    # 的 SYN）才真正生效，两端各钳自己收到的 SYN。ip6 目前是 disable：本套 overlay
+    # 只跑 IPv4，mss_clamp 的 CLI 又要求两口都写出来。
+    local mss=$((TUNNEL_MTU - 44))
     local clamp_out
     clamp_out=$(vppctl set interface tcp-mss-clamp "${WG_IF}" ip4 rx ip4-mss "${mss}" ip6 disable 2>&1 || true)
     [ -n "${clamp_out}" ] && log "set interface tcp-mss-clamp ${WG_IF} ip4 rx ip4-mss ${mss}: ${clamp_out}"
