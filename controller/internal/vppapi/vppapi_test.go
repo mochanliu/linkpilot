@@ -42,6 +42,9 @@ type fakeVPP struct {
 	mssDetails  [][]byte // mss_clamp_get 回的明细净体（不含 msg_id+context）
 	probeRaw    [][]byte // sr_wg_probe_dump 回的明细净体
 	bfdRaw      [][]byte // bfd_udp_session_dump 回的明细净体
+	ipRouteRaw  [][]byte // ip_route_dump 回的明细净体
+	mplsRaw     [][]byte // mpls_route_dump 回的明细净体
+	cliReply    string   // cli_inband 的应答字符串
 	requests    chan request
 }
 
@@ -237,6 +240,24 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "bfd_udp_session_dump":
 		for _, raw := range f.bfdRaw {
 			f.sendFrameOf(conn, "bfd_udp_session_details", reqCtx, raw)
+		}
+	case "ip_table_add_del":
+		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
+	case "ip_route_add_del", "mpls_route_add_del":
+		// 两条 reply 同形：retval(4) + stats_index(4)（CRC 都是 1992deab）。
+		f.reply(conn, name, reqCtx, append(uint32Bytes(uint32(f.retvals[name])), uint32Bytes(0)...))
+	case "cli_inband":
+		out := make([]byte, 0, 4+len(f.cliReply))
+		out = appendU32(out, uint32(len(f.cliReply)))
+		out = append(out, f.cliReply...)
+		f.reply(conn, name, reqCtx, append(uint32Bytes(uint32(f.retvals[name])), out...))
+	case "ip_route_dump":
+		for _, raw := range f.ipRouteRaw {
+			f.sendFrameOf(conn, "ip_route_details", reqCtx, raw)
+		}
+	case "mpls_route_dump":
+		for _, raw := range f.mplsRaw {
+			f.sendFrameOf(conn, "mpls_route_details", reqCtx, raw)
 		}
 	case "sw_interface_dump":
 		if len(f.swIfRaw) > 0 {

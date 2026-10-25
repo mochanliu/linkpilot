@@ -90,6 +90,21 @@ var requiredVersions = map[string]string{
 	"sr_wg_probe_send_reply": "e8d4e804",
 	"sr_wg_probe_dump":       "51077d14",
 	"sr_wg_probe_details":    "46673557",
+	// FIB 加载器（任务 #38）：core 的 ip / mpls 消息，外加执行 `sr-wg mpls-egress`
+	// 用的 cli_inband。CRC 取自 srwg-node1 的 /usr/share/vpp/api/core/*.api.json。
+	// fib_path / prefix 是变长结构，尺寸在 fib.go 里按 packed 布局算过。
+	"ip_table_add_del":         "0ffdaec0",
+	"ip_table_add_del_reply":   "e8d4e804",
+	"ip_route_add_del":         "b8ecfe0d",
+	"ip_route_add_del_reply":   "1992deab",
+	"ip_route_dump":            "b9d2e09e",
+	"ip_route_details":         "bda8f315",
+	"mpls_route_add_del":       "8e1d1e07",
+	"mpls_route_add_del_reply": "1992deab",
+	"mpls_route_dump":          "935fdefa",
+	"mpls_route_details":       "9b5043dc",
+	"cli_inband":               "f8377302",
+	"cli_inband_reply":         "05879051",
 	// 隧道内遥测：core BFD（vnet/bfd.api，VPP 自带）。同样取自 srwg-node1 的注册表。
 	// enable_multihop 不是可选项：不先调它，bfd_udp_add 一律回 -2（实测）。
 	"bfd_udp_enable_multihop":       "51077d14",
