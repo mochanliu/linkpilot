@@ -15,3 +15,5 @@ controller/vendor/
 *.pyc
 # 单元测试可执行文件（test/unit/Makefile 的 TARGET）
 test/unit/test_srwg
+# lab 运行时产物（生成的配置、取出的二进制、控制器 CA 与签发物）
+test/lab/run/
