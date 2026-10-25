@@ -1013,8 +1013,9 @@ func TestApplyPeerRefusesUnverifiedObservationInDataplane(t *testing.T) {
 }
 
 // allowed-ips 是常量，不是调用方的输入：定案 1（2026-10-18）把它固定成
-// 0.0.0.0/0，因为 wg4-input 会拿它过滤解密后的内层源地址。写对端 /32 会让
-// 被转发的终端流量在收端 punt 到 null-node（2026-10-24 实测，见 #26）。
+// 0.0.0.0/0 + ::/0，因为 wg4-input 会拿它过滤解密后的内层源地址。写对端 /32 会让
+// 被转发的终端流量在收端 punt 到 null-node（2026-10-24 实测，见 #26）；少了 ::/0，
+// MPLS 包会在同一个源地址检查处被黑洞（2026-10-25 实测，见 #36）。
 func TestApplyPeerAlwaysSendsWildcardAllowedIPs(t *testing.T) {
 	f := newFakeVPP()
 	l, pki := newTestLink(t, f)
@@ -1024,10 +1025,21 @@ func TestApplyPeerAlwaysSendsWildcardAllowedIPs(t *testing.T) {
 		target(2, cert, b, "10.10.2.2:51820", true, "")); err != nil {
 		t.Fatal(err)
 	}
-	got := f.peers[0].AllowedIPs
-	if len(got) != 1 || got[0].Len != 0 || !got[0].IP.Equal(net.IPv4zero) || len(got[0].IP) != 4 {
-		t.Fatalf("peer 的 allowed-ips 必须是唯一的 0.0.0.0/0（4 字节），实际 %+v", got)
+	if got := f.peers[0].AllowedIPs; !isWildcardPair(got) {
+		t.Fatalf("peer 的 allowed-ips 必须恰为 0.0.0.0/0（4 字节）+ ::/0（16 字节），实际 %+v", got)
 	}
+}
+
+// isWildcardPair 判断 allowed-ips 是不是那条常量，且字节宽度已归一
+// （4 字节的 IPv4 零地址、16 字节的 IPv6 零地址）—— 顺序不敏感。
+func isWildcardPair(ps []vppapi.Prefix) bool {
+	is4 := func(p vppapi.Prefix) bool {
+		return p.Len == 0 && len(p.IP) == 4 && p.IP.Equal(net.IPv4zero)
+	}
+	is6 := func(p vppapi.Prefix) bool {
+		return p.Len == 0 && len(p.IP) == 16 && p.IP.Equal(net.IPv6zero)
+	}
+	return len(ps) == 2 && ((is4(ps[0]) && is6(ps[1])) || (is6(ps[0]) && is4(ps[1])))
 }
 
 // 插件的绑定表**配置侧**按 sw_if_index 一槽（sr_wg4_encap.c 的
@@ -1294,7 +1306,7 @@ func TestApplyPeerNormalizesWildcardAllowedIPs(t *testing.T) {
 	if _, err := l.ApplyPeer(ctx, pt); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.peers[0].AllowedIPs; len(got) != 1 || got[0].Len != 0 || len(got[0].IP) != 4 {
+	if got := f.peers[0].AllowedIPs; !isWildcardPair(got) {
 		t.Errorf("写进数据面的前缀没归一: %+v", got)
 	}
 	if _, err := l.ApplyPeer(ctx, pt); err != nil {
@@ -1313,7 +1325,7 @@ func TestApplyPeerNormalizesWildcardAllowedIPs(t *testing.T) {
 	if change != PeerReplaced {
 		t.Errorf("数据面还是 /32，却判成 %q（期望 replaced）", change)
 	}
-	if got := f.peers[0].AllowedIPs; len(got) != 1 || got[0].Len != 0 {
+	if got := f.peers[0].AllowedIPs; !isWildcardPair(got) {
 		t.Errorf("没有纠正回常量: %+v", got)
 	}
 }
