@@ -32,7 +32,10 @@ func TestLiveFIB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial(%s): %v", sock, err)
 	}
-	defer c.Close()
+	// 关闭必须排在 cleanup 之后：t.Cleanup 按注册顺序的逆序执行，而 defer 比
+	// 任何 t.Cleanup 都先跑。直接 defer c.Close() 会让 cleanup 用一条已经关掉
+	// 的连接删标签/删表，错误又被 `_ =` 吞掉 —— 实测会留下 9991 + 9901。
+	t.Cleanup(func() { c.Close() })
 
 	const (
 		testTable = 9901

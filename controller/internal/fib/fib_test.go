@@ -90,6 +90,23 @@ func (f *fakeDP) DumpInterfaces(context.Context) ([]vppapi.SwInterface, error) {
 	return f.ifs, nil
 }
 
+func (f *fakeDP) FIBRoutes(_ context.Context, table uint32) ([]vppapi.IPRoute, error) {
+	var out []vppapi.IPRoute
+	for k, paths := range f.routes {
+		var t uint32
+		var p string
+		if _, err := fmt.Sscanf(k, "%d|%s", &t, &p); err != nil || t != table {
+			continue
+		}
+		out = append(out, vppapi.IPRoute{
+			TableID: table,
+			Prefix:  netip.MustParsePrefix(p),
+			Paths:   paths,
+		})
+	}
+	return out, nil
+}
+
 func (f *fakeDP) CLI(_ context.Context, cmd string) (string, error) {
 	if err := f.fail("cli"); err != nil {
 		return "", err

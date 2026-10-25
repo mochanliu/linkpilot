@@ -204,6 +204,7 @@ type DP interface {
 	MPLSLabelAddDel(ctx context.Context, label uint32, lookupTable uint32, add bool) error
 	MPLSLabelDel(ctx context.Context, label uint32) error
 	DumpInterfaces(ctx context.Context) ([]vppapi.SwInterface, error)
+	FIBRoutes(ctx context.Context, tableID uint32) ([]vppapi.IPRoute, error)
 	CLI(ctx context.Context, cmd string) (string, error)
 }
 

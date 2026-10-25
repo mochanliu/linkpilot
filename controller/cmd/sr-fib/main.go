@@ -114,9 +114,13 @@ func fetchRIB(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRoute,
 func main() {
 	configPath := flag.String("config", "", "path to the sr-fib config JSON")
 	once := flag.Bool("once", false, "收敛一次后退出（e2e / 手工验证用）")
+	reset := flag.Bool("reset", false, "撤掉配置里这些 VRF 的 FIB 状态（路由/标签/表）后退出")
 	flag.Parse()
 	if *configPath == "" {
 		log.Fatal("-config is required")
+	}
+	if *reset && *once {
+		log.Fatal("-reset 与 -once 不能同时用")
 	}
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
@@ -131,6 +135,16 @@ func main() {
 		log.Fatalf("vpp: %v", err)
 	}
 	defer vc.Close()
+
+	if *reset {
+		res, err := fib.Reset(ctx, vc, cfg.VRFs)
+		if err != nil {
+			log.Fatalf("sr-fib: reset: %v", err)
+		}
+		log.Printf("sr-fib: reset 撤 routes=%d labels=%d tables=%d",
+			res.RoutesRemoved, res.LabelsRemoved, res.TablesRemoved)
+		return
+	}
 
 	tunnels := make([]fib.Tunnel, 0, len(cfg.Tunnels))
 	for _, t := range cfg.Tunnels {
