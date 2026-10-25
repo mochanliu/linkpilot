@@ -26,8 +26,8 @@ UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
   lab-cpeN 10.99.0.1N:1900N   sr-route /status（sr-fib、sr-frr 从这里取 RIB）
 ```
 
-隧道（每对一条、每隧道一个端口——**两端同端口**——独立 overlay /32，全部经
-transit 两跳）：
+隧道（每对一条、每隧道一个端口——本 lab 里两端配成同号，便于肉眼对表——
+独立 overlay /32，全部经 transit 两跳）：
 
 | 隧道 | A 端 | B 端 | transit 端口 |
 |------|------|------|--------------|
@@ -35,10 +35,10 @@ transit 两跳）：
 | T13 | cpe1 wg1 51840 / 192.168.100.1 | cpe3 wg0 51840 / 192.168.100.2 | 51841 |
 | T23 | cpe2 wg1 51860 / 192.168.101.1 | cpe3 wg1 51860 / 192.168.101.2 | 51861 |
 
-为什么两端必须同端口：encap 的端口判据是 `udp->dst_port ∈ 本机 vpn_ports`，
-而 A→B 的 WG 包目的端口是 **B 的监听端口**。两端端口不同时该判据在发送侧
-永远不成立，SR 封装被静默跳过（`show sr-wg stats` 只见 encap_bypass 上涨，
-隧道仍然直连可用），终端流量因此不经 transit。
+两端端口不必相同：encap 的隧道身份来自绑定表 `(对端 endpoint, 对端 dst_port)`，
+与**本机** vpn_ports 无关（vpn_ports 只决定收包进 `sr-wg4-input` 还是
+`wg4-input`）。本 lab 用同号只是排版方便；非对称端口的回归在
+`test/scripts/test-multitunnel.sh`（node1 51830 / node2 51840）。
 
 路由链路：
 
