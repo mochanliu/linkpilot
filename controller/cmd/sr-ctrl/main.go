@@ -96,6 +96,13 @@ type NodeRecord struct {
 	// claimed over its authenticated channel.
 	LocalAddrs []string `json:"local_addrs,omitempty"`
 
+	// Tunnels is the node's declared tunnel table (peer + this node's overlay
+	// address on that tunnel), in canonical order. It is relayed PER READER in
+	// PeerInfo.OverlayIPs: the route protocol puts no next hop on a prefix, so a
+	// peer resolves the routes it learns from this node against the address this
+	// node declared for the link between them.
+	Tunnels []wire.TunnelEndpoint `json:"tunnels,omitempty"`
+
 	// Binding is the device's attested X25519 key (verified before storage --
 	// see applyBinding), and per the wire contract that key IS the node's
 	// WireGuard static public key. The controller stores and relays it; it can
@@ -665,6 +672,24 @@ func (s *server) handleMapping(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Declared tunnel endpoints are what peers resolve a next hop against. nil
+	// means "not reported" (keep the old table); an empty list means "I have no
+	// tunnels" and must clear it -- a torn-down tunnel left in the registry would
+	// keep handing peers an address that no longer answers.
+	if rep.Tunnels != nil {
+		tunnels, terr := wire.NormaliseTunnelEndpoints(nodeID, *rep.Tunnels)
+		if terr != nil {
+			s.mu.Unlock()
+			http.Error(w, terr.Error(), 400)
+			return
+		}
+		if !equalTunnels(tunnels, rec.Tunnels) {
+			rec.Tunnels = tunnels
+			changed = true
+			log.Printf("mapping: %s/%d declared %d tunnel endpoint(s)", tenant, nodeID, len(tunnels))
+		}
+	}
+
 	var bindingErr string
 	keyChanged, err := s.applyBinding(rec, rep.Binding)
 	if err != nil {
@@ -1126,6 +1151,20 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+// equalTunnels compares two canonical tunnel tables. Both sides come out of
+// wire.NormaliseTunnelEndpoints, so element-wise comparison is enough.
+func equalTunnels(a, b []wire.TunnelEndpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 const (
 	// pKeyLen is SR_PKEY_LEN in vpp-plugin/sr_hmac.h: 128-bit hop-MAC key. The
 	// two numbers must agree, and the dataplane is the one that decides.
@@ -1260,6 +1299,17 @@ func (s *server) toPeerInfoLocked(rec *NodeRecord, reader uint16) wire.PeerInfo 
 		// observer's own uptime; the controller's wait since that dump is added so
 		// a reader never sees an age that got YOUNGER by sitting in a registry.
 		pi.ObservedAgeSec = o.ageSec + uint64(time.Since(time.Unix(o.seenAt, 0)).Seconds())
+	}
+	// Only the entries this node declared TOWARD the reader travel: those are the
+	// addresses the reader may use as next hops for routes learned from it, one
+	// per parallel tunnel. An entry toward somebody else is none of the reader's
+	// business and would be a wrong next hop if it used it.
+	if reader != 0 {
+		for _, t := range rec.Tunnels {
+			if t.PeerNodeID == reader {
+				pi.OverlayIPs = append(pi.OverlayIPs, t.LocalIP)
+			}
+		}
 	}
 	return pi
 }

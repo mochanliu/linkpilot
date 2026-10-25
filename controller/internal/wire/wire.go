@@ -10,7 +10,13 @@
 // the fields and their semantics stay exactly as defined here.
 package wire
 
-import "sdwan/controller/internal/keybinding"
+import (
+	"fmt"
+	"net/netip"
+	"sort"
+
+	"sdwan/controller/internal/keybinding"
+)
 
 // ProtocolVersion lets the controller refuse agents it cannot talk to,
 // instead of failing in some confusing way later.
@@ -285,6 +291,80 @@ func TunnelMTUBudget(underlayMTU uint16, segCount uint8) uint16 {
 
 // ------------------------------------------------------------------ runtime
 
+// MaxTunnelEndpoints bounds one node's declared tunnel table. It is the same
+// order as the route protocol's MaxTunnelsPerDevice but deliberately a separate
+// constant: the two guard different stores (this controller's registry and one
+// RR session's table), and the number a node announces to its RR may be a
+// subset of what its dataplane holds.
+const MaxTunnelEndpoints = 4096
+
+// TunnelEndpoint is one tunnel as the declaring node's own dataplane sees it:
+// the peer it reaches and the OVERLAY address of the declaring node on that
+// tunnel.
+//
+// It is declared, not assigned. The address belongs to an interface the node
+// built, and the controller has no way to invent it. It exists because the
+// route protocol (v3) puts no next hop on a prefix: a next hop only means
+// something to the RECEIVER, so each side has to know "which address of MINE
+// does my peer send to". When X declares {peer: R, local_ip: 192.168.99.3},
+// the controller shows 192.168.99.3 to R as X's address toward R, and R then
+// resolves "routes learned from X via 192.168.99.3" without X ever carrying a
+// next hop on its prefixes.
+//
+// Parallel tunnels to the same peer are legal: two entries, two addresses.
+// Same peer AND same address is one tunnel declared twice and is collapsed.
+type TunnelEndpoint struct {
+	PeerNodeID uint16 `json:"peer_node_id"`
+	LocalIP    string `json:"local_ip"` // canonical IPv4; this node's own overlay /32 on that tunnel
+}
+
+// NormaliseTunnelEndpoints validates one node's declared table and returns it
+// in canonical form: dotted-quad IPv4, ascending by (peer, address), exact
+// duplicates collapsed.
+//
+// self is the declaring node. A tunnel to yourself is refused rather than
+// dropped: it can only come from a bug, and a silently dropped entry would
+// leave the registry row looking healthy.
+func NormaliseTunnelEndpoints(self uint16, in []TunnelEndpoint) ([]TunnelEndpoint, error) {
+	if len(in) > MaxTunnelEndpoints {
+		return nil, fmt.Errorf("%d tunnel endpoints exceeds %d", len(in), MaxTunnelEndpoints)
+	}
+	out := make([]TunnelEndpoint, 0, len(in))
+	for i, t := range in {
+		if t.PeerNodeID == 0 {
+			return nil, fmt.Errorf("tunnel endpoint #%d: peer_node_id must be non-zero", i)
+		}
+		if t.PeerNodeID == self {
+			return nil, fmt.Errorf("tunnel endpoint #%d: a tunnel to this node itself", i)
+		}
+		a, err := netip.ParseAddr(t.LocalIP)
+		if err != nil {
+			return nil, fmt.Errorf("tunnel endpoint to node %d: bad local_ip %q: %w", t.PeerNodeID, t.LocalIP, err)
+		}
+		if !a.Is4() {
+			return nil, fmt.Errorf("tunnel endpoint to node %d: local_ip %q is not IPv4", t.PeerNodeID, t.LocalIP)
+		}
+		if a.IsUnspecified() || a.IsMulticast() {
+			return nil, fmt.Errorf("tunnel endpoint to node %d: local_ip %q is not a unicast address", t.PeerNodeID, t.LocalIP)
+		}
+		out = append(out, TunnelEndpoint{PeerNodeID: t.PeerNodeID, LocalIP: a.String()})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].PeerNodeID != out[j].PeerNodeID {
+			return out[i].PeerNodeID < out[j].PeerNodeID
+		}
+		return out[i].LocalIP < out[j].LocalIP
+	})
+	deduped := make([]TunnelEndpoint, 0, len(out))
+	for i, t := range out {
+		if i > 0 && t == out[i-1] {
+			continue
+		}
+		deduped = append(deduped, t)
+	}
+	return deduped, nil
+}
+
 // MappingReport is a node describing ITSELF: what the reflectors saw, what its
 // own addresses are, which ports its dataplane is actually listening on, and its
 // key binding.
@@ -337,6 +417,15 @@ type MappingReport struct {
 	VpnPort     uint16   `json:"vpn_port,omitempty"`
 	TransitPort uint16   `json:"transit_port,omitempty"`
 	LocalAddrs  []string `json:"local_addrs,omitempty"` // each "ip" or "ip/prefix"
+
+	// Tunnels is this node's whole tunnel table: for every tunnel its dataplane
+	// holds, the peer and THIS node's own overlay address on it (see
+	// TunnelEndpoint). nil means "not reported" (an agent that does not fill it,
+	// or a report that only refreshes liveness); an EMPTY non-nil list means "I
+	// have no tunnels", which is a real state and must be declarable -- otherwise
+	// a torn-down tunnel would sit in the registry forever and peers would keep
+	// resolving a next hop to an interface that no longer exists.
+	Tunnels *[]TunnelEndpoint `json:"tunnels,omitempty"`
 }
 
 // Heartbeat is the liveness + re-registration signal. It carries the
@@ -384,6 +473,16 @@ type PeerInfo struct {
 	// IT advertises, not the one the tenant was issued.
 	VpnPort     uint16 `json:"vpn_port,omitempty"`
 	TransitPort uint16 `json:"transit_port,omitempty"`
+	// OverlayIPs are this peer's own overlay addresses on the tunnels it built
+	// TOWARD THE READER -- not a node-wide address list. Filled per reader (like
+	// ObservedMapping), so what a reader receives is exactly the set of next hops
+	// it may use for routes learned from this peer, one per parallel tunnel.
+	//
+	// This is the controller-side half of protocol v3: prefixes carry no next
+	// hop, so the receiver resolves "routes from X" against these addresses from
+	// its own tunnel table. An empty list means the peer has not declared a
+	// tunnel toward this reader (yet), and routes from it cannot be installed.
+	OverlayIPs []string `json:"overlay_ips,omitempty"`
 	// ObservedMapping, ObservedAgeSec and ObservedVerified are filled PER READER,
 	// like IsSelf: "the outer source this peer's traffic had when I received it".
 	// There is no tenant-wide answer to that question -- under a symmetric NAT two
