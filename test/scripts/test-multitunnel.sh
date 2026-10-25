@@ -8,6 +8,11 @@
 #   (2) 中转侧要有它自己的 transit 端口，否则中转不认它；
 #   (3) 绑定键要带 dst-port，否则两条隧道的 (endpoint) 撞在同一个身份上。
 #
+# 隧道 2 故意用**两端不同**的监听端口（node1 51830 / node2 51840）：
+# 发往对端的 WG 包目的端口是**对端**的监听端口，encap 若拿它去查本机 vpn 集合，
+# 就会在这里静默旁路（ping 仍通、Decap bypass 上涨）。这条断言钉住
+# "encap 的隧道身份只看绑定 (endpoint, dst_port)，与两端端口是否相同无关"。
+#
 # 前置：**必须先跑过 test-e2e.sh --keep**（单隧道 wg0@51820 已通、三个容器在跑、
 # 插件是最新的）。本脚本只往上加第二条隧道，跑完自己拆干净，把环境还原成
 # 交给它的样子；`--keep` 则保留第二条隧道供人工排查。
@@ -51,7 +56,8 @@ OVERLAY_N2=${OVERLAY_N2:-192.168.99.2}
 PATH1=${PATH1:-1}
 
 # ---- 隧道 2：本脚本新建 ----
-VPN2_PORT=${VPN2_PORT:-51830}
+VPN2_PORT=${VPN2_PORT:-51830}      # node1 的监听端口（本端）
+VPN3_PORT=${VPN3_PORT:-51840}      # node2 的监听端口（对端，故意与本端不同）
 TRANSIT2_PORT=${TRANSIT2_PORT:-51831}
 OVERLAY2_N1=${OVERLAY2_N1:-192.168.100.1}
 OVERLAY2_N2=${OVERLAY2_N2:-192.168.100.2}
@@ -164,7 +170,7 @@ teardown() {   # $1=force 时无视 --keep（用来收拾上一轮的残留）
     [ -n "${sw}" ] && vpp "${C_NODE1}" "set sr-wg tunnel ${sw} del" >/dev/null 2>&1
     vpp "${C_NODE1}" "sr-wg path del ${PATH2}"            >/dev/null 2>&1
     vpp "${C_NODE1}" "set sr-wg port del vpn ${VPN2_PORT}" >/dev/null 2>&1
-    vpp "${C_NODE2}" "set sr-wg port del vpn ${VPN2_PORT}" >/dev/null 2>&1
+    vpp "${C_NODE2}" "set sr-wg port del vpn ${VPN3_PORT}" >/dev/null 2>&1
     vpp "${C_TRANSIT}" "set sr-wg port del transit ${TRANSIT2_PORT}" >/dev/null 2>&1
     vpp "${C_NODE1}" "wireguard delete ${IF2}"            >/dev/null 2>&1
     vpp "${C_NODE2}" "wireguard delete ${IF2}"            >/dev/null 2>&1
@@ -218,30 +224,31 @@ echo "${TUNNELS}" | grep -q "端口通配" &&
     bad "表里仍有端口通配的绑定" || ok "已无端口通配绑定"
 
 # ==================================================================
-info "ASSERT C: 端口注册（node1/node2 的 vpn ${VPN2_PORT}、transit 的 transit ${TRANSIT2_PORT}）"
+info "ASSERT C: 端口注册（node1 vpn ${VPN2_PORT} / node2 vpn ${VPN3_PORT}、transit ${TRANSIT2_PORT}）"
 # ==================================================================
 # 建 WG 接口和登记端口这对顺序**不能反**：`wireguard create` 会把 listen-port
-# 重新注册给 wg4-input，先登记就被抢走。登记之后 51830 才有人给它加 SR 头
-# —— 没登记不报错，只是 encap_bypass，这是最阴的一种坏。
+# 重新注册给 wg4-input，先登记就被抢走。登记之后收端端口才有人给它剥 SR 头
+# —— 没登记不报错，只是收包落到 wg4-input，这是最阴的一种坏。
 PUB1=$(setup_node node1 "WG_IF=${IF2} VPN_PORT=${VPN2_PORT} OVERLAY_N1=${OVERLAY2_N1}" -- wg-create | tail -1)
-PUB2=$(setup_node node2 "WG_IF=${IF2} VPN_PORT=${VPN2_PORT} OVERLAY_N2=${OVERLAY2_N2}" -- wg-create | tail -1)
+PUB2=$(setup_node node2 "WG_IF=${IF2} VPN_PORT=${VPN3_PORT} OVERLAY_N2=${OVERLAY2_N2}" -- wg-create | tail -1)
 echo "${PUB1}" | grep -qE '^[A-Za-z0-9+/]{43}=$' || die "没拿到 node1 ${IF2} 的公钥: '${PUB1}'"
 echo "${PUB2}" | grep -qE '^[A-Za-z0-9+/]{43}=$' || die "没拿到 node2 ${IF2} 的公钥: '${PUB2}'"
 echo "  ${IF2} 公钥: node1=${PUB1:0:12}... node2=${PUB2:0:12}..."
 
 setup_node node1 -- port add vpn "${VPN2_PORT}" >&2 || die "node1: 登记 vpn ${VPN2_PORT} 失败"
-setup_node node2 -- port add vpn "${VPN2_PORT}" >&2 || die "node2: 登记 vpn ${VPN2_PORT} 失败"
+setup_node node2 -- port add vpn "${VPN3_PORT}" >&2 || die "node2: 登记 vpn ${VPN3_PORT} 失败"
 # transit 的启用标志是全局的：上一轮 e2e 设过就还在，没设过这里补一次，
 # 否则 `port add transit` 只注册端口，收到包仍按"未启用"丢弃。
 vpp "${C_TRANSIT}" "show sr-wg ports" | grep -q "已启用" || setup_node transit -- transit >&2
 setup_node transit -- port add transit "${TRANSIT2_PORT}" >&2 ||
     die "transit: 登记 transit ${TRANSIT2_PORT} 失败"
 
-for c in ${C_NODE1} ${C_NODE2}; do
-    [ "$(port_set "${c}" vpn)" = "${VPN_PORT},${VPN2_PORT}" ] &&
-        ok "$(role_of "${c}"): vpn 集合 = ${VPN_PORT},${VPN2_PORT}" ||
-        bad "$(role_of "${c}"): vpn 集合不对 -> 实际 '$(port_set "${c}" vpn)'"
-done
+[ "$(port_set "${C_NODE1}" vpn)" = "${VPN_PORT},${VPN2_PORT}" ] &&
+    ok "node1: vpn 集合 = ${VPN_PORT},${VPN2_PORT}" ||
+    bad "node1: vpn 集合不对 -> 实际 '$(port_set "${C_NODE1}" vpn)'"
+[ "$(port_set "${C_NODE2}" vpn)" = "${VPN_PORT},${VPN3_PORT}" ] &&
+    ok "node2: vpn 集合 = ${VPN_PORT},${VPN3_PORT}（与 node1 不同端口）" ||
+    bad "node2: vpn 集合不对 -> 实际 '$(port_set "${C_NODE2}" vpn)'"
 [ "$(port_set "${C_TRANSIT}" transit)" = "${TRANSIT_PORT},${TRANSIT2_PORT}" ] &&
     ok "transit: transit 集合 = ${TRANSIT_PORT},${TRANSIT2_PORT}" ||
     bad "transit 集合不对 -> 实际 '$(port_set "${C_TRANSIT}" transit)'"
@@ -253,9 +260,9 @@ info "ASSERT D: 隧道 2 建好（path ${PATH2} + 按端口绑定 + WG peer）"
 # 配好再加 peer，否则 peer 一加 wireguard 立刻发 handshake-init，那时还没加 SR
 # 头，这个包会被 docker 网桥 SNAT，回包外层源变成网关地址，endpoint roaming
 # 把静态 endpoint 污染掉 → 整条路径静默旁路（e2e 实测踩过）。
-setup_node node1 "WG_IF=${IF2} VPN_PORT=${VPN2_PORT} TRANSIT_PORT=${TRANSIT2_PORT} SR_PATH_ID=${PATH2} OVERLAY_N1=${OVERLAY2_N1} OVERLAY_N2=${OVERLAY2_N2} TUN_DST_PORT=${VPN2_PORT}" -- peer "${PUB2}" >&2 ||
+setup_node node1 "WG_IF=${IF2} VPN_PORT=${VPN2_PORT} TRANSIT_PORT=${TRANSIT2_PORT} SR_PATH_ID=${PATH2} OVERLAY_N1=${OVERLAY2_N1} OVERLAY_N2=${OVERLAY2_N2} TUN_DST_PORT=${VPN3_PORT}" -- peer "${PUB2}" >&2 ||
     die "node1: 隧道 2 发送侧配置失败"
-setup_node node2 "WG_IF=${IF2} VPN_PORT=${VPN2_PORT} OVERLAY_N1=${OVERLAY2_N1} OVERLAY_N2=${OVERLAY2_N2}" -- peer "${PUB1}" nosr >&2 ||
+setup_node node2 "WG_IF=${IF2} VPN_PORT=${VPN3_PORT} OVERLAY_N1=${OVERLAY2_N1} OVERLAY_N2=${OVERLAY2_N2} TUN_DST_PORT=${VPN2_PORT}" -- peer "${PUB1}" nosr >&2 ||
     die "node2: 隧道 2 接收侧配置失败"
 
 TUNNELS=$(vpp "${C_NODE1}" "show sr-wg tunnels")
@@ -264,8 +271,8 @@ NBIND=$(bind_lines "${C_NODE1}" | wc -l | tr -d ' ')
 [ "${NBIND}" = "2" ] && ok "同一对 CPE 上两条绑定共存" ||
     bad "绑定数=${NBIND}，期望 2"
 echo "${TUNNELS}" | grep -q "endpoint=${N2_UNDERLAY}:${VPN_PORT}"   &&
-    echo "${TUNNELS}" | grep -q "endpoint=${N2_UNDERLAY}:${VPN2_PORT}" &&
-    ok "两条绑定各占一个显式 dst-port（${VPN_PORT} / ${VPN2_PORT}）" ||
+    echo "${TUNNELS}" | grep -q "endpoint=${N2_UNDERLAY}:${VPN3_PORT}" &&
+    ok "两条绑定各占一个显式 dst-port（${VPN_PORT} / ${VPN3_PORT}）" ||
     bad "绑定表里没看到两个不同的 dst-port"
 echo "${TUNNELS}" | grep -q "端口通配" && bad "表里又出现端口通配" || ok "无通配绑定"
 PATHS=$(vpp "${C_NODE1}" "show sr-wg paths")
@@ -292,14 +299,15 @@ info "ASSERT F: 每条隧道真的带着自己的 SR 头，且外层端口对是
 #     都不认）；node2 是收包方，af-packet-input 一打全链都有。
 #   - Decap ok 只在 sr-wg4-input 认到 magic 0x53 时才增长 → 证明"确实加了 SR 头"；
 #     Decap bypass 保持 0 → 证明"没有任何包是裸 WG 直发过来的"。
-#   - 剥头前的外层 UDP 端口对（<vpn_port> -> <vpn_port>）就是隧道身份：
-#     51820 的那条属隧道 1，51830 的那条属隧道 2。
+#   - 剥头前的外层 UDP 端口对就是隧道身份：隧道 1 是 51820->51820，隧道 2 是
+#     51830->51840（两端不同端口）。**收端 Decap ok 增长** 才证明发送侧的 encap
+#     没有因为"目的端口不在本机 vpn 集合里"而静默旁路。
 stat_of() {   # <container> <Section>_<name> -> 计数
     setup_node "$(role_of "$1")" -- stats 2>/dev/null |
         awk -F= -v k="$2" '$1==k {print $2; f=1} END{if(!f) print 0}'
 }
-f_probe() {   # <dst> <iface> <期望端口> <标签>
-    local dst=$1 ifn=$2 port=$3 tag=$4 ok_n by ep
+f_probe() {   # <dst> <iface> <本端端口> <对端端口> <标签>
+    local dst=$1 ifn=$2 port=$3 dport=$4 tag=$5 ok_n by ep
     setup_node node2 -- clear-stats >/dev/null 2>&1
     vpp "${C_NODE2}" "clear trace" >/dev/null
     vpp "${C_NODE2}" "trace add af-packet-input 100" >/dev/null
@@ -308,18 +316,18 @@ f_probe() {   # <dst> <iface> <期望端口> <标签>
     vpp "${C_NODE2}" "clear trace" >/dev/null
     ok_n=$(stat_of "${C_NODE2}" Decap_ok)
     by=$(stat_of "${C_NODE2}" Decap_bypass)
-    ep=$(grep -c "UDP: ${port} -> ${port}" "${TRACE}" || true)
-    echo "      ${tag}: Decap ok=${ok_n} bypass=${by}, 外层端口对 ${port}->${port} 命中 ${ep} 条"
+    ep=$(grep -c "UDP: ${port} -> ${dport}" "${TRACE}" || true)
+    echo "      ${tag}: Decap ok=${ok_n} bypass=${by}, 外层端口对 ${port}->${dport} 命中 ${ep} 条"
     [ "${ok_n}" -ge 4 ] && ok "${tag} 收到的包都带 SR 头（Decap ok=${ok_n}）" ||
         bad "${tag} 只有 ${ok_n} 个包解封装：多数没走 SR，可能被旁路"
     [ "${by}" = "0" ] && ok "${tag} 没有任何裸 WG 直发包（Decap bypass=0）" ||
         bad "${tag} 收到 ${by} 个未封装的 WG 包：这条隧道的绑定没生效"
-    [ "${ep}" -ge 1 ] && ok "${tag} 外层端口对是 ${port}（它自己的隧道身份）" ||
-        bad "${tag} 的收包里没有 ${port}->${port} 端口对：包不是从这条隧道进来的"
+    [ "${ep}" -ge 1 ] && ok "${tag} 外层端口对是 ${port}->${dport}（它自己的隧道身份）" ||
+        bad "${tag} 的收包里没有 ${port}->${dport} 端口对：包不是从这条隧道进来的"
 }
 : > "${TRACE}"
-f_probe "${OVERLAY_N2}"  wg0    "${VPN_PORT}"   "隧道 1"
-f_probe "${OVERLAY2_N2}" "${IF2}" "${VPN2_PORT}" "隧道 2"
+f_probe "${OVERLAY_N2}"  wg0    "${VPN_PORT}"  "${VPN_PORT}"  "隧道 1"
+f_probe "${OVERLAY2_N2}" "${IF2}" "${VPN2_PORT}" "${VPN3_PORT}" "隧道 2"
 
 # 中转侧再钉一次"第一跳也各走各的端口"：中转是收包方，trace 打得起来。
 vpp "${C_TRANSIT}" "clear trace" >/dev/null

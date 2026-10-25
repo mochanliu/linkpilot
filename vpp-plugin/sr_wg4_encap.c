@@ -296,8 +296,8 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       /*
        * Step 3: 环路守卫。载荷首字节已是 SR_MAGIC 说明本包已经封装过
        * SR Header。本节点改写外层 dst 后会交回 ip4-lookup，重查表的包
-       * 会**第二次**经过本节点（同一张 underlay 网卡），这条判据 + Step 4
-       * 的端口判据一起保证第二次只走直通，不会二次封装。
+       * 会**第二次**经过本节点（同一张 underlay 网卡），这条判据保证
+       * 第二次只走直通，不会二次封装。
        * 该判据安全：WG transport header 首字节是消息类型（1/2/3/4），
        * 永不等于 0x53。
        */
@@ -305,27 +305,31 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
         goto done;
 
       /*
-       * Step 4: 只处理打在本机**某条** WG 隧道监听端口上的包（vpn_ports 集合，
-       * 定案 2「每隧道一个端口」）。集合外的端口一律直通。
-       * 封装后外层端口被改成 SR 段里的第一跳端口，正常不在集合内，所以这一条
-       * 同时仍是"第二次经过本节点时直通"的第二重保险（第一重是 Step 3 的 magic）。
-       */
-      in_port = clib_net_to_host_u16 (udp->dst_port);
-      if (PREDICT_FALSE (!clib_bitmap_get (sm->vpn_ports, in_port)))
-        goto done;
-
-      /* Step 5: 查绑定（外层 (dst IP, 封装前 dst 端口) 优先，sw_if_index 兜底）。
+       * Step 4: 查绑定（外层 (dst IP, 封装前 dst 端口)）。
+       *
+       * 这里**不能**再拿 udp->dst_port 去查本机 vpn_ports：挂点在 underlay
+       * 出口，发往对端的 WG 包目的端口是**对端**的监听端口，与本机监听端口
+       * 没有必然关系（两端各用各的端口是 WG 的正常形态）。旧规则要求两端
+       * 同端口，代价是发送侧判据永远不成立、SR 封装被静默直通。
+       *
+       * 绑定表本身就是精确判据：(peer endpoint, 对端端口) 命中才封装，
+       * 未命中即普通 WG / 非 WG 流量，直通；封装后第二遍的外层 dst 是
+       * transit 地址与 transit 端口，不存在对应绑定（且 Step 3 已拦 magic），
+       * 不会二次封装。
+       *
        * 挂点在 underlay 接口，tx_sw_if_index 是物理/宿主接口而不是 wg0，
        * 所以实际生效的是 endpoint_path（外层 dst = WG peer endpoint）。
        * 端口是这个键的另一半：同一对 CPE 开多条隧道时，只有端口能把
        * "这条流属于哪条隧道"分清楚。绑定时必须下发 endpoint，否则本步查不到
        * → 静默直通 → 流量绕过 SR 路径直发 peer。`show sr-wg tunnels` 会把
-       * 这种配错显式标出来。 */
+       * 这种配错显式标出来。
+       */
+      in_port = clib_net_to_host_u16 (udp->dst_port);
       bind = sr_wg_bind_lookup (sm, tx_sw_if_index, orig_dst, in_port);
       if (PREDICT_FALSE (bind == NULL))
         goto done;   /* 未绑定 → 普通 WG 隧道，直通 */
 
-      /* Step 6: 查路径。已显式绑定却查不到/未激活属于配置错误，丢包并计数，
+      /* Step 5: 查路径。已显式绑定却查不到/未激活属于配置错误，丢包并计数，
        * 不做静默回退——否则流量会绕开 SR 路径直发 peer，破坏源路由语义。 */
       path = sr_path_lookup (&sm->path_table, bind->path_id);
       if (PREDICT_FALSE (path == NULL || !path->active))
@@ -339,7 +343,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       path_id = path->path_id;
       seg_count = path->seg_count;
 
-      /* Step 7: 构造 SR Header（含 HMAC 签名） */
+      /* Step 6: 构造 SR Header（含 HMAC 签名） */
       if (PREDICT_FALSE (sr_path_fill_header (path, &srh, now) != 0))
         {
           error = SR_WG4_ENCAP_ERROR_HMAC_FAIL;
@@ -349,7 +353,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           goto done;
         }
 
-      /* Step 8: 首跳免费——seg_left 覆盖为 seg_count-1（不在 HMAC 覆盖内） */
+      /* Step 7: 首跳免费——seg_left 覆盖为 seg_count-1（不在 HMAC 覆盖内） */
       seg_left = (u8) (seg_count - 1);
       srh.seg_left = seg_left;
 
@@ -357,10 +361,10 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       sr_len = sr_hdr_total_len (seg_count);
 
       /*
-       * Step 9: headroom 守卫。
+       * Step 8: headroom 守卫。
        * vlib_buffer_get_current() = b->data + b->current_data，
        * 可用 headroom = b->current_data + VLIB_BUFFER_PRE_DATA_SIZE。
-       * 此处 current 仍指向 L2 头，Step 10 会先剥掉 l2_len 再抢 sr_len，
+       * 此处 current 仍指向 L2 头，Step 9 会先剥掉 l2_len 再抢 sr_len，
        * 所以 l2_len 要计入可用余量。26.06 的 VLIB_BUFFER_PRE_DATA_SIZE=128，
        * ip4-rewrite 掉 14B 后仍余 >100B，容得下最大 SR Header（72B），
        * 但外层带 IP options 时余量会变，故保留运行时校验。
@@ -377,7 +381,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
         }
 
       /*
-       * Step 10: 剥 L2 → 抢 headroom → 把外层 IP4/UDP 拉回包首。
+       * Step 9: 剥 L2 → 抢 headroom → 把外层 IP4/UDP 拉回包首。
        * 顺序不能颠倒：先剥 L2 才有 l2_len 字节的余量给 sr_len，
        * 且交给 ip4-lookup 的包必须是纯 L3。
        */
@@ -390,20 +394,20 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       ip4 = (ip4_header_t *) p;
       udp = (udp_header_t *) (p + ip4_len);
 
-      /* Step 11: 写入 SR Header（仅 sr_len 字节，不越界覆盖 WG 载荷） */
+      /* Step 10: 写入 SR Header（仅 sr_len 字节，不越界覆盖 WG 载荷） */
       clib_memcpy_fast (p + outer_len, &srh, sr_len);
 
-      /* Step 12: 改写外层 IP4 dst / UDP dst_port 为第一跳 */
+      /* Step 11: 改写外层 IP4 dst / UDP dst_port 为第一跳 */
       clib_memcpy_fast (&ip4->dst_address, first_hop->ip, 4);
       clib_memcpy_fast (&udp->dst_port, first_hop->port, 2);
 
-      /* Step 13: 长度增加 sr_len */
+      /* Step 12: 长度增加 sr_len */
       ip4->length =
         clib_host_to_net_u16 (clib_net_to_host_u16 (ip4->length) + sr_len);
       udp->length =
         clib_host_to_net_u16 (clib_net_to_host_u16 (udp->length) + sr_len);
 
-      /* Step 14: 校验和。UDP checksum 置 0（与 sr-wg4-transit 保持一致，
+      /* Step 13: 校验和。UDP checksum 置 0（与 sr-wg4-transit 保持一致，
        * 也是 WireGuard 的惯例）；同时清掉所有 offload 标志，避免下游按
        * 过期的 hdr offset 重算。 */
       vnet_buffer_offload_flags_clear (b, vnet_buffer (b)->oflags);
@@ -414,7 +418,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       ip4->checksum = ip4_header_checksum (ip4);
 
       /*
-       * Step 15: 交回 ip4-lookup 重新查表。
+       * Step 14: 交回 ip4-lookup 重新查表。
        *
        * ip4-lookup 的入参约定（vnet/ip/ip4_forward.c 的 @node ip4-lookup 文档）
        * 是 **复用 sw_if_index[VLIB_TX] 当 FIB index**：

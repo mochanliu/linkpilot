@@ -150,6 +150,11 @@ UNDERLAY_MTU=${UNDERLAY_MTU:-}
 # 绑定键的第二半（封装前的外层目的端口）。空=通配，沿用单隧道配法。
 TUN_DST_PORT=${TUN_DST_PORT:-}
 
+# **对端**的监听端口。空 = 与本机 VPN_PORT 相同（对称配法，历史默认）。
+# 两端监听端口不同时（WG 原生就允许），必须给 TUN_DST_PORT：它同时是
+# 绑定的目的端口、peer 的 dst-port、SR 路径最终目的段的端口。
+PEER_VPN_PORT=${TUN_DST_PORT:-${VPN_PORT}}
+
 log() { echo "[setup:${ROLE}] $*" >&2; }
 die() { echo "[setup:${ROLE}] FATAL: $*" >&2; exit 1; }
 
@@ -316,9 +321,9 @@ wg_add_peer() {
                endpoint "${PEER_UNDERLAY}" \
                allowed-ip 0.0.0.0/0 \
                allowed-ip ::/0 \
-               dst-port "${VPN_PORT}" \
+               dst-port "${PEER_VPN_PORT}" \
                persistent-keepalive "${KEEPALIVE}" || die "wireguard peer add failed"
-    log "wg peer added: endpoint=${PEER_UNDERLAY}:${VPN_PORT} allowed-ip=0.0.0.0/0,::/0"
+    log "wg peer added: endpoint=${PEER_UNDERLAY}:${PEER_VPN_PORT} allowed-ip=0.0.0.0/0,::/0"
 }
 
 # WireGuard 有 endpoint roaming：对端只要从另一个地址发来**签名有效**的报文，
@@ -329,7 +334,7 @@ wg_add_peer() {
 # 污染了就摘掉重建一次 —— 调用点已保证 encap 先配好，重建后的 handshake
 # 第一跳就走 SR 路径，不会再被网桥改写。
 wg_ensure_endpoint() {
-    local peer_pub=$1 ep idx want="${PEER_UNDERLAY}:${VPN_PORT}"
+    local peer_pub=$1 ep idx want="${PEER_UNDERLAY}:${PEER_VPN_PORT}"
     ep=$(wg_peer_endpoint "${peer_pub}")
     if [ "${ep}" = "${want}" ]; then
         log "wg peer endpoint ok: ${ep}"
@@ -501,9 +506,9 @@ cmd_peer() {
     if [ "${no_sr}" = "nosr" ]; then
         log "nosr mode: skip SR path setup (WG direct endpoint)"
     else
-        # SR 路径：segments[0]=最终目的(peer:51820)，segments[1]=第一跳(transit:51821)
+        # SR 路径：segments[0]=最终目的(peer:PEER_VPN_PORT)，segments[1]=第一跳(transit)
         vppctl sr-wg path add "${SR_PATH_ID}" \
-               via "${PEER_UNDERLAY}:${VPN_PORT}" \
+               via "${PEER_UNDERLAY}:${PEER_VPN_PORT}" \
                via "${FIRST_HOP}:${TRANSIT_PORT}" \
                hmac-id "${SR_HMAC_ID}" || die "sr-wg path add failed"
 

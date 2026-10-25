@@ -32,9 +32,11 @@ VLIB_PLUGIN_REGISTER () = {
  *   transit_ports -> sr-wg4-transit（只验签转发，不解密）。
  *
  * 为什么是集合而不是单个 vpn_port：同一对 CPE 之间可以开多条 WG 隧道，每隧道
- * 绑一个自己的监听端口（定案 2）。只注册一个端口时，第二条隧道的包既进不到
- * sr-wg4-input（不解密、不进观测表），也过不了 encap 的端口判据 —— 表现是
- * "隧道正常、SR 静默旁路"，计数器上只有 encap_bypass 在涨。
+ * 绑一个自己的监听端口（定案 2）。只注册一个端口时，第二条隧道的包进不到
+ * sr-wg4-input（不解密、不进观测表）—— 表现是"隧道看着通、SR 静默没生效"。
+ *
+ * 端口集合只决定**收包**去哪个节点；encap 的隧道身份由绑定表的
+ * (peer endpoint, 对端 dst_port) 决定，与本机监听端口无关（两端可以各用各的）。
  *
  * 建 WireGuard 接口时 wireguard 插件会把**该接口的** listen-port 重新注册给
  * 自己的 wg4-input，把我们的旁路入口摘掉；因此 WG 建完之后、以及 transit 换

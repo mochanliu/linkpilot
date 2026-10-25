@@ -246,8 +246,8 @@ sr_wg_show_ports_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (sr_wg_port_count (sm, SR_WG_PORT_VPN) == 0)
     vlib_cli_output (
-      vm, "  !! WARNING: vpn 端口集合是空的，任何隧道都进不到 sr-wg4-input，"
-          "encap 的端口判据也一律直通。用 `set sr-wg port add vpn <port>` 补。");
+      vm, "  !! WARNING: vpn 端口集合是空的，隧道收包会落到 wg4-input 而不是 "
+          "sr-wg4-input（SR 头不会被解掉）。用 `set sr-wg port add vpn <port>` 补。");
 
   return 0;
 }
