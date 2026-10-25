@@ -1,6 +1,6 @@
 # SD-WAN CPE Data Plane - Top Level Makefile
 
-.PHONY: all plugin controller test test-vbond clean docker
+.PHONY: all plugin controller test test-vbond test-frr clean docker
 
 VPP_PLUGIN_DIR = vpp-plugin
 CONTROLLER_DIR = controller
@@ -29,6 +29,10 @@ test-integration:
 # vBOND 控制面 acceptance（复用 srwg-* 容器所在的 docker_net_ctrl）
 test-vbond:
 	@controller/test/scripts/test-vbond.sh
+
+# sr-frr 把控制面 RIB 导出到 FRR 旁路表的 e2e（一次性 FRR 10.7.1 容器）
+test-frr:
+	@test/scripts/test-frr-export.sh
 
 docker:
 	@echo "Building Docker environment..."
