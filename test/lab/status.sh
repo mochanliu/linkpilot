@@ -31,7 +31,7 @@ echo "隧道绑定（show sr-wg tunnels）"
 for c in lab-cpe1 lab-cpe2 lab-cpe3; do
     echo "  $c:"
     vppc "$c" show sr-wg tunnels | sed 's/^/    /'
-    echo "    peers: $(vppc "$c" show wireguard peer | grep -c 'flags: 2') established / $(vppc "$c" show wireguard peer | grep -c 'public-key') total"
+    echo "    peers: $(vppc "$c" show wireguard peer | grep -c 'flags: 2') established / $(vppc "$c" show wireguard peer | grep -c '^\[[0-9]*\] endpoint:') total"
 done
 echo
 hr
@@ -57,7 +57,7 @@ echo "FRR 客户侧"
 for n in 1 2 3; do
     echo "  lab-frr$n:"
     docker exec "lab-frr$n" vtysh -c 'show ip route table 1250' 2>/dev/null |
-        grep -E '10\.30\.' | sed 's/^/    /'
+        grep -E '10\.68\.' | sed 's/^/    /'
     echo "    BGP: $(docker exec "lab-frr$n" vtysh -c 'show bgp ipv4 unicast' 2>/dev/null | grep -c '\*>') 条"
 done
 echo
