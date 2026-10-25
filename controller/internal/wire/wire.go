@@ -212,11 +212,23 @@ const (
 )
 
 // TCPOverheadBytes is what a TCP segment carries in front of its payload in an
-// IPv4 packet: 20 B IP + 20 B TCP. MSS = overlay MTU - this.
+// IPv4 packet: 20 B IP + 20 B TCP.
 const TCPOverheadBytes = 40
 
+// MPLSLabelBytes is the MPLS shim header a VPN-VRF route pushes: 20-bit label +
+// 3-bit TC + 1-bit S + 8-bit TTL = exactly 4 bytes. It is budgeted
+// unconditionally because a terminal behind a 1500-byte LAN cannot tell whether
+// its flow will land in a VRF, and an under-clamped MSS only shows up as
+// "big packets vanish" much later.
+const MPLSLabelBytes = 4
+
+// MSSOverheadBytes is everything that rides in front of a TCP payload inside
+// the tunnel: the IPv4 header, the TCP header and the VPN label.
+const MSSOverheadBytes = TCPOverheadBytes + MPLSLabelBytes
+
 // TCPMSSForTunnelMTU is the MSS a CPE must clamp TCP to on a tunnel of this
-// overlay MTU (2026-10-24 ruling: automatic, MTU - 40).
+// overlay MTU (2026-10-24 ruling: automatic, MTU - 44 since the VPN label
+// layer was added).
 //
 // Why clamp at all: a LAN terminal sits behind a 1500-byte interface and
 // negotiates MSS 1460, while the tunnel carries at most mtu bytes. VPP does
@@ -230,10 +242,10 @@ const TCPOverheadBytes = 40
 // thing that tells both TCP endpoints the truth. test/scripts/test-mtu.sh
 // re-measures the clamp on the wire (ASSERT J).
 func TCPMSSForTunnelMTU(mtu uint16) uint16 {
-	if mtu <= TCPOverheadBytes {
+	if mtu <= MSSOverheadBytes {
 		return 0
 	}
-	return mtu - TCPOverheadBytes
+	return mtu - MSSOverheadBytes
 }
 
 // SRHeaderBytes is the on-wire length of the SR header for a path with segCount

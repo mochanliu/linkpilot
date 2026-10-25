@@ -114,17 +114,18 @@ func TestTunnelMTUBoundsAreReachable(t *testing.T) {
 }
 
 // MSS 与 MTU 的关系是契约，不是 agent 的实现细节：控制器要把这个数报给运维，
-// agent 要把它写进数据面，两边必须同一套算术（2026-10-24 定案：MTU - 40）。
+// agent 要把它写进数据面，两边必须同一套算术（2026-10-24 定案：MTU - 44，
+// 多出的 4 B 是 VPN VRF 路由压入的 MPLS 标签）。
 func TestTCPMSSForTunnelMTU(t *testing.T) {
 	for _, tc := range []struct {
 		mtu, want uint16
 	}{
-		{DefaultTunnelMTU, DefaultTunnelMTU - 40}, // 1360 → 1320
-		{1500, 1460},
-		{MinTunnelMTU, MinTunnelMTU - 40},
-		{MaxTunnelMTU, MaxTunnelMTU - 40},
-		// 小于 40 的 MTU 在契约里已经出界；这里只保证不 uint16 回绕成一个巨大 MSS。
-		{40, 0},
+		{DefaultTunnelMTU, DefaultTunnelMTU - 44}, // 1360 → 1316
+		{1500, 1456},
+		{MinTunnelMTU, MinTunnelMTU - 44},
+		{MaxTunnelMTU, MaxTunnelMTU - 44},
+		// 小于 44 的 MTU 在契约里已经出界；这里只保证不 uint16 回绕成一个巨大 MSS。
+		{44, 0},
 		{0, 0},
 	} {
 		if got := TCPMSSForTunnelMTU(tc.mtu); got != tc.want {

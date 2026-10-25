@@ -619,8 +619,17 @@ type PeerTarget struct {
 // 但 `wg4-input` 会拿它过滤**解密后的内层源地址**，所以它不是"无害的占位符"：
 // 写对端 overlay /32 时，被本机转发的终端流量在收端被 error-punt 到 null-node，
 // 而源恰好等于那个 /32 的隧道自测 ping 照常通（2026-10-24 实测）。因此这里
-// 不接受调用方给前缀 —— 每条隧道都只会是 0.0.0.0/0。
-var allowedIPsAny = []vppapi.Prefix{{IP: net.IPv4zero, Len: 0}}
+// 不接受调用方给前缀 —— 每条隧道都只会是 0.0.0.0/0 + ::/0。
+//
+// ::/0 是 MPLS over WireGuard 的必要条件（2026-10-25 实测）：同一个源地址
+// 检查发生在 wg4-input 按 nibble 分派**之前**，MPLS 包不满足 is_ip4_header，
+// 被它当 IPv6 读 8..24 字节（标签栈+载荷）当源地址，只有 ::/0 覆盖得到；
+// 只配 0.0.0.0/0 时 MPLS 包在 error-punt 就被黑洞掉，到不了 sr-wg4-post。
+// 两个前缀仍然只是过滤器，不参与选路。
+var allowedIPsAny = []vppapi.Prefix{
+	{IP: net.IPv4zero, Len: 0},
+	{IP: net.IPv6zero, Len: 0},
+}
 
 // PeerChange 描述一次下发到底动了什么，调用方用它决定要不要记日志、要不要
 // 重新回报可达性。

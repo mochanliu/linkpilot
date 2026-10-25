@@ -574,13 +574,13 @@ else
 fi
 
 # ==================================================================
-info "ASSERT J: TCP MSS 钳制 —— 两端 RX 钳制把穿隧道的 SYN 改成 隧道MTU-40"
+info "ASSERT J: TCP MSS 钳制 —— 两端 RX 钳制把穿隧道的 SYN 改成 隧道MTU-44"
 # ==================================================================
 # 这条补的是"MTU 记录怎么影响 TCP"的落点。内层超了记录时 VPP 会切片（ASSERT E），
 # 但 TCP 端点并不知道，LAN 终端按 1500 谈出 MSS=1460 才是最省事的路径，于是大包在
 # WG 出口被切，每片再背一份 SR/WG 头。真实 LAN 不会替 CPE 记住隧道 MTU，所以要么
 # 发端收到 ICMP frag-needed 自己降（ASSERT I），要么在入口把 MSS 改小 —— 后者就是
-# mss_clamp 插件，MSS = 隧道 MTU - 40（20 IP + 20 TCP）。
+# mss_clamp 插件，MSS = 隧道 MTU - 44（20 IP + 20 TCP + 4 B VPN MPLS 标签）。
 #
 # 方向实测结论（2026-10-24，wg0 上 A/B/A 三轮）：TX 钳制**完全无效** —— WG 接口的
 # ip4-output arc 上 wg4-output-tun 排在 tcp-mss-clamping-ip4-out 之前，SYN 原样带着
@@ -588,16 +588,16 @@ info "ASSERT J: TCP MSS 钳制 —— 两端 RX 钳制把穿隧道的 SYN 改成
 # 在自己 wg0 的 RX 上钳，setup-node.sh 的 wg-create 已经这么配了。
 #
 # 判据两条：
-#   (a) 配置：两端 wg0 的明细是 ip4: <MTU-40> [RX]（TX 或 disabled 都算红）；
+#   (a) 配置：两端 wg0 的明细是 ip4: <MTU-44> [RX]（TX 或 disabled 都算红）；
 #   (b) 功能：在 node1 接一台内核"终端"发真 SYN，node2 接一台"终端"收 —— 出去时
-#       MSS 是 1460（终端按自己 1500 的 LAN 谈的），到 node2 已经是 1320。
-#       只断言收端等于 MTU-40 不够：如果 SYN 根本没走隧道，那条断言也会"通过"，
+#       MSS 是 1460（终端按自己 1500 的 LAN 谈的），到 node2 已经是 1316。
+#       只断言收端等于 MTU-44 不够：如果 SYN 根本没走隧道，那条断言也会"通过"，
 #       所以必须同时看到发端那条更大的 MSS。
 J_TAP_A=tap10
 J_TAP_B=tap11
 J_LAN_A=192.168.50
 J_LAN_B=192.168.60
-MSS_EXPECT=$((MTU_LIVE - 40))
+MSS_EXPECT=$((MTU_LIVE - 44))
 J_A_OUT="${TRACE_DIR}/j-syn-a.txt"
 J_B_OUT="${TRACE_DIR}/j-syn-b.txt"
 
@@ -606,7 +606,7 @@ for jc in "${C_NODE1}" "${C_NODE2}"; do
     jl=$(vpp "${jc}" "show interface tcp-mss-clamp ${IF1}")
     echo "      $(role_of "${jc}") ${IF1}: ${jl}"
     printf '%s' "${jl}" | grep -q "ip4: ${MSS_EXPECT} \[RX\]" &&
-        ok "$(role_of "${jc}") ${IF1} 上配着 RX 钳制 ${MSS_EXPECT}（= ${MTU_LIVE} - 40）" ||
+        ok "$(role_of "${jc}") ${IF1} 上配着 RX 钳制 ${MSS_EXPECT}（= ${MTU_LIVE} - 44）" ||
         bad "$(role_of "${jc}") ${IF1} 的钳制不是 'ip4: ${MSS_EXPECT} [RX]'（'${jl}'）—— TX 方向实测不生效；手工修：vppctl set interface tcp-mss-clamp ${IF1} ip4 rx ip4-mss ${MSS_EXPECT} ip6 disable"
 done
 
@@ -666,7 +666,7 @@ else
         bad "发端 SYN 的 MSS 是 '${MSS_A:-<没抓到>}'（应大于 ${MSS_EXPECT}）：抓包或注入路径有问题，下面收端那条不能单独作数"
     fi
     [ "${MSS_B:-0}" = "${MSS_EXPECT}" ] &&
-        ok "SYN 到 node2 时 MSS 已被 RX 钳制改成 ${MSS_B}（= ${MTU_LIVE} - 40）" ||
+        ok "SYN 到 node2 时 MSS 已被 RX 钳制改成 ${MSS_B}（= ${MTU_LIVE} - 44）" ||
         bad "SYN 到 node2 的 MSS 是 '${MSS_B:-<没抓到>}'，期望 ${MSS_EXPECT}：钳制没生效或方向配错了"
 
     # ---- 收拾：只删自己加的 ----

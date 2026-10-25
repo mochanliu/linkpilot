@@ -64,8 +64,9 @@
 #       wg0，VPP 在 WG 出口把内层切成 1356+100 两片、各自封自己的 SR/WG 头，于是
 #       外层 1452 与 196 都不超 underlay。手建的 WG 接口四个 MTU 槽默认全 0（等于
 #       没有记录），不写这一行就等于这条隧道不做任何限制。
-#   vppctl set interface tcp-mss-clamp wg0 ip4 rx ip4-mss 1320 ip6 disable
-#       MSS = 隧道 MTU - 40（20 IP + 20 TCP），这里是 1360-40。**方向必须是 RX**：
+#   vppctl set interface tcp-mss-clamp wg0 ip4 rx ip4-mss 1316 ip6 disable
+#       MSS = 隧道 MTU - 44（20 IP + 20 TCP + 4 B MPLS 标签），这里是 1360-44。
+#       **方向必须是 RX**：
 #       实测 WG 接口的 ip4-output arc 上 wg4-output-tun 排在 tcp-mss-clamping-ip4-out
 #       前面，TX 钳制一包都不改；收包侧（含从别的口转发进来的 SYN）则真的生效，
 #       所以两端的 CPE 各自钳自己收到的 SYN。缺了这条，LAN 终端按 1500 谈出 1460，

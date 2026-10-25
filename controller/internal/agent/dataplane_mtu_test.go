@@ -244,17 +244,18 @@ func TestOpenFailsWhenMTUWriteFails(t *testing.T) {
 	}
 }
 
-// MSS 钳制是隧道 MTU 的函数（2026-10-24 定案：自动取 MTU - 40），调用方不再给
-// 第二个数。它只写在隧道口上 —— underlay 出口的外层是 UDP，钳 TCP MSS 毫无意义。
+// MSS 钳制是隧道 MTU 的函数（2026-10-24 定案：自动取 MTU - 44，含 4 B VPN 标签），
+// 调用方不再给第二个数。它只写在隧道口上 —— underlay 出口的外层是 UDP，钳 TCP MSS
+// 毫无意义。
 func TestOpenSetsMSSClampFromTunnelMTU(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		mtu  uint16
 		want uint16
 	}{
-		{"没下发时用契约默认", 0, wire.DefaultTunnelMTU - wire.TCPOverheadBytes},
-		{"显式 1200", 1200, 1160},
-		{"下界", wire.MinTunnelMTU, wire.MinTunnelMTU - wire.TCPOverheadBytes},
+		{"没下发时用契约默认", 0, wire.DefaultTunnelMTU - wire.MSSOverheadBytes},
+		{"显式 1200", 1200, 1156},
+		{"下界", wire.MinTunnelMTU, wire.MinTunnelMTU - wire.MSSOverheadBytes},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeVPP()
@@ -272,7 +273,7 @@ func TestOpenSetsMSSClampFromTunnelMTU(t *testing.T) {
 				t.Fatalf("Open: %v", err)
 			}
 			if got := f.mssClamps[l.SWIfIndex()]; got != tc.want {
-				t.Errorf("隧道接口 %d 的 MSS 应是 %d（MTU %d - 40），实际 %d",
+				t.Errorf("隧道接口 %d 的 MSS 应是 %d（MTU %d - 44），实际 %d",
 					l.SWIfIndex(), tc.want, f.mtus[l.SWIfIndex()], got)
 			}
 			if _, seen := f.mssClamps[encapIfIndex]; seen {
@@ -311,7 +312,7 @@ func TestAdoptRewritesMSSClamp(t *testing.T) {
 	if err != nil || !adopted {
 		t.Fatalf("第二次 Open 应认回: adopted=%v err=%v", adopted, err)
 	}
-	want := wire.DefaultTunnelMTU - wire.TCPOverheadBytes
+	want := wire.DefaultTunnelMTU - wire.MSSOverheadBytes
 	if got := f.mssClamps[l2.SWIfIndex()]; got != want {
 		t.Errorf("认回后应补上 MSS=%d，实际 %d", want, got)
 	}
