@@ -1,8 +1,13 @@
 # 三站点复杂 lab（CPE 全互联 + RR + 控制器 + FRR）
 
 一张网里同时放进了已经落地的每一层：入网、控制面反射、VPP 转发、MPLS over
-WireGuard、客户侧 FRR 导出。目标是登进任意一个终端，从 10.68.N.10 一路追到
+WireGuard、盒内 FRR 导出。目标是登进任意一个终端，从 10.68.N.10 一路追到
 另一个站点的 10.68.M.10，而不是只看单点命令输出。
+
+**FRR 是盒子的一部分**，不是客户设备：盒子内部一边是 VPP 数据面，另一边是
+FRR 路由协议栈（sr-frr 把自研控制面的 RIB 注入 FRR，FRR 再与客户侧路由器
+跑路由协议）。本 lab 为了钉住 FRR 10.7.1、隔离故障域并暴露 ZAPI 接缝，
+把盒内的这两半拆成了 `lab-cpeN` 与 `lab-frrN` 两个容器；真机上二者同盒。
 
 **这里不开发控制器。** 按 2026-10-25 的指示，凡是由控制器下发的值（每隧道
 UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
@@ -12,13 +17,17 @@ UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
 ## 拓扑
 
 ```
-站点 N（N = 1..3）
+站点 N（N = 1..3）。lab-frrN + lab-cpeN = 同一个盒子拆成的两半：
 
-  lab-termN            lab-frrN            lab-cpeN                lab_wan
-  10.68.N.10  ───────  10.68.N.2  ───────  10.78.N.2  ───────────  10.88.1.1N
-  (lanN)              (客户路由器)        (inside，VPP VRF 250)   (WAN，VPP)
-                                            │
-                                            └── SR-over-WG 隧道 ── lab-transit 10.88.1.3 ── 对端 CPE
+  lab-termN            lab-frrN              lab-cpeN                 lab_wan
+  10.68.N.10  ───────  10.68.N.2  ────────  10.78.N.2  ────────────  10.88.1.1N
+  客户终端             盒内 FRR              盒内 VPP（VRF 250）        WAN
+                                              │
+                                              └── SR-over-WG 隧道 ── lab-transit 10.88.1.3 ── 对端 CPE
+
+lab-frrN 对应真机盒内的 FRR；lab-termN 代表客户侧网络。当前 lab 还没有独立的
+客户路由器容器，FRR 也没有配置 BGP 邻居——已验证的是前缀进入 FRR 的 BGP 表，
+FRR ↔ 客户路由器的协议互通尚未建模。
 
 控制面（管理网 10.99.0.0/24，不进货数据面）：
   lab-ctrl 10.99.0.200:8444   sr-ctrl（入网 / CA / 设备证书）
@@ -47,9 +56,10 @@ UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
    lab-rr 互相反射。
 3. sr-fib 把远端前缀装成「压 266、走对应 wg 接口、下一跳是对端 overlay」。
 4. 每台 lab-frrN 的 sr-frr 把控制面 RIB 导成 FRR **table 1250**，由
-   `redistribute table-direct 1250` 呈现在 BGP 里；客户侧再一条默认路由
-   指向 CPE。
-5. 终端只需要 `default via 10.68.N.2`。
+   `redistribute table-direct 1250` 呈现在 FRR 的 BGP 表里。真机上 FRR
+   再用 eBGP/OSPF 等把前缀交给客户侧路由器；本 lab 尚无独立客户路由器，
+   终端直接以 FRR 为默认网关。
+5. 客户侧终端只需要 `default via 10.68.N.2`（盒子的 LAN 口）。
 
 ## 起停
 
@@ -85,7 +95,7 @@ dpo-drop）；`--keep` 不先拆现有容器（只用于调试，状态可能是
 docker exec -it lab-term1 ping 10.68.2.10
 docker exec -it lab-term1 ping 10.68.3.10
 
-# 客户路由器视角
+# 盒内 FRR 视角
 docker exec -it lab-frr1 vtysh
 lab-frr1# show ip route table 1250
 lab-frr1# show bgp ipv4 unicast

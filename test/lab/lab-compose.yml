@@ -1,9 +1,10 @@
 # 复杂 lab 的容器与网络定义（bringup.sh 负责所有配置）。
 #
-#   站点 N（1..3）：
+#   站点 N（1..3）。lab-cpeN + lab-frrN 是同一个盒子的两半（数据面 / 盒内 FRR），
+#   实验里拆成两个容器：
 #     lab-cpeN   10.88.1.1N(wan)   10.78.N.2(inN, 进 VPP table 250)   10.99.0.1N(mgmt)
 #     lab-frrN                     10.78.N.20(inN)  10.68.N.2(lanN)   10.99.0.2N(mgmt)
-#     lab-termN                                       10.68.N.10(lanN)  10.99.0.3N(mgmt)
+#     lab-termN                                       10.68.N.10(lanN)  10.99.0.3N(mgmt)  # 客户终端
 #   公共：lab-transit 10.88.1.3 / lab-rr 10.88.1.100 / lab-ctrl 10.88.1.200（都另有 mgmt 地址）
 #
 # 为什么 inside 用 .2 而不是 .1：docker 网桥自己占着子网的 .1，把 CPE 的 LAN

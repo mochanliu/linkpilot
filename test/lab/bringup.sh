@@ -22,7 +22,8 @@
 #   宣告自己站点的 10.68.N.0/24（经 FRR 下一跳 10.78.N.20）。三个 sr-route 经
 #   lab-rr 反射成全网表，sr-fib 把远端前缀装成「压 266、走对应 wg 接口」的路由。
 #   每台 lab-frrN 的 sr-frr 再把控制面 RIB 导出到 FRR 的 table 1250，并由
-#   `redistribute table-direct 1250` 让它出现在 BGP 里——那是客户侧能看到的事实。
+#   `redistribute table-direct 1250` 让它出现在 FRR 的 BGP 表里。FRR 是盒子的
+#   一部分（lab 里与 VPP 拆成两个容器），真机上再与客户侧路由器跑路由协议。
 #
 # 管理网 10.99.0.0/24 承载控制面（RR 的 mTLS、sr-route 的 /status、控制器 8444）。
 # 数据面的 WAN/LAN IP 都搬进了 VPP，CPE 内核只保留管理地址。
@@ -191,8 +192,9 @@ router bgp 6500$n
   redistribute table-direct 1250
  exit-address-family
 !
-! 客户侧只需要一条默认路由指向 CPE 的 inside 地址（10.78.N.2），
-! 远端站点的明细由 sr-frr 导出的 table 1250 经 BGP 呈现，不进内核主表。
+! 本 lab 未配置 eBGP 邻居（客户路由器未建模）；真机在此与客户路由器建邻。
+! 盒内 FRR 的默认路由指向 VPP inside（10.78.N.2）；远端明细由 sr-frr 导出的
+! table 1250 经 BGP 呈现，不进内核主表。客户侧只需要一条默认路由指向盒子的 LAN 口。
 ip route 0.0.0.0/0 ${INSIDE_IP[$n]}
 !
 EOF
