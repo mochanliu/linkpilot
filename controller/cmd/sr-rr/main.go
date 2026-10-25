@@ -12,6 +12,12 @@
 // issued. The tenant and device id used for routing come from that certificate
 // (srou://<tenant>/node/<id>), never from the hello frame -- the hello's
 // device_id is only cross-checked against it.
+//
+// Reflection: a prefix carries no next hop. Each CPE announces its tunnel table
+// (peer device -> next hop) separately, the RR keeps the mutual edges, and a
+// prefix is sent only to peers that have a tunnel to its origin. The receiver
+// looks the next hop up in its own table, so a hub with a thousand tunnels is
+// one small message to the RR instead of a thousand next hops per prefix.
 package main
 
 import (
@@ -40,7 +46,6 @@ type fileConfig struct {
 	Listen     string              `json:"listen"`
 	StatusAddr string              `json:"status_addr"`
 	TLS        tlsFiles            `json:"tls"`
-	Topology   map[string][]uint16 `json:"topology"`
 	ReflectTo  map[string][]uint16 `json:"reflect_to"`
 }
 
@@ -118,10 +123,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	topology, err := parseDeviceMap("topology", cfg.Topology)
-	if err != nil {
-		log.Fatalf("config: %v", err)
-	}
 	reflectTo, err := parseDeviceMap("reflect_to", cfg.ReflectTo)
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -131,7 +132,6 @@ func main() {
 		RRID:      cfg.RRID,
 		Tenant:    cfg.Tenant,
 		HoldSec:   cfg.HoldSec,
-		Topology:  topology,
 		ReflectTo: reflectTo,
 	})
 	if err != nil {
@@ -224,12 +224,28 @@ func serveStatus(addr string, cfg *fileConfig, ref *route.Reflector) {
 		for dev, routes := range ref.Routes() {
 			counts[strconv.Itoa(int(dev))] = len(routes)
 		}
+		tunnelCounts := map[string]int{}
+		for dev, table := range ref.Tunnels() {
+			tunnelCounts[strconv.Itoa(int(dev))] = len(table)
+		}
 		writeJSON(w, struct {
 			RRID     string              `json:"rr_id"`
 			Tenant   string              `json:"tenant"`
 			Sessions []route.SessionInfo `json:"sessions"`
 			Routes   map[string]int      `json:"routes"`
-		}{cfg.RRID, cfg.Tenant, ref.Sessions(), counts})
+			Tunnels  map[string]int      `json:"tunnels"`
+		}{cfg.RRID, cfg.Tenant, ref.Sessions(), counts, tunnelCounts})
+	})
+	mux.HandleFunc("/tunnels", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		out := map[string][]route.Tunnel{}
+		for dev, table := range ref.Tunnels() {
+			out[strconv.Itoa(int(dev))] = table
+		}
+		writeJSON(w, out)
 	})
 	mux.HandleFunc("/routes", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

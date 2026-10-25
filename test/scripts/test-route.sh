@@ -1,17 +1,19 @@
 #!/bin/bash
-# test-route.sh - 路由控制面：两个 RR + 三个 CPE 的二进制级 e2e（任务 #34/#35）
+# test-route.sh - 路由控制面：两个 RR + 三个 CPE 的二进制级 e2e（任务 #34/#35/#48）
 #
 # 这条脚本跑的是**真二进制**（cmd/sr-rr、cmd/sr-route）和**真 mTLS**
 # （自签租户 CA，CPE 证书带 srou://tenant-a/node/N 身份），不是进程内假端。
-# 它回答四件事：
+# 协议 v3：prefix 不带下一跳，每台 CPE 单独宣告自己的隧道表，RR 只把路由送给
+# 与源发端有**双向**隧道的 CPE，收端用自己的隧道表解析下一跳。它回答五件事：
 #
-#   (A) 默认反射：CPE1 的路由经 RR 到达与它有 VPN 隧道（topology 里配的）的
-#       CPE2，且 CPE2 的 import RT 有交集才进 bgp 表。
-#   (B) RT import 过滤：CPE3 的路由到了 CPE1 的邻居（拓扑上有隧道），但
-#       export RT 与 CPE1 vrf5 的 import RT 没有交集 ⇒ 不进表，且
-#       dropped_rt_mismatch 计数增加（"没收到"和"收到了但拒收"必须分得开）。
-#   (C) 反射策略：reflect_to {"2":[3]} 把 CPE2 的反射目标从拓扑默认的 1
-#       换成 3 —— CPE3 收到 CPE2 的路由，CPE1 收不到。
+#   (A) 隧道表 + 反射：三台互相有隧道（1↔2、1↔3、2↔3），RR 收齐三张表；
+#       CPE1 的路由到了 CPE2 和 CPE3，下一跳分别由各自的隧道表解析出来。
+#       CPE3 对 CPE1 有两条并行隧道 ⇒ 同一条路由解析出两个等价下一跳。
+#   (B) RT import 过滤：CPE3 的路由到了 CPE1（有隧道），但 export RT 与
+#       CPE1 vrf5 的 import RT 没有交集 ⇒ 不进表，且 dropped_rt_mismatch
+#       计数增加（"没收到"和"收到了但拒收"必须分得开）。
+#   (C) 反射策略：reflect_to {"2":[3]} 只能在邻接之上做减法 —— CPE2 的路由
+#       送到 CPE3，不再送到 CPE1。策略不能凭空造出可达性。
 #   (D) 双 RR 主备：杀掉首选 RR 后三个 CPE 都切到 rr-b（active_rr=1）且表不
 #       变；首选 RR 回来后切回（active_rr=0）。
 #
@@ -138,7 +140,7 @@ done
 
 # ---------------------------------------------------------------- 配置
 
-info "写配置（拓扑 1:[2,3]，策略 reflect_to {\"2\":[3]}）"
+info "写配置（全互联隧道 1↔2、1↔3、2↔3，策略 reflect_to {\"2\":[3]}）"
 cat > "$WORK/rr-a.json" <<EOF
 {
   "rr_id": "rr-a",
@@ -147,7 +149,6 @@ cat > "$WORK/rr-a.json" <<EOF
   "listen": "127.0.0.1:$RR_A_PORT",
   "status_addr": "127.0.0.1:$RR_A_STATUS",
   "tls": {"cert_file": "$WORK/pki/rr.crt", "key_file": "$WORK/pki/rr.key", "ca_file": "$WORK/pki/ca.crt"},
-  "topology": {"1": [2, 3]},
   "reflect_to": {"2": [3]}
 }
 EOF
@@ -158,8 +159,9 @@ sed -e 's/"rr-a"/"rr-b"/' \
 
 # node1: 枢纽，import 65000:6；node2: export 65000:6（默认应被 1 收，但策略把它
 # 改送到 3）；node3: export 65000:7（能到 1，但 RT 不匹配 ⇒ 必须被拒收）。
-write_node() {   # <n> <overlays-json> <prefix> <export> <import-csv> <status-port>
-    local n=$1 overlays=$2 prefix=$3 export=$4 imports=$5 status=$6
+# 每台只宣告自己的隧道表（peer_device_id + 对端 overlay），prefix 里没有下一跳。
+write_node() {   # <n> <tunnels-json> <prefix> <export> <import-csv> <status-port>
+    local n=$1 tunnels=$2 prefix=$3 export=$4 imports=$5 status=$6
     cat > "$WORK/node$n.json" <<EOF
 {
   "tenant": "tenant-a",
@@ -171,7 +173,7 @@ write_node() {   # <n> <overlays-json> <prefix> <export> <import-csv> <status-po
     {"id": "rr-a", "addr": "127.0.0.1:$RR_A_PORT"},
     {"id": "rr-b", "addr": "127.0.0.1:$RR_B_PORT"}
   ],
-  "overlay_addrs": $overlays,
+  "tunnels": $tunnels,
   "vrfs": [
     {"id": 5, "export_rts": ["$export"], "import_rts": [$imports]}
   ],
@@ -180,26 +182,37 @@ write_node() {   # <n> <overlays-json> <prefix> <export> <import-csv> <status-po
 }
 EOF
 }
-write_node 1 '["192.168.99.1"]' 10.10.0.0/16 65000:5 '"65000:6"' "$N1_STATUS"
-write_node 2 '["192.168.99.2"]' 10.20.0.0/16 65000:6 '"65000:5"' "$N2_STATUS"
-# node3 同时 import 65000:5（收 node1）与 65000:6（收策略改送过来的 node2）。
-# 两个 overlay：一条路由带两个下一跳，验证 v2 的集合形状真的在线上跑。
-write_node 3 '["192.168.99.3", "192.168.88.3"]' 10.30.0.0/16 65000:7 '"65000:5", "65000:6"' "$N3_STATUS"
+write_node 1 '[{"peer_device_id": 2, "next_hop": "192.168.99.2"},
+              {"peer_device_id": 3, "next_hop": "192.168.99.3"}]' \
+    10.10.0.0/16 65000:5 '"65000:6"' "$N1_STATUS"
+write_node 2 '[{"peer_device_id": 1, "next_hop": "192.168.99.1"},
+              {"peer_device_id": 3, "next_hop": "192.168.99.3"}]' \
+    10.20.0.0/16 65000:6 '"65000:5"' "$N2_STATUS"
+# node3 同时 import 65000:5（收 node1）与 65000:6（收 node2）。
+# 对 node1 有两条并行隧道：同一条 prefix 必须解析出两个等价下一跳（ECMP）。
+write_node 3 '[{"peer_device_id": 1, "next_hop": "192.168.99.1"},
+              {"peer_device_id": 1, "next_hop": "192.168.88.1"},
+              {"peer_device_id": 2, "next_hop": "192.168.99.2"}]' \
+    10.30.0.0/16 65000:7 '"65000:5", "65000:6"' "$N3_STATUS"
 
 # ---------------------------------------------------------------- 启动
 
+# start 改 LAST_PID 而不是 echo：调用方一旦用 $(start ...)，PIDS 的更新就发生在
+# 子 shell 里丢了，cleanup 会漏杀，下一轮直接撞端口。所以 start 后面紧跟
+# `RR_A=$LAST_PID`，不要放进命令替换。
+LAST_PID=
 start() {   # <bin> <config> <log>
     "$WORK/bin/$1" -config "$2" >"$3" 2>&1 &
-    PIDS="$PIDS $!"
-    echo $!
+    LAST_PID=$!
+    PIDS="$PIDS $LAST_PID"
 }
 
 info "启动两个 RR 与三个 CPE"
-RR_A=$(start sr-rr "$WORK/rr-a.json" "$WORK/rr-a.log")
-RR_B=$(start sr-rr "$WORK/rr-b.json" "$WORK/rr-b.log")
-N1=$(start sr-route "$WORK/node1.json" "$WORK/node1.log")
-N2=$(start sr-route "$WORK/node2.json" "$WORK/node2.log")
-N3=$(start sr-route "$WORK/node3.json" "$WORK/node3.log")
+start sr-rr "$WORK/rr-a.json" "$WORK/rr-a.log"; RR_A=$LAST_PID
+start sr-rr "$WORK/rr-b.json" "$WORK/rr-b.log"; RR_B=$LAST_PID
+start sr-route "$WORK/node1.json" "$WORK/node1.log"; N1=$LAST_PID
+start sr-route "$WORK/node2.json" "$WORK/node2.log"; N2=$LAST_PID
+start sr-route "$WORK/node3.json" "$WORK/node3.log"; N3=$LAST_PID
 
 URL_RR_A="http://127.0.0.1:$RR_A_STATUS/status"
 URL_N1="http://127.0.0.1:$N1_STATUS/status"
@@ -208,24 +221,24 @@ URL_N3="http://127.0.0.1:$N3_STATUS/status"
 
 # ---------------------------------------------------------------- 断言
 
-info "(A) RR 收齐三家的宣告（device_id / vrf / next_hops / RT 原样保留）"
+info "(A) RR 收齐三家的宣告：隧道表与 prefix 是分开的两张表"
 wait_status "http://127.0.0.1:$RR_A_STATUS/status" \
     "set(d['routes'])=={'1','2','3'} and all(v==1 for v in d['routes'].values()) and all(s['synced'] for s in d['sessions']) and len(d['sessions'])==3" \
     "rr-a 有 3 个 synced 会话、每家 1 条 adj-rib-in" 20
+assert_status "http://127.0.0.1:$RR_A_STATUS/status" \
+    "sorted((s['device_id'], s['tunnels']) for s in d['sessions']) == [(1,2),(2,2),(3,3)]" \
+    "rr-a：三家的隧道表条目数 2/2/3（node3 对 node1 有两条并行隧道）"
 assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
-    "[r for r in d['1'] if r['device_id']==1 and r['next_hops']==['192.168.99.1'] and len(r['rts'])==1]" \
-    "rr-a：device 1 的宣告带本端 overlay 与 RT"
-assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
-    "[r for r in d['2'] if r['device_id']==2 and r['next_hops']==['192.168.99.2'] and len(r['rts'])==1]" \
-    "rr-a：device 2 的宣告带本端 overlay 与 RT"
-assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
-    "len(d['3'])==1 and d['3'][0]['next_hops']==['192.168.88.3', '192.168.99.3'] and len(d['3'][0]['rts'])==1" \
-    "rr-a：device 3 用一条路由带两个 overlay（不是两条）"
+    "all(len(v)==1 and 'next_hops' not in v[0] and len(v[0]['rts'])==1 for v in d.values()) and sorted(v[0]['device_id'] for v in d.values())==[1,2,3]" \
+    "rr-a：每条 prefix 都不带下一跳（只有 device_id/vrf/prefix/rts）"
+assert_status "http://127.0.0.1:$RR_A_STATUS/tunnels" \
+    "sorted(t['peer_device_id'] for t in d['1'])==[2,3] and sorted(t['peer_device_id'] for t in d['3'])==[1,1,2] and sorted(t['next_hop'] for t in d['3'] if t['peer_device_id']==1)==['192.168.88.1','192.168.99.1']" \
+    "rr-a：隧道表按设备保存，node3 到 node1 的两条隧道都在"
 
-info "(A) 默认反射 + RT 匹配：node1 路由进入 node2 的 bgp 表"
+info "(A) 收端本地解析 + RT 匹配：node1 路由进入 node2 的 bgp 表"
 wait_status "$URL_N2" \
     "d['active_rr']==0 and [ (r['prefix'], r['next_hops']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16',['192.168.99.1'])]" \
-    "node2 vrf5 = {10.10.0.0/16 via 192.168.99.1}" 25
+    "node2 vrf5 = {10.10.0.0/16 via 192.168.99.1（来自 node2 自己的隧道表）}" 25
 
 info "(B) RT import 过滤：node3 的 65000:7 到了 node1 但不进表"
 wait_status "$URL_N1" "d['active_rr']==0 and d['dropped_rt_mismatch']>=1" \
@@ -237,10 +250,10 @@ assert_status "$URL_N1" "d['received']>=1" \
 
 info "(C) 反射策略：node2 的路由只送到 node3，不送到 node1"
 wait_status "$URL_N3" \
-    "d['active_rr']==0 and sorted((r['prefix'], r['next_hops']) for r in d['rib'].get('5',[])) == [('10.10.0.0/16',['192.168.99.1']), ('10.20.0.0/16',['192.168.99.2'])]" \
-    "node3 同时收到 node1（拓扑）与 node2（策略）" 25
+    "d['active_rr']==0 and sorted((r['prefix'], r['next_hops']) for r in d['rib'].get('5',[])) == [('10.10.0.0/16',['192.168.88.1','192.168.99.1']), ('10.20.0.0/16',['192.168.99.2'])]" \
+    "node3 收到 node1（两条并行隧道 ⇒ 两个下一跳）与 node2（策略允许）" 25
 assert_status "$URL_N1" "not [r for r in d['rib'].get('5',[]) if r['prefix']=='10.20.0.0/16']" \
-    "node1 没收到 node2 的路由（策略替换了拓扑目标）"
+    "node1 没收到 node2 的路由（reflect_to 在邻接之上把它减掉了）"
 
 info "(D) 主备切换：杀掉 rr-a，三个 CPE 切到 rr-b 且表不变"
 kill "$RR_A" 2>/dev/null || true
@@ -257,7 +270,7 @@ assert_status "$URL_N3" \
     "切到 rr-b 后 node3 的表不变"
 
 info "(D) 首选 RR 回来：切回 rr-a"
-RR_A=$(start sr-rr "$WORK/rr-a.json" "$WORK/rr-a.log.2")
+start sr-rr "$WORK/rr-a.json" "$WORK/rr-a.log.2"; RR_A=$LAST_PID
 for u in "$URL_N1:node1" "$URL_N2:node2" "$URL_N3:node3"; do
     url=${u%:*}; who=${u##*:}
     wait_status "$url" "d['active_rr']==0 and d['sessions'][0]['synced']==True" \

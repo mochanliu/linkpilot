@@ -43,10 +43,17 @@ type fileConfig struct {
 	HoldSec       int              `json:"hold_sec"`
 	TLSServerName string           `json:"tls_server_name"`
 	RRs           []wire.RRAddress `json:"rrs"`
-	OverlayAddrs  []string         `json:"overlay_addrs"`
+	Tunnels       []tunnelConfig   `json:"tunnels"`
 	VRFs          []vrfConfig      `json:"vrfs"`
 	LocalPrefixes []prefixConfig   `json:"local_prefixes"`
 	StatusAddr    string           `json:"status_addr"`
+}
+
+// tunnelConfig 是控制器分配的隧道表：对端设备 + 对端 overlay 地址。本端接口名
+// 只需要 sr-fib 知道，路由协议不关心。
+type tunnelConfig struct {
+	Peer    uint16 `json:"peer_device_id"`
+	NextHop string `json:"next_hop"`
 }
 
 type vrfConfig struct {
@@ -139,16 +146,18 @@ func main() {
 	}
 
 	clientCfg := route.ClientConfig{
-		Tenant:       cfg.Tenant,
-		DeviceID:     cfg.DeviceID,
-		HoldSec:      cfg.HoldSec,
-		RRs:          make([]route.RRConfig, 0, len(cfg.RRs)),
-		OverlayAddrs: cfg.OverlayAddrs,
-		Dial:         dial,
-		Logf:         log.Printf,
+		Tenant:   cfg.Tenant,
+		DeviceID: cfg.DeviceID,
+		HoldSec:  cfg.HoldSec,
+		RRs:      make([]route.RRConfig, 0, len(cfg.RRs)),
+		Dial:     dial,
+		Logf:     log.Printf,
 	}
 	for _, rr := range cfg.RRs {
 		clientCfg.RRs = append(clientCfg.RRs, route.RRConfig{ID: rr.ID, Addr: rr.Addr})
+	}
+	for _, t := range cfg.Tunnels {
+		clientCfg.Tunnels = append(clientCfg.Tunnels, route.Tunnel{Peer: t.Peer, NextHop: t.NextHop})
 	}
 	for _, v := range cfg.VRFs {
 		clientCfg.VRFs = append(clientCfg.VRFs, route.VRFConfig{ID: v.ID, ExportRTs: v.ExportRTs, ImportRTs: v.ImportRTs})
@@ -161,8 +170,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("route client: %v", err)
 	}
-	log.Printf("sr-route: device %d (tenant %s), %d local prefixes, %d RRs",
-		cfg.DeviceID, cfg.Tenant, len(c.LocalRoutes()), len(cfg.RRs))
+	log.Printf("sr-route: device %d (tenant %s), %d local prefixes, %d tunnels, %d RRs",
+		cfg.DeviceID, cfg.Tenant, len(c.LocalRoutes()), len(c.Tunnels()), len(cfg.RRs))
 
 	if cfg.StatusAddr != "" {
 		go serveStatus(cfg.StatusAddr, c)
@@ -235,7 +244,7 @@ func serveStatus(addr string, c *route.Client) {
 			return
 		}
 		all := c.AllRIB()
-		rib := make(map[string][]route.Route, len(all))
+		rib := make(map[string][]route.RIBEntry, len(all))
 		for vrf, routes := range all {
 			rib[strconv.Itoa(int(vrf))] = routes
 		}
@@ -244,7 +253,7 @@ func serveStatus(addr string, c *route.Client) {
 		enc.SetIndent("", "  ")
 		enc.Encode(struct {
 			route.ClientStats
-			RIB map[string][]route.Route `json:"rib"`
+			RIB map[string][]route.RIBEntry `json:"rib"`
 		}{c.Stats(), rib})
 	})
 	log.Printf("sr-route: status on http://%s/status", addr)

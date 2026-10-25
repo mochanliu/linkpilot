@@ -4,7 +4,8 @@
 # 这条脚本把几段真东西接在一起，回答"路由真的在转发吗"：
 #
 #   (A) 真 RR + 两个真 sr-route：node2 宣告 10.20.0.0/16，经 RR 反射进 node1
-#       的 RIB（sr-route 的 /status 就是 FIB 加载器的输入）。
+#       的 RIB（sr-route 的 /status 就是 FIB 加载器的输入）。prefix 本身不带
+#       下一跳：node1 用自己宣告给 RR 的隧道表（peer=2 → 192.168.99.2）解析。
 #   (B) 真 sr-fib + 真 VPP：node1 的 VPP 里应出现 VRF 250 的 10.20.0.0/16，
 #       出口是 wg0、压标签 266（= 16 + VRF 250），并登记本地标签 266。
 #   (C) 真 BFD（node2 是真容器）：两端会话 Up 时路由保留；对端撤会话、本端
@@ -275,12 +276,11 @@ cat > "$WORK/rr.json" <<EOF
   "hold_sec": 6,
   "listen": "127.0.0.1:$RR_PORT",
   "status_addr": "127.0.0.1:$RR_STATUS",
-  "tls": {"cert_file": "$WORK/pki/rr.crt", "key_file": "$WORK/pki/rr.key", "ca_file": "$WORK/pki/ca.crt"},
-  "topology": {"2": [1]}
+  "tls": {"cert_file": "$WORK/pki/rr.crt", "key_file": "$WORK/pki/rr.key", "ca_file": "$WORK/pki/ca.crt"}
 }
 EOF
 
-write_node() {   # <n> <overlay> <prefix> <export> <import> <status>
+write_node() {   # <n> <peer-device> <peer-overlay> <prefix> <export> <import> <status>
     cat > "$WORK/node$1.json" <<EOF
 {
   "tenant": "tenant-a",
@@ -289,16 +289,16 @@ write_node() {   # <n> <overlay> <prefix> <export> <import> <status>
   "serial": "node$1",
   "hold_sec": 6,
   "rrs": [{"id": "rr-a", "addr": "127.0.0.1:$RR_PORT"}],
-  "overlay_addrs": ["$2"],
-  "vrfs": [{"id": $VRF, "export_rts": ["$4"], "import_rts": ["$5"]}],
-  "local_prefixes": [{"vrf_id": $VRF, "prefix": "$3"}],
-  "status_addr": "$6"
+  "tunnels": [{"peer_device_id": $2, "next_hop": "$3"}],
+  "vrfs": [{"id": $VRF, "export_rts": ["$5"], "import_rts": ["$6"]}],
+  "local_prefixes": [{"vrf_id": $VRF, "prefix": "$4"}],
+  "status_addr": "$7"
 }
 EOF
 }
-write_node 1 "$OVERLAY_N1" "$LOCAL_PFX"  65000:250 65000:251 "127.0.0.1:$N1_STATUS"
+write_node 1 2 "$OVERLAY_N2" "$LOCAL_PFX"  65000:250 65000:251 "127.0.0.1:$N1_STATUS"
 # node2 的状态口绑 0.0.0.0：node2 容器里的 sr-fib 要跨 bridge 来拉这份 RIB。
-write_node 2 "$OVERLAY_N2" "$REMOTE_PFX" 65000:251 65000:250 "0.0.0.0:$N2_STATUS"
+write_node 2 1 "$OVERLAY_N1" "$REMOTE_PFX" 65000:251 65000:250 "0.0.0.0:$N2_STATUS"
 
 cat > "$WORK/fib.json" <<EOF
 {
