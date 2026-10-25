@@ -81,10 +81,10 @@ CTRL_PORT=8444
 TENANT=tenant-a
 
 # a b aif aport a_overlay bif bport b_overlay path_a path_b transit_port
-# 端口是「每隧道一个」，两端必须用同一个端口：encap 的判据是
-# udp->dst_port ∈ 本机 vpn_ports，而发往对端的包 dst_port 是**对端的**
-# 监听端口。两端各用各的端口时，发送侧判据永远不成立 → 包被静默直通，
-# 计数器只涨 encap_bypass 而隧道本身还是通的，很难查。
+# 端口是「每隧道一个」，但两端不必同号：encap 的隧道身份来自绑定表
+# (对端 endpoint, 对端 dst_port)，与本机 vpn_ports 无关；vpn_ports 只决定
+# 收包进 sr-wg4-input 还是 wg4-input。这里两端写成同号只是方便对表；
+# 非对称端口的回归在 test/scripts/test-multitunnel.sh（51830/51840）。
 TUNNELS="1 2 wg0 51820 192.168.99.1  wg0 51820 192.168.99.2  1 3 51821
 1 3 wg1 51840 192.168.100.1 wg0 51840 192.168.100.2 2 5 51841
 2 3 wg1 51860 192.168.101.1 wg1 51860 192.168.101.2 4 6 51861"
