@@ -1,16 +1,22 @@
 #!/bin/bash
 # status.sh - 打印 lab 的当前状态快照（只读，不做任何修改）
 #
-# 排障时先看这里：哪一层没起来、隧道绑定可用几条、RIB 里有什么、客户侧看到
-# 什么。深入某一层再去对应容器里敲命令（login 方式见 README.md）。
+# 排障时先看这里：哪一层没起来、隧道绑定可用几条、RIB 里有什么、盒内 FRR
+# 和客户路由器各自看到什么。深入某一层再去对应容器里敲命令（login 方式见
+# README.md）。
+#
+# 每台 lab-cpeN 是一整台盒子：VPP + 盒内 FRR + sr-route/sr-fib/sr-frr，
+# 客户路由器是独立的 lab-custN。
 set -u
 
 VRF=250
+FRR_TABLE=1250
 ROUTE_STATUS=( "" 19001 19002 19003 )
 RR_STATUS=18447
 CTRL_PORT=8444
 
 vppc(){ local c=$1; shift; docker exec "$c" vppctl "$@" 2>&1 | tr -d '\r'; }
+vtysh(){ local c=$1; shift; docker exec "$c" vtysh "$@" 2>&1 | tr -d '\r'; }
 hr() { echo "------------------------------------------------------------"; }
 
 hr
@@ -53,12 +59,25 @@ for n in 1 2 3; do
 done
 echo
 hr
-echo "FRR 客户侧"
+echo "盒内 FRR（lab-cpeN：正向导出 table $FRR_TABLE / 反向吃 tag 1001）"
 for n in 1 2 3; do
-    echo "  lab-frr$n:"
-    docker exec "lab-frr$n" vtysh -c 'show ip route table 1250' 2>/dev/null |
-        grep -E '10\.68\.' | sed 's/^/    /'
-    echo "    BGP: $(docker exec "lab-frr$n" vtysh -c 'show bgp ipv4 unicast' 2>/dev/null | grep -c '\*>') 条"
+    c=lab-cpe$n
+    echo "  $c:"
+    vtysh "$c" -c "show ip route table $FRR_TABLE" 2>/dev/null |
+        grep -E '^[TBCSKL][>*]' | sed 's/^/    table '"$FRR_TABLE"': /'
+    vtysh "$c" -c 'show bgp summary' 2>/dev/null |
+        awk '/^Neighbor/{h=1;next} h&&NF{print "    bgp: "$0}'
+done
+echo
+hr
+echo "客户路由器（lab-custN：只跑 BGP 和一条默认路由）"
+for n in 1 2 3; do
+    c=lab-cust$n
+    echo "  $c:"
+    vtysh "$c" -c 'show bgp summary' 2>/dev/null |
+        awk '/^Neighbor/{h=1;next} h&&NF{print "    bgp: "$0}'
+    vtysh "$c" -c 'show ip route' 2>/dev/null |
+        grep -E '^(B|S)\*' | sed 's/^/    /'
 done
 echo
 hr

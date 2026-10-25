@@ -1,9 +1,15 @@
 #!/bin/bash
 # verify.sh - 对 bringup.sh 搭好的三站点 lab 做端到端体检（宿主机执行）
 #
-# 检查顺序就是一次报文的真实路径：
-#   容器/VPP → WG 隧道（端口/路径/绑定/peer）→ 控制面 RIB → VPP FIB →
-#   FRR 客户侧（table 1250 + BGP）→ 终端到终端。
+# 拓扑要点：每个站点是一台"盒子"= lab-cpeN（VPP 数据面 + 盒内 FRR +
+# sr-route/sr-fib/sr-frr），盒子外接一台客户路由器 lab-custN，再往外是
+# lab-termN。所以报文路径是：
+#   终端 → 客户路由器 → 盒内核 xconn → VPP table 250 → SR/WG → 对端盒子 →
+#   对端客户路由器 → 对端终端
+#
+# 再单独验证两个方向的 FRR 联动：
+#   正向：sr-route RIB → sr-frr → FRR table 1250 → BGP → 客户路由器
+#   反向：客户 BGP（tag 1001）→ 盒内 FRR → sr-frr → sr-route local → 远端 FIB
 #
 # 只读：不改任何配置，不重启任何进程。失败项逐条打印，最后给总数。
 #
@@ -14,12 +20,19 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 VRF=250
 LABEL=266
 TUNNEL_MTU=1360
+FRR_TABLE=1250
+BGP_TAG=1001
 ROUTE_STATUS=( "" 19001 19002 19003 )
 WAN_IP=( "" 10.88.1.11 10.88.1.12 10.88.1.13 )
 INSIDE_IP=( "" 10.78.1.2 10.78.2.2 10.78.3.2 )
+FRR_IP=( "" 10.78.1.20 10.78.2.20 10.78.3.20 )
+XCONN_IP=( "" 10.79.1.2 10.79.2.2 10.79.3.2 )
+CUST_X_IP=( "" 10.79.1.3 10.79.2.3 10.79.3.3 )
 LAN_PFX=( "" 10.68.1.0/24 10.68.2.0/24 10.68.3.0/24 )
 TERM_IP=( "" 10.68.1.10 10.68.2.10 10.68.3.10 )
-FRR_IP=( "" 10.78.1.20 10.78.2.20 10.78.3.20 )
+LOOP_IP=( "" 172.16.1.1 172.16.2.1 172.16.3.1 )
+BOX_AS=( "" 65101 65102 65103 )
+CUST_AS=( "" 65001 65002 65003 )
 RR_STATUS=18447
 CTRL_ADDR=10.99.0.200
 CTRL_PORT=8444
@@ -38,16 +51,25 @@ QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
 
 PASS=0 FAIL=0
+
 ok()  { PASS=$((PASS + 1)); printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
 sect(){ echo; echo "== $*"; }
 note(){ [ "$QUIET" = "1" ] || printf '  .... %s\n' "$*"; }
 
 vppc(){ local c=$1; shift; docker exec "$c" vppctl "$@" 2>&1 | tr -d '\r'; }
+vtysh(){ local c=$1; shift; docker exec "$c" vtysh "$@" 2>&1 | tr -d '\r'; }
 peer_up() {   # <cpe> <want>
     local n
     n=$(vppc "$1" show wireguard peer | grep -c 'flags: 2')
     [ "$n" -ge "$2" ]
+}
+kern_if_for_ip() {   # <cpe> <ip> -> 内核接口名
+    docker exec "$1" ip -o -4 addr show 2>/dev/null |
+        awk -v w="$2" '{split($4,a,"/"); if (a[1]==w) {print $2; exit}}'
+}
+kern_fwd() {   # <cpe> <iface> -> forwarding 值
+    docker exec "$1" cat "/proc/sys/net/ipv4/conf/$2/forwarding" 2>/dev/null || echo NA
 }
 
 # 反复执行直到成功（收敛类断言用）
@@ -61,11 +83,12 @@ retry() {   # <秒> <命令...>
 }
 
 # 在容器里用 python3 断言 /status（Go 的 JSON 是紧凑格式，用 JSON 解析而不是 grep）
-status_check() {   # <cpe> <port> <expect: "prefix:nh,prefix:nh">
-    local c=$1 port=$2 want=$3
-    docker exec "$c" python3 - "$port" "$VRF" "$want" <<'PY' >/dev/null 2>&1
+# want_rib 格式："prefix:nh,prefix:nh"；want_local 是逗号分隔的 prefix。
+status_check() {   # <cpe> <port> <want_rib> <want_local>
+    local c=$1 port=$2 want=$3 wantl=$4
+    docker exec "$c" python3 - "$port" "$VRF" "$want" "$wantl" <<'PY' >/dev/null 2>&1
 import json, sys, urllib.request
-port, vrf, want = sys.argv[1], sys.argv[2], sys.argv[3]
+port, vrf, want, wantl = sys.argv[1:5]
 d = json.load(urllib.request.urlopen("http://127.0.0.1:%s/status" % port, timeout=3))
 if d.get("active_rr") != 0:
     raise SystemExit("active_rr=%r" % d.get("active_rr"))
@@ -73,6 +96,9 @@ got = sorted("%s:%s" % (r["prefix"], ",".join(sorted(r["next_hops"])))
              for r in d.get("rib", {}).get(vrf, []))
 if got != sorted(x for x in want.split(",") if x):
     raise SystemExit("rib=%r want=%r" % (got, want))
+gotl = sorted(x["prefix"] for x in (d.get("local") or []))
+if gotl != sorted(x for x in wantl.split(",") if x):
+    raise SystemExit("local=%r want=%r" % (gotl, wantl))
 PY
 }
 
@@ -89,7 +115,8 @@ ping4() { docker exec "$1" ping -c 3 -W 2 -i 0.3 "$2" >/dev/null 2>&1; }
 overlay_ping() { vppc "$1" ping "$2" repeat 3 interval 0.2 | grep -q '0% packet loss'; }
 
 echo "===== 1. 容器与 VPP ====="
-for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-transit lab-rr lab-ctrl lab-frr1 lab-frr2 lab-frr3 lab-term1 lab-term2 lab-term3; do
+for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-cust1 lab-cust2 lab-cust3 \
+         lab-transit lab-rr lab-ctrl lab-term1 lab-term2 lab-term3; do
     docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null | grep -q true && ok "$c 运行中" || bad "$c 没运行"
 done
 for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-transit; do
@@ -97,8 +124,34 @@ for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-transit; do
     vppc "$c" show plugins | grep -q sr_wg_plugin.so && ok "$c: sr_wg 插件已加载" || bad "$c: sr_wg 插件缺失"
 done
 
-echo
-echo "===== 2. WG 隧道（端口 / 路径 / 绑定 / peer） ====="
+sect "2. 盒内核 ↔ VPP 的接缝（vti0/vti1 + 转发开关）"
+for n in 1 2 3; do
+    c=lab-cpe$n
+    vppc "$c" show interface addr | grep -q "L3 ${INSIDE_IP[$n]}/" \
+        && ok "$c: VPP 侧持有 ${INSIDE_IP[$n]}（table $VRF 入口）" \
+        || bad "$c: VPP 侧没有 ${INSIDE_IP[$n]}"
+    docker exec "$c" ip -o -4 addr show | grep -q "inet ${FRR_IP[$n]}/" \
+        && ok "$c: 内核 vti0 持有 ${FRR_IP[$n]}（盒内 FRR 下一跳）" \
+        || bad "$c: 内核没有 ${FRR_IP[$n]}"
+    [ "$(kern_fwd "$c" vti0)" = "1" ] && ok "$c: vti0 转发开" || bad "$c: vti0 forwarding=$(kern_fwd "$c" vti0)"
+    [ "$(kern_fwd "$c" vti1)" = "0" ] && ok "$c: vti1 转发关（只在 VPP 里转，避免重复）" \
+        || bad "$c: vti1 forwarding=$(kern_fwd "$c" vti1)"
+    xif=$(kern_if_for_ip "$c" "${XCONN_IP[$n]}")
+    if [ -z "$xif" ]; then
+        bad "$c: 内核没有客户侧接缝地址 ${XCONN_IP[$n]}"
+    elif [ "$(kern_fwd "$c" "$xif")" = "1" ]; then
+        ok "$c: $xif（面向客户路由器）转发开"
+    else
+        bad "$c: $xif forwarding=$(kern_fwd "$c" "$xif")"
+    fi
+    [ "$(docker exec "$c" cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] \
+        && ok "$c: 全局 ip_forward=1" || bad "$c: 全局 ip_forward 不是 1"
+    vtysh "$c" -c 'show ip route 0.0.0.0/0' | grep -q "${INSIDE_IP[$n]}" \
+        && ok "$c: 盒内 FRR 默认路由指向 VPP ${INSIDE_IP[$n]}" \
+        || bad "$c: 盒内 FRR 默认路由没指向 ${INSIDE_IP[$n]}"
+done
+
+sect "3. WG 隧道（端口 / 路径 / 绑定 / peer）"
 for n in 1 2 3; do
     c=lab-cpe$n
     ports=$(vppc "$c" show sr-wg ports | awk '/^vpn/{i=index($0,": "); s=substr($0,i+2); gsub(/ /,"",s); print s}')
@@ -135,8 +188,7 @@ for p in 51821 51841 51861; do
         && ok "lab-transit: transit 端口 $p 已登记" || bad "lab-transit: 缺 transit 端口 $p"
 done
 
-echo
-echo "===== 3. overlay 可达性（VPP 自己发起的 ping，走 SR 两跳） ====="
+sect "4. overlay 可达性（VPP 自己发起的 ping，走 SR 两跳）"
 for pair in "1 2 192.168.99.2" "2 1 192.168.99.1" \
             "1 3 192.168.100.2" "3 1 192.168.100.1" \
             "2 3 192.168.101.2" "3 2 192.168.101.1"; do
@@ -146,8 +198,7 @@ for pair in "1 2 192.168.99.2" "2 1 192.168.99.1" \
         || bad "lab-cpe$1 -> $3（cpe$2）overlay 不通"
 done
 
-echo
-echo "===== 4. 控制面（sr-ctrl / sr-rr / sr-route） ====="
+sect "5. 控制面（sr-ctrl / sr-rr / sr-route）"
 docker exec lab-ctrl test -f /var/lib/sr-ctrl/ca.pem && ok "sr-ctrl CA 已生成" || bad "sr-ctrl 没有 CA"
 for n in 1 2 3; do
     for f in device_ed25519.key node_cert.pem ca_cert.pem state.json; do
@@ -164,63 +215,112 @@ for n in 1 2 3; do
     want=""
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
-        want+="${LAN_PFX[$m]}:$(peer_overlay "$n" "$m"),"
+        ov=$(peer_overlay "$n" "$m")
+        # 远端站点自己的 LAN + 客户路由器宣告的 loopback 都该被反射过来
+        want+="${LAN_PFX[$m]}:$ov,${LOOP_IP[$m]}/32:$ov,"
     done
-    retry 30 status_check "$c" "${ROUTE_STATUS[$n]}" "${want%,}" \
-        && ok "$c: RIB 收到另两个站点且 next_hop 正确" \
-        || bad "$c: RIB 不符合预期（docker exec $c curl -s http://127.0.0.1:${ROUTE_STATUS[$n]}/status）"
+    wantl="${LAN_PFX[$n]},${LOOP_IP[$n]}/32"
+    retry 30 status_check "$c" "${ROUTE_STATUS[$n]}" "${want%,}" "$wantl" \
+        && ok "$c: RIB 有另两站的 LAN+loopback，local 含本站 LAN+反向导入的 loopback" \
+        || bad "$c: sr-route 状态不符合预期（docker exec $c curl -s http://127.0.0.1:${ROUTE_STATUS[$n]}/status）"
 done
 
-echo
-echo "===== 5. VPP FIB（table $VRF，VPN 标签 $LABEL） ====="
+sect "6. VPP FIB（table $VRF：远端压标签 $LABEL，本地不打标签交给盒内 FRR）"
 for n in 1 2 3; do
     c=lab-cpe$n
+    fib=$(vppc "$c" show ip fib table "$VRF")
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
-        fib=$(vppc "$c" show ip fib table "$VRF")
-        echo "$fib" | grep -q "^${LAN_PFX[$m]}" \
-            && ok "$c: table $VRF 有远端 ${LAN_PFX[$m]}" || bad "$c: table $VRF 缺 ${LAN_PFX[$m]}"
-        echo "$fib" | grep -A8 "^${LAN_PFX[$m]}" |
-            grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" \
-            && ok "$c: ${LAN_PFX[$m]} 压标签 $LABEL" || bad "$c: ${LAN_PFX[$m]} 没压标签 $LABEL"
+        for pfx in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
+            echo "$fib" | grep -q "^$pfx" \
+                && ok "$c: table $VRF 有远端 $pfx" || bad "$c: table $VRF 缺 $pfx"
+            echo "$fib" | grep -A8 "^$pfx" |
+                grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" \
+                && ok "$c: $pfx 压标签 $LABEL" || bad "$c: $pfx 没压标签 $LABEL"
+        done
     done
-    vppc "$c" show ip fib table "$VRF" | grep -q "^${LAN_PFX[$n]}" \
-        && ok "$c: table $VRF 有本地 ${LAN_PFX[$n]}（via FRR）" \
-        || bad "$c: table $VRF 缺本地 ${LAN_PFX[$n]}"
+    for pfx in "${LAN_PFX[$n]}" "${LOOP_IP[$n]}/32"; do
+        one=$(vppc "$c" show ip fib table "$VRF" "$pfx")
+        echo "$one" | grep -q "via ${FRR_IP[$n]} " \
+            && ok "$c: 本地 $pfx 交给盒内 FRR（${FRR_IP[$n]}），不打标签" \
+            || bad "$c: 本地 $pfx 没指向盒内 FRR ${FRR_IP[$n]}"
+        echo "$one" | grep -q "dpo-drop" \
+            && bad "$c: 本地 $pfx 是 dpo-drop" || ok "$c: 本地 $pfx 不是 dpo-drop"
+    done
 done
 
-echo
-echo "===== 6. FRR 客户侧（table 1250 + BGP + 默认路由） ====="
+sect "7. 正向导入：sr-frr → FRR table $FRR_TABLE → BGP → 客户路由器"
 for n in 1 2 3; do
-    c=lab-frr$n
-    docker exec "$c" vtysh -c 'show running-config' | grep -q 'redistribute table-direct 1250' \
-        && ok "$c: 已配置 redistribute table-direct 1250" || bad "$c: 缺 redistribute table-direct 1250"
-    docker exec "$c" vtysh -c 'show ip route 0.0.0.0/0' | grep -q "${INSIDE_IP[$n]}" \
-        && ok "$c: 默认路由指向 CPE ${INSIDE_IP[$n]}" || bad "$c: 默认路由没指向 ${INSIDE_IP[$n]}"
+    c=lab-cpe$n
+    vtysh "$c" -c 'show running-config' | grep -q "redistribute table-direct $FRR_TABLE" \
+        && ok "$c: 已配置 redistribute table-direct $FRR_TABLE" || bad "$c: 缺 redistribute table-direct $FRR_TABLE"
+    retry 20 bash -c "docker exec $c vtysh -c 'show bgp summary' | grep -q '^${CUST_X_IP[$n]} '" \
+        && ok "$c: BGP 与客户路由器 ${CUST_X_IP[$n]}（AS ${CUST_AS[$n]}）建立" \
+        || bad "$c: BGP 与 ${CUST_X_IP[$n]} 未建立"
+    t1250=$(vtysh "$c" -c "show ip route table $FRR_TABLE")
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
-        docker exec "$c" vtysh -c 'show ip route table 1250' | grep -q "${LAN_PFX[$m]}" \
-            && ok "$c: table 1250 有 ${LAN_PFX[$m]}" || bad "$c: table 1250 缺 ${LAN_PFX[$m]}"
-        docker exec "$c" vtysh -c 'show bgp ipv4 unicast' | grep -q "${LAN_PFX[$m]}" \
-            && ok "$c: BGP 可见 ${LAN_PFX[$m]}" || bad "$c: BGP 不可见 ${LAN_PFX[$m]}"
+        for pfx in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
+            echo "$t1250" | grep -q "$pfx" \
+                && ok "$c: table $FRR_TABLE 有远端 $pfx" || bad "$c: table $FRR_TABLE 缺 $pfx"
+            retry 20 bash -c "docker exec $c vtysh -c 'show bgp ipv4 unicast' | grep -q '$pfx'" \
+                && ok "$c: 本盒 BGP 里有 $pfx（box FRR 自身可见）" \
+                || bad "$c: 本盒 BGP 不可见 $pfx"
+        done
     done
-    docker exec "$c" vtysh -c 'show bgp summary' | grep -qi "No BGP neighbors" \
-        && note "$c: 无 BGP 邻居（本 lab 只验证 redistribute 可见性）"
+done
+for n in 1 2 3; do
+    c=lab-cust$n
+    retry 20 bash -c "docker exec $c vtysh -c 'show bgp summary' | grep -q '^${XCONN_IP[$n]} '" \
+        && ok "$c: 与盒内 FRR ${XCONN_IP[$n]}（AS ${BOX_AS[$n]}）建立" \
+        || bad "$c: 与 ${XCONN_IP[$n]} 未建立"
+    bgp=$(vtysh "$c" -c 'show bgp ipv4 unicast')
+    for m in 1 2 3; do
+        [ "$m" = "$n" ] && continue
+        for pfx in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
+            echo "$bgp" | grep -q "$pfx" \
+                && ok "$c: 客户 BGP 学到远端 $pfx（正向导入生效）" \
+                || bad "$c: 客户 BGP 没有远端 $pfx"
+        done
+    done
+    vtysh "$c" -c 'show ip route 0.0.0.0/0' | grep -q "${XCONN_IP[$n]}" \
+        && ok "$c: 默认路由指向盒内核 ${XCONN_IP[$n]}" || bad "$c: 默认路由没指向 ${XCONN_IP[$n]}"
 done
 
-echo
-echo "===== 7. 终端到终端（客户视角） ====="
+sect "8. 反向导入：客户 BGP（tag $BGP_TAG）→ 盒内 FRR → sr-frr → sr-route local"
+for n in 1 2 3; do
+    c=lab-cpe$n
+    r=$(vtysh "$c" -c "show ip route ${LOOP_IP[$n]}/32")
+    echo "$r" | grep -q "tag $BGP_TAG" \
+        && ok "$c: 客户 loopback 在 zebra 里带 tag $BGP_TAG（反向上报的门槛）" \
+        || bad "$c: 客户 loopback 不带 tag $BGP_TAG（sr-frr 会丢弃它）"
+    echo "$r" | grep -q "${CUST_X_IP[$n]}" \
+        && ok "$c: 客户 loopback 的下一跳是客户路由器 ${CUST_X_IP[$n]}" \
+        || bad "$c: 客户 loopback 的下一跳不是 ${CUST_X_IP[$n]}"
+    # 我们经 table 1250 导出的远端前缀回到 BGP 时 tag 是 0，不能被反向再吃回来：
+    # 它们只能停在 table 1250，主表里必须不存在。
+    for m in 1 2 3; do
+        [ "$m" = "$n" ] && continue
+        vtysh "$c" -c "show ip route ${LAN_PFX[$m]}" | grep -q "Network not in table" \
+            && ok "$c: 远端 ${LAN_PFX[$m]} 只停在 table $FRR_TABLE，没回灌主表（无环路）" \
+            || bad "$c: 远端 ${LAN_PFX[$m]} 出现在主表（可能被反向再导入）"
+    done
+done
+
+sect "9. 终端到终端 / 终端到远端客户 loopback（客户视角）"
 for a in 1 2 3; do
     for b in 1 2 3; do
         [ "$a" = "$b" ] && continue
         retry 20 ping4 "lab-term$a" "${TERM_IP[$b]}" \
             && ok "lab-term$a -> lab-term$b（${TERM_IP[$b]}）通" \
             || bad "lab-term$a -> lab-term$b（${TERM_IP[$b]}）不通"
+        retry 20 ping4 "lab-term$a" "${LOOP_IP[$b]}" \
+            && ok "lab-term$a -> cust$b loopback ${LOOP_IP[$b]} 通（反向导入落到了数据面）" \
+            || bad "lab-term$a -> ${LOOP_IP[$b]} 不通"
     done
 done
 
-echo
-echo "===== 8. 数据面计数器 ====="
+sect "10. 数据面计数器"
 for n in 1 2 3; do
     c=lab-cpe$n
     enc=$(vppc "$c" show sr-wg stats | awk '/Encap:/{e=1} e&&/ok:/{print $2; exit}')
