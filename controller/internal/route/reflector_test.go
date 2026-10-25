@@ -135,7 +135,7 @@ func testRoute(dev, vrf uint16, prefix, nextHop string, rts ...string) Route {
 	if len(rts) == 0 {
 		rts = []string{"65000:100"}
 	}
-	return Route{DeviceID: dev, VRFID: uint8(vrf), Prefix: prefix, NextHop: nextHop, RTs: rts}
+	return Route{DeviceID: dev, VRFID: uint8(vrf), Prefix: prefix, NextHops: []string{nextHop}, RTs: rts}
 }
 
 func TestNewReflectorValidation(t *testing.T) {

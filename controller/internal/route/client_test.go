@@ -66,7 +66,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func ribPrefixes(routes []Route) []string {
 	out := make([]string, 0, len(routes))
 	for _, r := range routes {
-		out = append(out, r.Prefix+"@"+r.NextHop)
+		out = append(out, r.Prefix+"@"+strings.Join(r.NextHops, ","))
 	}
 	return out
 }
@@ -95,6 +95,7 @@ func TestNewClientValidation(t *testing.T) {
 		}, "no export RTs"},
 		{"bad local prefix", func(c *ClientConfig) { c.LocalPrefixes[0].Prefix = "10.10.1.1/16" }, "not canonical"},
 		{"bad overlay", func(c *ClientConfig) { c.OverlayAddrs = []string{"192.168.099.1"} }, "bad next_hop"},
+		{"local prefix without overlays", func(c *ClientConfig) { c.OverlayAddrs = nil }, "no overlay addresses"},
 		{"duplicate overlay", func(c *ClientConfig) {
 			c.OverlayAddrs = []string{"192.168.99.1", "192.168.99.1"}
 		}, "twice"},
@@ -111,7 +112,7 @@ func TestNewClientValidation(t *testing.T) {
 	}
 }
 
-func TestLocalRoutesExpandedPerOverlay(t *testing.T) {
+func TestLocalRoutesCarryEveryOverlay(t *testing.T) {
 	cfg := testClientConfig()
 	cfg.OverlayAddrs = []string{"192.168.99.1", "192.168.77.1"}
 	cfg.VRFs[0].ExportRTs = []string{"65000:5", "65000:50"}
@@ -122,12 +123,16 @@ func TestLocalRoutesExpandedPerOverlay(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 	got := c.LocalRoutes()
-	if len(got) != 4 {
-		t.Fatalf("local routes = %d, want 2 prefixes x 2 overlays", len(got))
+	if len(got) != 2 {
+		t.Fatalf("local routes = %d, want 1 per prefix (2)", len(got))
 	}
 	for _, rt := range got {
 		if rt.DeviceID != 10 {
 			t.Fatalf("route device = %d", rt.DeviceID)
+		}
+		if len(rt.NextHops) != 2 ||
+			rt.NextHops[0] != "192.168.77.1" || rt.NextHops[1] != "192.168.99.1" {
+			t.Fatalf("%s next hops = %v, want the ascending overlay set", rt.Prefix, rt.NextHops)
 		}
 		if rt.VRFID == 5 && len(rt.RTs) != 2 {
 			t.Fatalf("vrf 5 exported %v, want both RTs", rt.RTs)
@@ -198,16 +203,14 @@ func TestClientAnnouncesItsTable(t *testing.T) {
 	cfg.Dial = srv.dial
 	c := startClient(t, cfg)
 
-	waitFor(t, "rr to receive the announced table", func() bool { return len(rr.RoutesOf(10)) == 2 })
+	waitFor(t, "rr to receive the announced table", func() bool { return len(rr.RoutesOf(10)) == 1 })
 	got := rr.RoutesOf(10)
 	want := c.LocalRoutes()
-	if len(want) != 2 {
+	if len(want) != 1 {
 		t.Fatalf("client local routes = %d", len(want))
 	}
-	for i := range want {
-		if !got[i].Equal(want[i]) {
-			t.Fatalf("rr stored %+v, want %+v", got[i], want[i])
-		}
+	if !got[0].Equal(want[0]) || len(got[0].NextHops) != 2 {
+		t.Fatalf("rr stored %+v, want %+v (one route, two next hops)", got[0], want[0])
 	}
 	waitFor(t, "session synced", func() bool {
 		st := c.Stats()
@@ -428,9 +431,9 @@ func TestClientDropsOwnAndMalformedRoutes(t *testing.T) {
 				}
 			}()
 			if err := WriteEnvelope(srv, Envelope{Type: MsgAnnounce, Routes: []Route{
-				{DeviceID: 10, VRFID: 5, Prefix: "10.99.0.0/16", NextHop: "192.168.99.2", RTs: []string{"65000:6"}},
-				{DeviceID: 21, VRFID: 5, Prefix: "10.21.2.3/16", NextHop: "192.168.99.3", RTs: []string{"65000:6"}},
-				{DeviceID: 21, VRFID: 5, Prefix: "10.21.0.0/16", NextHop: "192.168.99.3", RTs: []string{"65000:6"}},
+				{DeviceID: 10, VRFID: 5, Prefix: "10.99.0.0/16", NextHops: []string{"192.168.99.2"}, RTs: []string{"65000:6"}},
+				{DeviceID: 21, VRFID: 5, Prefix: "10.21.2.3/16", NextHops: []string{"192.168.99.3"}, RTs: []string{"65000:6"}},
+				{DeviceID: 21, VRFID: 5, Prefix: "10.21.0.0/16", NextHops: []string{"192.168.99.3"}, RTs: []string{"65000:6"}},
 			}}); err != nil {
 				return
 			}

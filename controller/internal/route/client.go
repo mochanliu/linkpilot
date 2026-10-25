@@ -45,10 +45,10 @@ type RRConfig struct {
 // ClientConfig is the CPE route instance's static configuration.
 //
 // OverlayAddrs are the local overlay /32s of this CPE's VPN tunnels (one per
-// tunnel, controller-assigned). Every local prefix is announced once per
-// overlay address, so a peer learns a path per tunnel -- that is what makes
-// "下一跳是自己所有VPN隧道的本端overlay地址" true without the RR rewriting
-// anything.
+// tunnel, controller-assigned). Every local prefix is announced once with all
+// of them as next hops, so a peer learns one route per prefix carrying a path
+// per tunnel -- that is what makes "下一跳是自己所有VPN隧道的本端overlay地址"
+// true without the RR rewriting anything.
 type ClientConfig struct {
 	Tenant        string
 	DeviceID      uint16
@@ -209,6 +209,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		seenOverlay[a] = true
 		overlays = append(overlays, a)
 	}
+	// Canonical next-hop sets are strictly ascending; announce in that order so
+	// the receiver can keep comparing next-hop sets verbatim.
+	sort.Strings(overlays)
 
 	for _, lp := range cfg.LocalPrefixes {
 		if c.vrfs[lp.VRFID] == nil {
@@ -219,13 +222,21 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 			return nil, fmt.Errorf("route client: vrf %d has local prefix %s but no export RTs (nothing could import it)",
 				lp.VRFID, lp.Prefix)
 		}
-		for _, nh := range overlays {
-			rt := Route{DeviceID: cfg.DeviceID, VRFID: lp.VRFID, Prefix: lp.Prefix, NextHop: nh, RTs: rts}
-			if err := rt.Validate(); err != nil {
-				return nil, fmt.Errorf("route client: local prefix: %w", err)
-			}
-			c.local = append(c.local, rt)
+		if len(overlays) == 0 {
+			return nil, fmt.Errorf("route client: vrf %d has local prefix %s but no overlay addresses (there is no path to announce)",
+				lp.VRFID, lp.Prefix)
 		}
+		rt := Route{
+			DeviceID: cfg.DeviceID,
+			VRFID:    lp.VRFID,
+			Prefix:   lp.Prefix,
+			NextHops: append([]string(nil), overlays...),
+			RTs:      rts,
+		}
+		if err := rt.Validate(); err != nil {
+			return nil, fmt.Errorf("route client: local prefix: %w", err)
+		}
+		c.local = append(c.local, rt)
 	}
 	c.local = SortedRoutes(c.local)
 
@@ -235,9 +246,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	return c, nil
 }
 
-// LocalRoutes returns the routes this CPE announces (device × VRF × prefix ×
-// overlay). It is the input for tests and for later FIB integration, and it is
-// fixed for the lifetime of this instance.
+// LocalRoutes returns the routes this CPE announces (one per VRF × prefix, all
+// overlay addresses as next hops). It is the input for tests and for later FIB
+// integration, and it is fixed for the lifetime of this instance.
 func (c *Client) LocalRoutes() []Route {
 	return append([]Route(nil), c.local...)
 }

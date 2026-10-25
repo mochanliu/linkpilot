@@ -15,7 +15,7 @@ func validRoute() Route {
 		DeviceID: 7,
 		VRFID:    3,
 		Prefix:   "10.1.0.0/16",
-		NextHop:  "192.168.99.1",
+		NextHops: []string{"192.168.99.1"},
 		RTs:      []string{"65000:100", "65000:200"},
 	}
 }
@@ -37,10 +37,13 @@ func TestValidateRejectsNonCanonicalOrBadRoutes(t *testing.T) {
 		{"ipv6 prefix", func(r *Route) { r.Prefix = "2001:db8::/32" }, "not IPv4"},
 		{"prefix with space", func(r *Route) { r.Prefix = "10.1.0.0/16 " }, "bad prefix"},
 		{"default route ok", func(r *Route) { r.Prefix = "0.0.0.0/0" }, ""},
-		{"ipv6 next hop", func(r *Route) { r.NextHop = "2001:db8::1" }, "not IPv4"},
-		{"unspecified next hop", func(r *Route) { r.NextHop = "0.0.0.0" }, "not a unicast"},
-		{"multicast next hop", func(r *Route) { r.NextHop = "224.0.0.1" }, "not a unicast"},
-		{"next hop non-canonical", func(r *Route) { r.NextHop = "192.168.099.1" }, "bad next_hop"},
+		{"ipv6 next hop", func(r *Route) { r.NextHops = []string{"2001:db8::1"} }, "not IPv4"},
+		{"unspecified next hop", func(r *Route) { r.NextHops = []string{"0.0.0.0"} }, "not a unicast"},
+		{"multicast next hop", func(r *Route) { r.NextHops = []string{"224.0.0.1"} }, "not a unicast"},
+		{"next hop non-canonical", func(r *Route) { r.NextHops = []string{"192.168.099.1"} }, "bad next_hop"},
+		{"no next hops", func(r *Route) { r.NextHops = nil }, "at least one next_hop"},
+		{"next hops unsorted", func(r *Route) { r.NextHops = []string{"192.168.99.1", "192.168.77.1"} }, "ascending"},
+		{"duplicate next hop", func(r *Route) { r.NextHops = []string{"192.168.99.1", "192.168.99.1"} }, "ascending"},
 		{"no RTs", func(r *Route) { r.RTs = nil }, "at least one RT"},
 		{"empty RT", func(r *Route) { r.RTs = []string{""} }, "bad RT"},
 		{"RT without colon", func(r *Route) { r.RTs = []string{"65000"} }, "ASN:value"},
@@ -82,6 +85,17 @@ func TestValidateRejectsTooManyRTs(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsTooManyNextHops(t *testing.T) {
+	r := validRoute()
+	r.NextHops = nil
+	for i := 0; i <= MaxNextHopsPerRoute; i++ {
+		r.NextHops = append(r.NextHops, "192.168.99."+itoa(i+1))
+	}
+	if err := r.Validate(); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("want next-hop-count error, got %v", err)
+	}
+}
+
 func itoa(i int) string {
 	if i == 0 {
 		return "0"
@@ -102,9 +116,8 @@ func TestRouteKeyValidate(t *testing.T) {
 		t.Fatalf("valid key rejected: %v", err)
 	}
 	bad := []RouteKey{
-		{DeviceID: 0, VRFID: 1, Prefix: "10.0.0.0/8", NextHop: "192.168.99.1"},
-		{DeviceID: 1, VRFID: 1, Prefix: "10.0.0.1/8", NextHop: "192.168.99.1"},
-		{DeviceID: 1, VRFID: 1, Prefix: "10.0.0.0/8", NextHop: "0.0.0.0"},
+		{DeviceID: 0, VRFID: 1, Prefix: "10.0.0.0/8"},
+		{DeviceID: 1, VRFID: 1, Prefix: "10.0.0.1/8"},
 	}
 	for _, k := range bad {
 		if err := k.Validate(); err == nil {
@@ -148,9 +161,24 @@ func TestEqualAndKey(t *testing.T) {
 		t.Fatal("RT order should be part of equality (snapshot dedupe depends on it)")
 	}
 	b = validRoute()
-	b.NextHop = "192.168.99.2"
-	if a.Equal(b) || a.Key() == b.Key() {
-		t.Fatal("different next hops must be different paths")
+	b.NextHops = []string{"192.168.99.2"}
+	if a.Equal(b) {
+		t.Fatal("different next-hop sets must not be equal")
+	}
+	if a.Key() != b.Key() {
+		t.Fatal("a different path for the same prefix must share the key")
+	}
+	b = validRoute()
+	b.NextHops = []string{"192.168.99.1", "192.168.77.1"}
+	if a.Equal(b) {
+		t.Fatal("extra next hop not detected")
+	}
+	x := validRoute()
+	x.NextHops = []string{"192.168.77.1", "192.168.99.1"}
+	y := validRoute()
+	y.NextHops = []string{"192.168.99.1", "192.168.77.1"}
+	if x.Equal(y) {
+		t.Fatal("next-hop order is part of equality (the set is canonical)")
 	}
 	b = validRoute()
 	b.RTs = append(b.RTs, "65000:300")
@@ -253,22 +281,20 @@ func TestReadRejectsOversizedLine(t *testing.T) {
 
 func TestSortedRoutesDeterministic(t *testing.T) {
 	in := []Route{
-		{DeviceID: 2, VRFID: 1, Prefix: "10.0.0.0/8", NextHop: "192.168.99.2"},
-		{DeviceID: 1, VRFID: 2, Prefix: "10.0.0.0/8", NextHop: "192.168.99.1"},
-		{DeviceID: 1, VRFID: 1, Prefix: "10.2.0.0/16", NextHop: "192.168.99.1"},
-		{DeviceID: 1, VRFID: 1, Prefix: "10.0.0.0/8", NextHop: "192.168.77.1"},
-		{DeviceID: 1, VRFID: 1, Prefix: "10.0.0.0/8", NextHop: "192.168.99.1"},
+		{DeviceID: 2, VRFID: 1, Prefix: "10.0.0.0/8", NextHops: []string{"192.168.99.2"}},
+		{DeviceID: 1, VRFID: 2, Prefix: "10.0.0.0/8", NextHops: []string{"192.168.99.1"}},
+		{DeviceID: 1, VRFID: 1, Prefix: "10.2.0.0/16", NextHops: []string{"192.168.99.1"}},
+		{DeviceID: 1, VRFID: 1, Prefix: "10.0.0.0/8", NextHops: []string{"192.168.77.1", "192.168.99.1"}},
 	}
 	got := SortedRoutes(in)
 	wantOrder := []string{
-		"1/1/10.0.0.0/8/192.168.77.1", // next hop sorts as a string: "77" < "99"
-		"1/1/10.0.0.0/8/192.168.99.1",
-		"1/1/10.2.0.0/16/192.168.99.1",
-		"1/2/10.0.0.0/8/192.168.99.1",
-		"2/1/10.0.0.0/8/192.168.99.2",
+		"1/1/10.0.0.0/8",
+		"1/1/10.2.0.0/16",
+		"1/2/10.0.0.0/8",
+		"2/1/10.0.0.0/8",
 	}
 	for i, r := range got {
-		gotStr := itoa(int(r.DeviceID)) + "/" + itoa(int(r.VRFID)) + "/" + r.Prefix + "/" + r.NextHop
+		gotStr := itoa(int(r.DeviceID)) + "/" + itoa(int(r.VRFID)) + "/" + r.Prefix
 		if gotStr != wantOrder[i] {
 			t.Fatalf("position %d = %s, want %s", i, gotStr, wantOrder[i])
 		}

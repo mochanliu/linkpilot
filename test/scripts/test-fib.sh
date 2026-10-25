@@ -379,10 +379,10 @@ dx "$N1" "bash $WORK/start.sh" || die "启动失败"
 sleep 0.5
 
 wait_json "$N1_STATUS" \
-    "[(r['prefix'], r['next_hop']) for r in d['rib'].get('$VRF', [])] == [('$REMOTE_PFX', '$OVERLAY_N2')]" \
+    "[(r['prefix'], r['next_hops']) for r in d['rib'].get('$VRF', [])] == [('$REMOTE_PFX', ['$OVERLAY_N2'])]" \
     "node1 的 RIB 收到 node2 的 $REMOTE_PFX（next_hop=$OVERLAY_N2）" 25
 wait_json "$N2_STATUS" \
-    "[(r['prefix'], r['next_hop']) for r in d['rib'].get('$VRF', [])] == [('$LOCAL_PFX', '$OVERLAY_N1')]" \
+    "[(r['prefix'], r['next_hops']) for r in d['rib'].get('$VRF', [])] == [('$LOCAL_PFX', ['$OVERLAY_N1'])]" \
     "node2 的 RIB 收到 node1 的 $LOCAL_PFX（反向也通）" 25
 
 # ---------------------------------------------------------------- 3 落 FIB

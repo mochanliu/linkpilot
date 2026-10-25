@@ -123,7 +123,7 @@ func planFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
 func plan1() Plan {
 	p, err := planFrom(
 		[]uint8{100},
-		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"}},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}},
 		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0"}},
 	)
 	if err != nil {
@@ -146,9 +146,9 @@ func TestPlanFrom(t *testing.T) {
 		[]uint8{101, 100},
 		[]RIBRoute{
 			// 同一条路径被两个 RR 各反射一次：只该出现一次。
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
-			{VRF: 100, Prefix: "10.1.0.9/24", NextHop: "10.255.0.2"}, // 未规范化前缀
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}},
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}},
+			{VRF: 100, Prefix: "10.1.0.9/24", NextHops: []string{"10.255.0.2"}}, // 未规范化前缀
 		},
 		[]Tunnel{tun},
 	)
@@ -178,9 +178,9 @@ func TestPlanFromMultipath(t *testing.T) {
 	plan, err := planFrom(
 		[]uint8{100},
 		[]RIBRoute{
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"},
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"},
+			// 一条路由自带两条路径；另一台设备宣告同一前缀、其中一条路径重合。
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2", "10.255.0.3"}},
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.3"}},
 		},
 		[]Tunnel{
 			{NextHop: "10.255.0.3", Interface: "wg1"},
@@ -203,8 +203,8 @@ func TestPlanFromUnknownNextHopWarnsOnly(t *testing.T) {
 	plan, err := planFrom(
 		[]uint8{100},
 		[]RIBRoute{
-			{VRF: 100, Prefix: "10.9.0.0/24", NextHop: "10.255.0.9"},
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
+			{VRF: 100, Prefix: "10.9.0.0/24", NextHops: []string{"10.255.0.9"}},
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}},
 		},
 		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0"}},
 	)
@@ -231,10 +231,11 @@ func TestPlanFromRejects(t *testing.T) {
 		{"no vrf", nil, nil, tun, "没有配置任何 VRF"},
 		{"vrf 0", []uint8{0}, nil, tun, "VRF 0"},
 		{"duplicate vrf", []uint8{100, 100}, nil, tun, "配了两次"},
-		{"vrf not local", []uint8{100}, []RIBRoute{{VRF: 101, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"}}, tun, "没配这个 VRF"},
-		{"bad prefix", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "10.1.0.0/33", NextHop: "10.255.0.2"}}, tun, "不是规范 IPv4 前缀"},
-		{"v6 prefix", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "2001:db8::/64", NextHop: "10.255.0.2"}}, tun, "不是规范 IPv4 前缀"},
-		{"bad nexthop", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "wg0"}}, tun, "不是规范 IPv4 地址"},
+		{"vrf not local", []uint8{100}, []RIBRoute{{VRF: 101, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}}, tun, "没配这个 VRF"},
+		{"bad prefix", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "10.1.0.0/33", NextHops: []string{"10.255.0.2"}}}, tun, "不是规范 IPv4 前缀"},
+		{"v6 prefix", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "2001:db8::/64", NextHops: []string{"10.255.0.2"}}}, tun, "不是规范 IPv4 前缀"},
+		{"bad nexthop", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"wg0"}}}, tun, "不是规范 IPv4 地址"},
+		{"no nexthops", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24"}}, tun, "没有任何下一跳"},
 		{"tunnel bad addr", []uint8{100}, nil, []Tunnel{{NextHop: "10.255.0.2/32", Interface: "wg0"}}, "不是规范的 IPv4 地址"},
 		{"tunnel no iface", []uint8{100}, nil, []Tunnel{{NextHop: "10.255.0.2"}}, "没有接口名"},
 		{"tunnel duplicate", []uint8{100}, nil, append(tun, tun...), "配了两次"},
@@ -302,7 +303,7 @@ func TestApplyConvergesToNewPlan(t *testing.T) {
 
 	next, err := planFrom(
 		[]uint8{101},
-		[]RIBRoute{{VRF: 101, Prefix: "172.16.0.0/16", NextHop: "10.255.0.3"}},
+		[]RIBRoute{{VRF: 101, Prefix: "172.16.0.0/16", NextHops: []string{"10.255.0.3"}}},
 		[]Tunnel{{NextHop: "10.255.0.3", Interface: "wg1"}},
 	)
 	if err != nil {
@@ -343,7 +344,7 @@ func TestApplyReplacesChangedPaths(t *testing.T) {
 
 	next, err := planFrom(
 		[]uint8{100},
-		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"}},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.3"}}},
 		[]Tunnel{
 			{NextHop: "10.255.0.2", Interface: "wg0"},
 			{NextHop: "10.255.0.3", Interface: "wg1"},
@@ -370,7 +371,7 @@ func TestApplyMissingInterfaceWritesNothing(t *testing.T) {
 	a := NewApplier(dp)
 	plan, err := planFrom(
 		[]uint8{100},
-		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"}},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}},
 		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg9"}},
 	)
 	if err != nil {
@@ -415,9 +416,8 @@ func TestPlanFromSkipsBFDDownPaths(t *testing.T) {
 	plan, err := PlanFrom(
 		[]uint8{100},
 		[]RIBRoute{
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
-			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"},
-			{VRF: 100, Prefix: "10.2.0.0/24", NextHop: "10.255.0.3"},
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2", "10.255.0.3"}},
+			{VRF: 100, Prefix: "10.2.0.0/24", NextHops: []string{"10.255.0.3"}},
 		},
 		tun, down,
 	)
@@ -449,8 +449,7 @@ func TestApplyBFDDownRemovesPath(t *testing.T) {
 		{NextHop: "10.255.0.3", Interface: "wg1"},
 	}
 	routes := []RIBRoute{
-		{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
-		{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"},
+		{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2", "10.255.0.3"}},
 	}
 	up, err := PlanFrom([]uint8{100}, routes, tun, nil)
 	if err != nil {

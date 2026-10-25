@@ -35,7 +35,7 @@ type fileConfig struct {
 	Tunnels   []tunnelConfig `json:"tunnels"`
 }
 
-// tunnelConfig 是控制面分配的隧道映射。下一跳必须与 RIB 里的 next_hop 逐字相同。
+// tunnelConfig 是控制面分配的隧道映射。下一跳必须与 RIB 里 next_hops 的某个元素逐字相同。
 type tunnelConfig struct {
 	NextHop   string `json:"next_hop"`
 	Interface string `json:"interface"`
@@ -80,9 +80,9 @@ type statusDoc struct {
 }
 
 type ribRoute struct {
-	VRFID   uint8  `json:"vrf_id"`
-	Prefix  string `json:"prefix"`
-	NextHop string `json:"next_hop"`
+	VRFID    uint8    `json:"vrf_id"`
+	Prefix   string   `json:"prefix"`
+	NextHops []string `json:"next_hops"`
 }
 
 func fetchRIB(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRoute, error) {
@@ -105,7 +105,7 @@ func fetchRIB(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRoute,
 	var out []fib.RIBRoute
 	for _, rs := range doc.RIB {
 		for _, r := range rs {
-			out = append(out, fib.RIBRoute{VRF: r.VRFID, Prefix: r.Prefix, NextHop: r.NextHop})
+			out = append(out, fib.RIBRoute{VRF: r.VRFID, Prefix: r.Prefix, NextHops: r.NextHops})
 		}
 	}
 	return out, nil

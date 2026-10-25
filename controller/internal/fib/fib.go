@@ -1,7 +1,7 @@
 // Package fib turns the control plane's RIB into VPP FIB state.
 //
 // 这段代码是路由与转发之间那条**显式**的接缝：sr-route 只维护 RIB，从不碰 FIB；
-// 本包把 (VRF, prefix, next_hop) 翻译成 VPP 的 VRF 表 + 带标签路由 + 本地标签，
+// 本包把 (VRF, prefix, 下一跳集合) 翻译成 VPP 的 VRF 表 + 带标签路由 + 本地标签，
 // 由 cmd/sr-fib 周期性地把差异写下去。
 //
 // 三个决定，都是数据面实测之后定下来的：
@@ -10,8 +10,8 @@
 //     远端压的值必须等于收端登记的本地标签；两个 CPE 对同一个 VPN 用同一个号，
 //     收发就自动对齐，不需要在路由协议里再多一个字段（Cisco 的 VPN-ID 当标签
 //     也是这个形状：VPN 标识由控制面分配、在路由里携带、每跳只在本机有意义）。
-//   - **下一跳 → 出口**来自控制面给的隧道表，不从 VPP 猜。RIB 里同一条前缀的
-//     每个 next_hop 对应一条本地隧道；映射关系（对端 overlay → 本端 wg 接口）
+//   - **下一跳 → 出口**来自控制面给的隧道表，不从 VPP 猜。RIB 里一条路由的每个
+//     next_hop 对应一条本地隧道；映射关系（对端 overlay → 本端 wg 接口）
 //     是 vBOND 分配隧道时就定下来的，猜它等于把控制面的职责挪进数据面。
 //   - **每次重算整份计划再收敛**，不做增量：RIB 是声明式快照，增量下发会留下
 //     已经撤掉的路径，而 VPP 不会告诉你它还在。
@@ -40,15 +40,15 @@ func LabelFor(vrf uint8) uint32 { return LabelBase + uint32(vrf) }
 
 // RIBRoute 是喂给本包的最小路由形状（由 cmd/sr-fib 从 route.Route 转换）。
 type RIBRoute struct {
-	VRF     uint8
-	Prefix  string
-	NextHop string
+	VRF      uint8
+	Prefix   string
+	NextHops []string
 }
 
 // Tunnel 是控制面分配的隧道：对端 overlay 地址 → 本端 wg 接口名。
 //
-// 对端 overlay 地址必须与 RIB 里的 next_hop 逐字相同（规范 IPv4 点分）。这里
-// 不做"可达就猜"：同一台 CPE 到同一个人可以有多条隧道，猜错一条的后果是流量
+// 对端 overlay 地址必须与 RIB 里 next_hops 的某个元素逐字相同（规范 IPv4 点分）。
+// 这里不做"可达就猜"：同一台 CPE 到同一个人可以有多条隧道，猜错一条的后果是流量
 // 静默走错端口，而端口是这套数据面区分隧道的唯一键。
 type Tunnel struct {
 	NextHop   string
@@ -140,33 +140,38 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 			return p, fmt.Errorf("fib: 路由前缀 %q 不是规范 IPv4 前缀", r.Prefix)
 		}
 		prefix = prefix.Masked()
-		nh, err := netip.ParseAddr(r.NextHop)
-		if err != nil || !nh.Is4() {
-			return p, fmt.Errorf("fib: %s 的下一跳 %q 不是规范 IPv4 地址", prefix, r.NextHop)
+		if len(r.NextHops) == 0 {
+			return p, fmt.Errorf("fib: %s 没有任何下一跳", prefix)
 		}
-		t, ok := tunnelOf[nh.String()]
-		if !ok {
-			// 这台 CPE 上没有到该下一跳的隧道：这条路径不可用。留一条 warning，
-			// 不去猜别的隧道 —— 猜错比不通更难查。
-			w := fmt.Sprintf("%s: 下一跳 %s 不在隧道表里，该路径跳过", prefix, nh)
-			if !warned[w] {
-				warned[w] = true
-				p.Warnings = append(p.Warnings, w)
+		for _, raw := range r.NextHops {
+			nh, err := netip.ParseAddr(raw)
+			if err != nil || !nh.Is4() {
+				return p, fmt.Errorf("fib: %s 的下一跳 %q 不是规范 IPv4 地址", prefix, raw)
 			}
-			continue
-		}
-		if down[nh] {
-			// BFD 明确说这条隧道不通。跳过而不是整条撤掉：同前缀的多路径里
-			// 可能还有活着的。
-			w := fmt.Sprintf("%s: 下一跳 %s 的 BFD 会话不是 Up，该路径跳过", prefix, nh)
-			if !warned[w] {
-				warned[w] = true
-				p.Warnings = append(p.Warnings, w)
+			t, ok := tunnelOf[nh.String()]
+			if !ok {
+				// 这台 CPE 上没有到该下一跳的隧道：这条路径不可用。留一条 warning，
+				// 不去猜别的隧道 —— 猜错比不通更难查。
+				w := fmt.Sprintf("%s: 下一跳 %s 不在隧道表里，该路径跳过", prefix, nh)
+				if !warned[w] {
+					warned[w] = true
+					p.Warnings = append(p.Warnings, w)
+				}
+				continue
 			}
-			continue
+			if down[nh] {
+				// BFD 明确说这条隧道不通。跳过而不是整条撤掉：同前缀的多路径里
+				// 可能还有活着的。
+				w := fmt.Sprintf("%s: 下一跳 %s 的 BFD 会话不是 Up，该路径跳过", prefix, nh)
+				if !warned[w] {
+					warned[w] = true
+					p.Warnings = append(p.Warnings, w)
+				}
+				continue
+			}
+			k := key{table: uint32(r.VRF), prefix: prefix}
+			grouped[k] = append(grouped[k], Path{NextHop: nh, Interface: t.Interface, Label: LabelFor(r.VRF)})
 		}
-		k := key{table: uint32(r.VRF), prefix: prefix}
-		grouped[k] = append(grouped[k], Path{NextHop: nh, Interface: t.Interface, Label: LabelFor(r.VRF)})
 	}
 
 	for k, paths := range grouped {

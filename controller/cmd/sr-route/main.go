@@ -161,7 +161,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("route client: %v", err)
 	}
-	log.Printf("sr-route: device %d (tenant %s), %d local paths, %d RRs",
+	log.Printf("sr-route: device %d (tenant %s), %d local prefixes, %d RRs",
 		cfg.DeviceID, cfg.Tenant, len(c.LocalRoutes()), len(cfg.RRs))
 
 	if cfg.StatusAddr != "" {

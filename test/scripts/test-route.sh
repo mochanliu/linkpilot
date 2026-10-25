@@ -158,8 +158,8 @@ sed -e 's/"rr-a"/"rr-b"/' \
 
 # node1: 枢纽，import 65000:6；node2: export 65000:6（默认应被 1 收，但策略把它
 # 改送到 3）；node3: export 65000:7（能到 1，但 RT 不匹配 ⇒ 必须被拒收）。
-write_node() {   # <n> <overlay> <prefix> <export> <import-csv> <status-port>
-    local n=$1 overlay=$2 prefix=$3 export=$4 imports=$5 status=$6
+write_node() {   # <n> <overlays-json> <prefix> <export> <import-csv> <status-port>
+    local n=$1 overlays=$2 prefix=$3 export=$4 imports=$5 status=$6
     cat > "$WORK/node$n.json" <<EOF
 {
   "tenant": "tenant-a",
@@ -171,7 +171,7 @@ write_node() {   # <n> <overlay> <prefix> <export> <import-csv> <status-port>
     {"id": "rr-a", "addr": "127.0.0.1:$RR_A_PORT"},
     {"id": "rr-b", "addr": "127.0.0.1:$RR_B_PORT"}
   ],
-  "overlay_addrs": ["$overlay"],
+  "overlay_addrs": $overlays,
   "vrfs": [
     {"id": 5, "export_rts": ["$export"], "import_rts": [$imports]}
   ],
@@ -180,10 +180,11 @@ write_node() {   # <n> <overlay> <prefix> <export> <import-csv> <status-port>
 }
 EOF
 }
-write_node 1 192.168.99.1 10.10.0.0/16 65000:5 '"65000:6"' "$N1_STATUS"
-write_node 2 192.168.99.2 10.20.0.0/16 65000:6 '"65000:5"' "$N2_STATUS"
-# node3 同时 import 65000:5（收 node1）与 65000:6（收策略改送过来的 node2）
-write_node 3 192.168.99.3 10.30.0.0/16 65000:7 '"65000:5", "65000:6"' "$N3_STATUS"
+write_node 1 '["192.168.99.1"]' 10.10.0.0/16 65000:5 '"65000:6"' "$N1_STATUS"
+write_node 2 '["192.168.99.2"]' 10.20.0.0/16 65000:6 '"65000:5"' "$N2_STATUS"
+# node3 同时 import 65000:5（收 node1）与 65000:6（收策略改送过来的 node2）。
+# 两个 overlay：一条路由带两个下一跳，验证 v2 的集合形状真的在线上跑。
+write_node 3 '["192.168.99.3", "192.168.88.3"]' 10.30.0.0/16 65000:7 '"65000:5", "65000:6"' "$N3_STATUS"
 
 # ---------------------------------------------------------------- 启动
 
@@ -207,19 +208,23 @@ URL_N3="http://127.0.0.1:$N3_STATUS/status"
 
 # ---------------------------------------------------------------- 断言
 
-info "(A) RR 收齐三家的宣告（device_id / vrf / next_hop / RT 原样保留）"
+info "(A) RR 收齐三家的宣告（device_id / vrf / next_hops / RT 原样保留）"
 wait_status "http://127.0.0.1:$RR_A_STATUS/status" \
     "set(d['routes'])=={'1','2','3'} and all(v==1 for v in d['routes'].values()) and all(s['synced'] for s in d['sessions']) and len(d['sessions'])==3" \
     "rr-a 有 3 个 synced 会话、每家 1 条 adj-rib-in" 20
-for n in 1 2 3; do
-    assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
-        "[r for r in d['$n'] if r['device_id']==$n and r['next_hop']=='192.168.99.$n' and len(r['rts'])==1]" \
-        "rr-a：device $n 的宣告带本端 overlay 与 RT"
-done
+assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
+    "[r for r in d['1'] if r['device_id']==1 and r['next_hops']==['192.168.99.1'] and len(r['rts'])==1]" \
+    "rr-a：device 1 的宣告带本端 overlay 与 RT"
+assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
+    "[r for r in d['2'] if r['device_id']==2 and r['next_hops']==['192.168.99.2'] and len(r['rts'])==1]" \
+    "rr-a：device 2 的宣告带本端 overlay 与 RT"
+assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
+    "len(d['3'])==1 and d['3'][0]['next_hops']==['192.168.88.3', '192.168.99.3'] and len(d['3'][0]['rts'])==1" \
+    "rr-a：device 3 用一条路由带两个 overlay（不是两条）"
 
 info "(A) 默认反射 + RT 匹配：node1 路由进入 node2 的 bgp 表"
 wait_status "$URL_N2" \
-    "d['active_rr']==0 and [ (r['prefix'], r['next_hop']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16','192.168.99.1')]" \
+    "d['active_rr']==0 and [ (r['prefix'], r['next_hops']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16',['192.168.99.1'])]" \
     "node2 vrf5 = {10.10.0.0/16 via 192.168.99.1}" 25
 
 info "(B) RT import 过滤：node3 的 65000:7 到了 node1 但不进表"
@@ -232,7 +237,7 @@ assert_status "$URL_N1" "d['received']>=1" \
 
 info "(C) 反射策略：node2 的路由只送到 node3，不送到 node1"
 wait_status "$URL_N3" \
-    "d['active_rr']==0 and sorted((r['prefix'], r['next_hop']) for r in d['rib'].get('5',[])) == [('10.10.0.0/16','192.168.99.1'), ('10.20.0.0/16','192.168.99.2')]" \
+    "d['active_rr']==0 and sorted((r['prefix'], r['next_hops']) for r in d['rib'].get('5',[])) == [('10.10.0.0/16',['192.168.99.1']), ('10.20.0.0/16',['192.168.99.2'])]" \
     "node3 同时收到 node1（拓扑）与 node2（策略）" 25
 assert_status "$URL_N1" "not [r for r in d['rib'].get('5',[]) if r['prefix']=='10.20.0.0/16']" \
     "node1 没收到 node2 的路由（策略替换了拓扑目标）"
@@ -245,7 +250,7 @@ for u in "$URL_N1:node1" "$URL_N2:node2" "$URL_N3:node3"; do
         "$who 切到 rr-b" 15
 done
 assert_status "$URL_N2" \
-    "[ (r['prefix'], r['next_hop']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16','192.168.99.1')]" \
+    "[ (r['prefix'], r['next_hops']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16',['192.168.99.1'])]" \
     "切到 rr-b 后 node2 的表不变"
 assert_status "$URL_N3" \
     "sorted(r['prefix'] for r in d['rib'].get('5',[])) == ['10.10.0.0/16','10.20.0.0/16']" \

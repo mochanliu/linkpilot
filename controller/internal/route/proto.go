@@ -10,10 +10,10 @@
 //   - 一条 TCP/TLS 连接就是一个邻居，v1 只承载 IPv4 单播前缀，不做 capability
 //     协商。版本在 hello 里显式交换，对不上就断，不存在"猜对方支持什么"。
 //
-//   - 路由身份是 (发起设备, VRF, prefix, next_hop)，不是 (prefix, vrf) 一条。
-//     一台 CPE 每条 VPN 隧道各有一个本端 overlay 地址，同一个内侧前缀会按
-//     next_hop 各发一条路径；RR 原样反射，不替任何一端改写下一跳。哪些路径
-//     最终可被数据面使用，是数据面选路阶段的事。
+//   - 路由身份是 (发起设备, VRF, prefix)，一条路由带一组 next_hop。一台 CPE
+//     每条 VPN 隧道各有一个本端 overlay 地址，所以同一个内侧前缀的所有路径
+//     放在一条路由里宣告；RR 原样反射，不替任何一端改写下一跳。哪些路径最终
+//     可被数据面使用，是数据面选路阶段的事。
 //
 //   - 路由器只交换**声明式快照**：会话建立时双方各发一份全量，之后 announce/
 //     withdraw 增量。没有 BGP 的 best-path 计算，也没有 MED/LP；RR 存的是
@@ -40,7 +40,12 @@ import (
 const (
 	// ProtocolVersion is exchanged in hello. A mismatch is fatal for the
 	// session: half-understanding an update is worse than not having a session.
-	ProtocolVersion = 1
+	//
+	// v2 changed a route from one path to a prefix with a set of next hops, and
+	// withdrawals from a path key to a prefix key. There is no v1 compatibility
+	// mode: both ends are ours and a mixed pair would be talking about different
+	// tables while looking healthy.
+	ProtocolVersion = 2
 
 	// DefaultHoldSec is how long either side waits for any message before
 	// declaring the session dead. Keepalive goes out at a third of it.
@@ -54,6 +59,9 @@ const (
 	MaxRoutesPerMessage = 8192
 	// MaxRTsPerRoute bounds the RT list on one route.
 	MaxRTsPerRoute = 16
+	// MaxNextHopsPerRoute bounds the next-hop set on one route. One CPE has one
+	// overlay address per tunnel, so this is really a cap on tunnels per device.
+	MaxNextHopsPerRoute = 16
 )
 
 // MsgType is the envelope discriminator. Unknown types are protocol errors,
@@ -91,41 +99,52 @@ type Envelope struct {
 	Message string `json:"message,omitempty"`
 }
 
-// Route is one path advertised by its origin device.
+// Route is one prefix advertised by its origin device, carrying every path that
+// origin has for it.
 //
 // DeviceID is the origin, and it is NOT allowed to differ from the session's
 // certificate identity -- a CPE can only ever speak for itself. The RR checks
 // that on every announce/withdraw; without it one node could poison another's
 // routes by simply claiming its id in JSON.
+//
+// NextHops is the origin's local overlay address on each of its tunnels: one
+// route covers all of them, and the set is the whole opinion. An announce
+// replaces the set; a withdraw removes the prefix entirely.
 type Route struct {
 	DeviceID uint16   `json:"device_id"`
 	VRFID    uint8    `json:"vrf_id"`
-	Prefix   string   `json:"prefix"`   // canonical CIDR, IPv4
-	NextHop  string   `json:"next_hop"` // canonical IPv4; origin's local overlay address on one tunnel
-	RTs      []string `json:"rts"`      // export RTs of the origin VRF, canonical "ASN:value"
+	Prefix   string   `json:"prefix"`    // canonical CIDR, IPv4
+	NextHops []string `json:"next_hops"` // canonical IPv4, strictly ascending
+	RTs      []string `json:"rts"`       // export RTs of the origin VRF, canonical "ASN:value"
 }
 
-// RouteKey identifies one path. Withdrawals and the RR's adj-rib-in are keyed
-// by it, so RT-only changes replace the path instead of creating a second one.
+// RouteKey identifies one route: an origin's opinion about one prefix.
+// Withdrawals and the RR's adj-rib-in are keyed by it, so a next-hop-set or
+// RT-only change replaces the route instead of creating a second one.
 type RouteKey struct {
 	DeviceID uint16 `json:"device_id"`
 	VRFID    uint8  `json:"vrf_id"`
 	Prefix   string `json:"prefix"`
-	NextHop  string `json:"next_hop"`
 }
 
 func (r Route) Key() RouteKey {
-	return RouteKey{DeviceID: r.DeviceID, VRFID: r.VRFID, Prefix: r.Prefix, NextHop: r.NextHop}
+	return RouteKey{DeviceID: r.DeviceID, VRFID: r.VRFID, Prefix: r.Prefix}
 }
 
-// Equal compares everything, including RTs. The RR uses it to decide whether an
-// announce that lands on an existing key is a no-op or a replacement.
+// Equal compares everything, including the next-hop set and RTs. The RR uses it
+// to decide whether an announce that lands on an existing key is a no-op or a
+// replacement.
 func (r Route) Equal(o Route) bool {
-	if r.Key() != o.Key() || len(r.RTs) != len(o.RTs) {
+	if r.Key() != o.Key() || len(r.RTs) != len(o.RTs) || len(r.NextHops) != len(o.NextHops) {
 		return false
 	}
 	for i := range r.RTs {
 		if r.RTs[i] != o.RTs[i] {
+			return false
+		}
+	}
+	for i := range r.NextHops {
+		if r.NextHops[i] != o.NextHops[i] {
 			return false
 		}
 	}
@@ -142,8 +161,20 @@ func (r Route) Validate() error {
 	if err := validatePrefix(r.Prefix); err != nil {
 		return fmt.Errorf("route %s: %w", r.Prefix, err)
 	}
-	if err := validateNextHop(r.NextHop); err != nil {
-		return fmt.Errorf("route %s: %w", r.Prefix, err)
+	if len(r.NextHops) == 0 {
+		return fmt.Errorf("route %s: at least one next_hop is required", r.Prefix)
+	}
+	if len(r.NextHops) > MaxNextHopsPerRoute {
+		return fmt.Errorf("route %s: %d next_hops exceeds %d", r.Prefix, len(r.NextHops), MaxNextHopsPerRoute)
+	}
+	for i, nh := range r.NextHops {
+		if err := validateNextHop(nh); err != nil {
+			return fmt.Errorf("route %s: %w", r.Prefix, err)
+		}
+		if i > 0 && r.NextHops[i-1] >= nh {
+			return fmt.Errorf("route %s: next_hops must be strictly ascending and unique (got %q after %q)",
+				r.Prefix, nh, r.NextHops[i-1])
+		}
 	}
 	if len(r.RTs) == 0 {
 		return fmt.Errorf("route %s: at least one RT is required (it can never be imported otherwise)", r.Prefix)
@@ -168,16 +199,13 @@ func (r Route) Validate() error {
 	return nil
 }
 
-// Validate checks a withdrawal key. No RTs are involved: removing a path is
+// Validate checks a withdrawal key. No RTs are involved: removing a prefix is
 // identified by where it came from, not by how it was exported.
 func (k RouteKey) Validate() error {
 	if k.DeviceID == 0 {
 		return errors.New("route key: device_id must be non-zero")
 	}
 	if err := validatePrefix(k.Prefix); err != nil {
-		return fmt.Errorf("route key %s: %w", k.Prefix, err)
-	}
-	if err := validateNextHop(k.NextHop); err != nil {
 		return fmt.Errorf("route key %s: %w", k.Prefix, err)
 	}
 	return nil
@@ -311,7 +339,8 @@ func SortedRoutes(in []Route) []Route {
 		if out[i].Prefix != out[j].Prefix {
 			return out[i].Prefix < out[j].Prefix
 		}
-		return out[i].NextHop < out[j].NextHop
+		// The key is the whole identity: equal keys are the same route.
+		return false
 	})
 	return out
 }
@@ -328,7 +357,8 @@ func SortedKeys(in []RouteKey) []RouteKey {
 		if out[i].Prefix != out[j].Prefix {
 			return out[i].Prefix < out[j].Prefix
 		}
-		return out[i].NextHop < out[j].NextHop
+		// The key is the whole identity: equal keys are the same route.
+		return false
 	})
 	return out
 }
