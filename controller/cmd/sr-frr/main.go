@@ -16,13 +16,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strconv"
@@ -34,13 +37,23 @@ import (
 )
 
 type fileConfig struct {
-	StatusURL   string      `json:"status_url"`
-	ZServSocket string      `json:"zserv_socket"`
-	StateFile   string      `json:"state_file"`
-	PollSec     int         `json:"poll_sec"`
-	Distance    *int        `json:"distance"`
-	Metric      *int        `json:"metric"`
-	VRFs        []vrfConfig `json:"vrfs"`
+	StatusURL   string        `json:"status_url"`
+	ZServSocket string        `json:"zserv_socket"`
+	StateFile   string        `json:"state_file"`
+	PollSec     int           `json:"poll_sec"`
+	Distance    *int          `json:"distance"`
+	Metric      *int          `json:"metric"`
+	VRFs        []vrfConfig   `json:"vrfs"`
+	Import      *importConfig `json:"import"`
+}
+
+// importConfig 打开反方向：把客户侧 BGP 学到的前缀上报给 sr-route。
+// tag 是客户侧邻居入方向 route-map 打的标记，用来区分"客户告诉我们的前缀"
+// 和盒内自己产生/导出的 BGP 路由。
+type importConfig struct {
+	VRFID       uint8  `json:"vrf_id"`
+	Tag         uint32 `json:"tag"`
+	PrefixesURL string `json:"prefixes_url"`
 }
 
 // vrfConfig 的 vrf_id 是**控制面**的 VRF（sr-route 的编号），不是 FRR 的 VRF；
@@ -106,6 +119,17 @@ func loadConfig(path string) (*fileConfig, error) {
 	}
 	if *cfg.Metric < 0 {
 		return nil, errors.New("metric 不能为负")
+	}
+	if cfg.Import != nil {
+		if cfg.Import.VRFID == 0 {
+			return nil, errors.New("import.vrf_id 不能为 0（那是实例的外层表）")
+		}
+		if cfg.Import.Tag == 0 {
+			return nil, errors.New("import.tag 不能为 0（没有 tag 就无法区分客户路由与盒内导出的路由）")
+		}
+		if cfg.Import.PrefixesURL == "" {
+			return nil, errors.New("import.prefixes_url is required（sr-route 的 PUT /local-prefixes）")
+		}
 	}
 	return &cfg, nil
 }
@@ -195,6 +219,14 @@ func main() {
 	distance := uint8(*cfg.Distance)
 	metric := uint32(*cfg.Metric)
 
+	// 反向导入只在常驻模式打开：-once 只跑一轮导出，订阅回放还没到齐就退出，
+	// 反而会用一份不完整的集合清掉 sr-route 里上一轮的结论。
+	var imp *frr.Importer
+	importEnabled := cfg.Import != nil && !*once
+	if cfg.Import != nil {
+		imp = frr.NewImporter(cfg.Import.Tag)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -208,6 +240,7 @@ func main() {
 				log.Fatalf("sr-frr: 删状态文件: %v", err)
 			}
 			log.Printf("sr-frr: 没有待撤状态（%s 不存在或为空）", cfg.StateFile)
+			clearImports(cfg.Import)
 			return
 		}
 		cl, err := frr.Dial(ctx, cfg.ZServSocket)
@@ -227,6 +260,7 @@ func main() {
 			log.Fatalf("sr-frr: 删状态文件: %v", err)
 		}
 		log.Printf("sr-frr: reset 撤掉 %d 条前缀", n)
+		clearImports(cfg.Import)
 		return
 	}
 
@@ -248,6 +282,16 @@ func main() {
 		c, err := frr.Dial(ctx, cfg.ZServSocket)
 		if err != nil {
 			return err
+		}
+		if importEnabled {
+			// 新连接上的回放会重建整份 BGP 视图；旧连接的条目不会再收到
+			// 删除通知，所以先清空，再让回放把它们重新加回来。
+			imp.Reset()
+			c.SetRouteHandler(imp.Handle)
+			if err := c.SubscribeBGP(ctx); err != nil {
+				c.Close()
+				return fmt.Errorf("订阅 BGP 再分发: %w", err)
+			}
 		}
 		cl, ex = c, frr.NewExporter(c)
 		return nil
@@ -279,6 +323,7 @@ func main() {
 
 	hc := &http.Client{Timeout: 5 * time.Second}
 	lastSig := ""
+	lastImportSig := ""
 	poll := func() error {
 		if err := connect(); err != nil {
 			return err
@@ -316,6 +361,16 @@ func main() {
 		if res.Changed() {
 			log.Printf("sr-frr: 收敛 routes+%d/-%d（表 %s）", res.Added, res.Removed, tableList(tables))
 		}
+		if importEnabled {
+			ps := imp.Prefixes()
+			if sig := importSig(cfg.Import.VRFID, ps); sig != lastImportSig {
+				if err := pushLocalPrefixes(ctx, hc, cfg.Import, ps); err != nil {
+					return fmt.Errorf("上报客户侧前缀: %w", err)
+				}
+				lastImportSig = sig
+				log.Printf("sr-frr: 客户侧前缀 %d 条 → sr-route vrf %d", len(ps), cfg.Import.VRFID)
+			}
+		}
 		return nil
 	}
 
@@ -330,6 +385,10 @@ func main() {
 	interval := time.Duration(cfg.PollSec) * time.Second
 	log.Printf("sr-frr: 每 %s 从 %s 收敛到 FRR 表 %s；FRR 侧需 redistribute table-direct <表号>",
 		interval, cfg.StatusURL, tableList(tables))
+	if importEnabled {
+		log.Printf("sr-frr: 反向导入已开：tag %d 的 BGP 前缀 → sr-route vrf %d（%s）",
+			cfg.Import.Tag, cfg.Import.VRFID, cfg.Import.PrefixesURL)
+	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
@@ -342,26 +401,88 @@ func main() {
 		}
 		select {
 		case <-ctx.Done():
-			if ex == nil || len(ex.Routes()) == 0 {
-				log.Printf("sr-frr: 停止")
-				return
-			}
-			log.Printf("sr-frr: 停止，撤掉自己下发的 %d 条前缀", len(ex.Routes()))
 			fctx, fcancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer fcancel()
-			if err := ex.Flush(fctx); err != nil {
-				// 留着状态文件，下次启动按它对账。
-				log.Printf("sr-frr: 退出清理未完成（状态文件已保留）: %v", err)
-				return
+			if ex != nil && len(ex.Routes()) > 0 {
+				log.Printf("sr-frr: 停止，撤掉自己下发的 %d 条前缀", len(ex.Routes()))
+				if err := ex.Flush(fctx); err != nil {
+					// 留着状态文件，下次启动按它对账。
+					log.Printf("sr-frr: 退出清理未完成（状态文件已保留）: %v", err)
+					return
+				}
+				settle()
+				if err := frr.RemoveState(cfg.StateFile); err != nil {
+					log.Printf("sr-frr: 删状态文件: %v", err)
+				}
+			} else {
+				log.Printf("sr-frr: 停止")
 			}
-			settle()
-			if err := frr.RemoveState(cfg.StateFile); err != nil {
-				log.Printf("sr-frr: 删状态文件: %v", err)
+			if importEnabled {
+				if err := pushLocalPrefixes(fctx, hc, cfg.Import, nil); err != nil {
+					log.Printf("sr-frr: 退出时清空本地前缀失败: %v", err)
+				}
 			}
 			return
 		case <-tick.C:
 		}
 	}
+}
+
+func clearImports(ic *importConfig) {
+	if ic == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := pushLocalPrefixes(ctx, &http.Client{Timeout: 5 * time.Second}, ic, nil); err != nil {
+		log.Printf("sr-frr: 清空本地前缀失败: %v", err)
+	}
+}
+
+// localPrefixJSON 与 sr-route PUT /local-prefixes 的请求体逐字段对应。
+type localPrefixJSON struct {
+	VRFID  uint8  `json:"vrf_id"`
+	Prefix string `json:"prefix"`
+}
+
+type localPrefixesDoc struct {
+	Prefixes []localPrefixJSON `json:"prefixes"`
+}
+
+func importSig(vrf uint8, ps []netip.Prefix) string {
+	var b strings.Builder
+	b.WriteString(strconv.Itoa(int(vrf)))
+	for _, p := range ps {
+		b.WriteByte('|')
+		b.WriteString(p.String())
+	}
+	return b.String()
+}
+
+func pushLocalPrefixes(ctx context.Context, hc *http.Client, ic *importConfig, ps []netip.Prefix) error {
+	doc := localPrefixesDoc{Prefixes: make([]localPrefixJSON, 0, len(ps))}
+	for _, p := range ps {
+		doc.Prefixes = append(doc.Prefixes, localPrefixJSON{VRFID: ic.VRFID, Prefix: p.String()})
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, ic.PrefixesURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("PUT %s: %s: %s", ic.PrefixesURL, resp.Status, strings.TrimSpace(string(msg)))
+	}
+	return nil
 }
 
 func tableList(tables []frr.Table) string {

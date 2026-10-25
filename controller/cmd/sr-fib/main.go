@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -33,6 +34,14 @@ type fileConfig struct {
 	PollSec   int            `json:"poll_sec"`
 	VRFs      []uint8        `json:"vrfs"`
 	Tunnels   []tunnelConfig `json:"tunnels"`
+	Local     *localConfig   `json:"local"`
+}
+
+// localConfig 是本机从客户侧学到的前缀的出口：盒内 FRR 的 inside 地址，
+// 以及 VPP 上持有该地址的接口。没有这一块就表示这台盒子不接入客户路由。
+type localConfig struct {
+	NextHop   string `json:"next_hop"`
+	Interface string `json:"interface"`
 }
 
 // tunnelConfig 是控制面分配的隧道映射。下一跳必须与 RIB 里 next_hops 的某个元素逐字相同。
@@ -70,13 +79,22 @@ func loadConfig(path string) (*fileConfig, error) {
 	if cfg.PollSec < 0 {
 		return nil, errors.New("poll_sec 不能为负")
 	}
+	if cfg.Local != nil {
+		if addr, err := netip.ParseAddr(cfg.Local.NextHop); err != nil || !addr.Is4() {
+			return nil, fmt.Errorf("local.next_hop %q 不是规范 IPv4 地址", cfg.Local.NextHop)
+		}
+		if cfg.Local.Interface == "" {
+			return nil, errors.New("local.interface is required（本地前缀的下一跳必须挂在接口上）")
+		}
+	}
 	return &cfg, nil
 }
 
 // statusDoc 是 sr-route /status 里本进程用到的部分。刻意只声明需要的字段：
 // 那个 JSON 还有会话统计等，与本进程无关。
 type statusDoc struct {
-	RIB map[string][]ribRoute `json:"rib"`
+	RIB   map[string][]ribRoute `json:"rib"`
+	Local []localRoute          `json:"local"`
 }
 
 type ribRoute struct {
@@ -85,22 +103,27 @@ type ribRoute struct {
 	NextHops []string `json:"next_hops"`
 }
 
-func fetchRIB(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRoute, error) {
+type localRoute struct {
+	VRFID  uint8  `json:"vrf_id"`
+	Prefix string `json:"prefix"`
+}
+
+func fetchStatus(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRoute, []fib.LocalRoute, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+		return nil, nil, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
 	var doc statusDoc
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		return nil, fmt.Errorf("解析 %s: %w", url, err)
+		return nil, nil, fmt.Errorf("解析 %s: %w", url, err)
 	}
 	var out []fib.RIBRoute
 	for _, rs := range doc.RIB {
@@ -108,7 +131,11 @@ func fetchRIB(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRoute,
 			out = append(out, fib.RIBRoute{VRF: r.VRFID, Prefix: r.Prefix, NextHops: r.NextHops})
 		}
 	}
-	return out, nil
+	local := make([]fib.LocalRoute, 0, len(doc.Local))
+	for _, l := range doc.Local {
+		local = append(local, fib.LocalRoute{VRF: l.VRFID, Prefix: l.Prefix})
+	}
+	return out, local, nil
 }
 
 func main() {
@@ -150,14 +177,28 @@ func main() {
 	for _, t := range cfg.Tunnels {
 		tunnels = append(tunnels, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface})
 	}
+	var localPath fib.LocalPath
+	if cfg.Local != nil {
+		localPath = fib.LocalPath{NextHop: netip.MustParseAddr(cfg.Local.NextHop), Interface: cfg.Local.Interface}
+	}
 	applier := fib.NewApplier(vc)
 	hc := &http.Client{Timeout: 5 * time.Second}
 	var lastWarn string
+	warnedLocal := false
 
 	poll := func() error {
-		routes, err := fetchRIB(ctx, hc, cfg.StatusURL)
+		routes, locals, err := fetchStatus(ctx, hc, cfg.StatusURL)
 		if err != nil {
 			return fmt.Errorf("读 RIB: %w", err)
+		}
+		if cfg.Local == nil && len(locals) > 0 {
+			// 没有 local 出口就装不了本地前缀；说清楚是配置缺失，而不是让
+			// PlanFrom 每一轮报同一个错把远端路由也一起卡住。
+			if !warnedLocal {
+				log.Printf("sr-fib: sr-route 报了 %d 条本地前缀，但配置里没有 local 出口，跳过安装", len(locals))
+				warnedLocal = true
+			}
+			locals = nil
 		}
 		// 可达性只认本机 VPP 里的 BFD 会话：它就是这个 CPE 眼里"隧道通不通"
 		// 的权威答案，不用绕到北向去拿一份更旧的。
@@ -165,7 +206,7 @@ func main() {
 		if err != nil {
 			return fmt.Errorf("读 BFD 会话: %w", err)
 		}
-		plan, err := fib.PlanFrom(cfg.VRFs, routes, tunnels, fib.UnreachablePeers(sessions))
+		plan, err := fib.PlanFrom(cfg.VRFs, routes, tunnels, fib.UnreachablePeers(sessions), locals, localPath)
 		if err != nil {
 			return err
 		}

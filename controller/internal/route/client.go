@@ -118,7 +118,10 @@ type Client struct {
 	cfg      ClientConfig
 	hold     time.Duration
 	vrfs     map[uint8]*localVRF
-	local    []Route
+	exports  map[uint8][]string // vrf -> canonical export RTs, stamped on local routes
+	base     map[RouteKey]Route // static local_prefixes from config
+	dynamic  map[RouteKey]Route // replaced wholesale by SetLocalPrefixes
+	local    []Route            // effective (base + dynamic), sorted
 	tunnels  []Tunnel
 	nextHops map[uint16][]string // peer -> ascending next hops of its tunnels
 
@@ -154,6 +157,13 @@ type clientSession struct {
 	rib        map[RouteKey]RIBEntry
 	reconnects uint64
 	lastErr    string
+
+	// sc is the serialized writer owned by serveSession. ready is set once the
+	// session's snapshot has been written; only then may local-prefix updates
+	// be streamed to it. announced is what this session has been told.
+	sc        *sessionConn
+	ready     bool
+	announced map[RouteKey]Route
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -183,6 +193,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg:      cfg,
 		hold:     hold,
 		vrfs:     make(map[uint8]*localVRF, len(cfg.VRFs)),
+		exports:  make(map[uint8][]string, len(cfg.VRFs)),
+		base:     map[RouteKey]Route{},
+		dynamic:  map[RouteKey]Route{},
 		sessions: make([]clientSession, len(cfg.RRs)),
 		active:   -1,
 	}
@@ -209,6 +222,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		}
 		c.vrfs[v.ID] = lv
 		exports[v.ID] = sortedKeys(exp)
+		c.exports[v.ID] = exports[v.ID]
 	}
 
 	tunnels := append([]Tunnel(nil), cfg.Tunnels...)
@@ -228,26 +242,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 
 	for _, lp := range cfg.LocalPrefixes {
-		if c.vrfs[lp.VRFID] == nil {
-			return nil, fmt.Errorf("route client: local prefix %s references unconfigured vrf %d", lp.Prefix, lp.VRFID)
+		rt, err := c.localRoute(lp)
+		if err != nil {
+			return nil, err
 		}
-		rts := exports[lp.VRFID]
-		if len(rts) == 0 {
-			return nil, fmt.Errorf("route client: vrf %d has local prefix %s but no export RTs (nothing could import it)",
-				lp.VRFID, lp.Prefix)
-		}
-		rt := Route{
-			DeviceID: cfg.DeviceID,
-			VRFID:    lp.VRFID,
-			Prefix:   lp.Prefix,
-			RTs:      rts,
-		}
-		if err := rt.Validate(); err != nil {
-			return nil, fmt.Errorf("route client: local prefix: %w", err)
-		}
-		c.local = append(c.local, rt)
+		c.base[rt.Key()] = rt
 	}
-	c.local = SortedRoutes(c.local)
+	c.local = c.mergedLocalLocked()
 
 	for i := range c.sessions {
 		c.sessions[i] = clientSession{addr: cfg.RRs[i].Addr, rib: map[RouteKey]RIBEntry{}}
@@ -256,9 +257,154 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 }
 
 // LocalRoutes returns the routes this CPE announces (one per VRF × prefix, no
-// next hops). It is fixed for the lifetime of this instance.
+// next hops): the static configuration plus whatever SetLocalPrefixes last
+// installed.
 func (c *Client) LocalRoutes() []Route {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return append([]Route(nil), c.local...)
+}
+
+// localRoute builds a local route from a (vrf, prefix) pair. Export RTs come
+// from the VRF config, so a local prefix can never be announced without the
+// policy that makes it importable somewhere.
+func (c *Client) localRoute(lp LocalPrefix) (Route, error) {
+	if c.vrfs[lp.VRFID] == nil {
+		return Route{}, fmt.Errorf("route client: local prefix %s references unconfigured vrf %d", lp.Prefix, lp.VRFID)
+	}
+	rts := c.exports[lp.VRFID]
+	if len(rts) == 0 {
+		return Route{}, fmt.Errorf("route client: vrf %d has local prefix %s but no export RTs (nothing could import it)",
+			lp.VRFID, lp.Prefix)
+	}
+	rt := Route{
+		DeviceID: c.cfg.DeviceID,
+		VRFID:    lp.VRFID,
+		Prefix:   lp.Prefix,
+		RTs:      rts,
+	}
+	if err := rt.Validate(); err != nil {
+		return Route{}, fmt.Errorf("route client: local prefix: %w", err)
+	}
+	return rt, nil
+}
+
+// mergedLocalLocked is base ∪ dynamic. A dynamic prefix identical to a static
+// one collapses to one route: the same (device, vrf, prefix) key must be
+// announced once, or a withdraw of one copy would take the other with it.
+func (c *Client) mergedLocalLocked() []Route {
+	m := make(map[RouteKey]Route, len(c.base)+len(c.dynamic))
+	for k, r := range c.base {
+		m[k] = r
+	}
+	for k, r := range c.dynamic {
+		m[k] = r
+	}
+	out := make([]Route, 0, len(m))
+	for _, r := range m {
+		out = append(out, r)
+	}
+	return SortedRoutes(out)
+}
+
+// SetLocalPrefixes replaces the dynamic local set (customer prefixes learned
+// from the in-box FRR). The static local_prefixes from the config are always
+// kept. Every live session receives the difference immediately; a session
+// still streaming its snapshot reconciles against its own announced set once
+// the snapshot is done.
+func (c *Client) SetLocalPrefixes(lps []LocalPrefix) error {
+	next := make(map[RouteKey]Route, len(lps))
+	for _, lp := range lps {
+		rt, err := c.localRoute(lp)
+		if err != nil {
+			return err
+		}
+		next[rt.Key()] = rt
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if equalRouteMaps(c.dynamic, next) {
+		return nil
+	}
+	c.dynamic = next
+	c.local = c.mergedLocalLocked()
+	c.pushLocalLocked()
+	return nil
+}
+
+// pushLocalLocked streams local-set changes to every session that has finished
+// its snapshot. Must be called with c.mu held.
+func (c *Client) pushLocalLocked() {
+	desired := make(map[RouteKey]Route, len(c.local))
+	for _, r := range c.local {
+		desired[r.Key()] = r
+	}
+	for i := range c.sessions {
+		s := &c.sessions[i]
+		if !s.ready || s.sc == nil {
+			continue
+		}
+		c.syncSessionLocalLocked(s, desired)
+	}
+}
+
+// syncSessionLocalLocked writes the difference between what this session knows
+// and the desired local set. Write failure closes the session: the reconnect
+// path re-sends a full snapshot, which is more reliable than patching up a
+// half-written stream. Must be called with c.mu held.
+func (c *Client) syncSessionLocalLocked(s *clientSession, desired map[RouteKey]Route) {
+	var adds []Route
+	var dels []RouteKey
+	for k, rt := range desired {
+		if old, ok := s.announced[k]; !ok || !old.Equal(rt) {
+			adds = append(adds, rt)
+		}
+	}
+	for k := range s.announced {
+		if _, ok := desired[k]; !ok {
+			dels = append(dels, k)
+		}
+	}
+	if len(adds) == 0 && len(dels) == 0 {
+		return
+	}
+	adds = SortedRoutes(adds)
+	dels = SortedKeys(dels)
+	if len(adds) > 0 {
+		if err := s.sc.write(Envelope{Type: MsgAnnounce, Routes: adds}); err != nil {
+			s.sc.close()
+			return
+		}
+	}
+	if len(dels) > 0 {
+		if err := s.sc.write(Envelope{Type: MsgWithdraw, Keys: dels}); err != nil {
+			s.sc.close()
+			return
+		}
+	}
+	s.announced = cloneRoutes(desired)
+}
+
+func equalRouteMaps(a, b map[RouteKey]Route) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, ra := range a {
+		rb, ok := b[k]
+		if !ok || !ra.Equal(rb) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneRoutes(in map[RouteKey]Route) map[RouteKey]Route {
+	out := make(map[RouteKey]Route, len(in))
+	for k, r := range in {
+		out[k] = r
+	}
+	return out
 }
 
 // Tunnels returns the table this device announces, in canonical order.
@@ -379,6 +525,9 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 	handshook = true
 
 	c.markUp(idx, conn, env.RRID, hold)
+	c.mu.Lock()
+	c.sessions[idx].sc = sc
+	c.mu.Unlock()
 
 	// The tunnel table goes first: the RR withholds its snapshot until it knows
 	// which peers this device can reach, and it must not see that as "no
@@ -389,7 +538,8 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 	}
 
 	// Announce our whole table before EOR, in bounded chunks.
-	for rest := c.local; len(rest) > 0; {
+	local := c.LocalRoutes()
+	for rest := local; len(rest) > 0; {
 		n := len(rest)
 		if n > MaxRoutesPerMessage {
 			n = MaxRoutesPerMessage
@@ -402,6 +552,27 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 	if err := sc.write(Envelope{Type: MsgEOR}); err != nil {
 		return true, fmt.Errorf("send eor: %w", err)
 	}
+
+	// From here on the session is part of the live local-prefix fanout. The
+	// snapshot may already be stale: reconcile against the current set before
+	// releasing the lock, so no update can slip between snapshot and fanout.
+	c.mu.Lock()
+	s := &c.sessions[idx]
+	if !s.up {
+		c.mu.Unlock()
+		return true, fmt.Errorf("session went down while sending snapshot")
+	}
+	s.ready = true
+	s.announced = make(map[RouteKey]Route, len(local))
+	for _, rt := range local {
+		s.announced[rt.Key()] = rt
+	}
+	desired := make(map[RouteKey]Route, len(c.local))
+	for _, rt := range c.local {
+		desired[rt.Key()] = rt
+	}
+	c.syncSessionLocalLocked(s, desired)
+	c.mu.Unlock()
 
 	go c.keepaliveLoop(sc, hold/3, sessionDone)
 
@@ -461,6 +632,9 @@ func (c *Client) markUp(idx int, conn net.Conn, rrID string, hold time.Duration)
 	s.rrID = rrID
 	s.reconnects++
 	s.lastErr = ""
+	s.sc = nil
+	s.ready = false
+	s.announced = nil
 }
 
 func (c *Client) markDown(idx int) {
@@ -471,6 +645,9 @@ func (c *Client) markDown(idx int) {
 	s.synced = false
 	s.rib = map[RouteKey]RIBEntry{}
 	s.conn = nil
+	s.sc = nil
+	s.ready = false
+	s.announced = nil
 	c.pickActiveLocked()
 }
 

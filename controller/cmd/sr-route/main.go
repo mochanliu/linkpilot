@@ -236,6 +236,26 @@ func summary(c *route.Client) string {
 	return fmt.Sprintf("active=%d sessions[%v] rib{%s}", st.ActiveRR, synced, strings.Join(parts, " "))
 }
 
+// localPrefixJSON is both the /status "local" shape and the /local-prefixes
+// request/response body. It carries no RTs: those come from the VRF config.
+type localPrefixJSON struct {
+	VRFID  uint8  `json:"vrf_id"`
+	Prefix string `json:"prefix"`
+}
+
+type localPrefixesDoc struct {
+	Prefixes []localPrefixJSON `json:"prefixes"`
+}
+
+func localPrefixes(c *route.Client) []localPrefixJSON {
+	routes := c.LocalRoutes()
+	out := make([]localPrefixJSON, 0, len(routes))
+	for _, rt := range routes {
+		out = append(out, localPrefixJSON{VRFID: rt.VRFID, Prefix: rt.Prefix})
+	}
+	return out
+}
+
 func serveStatus(addr string, c *route.Client) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -253,10 +273,42 @@ func serveStatus(addr string, c *route.Client) {
 		enc.SetIndent("", "  ")
 		enc.Encode(struct {
 			route.ClientStats
-			RIB map[string][]route.RIBEntry `json:"rib"`
-		}{c.Stats(), rib})
+			RIB   map[string][]route.RIBEntry `json:"rib"`
+			Local []localPrefixJSON           `json:"local"`
+		}{c.Stats(), rib, localPrefixes(c)})
 	})
-	log.Printf("sr-route: status on http://%s/status", addr)
+	// PUT replaces the dynamic local set (static local_prefixes are kept).
+	// This is the reverse-import entry point: sr-frr watches the in-box FRR
+	// for customer-learned BGP prefixes and publishes the current set here.
+	mux.HandleFunc("/local-prefixes", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(localPrefixesDoc{Prefixes: localPrefixes(c)})
+		case http.MethodPut:
+			var doc localPrefixesDoc
+			dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&doc); err != nil {
+				http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			lps := make([]route.LocalPrefix, 0, len(doc.Prefixes))
+			for _, p := range doc.Prefixes {
+				lps = append(lps, route.LocalPrefix{VRFID: p.VRFID, Prefix: p.Prefix})
+			}
+			if err := c.SetLocalPrefixes(lps); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			log.Printf("sr-route: 动态 local prefixes = %d 条", len(lps))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(localPrefixesDoc{Prefixes: localPrefixes(c)})
+		default:
+			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
+		}
+	})
+	log.Printf("sr-route: status on http://%s/status（反向上报入口 PUT /local-prefixes）", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Printf("sr-route: status server: %v", err)
 	}

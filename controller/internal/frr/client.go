@@ -15,13 +15,17 @@ import (
 // 守护进程有问题，让本轮失败、下一轮重连，比无限等下去好。
 const writeTimeout = 5 * time.Second
 
-// Client 是到 zebra 的一条 ZAPI 连接。它只做三件事：HELLO、ROUTE_ADD、
-// ROUTE_DELETE；收到的其它消息一律丢弃，只把 ZEBRA_ERROR 留下来 ——
-// 不读 socket 会让 zebra 的发送缓冲反过来堵住它自己。
+// Client 是到 zebra 的一条 ZAPI 连接。它做两部分事：把我们导出的前缀写成
+// TABLE 路由；订阅 BGP 再分发，把客户侧学来的前缀交回调用方。收到的其它
+// 消息一律丢弃，只把 ZEBRA_ERROR 留下来 —— 不读 socket 会让 zebra 的发送
+// 缓冲反过来堵住它自己。
 type Client struct {
 	conn net.Conn
 
 	writeMu sync.Mutex
+
+	handlerMu    sync.RWMutex
+	routeHandler func(RouteEvent)
 
 	closeOnce sync.Once
 
@@ -81,6 +85,19 @@ func (c *Client) RouteDelete(ctx context.Context, r Route) error {
 	return c.write(ctx, msg)
 }
 
+// SetRouteHandler 注册再分发通知的处理函数。必须在 SubscribeBGP 之前调用：
+// zebra 接受订阅后会立刻回放当前已经选中的路由。
+func (c *Client) SetRouteHandler(fn func(RouteEvent)) {
+	c.handlerMu.Lock()
+	c.routeHandler = fn
+	c.handlerMu.Unlock()
+}
+
+// SubscribeBGP 订阅 zebra 里 BGP 类型的 IPv4 unicast 路由（含立即回放）。
+func (c *Client) SubscribeBGP(ctx context.Context) error {
+	return c.write(ctx, encodeRedistributeAdd(afiIPv4, routeTypeBGP, 0))
+}
+
 func (c *Client) write(ctx context.Context, msg []byte) error {
 	if err := c.Err(); err != nil {
 		return err
@@ -130,8 +147,23 @@ func (c *Client) readLoop() {
 			c.setIOErr(err)
 			return
 		}
-		if cmd == cmdError {
+		switch cmd {
+		case cmdError:
 			c.setZAPIErr(body)
+		case cmdRedistRouteAdd, cmdRedistRouteDel:
+			ev, err := decodeRedistributeRoute(body, cmd == cmdRedistRouteAdd)
+			if err != nil {
+				// 线格式对不上就重连：带着一条解歪的流继续跑，后面的
+				// 通知只会错得更隐蔽。
+				c.setIOErr(fmt.Errorf("解析再分发通知: %w", err))
+				return
+			}
+			c.handlerMu.RLock()
+			fn := c.routeHandler
+			c.handlerMu.RUnlock()
+			if fn != nil {
+				fn(ev)
+			}
 		}
 	}
 }
