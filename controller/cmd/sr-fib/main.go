@@ -1,4 +1,6 @@
 // sr-fib 把 sr-route 的 RIB 收敛成 VPP 的转发状态：VRF 表、带标签路由、本地标签。
+// 同时读本机 VPP 的 BFD 会话，把明确不 Up 的隧道从路径集合里剔除 —— 可达性信息
+// 与路由同源（都在这台 CPE 上），不在两个进程之间另造一套状态。
 //
 // 单独一个二进制、单独一次显式下发，是刻意的：sr-route 只维护 RIB（反射、策略、
 // 双 RR 切换都在那边），FIB 是控制面的**输出**。同一台 CPE 上，sr-fib 是唯一写
@@ -143,7 +145,13 @@ func main() {
 		if err != nil {
 			return fmt.Errorf("读 RIB: %w", err)
 		}
-		plan, err := fib.PlanFrom(cfg.VRFs, routes, tunnels)
+		// 可达性只认本机 VPP 里的 BFD 会话：它就是这个 CPE 眼里"隧道通不通"
+		// 的权威答案，不用绕到北向去拿一份更旧的。
+		sessions, err := vc.BFDSessions(ctx)
+		if err != nil {
+			return fmt.Errorf("读 BFD 会话: %w", err)
+		}
+		plan, err := fib.PlanFrom(cfg.VRFs, routes, tunnels, fib.UnreachablePeers(sessions))
 		if err != nil {
 			return err
 		}

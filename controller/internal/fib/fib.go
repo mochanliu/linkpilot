@@ -88,7 +88,11 @@ type Plan struct {
 //
 // vrfs 是这台 CPE 服务的 VPN VRF（与 sr-route 的 vrfs 配置同源）；每一条都要
 // 登记本地标签 —— 即使某个 VRF 眼下没有任何路由，也可能有对端压着标签进来。
-func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
+//
+// down 是"明确不可达"的下一跳集合（来自 UnreachablePeers）；nil 表示没有
+// 可达性信息，所有路径保留。显式不可达的路径与"下一跳不在隧道表里"同样处理：
+// 跳过它、留一条 warning，而不是把整条前缀撤掉 —— 同前缀可能还有别的隧道。
+func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool) (Plan, error) {
 	var p Plan
 	if len(vrfs) == 0 {
 		return p, fmt.Errorf("fib: 没有配置任何 VRF，无事可做")
@@ -145,6 +149,16 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
 			// 这台 CPE 上没有到该下一跳的隧道：这条路径不可用。留一条 warning，
 			// 不去猜别的隧道 —— 猜错比不通更难查。
 			w := fmt.Sprintf("%s: 下一跳 %s 不在隧道表里，该路径跳过", prefix, nh)
+			if !warned[w] {
+				warned[w] = true
+				p.Warnings = append(p.Warnings, w)
+			}
+			continue
+		}
+		if down[nh] {
+			// BFD 明确说这条隧道不通。跳过而不是整条撤掉：同前缀的多路径里
+			// 可能还有活着的。
+			w := fmt.Sprintf("%s: 下一跳 %s 的 BFD 会话不是 Up，该路径跳过", prefix, nh)
 			if !warned[w] {
 				warned[w] = true
 				p.Warnings = append(p.Warnings, w)

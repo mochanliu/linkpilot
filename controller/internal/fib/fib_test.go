@@ -98,8 +98,13 @@ func (f *fakeDP) CLI(_ context.Context, cmd string) (string, error) {
 	return "", nil
 }
 
+// planFrom 是"没有可达性信息"的 PlanFrom：这些用例只关心 RIB 的翻译。
+func planFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
+	return PlanFrom(vrfs, routes, tunnels, nil)
+}
+
 func plan1() Plan {
-	p, err := PlanFrom(
+	p, err := planFrom(
 		[]uint8{100},
 		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"}},
 		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0"}},
@@ -120,7 +125,7 @@ func TestLabelFor(t *testing.T) {
 
 func TestPlanFrom(t *testing.T) {
 	tun := Tunnel{NextHop: "10.255.0.2", Interface: "wg0"}
-	plan, err := PlanFrom(
+	plan, err := planFrom(
 		[]uint8{101, 100},
 		[]RIBRoute{
 			// 同一条路径被两个 RR 各反射一次：只该出现一次。
@@ -153,7 +158,7 @@ func TestPlanFrom(t *testing.T) {
 }
 
 func TestPlanFromMultipath(t *testing.T) {
-	plan, err := PlanFrom(
+	plan, err := planFrom(
 		[]uint8{100},
 		[]RIBRoute{
 			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"},
@@ -178,7 +183,7 @@ func TestPlanFromMultipath(t *testing.T) {
 }
 
 func TestPlanFromUnknownNextHopWarnsOnly(t *testing.T) {
-	plan, err := PlanFrom(
+	plan, err := planFrom(
 		[]uint8{100},
 		[]RIBRoute{
 			{VRF: 100, Prefix: "10.9.0.0/24", NextHop: "10.255.0.9"},
@@ -219,7 +224,7 @@ func TestPlanFromRejects(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := PlanFrom(c.vrfs, c.routes, c.tuns); err == nil || !strings.Contains(err.Error(), c.want) {
+			if _, err := planFrom(c.vrfs, c.routes, c.tuns); err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("err = %v, want 包含 %q", err, c.want)
 			}
 		})
@@ -278,7 +283,7 @@ func TestApplyConvergesToNewPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	next, err := PlanFrom(
+	next, err := planFrom(
 		[]uint8{101},
 		[]RIBRoute{{VRF: 101, Prefix: "172.16.0.0/16", NextHop: "10.255.0.3"}},
 		[]Tunnel{{NextHop: "10.255.0.3", Interface: "wg1"}},
@@ -319,7 +324,7 @@ func TestApplyReplacesChangedPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	next, err := PlanFrom(
+	next, err := planFrom(
 		[]uint8{100},
 		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"}},
 		[]Tunnel{
@@ -346,7 +351,7 @@ func TestApplyReplacesChangedPaths(t *testing.T) {
 func TestApplyMissingInterfaceWritesNothing(t *testing.T) {
 	dp := newFakeDP()
 	a := NewApplier(dp)
-	plan, err := PlanFrom(
+	plan, err := planFrom(
 		[]uint8{100},
 		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"}},
 		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg9"}},
@@ -381,6 +386,81 @@ func TestApplyFailureDoesNotAdvancePrev(t *testing.T) {
 	}
 	if len(dp.routes["100|10.1.0.0/24"]) != 1 {
 		t.Error("重试后路由缺失")
+	}
+}
+
+func TestPlanFromSkipsBFDDownPaths(t *testing.T) {
+	tun := []Tunnel{
+		{NextHop: "10.255.0.2", Interface: "wg0"},
+		{NextHop: "10.255.0.3", Interface: "wg1"},
+	}
+	down := map[netip.Addr]bool{netip.MustParseAddr("10.255.0.3"): true}
+	plan, err := PlanFrom(
+		[]uint8{100},
+		[]RIBRoute{
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
+			{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"},
+			{VRF: 100, Prefix: "10.2.0.0/24", NextHop: "10.255.0.3"},
+		},
+		tun, down,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Routes) != 1 || plan.Routes[0].Prefix.String() != "10.1.0.0/24" {
+		t.Fatalf("routes = %+v, want 只有还有活路径的 10.1.0.0/24", plan.Routes)
+	}
+	if paths := plan.Routes[0].Paths; len(paths) != 1 || paths[0].Interface != "wg0" {
+		t.Errorf("paths = %+v, want 只剩 wg0", paths)
+	}
+	if len(plan.Warnings) != 2 { // 两条前缀各一条
+		t.Errorf("warnings = %v, want 每条被跳过路径一条", plan.Warnings)
+	}
+	for _, w := range plan.Warnings {
+		if !strings.Contains(w, "BFD") {
+			t.Errorf("warning 没说明原因: %s", w)
+		}
+	}
+}
+
+func TestApplyBFDDownRemovesPath(t *testing.T) {
+	dp := newFakeDP()
+	a := NewApplier(dp)
+	ctx := context.Background()
+	tun := []Tunnel{
+		{NextHop: "10.255.0.2", Interface: "wg0"},
+		{NextHop: "10.255.0.3", Interface: "wg1"},
+	}
+	routes := []RIBRoute{
+		{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.2"},
+		{VRF: 100, Prefix: "10.1.0.0/24", NextHop: "10.255.0.3"},
+	}
+	up, err := PlanFrom([]uint8{100}, routes, tun, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Apply(ctx, up); err != nil {
+		t.Fatal(err)
+	}
+	if paths := dp.routes["100|10.1.0.0/24"]; len(paths) != 2 {
+		t.Fatalf("初始应有 2 条路径，got %+v", paths)
+	}
+
+	down, err := PlanFrom([]uint8{100}, routes, tun,
+		map[netip.Addr]bool{netip.MustParseAddr("10.255.0.3"): true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(ctx, down)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RoutesSet != 1 || res.RoutesRemoved != 0 || res.LabelsSet != 0 {
+		t.Errorf("res = %+v, want 只重下发这条路由（标签/表不动）", res)
+	}
+	paths := dp.routes["100|10.1.0.0/24"]
+	if len(paths) != 1 || paths[0].SWIfIndex != 10 {
+		t.Errorf("paths = %+v, want 只剩 wg0 那条", paths)
 	}
 }
 
