@@ -94,18 +94,24 @@ func enrollReqSerial(t *testing.T, claim, serial string) *http.Request {
 }
 
 func TestEnrollRejectsClaimsThatAuthorizeNothing(t *testing.T) {
+	// The fixture grant's live code is the string "c"; its hash is what the
+	// controller stores, so these cases exercise the real lookup path.
+	c := func() *Claim {
+		return &Claim{ID: "clm_test", TenantID: "t", CodeHash: hashClaimCode("c")}
+	}
 	cases := []struct {
 		name  string
 		claim *Claim
 	}{
-		{"revoked", &Claim{Code: "c", TenantID: "t", Revoked: true}},
-		{"expired", &Claim{Code: "c", TenantID: "t", ExpiresAt: time.Now().Add(-time.Hour).Unix()}},
-		{"unknown tenant", &Claim{Code: "c", TenantID: "nope"}},
-		{"no tenant", &Claim{Code: "c"}},
+		{"revoked", func() *Claim { g := c(); g.Revoked = true; return g }()},
+		{"expired", func() *Claim { g := c(); g.CodeExpiresAt = time.Now().Add(-time.Hour).Unix(); return g }()},
+		{"no code generated", &Claim{ID: "clm_test", TenantID: "t"}},
+		{"unknown tenant", &Claim{ID: "clm_test", TenantID: "nope", CodeHash: hashClaimCode("c")}},
+		{"no tenant", &Claim{ID: "clm_test", CodeHash: hashClaimCode("c")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := enrollFixture(t, claimMap{"c": tc.claim})
+			s := enrollFixture(t, claimMap{"clm_test": tc.claim})
 			rec := httptest.NewRecorder()
 			s.handleEnroll(rec, enrollReq(t, "c"))
 			if rec.Code != http.StatusForbidden {
@@ -119,8 +125,8 @@ func TestEnrollRejectsClaimsThatAuthorizeNothing(t *testing.T) {
 }
 
 func TestEnrollRecordsSeatOnceAndIsIdempotent(t *testing.T) {
-	claim := &Claim{Code: "c", TenantID: "t", MaxUses: 5}
-	s := enrollFixture(t, claimMap{"c": claim})
+	claim := &Claim{ID: "clm_test", TenantID: "t", MaxUses: 5, CodeHash: hashClaimCode("c")}
+	s := enrollFixture(t, claimMap{"clm_test": claim})
 
 	rec := httptest.NewRecorder()
 	s.handleEnroll(rec, enrollReq(t, "c"))
@@ -150,8 +156,8 @@ func TestEnrollRecordsSeatOnceAndIsIdempotent(t *testing.T) {
 }
 
 func TestEnrollStopsAtTheActivationLimit(t *testing.T) {
-	claim := &Claim{Code: "c", TenantID: "t", MaxUses: 2}
-	s := enrollFixture(t, claimMap{"c": claim})
+	claim := &Claim{ID: "clm_test", TenantID: "t", MaxUses: 2, CodeHash: hashClaimCode("c")}
+	s := enrollFixture(t, claimMap{"clm_test": claim})
 
 	for _, serial := range []string{"sn-1", "sn-2"} {
 		rec := httptest.NewRecorder()

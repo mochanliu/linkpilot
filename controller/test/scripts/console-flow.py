@@ -4,8 +4,10 @@
 跑在控制器容器里：控制台在 http://127.0.0.1:8088（明文 + 会话 cookie），
 设备入网在 https://127.0.0.1:8444（mTLS，但 enroll 这一步没有证书）。
 
-A 段是运营方：租户 / 入网码 / 入网 / 吊销，与 GUI 里点的那几步一一对应。
-B 段是把"多角色"当成契约来测：权限在服务端收口，页面只是一层皮。
+入网是两级模型：运营方只下发「授权」（名称 + 可激活台数，永不出现码），
+租户登录后自己点「生成」才拿到一次性码；码默认 5 分钟，明文只在生成响应里
+出现一次，落库只有 SHA-256。A 段照这个顺序走一遍，与 GUI 里点的那几步一一
+对应。B 段是把"多角色"当成契约来测：权限在服务端收口，页面只是一层皮。
 
 A 段输出：
   unauth_state=401          没有会话读状态必须被拒
@@ -15,23 +17,51 @@ A 段输出：
   state_tenants=<n>         登录后能读到状态
   tenant=tenant-new         建租户
   tenant_account=...        建租户同时得到第一个租户账号
-  claim=<code>              建租户同时拿到第一个入网码
-  claim_code_shape=ok       码是 srk_ + 32 位随机串，不含租户名
-  claim_default_uses=10     没指定台数时的默认名额
+  grant=clm_...             建租户同时下发第一条授权（id，不是码）
+  grant_has_code=false      授权响应里没有 code 字段
+  grant_no_plaintext=true   响应原文里没有 srk_ 开头的明文
+  grant_default_uses=10     没指定台数时的默认名额
   dup_tenant=409            同 ID 再建一次必须冲突
   bad_id=400                非法 tenant_id 被拒（不是"建了再报错"）
   no_json=415               非 JSON 的 POST 被拒（cookie 不是 CSRF 杠杆）
-  new_claim=<code>          给已有租户追加签发
-  enroll=200                用新租户的入网码入网成功
+  new_grant=clm_...         给已有租户追加下发授权
+  new_grant_name=现场设备    授权带名字（客户在页面里靠它认领）
+  new_grant_no_code=true    追加下发同样不产生码
+  operator_generate=403     运营方不能替客户生成码
+  tenant_login=200          租户账号登录
+  tenant_role=tenant / tenant_scope=tenant-new
+  tenant_initial_password=true 首次登录仍是一次性口令
+  generate_code=200         租户为自己的授权生成码
+  claim_code_shape=ok       码是 srk_ + 32 位随机串，不含租户名
+  claim_code_hides_tenant=true
+  claim_code_ttl=300        默认窗口 5 分钟
+  claim_code_name=现场设备    生成响应把授权名带回来，避免复制错
+  enroll=200                用刚生成的码入网成功
   enroll_tenant=tenant-new  入网落在新租户下
   enroll_node=1             新租户的第一台设备
   node_status=pending       入网不等于上线：还没有心跳
   node_tenant=tenant-new    状态里的设备归属
-  claim_serials=1           入网码记录了被谁用过
-  revoke=200                吊销入网码
+  claim_serials=1           授权记录了被谁激活
+  claim_code_active=true    状态里只说"码还有效"，不给码
+  state_has_secret=false    状态 JSON 里没有明文码
+  state_has_hash=false      状态 JSON 里连哈希也不回传
+  state_claims_have_code_field=false 授权视图没有 code 字段
+  rotate_code=200           重新生成
+  rotate_changed=true       新码与旧码不同
+  rotate_old_code=403       旧码在重新生成那一刻失效
+  rotate_existing_device=200 已入网设备用新码重入仍成功
+  revoke=200                按 id 吊销授权
   claim_revoked=true        状态里反映吊销
+  revoke_code_active=false  吊销同时清掉当前码
   enroll_revoked=403        吊销后不许再入网
+  expiry_code=200           生成 1 秒窗口的码
+  expiry_enroll=403         过期后入网被拒（由服务端判定）
+  expiry_code_active=false  过期后状态里也不再是"有效"
+  expiry_bad_ttl=400        窗口上限在服务端校验（> 24h 被拒）
+  expiry_default_ttl=300    不带 ttl 时回到默认 5 分钟
+  quota_tenant=tenant-quota
   quota_tenant_claim_uses=2 建租户时指定名额
+  quota_generate=200        租户为这条授权生成码
   quota_enroll_1|2=200      名额内正常入网
   quota_enroll_3_blocked=403 名额用满后新设备被拒
   quota_reenroll_existing=200 已入网设备重复入网不占名额
@@ -43,7 +73,10 @@ A 段输出：
   quota_update_zero=200     0 表示默认名额
 
 B 段输出：
-  tenant_login / tenant_role / tenant_scope
+  other_tenant=tenant-other / other_grant=clm_...
+  other_tenant_generate=200             别家可以生成自己的码
+  tenant_foreign_grant_code=404         别家的授权对我是 404（不确认存在）
+  tenant_session=200                    会话仍有效
   tenant_tenants / tenant_nodes / tenant_claims    租户只看到自己的
   tenant_foreign_nodes / tenant_foreign_claims     必须是 0
   tenant_node_runtime=true                         租户看得到自己设备的运行时
@@ -66,10 +99,12 @@ B 段输出：
   empty_nodes_is_list=true                         空集合是 [] 不是 null
   sse_foreign=0 / sse_own=<n>                      SSE 只投递自己的事件
   login_lock=429                                   连续失败锁定
-  tenant_logout=401
+  tenant_logout=200 / tenant_after_logout=401      退出后会话立即失效
 
 入网用的公钥是 32 字节随机数（控制器只校验长度与 base64）：这个脚本要证明的是
-"claim code 能不能授权入网"，真设备证书链由 test-vbond.sh 里 openssl 那几条负责。
+"授权 + 一次性码能不能放设备进来"，真设备证书链由 test-vbond.sh 里 openssl
+那几条负责。码本身只在这里出现一次，后面所有断言都在确认它没有落进状态、
+日志或账号视图。
 """
 import base64
 import http.client
@@ -223,7 +258,7 @@ code, raw = call("GET", CONSOLE + "/api/state")
 st = jstat(code, raw)
 say("state_tenants", len(st["tenants"]) if st else "none")
 
-# 6. 建租户（同时得到第一个入网码与租户管理员账号）
+# 6. 建租户：同时下发第一个入网授权（名称 + 名额，不含码）与租户管理员账号
 code, raw = call("POST", CONSOLE + "/api/tenants", {
     "tenant_id": "tenant-new", "name": "新建租户",
     "account": "tenant-new-admin", "password": "tenant-new-pass-2026",
@@ -234,8 +269,12 @@ if not res:
     sys.exit(1)
 say("tenant", res["tenant"]["tenant_id"])
 say("tenant_account", (res.get("account") or {}).get("username", "none"))
-claim = res["claim"]["code"]
-say("claim", claim)
+grant = res["claim"]
+claim_id = grant["id"]
+say("grant", claim_id)
+say("grant_has_code", str("code" in grant).lower())
+say("grant_no_plaintext", str("srk_" not in raw.decode(errors="replace")).lower())
+say("grant_default_uses", grant["max_uses"])
 
 # 7. 重复建租户
 code, _ = call("POST", CONSOLE + "/api/tenants", {"tenant_id": "tenant-new"})
@@ -250,14 +289,48 @@ code, _ = call("POST", CONSOLE + "/api/claims",
                {"tenant_id": "tenant-new"}, json_ct=False)
 say("no_json", code)
 
-# 10. 追加签发入网码
-code, raw = call("POST", CONSOLE + "/api/claims", {"tenant_id": "tenant-new", "note": "second"})
-res = jstat(code, raw)
-second = res["code"] if res else "none"
-say("new_claim", second)
+# 10. 追加下发一条授权。运营方只看到「名称 + 名额」，看不到也生成不了码。
+code, raw = call("POST", CONSOLE + "/api/claims",
+                 {"tenant_id": "tenant-new", "name": "现场设备", "max_uses": 5})
+second = jstat(code, raw)
+if not second:
+    say("new_grant", "HTTP %d: %s" % (code, raw.decode(errors="replace")))
+    sys.exit(1)
+say("new_grant", second["id"])
+say("new_grant_name", second["name"])
+say("new_grant_no_code", str("code" not in second and "code_hash" not in second).lower())
+code, _ = call("POST", CONSOLE + "/api/claims/code", {"id": second["id"], "ttl_sec": 300})
+say("operator_generate", code)
 
-# 11. 用第二个码入网
-code, res = enroll(second, "vcpe-001")
+# 11. 租户登录，自己为这条授权生成一次性码（默认 5 分钟）
+tjar = http.cookiejar.CookieJar()
+topener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(tjar))
+code, _ = call("POST", CONSOLE + "/api/login",
+               {"username": "tenant-new-admin", "password": "tenant-new-pass-2026"},
+               opener_=topener)
+say("tenant_login", code)
+if code != 200:
+    sys.exit(1)
+code, raw = call("GET", CONSOLE + "/api/session", opener_=topener)
+sess = jstat(code, raw) or {}
+say("tenant_role", sess.get("role"))
+say("tenant_scope", sess.get("tenant_id"))
+say("tenant_username", sess.get("username"))
+say("tenant_initial_password", str(sess.get("initial_password")).lower())
+tenant_cookie = cookie_header(tjar)
+
+code, raw = call("POST", CONSOLE + "/api/claims/code",
+                 {"id": second["id"], "ttl_sec": 300}, opener_=topener)
+cc = jstat(code, raw)
+say("generate_code", code)
+code1 = cc["code"] if cc else ""
+say("claim_code_shape", "ok" if re.fullmatch(r"srk_[23456789BCDFGHJKLMNPQRSTVWXZ]{32}", code1) else code1)
+say("claim_code_hides_tenant", str("tenant-new" not in code1).lower())
+say("claim_code_ttl", (cc["expires_at_unix"] - cc["issued_at_unix"]) if cc else "missing")
+say("claim_code_name", cc.get("name") if cc else "missing")
+
+# 12. 用码入网
+code, res = enroll(code1, "vcpe-001")
 say("enroll", code)
 if isinstance(res, dict):
     say("enroll_tenant", res.get("tenant_id"))
@@ -265,41 +338,80 @@ if isinstance(res, dict):
 else:
     say("enroll_tenant", res.decode(errors="replace")[:120])
 
-# 12. 状态里能看到它，且是 pending（入网 ≠ 上线）
+# 13. 状态里能看到它，且是 pending（入网 ≠ 上线）；码只在响应里，落库只有哈希
 code, raw = call("GET", CONSOLE + "/api/state")
 st = jstat(code, raw)
 node = next((n for n in st["nodes"] if n["serial"] == "vcpe-001"), None) if st else None
 say("node_status", node["status"] if node else "missing")
 say("node_tenant", node["tenant_id"] if node else "missing")
-c2 = next((c for c in st["claims"] if c["code"] == second), None) if st else None
+c2 = next((c for c in st["claims"] if c["id"] == second["id"]), None) if st else None
 say("claim_serials", len(c2["serials"]) if c2 else "missing")
+say("claim_code_active", str(c2.get("code_active")).lower() if c2 else "missing")
+body = raw.decode(errors="replace")
+say("state_has_secret", str("srk_" in body).lower())
+say("state_has_hash", str("code_hash" in body).lower())
+say("state_claims_have_code_field",
+    str(any("code" in c for c in (st["claims"] if st else []))).lower())
 
-# 13. 吊销
-code, _ = call("POST", CONSOLE + "/api/claims/revoke", {"code": second})
+# 14. 轮换：旧码立刻失效，新码可用；同一台设备重入不占名额
+code, raw = call("POST", CONSOLE + "/api/claims/code",
+                 {"id": second["id"], "ttl_sec": 300}, opener_=topener)
+code2 = (jstat(code, raw) or {}).get("code", "")
+say("rotate_code", code)
+say("rotate_changed", str(code1 != code2).lower())
+say("rotate_old_code", enroll(code1, "vcpe-001b")[0])
+say("rotate_existing_device", enroll(code2, "vcpe-001")[0])
+
+# 15. 吊销按 id，并让当前码立刻作废
+code, _ = call("POST", CONSOLE + "/api/claims/revoke", {"id": second["id"]})
 say("revoke", code)
 code, raw = call("GET", CONSOLE + "/api/state")
 st = jstat(code, raw)
-c2 = next((c for c in st["claims"] if c["code"] == second), None) if st else None
+c2 = next((c for c in st["claims"] if c["id"] == second["id"]), None) if st else None
 say("claim_revoked", str(c2["revoked"]).lower() if c2 else "missing")
+say("revoke_code_active", str(c2.get("code_active")).lower() if c2 else "missing")
+say("enroll_revoked", enroll(code2, "vcpe-002")[0])
 
-# 14. 吊销后同一码不能再入网
-code, _ = enroll(second, "vcpe-002")
-say("enroll_revoked", code)
-
-# 15. 入网码是随机密钥，不是可读的固定串
-say("claim_code_shape", "ok" if re.fullmatch(r"srk_[23456789BCDFGHJKLMNPQRSTVWXZ]{32}", claim) else claim)
-say("claim_code_hides_tenant", str("tenant-new" not in claim).lower())
+# 16. 到期由服务端判定：1 秒窗口的码，过了就进不了网
+code, raw = call("POST", CONSOLE + "/api/claims",
+                 {"tenant_id": "tenant-new", "name": "短时测试", "max_uses": 2})
+short = jstat(code, raw)
+code, raw = call("POST", CONSOLE + "/api/claims/code",
+                 {"id": short["id"], "ttl_sec": 1}, opener_=topener)
+sc = jstat(code, raw)
+say("expiry_code", code)
+time.sleep(2.2)
+say("expiry_enroll", enroll(sc["code"], "vcpe-short")[0])
 code, raw = call("GET", CONSOLE + "/api/state")
 st = jstat(code, raw)
-c1 = next((c for c in st["claims"] if c["code"] == claim), None) if st else None
-say("claim_default_uses", c1["max_uses"] if c1 else "missing")
+cs = next((c for c in st["claims"] if c["id"] == short["id"]), None) if st else None
+say("expiry_code_active", str(cs.get("code_active")).lower() if cs else "missing")
+code, _ = call("POST", CONSOLE + "/api/claims/code",
+               {"id": short["id"], "ttl_sec": 86401}, opener_=topener)
+say("expiry_bad_ttl", code)
+code, raw = call("POST", CONSOLE + "/api/claims/code",
+                 {"id": short["id"]}, opener_=topener)
+sdef = jstat(code, raw)
+say("expiry_default_ttl", (sdef["expires_at_unix"] - sdef["issued_at_unix"]) if sdef else "missing")
 
-# 16. 名额按设备计：建租户时指定 2 台
-code, raw = call("POST", CONSOLE + "/api/tenants", {"tenant_id": "tenant-quota", "claim_max_uses": 2})
+# 17. 名额按设备计：租户账号持有 2 个名额的授权
+code, raw = call("POST", CONSOLE + "/api/tenants", {
+    "tenant_id": "tenant-quota", "account": "tenant-quota-admin",
+    "password": "quota-pass-2026", "claim_max_uses": 2,
+})
 res = jstat(code, raw)
 say("quota_tenant", res["tenant"]["tenant_id"] if res else "HTTP %d" % code)
-quota = res["claim"]["code"] if res else ""
+quota_id = res["claim"]["id"] if res else ""
 say("quota_tenant_claim_uses", res["claim"]["max_uses"] if res else "missing")
+qjar = http.cookiejar.CookieJar()
+qopener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(qjar))
+call("POST", CONSOLE + "/api/login",
+     {"username": "tenant-quota-admin", "password": "quota-pass-2026"}, opener_=qopener)
+code, raw = call("POST", CONSOLE + "/api/claims/code",
+                 {"id": quota_id, "ttl_sec": 300}, opener_=qopener)
+res = jstat(code, raw)
+quota = res["code"] if res else ""
+say("quota_generate", code)
 
 say("quota_enroll_1", enroll(quota, "vcpe-q1")[0])
 say("quota_enroll_2", enroll(quota, "vcpe-q2")[0])
@@ -308,34 +420,48 @@ say("quota_enroll_3_blocked", enroll(quota, "vcpe-q3")[0])
 say("quota_reenroll_existing", enroll(quota, "vcpe-q1")[0])
 code, raw = call("GET", CONSOLE + "/api/state")
 st = jstat(code, raw)
-cq = next((c for c in st["claims"] if c["code"] == quota), None) if st else None
+cq = next((c for c in st["claims"] if c["id"] == quota_id), None) if st else None
 say("quota_used", cq["uses"] if cq else "missing")
 
-# 17. 名额可以调整，但不能调到已激活数以下（那台设备的证书已经发出去了）
-code, _ = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 1})
+# 18. 名额可以调整，但不能调到已激活数以下（那台设备的证书已经发出去了）
+code, _ = call("POST", CONSOLE + "/api/claims/update", {"id": quota_id, "max_uses": 1})
 say("quota_lower", code)
-code, raw = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 3})
+code, raw = call("POST", CONSOLE + "/api/claims/update", {"id": quota_id, "max_uses": 3})
 res = jstat(code, raw)
 say("quota_raise", code)
 say("quota_raise_value", res["max_uses"] if res else "missing")
 say("quota_enroll_after_raise", enroll(quota, "vcpe-q3")[0])
-code, _ = call("POST", CONSOLE + "/api/claims/update", {"code": "srk_" + "X" * 32, "max_uses": 2})
+code, _ = call("POST", CONSOLE + "/api/claims/update",
+               {"id": "clm_ZZZZZZZZZZZZ", "max_uses": 2})
 say("quota_update_unknown", code)
-code, _ = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 10001})
+code, _ = call("POST", CONSOLE + "/api/claims/update", {"id": quota_id, "max_uses": 10001})
 say("quota_update_too_big", code)
-code, raw = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 0})
+code, raw = call("POST", CONSOLE + "/api/claims/update", {"id": quota_id, "max_uses": 0})
 res = jstat(code, raw)
 say("quota_update_zero", code)
 say("quota_update_zero_value", res["max_uses"] if res else "missing")
 
 # ---------------------------------------------------------------- B. 多角色
-# B1. 第二家租户：有账号、没有设备（空集合契约）
+# B1. 第二家租户：有账号、没有设备（空集合契约）；也能为自己的授权生成码
 code, raw = call("POST", CONSOLE + "/api/tenants", {
     "tenant_id": "tenant-other", "name": "另一家",
     "account": "tenant-other-admin", "password": "other-side-2026",
 })
 res = jstat(code, raw)
 say("other_tenant", res["tenant"]["tenant_id"] if res else "HTTP %d" % code)
+other_grant = res["claim"]["id"] if res else ""
+say("other_grant", other_grant)
+ojar = http.cookiejar.CookieJar()
+oopener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(ojar))
+call("POST", CONSOLE + "/api/login",
+     {"username": "tenant-other-admin", "password": "other-side-2026"}, opener_=oopener)
+code, _ = call("POST", CONSOLE + "/api/claims/code",
+               {"id": other_grant, "ttl_sec": 60}, opener_=oopener)
+say("other_tenant_generate", code)
+# 别家的授权是 404：不确认它存在，更不给出码
+code, _ = call("POST", CONSOLE + "/api/claims/code",
+               {"id": other_grant}, opener_=topener)
+say("tenant_foreign_grant_code", code)
 
 # B2. 账号列表：有账号、有角色，但永远没有口令哈希
 code, raw = call("GET", CONSOLE + "/api/accounts")
@@ -359,22 +485,9 @@ code, _ = call("POST", CONSOLE + "/api/accounts",
                {"username": "short-pw", "role": "operator", "password": "short"})
 say("short_password", code)
 
-# B5. 租户账号登录（独立 cookie jar）
-tjar = http.cookiejar.CookieJar()
-topener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(tjar))
-code, _ = call("POST", CONSOLE + "/api/login",
-               {"username": "tenant-new-admin", "password": "tenant-new-pass-2026"},
-               opener_=topener)
-say("tenant_login", code)
-if code != 200:
-    sys.exit(1)
+# B5. 租户会话已经建立（A 段登录），这里只确认会话仍有效
 code, raw = call("GET", CONSOLE + "/api/session", opener_=topener)
-sess = jstat(code, raw) or {}
-say("tenant_role", sess.get("role"))
-say("tenant_scope", sess.get("tenant_id"))
-say("tenant_username", sess.get("username"))
-say("tenant_initial_password", str(sess.get("initial_password")).lower())
-tenant_cookie = cookie_header(tjar)
+say("tenant_session", code)
 
 # B6. 租户状态：只有自己的一家租户、自己的设备、自己的入网码
 code, raw = call("GET", CONSOLE + "/api/state", opener_=topener)
@@ -387,7 +500,7 @@ say("tenant_nodes", len(tnodes))
 say("tenant_claims", len(tclaims))
 say("tenant_foreign_nodes", len([n for n in tnodes if n.get("tenant_id") != "tenant-new"]))
 say("tenant_foreign_claims", len([c for c in tclaims if c.get("tenant_id") != "tenant-new"]))
-tclaim = next((c for c in tclaims if c["code"] == claim), None)
+tclaim = next((c for c in tclaims if c["id"] == claim_id), None)
 say("tenant_claim_seats", "%d/%d" % (tclaim["uses"], tclaim["max_uses"]) if tclaim else "missing")
 say("tenant_node_runtime", str(bool(tnodes and tnodes[0].get("runtime"))).lower())
 say("tenant_node_configured",
@@ -431,8 +544,8 @@ def deny(name, path, body):
 
 deny("tenant_deny_tenants", "/api/tenants", {"tenant_id": "evil"})
 deny("tenant_deny_claims", "/api/claims", {"tenant_id": "tenant-new"})
-deny("tenant_deny_revoke", "/api/claims/revoke", {"code": claim})
-deny("tenant_deny_claim_update", "/api/claims/update", {"code": claim, "max_uses": 999})
+deny("tenant_deny_revoke", "/api/claims/revoke", {"id": claim_id})
+deny("tenant_deny_claim_update", "/api/claims/update", {"id": claim_id, "max_uses": 999})
 deny("tenant_deny_accounts", "/api/accounts",
      {"username": "evil-admin", "role": "tenant", "tenant_id": "tenant-new", "password": "evil-pass-2026"})
 deny("tenant_deny_account_reset", "/api/accounts/reset", {"username": "tenant-other-admin"})
@@ -507,8 +620,8 @@ if not sse.hello.wait(5):
     say("sse_foreign", "no-stream")
     say("sse_own", "no-stream")
 else:
-    call("POST", CONSOLE + "/api/claims", {"tenant_id": "tenant-other", "note": "sse-foreign"})
-    call("POST", CONSOLE + "/api/claims", {"tenant_id": "tenant-new", "note": "sse-own"})
+    call("POST", CONSOLE + "/api/claims", {"tenant_id": "tenant-other", "name": "sse-foreign"})
+    call("POST", CONSOLE + "/api/claims", {"tenant_id": "tenant-new", "name": "sse-own"})
     time.sleep(1.2)
     evs = list(sse.events)
     say("sse_foreign", len([e for e in evs if e[1] not in ("", "tenant-new")]))

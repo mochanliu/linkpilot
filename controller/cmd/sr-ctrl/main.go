@@ -36,6 +36,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -128,23 +129,56 @@ type Tenant struct {
 	CreatedAt int64  `json:"created_at_unix"`
 }
 
-// Claim is one enrollment token. Its only authority is "bind the holder to
-// TenantID" -- it carries no configuration. Codes are tenant-scoped and reusable
-// up to MaxUses devices; Serials lists exactly the devices this code activated,
-// so len(Serials) is also the seat count the console shows.
+// Claim is one enrollment grant: the operator's promise that a tenant may
+// activate up to MaxUses devices. It carries no configuration -- its only
+// authority is "bind the holder of a valid code to TenantID". Serials lists
+// exactly the devices this grant activated, so len(Serials) is both the audit
+// trail and the seat count the console shows.
+//
+// The secret is NOT stored. A tenant generates a short-lived code from the
+// grant, and the controller keeps only its SHA-256 plus issue metadata. The
+// plaintext exists in exactly one place: the response to the generation call.
+// That is why neither State, /api/state nor the logs can leak a usable code.
 type Claim struct {
-	Code      string   `json:"code"`
+	ID        string   `json:"id"`
 	TenantID  string   `json:"tenant_id"`
-	Note      string   `json:"note,omitempty"`
+	Name      string   `json:"name,omitempty"`
 	CreatedAt int64    `json:"created_at_unix"`
-	ExpiresAt int64    `json:"expires_at_unix,omitempty"`
 	Revoked   bool     `json:"revoked,omitempty"`
 	MaxUses   int      `json:"max_uses"`
 	Serials   []string `json:"serials,omitempty"`
+
+	// CodeHash is the SHA-256 of the currently issued code. Empty means "no
+	// live code": never generated, already expired, or rotated out. Generating
+	// a new code replaces these fields, so a grant never has two valid secrets.
+	CodeHash      string `json:"code_hash,omitempty"`
+	CodeIssuedAt  int64  `json:"code_issued_at_unix,omitempty"`
+	CodeExpiresAt int64  `json:"code_expires_at_unix,omitempty"`
+	CodeIssuedBy  string `json:"code_issued_by,omitempty"`
+	CodeUsedAt    int64  `json:"code_used_at_unix,omitempty"`
+
+	// Legacy fields, read-only migration input. State files written before
+	// codes became ephemeral keep the plaintext code (as the map key and in
+	// "code"), a note, and a grant-level expiry. normalizeState turns them into
+	// CodeHash / Name / CodeExpiresAt and clears them; they are never written
+	// back, so a saved state no longer contains a usable code.
+	LegacyCode      string `json:"code,omitempty"`
+	LegacyNote      string `json:"note,omitempty"`
+	LegacyExpiresAt int64  `json:"expires_at_unix,omitempty"`
+}
+
+// hashClaimCode maps a presented code to the value stored in State. SHA-256 is
+// enough here: the code carries 157 bits of entropy, so there is no dictionary
+// to slow down -- a slow KDF would only add cost to every enrollment.
+func hashClaimCode(code string) string {
+	sum := sha256.Sum256([]byte(code))
+	return hex.EncodeToString(sum[:])
 }
 
 // claimMap reads both the current record shape and the legacy
 // `{"claim-a":"tenant-a"}` shape, so an existing lab state file keeps working.
+// Keys are grant ids now; files written before the id field existed key the map
+// by the plaintext code, which normalizeState detects and converts.
 type claimMap map[string]*Claim
 
 func (m *claimMap) UnmarshalJSON(b []byte) error {
@@ -161,7 +195,7 @@ func (m *claimMap) UnmarshalJSON(b []byte) error {
 	}
 	out := make(claimMap, len(legacy))
 	for code, tenant := range legacy {
-		out[code] = &Claim{Code: code, TenantID: tenant}
+		out[code] = &Claim{LegacyCode: code, TenantID: tenant}
 	}
 	*m = out
 	return nil
@@ -174,7 +208,7 @@ type State struct {
 	NextNodeID map[string]uint16      `json:"next_node_id"` // per tenant
 	Epoch      uint32                 `json:"epoch"`        // monotonic, survives restart
 	Tenants    map[string]*Tenant     `json:"tenants"`
-	Claims     claimMap               `json:"claims"` // claim_code -> Claim
+	Claims     claimMap               `json:"claims"` // claim id -> Claim (grant)
 	// PKeyRings holds each tenant's hop-MAC key ring. This is DOMAIN material:
 	// shared across the tenant on purpose, because a node has to verify headers
 	// signed by nodes it never talked to (a transit hop). What is NOT here is any
@@ -218,6 +252,21 @@ type Store interface {
 
 type fileStore struct{ path string }
 
+// newClaimID is a grant's stable, public handle. It is random only so ids do
+// not invite enumeration; unlike a code it carries no authority.
+func newClaimID() string {
+	const alphabet = "23456789BCDFGHJKLMNPQRSTVWXZ"
+	buf := make([]byte, 12)
+	if _, err := rand.Read(buf); err != nil {
+		log.Fatalf("console: entropy unavailable: %v", err)
+	}
+	out := make([]byte, len(buf))
+	for i, b := range buf {
+		out[i] = alphabet[int(b)%len(alphabet)]
+	}
+	return "clm_" + string(out)
+}
+
 func (f *fileStore) Load() (*State, error) {
 	b, err := os.ReadFile(f.path)
 	if os.IsNotExist(err) {
@@ -230,13 +279,22 @@ func (f *fileStore) Load() (*State, error) {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, err
 	}
-	normalizeState(&s)
+	if normalizeState(&s) {
+		// The migration exists to remove plaintext codes from disk; leaving the
+		// old file in place would keep the very secret this change eliminates.
+		log.Printf("state: migrated legacy claim records (codes are now stored hashed)")
+		if err := f.Save(&s); err != nil {
+			return nil, fmt.Errorf("saving migrated state: %w", err)
+		}
+	}
 	return &s, nil
 }
 
 // seedState is the demo world the harness and the lab start from: two tenants
-// and three claim codes, so multi-tenancy is provable out of the box. Console
-// creation appends to it; nothing here is special.
+// and three enrollment grants, so multi-tenancy is provable out of the box. The
+// demo codes are the fixed strings the vBond harness types ("claim-a"...); they
+// are hashed like any other code, and this file is the only place they exist in
+// plaintext. Console creation appends to it; nothing here is special.
 func seedState() *State {
 	now := time.Now().Unix()
 	s := &State{
@@ -251,8 +309,10 @@ func seedState() *State {
 		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
 	}
 	for code, tenant := range map[string]string{"claim-a": "tenant-a", "claim-b": "tenant-a", "claim-c": "tenant-b"} {
-		s.Claims[code] = &Claim{Code: code, TenantID: tenant, Note: "demo seed",
-			CreatedAt: now, MaxUses: claimDefaultMaxUses}
+		c := &Claim{ID: newClaimID(), TenantID: tenant, Name: "演示入网授权",
+			CreatedAt: now, MaxUses: claimDefaultMaxUses,
+			CodeHash: hashClaimCode(code), CodeIssuedAt: now}
+		s.Claims[c.ID] = c
 	}
 	return s
 }
@@ -261,7 +321,11 @@ func seedState() *State {
 // missing. A claim that names no tenant authorizes nothing and is dropped; a
 // tenant referenced by a node or claim exists by definition, so it is
 // backfilled instead of leaving a row the console cannot render.
-func normalizeState(s *State) {
+//
+// It reports whether it converted legacy plaintext claim codes, because that is
+// the one repair the caller must persist immediately: the file on disk would
+// otherwise still contain a usable secret.
+func normalizeState(s *State) bool {
 	if s.Nodes == nil {
 		s.Nodes = map[string]*NodeRecord{}
 	}
@@ -298,30 +362,64 @@ func normalizeState(s *State) {
 		}
 	}
 	now := time.Now().Unix()
-	for code, c := range s.Claims {
+	migrated := false
+	claims := make(claimMap, len(s.Claims))
+	for mapKey, c := range s.Claims {
 		if c == nil {
-			delete(s.Claims, code)
+			migrated = true
 			continue
 		}
-		if c.Code == "" {
-			c.Code = code
+		if c.ID == "" {
+			// Old files key the map by the plaintext code and have no id.
+			c.ID = newClaimID()
+			if c.LegacyCode == "" {
+				c.LegacyCode = mapKey
+			}
+			migrated = true
 		}
+		// A record whose key is not its id is an old file, whichever fields it
+		// happens to carry. The key is still the code that file was issued for.
+		if c.LegacyCode == "" && mapKey != c.ID && c.CodeHash == "" {
+			c.LegacyCode = mapKey
+		}
+		if c.LegacyCode != "" {
+			if c.CodeHash == "" {
+				c.CodeHash = hashClaimCode(c.LegacyCode)
+				if c.CodeExpiresAt == 0 && c.LegacyExpiresAt > 0 {
+					c.CodeExpiresAt = c.LegacyExpiresAt
+				}
+				if c.CodeIssuedAt == 0 {
+					c.CodeIssuedAt = c.CreatedAt
+				}
+			}
+			migrated = true
+		}
+		if c.Name == "" {
+			c.Name = c.LegacyNote
+			if c.Name == "" {
+				c.Name = "入网授权"
+			}
+		}
+		if c.LegacyCode != "" || c.LegacyNote != "" || c.LegacyExpiresAt != 0 {
+			migrated = true
+		}
+		c.LegacyCode, c.LegacyNote, c.LegacyExpiresAt = "", "", 0
 		if c.CreatedAt == 0 {
 			c.CreatedAt = now
 		}
 		if c.TenantID == "" {
-			delete(s.Claims, code)
+			migrated = true
 			continue
 		}
 		// Older records reused one list for every enrollment attempt, so the
 		// same serial can appear twice. Seats are distinct devices, and the
-		// limit must never sit below what this code has already activated.
+		// limit must never sit below what this grant has already activated.
 		seen := map[string]bool{}
 		uniq := c.Serials[:0]
-		for _, s := range c.Serials {
-			if s != "" && !seen[s] {
-				seen[s] = true
-				uniq = append(uniq, s)
+		for _, serial := range c.Serials {
+			if serial != "" && !seen[serial] {
+				seen[serial] = true
+				uniq = append(uniq, serial)
 			}
 		}
 		c.Serials = uniq
@@ -334,13 +432,20 @@ func normalizeState(s *State) {
 		if c.MaxUses < len(c.Serials) {
 			c.MaxUses = len(c.Serials)
 		}
+		if claims[c.ID] != nil {
+			c.ID = newClaimID()
+			migrated = true
+		}
+		claims[c.ID] = c
 		ensureTenant(s, c.TenantID, now)
 	}
+	s.Claims = claims
 	for _, n := range s.Nodes {
 		if n != nil && n.TenantID != "" {
 			ensureTenant(s, n.TenantID, now)
 		}
 	}
+	return migrated
 }
 
 func ensureTenant(s *State, id string, now int64) *Tenant {
@@ -651,25 +756,25 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	claim, ok := s.state.Claims[req.ClaimCode]
-	if !ok || claim == nil || claim.TenantID == "" {
-		log.Printf("enroll REJECTED serial=%s (unknown claim code)", req.Serial)
+	claim := s.findClaimByCodeLocked(req.ClaimCode)
+	if claim == nil || claim.TenantID == "" {
+		log.Printf("enroll REJECTED serial=%s (invalid claim code)", req.Serial)
 		http.Error(w, "invalid claim code", 403)
 		return
 	}
 	if claim.Revoked {
-		log.Printf("enroll REJECTED serial=%s (revoked claim code %s)", req.Serial, req.ClaimCode)
+		log.Printf("enroll REJECTED serial=%s (revoked grant %s)", req.Serial, claim.ID)
 		http.Error(w, "claim code revoked", 403)
 		return
 	}
-	if claim.ExpiresAt > 0 && time.Now().Unix() > claim.ExpiresAt {
-		log.Printf("enroll REJECTED serial=%s (expired claim code %s)", req.Serial, req.ClaimCode)
+	if claim.CodeExpiresAt > 0 && time.Now().Unix() > claim.CodeExpiresAt {
+		log.Printf("enroll REJECTED serial=%s (expired code on grant %s)", req.Serial, claim.ID)
 		http.Error(w, "claim code expired", 403)
 		return
 	}
 	tenant := claim.TenantID
 	if _, ok := s.state.Tenants[tenant]; !ok {
-		log.Printf("enroll REJECTED serial=%s (claim %s points at unknown tenant %s)", req.Serial, req.ClaimCode, tenant)
+		log.Printf("enroll REJECTED serial=%s (grant %s points at unknown tenant %s)", req.Serial, claim.ID, tenant)
 		http.Error(w, "claim code references an unknown tenant", 403)
 		return
 	}
@@ -688,8 +793,8 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		// A seat is a device, not an enrollment: re-enrolling a serial that
 		// already belongs to this tenant is free, even when the code is full.
 		if claim.MaxUses > 0 && len(claim.Serials) >= claim.MaxUses {
-			log.Printf("enroll REJECTED serial=%s (claim %s used %d/%d)",
-				req.Serial, req.ClaimCode, len(claim.Serials), claim.MaxUses)
+			log.Printf("enroll REJECTED serial=%s (grant %s used %d/%d)",
+				req.Serial, claim.ID, len(claim.Serials), claim.MaxUses)
 			http.Error(w, "claim code has no activations left", 403)
 			return
 		}
@@ -707,10 +812,11 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		}
 		s.state.Nodes[key(tenant, id)] = rec
 		// Serials is both the audit trail and the seat ledger; only a device
-		// this code actually activated belongs in it.
+		// this grant actually activated belongs in it.
 		claim.Serials = append(claim.Serials, req.Serial)
-		log.Printf("enroll: serial=%s -> tenant=%s node=%d (claim %d/%d)",
-			req.Serial, tenant, id, len(claim.Serials), claim.MaxUses)
+		claim.CodeUsedAt = time.Now().Unix()
+		log.Printf("enroll: serial=%s -> tenant=%s node=%d (grant %s %d/%d)",
+			req.Serial, tenant, id, claim.ID, len(claim.Serials), claim.MaxUses)
 	} else {
 		log.Printf("enroll: serial=%s re-enrolled as tenant=%s node=%d", req.Serial, tenant, rec.NodeID)
 	}
@@ -728,6 +834,38 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	s.admin.publish("node.enrolled", tenant, rec)
 
 	json.NewEncoder(w).Encode(s.enrollResponse(tenant, rec, certPEM, string(caPEM)))
+}
+
+// findClaimByCodeLocked resolves a presented code to its grant. The caller must
+// hold s.mu. Comparison is over the digest: the plaintext code is never stored,
+// so there is nothing to compare it to.
+func (s *server) findClaimByCodeLocked(code string) *Claim {
+	if code == "" {
+		return nil
+	}
+	want := hashClaimCode(code)
+	for _, c := range s.state.Claims {
+		if c != nil && c.CodeHash == want {
+			return c
+		}
+	}
+	return nil
+}
+
+// expireClaimCodesLocked retires grants whose code window has closed. The
+// enroll path already checks the deadline; clearing the hash here is what makes
+// "expired" true of the stored record too, so a stale row cannot be resurrected
+// by a later code path that forgets the deadline. The issue metadata stays for
+// the audit trail and so the console can still say "the last code expired".
+func (s *server) expireClaimCodesLocked(now int64) {
+	for _, c := range s.state.Claims {
+		if c == nil || c.CodeHash == "" || c.CodeExpiresAt == 0 || now <= c.CodeExpiresAt {
+			continue
+		}
+		c.CodeHash = ""
+		log.Printf("ttl: code on grant %s (tenant %s) expired", c.ID, c.TenantID)
+		s.admin.publish("claim.updated", c.TenantID, nil)
+	}
 }
 
 // enrollResponse is IDENTITY ONLY. Enrollment connects a device to a tenant; it
@@ -1599,6 +1737,7 @@ func (s *server) ttlSweeper(ctx context.Context) {
 			}
 			s.expireObservationsLocked()
 			s.expireTelemetryLocked(now)
+			s.expireClaimCodesLocked(now)
 			s.save()
 			s.mu.Unlock()
 		}

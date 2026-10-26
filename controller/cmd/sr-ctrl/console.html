@@ -118,10 +118,10 @@
   .form-row input[name=password]{width:200px}
   .form-row input[name=claim_max_uses]{width:230px}
   .form-row input[name=max_uses]{width:120px}
-  .form-row input[name=note]{width:220px}
   .form-row select{width:180px}
   .row-actions button{display:inline-block}
   .row-actions button + button{margin-left:6px}
+  .row-actions select{margin-right:6px}
   .banner{display:flex;align-items:center;justify-content:space-between;gap:12px;
     border:1px solid #eed888;background:#fff8c5;border-radius:8px;padding:10px 14px;
     font-size:13px;margin-top:16px}
@@ -133,6 +133,11 @@
   .copybox{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
   .copybox code{background:#fff;border:1px solid var(--line);border-radius:6px;
     padding:5px 10px;font-size:13.5px}
+  .bigcode{display:inline-block;background:#fff;border:1px solid #aceebb;border-radius:8px;
+    padding:10px 14px;font-size:17px;letter-spacing:1.6px;user-select:all;word-break:break-all}
+  .ttl-now{font-variant-numeric:tabular-nums;font-weight:600;color:var(--warn)}
+  .ttl-now.dead{color:var(--bad)}
+  select.ttl{width:auto;padding:4px 6px;font-size:12.5px}
   .steps{margin:10px 0 0;padding-left:20px;color:var(--muted);font-size:13px}
   .steps li{margin:3px 0}
   pre.cmd{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;
@@ -194,7 +199,7 @@
       <div class="sect" data-roles="operator">运营</div>
       <a href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
       <a href="#accounts" data-view="accounts" data-roles="operator">账号 <span class="n" id="n-accounts">0</span></a>
-      <a href="#enroll" data-view="enroll">入网码 <span class="n" id="n-claims">0</span></a>
+      <a href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
       <div class="sect" data-roles="tenant">我的网络</div>
       <a href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
       <a href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
@@ -230,7 +235,8 @@
   "use strict";
 
   var S = { state: null, me: null, accounts: null, loginTab: "account",
-    view: "overview", lastResult: null, lastSecret: null, html: "", timer: null, ago: null, es: null,
+    view: "overview", lastResult: null, lastSecret: null, codeReveal: null,
+    html: "", timer: null, ago: null, es: null,
     metrics: null, fast: null };
 
   // Only a placeholder for the input; the server owns the real default.
@@ -264,6 +270,23 @@
     return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
       p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
   }
+  function hms(unix) {
+    if (!unix) return "—";
+    var d = new Date(unix * 1000);
+    function p(n) { return n < 10 ? "0" + n : "" + n; }
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  // The code is read off a screen and typed on a device console; grouping it in
+  // fours is for the person doing that. The copy button still takes the raw
+  // string, because that is what the device expects.
+  function groupCode(code) {
+    if (!code) return "";
+    return code.slice(0, 4) + " " + code.slice(4).replace(/(.{4})/g, "$1 ").trim();
+  }
+  function mmss(sec) {
+    var m = Math.floor(sec / 60), s = sec % 60;
+    return m + ":" + (s < 10 ? "0" + s : s);
+  }
   function api(method, path, body) {
     var opt = { method: method, credentials: "same-origin", headers: {} };
     if (body !== undefined) {
@@ -288,6 +311,9 @@
     S.state = null;
     S.accounts = null;
     S.metrics = null;
+    S.lastSecret = null;
+    S.lastResult = null;
+    S.codeReveal = null;
     S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
     clearInterval(S.timer);
@@ -455,7 +481,7 @@
           if (n === "node.enrolled") toast("设备已入网，正在等待第一个心跳");
           if (n === "node.online") toast("设备上线");
           if (n === "node.stale") toast("设备失联：心跳超时");
-          if (n === "claim.created" || n === "tenant.created") toast(n === "tenant.created" ? "租户已创建" : "已签发新的入网码");
+          if (n === "claim.created" || n === "tenant.created") toast(n === "tenant.created" ? "租户已创建" : "已下发新的入网授权");
         });
       });
       S.es.onerror = function () {
@@ -468,7 +494,7 @@
     clearInterval(S.timer);
     S.timer = setInterval(load, 10000);
     clearInterval(S.ago);
-    S.ago = setInterval(refreshAgo, 1000);
+    S.ago = setInterval(refreshClocks, 1000);
   }
 
   /* ---------------- render ---------------- */
@@ -484,9 +510,9 @@
     tenants: { title: "租户", sub: "租户是设备归属的唯一依据，只有控制台能创建", roles: ["operator"] },
     accounts: { title: "账号", sub: "登录控制台的账号；角色决定能看到什么、能改什么", roles: ["operator"] },
     enroll: {
-      title: "入网码",
-      sub: "入网码只决定设备属于哪个租户，不携带任何配置",
-      tenantSub: "入网码由运营方签发；你只能查看和复制自己的码，不能签发或吊销"
+      title: "入网授权",
+      sub: "运营方下发授权（名称 + 可激活台数）；入网码由客户在激活设备时生成，运营方看不到明文",
+      tenantSub: "运营方下发的授权在这里；激活设备时点「生成」，入网码只显示一次并很快失效"
     },
     nodes: {
       title: "设备",
@@ -517,7 +543,7 @@
     var online = st.nodes.filter(function (n) { return n.status === "online"; }).length;
     $("n-tenants").textContent = st.tenants.length;
     $("n-accounts").textContent = S.accounts ? S.accounts.length : 0;
-    $("n-claims").textContent = st.claims.filter(function (c) { return !c.revoked; }).length;
+    $("n-claims").textContent = liveGrants(st).length;
     $("n-devices").textContent = online + "/" + st.nodes.length;
     $("ctrl-line").textContent = (st.controller.tls_addrs || []).join(" · ");
 
@@ -541,7 +567,7 @@
     // 结构没变就只刷新相对时间，不重建 DOM：重建会让正在点的按钮在半路
     // 被替换掉（点击丢失），也会闪。心跳只改变「x 秒前」的文字，结构不变。
     if (c === S.html) {
-      refreshAgo();
+      refreshClocks();
       return;
     }
 
@@ -559,7 +585,7 @@
       var k = el.tagName + ":" + (el.name || el.id || "");
       if (!el.value && keep[k]) el.value = keep[k];
     });
-    refreshAgo();
+    refreshClocks();
 
     document.querySelectorAll("#nav a[data-view]").forEach(function (a) {
       a.classList.toggle("active", a.getAttribute("data-view") === S.view);
@@ -567,11 +593,17 @@
     bind();
   }
 
-  // Relative times live in spans so a poll can age them without touching the
-  // table structure (and without detaching the button under the pointer).
-  function refreshAgo() {
+  // Relative times and code windows live in spans/attributes so a poll can age
+  // them without touching the table structure (and without detaching the button
+  // under the pointer).
+  function refreshClocks() {
     document.querySelectorAll("#content [data-ago]").forEach(function (el) {
       el.textContent = ago(+el.getAttribute("data-ago"));
+    });
+    document.querySelectorAll("#content [data-expires]").forEach(function (el) {
+      var left = (+el.getAttribute("data-expires")) - Math.floor(Date.now() / 1000);
+      el.textContent = left > 0 ? "剩余 " + mmss(left) : "已过期";
+      el.classList.toggle("dead", left <= 0);
     });
   }
 
@@ -580,30 +612,31 @@
       '<button class="small" data-act="goto" data-view="account">去修改</button></div>';
   }
 
+  function liveGrants(st) {
+    return st.claims.filter(function (c) { return !c.revoked; });
+  }
+
   function cards(st, online, isOp) {
-    var live = st.claims.filter(function (c) { return !c.revoked && !expired(c); }).length;
+    var grants = liveGrants(st).length;
     if (isOp) {
       return '<div class="cards">' +
         card("租户", st.tenants.length, "个") +
         card("已入网设备", st.nodes.length, "台") +
         card("在线", online, "台") +
-        card("可用入网码", live, "个") +
+        card("入网授权", grants, "个") +
         "</div>";
     }
     var unconfigured = st.nodes.filter(function (n) { return n.runtime && !n.runtime.configured; }).length;
     return '<div class="cards">' +
       card("我的设备", st.nodes.length, "台") +
       card("在线", online, "台") +
-      card("可用入网码", live, "个") +
+      card("入网授权", grants, "个") +
       card("待配置", unconfigured, "台") +
       "</div>";
   }
   function card(k, v, u) {
     return '<div class="card"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) +
       ' <small>' + esc(u) + "</small></div></div>";
-  }
-  function expired(c) {
-    return c.expires_at_unix > 0 && c.expires_at_unix * 1000 < Date.now();
   }
 
   function deviceTable(nodes, emptyMsg, isOp) {
@@ -652,8 +685,8 @@
     h += '<section class="panel"><header><h2>' + (isOp ? "设备库存" : "我的设备") + "</h2>" +
       '<button class="small" data-act="refresh">刷新</button></header>' +
       deviceTable(st.nodes, isOp
-        ? "还没有设备。到「租户」新建一个租户拿到入网码，再让设备用它入网。"
-        : "还没有设备。用运营方给你的入网码，在「入网码」页按命令启动一台设备。", isOp) +
+        ? "还没有设备。先到「租户」页新建租户（同时下发第一个入网授权），客户生成一次性码后设备即可入网。"
+        : "还没有设备。到「入网授权」页为一条授权生成一次性码，再按命令启动设备。", isOp) +
       "</section>";
     h += isOp ? operatorSteps() : tenantSteps();
     return h;
@@ -663,8 +696,9 @@
     return '<section class="panel"><header><h2>运营方做什么</h2></header>' +
       '<div class="placeholder"><b>入网 = 设备与租户建立归属关系</b>，只签设备证书、登记一行记录，零配置。' +
       "<ul>" +
-      "<li>新建租户 → 同时得到入网码，和（可选的）客户登录账号</li>" +
-      "<li>客户自己用码入网设备；设备出现在「设备」页，只显示归属与库存信息</li>" +
+      "<li>新建租户 → 同时下发第一个入网授权（名称 + 可激活台数），并可选建客户登录账号</li>" +
+      "<li>客户在真正激活设备时自己生成一次性入网码；运营方看不到码的明文</li>" +
+      "<li>设备出现在「设备」页，只显示归属与库存信息</li>" +
       "<li>隧道 / 端口 / overlay / 密钥属于租户的网络配置，运营方看不到</li>" +
       "</ul></div></section>";
   }
@@ -673,7 +707,8 @@
     return '<section class="panel"><header><h2>接下来</h2></header>' +
       '<div class="placeholder"><b>设备入网只建立归属，不带任何配置。</b>' +
       "<ul>" +
-      "<li>用运营方给你的入网码，在「入网码」页按命令启动一台设备</li>" +
+      "<li>在「入网授权」页选一条授权，点「生成」拿到一次性入网码（默认 5 分钟有效）</li>" +
+      "<li>立刻复制或手抄到设备上；码只显示这一次，重新生成后旧码立即失效</li>" +
       "<li>设备出现在「设备」页即表示归属成功；心跳变绿才代表在线</li>" +
       "<li>心跳年龄、在线时长与隧道内遥测在「监控」页；没有上报时那里会明说，不显示 0 或假数据</li>" +
       "<li>设备配置（隧道 / 端口 / overlay 地址 / 密钥环）尚未实现，所以设备暂时显示「未配置」</li>" +
@@ -682,14 +717,14 @@
 
   function viewTenants(st) {
     var h = '<section class="panel"><header><h2>新建租户</h2></header>' +
-      '<div class="hint">新建租户会同时签发第一个入网码；填写「客户登录名」会一并建好客户账号。' +
-      "入网码按台计数：一台设备占一个名额，留空为默认 " + CLAIM_DEFAULT_USES + " 台。</div>" +
+      '<div class="hint">新建租户会同时下发第一个入网授权（只定名额，不含码）；填写「客户登录名」会一并建好客户账号。' +
+      "客户在「入网授权」页自己生成一次性码。名额按设备计：一台设备占一个名额，留空为默认 " + CLAIM_DEFAULT_USES + " 台。</div>" +
       '<form class="form-row" id="tenant-form">' +
       '<input name="tenant_id" placeholder="tenant_id，如 acme" required>' +
       '<input name="name" placeholder="显示名称（可选）">' +
       '<input name="account" placeholder="客户登录名（可选）" spellcheck="false">' +
       '<input name="password" type="password" placeholder="初始密码（留空自动生成）" autocomplete="new-password">' +
-      '<input name="claim_max_uses" type="number" min="1" max="10000" placeholder="入网码可用台数（留空默认 ' + CLAIM_DEFAULT_USES + '）">' +
+      '<input name="claim_max_uses" type="number" min="1" max="10000" placeholder="授权可激活台数（留空默认 ' + CLAIM_DEFAULT_USES + '）">' +
       '<button class="primary" type="submit">创建租户</button>' +
       "</form>" + resultBox() + "</section>";
 
@@ -698,7 +733,7 @@
       h += '<div class="empty">还没有租户。</div>';
     } else {
       h += "<table><thead><tr><th>租户</th><th>ID</th><th>账号</th><th>设备</th>" +
-        "<th>入网码</th><th>创建时间</th><th></th></tr></thead><tbody>";
+        "<th>入网授权</th><th>创建时间</th><th></th></tr></thead><tbody>";
       st.tenants.forEach(function (t) {
         var devs = st.nodes.filter(function (n) { return n.tenant_id === t.tenant_id; }).length;
         var cls = st.claims.filter(function (c) { return c.tenant_id === t.tenant_id && !c.revoked; }).length;
@@ -710,9 +745,9 @@
             ? '<span class="mono">' + accts.map(function (a) { return esc(a.username); }).join(", ") + "</span>"
             : '<span class="tag pending">无账号</span>') + "</td>" +
           "<td>" + devs + "</td>" +
-          "<td>" + cls + " 个可用</td>" +
+          "<td>" + cls + " 个</td>" +
           '<td class="muted">' + esc(clock(t.created_at_unix)) + "</td>" +
-          '<td><button class="small" data-act="claim" data-tenant="' + esc(t.tenant_id) + '">签发入网码</button></td>' +
+          '<td><button class="small" data-act="claim" data-tenant="' + esc(t.tenant_id) + '">下发授权</button></td>' +
           "</tr>";
       });
       h += "</tbody></table>";
@@ -720,58 +755,115 @@
     return h + "</section>";
   }
 
+  function grantCodeState(c) {
+    if (c.revoked) return '<span class="tag revoked">已吊销</span>';
+    if (c.code_active) return '<span class="tag online">码有效</span>';
+    if (c.code_expires_at_unix) return '<span class="tag stale">码已过期</span>';
+    return '<span class="tag pending">未生成码</span>';
+  }
+
+  // The operator can see THAT a customer is holding a live code and for how
+  // long; the code itself is never part of this view for anyone but the tenant
+  // that generated it (and only in the one-time box above).
+  function grantCodeWindow(c, isOp) {
+    if (c.revoked) return "授权已吊销，不能再生成码";
+    if (c.code_active) {
+      // Demo seeds and codes migrated from the old model have no deadline; they
+      // stay usable until someone regenerates them, which makes them short-lived.
+      if (!c.code_expires_at_unix) return "长期码（未设到期时间）；重新生成后改为短时码";
+      return (c.code_issued_by && !isOp ? "由 " + esc(c.code_issued_by) + " 生成 · " : "") +
+        "有效至 " + esc(hms(c.code_expires_at_unix)) + ' · <span class="ttl-now" data-expires="' +
+        esc(c.code_expires_at_unix) + '"></span>';
+    }
+    if (c.code_expires_at_unix) return "上次码已于 " + esc(clock(c.code_expires_at_unix)) + " 失效";
+    return "还没有生成过码";
+  }
+
+  function codeRevealBox(r) {
+    return '<div class="result show" id="code-reveal">' +
+      '<div class="ttl">「' + esc(r.name || "入网授权") + '」的入网码已生成</div>' +
+      "<div>只显示这一次。复制到设备上，或立刻手抄下来；离开后无法再查看，只能重新生成。</div>" +
+      '<div class="copybox"><code class="bigcode">' + esc(groupCode(r.code)) + "</code>" +
+      '<button class="small" data-act="copy" data-text="' + esc(r.code) + '">复制</button></div>' +
+      '<div class="muted" style="font-size:12.5px">有效至 ' + esc(clock(r.expires_at_unix)) +
+      '（<span class="ttl-now" data-expires="' + esc(r.expires_at_unix) + '"></span>）。' +
+      "重新生成会让这个码立刻失效。</div>" +
+      '<pre class="cmd">test/lab/vcpe.sh up --claim ' + esc(r.code) + "</pre>" +
+      '<div style="margin-top:10px"><button class="small" data-act="code-dismiss">我已保存，关闭</button></div>' +
+      "</div>";
+  }
+
   function viewEnroll(st, isOp) {
     var h = "";
     if (isOp) {
-      h += '<section class="panel"><header><h2>签发入网码</h2></header>' +
-        '<div class="hint">码是随机串（<code>srk_</code> 开头），不含租户名，无法从租户 ID 推断。名额按设备计：只有该码激活一台新设备时才消耗，同一台设备重复入网不再占名额。</div>' +
-        '<form class="form-row" id="claim-form">' +
-        '<select name="tenant_id" required>' +
-        st.tenants.map(function (t) {
-          return '<option value="' + esc(t.tenant_id) + '">' + esc(t.name || t.tenant_id) + " · " + esc(t.tenant_id) + "</option>";
-        }).join("") +
-        "</select>" +
-        '<input name="max_uses" type="number" min="1" max="10000" placeholder="可用台数（默认 ' + CLAIM_DEFAULT_USES + '）">' +
-        '<input name="note" placeholder="备注（可选）">' +
-        '<button class="primary" type="submit">生成入网码</button>' +
-        "</form></section>";
+      h += '<section class="panel"><header><h2>下发入网授权</h2></header>' +
+        '<div class="hint">授权只定义「哪家租户、可以激活几台设备」，不包含入网码。' +
+        "客户在真正激活设备时自己生成一次性码（默认 5 分钟有效）；运营方看不到码的明文，控制器只保存哈希。</div>";
       if (!st.tenants.length) {
-        h = '<section class="panel"><div class="empty">还没有租户：先到「租户」页建一个，再签发入网码。</div></section>';
+        h += '<div class="empty">还没有租户：先到「租户」页建一个，再下发授权。</div>';
+      } else {
+        h += '<form class="form-row" id="claim-form">' +
+          '<select name="tenant_id" required>' +
+          st.tenants.map(function (t) {
+            return '<option value="' + esc(t.tenant_id) + '">' + esc(t.name || t.tenant_id) + " · " + esc(t.tenant_id) + "</option>";
+          }).join("") +
+          "</select>" +
+          '<input name="name" placeholder="授权名称，如 上海办公室" maxlength="60">' +
+          '<input name="max_uses" type="number" min="1" max="10000" placeholder="可激活台数（默认 ' + CLAIM_DEFAULT_USES + '）">' +
+          '<button class="primary" type="submit">下发授权</button>' +
+          "</form>";
       }
+      h += "</section>";
     }
-    h += '<section class="panel"><header><h2>入网码</h2>' +
+
+    if (S.codeReveal) h += codeRevealBox(S.codeReveal);
+
+    h += '<section class="panel"><header><h2>' + (isOp ? "已下发的授权" : "我的入网授权") + "</h2>" +
       (isOp ? '<button class="small" data-act="goto" data-view="tenants">新建租户</button>' : "") +
       "</header>" +
       '<div class="hint">' + (isOp
-        ? "把码交给设备即可。名额用满后码自动失效；吊销只阻止未来的入网，已入网设备的证书不受影响。"
-        : "入网码由运营方签发。名额用满后码自动失效；用过的序列号会记在下面。") + "</div>";
+        ? "「当前码」只显示客户是否生成过、还有多久失效；码本身不在这里，也不会出现在接口或日志里。名额按设备计：每激活一台新设备占一个名额，同一台设备重复入网不再占名额。吊销只阻止未来的入网，已入网设备的证书不受影响。"
+        : "要激活设备时点「生成」并选有效期；码只显示这一次，重新生成或过期后旧码立即失效。名额按设备计：每激活一台新设备占一个名额，同一台设备重复入网不再占名额。") + "</div>";
     if (!st.claims.length) {
-      h += '<div class="empty">还没有入网码。' +
-        (isOp ? "" : "请联系运营方为你的租户签发一个。") + "</div>";
+      h += '<div class="empty">' + (isOp ? "还没有下发授权。" : "运营方还没有为你的租户下发入网授权。") + "</div>";
     } else {
-      h += "<table><thead><tr><th>入网码</th><th>租户</th><th>名额（已激活 / 上限）</th><th>已入网序列号</th><th>状态</th><th></th></tr></thead><tbody>";
+      var cols = isOp
+        ? ["授权名称", "租户", "名额（已激活 / 上限）", "当前码", "已入网序列号", ""]
+        : ["授权名称", "名额（已激活 / 上限）", "当前码", "已入网序列号", ""];
+      h += "<table><thead><tr>" + cols.map(function (x) { return "<th>" + esc(x) + "</th>"; }).join("") +
+        "</tr></thead><tbody>";
       st.claims.forEach(function (c) {
-        var dead = c.revoked || expired(c);
-        var full = !dead && c.uses >= c.max_uses;
-        var status = c.revoked ? '<span class="tag revoked">已吊销</span>'
-          : expired(c) ? '<span class="tag stale">已过期</span>'
-            : full ? '<span class="tag plan">已用满</span>'
-              : '<span class="tag online">可用</span>';
-        var seats = '<span class="seats' + (c.uses >= c.max_uses ? " full" : "") + '"><b>' +
+        var full = c.uses >= c.max_uses;
+        var seats = '<span class="seats' + (full ? " full" : "") + '"><b>' +
           c.uses + "</b> / " + c.max_uses + "</span>";
         h += "<tr>" +
-          '<td class="mono" style="font-size:12px">' + esc(c.code) + "</td>" +
-          "<td>" + esc(tenantName(c.tenant_id)) + "</td>" +
-          "<td>" + seats + "</td>" +
+          "<td><b>" + esc(c.name || "入网授权") + "</b>" +
+          (c.revoked ? ' <span class="tag revoked">已吊销</span>'
+            : full ? ' <span class="tag plan">已用满</span>' : "") + "</td>";
+        if (isOp) h += "<td>" + esc(tenantName(c.tenant_id)) + "</td>";
+        h += "<td>" + seats + "</td>" +
+          "<td>" + grantCodeState(c) +
+          '<div class="muted" style="font-size:12px;margin-top:2px">' + grantCodeWindow(c, isOp) + "</div></td>" +
           '<td class="mono muted">' + (c.serials.length ? esc(c.serials.join(", ")) : "—") + "</td>" +
-          "<td>" + status + "</td>" +
-          '<td class="row-actions"><button class="small" data-act="copy" data-text="' + esc(c.code) + '">复制</button>' +
-          (isOp
-            ? ' <button class="small" data-act="edit-max" data-code="' + esc(c.code) + '" data-used="' + c.uses +
-              '" data-max="' + c.max_uses + '">改名额</button>'
-            : "") +
-          (isOp && !dead ? ' <button class="small danger" data-act="revoke" data-code="' + esc(c.code) + '">吊销</button>' : "") +
-          "</td></tr>";
+          '<td class="row-actions">';
+        if (isOp) {
+          h += '<button class="small" data-act="edit-max" data-id="' + esc(c.id) +
+            '" data-used="' + c.uses + '" data-max="' + c.max_uses +
+            '" data-name="' + esc(c.name || "入网授权") + '">改名额</button>' +
+            (c.revoked ? "" : '<button class="small danger" data-act="revoke" data-id="' +
+              esc(c.id) + '" data-name="' + esc(c.name || "入网授权") + '">吊销</button>');
+        } else if (c.revoked) {
+          h += '<span class="muted">—</span>';
+        } else {
+          h += '<select class="ttl" data-role="ttl" name="ttl_' + esc(c.id) + '">' +
+            '<option value="300">5 分钟</option>' +
+            '<option value="3600">1 小时</option>' +
+            '<option value="86400">24 小时</option>' +
+            "</select>" +
+            '<button class="small primary" data-act="claim-code" data-id="' + esc(c.id) + '">' +
+            (c.code_active ? "重新生成" : "生成") + "</button>";
+        }
+        h += "</td></tr>";
       });
       h += "</tbody></table>";
     }
@@ -780,10 +872,11 @@
     h += '<section class="panel"><header><h2>让一台 vCPE 入网</h2></header>' +
       '<div class="hint">vCPE 是一个容器里跑的最小 agent：只做入网 + 心跳，不碰数据面。</div>' +
       '<div class="steps"><ol>' +
-      (isOp ? "<li>在「租户」页拿到（或签发）入网码</li>" : "<li>向运营方索取你这个租户的入网码</li>") +
-      "<li>在宿主机仓库根目录执行下面的命令（把 CODE 换成你的入网码）</li>" +
-      "<li>大约 5 秒后设备出现在「设备」页，状态从「已入网 · 未上线」变成「在线」</li>" +
-      "<li>用 <code>docker logs -f sr-lab-vcpe</code> 可以看 agent 自己的日志</li>" +
+      "<li>运营方下发一条入网授权（名称 + 可激活台数）</li>" +
+      "<li>客户登录后，在「入网授权」页点「生成」，选有效期（默认 5 分钟）</li>" +
+      "<li>把码复制到手，在宿主机仓库根目录执行下面的命令（把 CODE 换成你的入网码）</li>" +
+      "<li>大约 5 秒后设备出现在「设备」页；码过期不影响已经入网的设备</li>" +
+      "<li>每台新设备占一个名额，重复入网同一台设备不再占名额</li>" +
       "</ol></div>" +
       "<pre class=\"cmd\">test/lab/vcpe.sh up --claim CODE\n\ntest/lab/vcpe.sh logs      # 跟进 agent 日志\ntest/lab/vcpe.sh status    # 看本地身份（tenant / node_id）\ntest/lab/vcpe.sh down</pre>" +
       "</section>";
@@ -793,7 +886,7 @@
   function viewNodes(st, isOp) {
     return '<section class="panel"><header><h2>' + (isOp ? "已入网设备（库存）" : "已入网设备") + "</h2>" +
       '<button class="small" data-act="refresh">刷新</button></header>' +
-      deviceTable(st.nodes, isOp ? "还没有设备入网。" : "还没有设备入网，先用入网码接入一台。", isOp) +
+      deviceTable(st.nodes, isOp ? "还没有设备入网。" : "还没有设备入网，先在「入网授权」页生成一次性码接入一台。", isOp) +
       '<div class="hint" style="margin-top:12px">' + (isOp
         ? "运营方只保留归属信息（租户、序列号、入网时间、在线状态）。心跳明细与设备配置属于租户，接口对运营方不下发这些字段。"
         : "「未配置」是真实状态：enroll 不推任何参数，节点计划（每个隧道的端口、overlay /32、密钥环、RR 列表）还没有实现。心跳年龄、在线时长与隧道内遥测在「监控」页。") +
@@ -897,7 +990,7 @@
       '<div class="hint">控制器按心跳判断存活：设备每 ' + hb + " 秒上报一次，连续 " + lapse +
       " 秒没有心跳即判失联；「已运行」是 agent 上次报告的进程运行时长，失联设备显示的是它最后一次报告的值。</div>";
     if (!nodes.length) {
-      h += '<div class="empty">还没有设备。先用入网码接入一台。</div>';
+      h += '<div class="empty">还没有设备。先在「入网授权」页生成一次性码接入一台。</div>';
     } else {
       h += "<table><thead><tr><th>设备</th><th>序列号</th><th>状态</th><th>最后心跳</th>" +
         "<th>已运行</th><th>Agent 版本</th><th>外层映射</th><th>VPN 端口</th></tr></thead><tbody>";
@@ -1018,12 +1111,13 @@
   function resultBox() {
     var r = S.lastResult;
     if (!r) return "";
+    var g = r.claim || {};
     var h = '<div class="result show" id="result">' +
       '<div class="ttl">租户 ' + esc(r.tenant.tenant_id) + " 已创建</div>" +
-      '<div>入网码（交给设备）：</div>' +
-      '<div class="copybox"><code>' + esc(r.claim.code) + "</code>" +
-      '<button class="small" data-act="copy" data-text="' + esc(r.claim.code) + '">复制</button></div>' +
-      '<div class="muted" style="font-size:12.5px">可激活 <b>' + r.claim.max_uses + "</b> 台设备（一台一个名额，可随时在「入网码」页调整）。</div>";
+      "<div>已下发入网授权 <b>" + esc(g.name || "初始授权") + "</b>，可激活 <b>" +
+      esc(g.max_uses) + "</b> 台设备。</div>" +
+      '<div class="muted" style="font-size:12.5px">授权里没有码：客户登录后在「入网授权」页点「生成」，' +
+      "拿到一次性码（默认 5 分钟有效）。</div>";
     if (r.account) {
       h += '<div style="margin-top:10px">客户账号 <code>' + esc(r.account.username) + "</code>" +
         (r.password ? " · 一次性初始密码（只显示这一次）：" : " · 密码是你填写的值") + "</div>";
@@ -1032,11 +1126,20 @@
           '<button class="small" data-act="copy" data-text="' + esc(r.password) + '">复制</button></div>';
       }
     }
-    h += '<pre class="cmd">test/lab/vcpe.sh up --claim ' + esc(r.claim.code) + "</pre></div>";
-    return h;
+    return h + "</div>";
   }
 
   /* ---------------- actions ---------------- */
+
+  // The 10s poll skips re-render while a form field has focus, so it cannot
+  // wipe half-typed input. After a submit the response may carry a one-time
+  // secret, so drop that focus: otherwise the result box stays hidden until
+  // the operator happens to click elsewhere.
+  function releaseForm(form) {
+    form.reset();
+    var a = document.activeElement;
+    if (a && a.blur && form.contains(a)) a.blur();
+  }
 
   // An empty number field means "let the server pick", which is 0 on the wire;
   // anything non-numeric is a client mistake and should not silently become 0.
@@ -1053,7 +1156,7 @@
       e.preventDefault();
       var f = new FormData(tf);
       var maxUses = intField(f, "claim_max_uses");
-      if (isNaN(maxUses)) { toast("入网码可用台数必须是数字"); return; }
+      if (isNaN(maxUses)) { toast("授权可激活台数必须是数字"); return; }
       api("POST", "/api/tenants", {
         tenant_id: (f.get("tenant_id") || "").trim(),
         name: (f.get("name") || "").trim(),
@@ -1065,7 +1168,7 @@
         var msg = "租户 " + res.tenant.tenant_id + " 已创建";
         if (res.account) msg += "，账号 " + res.account.username;
         toast(msg);
-        tf.reset();
+        releaseForm(tf);
         load().then(function () { S.view = "tenants"; render(); });
       }).catch(function (err) { toast(err.message); });
     });
@@ -1085,7 +1188,7 @@
           ? { title: "账号 " + res.account.username + " 已创建", username: res.account.username, password: res.password }
           : null;
         toast("账号 " + res.account.username + " 已创建");
-        af.reset();
+        releaseForm(af);
         if (S.view === "accounts") load();
       }).catch(function (err) { toast(err.message); });
     });
@@ -1095,13 +1198,14 @@
       e.preventDefault();
       var f = new FormData(cf);
       var maxUses = intField(f, "max_uses");
-      if (isNaN(maxUses)) { toast("可用台数必须是数字"); return; }
+      if (isNaN(maxUses)) { toast("可激活台数必须是数字"); return; }
       api("POST", "/api/claims", {
         tenant_id: f.get("tenant_id") || "",
-        note: (f.get("note") || "").trim(),
+        name: (f.get("name") || "").trim(),
         max_uses: maxUses
       }).then(function (c) {
-        toast("已生成入网码（可激活 " + c.max_uses + " 台）");
+        toast("已下发授权「" + c.name + "」（可激活 " + c.max_uses + " 台）");
+        releaseForm(cf);
         load();
       }).catch(function (err) { toast(err.message); });
     });
@@ -1117,7 +1221,7 @@
         new_password: np
       }).then(function () {
         toast("密码已修改，其他会话已登出");
-        pf.reset();
+        releaseForm(pf);
         return api("GET", "/api/session").then(function (s) { S.me = s; });
       }).then(function () { renderChrome(); render(); })
         .catch(function (err) { toast(err.message); });
@@ -1130,27 +1234,51 @@
           load().then(function () { toast("已刷新"); });
           if (S.view === "monitor") loadMetrics();
         }
-        else if (act === "goto") { S.view = el.getAttribute("data-view"); render(); }
+        else if (act === "goto") {
+          if (S.view === "enroll") S.codeReveal = null;
+          S.view = el.getAttribute("data-view");
+          render();
+        }
         else if (act === "copy") copyText(el.getAttribute("data-text"));
         else if (act === "claim") {
           api("POST", "/api/claims", { tenant_id: el.getAttribute("data-tenant") })
             .then(function (c) {
-              toast("已签发入网码（可激活 " + c.max_uses + " 台），可在「入网码」页调整");
+              toast("已下发授权「" + c.name + "」（可激活 " + c.max_uses + " 台）");
               load();
             }).catch(function (err) { toast(err.message); });
+        } else if (act === "claim-code") {
+          var cid = el.getAttribute("data-id");
+          var sel = el.parentNode.querySelector("select[data-role=ttl]");
+          var ttl = sel ? Number(sel.value) : 300;
+          el.disabled = true;
+          api("POST", "/api/claims/code", { id: cid, ttl_sec: ttl })
+            .then(function (res) {
+              S.codeReveal = res;
+              toast("入网码已生成，有效期至 " + clock(res.expires_at_unix));
+              load();
+            }).catch(function (err) {
+              el.disabled = false;
+              toast(err.message);
+            });
+        } else if (act === "code-dismiss") {
+          S.codeReveal = null;
+          render();
         } else if (act === "edit-max") {
-          var code = el.getAttribute("data-code");
+          var gid = el.getAttribute("data-id");
+          var gname = el.getAttribute("data-name") || "入网授权";
           var used = Number(el.getAttribute("data-used")) || 0;
-          var v = prompt("可用台数（已激活 " + used + " 台，不能低于它）：", el.getAttribute("data-max"));
+          var v = prompt("「" + gname + "」的可激活台数（已激活 " + used + " 台，不能低于它）：", el.getAttribute("data-max"));
           if (v === null) return;
           var n = Number(String(v).trim());
           if (!v.trim() || !Number.isFinite(n) || n < 1) { toast("台数必须是 1 以上的整数"); return; }
-          api("POST", "/api/claims/update", { code: code, max_uses: Math.trunc(n) })
+          api("POST", "/api/claims/update", { id: gid, max_uses: Math.trunc(n) })
             .then(function (c) { toast("名额已改为 " + c.max_uses + " 台"); load(); })
             .catch(function (err) { toast(err.message); });
         } else if (act === "revoke") {
-          if (!confirm("吊销入网码 " + el.getAttribute("data-code") + "？已入网设备不受影响。")) return;
-          api("POST", "/api/claims/revoke", { code: el.getAttribute("data-code") })
+          var rid = el.getAttribute("data-id");
+          var rname = el.getAttribute("data-name") || "入网授权";
+          if (!confirm("吊销授权「" + rname + "」？客户将无法再为它生成入网码；已入网设备不受影响。")) return;
+          api("POST", "/api/claims/revoke", { id: rid })
             .then(function () { toast("已吊销"); load(); })
             .catch(function (err) { toast(err.message); });
         } else if (act === "reset") {
@@ -1181,6 +1309,8 @@
         e.preventDefault();
         var v = a.getAttribute("data-view");
         if (!allowed(v)) return;
+        // 一次性码只在该页面上保留；离开就等于放弃这次查看，要回看只能重新生成。
+        if (S.view === "enroll" && v !== "enroll") S.codeReveal = null;
         S.view = v;
         render();
       };

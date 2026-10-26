@@ -2,7 +2,8 @@
 # vcpe.sh - 起一台「vCPE」：一个只做入网 + 心跳的最小 agent，跑在 lab 管理网里
 #
 # 它模拟客户买回来的 CPE 盒子刚上电的样子：身份目录是空的，手里只有一张
-# 入网码（claim code）和控制器的 CA。入网之后设备出现在控制台里，等客户
+# 入网码（运营方下发授权后，客户在控制台点「生成」拿到的一次性码）和控制器的
+# CA。入网之后设备出现在控制台里，等客户
 # 在控制台配置它 —— 这一步没有任何数据面：入网不带端口、不带 overlay 地址、
 # 不带密钥环。真盒子在节点计划下发后才去装 VPP，这里先不假装。
 #
@@ -80,7 +81,7 @@ cmd_up() {
     local fresh=1
     [ -s "$IDDIR/state.json" ] && fresh=0
     if [ "$fresh" = "1" ] && [ -z "$CLAIM" ]; then
-        die "这台 vCPE 还没有身份：up --claim <入网码>（控制台 → 租户 → 复制入网码）"
+        die "这台 vCPE 还没有身份：up --claim <入网码>（控制台 → 入网授权 → 生成）"
     fi
     if [ "$fresh" = "0" ] && [ -n "$CLAIM" ]; then
         note "本地已有身份（tenant/node 见 vcpe.sh status），--claim 会被忽略"

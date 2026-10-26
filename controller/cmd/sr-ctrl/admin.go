@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 //go:embed console.html
@@ -27,10 +28,15 @@ var consoleHTML []byte
 //     asking every operator to install mTLS material.
 //
 //   - Its authority is narrower than the device API's, not wider. A console
-//     user can create tenants, mint claim codes and read device state. It can
-//     never enroll a device, sign a certificate or write key material: the
-//     claim code it hands out is redeemed by the device itself, over the mTLS
-//     listener, with a key the controller never sees.
+//     user can create tenants, issue enrollment grants and read device state. It
+//     can never enroll a device, sign a certificate or write key material: the
+//     claim code is redeemed by the device itself, over the mTLS listener, with a
+//     key the controller never sees.
+//
+// Enrollment is two levels. The OPERATOR issues a grant (name + how many devices
+// it may activate) and never sees a code. The TENANT generates a short-lived
+// code from that grant at the moment it activates a device; the controller keeps
+// only the code's hash, and the plaintext appears in exactly one response.
 //
 // Authentication is a console account (username + password) or the operator
 // token from the command line. Both produce a session that carries an IDENTITY,
@@ -132,7 +138,39 @@ func randToken() string {
 const (
 	claimDefaultMaxUses = 10
 	claimMaxUsesLimit   = 10000
+
+	// claimCodeTTLDefault is how long a generated code stays valid. Five
+	// minutes is long enough to type it into one device and short enough that a
+	// screenshot left on a desk is worthless. The tenant may stretch it to a day.
+	claimCodeTTLDefault = 300
+	claimCodeTTLMax     = 86400
 )
+
+// normalizeClaimCodeTTL turns the tenant's requested window into seconds. 0 is
+// the wire default; a window outside 1s..24h is a client mistake, not a wish.
+func normalizeClaimCodeTTL(n int) (int, error) {
+	switch {
+	case n == 0:
+		return claimCodeTTLDefault, nil
+	case n < 1 || n > claimCodeTTLMax:
+		return 0, fmt.Errorf("ttl_sec must be 1..%d (0 means the default %d)", claimCodeTTLMax, claimCodeTTLDefault)
+	}
+	return n, nil
+}
+
+// normalizeGrantName keeps a grant's name renderable: it is what the tenant
+// sees instead of a code, so it must be present, short, and not smuggled in as
+// an empty string.
+func normalizeGrantName(name, fallback string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = fallback
+	}
+	if utf8.RuneCountInString(name) > 60 {
+		return "", fmt.Errorf("name must be at most 60 characters")
+	}
+	return name, nil
+}
 
 // newClaimCode is the secret a customer pastes into a device. It deliberately
 // looks like an API key: an opaque, prefix-tagged, 160-bit random string with no
@@ -287,6 +325,7 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/metrics", s.handleAdminMetrics)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
+	mux.HandleFunc("/api/claims/code", s.handleAdminClaimCode)
 	mux.HandleFunc("/api/claims/revoke", s.handleAdminClaimRevoke)
 	mux.HandleFunc("/api/claims/update", s.handleAdminClaimUpdate)
 	mux.HandleFunc("/api/accounts", s.handleAdminAccounts)
@@ -467,17 +506,28 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 // ------------------------------------------------------------------ state view
 
+// consoleClaim is one enrollment grant as the page renders it. It is scoped to
+// the grant, not to a code: the code is a short-lived secret that only its
+// issuing tenant ever sees, so nothing here can be replayed against /v1/enroll.
+// The code_* fields are metadata (when generated, when it dies, who asked); the
+// hash never leaves the process, and the plaintext only exists in the one
+// response to the tenant that generated it.
 type consoleClaim struct {
-	Code          string   `json:"code"`
+	ID            string   `json:"id"`
 	TenantID      string   `json:"tenant_id"`
-	Note          string   `json:"note,omitempty"`
+	Name          string   `json:"name"`
 	CreatedAt     int64    `json:"created_at_unix"`
-	ExpiresAt     int64    `json:"expires_at_unix,omitempty"`
 	Revoked       bool     `json:"revoked"`
 	MaxUses       int      `json:"max_uses"`
 	Uses          int      `json:"uses"`
 	Serials       []string `json:"serials"`
 	RedeemedCount int      `json:"redeemed_count"`
+
+	CodeActive    bool   `json:"code_active"`
+	CodeIssuedAt  int64  `json:"code_issued_at_unix,omitempty"`
+	CodeExpiresAt int64  `json:"code_expires_at_unix,omitempty"`
+	CodeIssuedBy  string `json:"code_issued_by,omitempty"`
+	CodeUsedAt    int64  `json:"code_used_at_unix,omitempty"`
 }
 
 type consoleNode struct {
@@ -526,7 +576,7 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A tenant session is scoped here, before anything is rendered: tenants see
-	// their own tenant row, their own claim codes and their own devices. The
+	// their own tenant row, their own enrollment grants and their own devices. The
 	// page never has to filter, and a page bug cannot widen the view.
 	own := func(tenantID string) bool {
 		return id.Role == roleOperator || tenantID == id.TenantID
@@ -555,13 +605,7 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		if !own(c.TenantID) {
 			continue
 		}
-		out.Claims = append(out.Claims, consoleClaim{
-			Code: c.Code, TenantID: c.TenantID, Note: c.Note,
-			CreatedAt: c.CreatedAt, ExpiresAt: c.ExpiresAt, Revoked: c.Revoked,
-			MaxUses: c.MaxUses, Uses: len(c.Serials),
-			Serials:       append([]string{}, c.Serials...),
-			RedeemedCount: len(c.Serials),
-		})
+		out.Claims = append(out.Claims, *claimView(c))
 	}
 	for _, n := range s.state.Nodes {
 		if !own(n.TenantID) {
@@ -616,8 +660,8 @@ type createTenantRequest struct {
 	// intent in private deployments; the operator can also add accounts later.
 	Account  string `json:"account"`
 	Password string `json:"password"`
-	// ClaimMaxUses is the activation limit of the first enrollment code. Every
-	// code is bounded; 0 means "use the default", not "unlimited".
+	// ClaimMaxUses is the activation limit of the tenant's first enrollment
+	// grant. Every grant is bounded; 0 means "use the default", not "unlimited".
 	ClaimMaxUses int `json:"claim_max_uses"`
 }
 
@@ -631,11 +675,20 @@ type createTenantResponse struct {
 }
 
 func claimView(c *Claim) *consoleClaim {
+	now := time.Now().Unix()
 	return &consoleClaim{
-		Code: c.Code, TenantID: c.TenantID, Note: c.Note,
-		CreatedAt: c.CreatedAt, ExpiresAt: c.ExpiresAt, Revoked: c.Revoked,
+		ID: c.ID, TenantID: c.TenantID, Name: c.Name,
+		CreatedAt: c.CreatedAt, Revoked: c.Revoked,
 		MaxUses: c.MaxUses, Uses: len(c.Serials),
 		Serials: append([]string{}, c.Serials...), RedeemedCount: len(c.Serials),
+
+		// Expiry is evaluated here as well as in the sweeper: the two-second
+		// sweep interval must not show a dead code as live to the tenant.
+		CodeActive:    c.CodeHash != "" && (c.CodeExpiresAt == 0 || now <= c.CodeExpiresAt),
+		CodeIssuedAt:  c.CodeIssuedAt,
+		CodeExpiresAt: c.CodeExpiresAt,
+		CodeIssuedBy:  c.CodeIssuedBy,
+		CodeUsedAt:    c.CodeUsedAt,
 	}
 }
 
@@ -706,15 +759,16 @@ func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	t := &Tenant{ID: id, Name: name, CreatedAt: now}
 	s.state.Tenants[id] = t
-	// The tenant's first enrollment code ships with the tenant. Creating a
-	// tenant and being able to enroll a device are one intent, one step apart;
-	// making the operator discover a second button just to get a string is
-	// friction with a support ticket attached.
-	c := &Claim{Code: newClaimCode(), TenantID: id, Note: "created with tenant", CreatedAt: now, MaxUses: maxUses}
-	for s.state.Claims[c.Code] != nil {
-		c.Code = newClaimCode()
+	// The tenant's first enrollment grant ships with the tenant. Creating a
+	// tenant and being able to activate a device are one intent, one step apart;
+	// making the operator discover a second button just to get a row is friction
+	// with a support ticket attached. The grant carries no code: the tenant
+	// generates one when it actually has a device in hand.
+	c := &Claim{ID: newClaimID(), TenantID: id, Name: "初始授权", CreatedAt: now, MaxUses: maxUses}
+	for s.state.Claims[c.ID] != nil {
+		c.ID = newClaimID()
 	}
-	s.state.Claims[c.Code] = c
+	s.state.Claims[c.ID] = c
 	var accView *consoleAccount
 	if username != "" {
 		a := &Account{
@@ -727,7 +781,7 @@ func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
 	s.save()
 	s.mu.Unlock()
 
-	log.Printf("console: tenant %s created (claim %s, account %q)", id, c.Code, username)
+	log.Printf("console: tenant %s created (grant %s, account %q)", id, c.ID, username)
 	s.admin.publish("tenant.created", id, nil)
 	resp := createTenantResponse{Tenant: t, Claim: claimView(c), Account: accView}
 	if generated {
@@ -772,12 +826,13 @@ func validTenantID(id string) bool {
 // ------------------------------------------------------------------ claims
 
 type createClaimRequest struct {
-	TenantID   string `json:"tenant_id"`
-	Note       string `json:"note"`
-	ExpiresInH int    `json:"expires_in_hours"`
-	MaxUses    int    `json:"max_uses"`
+	TenantID string `json:"tenant_id"`
+	Name     string `json:"name"`
+	MaxUses  int    `json:"max_uses"`
 }
 
+// handleAdminClaims issues a grant. The operator names it and sets how many
+// devices it may activate; the code itself is the tenant's to generate later.
 func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireOperator(w, r); !ok {
 		return
@@ -791,11 +846,12 @@ func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", 400)
 		return
 	}
-	if req.ExpiresInH < 0 {
-		http.Error(w, "expires_in_hours must be >= 0", 400)
+	maxUses, err := normalizeClaimMaxUses(req.MaxUses)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
-	maxUses, err := normalizeClaimMaxUses(req.MaxUses)
+	name, err := normalizeGrantName(req.Name, "入网授权")
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -807,24 +863,105 @@ func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	c := &Claim{Code: newClaimCode(), TenantID: req.TenantID, Note: strings.TrimSpace(req.Note), CreatedAt: now, MaxUses: maxUses}
-	for s.state.Claims[c.Code] != nil {
-		c.Code = newClaimCode()
+	c := &Claim{ID: newClaimID(), TenantID: req.TenantID, Name: name, CreatedAt: now, MaxUses: maxUses}
+	for s.state.Claims[c.ID] != nil {
+		c.ID = newClaimID()
 	}
-	if req.ExpiresInH > 0 {
-		c.ExpiresAt = now + int64(req.ExpiresInH)*3600
-	}
-	s.state.Claims[c.Code] = c
+	s.state.Claims[c.ID] = c
 	s.save()
 	s.mu.Unlock()
 
-	log.Printf("console: claim %s issued for tenant %s", c.Code, c.TenantID)
+	log.Printf("console: grant %s (%q) issued for tenant %s with %d seats", c.ID, c.Name, c.TenantID, c.MaxUses)
 	s.admin.publish("claim.created", c.TenantID, nil)
 	writeJSON(w, claimView(c))
 }
 
+// claimCodeRequest names a grant and asks for a code good for TTLSec seconds.
+type claimCodeRequest struct {
+	ID     string `json:"id"`
+	TTLSec int    `json:"ttl_sec"`
+}
+
+// claimCodeResponse is the ONLY place a usable enrollment code exists outside
+// the device that redeems it. It is returned once, to the tenant that asked.
+// The page must let the user copy it immediately; it cannot be shown again,
+// because the controller kept only its hash.
+type claimCodeResponse struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Code      string `json:"code"`
+	IssuedAt  int64  `json:"issued_at_unix"`
+	ExpiresAt int64  `json:"expires_at_unix"`
+}
+
+// handleAdminClaimCode mints a short-lived code for one of the session tenant's
+// own grants. It is deliberately tenant-only: the operator decides WHETHER a
+// tenant may activate devices (the grant's seats) and the tenant decides WHEN,
+// so an operator never holds a credential it could use to bind a device to
+// somebody else's tenant. An operator gets 403 rather than a hidden 404: it is
+// allowed to know this endpoint exists and is not for it.
+func (s *server) handleAdminClaimCode(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	if id.Role != roleTenant {
+		http.Error(w, "tenant role required", 403)
+		return
+	}
+	var req claimCodeRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	ttl, err := normalizeClaimCodeTTL(req.TTLSec)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	s.mu.Lock()
+	c := s.state.Claims[req.ID]
+	// Another tenant's grant reports 404, not 403: whether that grant exists is
+	// not something a tenant gets to learn.
+	if c == nil || c.TenantID != id.TenantID {
+		s.mu.Unlock()
+		http.Error(w, "unknown grant", 404)
+		return
+	}
+	if c.Revoked {
+		s.mu.Unlock()
+		http.Error(w, "grant revoked", 403)
+		return
+	}
+	// A full grant may still generate a code: seats count devices, and an
+	// already-activated device must be able to re-enroll (factory reset) without
+	// the operator handing out another seat. The enroll path enforces the limit
+	// for NEW devices.
+	now := time.Now().Unix()
+	code := newClaimCode()
+	c.CodeHash = hashClaimCode(code)
+	c.CodeIssuedAt = now
+	c.CodeExpiresAt = now + int64(ttl)
+	c.CodeIssuedBy = id.Username
+	c.CodeUsedAt = 0
+	s.save()
+	name := c.Name
+	s.mu.Unlock()
+
+	log.Printf("console: tenant %s generated a %ds code for grant %s", id.TenantID, ttl, req.ID)
+	s.admin.publish("claim.updated", id.TenantID, nil)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, claimCodeResponse{
+		ID: req.ID, Name: name, Code: code, IssuedAt: now, ExpiresAt: now + int64(ttl),
+	})
+}
+
 type revokeClaimRequest struct {
-	Code string `json:"code"`
+	ID string `json:"id"`
 }
 
 func (s *server) handleAdminClaimRevoke(w http.ResponseWriter, r *http.Request) {
@@ -841,34 +978,38 @@ func (s *server) handleAdminClaimRevoke(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.mu.Lock()
-	c, ok := s.state.Claims[req.Code]
+	c, ok := s.state.Claims[req.ID]
 	if !ok {
 		s.mu.Unlock()
-		http.Error(w, "unknown claim code", 404)
+		http.Error(w, "unknown grant", 404)
 		return
 	}
 	tenantID := c.TenantID
 	c.Revoked = true
+	// Revoking is the operator's "stop, now". Clearing the hash means a code that
+	// was screenshotted a minute ago is dead on its own terms, not merely behind
+	// a flag every future enroll path must remember to check.
+	c.CodeHash = ""
 	s.save()
 	s.mu.Unlock()
 
-	// Revoking a code stops FUTURE enrollment. Devices that already redeemed it
+	// Revoking a grant stops FUTURE enrollment. Devices that already redeemed it
 	// keep their certificates: withdrawing an identity is a different action
 	// (certificate revocation), and this button must not imply it did that.
-	log.Printf("console: claim %s revoked (already-enrolled devices unaffected)", req.Code)
+	log.Printf("console: grant %s revoked (already-enrolled devices unaffected)", req.ID)
 	s.admin.publish("claim.revoked", tenantID, nil)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
 type updateClaimRequest struct {
-	Code    string `json:"code"`
+	ID      string `json:"id"`
 	MaxUses int    `json:"max_uses"`
 }
 
-// handleAdminClaimUpdate changes a live code's activation limit. Lowering it
-// below the number of devices that already redeemed the code is refused: those
-// devices hold certificates, so "used 5 of 3" is a state the operator cannot
-// actually reach and the console must not pretend otherwise.
+// handleAdminClaimUpdate changes a grant's activation limit. Lowering it below
+// the number of devices it already activated is refused: those devices hold
+// certificates, so "used 5 of 3" is a state the operator cannot actually reach
+// and the console must not pretend otherwise.
 func (s *server) handleAdminClaimUpdate(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireOperator(w, r); !ok {
 		return
@@ -888,10 +1029,10 @@ func (s *server) handleAdminClaimUpdate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.mu.Lock()
-	c, ok := s.state.Claims[req.Code]
+	c, ok := s.state.Claims[req.ID]
 	if !ok {
 		s.mu.Unlock()
-		http.Error(w, "unknown claim code", 404)
+		http.Error(w, "unknown grant", 404)
 		return
 	}
 	if used := len(c.Serials); maxUses < used {
@@ -904,7 +1045,7 @@ func (s *server) handleAdminClaimUpdate(w http.ResponseWriter, r *http.Request) 
 	s.save()
 	s.mu.Unlock()
 
-	log.Printf("console: claim %s max_uses set to %d (%d used)", req.Code, maxUses, len(view.Serials))
+	log.Printf("console: grant %s max_uses set to %d (%d used)", req.ID, maxUses, len(view.Serials))
 	s.admin.publish("claim.updated", view.TenantID, nil)
 	writeJSON(w, view)
 }
