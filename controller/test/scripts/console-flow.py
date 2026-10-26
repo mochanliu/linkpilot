@@ -47,6 +47,11 @@ B 段输出：
   tenant_tenants / tenant_nodes / tenant_claims    租户只看到自己的
   tenant_foreign_nodes / tenant_foreign_claims     必须是 0
   tenant_node_runtime=true                         租户看得到自己设备的运行时
+  metrics_tenant=200 / metrics_nodes=1             监控视图是租户专用的，只列自己的设备
+  metrics_status=pending / metrics_uptime=0        没心跳就没在线上时长，不编造
+  metrics_window=none / metrics_tunnels_empty=true 没上报遥测时窗口为空数组
+  metrics_ttl=30                                   窗口 TTL 与 --metrics-ttl 一致
+  metrics_operator=403 / metrics_unauth=401        运营方与未登录都读不到
   operator_node_runtime=false                      运营方状态里没有 runtime
   operator_config_leak=false                       原始 JSON 里没有端口/配置字样
   tenant_deny_tenants|claims|claim_update|revoke|accounts|...   全是 403
@@ -387,6 +392,28 @@ say("tenant_claim_seats", "%d/%d" % (tclaim["uses"], tclaim["max_uses"]) if tcla
 say("tenant_node_runtime", str(bool(tnodes and tnodes[0].get("runtime"))).lower())
 say("tenant_node_configured",
     str((tnodes[0].get("runtime") or {}).get("configured")).lower() if tnodes else "missing")
+
+# B6b. 监控：租户专用；没上报遥测时报空集合，而不是编一行
+code, raw = call("GET", CONSOLE + "/api/metrics", opener_=topener)
+met = jstat(code, raw) or {}
+mnodes = met.get("nodes") or []
+say("metrics_tenant", code)
+say("metrics_nodes", len(mnodes))
+say("metrics_foreign_nodes", len([n for n in mnodes if n.get("serial") != "vcpe-001"]))
+say("metrics_status", mnodes[0].get("status") if mnodes else "missing")
+say("metrics_uptime", mnodes[0].get("uptime_sec") if mnodes else "missing")
+say("metrics_window",
+    "none" if mnodes and mnodes[0].get("telemetry_seen_at_unix") == 0 else "reported")
+say("metrics_tunnels_empty",
+    str(bool(mnodes)
+        and all(isinstance(n.get("tunnels"), list) for n in mnodes)
+        and all(len(n.get("tunnels") or []) == 0 for n in mnodes)).lower())
+say("metrics_ttl", met.get("metrics_ttl_sec"))
+code, _ = call("GET", CONSOLE + "/api/metrics", cookie=cookie_header(jar))
+say("metrics_operator", code)
+# 不带任何会话：默认 opener 还挂着运营方的 cookie，必须用无 cookie 的 opener。
+code, _ = call("GET", CONSOLE + "/api/metrics", opener_=plain)
+say("metrics_unauth", code)
 
 # B7. 运营方状态：设备行里不该有 runtime / 端口 / 配置
 code, raw = call("GET", CONSOLE + "/api/state")

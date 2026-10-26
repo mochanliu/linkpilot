@@ -284,6 +284,7 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/session", s.handleAdminSession)
 	mux.HandleFunc("/api/password", s.handleAdminPassword)
 	mux.HandleFunc("/api/state", s.handleAdminState)
+	mux.HandleFunc("/api/metrics", s.handleAdminMetrics)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/revoke", s.handleAdminClaimRevoke)

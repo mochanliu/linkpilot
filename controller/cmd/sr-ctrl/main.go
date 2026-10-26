@@ -83,6 +83,13 @@ type NodeRecord struct {
 	EnrolledAt int64  `json:"enrolled_at_unix"`
 	Stale      bool   `json:"stale"`
 
+	// UptimeSec is the agent process's own uptime, as of its last heartbeat.
+	// Stored rather than derived because the controller has no other way to tell
+	// "the box rebooted 40 seconds ago" from "the box has been up for a month";
+	// a zero means the agent did not report one (the --once path), not that the
+	// process just started.
+	UptimeSec int64 `json:"uptime_sec,omitempty"`
+
 	// VpnPort / TransitPort are what this node's dataplane says it listens on.
 	// Seeded from the tenant's pushed values at enrollment, then overwritten by
 	// the node's own report -- because a node that had to rebind is reachable
@@ -768,6 +775,11 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	firstContact := rec.LastSeen == 0
 	rec.LastSeen = time.Now().Unix()
 	rec.Stale = false
+	// Only a positive value is a report. The one-shot agent path sends 0, and
+	// treating that as "just booted" would erase a real uptime from the view.
+	if req.Uptime > 0 {
+		rec.UptimeSec = req.Uptime
+	}
 	if req.UDPMapping != "" {
 		rec.UDPMapping = req.UDPMapping
 	}
@@ -1579,6 +1591,10 @@ func (s *server) ttlSweeper(ctx context.Context) {
 						Type: "stale", Peer: s.toPeerInfoLocked(rec, 0),
 						SentAt: now, Message: "heartbeat lapsed",
 					})
+					// Console-facing: the health table just changed without any
+					// request arriving. Waiting for the 10s poll would show a dead
+					// device as online for up to that long.
+					s.admin.publish("node.stale", rec.TenantID, rec)
 				}
 			}
 			s.expireObservationsLocked()
