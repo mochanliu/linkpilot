@@ -65,6 +65,10 @@ services:
     <<: *cpe
     container_name: lab-cpe1
     hostname: lab-cpe1
+    # VPP 主线程独占核（见 test/docker/start-node.sh：避开 CPU 0，盒子之间
+    # 也不抢核）。VM 核数不够时 start-node.sh 会退化成「避开 0」的集合。
+    environment:
+      VPP_CPU: "2"
     networks:
       lab_wan: { ipv4_address: 10.88.1.11 }
       lab_xconn1: { ipv4_address: 10.79.1.2 }
@@ -74,6 +78,8 @@ services:
     <<: *cpe
     container_name: lab-cpe2
     hostname: lab-cpe2
+    environment:
+      VPP_CPU: "4"
     networks:
       lab_wan: { ipv4_address: 10.88.1.12 }
       lab_xconn2: { ipv4_address: 10.79.2.2 }
@@ -83,6 +89,8 @@ services:
     <<: *cpe
     container_name: lab-cpe3
     hostname: lab-cpe3
+    environment:
+      VPP_CPU: "6"
     networks:
       lab_wan: { ipv4_address: 10.88.1.13 }
       lab_xconn3: { ipv4_address: 10.79.3.2 }
@@ -143,6 +151,8 @@ services:
     <<: *cpe
     container_name: lab-transit
     hostname: lab-transit
+    environment:
+      VPP_CPU: "8"
     networks:
       lab_wan: { ipv4_address: 10.88.1.3 }
       lab_mgmt: { ipv4_address: 10.99.0.3 }

@@ -118,7 +118,12 @@ peer_overlay() {   # <a> <b>  -> b 在 a 侧的 overlay
 }
 
 ping4() { docker exec "$1" ping -c 3 -W 2 -i 0.3 "$2" >/dev/null 2>&1; }
-overlay_ping() { vppc "$1" ping "$2" repeat 3 interval 0.2 | grep -q '0% packet loss'; }
+# vppctl ping 默认查 table 0，overlay 路由在 table 250，不发 `source wgN` 会直接
+# 报 "no egress interface" 并以 "0 sent, 0 received, 0% packet loss" 收尾——只 grep
+# 丢包率会把没发出去的包当成通。必须同时校验发包数。
+overlay_ping() {   # <容器> <目标 overlay> <出接口>
+    vppc "$1" ping "$2" source "$3" repeat 3 interval 0.2 | grep -Eq '(^|[^0-9])3 sent, 3 received'
+}
 
 echo "===== 1. 容器与 VPP ====="
 for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-cust1 lab-cust2 lab-cust3 \
@@ -238,13 +243,14 @@ for p in 51821 51841 51861; do
 done
 
 sect "4. overlay 可达性（VPP 自己发起的 ping，走 SR 两跳）"
-for pair in "1 2 192.168.99.2" "2 1 192.168.99.1" \
-            "1 3 192.168.100.2" "3 1 192.168.100.1" \
-            "2 3 192.168.101.2" "3 2 192.168.101.1"; do
+# 每条隧道在两端的接口名不一定相同（cpe3 的 wg0 指向 cpe1），按实际绑定写。
+for pair in "1 2 192.168.99.2 wg0" "2 1 192.168.99.1 wg0" \
+            "1 3 192.168.100.2 wg1" "3 1 192.168.100.1 wg0" \
+            "2 3 192.168.101.2 wg1" "3 2 192.168.101.1 wg1"; do
     set -- $pair
-    retry 20 overlay_ping "lab-cpe$1" "$3" \
-        && ok "lab-cpe$1 -> $3（cpe$2）overlay 通" \
-        || bad "lab-cpe$1 -> $3（cpe$2）overlay 不通"
+    retry 20 overlay_ping "lab-cpe$1" "$3" "$4" \
+        && ok "lab-cpe$1 -> $3（cpe$2，source $4）overlay 通" \
+        || bad "lab-cpe$1 -> $3（cpe$2，source $4）overlay 不通"
 done
 
 sect "5. 控制面（sr-ctrl / sr-rr / sr-route）"

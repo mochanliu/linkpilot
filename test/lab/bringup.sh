@@ -153,8 +153,11 @@ ensure_host_if() {
             die "$c: 恢复 $ip/$pfx 到 $ifn 失败"
     fi
     vif="host-$ifn"
+    # TPACKET_V2，不用默认的 V3：VPP 的 V3 路径把 tp_retire_blk_tov 写死 1ms，
+    # 稀疏报文（ping / BFD 探针）在每个接口每方向都要多等 0~1ms；V2 没有块退休
+    # 定时器。实测同一跳 RTT 0.75ms -> 0.27ms（2026-10-26）。
     vpp_if_exists "$c" "$vif" ||
-        docker exec "$c" vppctl create host-interface name "$ifn" >/dev/null ||
+        docker exec "$c" vppctl create host-interface name "$ifn" v2 >/dev/null ||
         die "$c: create host-interface $ifn 失败"
     kmac=$(docker exec "$c" cat "/sys/class/net/$ifn/address")
     vpp "$c" set interface mac address "$vif" "$kmac" >/dev/null
