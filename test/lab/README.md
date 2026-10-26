@@ -33,14 +33,16 @@ UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
                                                         └─ vti1（交给 VPP）
                                                               │ 容器内 veth
                                                         ┌─────┴──────────────────────────┐
-                                                        │ host-vti1 10.78.N.2 table 250  │ VPP
+                                                        │ host-vti1 10.78.N.2 table 0    │ VPP
                                                         │ wg0/wg1 ← WAN 10.88.1.1N       │
+                                                        │   （wg 接口在 table 250）      │
                                                         └───────────────┬────────────────┘
                                                                         └── SR-over-WG ── lab-transit 10.88.1.3
 ```
 
-盒内核把默认路由交给 VPP 的 10.78.N.2；VPP 在 table 250 里决定：远端前缀压
-标签 266 走 wg 接口，本机前缀不压标签、交还给盒内 FRR（10.78.N.20）。
+盒内核把默认路由交给 VPP 的 10.78.N.2。客户 VPN 0 与 underlay 共用 VPP
+**table 0**：远端前缀压标签 1000 走 wg 接口（wg 接口本身住在 overlay table
+250），本机前缀不压标签、交还给盒内 FRR（10.78.N.20）。
 
 控制面（管理网 10.99.0.0/24，不进数据面）：
 
@@ -67,13 +69,16 @@ lab-custN 10.99.0.2N        BGP router-id
 
 路由链路：
 
-1. 每台 CPE 的 inside 口在 **VPP table 250**（VRF 250，VPN 标签 16+250=266）。
+1. 客户 VPN 0 用 **VPP table 0**（和 underlay 同表）；VPN 标签 = 基址 1000 +
+   VPN ID = **1000**（16 是 IPv4 显式空标签，不能当 VPN 0）。wg 接口与
+   overlay /32 在 **table 250**——250 是 SD-WAN 传输域，不是 VPN，VPN ID
+   保留 250。
 2. 客户路由器宣告自己的 LAN（10.68.N.0/24）和 loopback（172.16.N.1/32）。
 3. 盒内 FRR 的入方向 route-map 给客户路由打 `tag 1001`；sr-frr 只收带这个
    tag 的路由，经 `PUT /local-prefixes` 变成 sr-route 的 local 集合。
 4. sr-route 把 local 集合（本站 LAN + 从客户学到的前缀）经 lab-rr 反射给
    另外两个站点。
-5. sr-fib 把远端前缀装成「压 266、走对应 wg 接口、下一跳是对端 overlay」；
+5. sr-fib 把远端前缀装成「压 1000、走对应 wg 接口、下一跳是对端 overlay」；
    本机 local 前缀不压标签，下一跳是盒内 FRR（10.78.N.20）。
 6. 反方向：sr-frr 把控制面 RIB 导成 FRR **table 1250**，
    `redistribute table-direct 1250` 让它们进 BGP；客户路由器于是能看到
@@ -104,7 +109,7 @@ test/lab/bringup.sh --stage containers   # 建容器/网络、veth、FRR 配置�
 test/lab/bringup.sh --stage vpp          # 4 个 VPP（3 CPE + transit）
 test/lab/bringup.sh --stage enroll       # 编译二进制、sr-ctrl、三台入网、RR 证书
 test/lab/bringup.sh --stage dataplane    # underlay/inside、WG、端口、SR 路径、peer
-test/lab/bringup.sh --stage control      # sr-route + sr-fib + table 250
+test/lab/bringup.sh --stage control      # sr-route + sr-fib（VPN table 0 / 标签 1000）
 test/lab/bringup.sh --stage frr          # sr-frr 正向导出 + 反向导入
 test/lab/bringup.sh --stage terms        # 终端默认路由
 ```
@@ -140,7 +145,8 @@ vppctl# show sr-wg ports
 vppctl# show sr-wg paths
 vppctl# show sr-wg tunnels
 vppctl# show wireguard peer
-vppctl# show ip fib table 250          # 远端带标签 266，本地 via 10.78.1.20
+vppctl# show ip fib table 0            # VPN 0：远端带标签 1000，本地 via 10.78.1.20
+vppctl# show ip fib table 250          # overlay：对端 /32 与 wg 接口所在表
 vppctl# show sr-wg stats
 vppctl# show trace                     # 先 trace add af-packet-input 100 再打流量
 
@@ -214,5 +220,14 @@ docker exec lab-cpe1 vppctl show trace
 - **重启 sr-frr 要先等旧进程退出**：它会按 SIGTERM 把 local prefixes 推空，
   和下一个实例的 PUT 抢跑，导致刚导入的前缀又变 0（脚本里用 pkill -x +
   等待）。
+- **VPP 不允许接口带地址改表**：`set interface ip table wg0 250` 会报
+  "IP addresses are still present on wg0"；必须先摘地址、改表、再重新配地址
+  （bringup.sh 的 `wg_to_overlay`）。重复执行时已经在目标表就什么都不做。
+- **MPLS 收包后的标签查表恒为全局 MPLS 表**：实测把 wg0 挪到 IP table 250
+  之后，VPN 标签仍按全局 MPLS 表弹栈，与接口所在的 IP 表无关——`mpls_table`
+  不需要跟着 VPN 走。
+- **VPN table 0 的下一跳可以指向 table 250 的 wg 接口**：`ip route add table 0
+  … via <对端 overlay> wg0` 解析成 attached-nexthop，跨表 + 显式接口的
+  MPLS-over-WG 转发成立（实测 3/3 ping）。
 - **BFD 必须 multihop**：绑在接口上的会话会让 overlay 路由变成 dpo-drop
   （见 test/scripts/test-fib.sh 的实测记录）。

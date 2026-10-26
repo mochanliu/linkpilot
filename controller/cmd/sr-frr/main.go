@@ -121,9 +121,6 @@ func loadConfig(path string) (*fileConfig, error) {
 		return nil, errors.New("metric 不能为负")
 	}
 	if cfg.Import != nil {
-		if cfg.Import.VRFID == 0 {
-			return nil, errors.New("import.vrf_id 不能为 0（那是实例的外层表）")
-		}
 		if cfg.Import.Tag == 0 {
 			return nil, errors.New("import.tag 不能为 0（没有 tag 就无法区分客户路由与盒内导出的路由）")
 		}

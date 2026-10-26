@@ -9,7 +9,8 @@
 # 客户路由器是独立的 lab-custN。
 set -u
 
-VRF=250
+VPN=0            # 客户 VPN ID，直接当 VPP 表号
+OVERLAY=250      # 隧道与 overlay 下一跳所在的表
 FRR_TABLE=1250
 ROUTE_STATUS=( "" 19001 19002 19003 )
 RR_STATUS=18447
@@ -52,10 +53,11 @@ for n in 1 2 3; do
 done
 echo
 hr
-echo "VPP FIB table $VRF"
+echo "VPP FIB table $VPN（客户 VPN）+ table $OVERLAY（overlay 隧道/下一跳）"
 for n in 1 2 3; do
     echo "  lab-cpe$n:"
-    vppc "lab-cpe$n" show ip fib table "$VRF" | head -12 | sed 's/^/    /'
+    vppc "lab-cpe$n" show ip fib table "$VPN" | head -12 | sed 's/^/    0: /'
+    vppc "lab-cpe$n" show ip fib table "$OVERLAY" | head -6 | sed "s/^/    $OVERLAY: /"
 done
 echo
 hr

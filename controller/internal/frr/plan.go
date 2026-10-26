@@ -8,9 +8,9 @@ import (
 	"sort"
 )
 
-// Table 是"控制面的一个 VRF 停到哪张内核表"。ID 必须 > 255：linux-cp 把
-// 内核表 N 同步到 VPP table N，而 sr-fib 用 1..255 当 VPN VRF 表号，
-// 两张表撞号时两边都以为路由是自己的。
+// Table 是"控制面的一个 VRF 停到哪张内核表"。ID 必须 > 255：sr-fib 用
+// 0..255 当 VPN VRF 表号（250 留给 overlay），而 linux-cp 会把内核表 N
+// 同步到 VPP table N —— 两张表撞号时两边都以为路由是自己的。
 type Table struct {
 	VRF uint8
 	ID  uint32
@@ -27,11 +27,8 @@ func ValidateTables(tables []Table) error {
 	seenVRF := map[uint8]bool{}
 	seenID := map[uint32]bool{}
 	for _, t := range tables {
-		if t.VRF == 0 {
-			return errors.New("frr: VRF 0 是 VPP 的默认表，不能当 VPN VRF")
-		}
 		if t.ID <= 255 {
-			return fmt.Errorf("frr: 表号 %d 落在 sr-fib 的 VRF 表号（1..255）里，必须 > 255", t.ID)
+			return fmt.Errorf("frr: 表号 %d 落在 sr-fib 的 VPN 表号（0..255）里，必须 > 255", t.ID)
 		}
 		if t.ID > MaxTableID {
 			return fmt.Errorf("frr: 表号 %d 超出 %d", t.ID, MaxTableID)

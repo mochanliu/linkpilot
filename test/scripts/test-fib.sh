@@ -6,13 +6,13 @@
 #   (A) 真 RR + 两个真 sr-route：node2 宣告 10.20.0.0/16，经 RR 反射进 node1
 #       的 RIB（sr-route 的 /status 就是 FIB 加载器的输入）。prefix 本身不带
 #       下一跳：node1 用自己宣告给 RR 的隧道表（peer=2 → 192.168.99.2）解析。
-#   (B) 真 sr-fib + 真 VPP：node1 的 VPP 里应出现 VRF 250 的 10.20.0.0/16，
-#       出口是 wg0、压标签 266（= 16 + VRF 250），并登记本地标签 266。
+#   (B) 真 sr-fib + 真 VPP：node1 的 VPP 里应出现 VPN 表 100 的 10.20.0.0/16，
+#       出口是 wg0、压标签 1100（= 1000 + VPN 100），并登记本地标签 1100。
 #   (C) 真 BFD（node2 是真容器）：两端会话 Up 时路由保留；对端撤会话、本端
 #       Down 后该下一跳的路径从 FIB 消失（标签保留）；对端恢复后路径回来。
 #       最后杀掉 node2 的 sr-route，让控制面撤销这条路由，FIB 也必须跟着撤。
-#   (D) 真流量：两端各建一个 VRF 250 里的 tap 终端，node1 SR-fib 装出的路由
-#       必须把 ping 一路送到 node2（压标签 → WG → 弹栈 → node2 的 VRF 表 →
+#   (D) 真流量：两端各建一个 VPN 表 100 里的 tap 终端，node1 SR-fib 装出的路由
+#       必须把 ping 一路送到 node2（压标签 → WG → 弹栈 → node2 的 VPN 表 →
 #       终端），反向也要通。BFD down 时连 ping 也必须断 —— 撤路径不是只改
 #       "show" 的输出。
 #
@@ -22,7 +22,7 @@
 # 前置：**必须先跑过 test/scripts/test-e2e.sh --keep**（wg0@51820 单隧道已通，
 # 三个容器在跑，node1/node2 的 overlay 互相可达，wg0 上 MPLS 已 enable）。
 # 脚本在两端 /tmp 下放文件与进程（node2 只放 sr-fib 与 tap），收尾时把 tap、
-# BFD 会话与两端 VRF 250 的 FIB 状态全部撤掉。
+# BFD 会话与两端 VPN 表 100 的 FIB 状态全部撤掉。
 #
 # 用法:
 #   test/scripts/test-fib.sh
@@ -40,8 +40,8 @@ N1_CORE=${N1_CORE:-10.10.0.2}
 MODULE=/workspace/controller
 WORK=${WORK:-/tmp/sr-fib-e2e}
 
-VRF=${VRF:-250}
-LABEL=$((16 + VRF))
+VRF=${VRF:-100}                      # 客户 VPN ID = VPP 表号（250 留给 overlay）
+LABEL=$((1000 + VRF))                # VPN 标签 = 基址 1000 + VPN ID
 REMOTE_PFX=${REMOTE_PFX:-10.20.0.0/16}   # node2 宣告、node1 要装进 VRF 的前缀
 LOCAL_PFX=${LOCAL_PFX:-10.10.0.0/16}     # node1 自己的前缀（只走控制面，不进 VRF）
 
@@ -296,9 +296,9 @@ write_node() {   # <n> <peer-device> <peer-overlay> <prefix> <export> <import> <
 }
 EOF
 }
-write_node 1 2 "$OVERLAY_N2" "$LOCAL_PFX"  65000:250 65000:251 "127.0.0.1:$N1_STATUS"
+write_node 1 2 "$OVERLAY_N2" "$LOCAL_PFX"  65000:100 65000:101 "127.0.0.1:$N1_STATUS"
 # node2 的状态口绑 0.0.0.0：node2 容器里的 sr-fib 要跨 bridge 来拉这份 RIB。
-write_node 2 1 "$OVERLAY_N1" "$REMOTE_PFX" 65000:251 65000:250 "0.0.0.0:$N2_STATUS"
+write_node 2 1 "$OVERLAY_N1" "$REMOTE_PFX" 65000:101 65000:100 "0.0.0.0:$N2_STATUS"
 
 cat > "$WORK/fib.json" <<EOF
 {

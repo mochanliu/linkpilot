@@ -133,7 +133,7 @@ func plan1() Plan {
 }
 
 func TestLabelFor(t *testing.T) {
-	for vrf, want := range map[uint8]uint32{0: 16, 1: 17, 100: 116, 255: 271} {
+	for vrf, want := range map[uint8]uint32{0: 1000, 1: 1001, 100: 1100, 255: 1255} {
 		if got := LabelFor(vrf); got != want {
 			t.Errorf("LabelFor(%d) = %d, want %d", vrf, got, want)
 		}
@@ -155,8 +155,8 @@ func TestPlanFrom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Labels) != 2 || plan.Labels[0] != (Label{116, 100}) || plan.Labels[1] != (Label{117, 101}) {
-		t.Fatalf("labels = %+v, want [{116 100} {117 101}]", plan.Labels)
+	if len(plan.Labels) != 2 || plan.Labels[0] != (Label{1100, 100}) || plan.Labels[1] != (Label{1101, 101}) {
+		t.Fatalf("labels = %+v, want [{1100 100} {1101 101}]", plan.Labels)
 	}
 	if len(plan.Routes) != 1 {
 		t.Fatalf("routes = %+v, want 1 条（同前缀合并）", plan.Routes)
@@ -165,7 +165,7 @@ func TestPlanFrom(t *testing.T) {
 	if r.Table != 100 || r.Prefix != netip.MustParsePrefix("10.1.0.0/24") {
 		t.Errorf("route = %d %s, want 100 10.1.0.0/24", r.Table, r.Prefix)
 	}
-	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 116}
+	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100}
 	if len(r.Paths) != 1 || r.Paths[0] != want {
 		t.Errorf("paths = %+v, want [%+v]", r.Paths, want)
 	}
@@ -229,7 +229,7 @@ func TestPlanFromRejects(t *testing.T) {
 		want   string
 	}{
 		{"no vrf", nil, nil, tun, "没有配置任何 VRF"},
-		{"vrf 0", []uint8{0}, nil, tun, "VRF 0"},
+		{"vrf 250 = overlay", []uint8{OverlayTable}, nil, tun, "overlay 表号冲突"},
 		{"duplicate vrf", []uint8{100, 100}, nil, tun, "配了两次"},
 		{"vrf not local", []uint8{100}, []RIBRoute{{VRF: 101, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}}, tun, "没配这个 VRF"},
 		{"bad prefix", []uint8{100}, []RIBRoute{{VRF: 100, Prefix: "10.1.0.0/33", NextHops: []string{"10.255.0.2"}}}, tun, "不是规范 IPv4 前缀"},
@@ -264,14 +264,14 @@ func TestApplyFirstThenIdempotent(t *testing.T) {
 	if !dp.tables[100] {
 		t.Error("表 100 没建")
 	}
-	if dp.labels[116] != 100 {
-		t.Errorf("label 116 → %d, want 表 100", dp.labels[116])
+	if dp.labels[1100] != 100 {
+		t.Errorf("label 1100 → %d, want 表 100", dp.labels[1100])
 	}
 	paths := dp.routes["100|10.1.0.0/24"]
 	if len(paths) != 1 || paths[0].SWIfIndex != 10 ||
 		paths[0].NextHop != netip.MustParseAddr("10.255.0.2") ||
-		len(paths[0].Labels) != 1 || paths[0].Labels[0] != 116 {
-		t.Fatalf("fIB path = %+v, want wg0(10) via 10.255.0.2 push 116", paths)
+		len(paths[0].Labels) != 1 || paths[0].Labels[0] != 1100 {
+		t.Fatalf("fIB path = %+v, want wg0(10) via 10.255.0.2 push 1100", paths)
 	}
 	if len(dp.cli) != 1 || dp.cli[0] != MPLSEgressCmd {
 		t.Errorf("第一次装路由后应立刻触发 %q，got %v", MPLSEgressCmd, dp.cli)
@@ -323,11 +323,11 @@ func TestApplyConvergesToNewPlan(t *testing.T) {
 	if dp.routes["101|172.16.0.0/16"][0].SWIfIndex != 11 {
 		t.Error("新路由没指到 wg1")
 	}
-	if _, ok := dp.labels[116]; ok {
-		t.Error("旧本地标签 116 没撤")
+	if _, ok := dp.labels[1100]; ok {
+		t.Error("旧本地标签 1100 没撤")
 	}
-	if dp.labels[117] != 101 {
-		t.Errorf("label 117 → %d, want 表 101", dp.labels[117])
+	if dp.labels[1101] != 101 {
+		t.Errorf("label 1101 → %d, want 表 101", dp.labels[1101])
 	}
 	if len(dp.cli) != 2 {
 		t.Errorf("CLI 调了 %d 次，want 2（首轮 + 收敛轮）", len(dp.cli))
@@ -361,8 +361,8 @@ func TestApplyReplacesChangedPaths(t *testing.T) {
 		t.Errorf("res = %+v, want 只重下发这条路由", res)
 	}
 	paths := dp.routes["100|10.1.0.0/24"]
-	if len(paths) != 1 || paths[0].SWIfIndex != 11 || paths[0].Labels[0] != 116 {
-		t.Errorf("path = %+v, want wg1 压 116（整条替换，不是追加）", paths)
+	if len(paths) != 1 || paths[0].SWIfIndex != 11 || paths[0].Labels[0] != 1100 {
+		t.Errorf("path = %+v, want wg1 压 1100（整条替换，不是追加）", paths)
 	}
 }
 
@@ -495,13 +495,13 @@ func TestApplyEmptyPlanOnFreshApplier(t *testing.T) {
 func TestPlanFromLocalRoutesUnlabeled(t *testing.T) {
 	lp := LocalPath{NextHop: netip.MustParseAddr("10.78.1.20"), Interface: "host-inside"}
 	plan, err := PlanFrom(
-		[]uint8{250},
-		[]RIBRoute{{VRF: 250, Prefix: "10.68.2.0/24", NextHops: []string{"192.168.99.2"}}},
+		[]uint8{100},
+		[]RIBRoute{{VRF: 100, Prefix: "10.68.2.0/24", NextHops: []string{"192.168.99.2"}}},
 		[]Tunnel{{NextHop: "192.168.99.2", Interface: "wg0"}},
 		nil,
 		[]LocalRoute{
-			{VRF: 250, Prefix: "10.68.1.9/24"}, // 未规范化
-			{VRF: 250, Prefix: "10.68.1.0/24"}, // 与上一条同一前缀
+			{VRF: 100, Prefix: "10.68.1.9/24"}, // 未规范化
+			{VRF: 100, Prefix: "10.68.1.0/24"}, // 与上一条同一前缀
 		},
 		lp,
 	)
@@ -520,8 +520,8 @@ func TestPlanFromLocalRoutesUnlabeled(t *testing.T) {
 	if local == nil {
 		t.Fatal("本地前缀没进计划")
 	}
-	if local.Table != 250 || len(local.Paths) != 1 {
-		t.Fatalf("local = %+v, want 表 250 单路径", local)
+	if local.Table != 100 || len(local.Paths) != 1 {
+		t.Fatalf("local = %+v, want 表 100 单路径", local)
 	}
 	if p := local.Paths[0]; p.NextHop != lp.NextHop || p.Interface != "host-inside" || p.Label != 0 {
 		t.Errorf("local path = %+v, want 10.78.1.20 via host-inside 无标签", p)
@@ -532,8 +532,8 @@ func TestApplyLocalRouteWritesNoLabel(t *testing.T) {
 	dp := newFakeDP()
 	dp.ifs = append(dp.ifs, vppapi.SwInterface{Name: "host-inside", SWIfIndex: 12})
 	a := NewApplier(dp)
-	plan, err := PlanFrom([]uint8{250}, nil, nil, nil,
-		[]LocalRoute{{VRF: 250, Prefix: "10.68.1.0/24"}},
+	plan, err := PlanFrom([]uint8{100}, nil, nil, nil,
+		[]LocalRoute{{VRF: 100, Prefix: "10.68.1.0/24"}},
 		LocalPath{NextHop: netip.MustParseAddr("10.78.1.20"), Interface: "host-inside"})
 	if err != nil {
 		t.Fatal(err)
@@ -543,32 +543,63 @@ func TestApplyLocalRouteWritesNoLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.TablesAdded != 1 || res.LabelsSet != 1 || res.RoutesSet != 1 {
-		t.Errorf("res = %+v, want 建表 + 登记 266 收端标签 + 一条路由", res)
+		t.Errorf("res = %+v, want 建表 + 登记 1100 收端标签 + 一条路由", res)
 	}
-	paths := dp.routes["250|10.68.1.0/24"]
+	paths := dp.routes["100|10.68.1.0/24"]
 	if len(paths) != 1 || paths[0].SWIfIndex != 12 || len(paths[0].Labels) != 0 {
 		t.Errorf("paths = %+v, want host-inside(12) 无标签", paths)
+	}
+}
+
+// VPN 0 落在 global 表：登记标签，但不建表（table 0 本来就存在，underlay 在里面）。
+func TestApplyVPN0UsesGlobalTable(t *testing.T) {
+	dp := newFakeDP()
+	dp.ifs = append(dp.ifs, vppapi.SwInterface{Name: "host-inside", SWIfIndex: 12})
+	a := NewApplier(dp)
+	plan, err := PlanFrom([]uint8{0},
+		[]RIBRoute{{VRF: 0, Prefix: "10.68.2.0/24", NextHops: []string{"192.168.99.2"}}},
+		[]Tunnel{{NextHop: "192.168.99.2", Interface: "wg0"}},
+		nil,
+		[]LocalRoute{{VRF: 0, Prefix: "10.68.1.0/24"}},
+		LocalPath{NextHop: netip.MustParseAddr("10.78.1.20"), Interface: "host-inside"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Labels) != 1 || plan.Labels[0] != (Label{Label: 1000, Table: 0}) {
+		t.Fatalf("labels = %+v, want 1000 → 表 0", plan.Labels)
+	}
+	res, err := a.Apply(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.TablesAdded != 0 || len(dp.tables) != 0 {
+		t.Errorf("res = %+v tables = %v, want 不建表（VPN 0 就是 global 表）", res, dp.tables)
+	}
+	remote := dp.routes["0|10.68.2.0/24"]
+	if len(remote) != 1 || remote[0].SWIfIndex != 10 ||
+		len(remote[0].Labels) != 1 || remote[0].Labels[0] != 1000 {
+		t.Errorf("remote = %+v, want 压 1000 走 wg0(10)", remote)
 	}
 }
 
 func TestPlanFromLocalConflictsAndMisconfig(t *testing.T) {
 	lp := LocalPath{NextHop: netip.MustParseAddr("10.78.1.20"), Interface: "host-inside"}
 	tun := []Tunnel{{NextHop: "192.168.99.2", Interface: "wg0"}}
-	overlay := []RIBRoute{{VRF: 250, Prefix: "10.68.1.0/24", NextHops: []string{"192.168.99.2"}}}
+	overlay := []RIBRoute{{VRF: 100, Prefix: "10.68.1.0/24", NextHops: []string{"192.168.99.2"}}}
 	cases := []struct {
 		name  string
 		local []LocalRoute
 		lp    LocalPath
 		want  string
 	}{
-		{"缺出口", []LocalRoute{{VRF: 250, Prefix: "10.68.1.0/24"}}, LocalPath{}, "本地出口"},
+		{"缺出口", []LocalRoute{{VRF: 100, Prefix: "10.68.1.0/24"}}, LocalPath{}, "本地出口"},
 		{"VRF 未配", []LocalRoute{{VRF: 251, Prefix: "10.68.1.0/24"}}, lp, "没配的 VRF"},
-		{"坏前缀", []LocalRoute{{VRF: 250, Prefix: "10.68.1.0/33"}}, lp, "不是规范 IPv4 前缀"},
-		{"与 overlay 冲突", []LocalRoute{{VRF: 250, Prefix: "10.68.1.0/24"}}, lp, "混合路径"},
+		{"坏前缀", []LocalRoute{{VRF: 100, Prefix: "10.68.1.0/33"}}, lp, "不是规范 IPv4 前缀"},
+		{"与 overlay 冲突", []LocalRoute{{VRF: 100, Prefix: "10.68.1.0/24"}}, lp, "混合路径"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := PlanFrom([]uint8{250}, overlay, tun, nil, c.local, c.lp)
+			_, err := PlanFrom([]uint8{100}, overlay, tun, nil, c.local, c.lp)
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("err = %v, want 包含 %q", err, c.want)
 			}

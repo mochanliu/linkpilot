@@ -15,6 +15,10 @@
 //     是 vBOND 分配隧道时就定下来的，猜它等于把控制面的职责挪进数据面。
 //   - **每次重算整份计划再收敛**，不做增量：RIB 是声明式快照，增量下发会留下
 //     已经撤掉的路径，而 VPP 不会告诉你它还在。
+//
+// 表布局：VPN 表号 = VPN ID（0, 1, ...），250 留给 overlay（wg 接口与对外下一跳
+// 空间），underlay 在 table 0 —— 所以 VPN 0 与 underlay 共用 table 0。MPLS 标签
+// 不分表：VPP 收包后的标签查表恒为全局 MPLS 表（实测与接口所在 IP 表无关）。
 package fib
 
 import (
@@ -28,11 +32,17 @@ import (
 )
 
 // LabelBase 是 VPN 标签的起点。0..15 是 MPLS 保留标签（0/2 显式空标签、
-// 3 隐式空标签……），VPN 标签从 16 开始。
-const LabelBase uint32 = 16
+// 3 隐式空标签……）。不从 16 起：VPN 0 是最常用的默认 VPN，16+0 恰好是
+// IPv4 显式空标签，收端会把它当"弹栈后按 IPv4 转发"，而不是 VPN 0。
+const LabelBase uint32 = 1000
 
 // MaxVRFID 是 VRFID 的上限（原字段是 uint8），也保证 LabelBase+VRFID < 2^20。
+// 表号 = VRFID；只有 250 被 overlay 占掉，其余 0..249、251..255 都能当 VPN。
 const MaxVRFID uint8 = 255
+
+// OverlayTable 是隧道与 overlay 下一跳所在的表，不是 VPN。VPN 表号 = VPN ID，
+// 所以 VPN ID 取 250 会把客户路由装进 overlay 表，静默破坏隧道。
+const OverlayTable uint8 = 250
 
 // LabelFor 是"这个 VRF 的 VPN 标签"的唯一算法。收端登记本地标签、发端压标签
 // 都用它 —— 两边各算一次还长得一样，是这套方案不需要信令的原因。
@@ -119,8 +129,8 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 	}
 	seenVRF := map[uint8]bool{}
 	for _, v := range vrfs {
-		if v == 0 {
-			return p, fmt.Errorf("fib: VRF 0 是 VPP 的默认表，不能当 VPN VRF")
+		if v == OverlayTable {
+			return p, fmt.Errorf("fib: VPN %d 与 overlay 表号冲突（250 留给隧道）", v)
 		}
 		if seenVRF[v] {
 			return p, fmt.Errorf("fib: VRF %d 配了两次", v)
@@ -311,19 +321,21 @@ func (a *Applier) Apply(ctx context.Context, next Plan) (Result, error) {
 		}
 	}
 
-	// 1. 表：新增的表先建。不删已经不在计划里的表 —— 表里可能还有本包没管的
-	//    路由（例如操作员手敲的）；删表会把它们一起带走。
+	// 1. 表：新增的表先建。table 0 是 global 表（underlay 也在里面），本来就
+	//    存在，建不得也删不得。不删已经不在计划里的表 —— 表里可能还有本包没管
+	//    的路由（例如操作员手敲的）；删表会把它们一起带走。
 	prevTables := map[uint32]bool{}
 	for _, l := range a.prev.Labels {
 		prevTables[l.Table] = true
 	}
 	for _, l := range next.Labels {
-		if !prevTables[l.Table] {
-			if err := a.dp.IPTableAddDel(ctx, l.Table, true); err != nil {
-				return res, fmt.Errorf("fib: 建 VRF 表 %d: %w", l.Table, err)
-			}
-			res.TablesAdded++
+		if l.Table == 0 || prevTables[l.Table] {
+			continue
 		}
+		if err := a.dp.IPTableAddDel(ctx, l.Table, true); err != nil {
+			return res, fmt.Errorf("fib: 建 VRF 表 %d: %w", l.Table, err)
+		}
+		res.TablesAdded++
 	}
 
 	// 2. 本地标签：新增/变更先加；删除放最后（先让新路径可用，再撤旧的）。

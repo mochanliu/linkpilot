@@ -25,7 +25,7 @@ func Reset(ctx context.Context, dp DP, vrfs []uint8) (ResetResult, error) {
 	seen := map[uint8]bool{}
 	for _, vrf := range vrfs {
 		if vrf == 0 {
-			return res, fmt.Errorf("fib: VRF 0 是 VPP 的默认表，不能当 VPN VRF")
+			return res, fmt.Errorf("fib: VRF 0 是 global 表（underlay 也在这张表里），reset 会连它一起删，拒绝")
 		}
 		if seen[vrf] {
 			return res, fmt.Errorf("fib: VRF %d 配了两次", vrf)

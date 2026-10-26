@@ -15,11 +15,12 @@
 # 拓扑（站点 N = 1..3）：
 #
 #   客户终端        客户路由器            盒子（单容器 lab-cpeN）
-#   10.68.N.10 ──── 10.68.N.2             VPP：wan 10.88.1.1N
+#   10.68.N.10 ──── 10.68.N.2             VPP：wan 10.88.1.1N（table 0）
 #                   xconn 10.79.N.3 ────  kernel 10.79.N.2
 #                                         │ veth vti0/vti1（盒内两半）
-#                                         │ kernel 10.78.N.20 <-> VPP 10.78.N.2
-#                                         │ VPP table 250 / 标签 266
+#                                         │ kernel 10.78.N.20 <-> VPP 10.78.N.2（table 0）
+#                                         │ 客户 VPN 0 = table 0 / 标签 1000
+#                                         │ overlay（wg 接口）在 table 250
 #                                         └── SR-over-WG（经 lab-transit 两跳）
 #
 #   CPE 全互联（每对一条隧道，每隧道一个端口，一对 overlay /32）：
@@ -27,7 +28,10 @@
 #     T13  cpe1 wg1 51840 192.168.100.1 <-> cpe3 wg0 51840 192.168.100.2  transit 51841
 #     T23  cpe2 wg1 51860 192.168.101.1 <-> cpe3 wg1 51860 192.168.101.2  transit 51861
 #
-#   路由：每台 CPE 的 inside 口在 VPP table 250（VRF 250，标签 16+250=266）。
+#   路由：underlay 与客户侧默认都在 VPP table 0（global）。客户 VPN 0 = table 0，
+#   VPN 标签 1000（= 标签基址 1000 + VPN ID 0）。wg 接口与 overlay 下一跳在
+#   table 250 —— 250 是 SD-WAN 路由域/传输表，不是 VPN；多 VPN 时 VPN N 用 table N
+#   （250 保留给 overlay）。
 #   静态 local prefix 是本站客户 LAN 10.68.N.0/24；客户路由器再通过 eBGP 宣告
 #   自己的 LAN 和 loopback 172.16.N.1/32。盒内 FRR 用 route-map 给客户路由打
 #   tag，sr-frr 只把带 tag 的 BGP 路由反向导入 sr-route 的 local prefixes；我方
@@ -71,7 +75,7 @@ esac
 
 # ---------------- 手写的"控制器下发值" ----------------
 WAN_IP=(  "" 10.88.1.11 10.88.1.12 10.88.1.13 )
-INSIDE_IP=( "" 10.78.1.2 10.78.2.2 10.78.3.2 )   # VPP 侧 veth（table 250）
+INSIDE_IP=( "" 10.78.1.2 10.78.2.2 10.78.3.2 )   # VPP 侧 veth（客户 VPN 表）
 FRR_IP=(  "" 10.78.1.20 10.78.2.20 10.78.3.20 )  # 内核侧 veth（盒内 FRR）
 XCONN_IP=( "" 10.79.1.2 10.79.2.2 10.79.3.2 )    # 盒子 kernel 对客户路由器
 CUST_X_IP=( "" 10.79.1.3 10.79.2.3 10.79.3.3 )   # 客户路由器对盒子
@@ -84,7 +88,9 @@ CUST_AS=( "" 65001 65002 65003 )
 BGP_TAG=1001
 FRR_TABLE=1250
 TRANSIT_WAN=10.88.1.3
-VRF=250
+VPN=0             # 客户 VPN ID，直接当 VPP 表号（0 = global；避开 250）
+OVERLAY=250       # 隧道与 overlay 下一跳所在的表，不是 VPN
+LABEL=$((1000 + VPN))  # VPN 标签 = 基址 1000 + VPN ID（16 是 IPv4 显式空标签）
 ROUTE_STATUS=( "" 19001 19002 19003 )
 SR_KEY=00112233445566778899aabbccddeeff
 TUNNEL_MTU=1360
@@ -153,11 +159,12 @@ ensure_host_if() {
     echo "$vif"
 }
 
-# 把内核上的 ip 搬进 VPP（可选放某张 table），并从内核摘掉。
+# 把内核上的 ip 搬进 VPP（可选放某张 table），并从内核摘掉。table 0 是 VPP 的
+# 默认表，不用也不该显式设置。
 take_ip() {
     local c=$1 vif=$2 ip=$3 pfx=$4 table=${5:-} kif
     kif=${vif#host-}
-    if [ -n "$table" ]; then
+    if [ -n "$table" ] && [ "$table" != "0" ]; then
         vpp "$c" set interface ip table "$vif" "$table" >/dev/null
     fi
     vpp_addr_has "$c" "$ip" || vpp "$c" set interface ip address "$vif" "$ip/$pfx" >/dev/null
@@ -222,11 +229,25 @@ wait_default_via() {   # <container> <nexthop> <label>
     die "$c: 内核默认路由没有指向 $nh（$what；看 /var/log/frr/ 与 vtysh show ip route 0.0.0.0/0）"
 }
 
+# WG 接口住在 overlay 表（250）。VPP 不允许带地址改表：先摘地址、换表、再放回。
+# 重复执行时已经在 250 就什么都不做。
+wg_to_overlay() {   # <cpe> <if> <overlay/32>
+    local c=$1 ifn=$2 ov=$3
+    vpp "$c" show interface address |
+        grep -A1 "^$ifn (" | grep -q "ip4 table-id $OVERLAY " && return 0
+    vpp "$c" set interface ip address del "$ifn" "$ov/32" >/dev/null 2>&1 || true
+    vpp "$c" set interface ip table "$ifn" "$OVERLAY" >/dev/null ||
+        die "$c: 把 $ifn 放进 overlay 表 $OVERLAY 失败"
+    vpp "$c" set interface ip address "$ifn" "$ov/32" >/dev/null ||
+        die "$c: $ifn 重新配 $ov/32 失败"
+}
+
 wg_create() {   # <cpe> <if> <listen-port> <src-ip> <overlay/32>
     local c=$1 ifn=$2 port=$3 src=$4 ov=$5
     vpp_if_exists "$c" "$ifn" ||
         docker exec "$c" vppctl wireguard create listen-port "$port" generate-key src "$src" >/dev/null ||
         die "$c: wireguard create $ifn 失败"
+    wg_to_overlay "$c" "$ifn" "$ov"
     vpp_addr_has "$c" "$ov" || vpp "$c" set interface ip address "$ifn" "$ov/32" >/dev/null
     vpp "$c" set interface state "$ifn" up >/dev/null
     vpp "$c" set interface mpls "$ifn" enable >/dev/null
@@ -282,7 +303,7 @@ router bgp ${BOX_AS[$n]}
  exit-address-family
 !
 ! 盒内默认路由指向 VPP：客户侧流量的明细路由由 BGP 提供，其余一律进 VPP
-! table 250（远端前缀在那里压标签走隧道；本站前缀由 sr-fib 经 FRR 回来）。
+! VPN table 0（远端前缀在那里压标签走隧道；本站前缀由 sr-fib 经 FRR 回来）。
 ip route 0.0.0.0/0 ${INSIDE_IP[$n]}
 !
 EOF
@@ -509,13 +530,13 @@ stage_dataplane() {
         ensure_veth "$c" "$n"
         vpp "$c" sr-wg key set 1 "$SR_KEY" >/dev/null
         vpp "$c" mpls table add 0 >/dev/null
-        vpp "$c" ip table add "$VRF" >/dev/null
+        vpp "$c" ip table add "$OVERLAY" >/dev/null
         wan=$(ensure_host_if "$c" "${WAN_IP[$n]}" 24)
         take_ip "$c" "$wan" "${WAN_IP[$n]}" 24
         ins=$(ensure_host_if "$c" "${INSIDE_IP[$n]}" 24)
-        take_ip "$c" "$ins" "${INSIDE_IP[$n]}" 24 "$VRF"
+        take_ip "$c" "$ins" "${INSIDE_IP[$n]}" 24 "$VPN"
         kernel_forwarding "$c" "$n"
-        note "$c: wan=$wan(${WAN_IP[$n]}) inside=$ins(${INSIDE_IP[$n]}, table $VRF) kernel↔FRR ${FRR_IP[$n]}"
+        note "$c: wan=$wan(${WAN_IP[$n]}, table 0) inside=$ins(${INSIDE_IP[$n]}, VPN $VPN=table $VPN) kernel↔FRR ${FRR_IP[$n]}"
     done
 
     # 先建所有 WG 接口（每个接口自己 generate-key；同对端的多条隧道不能用同一把
@@ -579,8 +600,12 @@ stage_dataplane() {
             vpp "$cb" wireguard peer add "$bif" public-key "$puba" endpoint "${WAN_IP[$a]}" \
                 allowed-ip 0.0.0.0/0 allowed-ip ::/0 dst-port "$aport" persistent-keepalive 5 >/dev/null ||
             die "$cb: 加 peer 失败"
-        vpp_fib_has "$ca" "$bov/32" || vpp "$ca" ip route add "$bov/32" via "$aif" >/dev/null
-        vpp_fib_has "$cb" "$aov/32" || vpp "$cb" ip route add "$aov/32" via "$bif" >/dev/null
+        # 对端 overlay /32 落在 overlay 表（wg 接口也在那里）。下一条 hop 的
+        # 解析只认显式接口，这张 /32 是给 BFD/探针和排障用的直连条目。
+        vpp "$ca" show ip fib table "$OVERLAY" | grep -q "^$bov/32" ||
+            vpp "$ca" ip route add table "$OVERLAY" "$bov/32" via "$aif" >/dev/null
+        vpp "$cb" show ip fib table "$OVERLAY" | grep -q "^$aov/32" ||
+            vpp "$cb" ip route add table "$OVERLAY" "$aov/32" via "$bif" >/dev/null
     done < <(tunnel_rows)
 
     log "dataplane: transit（三个 per-tunnel transit 端口）"
@@ -597,7 +622,7 @@ stage_dataplane() {
 
 # ==================================================================
 stage_control() {
-    log "control: sr-route（静态 local 10.68.N.0/24）+ sr-fib（table $VRF，标签 266）"
+    log "control: sr-route（静态 local 10.68.N.0/24）+ sr-fib（VPN table $VPN，标签 $LABEL）"
     local n c node_id a b aif aport aov bif bport bov pa pb tport tun route_tun fib_tun
     for n in 1 2 3; do
         c=lab-cpe$n
@@ -631,8 +656,8 @@ stage_control() {
   "tls_server_name": "$RR_ADDR",
   "rrs": [{"id": "rr-a", "addr": "$RR_ADDR:$RR_PORT"}],
   "tunnels": [$route_tun],
-  "vrfs": [{"id": $VRF, "export_rts": ["65000:$VRF"], "import_rts": ["65000:$VRF"]}],
-  "local_prefixes": [{"vrf_id": $VRF, "prefix": "${LAN_PFX[$n]}"}],
+  "vrfs": [{"id": $VPN, "export_rts": ["65000:$VPN"], "import_rts": ["65000:$VPN"]}],
+  "local_prefixes": [{"vrf_id": $VPN, "prefix": "${LAN_PFX[$n]}"}],
   "status_addr": "0.0.0.0:${ROUTE_STATUS[$n]}"
 }
 EOF
@@ -643,7 +668,7 @@ EOF
   "status_url": "http://127.0.0.1:${ROUTE_STATUS[$n]}/status",
   "vpp_socket": "/run/vpp/api.sock",
   "poll_sec": 1,
-  "vrfs": [$VRF],
+  "vrfs": [$VPN],
   "tunnels": [$fib_tun],
   "local": {"next_hop": "${FRR_IP[$n]}", "interface": "$ins"}
 }
@@ -695,23 +720,23 @@ EOF
             local got=0
             for remote in 1 2 3; do
                 [ "$remote" = "$n" ] && continue
-                vpp "$c" show ip fib table "$VRF" | grep -q "^${LAN_PFX[$remote]}" && got=$((got + 1))
+                vpp "$c" show ip fib table "$VPN" | grep -q "^${LAN_PFX[$remote]}" && got=$((got + 1))
             done
             [ "$got" = "2" ] && break
             sleep 0.5
         done
         for remote in 1 2 3; do
             [ "$remote" = "$n" ] && continue
-            vpp "$c" show ip fib table "$VRF" | grep -q "^${LAN_PFX[$remote]}" ||
-                die "$c: table $VRF 里没有 ${LAN_PFX[$remote]}（cat /var/log/sr-fib.log）"
+            vpp "$c" show ip fib table "$VPN" | grep -q "^${LAN_PFX[$remote]}" ||
+                die "$c: table $VPN 里没有 ${LAN_PFX[$remote]}（cat /var/log/sr-fib.log）"
         done
-        # 本站客户 LAN 也必须由 sr-fib 的 local 路径装进 table 250（不压标签、
+        # 本站客户 LAN 也必须由 sr-fib 的 local 路径装进 VPN table（不压标签、
         # 下一跳是盒内 FRR），否则远端解封装回来的包没有出口。
-        vpp "$c" show ip fib table "$VRF" "${LAN_PFX[$n]}" | grep -q "dpo-drop" &&
+        vpp "$c" show ip fib table "$VPN" "${LAN_PFX[$n]}" | grep -q "dpo-drop" &&
             die "$c: 本地 ${LAN_PFX[$n]} 解析成 dpo-drop（看 /var/log/sr-fib.log）"
-        vpp "$c" show ip fib table "$VRF" "${LAN_PFX[$n]}" | grep -q "${FRR_IP[$n]}" ||
+        vpp "$c" show ip fib table "$VPN" "${LAN_PFX[$n]}" | grep -q "${FRR_IP[$n]}" ||
             die "$c: 本地 ${LAN_PFX[$n]} 没有经 ${FRR_IP[$n]} 转发"
-        note "$c: FIB 已装好（远端压 266；本地 10.68.$n.0/24 → ${FRR_IP[$n]}）"
+        note "$c: FIB 已装好（远端压 $LABEL；本地 10.68.$n.0/24 → ${FRR_IP[$n]}）"
     done
 }
 
@@ -729,9 +754,9 @@ stage_frr() {
   "poll_sec": 1,
   "distance": 1,
   "metric": 20,
-  "vrfs": [{"vrf_id": $VRF, "table_id": $FRR_TABLE}],
+  "vrfs": [{"vrf_id": $VPN, "table_id": $FRR_TABLE}],
   "import": {
-    "vrf_id": $VRF,
+    "vrf_id": $VPN,
     "tag": $BGP_TAG,
     "prefixes_url": "http://127.0.0.1:${ROUTE_STATUS[$n]}/local-prefixes"
   }

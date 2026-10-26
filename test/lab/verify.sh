@@ -4,7 +4,7 @@
 # 拓扑要点：每个站点是一台"盒子"= lab-cpeN（VPP 数据面 + 盒内 FRR +
 # sr-route/sr-fib/sr-frr），盒子外接一台客户路由器 lab-custN，再往外是
 # lab-termN。所以报文路径是：
-#   终端 → 客户路由器 → 盒内核 xconn → VPP table 250 → SR/WG → 对端盒子 →
+#   终端 → 客户路由器 → 盒内核 xconn → VPP VPN table 0 → SR/WG → 对端盒子 →
 #   对端客户路由器 → 对端终端
 #
 # 再单独验证两个方向的 FRR 联动：
@@ -17,8 +17,9 @@
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-VRF=250
-LABEL=266
+VPN=0            # 客户 VPN ID，直接当 VPP 表号（0 = global）
+OVERLAY=250      # 隧道与 overlay 下一跳所在的表，不是 VPN
+LABEL=$((1000 + VPN))
 TUNNEL_MTU=1360
 FRR_TABLE=1250
 BGP_TAG=1001
@@ -86,7 +87,7 @@ retry() {   # <秒> <命令...>
 # want_rib 格式："prefix:nh,prefix:nh"；want_local 是逗号分隔的 prefix。
 status_check() {   # <cpe> <port> <want_rib> <want_local>
     local c=$1 port=$2 want=$3 wantl=$4
-    docker exec "$c" python3 - "$port" "$VRF" "$want" "$wantl" <<'PY' >/dev/null 2>&1
+    docker exec "$c" python3 - "$port" "$VPN" "$want" "$wantl" <<'PY' >/dev/null 2>&1
 import json, sys, urllib.request
 port, vrf, want, wantl = sys.argv[1:5]
 d = json.load(urllib.request.urlopen("http://127.0.0.1:%s/status" % port, timeout=3))
@@ -127,9 +128,13 @@ done
 sect "2. 盒内核 ↔ VPP 的接缝（vti0/vti1 + 转发开关）"
 for n in 1 2 3; do
     c=lab-cpe$n
-    vppc "$c" show interface addr | grep -q "L3 ${INSIDE_IP[$n]}/" \
-        && ok "$c: VPP 侧持有 ${INSIDE_IP[$n]}（table $VRF 入口）" \
+    addr=$(vppc "$c" show interface addr)
+    echo "$addr" | grep -q "L3 ${INSIDE_IP[$n]}/" \
+        && ok "$c: VPP 侧持有 ${INSIDE_IP[$n]}（VPN table $VPN 入口）" \
         || bad "$c: VPP 侧没有 ${INSIDE_IP[$n]}"
+    echo "$addr" | grep "L3 ${INSIDE_IP[$n]}/" | grep -q "ip4 table-id" \
+        && bad "$c: ${INSIDE_IP[$n]} 不在 global table 0（VPN 0 与 underlay 同表）" \
+        || ok "$c: ${INSIDE_IP[$n]} 在 global table 0"
     docker exec "$c" ip -o -4 addr show | grep -q "inet ${FRR_IP[$n]}/" \
         && ok "$c: 内核 vti0 持有 ${FRR_IP[$n]}（盒内 FRR 下一跳）" \
         || bad "$c: 内核没有 ${FRR_IP[$n]}"
@@ -161,6 +166,10 @@ for n in 1 2 3; do
             && ok "$c: $wgif 存在" || bad "$c: $wgif 不存在"
         vppc "$c" show interface addr | grep -q "L3 $ov/32" \
             && ok "$c: $wgif 持有 overlay $ov/32" || bad "$c: $wgif 没有 $ov/32"
+        vppc "$c" show interface addr | grep -A1 "^$wgif (" |
+            grep -q "ip4 table-id $OVERLAY " \
+            && ok "$c: $wgif 在 overlay 表 $OVERLAY" \
+            || bad "$c: $wgif 不在 overlay 表 $OVERLAY（show interface addr）"
         case ",$ports," in *",$port,"*) ok "$c: vpn 端口集合含 $port" ;;
             *) bad "$c: vpn 端口集合 '$ports' 不含 $port" ;; esac
         mtu=$(vppc "$c" show interface "$wgif" | awk -v n="$wgif" '$1==n{print $4; exit}')
@@ -225,28 +234,39 @@ for n in 1 2 3; do
         || bad "$c: sr-route 状态不符合预期（docker exec $c curl -s http://127.0.0.1:${ROUTE_STATUS[$n]}/status）"
 done
 
-sect "6. VPP FIB（table $VRF：远端压标签 $LABEL，本地不打标签交给盒内 FRR）"
+sect "6. VPP FIB（VPN table $VPN：远端压标签 $LABEL，本地不打标签交给盒内 FRR）"
 for n in 1 2 3; do
     c=lab-cpe$n
-    fib=$(vppc "$c" show ip fib table "$VRF")
+    fib=$(vppc "$c" show ip fib table "$VPN")
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
         for pfx in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
             echo "$fib" | grep -q "^$pfx" \
-                && ok "$c: table $VRF 有远端 $pfx" || bad "$c: table $VRF 缺 $pfx"
+                && ok "$c: table $VPN 有远端 $pfx" || bad "$c: table $VPN 缺 $pfx"
             echo "$fib" | grep -A8 "^$pfx" |
                 grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" \
                 && ok "$c: $pfx 压标签 $LABEL" || bad "$c: $pfx 没压标签 $LABEL"
         done
     done
     for pfx in "${LAN_PFX[$n]}" "${LOOP_IP[$n]}/32"; do
-        one=$(vppc "$c" show ip fib table "$VRF" "$pfx")
+        one=$(vppc "$c" show ip fib table "$VPN" "$pfx")
         echo "$one" | grep -q "via ${FRR_IP[$n]} " \
             && ok "$c: 本地 $pfx 交给盒内 FRR（${FRR_IP[$n]}），不打标签" \
             || bad "$c: 本地 $pfx 没指向盒内 FRR ${FRR_IP[$n]}"
         echo "$one" | grep -q "dpo-drop" \
             && bad "$c: 本地 $pfx 是 dpo-drop" || ok "$c: 本地 $pfx 不是 dpo-drop"
     done
+    # overlay 表只放隧道与 /32 下一跳：客户前缀一律不许混进来。
+    ovf=$(vppc "$c" show ip fib table "$OVERLAY")
+    for m in 1 2 3; do
+        [ "$m" = "$n" ] && continue
+        echo "$ovf" | grep -q "^$(peer_overlay "$n" "$m")/32" \
+            && ok "$c: overlay 表有对端 $(peer_overlay "$n" "$m")/32" \
+            || bad "$c: overlay 表缺对端 $(peer_overlay "$n" "$m")/32"
+    done
+    echo "$ovf" | grep -qE "^(10\.68\.|172\.16\.)" \
+        && bad "$c: overlay 表里混进了客户前缀" \
+        || ok "$c: overlay 表只有隧道/overlay，没有客户前缀"
 done
 
 sect "7. 正向导入：sr-frr → FRR table $FRR_TABLE → BGP → 客户路由器"

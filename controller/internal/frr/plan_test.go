@@ -53,7 +53,7 @@ func TestValidateTables(t *testing.T) {
 	}{
 		{"正常", []Table{{VRF: 1, ID: 1000}}, true},
 		{"空", nil, false},
-		{"VRF 0", []Table{{VRF: 0, ID: 1000}}, false},
+		{"VRF 0", []Table{{VRF: 0, ID: 1000}}, true},
 		{"表号 255", []Table{{VRF: 1, ID: 255}}, false},
 		{"表号 256", []Table{{VRF: 1, ID: 256}}, true},
 		{"表号过大", []Table{{VRF: 1, ID: MaxTableID + 1}}, false},
