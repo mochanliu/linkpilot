@@ -3,13 +3,17 @@
 #
 # 拓扑要点：每个站点是一台"盒子"= lab-cpeN（VPP 数据面 + 盒内 FRR +
 # sr-route/sr-fib/sr-frr），盒子外接一台客户路由器 lab-custN，再往外是
-# lab-termN。所以报文路径是：
-#   终端 → 客户路由器 → 盒内核 xconn → VPP VPN table 0 → SR/WG → 对端盒子 →
-#   对端客户路由器 → 对端终端
+# lab-termN。盒子里的分工是：FRR 只算路由（BGP 跑在 linux-cp 送出的内核 TAP
+# lcp-x0 上），VPP 转发**全部**数据（WAN 口与客户口都在 VPP 里，盒内核不转发）。
+# 所以报文路径是：
+#   终端 → 客户路由器 → VPP 客户口 → （远端：SR/WG + MPLS 标签 1000）→ 对端
+#   VPP 客户口 → 对端客户路由器 → 对端终端
 #
-# 再单独验证两个方向的 FRR 联动：
+# 再单独验证三条联动路径：
 #   正向：sr-route RIB → sr-frr → FRR table 1250 → BGP → 客户路由器
-#   反向：客户 BGP（tag 1001）→ 盒内 FRR → sr-frr → sr-route local → 远端 FIB
+#   反向：客户 BGP（tag 1001）→ 盒内 FRR → sr-frr → sr-route local
+#   数据面接缝：FRR 主表 → zebra 装内核 → linux-nl → VPP table 0（本地前缀
+#   交给客户路由器）；远端前缀由 sr-fib 直接装 VPP 并压标签
 #
 # 只读：不改任何配置，不重启任何进程。失败项逐条打印，最后给总数。
 #
@@ -25,8 +29,7 @@ FRR_TABLE=1250
 BGP_TAG=1001
 ROUTE_STATUS=( "" 19001 19002 19003 )
 WAN_IP=( "" 10.88.1.11 10.88.1.12 10.88.1.13 )
-INSIDE_IP=( "" 10.78.1.2 10.78.2.2 10.78.3.2 )
-FRR_IP=( "" 10.78.1.20 10.78.2.20 10.78.3.20 )
+LCP_IF=lcp-x0
 XCONN_IP=( "" 10.79.1.2 10.79.2.2 10.79.3.2 )
 CUST_X_IP=( "" 10.79.1.3 10.79.2.3 10.79.3.3 )
 LAN_PFX=( "" 10.68.1.0/24 10.68.2.0/24 10.68.3.0/24 )
@@ -65,12 +68,14 @@ peer_up() {   # <cpe> <want>
     n=$(vppc "$1" show wireguard peer | grep -c 'flags: 2')
     [ "$n" -ge "$2" ]
 }
-kern_if_for_ip() {   # <cpe> <ip> -> 内核接口名
-    docker exec "$1" ip -o -4 addr show 2>/dev/null |
-        awk -v w="$2" '{split($4,a,"/"); if (a[1]==w) {print $2; exit}}'
+vpp_if_for_ip() {   # <cpe> <ip> -> VPP 里持有该地址的接口名
+    vppc "$1" show interface addr |
+        awk -v want="$2" '
+            /:[[:space:]]*$/ { n=$1; next }
+            index($0, "L3 " want "/") { print n; exit }'
 }
-kern_fwd() {   # <cpe> <iface> -> forwarding 值
-    docker exec "$1" cat "/proc/sys/net/ipv4/conf/$2/forwarding" 2>/dev/null || echo NA
+kern_ipfwd() {   # <cpe> -> Ip: Forwarding（MIB: 1=forwarding, 2=notForwarding）
+    docker exec "$1" awk '/^Ip:/{n++; if(n==2){print $2; exit}}' /proc/net/snmp 2>/dev/null || echo NA
 }
 
 # 反复执行直到成功（收敛类断言用）
@@ -124,36 +129,71 @@ for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-transit; do
     vppc "$c" show version | grep -q "vpp v" && ok "$c: VPP 在运行" || bad "$c: VPP 不可用"
     vppc "$c" show plugins | grep -q sr_wg_plugin.so && ok "$c: sr_wg 插件已加载" || bad "$c: sr_wg 插件缺失"
 done
+# 这两个插件是"FRR 算路由、VPP 转发"的接缝；没加载时 show lcp 直接不存在。
+for c in lab-cpe1 lab-cpe2 lab-cpe3; do
+    for p in linux_cp_plugin.so linux_nl_plugin.so; do
+        vppc "$c" show plugins | grep -q "$p" && ok "$c: $p 已加载" || bad "$c: $p 未加载"
+    done
+done
 
-sect "2. 盒内核 ↔ VPP 的接缝（vti0/vti1 + 转发开关）"
+sect "2. 盒子接缝（linux-cp：FRR 跑在内核 TAP，VPP 独占转发）"
 for n in 1 2 3; do
     c=lab-cpe$n
     addr=$(vppc "$c" show interface addr)
-    echo "$addr" | grep -q "L3 ${INSIDE_IP[$n]}/" \
-        && ok "$c: VPP 侧持有 ${INSIDE_IP[$n]}（VPN table $VPN 入口）" \
-        || bad "$c: VPP 侧没有 ${INSIDE_IP[$n]}"
-    echo "$addr" | grep "L3 ${INSIDE_IP[$n]}/" | grep -q "ip4 table-id" \
-        && bad "$c: ${INSIDE_IP[$n]} 不在 global table 0（VPN 0 与 underlay 同表）" \
-        || ok "$c: ${INSIDE_IP[$n]} 在 global table 0"
-    docker exec "$c" ip -o -4 addr show | grep -q "inet ${FRR_IP[$n]}/" \
-        && ok "$c: 内核 vti0 持有 ${FRR_IP[$n]}（盒内 FRR 下一跳）" \
-        || bad "$c: 内核没有 ${FRR_IP[$n]}"
-    [ "$(kern_fwd "$c" vti0)" = "1" ] && ok "$c: vti0 转发开" || bad "$c: vti0 forwarding=$(kern_fwd "$c" vti0)"
-    [ "$(kern_fwd "$c" vti1)" = "0" ] && ok "$c: vti1 转发关（只在 VPP 里转，避免重复）" \
-        || bad "$c: vti1 forwarding=$(kern_fwd "$c" vti1)"
-    xif=$(kern_if_for_ip "$c" "${XCONN_IP[$n]}")
-    if [ -z "$xif" ]; then
-        bad "$c: 内核没有客户侧接缝地址 ${XCONN_IP[$n]}"
-    elif [ "$(kern_fwd "$c" "$xif")" = "1" ]; then
-        ok "$c: $xif（面向客户路由器）转发开"
+    wan=$(vpp_if_for_ip "$c" "${WAN_IP[$n]}")
+    xc=$(vpp_if_for_ip "$c" "${XCONN_IP[$n]}")
+    if [ -z "$wan" ]; then
+        bad "$c: VPP 里没有 WAN 地址 ${WAN_IP[$n]}"
     else
-        bad "$c: $xif forwarding=$(kern_fwd "$c" "$xif")"
+        ok "$c: VPP $wan 持有 WAN ${WAN_IP[$n]}"
+        echo "$addr" | grep "L3 ${WAN_IP[$n]}/" | grep -q "ip4 table-id" \
+            && bad "$c: WAN ${WAN_IP[$n]} 不在 table 0" \
+            || ok "$c: WAN ${WAN_IP[$n]} 在 table 0"
     fi
-    [ "$(docker exec "$c" cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] \
-        && ok "$c: 全局 ip_forward=1" || bad "$c: 全局 ip_forward 不是 1"
-    vtysh "$c" -c 'show ip route 0.0.0.0/0' | grep -q "${INSIDE_IP[$n]}" \
-        && ok "$c: 盒内 FRR 默认路由指向 VPP ${INSIDE_IP[$n]}" \
-        || bad "$c: 盒内 FRR 默认路由没指向 ${INSIDE_IP[$n]}"
+    if [ -z "$xc" ]; then
+        bad "$c: VPP 里没有客户口地址 ${XCONN_IP[$n]}"
+    else
+        ok "$c: VPP $xc 持有客户口 ${XCONN_IP[$n]}"
+        echo "$addr" | grep "L3 ${XCONN_IP[$n]}/" | grep -q "ip4 table-id" \
+            && bad "$c: 客户口 ${XCONN_IP[$n]} 不在 table 0" \
+            || ok "$c: 客户口 ${XCONN_IP[$n]} 在 table 0"
+    fi
+    # 地址只在 VPP + linux-cp 的 TAP 上：内核原始网卡不能再有它（否则 weak
+    # host 会抢先答 ARP）。
+    docker exec "$c" ip -o -4 addr show | grep -q "inet ${WAN_IP[$n]}/" \
+        && bad "$c: 内核还持有 WAN ${WAN_IP[$n]}（地址没搬进 VPP）" \
+        || ok "$c: 内核不持有 WAN ${WAN_IP[$n]}"
+    kxif=$(docker exec "$c" ip -o -4 addr show |
+        awk -v w="${XCONN_IP[$n]}" '{split($4,a,"/"); if (a[1]==w) {print $2; exit}}')
+    [ "$kxif" = "$LCP_IF" ] \
+        && ok "$c: 客户口地址只在内核 $LCP_IF（不在原始网卡）" \
+        || bad "$c: 客户口地址在内核上属于 '${kxif:-无}'，期望 $LCP_IF"
+    # linux-cp 配对 + lcp-sync：FRR 的 BGP 会话从 TAP 起。
+    vppc "$c" show lcp | grep -q 'lcp lcp-sync on' \
+        && ok "$c: lcp-sync 已打开" || bad "$c: lcp-sync 没打开"
+    vppc "$c" show lcp | grep -q " $xc .* $LCP_IF " \
+        && ok "$c: linux-cp 已配对 $xc ↔ $LCP_IF" \
+        || bad "$c: linux-cp 没有配对 $xc ↔ $LCP_IF"
+    # 盒内核不转发任何包：全局与每个接口都必须关，也没有默认路由。
+    [ "$(docker exec "$c" cat /proc/sys/net/ipv4/ip_forward)" = "0" ] \
+        && ok "$c: 全局 ip_forward=0" || bad "$c: 全局 ip_forward 不是 0"
+    fw=$(docker exec "$c" sh -c 'for i in /sys/class/net/*; do
+            [ -d "$i" ] || continue; i=$(basename "$i"); [ "$i" = lo ] && continue
+            cat "/proc/sys/net/ipv4/conf/$i/forwarding"; done' | tr -d '\r' | sort -u)
+    [ "$fw" = "0" ] && ok "$c: 所有非 lo 接口 forwarding=0" \
+        || bad "$c: 仍有接口 forwarding≠0（$fw）"
+    docker exec "$c" ip route show default | grep -q . \
+        && bad "$c: 内核还有默认路由（内核不该做路由器）" \
+        || ok "$c: 内核没有默认路由"
+    docker exec "$c" ip -o link show | grep -Eq '^[0-9]+: vti[01][@:]' \
+        && bad "$c: 还存在 vti0/vti1（旧架构残留）" \
+        || ok "$c: 没有 vti0/vti1"
+    # 原始网卡 arp_ignore=1：地址在 VPP，内核不该替它用错 MAC 回答 ARP。
+    [ -n "$xc" ] || continue
+    kif=${xc#host-}
+    [ "$(docker exec "$c" cat "/proc/sys/net/ipv4/conf/$kif/arp_ignore" 2>/dev/null)" = "1" ] \
+        && ok "$c: $kif 上 arp_ignore=1（不会抢答 VPP 的地址）" \
+        || bad "$c: $kif 上 arp_ignore 不是 1"
 done
 
 sect "3. WG 隧道（端口 / 路径 / 绑定 / peer）"
@@ -234,28 +274,42 @@ for n in 1 2 3; do
         || bad "$c: sr-route 状态不符合预期（docker exec $c curl -s http://127.0.0.1:${ROUTE_STATUS[$n]}/status）"
 done
 
-sect "6. VPP FIB（VPN table $VPN：远端压标签 $LABEL，本地不打标签交给盒内 FRR）"
+sect "6. VPP FIB（FRR 算路由、VPP 转发：远端压 $LABEL，本地交给客户路由器）"
 for n in 1 2 3; do
     c=lab-cpe$n
+    xc=$(vpp_if_for_ip "$c" "${XCONN_IP[$n]}")
     fib=$(vppc "$c" show ip fib table "$VPN")
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
         for pfx in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
             echo "$fib" | grep -q "^$pfx" \
-                && ok "$c: table $VPN 有远端 $pfx" || bad "$c: table $VPN 缺 $pfx"
+                && ok "$c: table $VPN 有远端 $pfx（sr-fib 直接装 VPP）" \
+                || bad "$c: table $VPN 缺 $pfx"
             echo "$fib" | grep -A8 "^$pfx" |
                 grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" \
                 && ok "$c: $pfx 压标签 $LABEL" || bad "$c: $pfx 没压标签 $LABEL"
         done
     done
-    for pfx in "${LAN_PFX[$n]}" "${LOOP_IP[$n]}/32"; do
-        one=$(vppc "$c" show ip fib table "$VPN" "$pfx")
-        echo "$one" | grep -q "via ${FRR_IP[$n]} " \
-            && ok "$c: 本地 $pfx 交给盒内 FRR（${FRR_IP[$n]}），不打标签" \
-            || bad "$c: 本地 $pfx 没指向盒内 FRR ${FRR_IP[$n]}"
-        echo "$one" | grep -q "dpo-drop" \
-            && bad "$c: 本地 $pfx 是 dpo-drop" || ok "$c: 本地 $pfx 不是 dpo-drop"
-    done
+    if [ -z "$xc" ]; then
+        bad "$c: 找不到客户口的 VPP 接口（本地前缀无从核对）"
+    else
+        for pfx in "${LAN_PFX[$n]}" "${LOOP_IP[$n]}/32"; do
+            one=$(vppc "$c" show ip fib table "$VPN" "$pfx")
+            echo "$one" | grep -q "via ${CUST_X_IP[$n]} $xc" \
+                && ok "$c: 本地 $pfx 在 VPP 里经 $xc 交给客户路由器 ${CUST_X_IP[$n]}" \
+                || bad "$c: 本地 $pfx 没有在 VPP 里指向 ${CUST_X_IP[$n]} $xc"
+            echo "$one" | grep -q "mpls-label" \
+                && bad "$c: 本地 $pfx 被压了标签（本地前缀不该走标签）" \
+                || ok "$c: 本地 $pfx 不打标签"
+            echo "$one" | grep -q "dpo-drop" \
+                && bad "$c: 本地 $pfx 是 dpo-drop" || ok "$c: 本地 $pfx 不是 dpo-drop"
+            # FRR 装进内核主表的原样记录：下一跳是客户路由器，出口是 TAP。
+            docker exec "$c" ip route show "$pfx" |
+                grep -q "via ${CUST_X_IP[$n]} dev $LCP_IF" \
+                && ok "$c: 内核主表 $pfx via ${CUST_X_IP[$n]} dev $LCP_IF（linux-nl 的输入）" \
+                || bad "$c: 内核主表没有 $pfx via ${CUST_X_IP[$n]} dev $LCP_IF"
+        done
+    fi
     # overlay 表只放隧道与 /32 下一跳：客户前缀一律不许混进来。
     ovf=$(vppc "$c" show ip fib table "$OVERLAY")
     for m in 1 2 3; do
@@ -267,6 +321,20 @@ for n in 1 2 3; do
     echo "$ovf" | grep -qE "^(10\.68\.|172\.16\.)" \
         && bad "$c: overlay 表里混进了客户前缀" \
         || ok "$c: overlay 表只有隧道/overlay，没有客户前缀"
+    # table 1250 是 FRR 专用停车场的镜像：只用于再分发，转发必须全是 drop。
+    t1250=$(vppc "$c" show ip fib table "$FRR_TABLE")
+    echo "$t1250" | grep -q "fib_index" \
+        && ok "$c: VPP table $FRR_TABLE 存在（linux-nl 镜像了 FRR 停车场）" \
+        || bad "$c: VPP table $FRR_TABLE 不存在"
+    echo "$t1250" | grep -q "mpls-label" \
+        && bad "$c: table $FRR_TABLE 里有压标签路由（不该参与转发）" \
+        || ok "$c: table $FRR_TABLE 没有压标签路由"
+    for m in 1 2 3; do
+        [ "$m" = "$n" ] && continue
+        echo "$t1250" | grep -A4 "^${LAN_PFX[$m]}" | grep -q "dpo-drop" \
+            && ok "$c: table $FRR_TABLE 的远端 ${LAN_PFX[$m]} 是 dpo-drop（不转发）" \
+            || bad "$c: table $FRR_TABLE 的远端 ${LAN_PFX[$m]} 不是 dpo-drop"
+    done
 done
 
 sect "7. 正向导入：sr-frr → FRR table $FRR_TABLE → BGP → 客户路由器"
@@ -277,6 +345,11 @@ for n in 1 2 3; do
     retry 20 bash -c "docker exec $c vtysh -c 'show bgp summary' | grep -q '^${CUST_X_IP[$n]} '" \
         && ok "$c: BGP 与客户路由器 ${CUST_X_IP[$n]}（AS ${CUST_AS[$n]}）建立" \
         || bad "$c: BGP 与 ${CUST_X_IP[$n]} 未建立"
+    # 会话的源地址必须是客户口（TAP 上那份），证明 BGP 跑在 linux-cp 的 TAP 上。
+    vtysh "$c" -c "show bgp neighbors ${CUST_X_IP[$n]}" |
+        grep -q "Local host: ${XCONN_IP[$n]}," \
+        && ok "$c: BGP 本地源地址是 ${XCONN_IP[$n]}（走 $LCP_IF，不经过内核转发）" \
+        || bad "$c: BGP 本地源地址不是 ${XCONN_IP[$n]}"
     t1250=$(vtysh "$c" -c "show ip route table $FRR_TABLE")
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
@@ -304,7 +377,8 @@ for n in 1 2 3; do
         done
     done
     vtysh "$c" -c 'show ip route 0.0.0.0/0' | grep -q "${XCONN_IP[$n]}" \
-        && ok "$c: 默认路由指向盒内核 ${XCONN_IP[$n]}" || bad "$c: 默认路由没指向 ${XCONN_IP[$n]}"
+        && ok "$c: 默认路由指向盒子客户口 ${XCONN_IP[$n]}（VPP）" \
+        || bad "$c: 默认路由没指向 ${XCONN_IP[$n]}"
 done
 
 sect "8. 反向导入：客户 BGP（tag $BGP_TAG）→ 盒内 FRR → sr-frr → sr-route local"
@@ -328,6 +402,9 @@ for n in 1 2 3; do
 done
 
 sect "9. 终端到终端 / 终端到远端客户 loopback（客户视角）"
+# 采样内核转发计数：数据流量全程只该走 VPP，内核一个包都不许转。
+FWD0=( "" "" "" "" )
+for n in 1 2 3; do FWD0[$n]=$(kern_ipfwd "lab-cpe$n"); done
 for a in 1 2 3; do
     for b in 1 2 3; do
         [ "$a" = "$b" ] && continue
@@ -338,6 +415,16 @@ for a in 1 2 3; do
             && ok "lab-term$a -> cust$b loopback ${LOOP_IP[$b]} 通（反向导入落到了数据面）" \
             || bad "lab-term$a -> ${LOOP_IP[$b]} 不通"
     done
+done
+for n in 1 2 3; do
+    c=lab-cpe$n
+    fwd=$(kern_ipfwd "$c")
+    [ "$fwd" = "${FWD0[$n]}" ] \
+        && ok "$c: 跑完数据流量内核 Ip:Forwarding 没变（$fwd），证明内核没转发" \
+        || bad "$c: 内核 Ip:Forwarding 从 ${FWD0[$n]} 变成 $fwd（内核参与了转发）"
+    [ "$fwd" = "2" ] \
+        && ok "$c: Ip:Forwarding=2（MIB notForwarding）" \
+        || bad "$c: Ip:Forwarding=$fwd（期望 2 = notForwarding）"
 done
 
 sect "10. 数据面计数器"

@@ -5,13 +5,15 @@
 # 和客户路由器各自看到什么。深入某一层再去对应容器里敲命令（login 方式见
 # README.md）。
 #
-# 每台 lab-cpeN 是一整台盒子：VPP + 盒内 FRR + sr-route/sr-fib/sr-frr，
+# 每台 lab-cpeN 是一整台盒子：VPP 转发全部数据（WAN 口与客户口都在 VPP 里），
+# FRR 只算路由（BGP 跑在 linux-cp 送出的内核 TAP lcp-x0 上）。盒内核不转发。
 # 客户路由器是独立的 lab-custN。
 set -u
 
 VPN=0            # 客户 VPN ID，直接当 VPP 表号
 OVERLAY=250      # 隧道与 overlay 下一跳所在的表
-FRR_TABLE=1250
+FRR_TABLE=1250   # FRR 的远端前缀停车场（镜像进 VPP 后全是 dpo-drop）
+LCP_IF=lcp-x0
 ROUTE_STATUS=( "" 19001 19002 19003 )
 RR_STATUS=18447
 CTRL_PORT=8444
@@ -42,6 +44,19 @@ for c in lab-cpe1 lab-cpe2 lab-cpe3; do
 done
 echo
 hr
+echo "盒子接缝（linux-cp：FRR 在 $LCP_IF 上跑路由，VPP 转发全部数据）"
+for n in 1 2 3; do
+    c=lab-cpe$n
+    echo "  $c:"
+    vppc "$c" show lcp | sed 's/^/    /'
+    docker exec "$c" sh -c 'printf "    ip_forward=%s\n" "$(cat /proc/sys/net/ipv4/ip_forward)"' 2>/dev/null
+    docker exec "$c" ip -o -4 addr show dev "$LCP_IF" 2>/dev/null |
+        awk '{print "    '"$LCP_IF"': "$4}'
+    echo "    内核主表（linux-nl 的输入）："
+    docker exec "$c" ip -4 route 2>/dev/null | sed 's/^/      /'
+done
+echo
+hr
 echo "控制面"
 echo "  sr-ctrl : https://10.99.0.200:$CTRL_PORT"
 docker exec lab-rr curl -sf "http://127.0.0.1:$RR_STATUS/status" 2>/dev/null |
@@ -53,15 +68,17 @@ for n in 1 2 3; do
 done
 echo
 hr
-echo "VPP FIB table $VPN（客户 VPN）+ table $OVERLAY（overlay 隧道/下一跳）"
+echo "VPP FIB：table $VPN（客户 VPN + WAN/客户口）· table $OVERLAY（隧道/overlay）"
+echo "          · table $FRR_TABLE（FRR 停车场镜像，全 dpo-drop）"
 for n in 1 2 3; do
     echo "  lab-cpe$n:"
-    vppc "lab-cpe$n" show ip fib table "$VPN" | head -12 | sed 's/^/    0: /'
+    vppc "lab-cpe$n" show ip fib table "$VPN" | head -16 | sed 's/^/    '"$VPN"': /'
     vppc "lab-cpe$n" show ip fib table "$OVERLAY" | head -6 | sed "s/^/    $OVERLAY: /"
+    vppc "lab-cpe$n" show ip fib table "$FRR_TABLE" | head -6 | sed "s/^/    $FRR_TABLE: /"
 done
 echo
 hr
-echo "盒内 FRR（lab-cpeN：正向导出 table $FRR_TABLE / 反向吃 tag 1001）"
+echo "盒内 FRR（lab-cpeN：BGP 跑在 $LCP_IF 上；正向导出 table $FRR_TABLE / 反向吃 tag 1001）"
 for n in 1 2 3; do
     c=lab-cpe$n
     echo "  $c:"

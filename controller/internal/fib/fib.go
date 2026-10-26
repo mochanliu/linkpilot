@@ -19,6 +19,10 @@
 // 表布局：VPN 表号 = VPN ID（0, 1, ...），250 留给 overlay（wg 接口与对外下一跳
 // 空间），underlay 在 table 0 —— 所以 VPN 0 与 underlay 共用 table 0。MPLS 标签
 // 不分表：VPP 收包后的标签查表恒为全局 MPLS 表（实测与接口所在 IP 表无关）。
+//
+// 本包只装 overlay 学到的前缀。客户侧/本机前缀归盒内 FRR：FRR 把路由装进内核
+// FIB，VPP 的 linux-nl 插件再按 netlink 同步进同一张 VPP 表。两个写者不碰同一
+// 个前缀，也就不需要在 sr-fib 里再造一条"下一跳指向内核"的路径。
 package fib
 
 import (
@@ -65,26 +69,11 @@ type Tunnel struct {
 	Interface string
 }
 
-// Path 是一条可下发的路径。Label 为 0 表示不压标签：流量在盒子内部交给 FRR，
-// 不经过 overlay。
+// Path 是一条可下发的路径。Label 是压入的 VPN 标签。
 type Path struct {
 	NextHop   netip.Addr
 	Interface string
 	Label     uint32
-}
-
-// LocalRoute 是本机从客户侧学到（经盒内 FRR 反向上报）的前缀。它和 overlay
-// 学到的前缀落同一张 VRF 表，但出口是盒内的 FRR，不压标签。
-type LocalRoute struct {
-	VRF    uint8
-	Prefix string
-}
-
-// LocalPath 是本地前缀的出口：盒内 FRR 的 inside 地址，以及持有它的 VPP 接口。
-// 必须给出接口，否则下一跳解析不出来（与静态路由挂在接口上同理）。
-type LocalPath struct {
-	NextHop   netip.Addr
-	Interface string
 }
 
 // Route 是一条要落进 VPP 的前缀。
@@ -117,12 +106,7 @@ type Plan struct {
 // down 是"明确不可达"的下一跳集合（来自 UnreachablePeers）；nil 表示没有
 // 可达性信息，所有路径保留。显式不可达的路径与"下一跳不在隧道表里"同样处理：
 // 跳过它、留一条 warning，而不是把整条前缀撤掉 —— 同前缀可能还有别的隧道。
-//
-// local 是本机从客户侧学到、要交给盒内 FRR 的前缀（localPath 是它的出口）。
-// 它们不走隧道、不压标签；与 overlay 学到的同一前缀冲突时整份计划报错，因为
-// 混着两种路径的 FIB 条目会把流量静默分到两个方向。
-func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool,
-	local []LocalRoute, localPath LocalPath) (Plan, error) {
+func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool) (Plan, error) {
 	var p Plan
 	if len(vrfs) == 0 {
 		return p, fmt.Errorf("fib: 没有配置任何 VRF，无事可做")
@@ -201,32 +185,6 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 			}
 			k := key{table: uint32(r.VRF), prefix: prefix}
 			grouped[k] = append(grouped[k], Path{NextHop: nh, Interface: t.Interface, Label: LabelFor(r.VRF)})
-		}
-	}
-
-	// 本地前缀：从客户侧学到的，出口是盒内 FRR。单独成组，不与 overlay 路径合并。
-	localKeys := map[key]bool{}
-	if len(local) > 0 {
-		if !localPath.NextHop.IsValid() || !localPath.NextHop.Is4() || localPath.Interface == "" {
-			return p, fmt.Errorf("fib: 有 %d 条本地前缀，但本地出口（next_hop/interface）没配对", len(local))
-		}
-		for _, l := range local {
-			if !seenVRF[l.VRF] {
-				return p, fmt.Errorf("fib: 本地前缀 %s 引用了本机没配的 VRF %d", l.Prefix, l.VRF)
-			}
-			prefix, err := netip.ParsePrefix(l.Prefix)
-			if err != nil || !prefix.Addr().Is4() {
-				return p, fmt.Errorf("fib: 本地前缀 %q 不是规范 IPv4 前缀", l.Prefix)
-			}
-			k := key{table: uint32(l.VRF), prefix: prefix.Masked()}
-			if localKeys[k] {
-				continue
-			}
-			if _, clash := grouped[k]; clash {
-				return p, fmt.Errorf("fib: %s 既是本机从客户学到的前缀、又是 overlay 学到的路由；拒绝下发混合路径", k.prefix)
-			}
-			localKeys[k] = true
-			grouped[k] = []Path{{NextHop: localPath.NextHop, Interface: localPath.Interface}}
 		}
 	}
 

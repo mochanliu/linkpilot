@@ -16,29 +16,35 @@
 #
 #   客户终端        客户路由器            盒子（单容器 lab-cpeN）
 #   10.68.N.10 ──── 10.68.N.2             VPP：wan 10.88.1.1N（table 0）
-#                   xconn 10.79.N.3 ────  kernel 10.79.N.2
-#                                         │ veth vti0/vti1（盒内两半）
-#                                         │ kernel 10.78.N.20 <-> VPP 10.78.N.2（table 0）
+#                   xconn 10.79.N.3 ────  VPP host-eth1 10.79.N.2（table 0）
+#                                         │ linux-cp 把它镜像成内核 TAP lcp-x0
+#                                         │ 盒内 FRR/zebra：只在 TAP 上跑 BGP
 #                                         │ 客户 VPN 0 = table 0 / 标签 1000
 #                                         │ overlay（wg 接口）在 table 250
 #                                         └── SR-over-WG（经 lab-transit 两跳）
+#
+# **数据面只有 VPP 转发**：盒内核 ip_forward 与每个接口的 forwarding 全为 0，
+# 客户口的 IP 在 VPP 里。内核之所以还能跑 FRR，是因为 linux-cp 把客户口镜像成
+# 一条 TAP，VPP 只把"发给盒子自己"的 L3 本地流量（BGP/ARP）punt 到 TAP。
+# FRR 把客户路由装进内核主表，linux-nl 插件按 netlink 把主表镜像成 VPP table 0
+# —— 这就是"FRR 算路由、VPP 转发"。sr-fib 只管 overlay 学到的前缀（压标签走
+# wg）；两个写者不碰同一批前缀。
 #
 #   CPE 全互联（每对一条隧道，每隧道一个端口，一对 overlay /32）：
 #     T12  cpe1 wg0 51820 192.168.99.1  <-> cpe2 wg0 51820 192.168.99.2   transit 51821
 #     T13  cpe1 wg1 51840 192.168.100.1 <-> cpe3 wg0 51840 192.168.100.2  transit 51841
 #     T23  cpe2 wg1 51860 192.168.101.1 <-> cpe3 wg1 51860 192.168.101.2  transit 51861
 #
-#   路由：underlay 与客户侧默认都在 VPP table 0（global）。客户 VPN 0 = table 0，
+#   路由：underlay 与客户侧都在 VPP table 0（global）。客户 VPN 0 = table 0，
 #   VPN 标签 1000（= 标签基址 1000 + VPN ID 0）。wg 接口与 overlay 下一跳在
 #   table 250 —— 250 是 SD-WAN 路由域/传输表，不是 VPN；多 VPN 时 VPN N 用 table N
 #   （250 保留给 overlay）。
-#   静态 local prefix 是本站客户 LAN 10.68.N.0/24；客户路由器再通过 eBGP 宣告
-#   自己的 LAN 和 loopback 172.16.N.1/32。盒内 FRR 用 route-map 给客户路由打
-#   tag，sr-frr 只把带 tag 的 BGP 路由反向导入 sr-route 的 local prefixes；我方
-#   导出到 table 1250 再进 BGP 的路由 tag=0，不会被反向吸回（防环）。
+#   本站 LAN 与客户 loopback 都由客户路由器通过 eBGP 宣告：盒内 FRR 用 route-map
+#   给客户路由打 tag，sr-frr 只把带 tag 的 BGP 路由反向导入 sr-route 的 local
+#   prefixes；我方导出到 table 1250 再进 BGP 的路由 tag=0，不会被反向吸回（防环）。
 #
 # 管理网 10.99.0.0/24 承载控制面（RR 的 mTLS、sr-route 的 /status、控制器 8444）
-# 与各容器的第二跳，不进货数据面。数据面的 WAN/inside/xconn 都在容器内核或 VPP。
+# 与各容器的第二跳，不开在数据面上。数据面的 WAN / 客户口都在 VPP 里。
 #
 # 用法:
 #   test/lab/bringup.sh                 # 全量重建并配置
@@ -75,9 +81,7 @@ esac
 
 # ---------------- 手写的"控制器下发值" ----------------
 WAN_IP=(  "" 10.88.1.11 10.88.1.12 10.88.1.13 )
-INSIDE_IP=( "" 10.78.1.2 10.78.2.2 10.78.3.2 )   # VPP 侧 veth（客户 VPN 表）
-FRR_IP=(  "" 10.78.1.20 10.78.2.20 10.78.3.20 )  # 内核侧 veth（盒内 FRR）
-XCONN_IP=( "" 10.79.1.2 10.79.2.2 10.79.3.2 )    # 盒子 kernel 对客户路由器
+XCONN_IP=( "" 10.79.1.2 10.79.2.2 10.79.3.2 )    # 盒子的客户口（IP 在 VPP 里）
 CUST_X_IP=( "" 10.79.1.3 10.79.2.3 10.79.3.3 )   # 客户路由器对盒子
 MGMT_IP=( "" 10.99.0.11 10.99.0.12 10.99.0.13 )
 CUST_MGMT=( "" 10.99.0.21 10.99.0.22 10.99.0.23 )
@@ -91,6 +95,7 @@ TRANSIT_WAN=10.88.1.3
 VPN=0             # 客户 VPN ID，直接当 VPP 表号（0 = global；避开 250）
 OVERLAY=250       # 隧道与 overlay 下一跳所在的表，不是 VPN
 LABEL=$((1000 + VPN))  # VPN 标签 = 基址 1000 + VPN ID（16 是 IPv4 显式空标签）
+LCP_IF=lcp-x0     # 客户口在盒内核里的镜像 TAP 名（每台盒子自己的 netns，不冲突）
 ROUTE_STATUS=( "" 19001 19002 19003 )
 SR_KEY=00112233445566778899aabbccddeeff
 TUNNEL_MTU=1360
@@ -173,49 +178,89 @@ take_ip() {
                             echo '$ip $kif $pfx' >> /tmp/lab-ifstate"
 }
 
-# 盒内两半之间的 veth：vti0 留内核（10.78.N.20），vti1 给 VPP（10.78.N.2）。
-ensure_veth() {   # <cpe> <n>
-    local c=$1 n=$2
-    docker exec "$c" ip link show vti0 >/dev/null 2>&1 ||
-        docker exec "$c" ip link add vti0 type veth peer name vti1 >/dev/null ||
-        die "$c: 建 veth 失败"
-    docker exec "$c" ip link set vti0 up
-    docker exec "$c" ip link set vti1 up
-    docker exec "$c" ip -o -4 addr show dev vti0 | grep -q "${FRR_IP[$n]}/" ||
-        docker exec "$c" ip addr add "${FRR_IP[$n]}/24" dev vti0 ||
-        die "$c: 给 vti0 配 ${FRR_IP[$n]} 失败"
-    if ! vpp_addr_has "$c" "${INSIDE_IP[$n]}"; then
-        docker exec "$c" ip -o -4 addr show dev vti1 | grep -q "${INSIDE_IP[$n]}/" ||
-            docker exec "$c" ip addr add "${INSIDE_IP[$n]}/24" dev vti1 ||
-            die "$c: 给 vti1 配 ${INSIDE_IP[$n]} 失败"
+# 把内核网卡交给 VPP 并回显 VPP 接口名。IP 由 take_ip 单独搬。重复执行时
+# 已经在 VPP 里就什么都不做（不然会把 linux-cp 给配对接口换过的 MAC 又改回去）。
+host_if_for_ip() {   # <cpe> <ip> <pfx> <table>
+    local c=$1 ip=$2 pfx=$3 table=${4:-} vif
+    vif=$(vpp_ifname_for_ip "$c" "$ip")
+    if [ -n "$vif" ]; then
+        echo "$vif"
+        return 0
     fi
+    vif=$(ensure_host_if "$c" "$ip" "$pfx") || return 1
+    take_ip "$c" "$vif" "$ip" "$pfx" "$table"
+    echo "$vif"
 }
 
-# 内核转发只对盒内两半之间的链路开。VPP 的 host-interface 仍在内核里
-# （AF_PACKET），WAN 口也会收到一份拷贝；那些口必须关转发，否则同一包会被
-# 内核再转发一次（重复包会撞 WG replay window）。start-node.sh 会先把全局
-# ip_forward 清零，所以这个函数要在 VPP 起来之后再跑一遍。
-kernel_forwarding() {   # <cpe> <n>
-    local c=$1 n=$2 xcif
-    xcif=$(kernel_if_for_ip "$c" "${XCONN_IP[$n]}")
-    [ -n "$xcif" ] || die "$c: 找不到持有 ${XCONN_IP[$n]} 的内核接口"
+# 把内核上的 ip 搬进 VPP（可选放某张 table），并从内核摘掉。table 0 是 VPP 的
+# 默认表，不用也不该显式设置。
+take_ip() {
+    local c=$1 vif=$2 ip=$3 pfx=$4 table=${5:-} kif
+    kif=${vif#host-}
+    if [ -n "$table" ] && [ "$table" != "0" ]; then
+        vpp "$c" set interface ip table "$vif" "$table" >/dev/null
+    fi
+    vpp_addr_has "$c" "$ip" || vpp "$c" set interface ip address "$vif" "$ip/$pfx" >/dev/null
+    docker exec "$c" ip addr del "$ip/$pfx" dev "$kif" 2>/dev/null || true
+    docker exec "$c" sh -c "grep -q '^$ip ' /tmp/lab-ifstate 2>/dev/null ||
+                            echo '$ip $kif $pfx' >> /tmp/lab-ifstate"
+}
+
+# 盒内核不转发**任何**包：数据面全在 VPP。start-node.sh 已经把全局开关清零，
+# 这里把每个接口的 forwarding 也清零（per-interface 会覆盖全局），并重新清一遍
+# 默认路由 —— 内核不是路由器，没有"下一跳"这件事。
+kernel_no_forwarding() {   # <cpe>
+    local c=$1
     docker exec "$c" bash -lc '
         set -e
-        xcif='"$xcif"'
-        sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.forwarding=1 net.ipv4.conf.all.rp_filter=0
+        sysctl -qw net.ipv4.ip_forward=0 net.ipv4.conf.all.forwarding=0 net.ipv4.conf.all.rp_filter=0
         for i in /sys/class/net/*; do
             [ -d "$i" ] || continue          # bonding_masters 是文件，不是网卡
             i=$(basename "$i"); [ "$i" = lo ] && continue
-            case "$i" in
-              "$xcif"|vti0) fwd=1 ;;
-              *)            fwd=0 ;;
-            esac
-            sysctl -qw net.ipv4.conf."$i".forwarding=$fwd net.ipv4.conf."$i".rp_filter=0
-        done' || die "$c: 设置内核转发失败"
+            sysctl -qw net.ipv4.conf."$i".forwarding=0 net.ipv4.conf."$i".rp_filter=0
+        done' || die "$c: 关内核转发失败"
 }
 
-# docker 塞的默认路由（distance 0）会压住 zebra 的 static(distance 1)，
-# 客户流量就会跑去管理网桥。先删干净，再让 FRR 把默认路由装回内核。
+# AF_PACKET 让内核仍收到一份网卡拷贝。地址已经在 VPP 里，内核不该再拿同一个
+# IP 抢答 ARP（weak host model 会在 eth1 上用 eth1 的 MAC 回答），否则客户路由器
+# 会把包发给内核那份 eth1，VPP 在 ethernet-input 按 l3 mac mismatch 丢掉——
+# 表现为"BGP 通、数据不通"。arp_ignore=1：只允许持有该地址的接口回答。
+kernel_arp_owner_only() {   # <cpe>
+    local c=$1
+    docker exec "$c" bash -lc '
+        set -e
+        for i in /sys/class/net/*; do
+            [ -d "$i" ] || continue
+            i=$(basename "$i"); [ "$i" = lo ] && continue
+            sysctl -qw net.ipv4.conf."$i".arp_ignore=1
+        done' || die "$c: 设置 arp_ignore 失败"
+}
+
+# 客户口交给 VPP 之后，linux-cp 把它镜像成内核 TAP：FRR 只在这条 TAP 上跑 BGP，
+# 转发全部由 VPP 完成。lcp-sync 把 VPP 的地址（和以后的新地址）复制到 TAP。
+lcp_pair() {   # <cpe> <vpp-if>
+    local c=$1 vif=$2
+    if ! vpp "$c" show lcp | grep -q " $vif "; then
+        # 上一次 VPP 被 SIGKILL 时 TAP 可能残留，先清掉再配
+        docker exec "$c" ip link del "$LCP_IF" 2>/dev/null || true
+        vpp "$c" lcp create "$vif" host-if "$LCP_IF" >/dev/null ||
+            die "$c: lcp create $vif 失败"
+    fi
+    vpp "$c" lcp lcp-sync on >/dev/null
+}
+
+wait_lcp_addr() {   # <cpe> <ip> <pfx>
+    local c=$1 ip=$2 pfx=$3 i
+    for i in $(seq 1 40); do
+        docker exec "$c" ip -o -4 addr show dev "$LCP_IF" 2>/dev/null |
+            grep -q "inet $ip/$pfx" && return 0
+        sleep 0.25
+    done
+    die "$c: $LCP_IF 没有拿到 $ip/$pfx（lcp-sync 没生效：vppctl show lcp / show interface addr）"
+}
+
+# docker 塞的默认路由指向管理网桥。盒子不转发、也不做出口路由器，删掉它，
+# 让"内核没有默认路由"成为一个可断言的事实（数据走 VPP 的 FIB）。
 drop_kernel_default() {   # <container>
     docker exec "$1" sh -c 'while ip route del default 2>/dev/null; do :; done' || true
 }
@@ -302,13 +347,12 @@ router bgp ${BOX_AS[$n]}
   redistribute table-direct $FRR_TABLE
  exit-address-family
 !
-! 盒内默认路由指向 VPP：客户侧流量的明细路由由 BGP 提供，其余一律进 VPP
-! VPN table 0（远端前缀在那里压标签走隧道；本站前缀由 sr-fib 经 FRR 回来）。
-ip route 0.0.0.0/0 ${INSIDE_IP[$n]}
-!
+! 盒内核不做转发，所以这里**没有**默认路由：客户侧流量的明细路由由 BGP
+! 装进内核主表，linux-nl 再把它镜像成 VPP table 0；远端前缀压标签走隧道，
+! 由 sr-fib 直接写进同一张 VPP 表。
 EOF
-        # 客户路由器：只宣告自己的 LAN 与 loopback。loopback /32 是"反向导入"
-        # 的探针：它不在 bringup 的 local_prefixes 里，只能经 BGP 学到。
+        # 客户路由器：只宣告自己的 LAN 与 loopback。两个前缀都只能经 BGP 学到
+        # （盒内没有静态 local_prefixes）——这是"FRR 算路由"的前提。
         cat > "$RUN/cust$n.frr.conf" <<EOF
 frr defaults traditional
 hostname lab-cust$n
@@ -345,10 +389,10 @@ EOF
 
     for n in 1 2 3; do
         c=lab-cpe$n
-        # veth 必须在 FRR 起来之前就位：static 默认路由的下一跳 10.78.N.2
-        # 只有 veth 起来才可达，zebra 的 NHT 才会把默认路由装进内核。
-        ensure_veth "$c" "$n"
-        kernel_forwarding "$c" "$n"
+        # 内核既不当路由器也不当主机：转发全关、默认路由删掉。客户口的 IP
+        # 在 stage dataplane 里搬进 VPP（那时 FRR 的 BGP 会话会短暂断掉，
+        # stage frr 里重启 FRR 让它从 TAP 重新建会话）。
+        kernel_no_forwarding "$c"
         drop_kernel_default "$c"
         docker cp "$RUN/cpe$n.frr.conf" "$c:/etc/frr/frr.conf" >/dev/null
         docker exec "$c" bash -lc 'touch /etc/frr/vtysh.conf; chown -R frr:frr /etc/frr'
@@ -363,8 +407,9 @@ EOF
         vtysh "$c" -c 'show running-config' | grep -q "redistribute table-direct $FRR_TABLE" ||
             die "$c: frr.conf 没应用（docker exec $c vtysh -c 'show running-config'）"
         drop_kernel_default "$c"
-        wait_default_via "$c" "${INSIDE_IP[$n]}" "盒内默认路由应指向 VPP"
-        note "$c: FRR 10.7.1 + VPP 同盒，BGP AS ${BOX_AS[$n]}，默认路由 → ${INSIDE_IP[$n]}"
+        docker exec "$c" ip route show default | grep -q . &&
+            die "$c: 盒内核还有默认路由（内核不转发，不该有）"
+        note "$c: FRR 10.7.1 + VPP 同盒，BGP AS ${BOX_AS[$n]}；内核转发全关、无默认路由"
     done
 
     for n in 1 2 3; do
@@ -397,8 +442,12 @@ stage_vpp() {
         die "缺 sr_wg_plugin.so：先跑一次 test/scripts/test-e2e.sh 或在容器里编译插件"
     local c
     for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-transit; do
-        docker exec "$c" bash -lc 'pkill -9 -x vpp_main; pkill -9 -f "script -qefc vpp"; sleep 1; rm -f /run/vpp/*.sock' >/dev/null 2>&1
-        docker exec -d "$c" bash -lc "bash /workspace/test/docker/start-node.sh ${c}"
+        docker exec "$c" bash -lc 'pkill -9 -x vpp_main; pkill -9 -f "script -qefc vpp"; sleep 1
+            rm -f /run/vpp/*.sock; ip link del '"$LCP_IF"' 2>/dev/null' >/dev/null 2>&1
+        # 必须用工作区里那份启动配置：镜像自带的没有开 linux-cp/linux-nl，
+        # 而这两个插件是"FRR 算路由、VPP 转发"的接缝。
+        docker exec -d "$c" bash -lc \
+            "VPP_CONF=/workspace/test/docker/vpp-startup.conf bash /workspace/test/docker/start-node.sh ${c}"
     done
     for c in lab-cpe1 lab-cpe2 lab-cpe3 lab-transit; do
         local i
@@ -410,11 +459,15 @@ stage_vpp() {
             die "$c: VPP 没起来（docker exec $c tail -40 /var/log/vpp/vpp.log）"
         docker exec "$c" vppctl show plugins | grep -q sr_wg_plugin.so ||
             die "$c: sr_wg 插件没加载"
-        note "$c: VPP + sr_wg OK"
+        docker exec "$c" vppctl show plugins | grep -q linux_cp_plugin.so ||
+            die "$c: linux-cp 插件没加载（检查 /workspace/test/docker/vpp-startup.conf 的 plugins 段，必须带 .so）"
+        docker exec "$c" vppctl show plugins | grep -q linux_nl_plugin.so ||
+            die "$c: linux-nl 插件没加载（检查 /workspace/test/docker/vpp-startup.conf 的 plugins 段，必须带 .so）"
+        note "$c: VPP + sr_wg + linux-cp/linux-nl OK"
     done
-    # start-node.sh 为了防重复包把 ip_forward 清零了；盒内两半之间的转发要开回来。
+    # 内核一个包都不转发：数据面全在 VPP。
     local n
-    for n in 1 2 3; do kernel_forwarding "lab-cpe$n" "$n"; done
+    for n in 1 2 3; do kernel_no_forwarding "lab-cpe$n"; done
 }
 
 # ==================================================================
@@ -523,20 +576,28 @@ EOF
 
 # ==================================================================
 stage_dataplane() {
-    log "dataplane: CPE 的 underlay / inside veth / 隧道（每隧道一个端口 + overlay /32）"
-    local n c wan ins
+    log "dataplane: CPE 的 underlay / 客户口（linux-cp）/ 隧道（每隧道一个端口 + overlay /32）"
+    local n c wan xc
     for n in 1 2 3; do
         c=lab-cpe$n
-        ensure_veth "$c" "$n"
+        kernel_no_forwarding "$c"
+        kernel_arp_owner_only "$c"
         vpp "$c" sr-wg key set 1 "$SR_KEY" >/dev/null
         vpp "$c" mpls table add 0 >/dev/null
         vpp "$c" ip table add "$OVERLAY" >/dev/null
-        wan=$(ensure_host_if "$c" "${WAN_IP[$n]}" 24)
-        take_ip "$c" "$wan" "${WAN_IP[$n]}" 24
-        ins=$(ensure_host_if "$c" "${INSIDE_IP[$n]}" 24)
-        take_ip "$c" "$ins" "${INSIDE_IP[$n]}" 24 "$VPN"
-        kernel_forwarding "$c" "$n"
-        note "$c: wan=$wan(${WAN_IP[$n]}, table 0) inside=$ins(${INSIDE_IP[$n]}, VPN $VPN=table $VPN) kernel↔FRR ${FRR_IP[$n]}"
+        wan=$(host_if_for_ip "$c" "${WAN_IP[$n]}" 24 0)
+        xc=$(host_if_for_ip "$c" "${XCONN_IP[$n]}" 24 0)
+        [ -n "$xc" ] || die "$c: 客户口没交给 VPP"
+        lcp_pair "$c" "$xc"
+        wait_lcp_addr "$c" "${XCONN_IP[$n]}" 24
+        drop_kernel_default "$c"
+        # 客户路由器在 stage containers 里可能已经把 10.79.N.2 解析成内核 eth1
+        # 的 MAC（那时地址还在内核）。地址搬进 VPP 之后必须让它重新 ARP，否则
+        # 数据包会被 VPP 按 l3 mac mismatch 丢掉。
+        local cif
+        cif=$(kernel_if_for_ip "lab-cust$n" "${CUST_X_IP[$n]}")
+        [ -n "$cif" ] && docker exec "lab-cust$n" ip neigh flush dev "$cif" 2>/dev/null || true
+        note "$c: wan=$wan(${WAN_IP[$n]}, table 0) cust=$xc(${XCONN_IP[$n]}, table 0) → 内核 TAP $LCP_IF（BGP 走 TAP，转发走 VPP）"
     done
 
     # 先建所有 WG 接口（每个接口自己 generate-key；同对端的多条隧道不能用同一把
@@ -622,7 +683,7 @@ stage_dataplane() {
 
 # ==================================================================
 stage_control() {
-    log "control: sr-route（静态 local 10.68.N.0/24）+ sr-fib（VPN table $VPN，标签 $LABEL）"
+    log "control: sr-route（local 全部来自客户 BGP）+ sr-fib（VPN table $VPN，标签 $LABEL）"
     local n c node_id a b aif aport aov bif bport bov pa pb tport tun route_tun fib_tun
     for n in 1 2 3; do
         c=lab-cpe$n
@@ -642,10 +703,6 @@ stage_control() {
         done <<< "$TUNNELS"
         route_tun=${route_tun%,}; fib_tun=${fib_tun%,}
 
-        local ins
-        ins=$(vpp_ifname_for_ip "$c" "${INSIDE_IP[$n]}")
-        [ -n "$ins" ] || die "$c: 找不到持有 ${INSIDE_IP[$n]} 的 VPP 接口"
-
         cat > "$RUN/cpe$n.route.json" <<EOF
 {
   "tenant": "$TENANT",
@@ -657,20 +714,18 @@ stage_control() {
   "rrs": [{"id": "rr-a", "addr": "$RR_ADDR:$RR_PORT"}],
   "tunnels": [$route_tun],
   "vrfs": [{"id": $VPN, "export_rts": ["65000:$VPN"], "import_rts": ["65000:$VPN"]}],
-  "local_prefixes": [{"vrf_id": $VPN, "prefix": "${LAN_PFX[$n]}"}],
   "status_addr": "0.0.0.0:${ROUTE_STATUS[$n]}"
 }
 EOF
-        # local 路径是盒内 FRR：这些前缀在 VPP 里没有 overlay 下一跳，也不压
-        # 标签——报文交给内核，由 FRR/客户路由器继续转发。
+        # sr-fib 只装 overlay 学到的前缀（压标签走 wg）。本站/客户前缀归盒内
+        # FRR：FRR 把它们装进内核主表，linux-nl 再镜像进 VPP table 0。
         cat > "$RUN/cpe$n.fib.json" <<EOF
 {
   "status_url": "http://127.0.0.1:${ROUTE_STATUS[$n]}/status",
   "vpp_socket": "/run/vpp/api.sock",
   "poll_sec": 1,
   "vrfs": [$VPN],
-  "tunnels": [$fib_tun],
-  "local": {"next_hop": "${FRR_IP[$n]}", "interface": "$ins"}
+  "tunnels": [$fib_tun]
 }
 EOF
         docker cp "$RUN/cpe$n.route.json" "$c:/etc/sdwan/route.json" >/dev/null
@@ -680,7 +735,7 @@ EOF
         docker exec -d "$c" sh -c '/usr/local/bin/sr-route -config /etc/sdwan/route.json > /var/log/sr-route.log 2>&1'
     done
 
-    local i remote
+    local i
     for n in 1 2 3; do
         c=lab-cpe$n
         for i in $(seq 1 40); do
@@ -689,25 +744,14 @@ EOF
         done
         docker exec "$c" curl -sf --max-time 2 "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" >/dev/null 2>&1 ||
             die "$c: sr-route 状态口没起来（cat /var/log/sr-route.log）"
-    done
-    # 等三台都从 RR 收到另外两个站点。Go 的 encoding/json 是紧凑输出（冒号后没有
-    # 空格），所以这里必须容忍 0..n 个空格，别按"好看"的 JSON 写死。
-    for n in 1 2 3; do
-        c=lab-cpe$n
-        for i in $(seq 1 60); do
-            local have=0
-            for remote in 1 2 3; do
-                [ "$remote" = "$n" ] && continue
-                docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" |
-                    grep -Eq "\"prefix\":[[:space:]]*\"${LAN_PFX[$remote]}\"" && have=$((have + 1))
-            done
-            [ "$have" = "2" ] && break
+        for i in $(seq 1 40); do
+            docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" |
+                grep -Eq "\"active_rr\":[[:space:]]*0" && break
             sleep 0.5
         done
         docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" |
             grep -Eq "\"active_rr\":[[:space:]]*0" ||
             die "$c: 没有和 rr-a 同步（cat /var/log/sr-route.log）"
-        note "$c: RIB 已收齐另两个站点"
     done
 
     for n in 1 2 3; do
@@ -716,34 +760,41 @@ EOF
     done
     for n in 1 2 3; do
         c=lab-cpe$n
-        for i in $(seq 1 40); do
-            local got=0
-            for remote in 1 2 3; do
-                [ "$remote" = "$n" ] && continue
-                vpp "$c" show ip fib table "$VPN" | grep -q "^${LAN_PFX[$remote]}" && got=$((got + 1))
-            done
-            [ "$got" = "2" ] && break
-            sleep 0.5
+        for i in $(seq 1 20); do
+            docker exec "$c" pgrep -x sr-fib >/dev/null 2>&1 && break
+            sleep 0.25
         done
-        for remote in 1 2 3; do
-            [ "$remote" = "$n" ] && continue
-            vpp "$c" show ip fib table "$VPN" | grep -q "^${LAN_PFX[$remote]}" ||
-                die "$c: table $VPN 里没有 ${LAN_PFX[$remote]}（cat /var/log/sr-fib.log）"
-        done
-        # 本站客户 LAN 也必须由 sr-fib 的 local 路径装进 VPN table（不压标签、
-        # 下一跳是盒内 FRR），否则远端解封装回来的包没有出口。
-        vpp "$c" show ip fib table "$VPN" "${LAN_PFX[$n]}" | grep -q "dpo-drop" &&
-            die "$c: 本地 ${LAN_PFX[$n]} 解析成 dpo-drop（看 /var/log/sr-fib.log）"
-        vpp "$c" show ip fib table "$VPN" "${LAN_PFX[$n]}" | grep -q "${FRR_IP[$n]}" ||
-            die "$c: 本地 ${LAN_PFX[$n]} 没有经 ${FRR_IP[$n]} 转发"
-        note "$c: FIB 已装好（远端压 $LABEL；本地 10.68.$n.0/24 → ${FRR_IP[$n]}）"
+        docker exec "$c" pgrep -x sr-fib >/dev/null 2>&1 ||
+            die "$c: sr-fib 没起来（cat /var/log/sr-fib.log）"
+        # 此刻 RIB 还是空的：local 全部来自客户 BGP，要等 stage frr 把
+        # sr-frr 的 tag 1001 反向导入接上。远端前缀下 FIB 的断言也在那里。
+        note "$c: sr-route/sr-fib 在跑（RIB 要等客户 BGP 反向上报才有前缀）"
     done
 }
 
 # ==================================================================
 stage_frr() {
-    log "frr: sr-frr 正向导出 table $FRR_TABLE，反向把客户 BGP 路由导入 local prefixes"
-    local n c i
+    log "frr: 重启 FRR（客户口已是 TAP）+ sr-frr 正向导出 table $FRR_TABLE / 反向导入 tag $BGP_TAG"
+    local n c i remote have xc st
+
+    # 客户口的地址在 stage dataplane 里从内核 eth1 搬到了 VPP，再由 lcp-sync
+    # 复制到 TAP。FRR 之前在 eth1 上建过会话，eBGP 的 ConnectRetryTimer 是
+    # 120s —— 重启一次，让它立刻从 TAP（源地址 10.79.N.2）重新建会话。
+    for n in 1 2 3; do
+        c=lab-cpe$n
+        stop_proc "$c" sr-frr
+        docker exec "$c" bash -lc '/usr/lib/frr/frrinit.sh restart >/dev/null 2>&1 ||
+                                   /usr/lib/frr/frrinit.sh start >/dev/null 2>&1' ||
+            die "$c: FRR 重启失败（docker exec $c tail -40 /var/log/frr/frr.log）"
+        for i in $(seq 1 40); do
+            vtysh "$c" -c 'show version' >/dev/null 2>&1 && break
+            sleep 0.5
+        done
+        docker exec "$c" ip -o -4 addr show dev "$LCP_IF" |
+            grep -q "inet ${XCONN_IP[$n]}/24" ||
+            die "$c: $LCP_IF 上没有 ${XCONN_IP[$n]}/24——FRR 无法从 TAP 建 BGP"
+    done
+
     for n in 1 2 3; do
         c=lab-cpe$n
         cat > "$RUN/cpe$n.sr-frr.json" <<EOF
@@ -768,7 +819,56 @@ EOF
         docker exec -d "$c" sh -c '/usr/local/bin/sr-frr -config /etc/sr-frr.json > /var/log/sr-frr.log 2>&1'
     done
 
-    local remote have
+    # 1) 正向导入的边界：BGP 与客户路由器 Established（会话跑在 lcp TAP 上）。
+    for n in 1 2 3; do
+        c=lab-cpe$n
+        for i in $(seq 1 60); do
+            vtysh "$c" -c "show bgp neighbors ${CUST_X_IP[$n]}" |
+                grep -q 'BGP state = Established' && break
+            sleep 0.5
+        done
+        vtysh "$c" -c "show bgp neighbors ${CUST_X_IP[$n]}" |
+            grep -q 'BGP state = Established' ||
+            die "$c: 与客户路由器 ${CUST_X_IP[$n]} 的 BGP 没建立（vtysh -c 'show bgp summary'）"
+    done
+    note "三台盒子与客户路由器的 BGP 都 Established（客户口是 VPP，会话经 linux-cp 的 TAP）"
+
+    # 2) 反向上报：客户宣告的 LAN 与 loopback（tag $BGP_TAG）进 sr-route 的 local。
+    for n in 1 2 3; do
+        c=lab-cpe$n
+        for i in $(seq 1 60); do
+            st=$(docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status")
+            echo "$st" | grep -Eq "\"prefix\":[[:space:]]*\"${LAN_PFX[$n]}\"" &&
+                echo "$st" | grep -Eq "\"prefix\":[[:space:]]*\"${LOOP_IP[$n]}/32\"" && break
+            sleep 0.5
+        done
+        st=$(docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status")
+        echo "$st" | grep -Eq "\"prefix\":[[:space:]]*\"${LAN_PFX[$n]}\"" ||
+            die "$c: 客户 LAN ${LAN_PFX[$n]} 没有反向导入 sr-route（cat /var/log/sr-frr.log）"
+        echo "$st" | grep -Eq "\"prefix\":[[:space:]]*\"${LOOP_IP[$n]}/32\"" ||
+            die "$c: 客户 loopback ${LOOP_IP[$n]}/32 没有反向导入 sr-route（cat /var/log/sr-frr.log）"
+        note "$c: sr-route local 已有 ${LAN_PFX[$n]} 与 ${LOOP_IP[$n]}/32（来源是客户 BGP）"
+    done
+
+    # 3) RR 反射：每台都收到另外两个站点的 LAN + loopback。
+    for n in 1 2 3; do
+        c=lab-cpe$n
+        for i in $(seq 1 60); do
+            have=0
+            for remote in 1 2 3; do
+                [ "$remote" = "$n" ] && continue
+                st=$(docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status")
+                echo "$st" | grep -Eq "\"prefix\":[[:space:]]*\"${LAN_PFX[$remote]}\"" && have=$((have + 1))
+                echo "$st" | grep -Eq "\"prefix\":[[:space:]]*\"${LOOP_IP[$remote]}/32\"" && have=$((have + 1))
+            done
+            [ "$have" = "4" ] && break
+            sleep 0.5
+        done
+        [ "$have" = "4" ] || die "$c: RIB 没收到另两个站点的 LAN+loopback（cat /var/log/sr-route.log）"
+    done
+    note "三台的 RIB 都收齐了对方两个站点的 LAN + loopback"
+
+    # 4) 正向：sr-frr 把远端前缀停进 FRR table $FRR_TABLE，BGP 再发给客户路由器。
     for n in 1 2 3; do
         c=lab-cpe$n
         for i in $(seq 1 60); do
@@ -782,23 +882,46 @@ EOF
             sleep 0.5
         done
         [ "$have" = "2" ] || die "$c: table $FRR_TABLE 没收到两个远端前缀（cat /var/log/sr-frr.log）"
-        # 正向导入的边界：BGP 与客户路由器必须 Established。
-        for i in $(seq 1 40); do
-            vtysh "$c" -c "show bgp neighbors ${CUST_X_IP[$n]}" | grep -q 'BGP state = Established' && break
-            sleep 0.5
+        note "$c: table $FRR_TABLE 有另两个站点的前缀"
+    done
+
+    # 5) 数据面：同一张 VPP table $VPN 里，两个方向的出口对得上。
+    for n in 1 2 3; do
+        c=lab-cpe$n
+        xc=$(vpp_ifname_for_ip "$c" "${XCONN_IP[$n]}")
+        [ -n "$xc" ] || die "$c: 找不到客户口的 VPP 接口"
+        # 远端：sr-fib 写进来的、压标签走 wg
+        for remote in 1 2 3; do
+            [ "$remote" = "$n" ] && continue
+            for pfx in "${LAN_PFX[$remote]}" "${LOOP_IP[$remote]}/32"; do
+                for i in $(seq 1 60); do
+                    vpp "$c" show ip fib table "$VPN" "$pfx" |
+                        grep -q "mpls-label\[@[0-9]*\]:\[$LABEL:" && break
+                    sleep 0.5
+                done
+                one=$(vpp "$c" show ip fib table "$VPN" "$pfx")
+                echo "$one" | grep -q "^$pfx" ||
+                    die "$c: table $VPN 里没有远端 $pfx（cat /var/log/sr-fib.log）"
+                echo "$one" | grep -q "mpls-label\[@[0-9]*\]:\[$LABEL:" ||
+                    die "$c: 远端 $pfx 没压标签 $LABEL（cat /var/log/sr-fib.log）"
+            done
         done
-        vtysh "$c" -c "show bgp neighbors ${CUST_X_IP[$n]}" | grep -q 'BGP state = Established' ||
-            die "$c: 与客户路由器 ${CUST_X_IP[$n]} 的 BGP 没建立（vtysh -c 'show bgp summary'）"
-        # 反向导入的边界：客户宣告的 loopback 已经进 sr-route 的 local 集合。
-        for i in $(seq 1 60); do
-            docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" |
-                grep -Eq "\"prefix\":[[:space:]]*\"${LOOP_IP[$n]}/32\"" && break
-            sleep 0.5
+        # 本地：FRR → 内核主表 → linux-nl → VPP，下一跳是客户路由器、不压标签。
+        # 这条路径就是"FRR 算路由、VPP 转发"的直接证据。
+        for pfx in "${LAN_PFX[$n]}" "${LOOP_IP[$n]}/32"; do
+            for i in $(seq 1 60); do
+                vpp "$c" show ip fib table "$VPN" "$pfx" | grep -q "via ${CUST_X_IP[$n]} " && break
+                sleep 0.5
+            done
+            one=$(vpp "$c" show ip fib table "$VPN" "$pfx")
+            echo "$one" | grep -q "via ${CUST_X_IP[$n]} $xc" ||
+                die "$c: 本地 $pfx 没有经客户口 $xc 转发到 ${CUST_X_IP[$n]}（linux-nl 没同步？看 vppctl show lcp 与 /var/log/vpp/vpp.log）"
+            echo "$one" | grep -q "mpls-label" &&
+                die "$c: 本地 $pfx 被压了标签（本地前缀不该走标签）"
+            docker exec "$c" ip route show "$pfx" | grep -q "via ${CUST_X_IP[$n]} dev $LCP_IF" ||
+                die "$c: 内核主表里没有 $pfx via ${CUST_X_IP[$n]} dev $LCP_IF（zebra 没装进去？）"
         done
-        docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" |
-            grep -Eq "\"prefix\":[[:space:]]*\"${LOOP_IP[$n]}/32\"" ||
-            die "$c: 客户 loopback ${LOOP_IP[$n]}/32 没有反向导入 sr-route（cat /var/log/sr-frr.log）"
-        note "$c: table $FRR_TABLE 有远端前缀；BGP 与 cust$n Established；已反向导入 ${LOOP_IP[$n]}/32"
+        note "$c: VPP table $VPN —— 远端压 $LABEL 走隧道；本地 ${LAN_PFX[$n]} / ${LOOP_IP[$n]}/32 经 $xc 交给客户路由器"
     done
 }
 

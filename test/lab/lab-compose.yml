@@ -1,20 +1,20 @@
 # 复杂 lab 的容器与网络定义（bringup.sh 负责所有配置）。
 #
 #   盒子 = lab-cpeN（单容器，镜像 srwg-lab：VPP 26.06 + FRR 10.7.1 + 自研路由栈）
-#     VPP 侧：WAN 10.88.1.1N / inside veth 10.78.N.2（table 250）/ wg0,wg1
-#     内核侧：inside veth 10.78.N.20（盒内 FRR）/ xconn 10.79.N.2 / mgmt 10.99.0.1N
+#     VPP 侧：wan 10.88.1.1N / 客户口 10.79.N.2（都在 VPP table 0）/ wg0,wg1（table 250）
+#     内核侧：客户口的 linux-cp 镜像 TAP lcp-x0（FRR 只在这上面跑 BGP）/ mgmt 10.99.0.1N
 #
 #   客户路由器 lab-custN（quay FRR，AS 6500N）
 #     xconn 10.79.N.3 / LAN 10.68.N.2 / loopback 172.16.N.1/32 / mgmt 10.99.0.2N
 #   客户终端 lab-termN：LAN 10.68.N.10 / mgmt 10.99.0.3N
 #   公共：lab-transit 10.88.1.3 / lab-rr 10.88.1.100 / lab-ctrl 10.88.1.200
 #
-# 盒内 VPP 与盒内 FRR 之间的 inside 链路是一条容器内 veth（vti0/vti1），
-# 由 bringup.sh 创建：vti0 留内核（10.78.N.20），vti1 交给 VPP（10.78.N.2）。
-# 这样客户流量与路由协议都走同一个盒子的两半，正反向导入都能验。
+# **盒内核不转发任何包**：客户口的 IP 在 VPP 里，linux-cp 把客户口镜像成 TAP，
+# VPP 只把发给盒子自己的 L3 本地流量 punt 上去（BGP/ARP）。FRR 把客户路由装进
+# 内核主表，linux-nl 按 netlink 镜像成 VPP table 0 —— FRR 算路由、VPP 转发。
 #
-# 为什么 inside 用 .2 而不是 .1：docker 网桥自己占着子网的 .1，把 CPE 的 LAN
-# 地址配成 .1 会让宿主机网桥抢答 ARP/ICMP，和 VPP 抢同一个身份。
+# 为什么客户口用 .2 而不是 .1：docker 网桥自己占着子网的 .1，把盒子的客户口
+# 配成 .1 会让宿主机网桥抢答 ARP/ICMP，和 VPP 抢同一个身份。
 #
 # 所有数据面网络都关掉网桥 masquerade：WG 的 endpoint roaming 会把被 SNAT 过的
 # 外层源写进 peer 的 endpoint，之后 encap 再也对不上绑定端点（见 test/docker/
@@ -34,7 +34,8 @@ x-cpe: &cpe
     - NET_ADMIN
     - SYS_NICE
   sysctls:
-    - net.ipv4.ip_forward=1
+    # 盒子内核不转发：数据面全在 VPP（bringup 还会逐接口再关一遍）
+    - net.ipv4.ip_forward=0
     - net.ipv4.conf.all.rp_filter=0
 
 x-cust: &cust

@@ -5,15 +5,21 @@ WireGuard、盒内 FRR 的两个方向联动。目标是登进任意一个终端
 一路追到另一个站点的 10.68.M.10 或客户路由器 loopback，而不是只看单点命令
 输出。
 
-**每个 `lab-cpeN` 就是一台盒子**：一边是 VPP 数据面，另一边是盒内 FRR 与
-sr-route / sr-fib / sr-frr。盒内 FRR 的目的只有一个——和客户侧路由器跑路由
-协议；自研控制面与 FRR 之间由 sr-frr 双向搬运：
+**每个 `lab-cpeN` 就是一台盒子**：VPP 独占数据面（WAN 口和客户口都在 VPP
+里，**盒内核不转发任何包**），盒内 FRR 只当用户态控制面算路由，sr-route /
+sr-fib / sr-frr 把两套路由体系接起来。FRR 和 VPP 的接缝是 VPP 的
+`linux-cp` 插件：客户口在 VPP 里，同时被镜像成内核 TAP `lcp-x0`，BGP 就跑在
+这条 TAP 上；FRR 算出的路由由 zebra 装进内核主表，`linux-nl` 插件再把内核表
+1:1 镜像进 VPP，于是**转发的每一跳都由 VPP 完成**：
 
 - **正向**：sr-route RIB → sr-frr → FRR `table 1250` → `redistribute
   table-direct 1250` → BGP → 客户路由器。
 - **反向**：客户路由器 eBGP → 盒内 FRR（入方向 route-map 打 `tag 1001`）→
   sr-frr 只收 tag 1001 → `PUT /local-prefixes` → sr-route local → RR 反射 →
   远端 CPE 的 RIB / 带标签 FIB。
+- **落地**：远端前缀由 sr-fib 直接装 VPP（压标签 1000 走 wg）；本地前缀由
+  FRR 装内核主表（下一跳 = 客户路由器、出口 = `lcp-x0`），linux-nl 镜像成
+  VPP table 0 里「via <客户路由器> <客户口>」。
 
 **这里不开发控制器。** 按 2026-10-25 的指示，凡是由控制器下发的值（每隧道
 UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
@@ -25,24 +31,24 @@ UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
 ```
 站点 N（N = 1..3）：
 
-  lab-termN           lab-custN                      lab-cpeN（单容器盒子）
-  10.68.N.10 ──LAN──  10.68.N.2 ──xconn── 10.79.N.2
-                      (AS 6500N)                      盒内核
-                      lo 172.16.N.1                     ├─ vti0 10.78.N.20：盒内 FRR
-                                                        ├─ 默认 0.0.0.0/0 → 10.78.N.2
-                                                        └─ vti1（交给 VPP）
-                                                              │ 容器内 veth
-                                                        ┌─────┴──────────────────────────┐
-                                                        │ host-vti1 10.78.N.2 table 0    │ VPP
-                                                        │ wg0/wg1 ← WAN 10.88.1.1N       │
-                                                        │   （wg 接口在 table 250）      │
-                                                        └───────────────┬────────────────┘
-                                                                        └── SR-over-WG ── lab-transit 10.88.1.3
+  lab-termN           lab-custN                    lab-cpeN（单容器盒子）
+  10.68.N.10 ──LAN──  10.68.N.2 ──xconn── VPP 客户口 10.79.N.2（table 0）
+                      (AS 6500N)            │
+                      lo 172.16.N.1         │  linux-cp 把客户口镜像成内核 TAP
+                                            ├─ 盒内核 lcp-x0 10.79.N.2：只跑 BGP
+                                            │    （不转发，ip_forward=0，无默认路由）
+                                            │         │ zebra 装内核主表
+                                            │         │ linux-nl 镜像
+                                            └─────────┴── VPP table 0（转发全部数据）
+                                                          wg0/wg1 ← WAN 10.88.1.1N
+                                                          （wg 接口在 table 250）
+                                                              └── SR-over-WG ── lab-transit 10.88.1.3
 ```
 
-盒内核把默认路由交给 VPP 的 10.78.N.2。客户 VPN 0 与 underlay 共用 VPP
-**table 0**：远端前缀压标签 1000 走 wg 接口（wg 接口本身住在 overlay table
-250），本机前缀不压标签、交还给盒内 FRR（10.78.N.20）。
+客户 VPN 0 与 underlay 共用 VPP **table 0**：远端前缀压标签 1000 走 wg
+接口（wg 接口本身住在 overlay table 250），本站/客户前缀不压标签、下一跳是
+客户路由器（`via 10.79.N.3 host-ethX`）。盒内核只是 FRR 的计算现场，不参与
+任何转发。
 
 控制面（管理网 10.99.0.0/24，不进数据面）：
 
@@ -78,11 +84,13 @@ lab-custN 10.99.0.2N        BGP router-id
    tag 的路由，经 `PUT /local-prefixes` 变成 sr-route 的 local 集合。
 4. sr-route 把 local 集合（本站 LAN + 从客户学到的前缀）经 lab-rr 反射给
    另外两个站点。
-5. sr-fib 把远端前缀装成「压 1000、走对应 wg 接口、下一跳是对端 overlay」；
-   本机 local 前缀不压标签，下一跳是盒内 FRR（10.78.N.20）。
-6. 反方向：sr-frr 把控制面 RIB 导成 FRR **table 1250**，
+5. sr-fib 只装**远端**前缀：压 1000、走对应 wg 接口、下一跳是对端 overlay。
+   本站/客户前缀归 FRR：zebra 装内核主表（`via 10.79.N.3 dev lcp-x0`），
+   linux-nl 镜像进 VPP table 0，下一跳是客户路由器、不打标签。
+6. 反方向：sr-frr 把控制面 RIB 导成 FRR **table 1250**（黑洞下一跳），
    `redistribute table-direct 1250` 让它们进 BGP；客户路由器于是能看到
-   远端站点的 LAN 与 loopback。
+   远端站点的 LAN 与 loopback。这张表也会被 linux-nl 镜像成 VPP table
+   1250，但全是 `dpo-drop`——它只用于再分发，不参与转发。
 7. 客户侧终端只需要 `default via 10.68.N.2`（客户路由器）。
 
 防环：
@@ -91,6 +99,9 @@ lab-custN 10.99.0.2N        BGP router-id
   所以不会反向再吃一遍；这些前缀也只停在 table 1250，不进 zebra 主表。
 - 客户也宣告本站 LAN 时，sr-route 的 local 集合按前缀去重（静态 local 与
   动态导入合并），不会出现两条同前缀。
+- linux-nl 只镜像内核表里的路由：table 0 的本地前缀来自 FRR（下一跳客户
+  路由器），table 1250 是黑洞停车场的镜像，两者都在 VPP 里保持"转发由 VPP
+  做"这一条边界。
 
 ## 起停
 
@@ -105,10 +116,10 @@ test/lab/teardown.sh --purge   # 连 test/lab/run/（含一次性 CA）一起删
 分阶段调试（阶段之间可反复重跑，配置是幂等的）：
 
 ```bash
-test/lab/bringup.sh --stage containers   # 建容器/网络、veth、FRR 配置、客户路由器
-test/lab/bringup.sh --stage vpp          # 4 个 VPP（3 CPE + transit）
+test/lab/bringup.sh --stage containers   # 建容器/网络、FRR 配置、客户路由器
+test/lab/bringup.sh --stage vpp          # 4 个 VPP（3 CPE + transit，含 linux-cp/linux-nl）
 test/lab/bringup.sh --stage enroll       # 编译二进制、sr-ctrl、三台入网、RR 证书
-test/lab/bringup.sh --stage dataplane    # underlay/inside、WG、端口、SR 路径、peer
+test/lab/bringup.sh --stage dataplane    # 客户口交给 VPP + linux-cp、WG、端口、SR 路径、peer
 test/lab/bringup.sh --stage control      # sr-route + sr-fib（VPN table 0 / 标签 1000）
 test/lab/bringup.sh --stage frr          # sr-frr 正向导出 + 反向导入
 test/lab/bringup.sh --stage terms        # 终端默认路由
@@ -132,21 +143,28 @@ lab-cust1# show bgp summary
 lab-cust1# show bgp ipv4 unicast      # 应看到另两站的 LAN + loopback
 lab-cust1# show ip route              # 远端前缀 B>* via 10.79.1.2
 
-# 盒内 FRR（同一个 lab-cpe1 容器里）
+# 盒内 FRR（同一个 lab-cpe1 容器里，BGP 跑在 lcp-x0 上）
 docker exec -it lab-cpe1 vtysh
-lab-cpe1# show ip route table 1250    # sr-frr 正向导出的远端前缀
+lab-cpe1# show ip route table 1250    # sr-frr 正向导出的远端前缀（黑洞，不转发）
 lab-cpe1# show bgp ipv4 unicast       # 含客户路由（tag 1001 的那个）
-lab-cpe1# show ip route 172.16.1.1/32 # 客户 loopback，带 tag 1001
-lab-cpe1# show ip route 0.0.0.0/0     # 指回 VPP 10.78.1.2
+lab-cpe1# show ip route 172.16.1.1/32 # 客户 loopback，带 tag 1001、via 客户路由器
+lab-cpe1# show ip route               # 没有默认路由：盒内核不转发
+lab-cpe1# show bgp neighbors 10.79.1.3  # Local host: 10.79.1.2（TAP 上的会话）
+
+# 盒内核（只跑 FRR，不转发）
+docker exec -it lab-cpe1 ip route     # 客户路由 via 10.79.1.3 dev lcp-x0
+docker exec -it lab-cpe1 cat /proc/sys/net/ipv4/ip_forward   # 0
 
 # CPE 数据面
 docker exec -it lab-cpe1 vppctl
+vppctl# show lcp                       # host-ethX ↔ lcp-x0 的配对
 vppctl# show sr-wg ports
 vppctl# show sr-wg paths
 vppctl# show sr-wg tunnels
 vppctl# show wireguard peer
-vppctl# show ip fib table 0            # VPN 0：远端带标签 1000，本地 via 10.78.1.20
+vppctl# show ip fib table 0            # VPN 0：远端带标签 1000，本地 via 10.79.1.3 host-ethX
 vppctl# show ip fib table 250          # overlay：对端 /32 与 wg 接口所在表
+vppctl# show ip fib table 1250         # FRR 停车场镜像：全是 dpo-drop
 vppctl# show sr-wg stats
 vppctl# show trace                     # 先 trace add af-packet-input 100 再打流量
 
@@ -177,7 +195,7 @@ docker exec lab-cpe1 vppctl show trace
 | [lab-compose.yml](lab-compose.yml) | 12 个容器、8 张网；数据面网络全部关 masquerade |
 | [Dockerfile](Dockerfile) | 在 srwg-dev 上装 FRR 10.7.1，做 `srwg-lab:latest` |
 | [bringup.sh](bringup.sh) | 分阶段搭建；所有"控制器下发值"手写在这里 |
-| [verify.sh](verify.sh) | 从容器/VPP 一直到终端到终端、双向导入的 200+ 条断言 |
+| [verify.sh](verify.sh) | 从容器/VPP 一直到终端到终端、双向导入的 290+ 条断言 |
 | [status.sh](status.sh) | 只读状态快照 |
 | [teardown.sh](teardown.sh) | 拆除 |
 | `run/` | 生成的配置、取出的二进制、控制器 CA（.gitignore） |
@@ -191,21 +209,38 @@ docker exec lab-cpe1 vppctl show trace
   外层源写进 peer 的 endpoint，之后 encap 再也对不上绑定端点，整条 SR 路径
   静默旁路；BGP 的 TCP 源地址也会被改写。见 [test/docker/docker-compose.yml](../docker/docker-compose.yml)
   里同一段注释。
-- **CPE 的 inside 地址用 10.78.N.2 而不是 .1**：docker 网桥自己占着子网的
-  .1，会跟 VPP 抢同一个身份（ARP/ICMP）。
-- **盒内核的转发开关要按接口开/关**：`start-node.sh` 启动 VPP 时会
-  `ip_forward=0`（AF_PACKET host 接口仍把包投给内核，全开会重复转发并撞 WG
-  重放窗）。bringup 在 VPP 起来后改回 `ip_forward=1`，但只对 xconn 与 vti0
-  打开 per-interface forwarding，wan/mgmt/vti1 保持 0。
+- **linux-cp / linux-nl 插件必须用带 `.so` 的名字启用**：`plugin
+  linux_cp_plugin.so { enable }`。写成不带后缀的名字不会加载，也没有报错，
+  `show lcp` 直接不存在。启动配置见
+  [test/docker/vpp-startup.conf](../docker/vpp-startup.conf)。
+- **客户口在 VPP 里，同时是内核 TAP 的一端**：`lcp create <vpp-if> host-if
+  lcp-x0` 会把 VPP 接口的 MAC 换成 TAP 的 MAC；`lcp lcp-sync on` 把 VPP 的
+  地址（以及后加的地址）复制到 TAP。FRR 只在这条 TAP 上跑 BGP，`ip_forward`
+  保持 0——内核一个数据包都不转发。
+- **arp_ignore=1 是数据能通的前提**：AF_PACKET host 接口让内核仍收到一份网卡
+  拷贝；地址在 VPP、内核是 weak host，默认 `arp_ignore=0` 时内核会用原始网卡
+  的 MAC 回答客户路由器的 ARP，客户把包发给那个 MAC，VPP 在 `ethernet-input`
+  按 `l3 mac mismatch` 丢掉——表现是"BGP 通、数据不通"。地址搬进 VPP 后还要
+  让客户路由器重学 ARP（`ip neigh flush`，bringup 已代做）。
+- **盒内核不是路由器**：没有默认路由（docker 注入的那条要删掉），
+  `ip_forward=0`，每个接口 `forwarding=0`。FRR 的客户路由经 zebra 进内核主表，
+  只作为 linux-nl 的输入；转发全部在 VPP。
+- **linux-nl 只镜像内核里能落地的路由**：`local`(255) 忽略；下一跳经过未配对
+  接口的路由忽略；下一跳解析不到也照样装（VPP 里是 unresolved arp 条目）。
+  VPP 的 table N 就是内核 table N，不存在别的映射。
+- **FRR table 1250 会以 table 1250 出现在 VPP 里**：那是 linux-nl 的镜像，
+  全是 `dpo-drop`；它只用于 `redistribute table-direct 1250`，不参与转发。
+  别把 VPN 表也规划到 1250（本 lab：VPN 0 = table 0，overlay = 250）。
+- **地址搬进 TAP 后要重启 FRR**：eBGP 的 ConnectRetryTimer 是 120 s，不重启
+  会等两分钟才从新源地址重建会话。
 - **建 WG 接口 → 登记端口 → `set sr-wg rebind-ports`**，顺序不能反：建接口
   会把 listen-port 抢回 wg4-input。
 - **encap 挂在 underlay 出口接口上**（`host-<wan>`），不是 wg0；peer 一定
   最后加，否则握手包在 encap 就位前发出。
 - **overlay /32 路由要排在 peer add 之后**，否则 FIB 里是 unresolved，转发
   落到 dpo-drop（接口 up、peer established 也一样不通）。
-- **zebra 的 static 默认路由只有一条且 distance 1**：docker 注入的内核默认
-  路由必须删掉（`ip route del default`），否则 FRR 的默认路由装不进内核，
-  盒子自己发起的流量出不去。
+- **zebra 的 static 默认路由现在不需要了**：客户口在 VPP 里之后，盒子本身
+  不发起经客户路由器的流量，内核也不该有默认路由（脚本会断言它是空的）。
 - **反向上报只认 `tag 1001`**：客户路由必须在 FRR 入方向 route-map 里打
   tag，否则 sr-frr 视为"我们自己导出的路由"丢弃。我们经 table 1250 回到
   BGP 的路由 tag 是 0，正好被同一规则挡在门外。
