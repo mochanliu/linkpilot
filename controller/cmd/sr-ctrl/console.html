@@ -23,7 +23,8 @@
   button.danger{color:var(--bad);border-color:#ffccc7}
   button.small{padding:2px 8px;font-size:12.5px}
   input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
-  input:focus{outline:2px solid #b6d6ff;outline-offset:-1px;border-color:var(--accent)}
+  select{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
+  input:focus,select:focus{outline:2px solid #b6d6ff;outline-offset:-1px;border-color:var(--accent)}
 
   /* ---------- login ---------- */
   #login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
@@ -38,6 +39,12 @@
   .login-card input{width:100%}
   .login-card button{width:100%;margin-top:14px;padding:9px}
   .err{color:var(--bad);font-size:13px;margin-top:10px;min-height:18px}
+  .tabs{display:flex;gap:6px;margin:0 0 16px;border-bottom:1px solid var(--line)}
+  .tabs button{border:none;border-bottom:2px solid transparent;border-radius:0;background:none;
+    color:var(--muted);padding:6px 2px;margin:0 14px -1px 0;font-size:13.5px}
+  .tabs button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  .tabs button:hover{background:none;color:var(--ink)}
+  .login-card label.gap{margin-top:10px}
 
   /* ---------- shell ---------- */
   #app{display:grid;grid-template-columns:212px 1fr;min-height:100vh}
@@ -53,6 +60,11 @@
   nav a.sect{margin-top:14px;color:var(--muted);font-size:11.5px;letter-spacing:1px;
     padding:8px 10px 4px;pointer-events:none}
   aside .foot{position:absolute;bottom:14px;left:12px;right:12px;font-size:12px;color:var(--muted)}
+  aside .me{font-size:12.5px;line-height:1.4;color:var(--ink);margin-bottom:8px}
+  aside .me .who{font-weight:600;word-break:break-all}
+  aside .me .role{color:var(--muted);font-size:11.5px;word-break:break-all}
+  aside .foot button{width:100%;margin-top:6px}
+  nav a[hidden],nav .sect[hidden]{display:none}
 
   main{padding:22px 26px 60px;max-width:1180px}
   .page-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:4px}
@@ -95,7 +107,15 @@
 
   .form-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   .form-row input[name=tenant_id]{width:180px}
-  .form-row input[name=name]{width:220px}
+  .form-row input[name=name]{width:200px}
+  .form-row input[name=account]{width:170px}
+  .form-row input[name=username]{width:170px}
+  .form-row input[name=password]{width:200px}
+  .row-actions button{display:inline-block}
+  .row-actions button + button{margin-left:6px}
+  .banner{display:flex;align-items:center;justify-content:space-between;gap:12px;
+    border:1px solid #eed888;background:#fff8c5;border-radius:8px;padding:10px 14px;
+    font-size:13px;margin-top:16px}
 
   .result{display:none;margin-top:14px;border:1px solid #aceebb;background:#f0fff4;
     border-radius:8px;padding:14px 16px}
@@ -129,10 +149,23 @@
 <div id="login">
   <form class="login-card" id="login-form" autocomplete="off">
     <div class="brand"><b>SROU 控制台</b><span>控制器管理面</span></div>
-    <p>输入控制器启动时打印的登录令牌。</p>
-    <label for="token">登录令牌</label>
-    <input id="token" name="token" type="password" placeholder="console login token" required>
-    <button class="primary" type="submit">登录</button>
+    <div class="tabs" id="login-tabs">
+      <button type="button" data-tab="account" class="active">账号登录</button>
+      <button type="button" data-tab="token">运营令牌</button>
+    </div>
+    <div data-pane="account">
+      <p>客户和运营方用同一个入口登录；能看到什么、能改什么由账号角色决定。</p>
+      <label for="username">账号</label>
+      <input id="username" name="username" type="text" placeholder="用户名" autocomplete="username" spellcheck="false">
+      <label for="password" class="gap">密码</label>
+      <input id="password" name="password" type="password" placeholder="密码" autocomplete="current-password">
+    </div>
+    <div data-pane="token" hidden>
+      <p>脱离账号的应急入口：只有控制器启动时打印的令牌能换到运营方会话。</p>
+      <label for="token">运营令牌</label>
+      <input id="token" type="password" placeholder="console login token">
+    </div>
+    <button class="primary" type="submit" id="login-submit">登录</button>
     <div class="err" id="login-err"></div>
     <div class="muted" style="font-size:12px;margin-top:14px">
       设备入网走另一条通道（mTLS :8444），不经过这个页面。
@@ -144,17 +177,21 @@
   <aside>
     <div class="logo">SROU<small>CONTROLLER</small></div>
     <nav id="nav">
-      <a href="#overview" data-view="overview">概览 <span class="n" id="n-nodes">0</span></a>
-      <a href="#tenants" data-view="tenants">租户 <span class="n" id="n-tenants">0</span></a>
+      <a href="#overview" data-view="overview">概览</a>
+      <div class="sect" data-roles="operator">运营</div>
+      <a href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
+      <a href="#accounts" data-view="accounts" data-roles="operator">账号 <span class="n" id="n-accounts">0</span></a>
       <a href="#enroll" data-view="enroll">入网码 <span class="n" id="n-claims">0</span></a>
+      <div class="sect" data-roles="tenant">我的网络</div>
       <a href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
-      <div class="sect">配置（未实现）</div>
-      <a href="#tunnels" data-view="tunnels">隧道</a>
-      <a href="#routes" data-view="routes">路由</a>
+      <a href="#tunnels" data-view="tunnels" data-roles="tenant">隧道</a>
+      <a href="#routes" data-view="routes" data-roles="tenant">路由</a>
     </nav>
     <div class="foot">
-      <div id="ctrl-line" class="mono" style="font-size:11.5px;word-break:break-all"></div>
-      <button class="small" id="logout" style="margin-top:8px">退出登录</button>
+      <div class="me"><div class="who" id="me-who">—</div><div class="role" id="me-role"></div></div>
+      <button class="small" id="pw-btn" hidden>修改密码</button>
+      <button class="small" id="logout">退出登录</button>
+      <div id="ctrl-line" class="mono" style="font-size:11px;word-break:break-all;margin-top:8px"></div>
     </div>
   </aside>
 
@@ -176,7 +213,8 @@
 (function () {
   "use strict";
 
-  var S = { state: null, view: "overview", lastResult: null, timer: null, es: null };
+  var S = { state: null, me: null, accounts: null, loginTab: "account",
+    view: "overview", lastResult: null, lastSecret: null, html: "", timer: null, ago: null, es: null };
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -226,39 +264,123 @@
   function showLogin() {
     $("app").hidden = true;
     $("login").hidden = false;
-    $("token").focus();
+    S.me = null;
+    S.state = null;
+    S.accounts = null;
+    S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
+    clearInterval(S.timer);
+    clearInterval(S.ago);
+    setLoginTab(S.loginTab);
   }
   function showApp() {
     $("login").hidden = true;
     $("app").hidden = false;
   }
 
+  function setLoginTab(t) {
+    S.loginTab = t;
+    document.querySelectorAll("#login-tabs button").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-tab") === t);
+    });
+    document.querySelectorAll("#login-form [data-pane]").forEach(function (p) {
+      p.hidden = p.getAttribute("data-pane") !== t;
+    });
+    $("login-submit").textContent = t === "token" ? "以运营令牌登录" : "登录";
+    $("login-err").textContent = "";
+    if (!$("login").hidden) (t === "token" ? $("token") : $("username")).focus();
+  }
+
+  document.querySelectorAll("#login-tabs button").forEach(function (b) {
+    b.addEventListener("click", function () { setLoginTab(b.getAttribute("data-tab")); });
+  });
+
   $("login-form").addEventListener("submit", function (e) {
     e.preventDefault();
     $("login-err").textContent = "";
-    api("POST", "/api/login", { token: $("token").value }).then(function () {
+    var body = S.loginTab === "token"
+      ? { token: $("token").value }
+      : { username: $("username").value.trim(), password: $("password").value };
+    api("POST", "/api/login", body).then(function () {
+      $("password").value = "";
       $("token").value = "";
-      showApp();
-      boot();
-    }).catch(function (err) {
-      $("login-err").textContent = /invalid token/.test(err.message) ? "令牌不正确" : err.message;
+      return api("GET", "/api/session");
+    }).then(bootSession).catch(function (err) {
+      $("login-err").textContent = loginError(err.message);
     });
   });
+
+  function loginError(m) {
+    if (/invalid token/.test(m)) return "令牌不正确";
+    if (/invalid username or password/.test(m)) return "账号或密码不正确";
+    if (/too many failed logins/.test(m)) return "失败次数过多，请一分钟后再试";
+    if (/username and password required/.test(m)) return "请填写账号和密码";
+    return m;
+  }
 
   $("logout").addEventListener("click", function () {
     api("POST", "/api/logout", {}).then(function () { location.reload(); });
   });
 
+  $("pw-btn").addEventListener("click", function () {
+    S.view = "account";
+    render();
+  });
+
+  /* ---------------- session ---------------- */
+
+  function bootSession(s) {
+    if (!s || !s.logged_in) { showLogin(); return; }
+    S.me = s;
+    S.html = "";
+    if (!allowed(S.view)) S.view = "overview";
+    showApp();
+    renderChrome();
+    boot();
+  }
+
+  // A view the role cannot use is not hidden after the fact -- the router refuses
+  // to draw it, so a stale URL or a page bug cannot widen what the role sees.
+  function allowed(view) {
+    var v = VIEWS[view];
+    if (!v || !v.roles) return true;
+    return !!S.me && v.roles.indexOf(S.me.role) >= 0;
+  }
+
   /* ---------------- data ---------------- */
 
   function load() {
-    return api("GET", "/api/state").then(function (st) {
+    var isOp = !!(S.me && S.me.role === "operator");
+    var jobs = [api("GET", "/api/state")];
+    if (isOp) jobs.push(api("GET", "/api/accounts").catch(function () { return null; }));
+    return Promise.all(jobs).then(function (r) {
+      var st = r[0] || {};
+      st.tenants = st.tenants || [];
+      st.claims = st.claims || [];
+      st.nodes = st.nodes || [];
       S.state = st;
+      if (isOp) S.accounts = r[1] || [];
       render();
     }).catch(function (err) {
       $("live-dot").className = "dot bad";
       $("live-text").textContent = "离线：" + err.message;
+    });
+  }
+
+  function roleLine(me) {
+    if (me.role === "operator") return me.via === "token" ? "运营方 · 应急令牌" : "运营方";
+    return "租户 · " + (me.tenant_name || me.tenant_id || "");
+  }
+
+  // Chrome is the sidebar identity and the role gate on navigation. It is drawn
+  // once per session, not per poll: the page should not flicker its identity.
+  function renderChrome() {
+    var me = S.me || {};
+    $("me-who").textContent = me.username || "";
+    $("me-role").textContent = me.role ? roleLine(me) : "";
+    $("pw-btn").hidden = me.via !== "password";
+    document.querySelectorAll("#nav [data-roles]").forEach(function (el) {
+      el.hidden = (el.getAttribute("data-roles") || "").split(",").indexOf(me.role) < 0;
     });
   }
 
@@ -290,29 +412,50 @@
     // happens; a slow refetch keeps the clock honest without hammering the API.
     clearInterval(S.timer);
     S.timer = setInterval(load, 10000);
+    clearInterval(S.ago);
+    S.ago = setInterval(refreshAgo, 1000);
   }
 
   /* ---------------- render ---------------- */
 
+  // roles omitted = both roles. The role gate is also enforced by the API; this
+  // table only keeps a view from being drawn for a role that has no data for it.
   var VIEWS = {
-    overview: { title: "概览", sub: "租户与设备的当前状态；入网只建立归属，配置在设备页另行下发" },
-    tenants: { title: "租户", sub: "租户是设备归属的唯一依据，只有控制台能创建" },
-    enroll: { title: "入网码", sub: "入网码只决定设备属于哪个租户，不携带任何配置" },
-    nodes: { title: "设备", sub: "已入网的设备；状态来自心跳，不是配置结果" },
-    tunnels: { title: "隧道", sub: "尚未实现：需要先把节点计划（端口 / overlay 地址 / 密钥环）做出来" },
-    routes: { title: "路由", sub: "尚未实现：路由表由 RR 反射，控制器不发布路由" }
+    overview: {
+      title: "概览",
+      sub: "运营侧重归属与库存；设备配置属于租户，不在这里展示",
+      tenantSub: "你的设备与入网入口；配置尚未下发，所以设备处于「未配置」"
+    },
+    tenants: { title: "租户", sub: "租户是设备归属的唯一依据，只有控制台能创建", roles: ["operator"] },
+    accounts: { title: "账号", sub: "登录控制台的账号；角色决定能看到什么、能改什么", roles: ["operator"] },
+    enroll: {
+      title: "入网码",
+      sub: "入网码只决定设备属于哪个租户，不携带任何配置",
+      tenantSub: "入网码由运营方签发；你只能查看和复制自己的码，不能签发或吊销"
+    },
+    nodes: {
+      title: "设备",
+      sub: "运营方只看库存（谁、序列号、入网时间、在线状态）",
+      tenantSub: "你的设备；入网只建立归属，隧道 / 端口 / overlay 都还没有下发"
+    },
+    tunnels: { title: "隧道", sub: "尚未实现：需要先把节点计划（端口 / overlay 地址 / 密钥环）做出来", roles: ["tenant"] },
+    routes: { title: "路由", sub: "尚未实现：路由表由 RR 反射，控制器不发布路由", roles: ["tenant"] },
+    account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" }
   };
 
   function render() {
     var st = S.state;
     if (!st) return;
+    var me = S.me || {};
+    var isOp = me.role === "operator";
+    if (!allowed(S.view)) S.view = "overview";
     var v = VIEWS[S.view] || VIEWS.overview;
     $("view-title").textContent = v.title;
-    $("view-sub").textContent = v.sub;
+    $("view-sub").textContent = (isOp ? v.sub : (v.tenantSub || v.sub));
 
     var online = st.nodes.filter(function (n) { return n.status === "online"; }).length;
-    $("n-nodes").textContent = st.nodes.length;
     $("n-tenants").textContent = st.tenants.length;
+    $("n-accounts").textContent = S.accounts ? S.accounts.length : 0;
     $("n-claims").textContent = st.claims.filter(function (c) { return !c.revoked; }).length;
     $("n-devices").textContent = online + "/" + st.nodes.length;
     $("ctrl-line").textContent = (st.controller.tls_addrs || []).join(" · ");
@@ -323,25 +466,38 @@
     var a = document.activeElement;
     if (a && a.closest && a.closest("#content") && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)) return;
 
-    // 焦点不在表单上时仍然保留已填的值（例如点了页面空白处）。
+    var c = "";
+    if (S.view === "overview") c = viewOverview(st, online, isOp);
+    else if (S.view === "tenants") c = viewTenants(st);
+    else if (S.view === "accounts") c = viewAccounts(st);
+    else if (S.view === "enroll") c = viewEnroll(st, isOp);
+    else if (S.view === "nodes") c = viewNodes(st, isOp);
+    else if (S.view === "account") c = viewAccount();
+    else c = viewPlaceholder(S.view);
+    if (me.initial_password) c = initialPassBanner() + c;
+
+    // 结构没变就只刷新相对时间，不重建 DOM：重建会让正在点的按钮在半路
+    // 被替换掉（点击丢失），也会闪。心跳只改变「x 秒前」的文字，结构不变。
+    if (c === S.html) {
+      refreshAgo();
+      return;
+    }
+
+    // 结构要重建时，先把已填的值记下来（例如点了页面空白处）。
     var keep = {};
     document.querySelectorAll("#content input, #content select").forEach(function (el) {
       var k = el.tagName + ":" + (el.name || el.id || "");
       if (k !== "INPUT:" && el.value) keep[k] = el.value;
     });
 
-    var c = "";
-    if (S.view === "overview") c = viewOverview(st, online);
-    else if (S.view === "tenants") c = viewTenants(st);
-    else if (S.view === "enroll") c = viewEnroll(st);
-    else if (S.view === "nodes") c = viewNodes(st);
-    else c = viewPlaceholder(S.view);
+    S.html = c;
     $("content").innerHTML = c;
 
     document.querySelectorAll("#content input, #content select").forEach(function (el) {
       var k = el.tagName + ":" + (el.name || el.id || "");
       if (!el.value && keep[k]) el.value = keep[k];
     });
+    refreshAgo();
 
     document.querySelectorAll("#nav a[data-view]").forEach(function (a) {
       a.classList.toggle("active", a.getAttribute("data-view") === S.view);
@@ -349,12 +505,35 @@
     bind();
   }
 
-  function cards(st, online) {
+  // Relative times live in spans so a poll can age them without touching the
+  // table structure (and without detaching the button under the pointer).
+  function refreshAgo() {
+    document.querySelectorAll("#content [data-ago]").forEach(function (el) {
+      el.textContent = ago(+el.getAttribute("data-ago"));
+    });
+  }
+
+  function initialPassBanner() {
+    return '<div class="banner"><span>你还在使用一次性初始密码，建议先改成自己的密码。</span>' +
+      '<button class="small" data-act="goto" data-view="account">去修改</button></div>';
+  }
+
+  function cards(st, online, isOp) {
+    var live = st.claims.filter(function (c) { return !c.revoked && !expired(c); }).length;
+    if (isOp) {
+      return '<div class="cards">' +
+        card("租户", st.tenants.length, "个") +
+        card("已入网设备", st.nodes.length, "台") +
+        card("在线", online, "台") +
+        card("可用入网码", live, "个") +
+        "</div>";
+    }
+    var unconfigured = st.nodes.filter(function (n) { return n.runtime && !n.runtime.configured; }).length;
     return '<div class="cards">' +
-      card("租户", st.tenants.length, "个") +
-      card("已入网设备", st.nodes.length, "台") +
+      card("我的设备", st.nodes.length, "台") +
       card("在线", online, "台") +
-      card("可用入网码", st.claims.filter(function (c) { return !c.revoked && !expired(c); }).length, "个") +
+      card("可用入网码", live, "个") +
+      card("待配置", unconfigured, "台") +
       "</div>";
   }
   function card(k, v, u) {
@@ -365,20 +544,31 @@
     return c.expires_at_unix > 0 && c.expires_at_unix * 1000 < Date.now();
   }
 
-  function deviceTable(nodes, emptyMsg) {
+  function deviceTable(nodes, emptyMsg, isOp) {
     if (!nodes.length) return '<div class="empty">' + esc(emptyMsg) + "</div>";
-    var h = "<table><thead><tr><th>设备</th><th>租户</th><th>序列号</th><th>状态</th>" +
-      "<th>最后心跳</th><th>入网时间</th><th>配置</th></tr></thead><tbody>";
+    var cols = isOp
+      ? ["设备", "租户", "序列号", "状态", "入网时间"]
+      : ["设备", "序列号", "状态", "最后心跳", "入网时间", "配置"];
+    var h = "<table><thead><tr>" + cols.map(function (c) {
+      return "<th>" + esc(c) + "</th>";
+    }).join("") + "</tr></thead><tbody>";
     nodes.forEach(function (n) {
+      var rt = n.runtime;
       h += "<tr>" +
-        '<td><span class="mono">node-' + esc(n.node_id) + "</span></td>" +
-        "<td>" + esc(tenantName(n.tenant_id)) + "</td>" +
-        '<td class="mono">' + esc(n.serial) + "</td>" +
-        "<td>" + statusTag(n.status) + "</td>" +
-        '<td class="muted">' + esc(ago(n.last_seen_unix)) + "</td>" +
-        '<td class="muted">' + esc(clock(n.enrolled_at_unix)) + "</td>" +
-        '<td><span class="tag plan">未配置</span></td>' +
-        "</tr>";
+        '<td><span class="mono">node-' + esc(n.node_id) + "</span></td>";
+      if (isOp) h += "<td>" + esc(tenantName(n.tenant_id)) + "</td>";
+      h += '<td class="mono">' + esc(n.serial) + "</td>" +
+        "<td>" + statusTag(n.status) + "</td>";
+      if (!isOp) h += '<td class="muted"><span data-ago="' + esc(n.last_seen_unix) + '"></span></td>';
+      h += '<td class="muted">' + esc(clock(n.enrolled_at_unix)) + "</td>";
+      if (!isOp) {
+        h += "<td>" + (rt && rt.configured
+          ? '<span class="tag online">已配置</span>'
+          : '<span class="tag plan">未配置</span>') +
+          (rt && rt.udp_mapping ? ' <span class="mono muted">' + esc(rt.udp_mapping) + "</span>" : "") +
+          "</td>";
+      }
+      h += "</tr>";
     });
     return h + "</tbody></table>";
   }
@@ -395,29 +585,46 @@
     return id;
   }
 
-  function viewOverview(st, online) {
-    var h = cards(st, online);
-    h += '<section class="panel"><header><h2>设备</h2>' +
+  function viewOverview(st, online, isOp) {
+    var h = cards(st, online, isOp);
+    h += '<section class="panel"><header><h2>' + (isOp ? "设备库存" : "我的设备") + "</h2>" +
       '<button class="small" data-act="refresh">刷新</button></header>' +
-      deviceTable(st.nodes,
-        "还没有设备。到「租户」新建一个租户拿到入网码，再按「入网码」页的命令启动一个 vCPE。") +
+      deviceTable(st.nodes, isOp
+        ? "还没有设备。到「租户」新建一个租户拿到入网码，再让设备用它入网。"
+        : "还没有设备。用运营方给你的入网码，在「入网码」页按命令启动一台设备。", isOp) +
       "</section>";
-    h += '<section class="panel"><header><h2>这一步做了什么</h2></header>' +
+    h += isOp ? operatorSteps() : tenantSteps();
+    return h;
+  }
+
+  function operatorSteps() {
+    return '<section class="panel"><header><h2>运营方做什么</h2></header>' +
       '<div class="placeholder"><b>入网 = 设备与租户建立归属关系</b>，只签设备证书、登记一行记录，零配置。' +
       "<ul>" +
-      "<li>控制台创建租户 → 得到一个入网码（claim code）</li>" +
-      "<li>设备用这个码入网 → 控制器返回证书与 node_id，设备出现在上面的表里</li>" +
-      "<li>之后客户在控制台配置这台设备 → 隧道 / 端口 / overlay 地址 / 密钥环才下发</li>" +
+      "<li>新建租户 → 同时得到入网码，和（可选的）客户登录账号</li>" +
+      "<li>客户自己用码入网设备；设备出现在「设备」页，只显示归属与库存信息</li>" +
+      "<li>隧道 / 端口 / overlay / 密钥属于租户的网络配置，运营方看不到</li>" +
       "</ul></div></section>";
-    return h;
+  }
+
+  function tenantSteps() {
+    return '<section class="panel"><header><h2>接下来</h2></header>' +
+      '<div class="placeholder"><b>设备入网只建立归属，不带任何配置。</b>' +
+      "<ul>" +
+      "<li>用运营方给你的入网码，在「入网码」页按命令启动一台设备</li>" +
+      "<li>设备出现在「设备」页即表示归属成功；心跳变绿才代表在线</li>" +
+      "<li>设备配置（隧道 / 端口 / overlay 地址 / 密钥环）尚未实现，所以设备暂时显示「未配置」</li>" +
+      "</ul></div></section>";
   }
 
   function viewTenants(st) {
     var h = '<section class="panel"><header><h2>新建租户</h2></header>' +
-      '<div class="hint">新建租户会同时签发它的第一个入网码，可以直接拿去 enroll 设备。</div>' +
+      '<div class="hint">新建租户会同时签发第一个入网码；填写「客户登录名」会一并建好客户账号。</div>' +
       '<form class="form-row" id="tenant-form">' +
       '<input name="tenant_id" placeholder="tenant_id，如 acme" required>' +
       '<input name="name" placeholder="显示名称（可选）">' +
+      '<input name="account" placeholder="客户登录名（可选）" spellcheck="false">' +
+      '<input name="password" type="password" placeholder="初始密码（留空自动生成）" autocomplete="new-password">' +
       '<button class="primary" type="submit">创建租户</button>' +
       "</form>" + resultBox() + "</section>";
 
@@ -425,13 +632,18 @@
     if (!st.tenants.length) {
       h += '<div class="empty">还没有租户。</div>';
     } else {
-      h += "<table><thead><tr><th>租户</th><th>ID</th><th>设备</th><th>入网码</th><th>创建时间</th><th></th></tr></thead><tbody>";
+      h += "<table><thead><tr><th>租户</th><th>ID</th><th>账号</th><th>设备</th>" +
+        "<th>入网码</th><th>创建时间</th><th></th></tr></thead><tbody>";
       st.tenants.forEach(function (t) {
         var devs = st.nodes.filter(function (n) { return n.tenant_id === t.tenant_id; }).length;
         var cls = st.claims.filter(function (c) { return c.tenant_id === t.tenant_id && !c.revoked; }).length;
+        var accts = (S.accounts || []).filter(function (a) { return a.tenant_id === t.tenant_id; });
         h += "<tr>" +
           "<td>" + esc(t.name || t.tenant_id) + "</td>" +
           '<td class="mono">' + esc(t.tenant_id) + "</td>" +
+          "<td>" + (accts.length
+            ? '<span class="mono">' + accts.map(function (a) { return esc(a.username); }).join(", ") + "</span>"
+            : '<span class="tag pending">无账号</span>') + "</td>" +
           "<td>" + devs + "</td>" +
           "<td>" + cls + " 个可用</td>" +
           '<td class="muted">' + esc(clock(t.created_at_unix)) + "</td>" +
@@ -443,12 +655,16 @@
     return h + "</section>";
   }
 
-  function viewEnroll(st) {
+  function viewEnroll(st, isOp) {
     var h = '<section class="panel"><header><h2>入网码</h2>' +
-      '<button class="small" data-act="goto" data-view="tenants">新建租户 / 签发</button></header>' +
-      '<div class="hint">把码交给设备即可；码可以复用，每个用过的序列号都会记在下面。吊销只阻止未来的入网，已入网设备的证书不受影响。</div>';
+      (isOp ? '<button class="small" data-act="goto" data-view="tenants">新建租户 / 签发</button>' : "") +
+      "</header>" +
+      '<div class="hint">' + (isOp
+        ? "把码交给设备即可；码可以复用，每个用过的序列号都会记在下面。吊销只阻止未来的入网，已入网设备的证书不受影响。"
+        : "入网码由运营方签发。码可以复用；用过的序列号会记在下面。") + "</div>";
     if (!st.claims.length) {
-      h += '<div class="empty">还没有入网码。</div>';
+      h += '<div class="empty">还没有入网码。' +
+        (isOp ? "" : "请联系运营方为你的租户签发一个。") + "</div>";
     } else {
       h += "<table><thead><tr><th>入网码</th><th>租户</th><th>已入网序列号</th><th>状态</th><th></th></tr></thead><tbody>";
       st.claims.forEach(function (c) {
@@ -462,7 +678,7 @@
           '<td class="mono muted">' + (c.serials.length ? esc(c.serials.join(", ")) : "—") + "</td>" +
           "<td>" + status + "</td>" +
           '<td><button class="small" data-act="copy" data-text="' + esc(c.code) + '">复制</button>' +
-          (dead ? "" : ' <button class="small danger" data-act="revoke" data-code="' + esc(c.code) + '">吊销</button>') +
+          (isOp && !dead ? ' <button class="small danger" data-act="revoke" data-code="' + esc(c.code) + '">吊销</button>' : "") +
           "</td></tr>";
       });
       h += "</tbody></table>";
@@ -472,7 +688,7 @@
     h += '<section class="panel"><header><h2>让一台 vCPE 入网</h2></header>' +
       '<div class="hint">vCPE 是一个容器里跑的最小 agent：只做入网 + 心跳，不碰数据面。</div>' +
       '<div class="steps"><ol>' +
-      "<li>在「租户」页拿到入网码</li>" +
+      (isOp ? "<li>在「租户」页拿到（或签发）入网码</li>" : "<li>向运营方索取你这个租户的入网码</li>") +
       "<li>在宿主机仓库根目录执行下面的命令（把 CODE 换成你的入网码）</li>" +
       "<li>大约 5 秒后设备出现在「设备」页，状态从「已入网 · 未上线」变成「在线」</li>" +
       "<li>用 <code>docker logs -f sr-lab-vcpe</code> 可以看 agent 自己的日志</li>" +
@@ -482,12 +698,87 @@
     return h;
   }
 
-  function viewNodes(st) {
-    return '<section class="panel"><header><h2>已入网设备</h2>' +
+  function viewNodes(st, isOp) {
+    return '<section class="panel"><header><h2>' + (isOp ? "已入网设备（库存）" : "已入网设备") + "</h2>" +
       '<button class="small" data-act="refresh">刷新</button></header>' +
-      deviceTable(st.nodes, "还没有设备入网。") +
-      '<div class="hint" style="margin-top:12px">「未配置」是真实状态：enroll 不推任何参数，节点计划（每个隧道的端口、overlay /32、密钥环、RR 列表）还没有实现。</div>' +
-      "</section>";
+      deviceTable(st.nodes, isOp ? "还没有设备入网。" : "还没有设备入网，先用入网码接入一台。", isOp) +
+      '<div class="hint" style="margin-top:12px">' + (isOp
+        ? "运营方只保留归属信息（租户、序列号、入网时间、在线状态）。心跳明细与设备配置属于租户，接口对运营方不下发这些字段。"
+        : "「未配置」是真实状态：enroll 不推任何参数，节点计划（每个隧道的端口、overlay /32、密钥环、RR 列表）还没有实现。") +
+      "</div></section>";
+  }
+
+  function viewAccounts() {
+    var h = "";
+    if (S.lastSecret) {
+      var s = S.lastSecret;
+      h += '<div class="result show"><div class="ttl">' + esc(s.title) + "</div>" +
+        '<div>账号 <code>' + esc(s.username) + "</code> 的一次性初始密码（只显示这一次）：</div>" +
+        '<div class="copybox"><code>' + esc(s.password) + "</code>" +
+        '<button class="small" data-act="copy" data-text="' + esc(s.password) + '">复制</button></div>' +
+        '<div class="muted" style="font-size:12.5px">把这串密码交给对应的人；对方登录后应立即修改。</div></div>';
+    }
+    h += '<section class="panel"><header><h2>新建账号</h2></header>' +
+      '<div class="hint">客户账号绑定一个租户，只能看到自己租户的内容；运营账号不绑定租户，也看不到任何设备配置。</div>' +
+      '<form class="form-row" id="account-form">' +
+      '<input name="username" placeholder="登录名" spellcheck="false" required>' +
+      '<select name="role"><option value="tenant">客户（租户）</option><option value="operator">运营方</option></select>' +
+      '<input name="tenant_id" placeholder="租户 ID（客户账号必填）" spellcheck="false">' +
+      '<input name="password" type="password" placeholder="初始密码（留空自动生成）" autocomplete="new-password">' +
+      '<button class="primary" type="submit">创建账号</button>' +
+      "</form></section>";
+
+    var list = S.accounts || [];
+    h += '<section class="panel"><header><h2>账号列表</h2>' +
+      '<button class="small" data-act="refresh">刷新</button></header>';
+    if (!list.length) {
+      h += '<div class="empty">还没有账号。应急运营令牌不是账号，不会出现在这里。</div>';
+    } else {
+      h += "<table><thead><tr><th>账号</th><th>角色</th><th>租户</th><th>最近登录</th>" +
+        "<th>状态</th><th></th></tr></thead><tbody>";
+      list.forEach(function (a) {
+        var self = S.me && a.username === S.me.username;
+        h += "<tr>" +
+          '<td class="mono">' + esc(a.username) + "</td>" +
+          "<td>" + (a.role === "operator" ? "运营方" : "客户") + "</td>" +
+          '<td class="mono muted">' + esc(a.tenant_id || "—") + "</td>" +
+          '<td class="muted">' + (a.last_login_unix
+            ? '<span data-ago="' + esc(a.last_login_unix) + '"></span>'
+            : "从未登录") + "</td>" +
+          "<td>" + (a.disabled ? '<span class="tag revoked">已禁用</span>'
+            : a.initial_password ? '<span class="tag stale">初始密码</span>'
+              : '<span class="tag online">正常</span>') + "</td>" +
+          '<td class="row-actions">' +
+          '<button class="small" data-act="reset" data-user="' + esc(a.username) + '">重置密码</button>' +
+          (self ? "" : '<button class="small ' + (a.disabled ? "" : "danger") +
+            '" data-act="disable" data-user="' + esc(a.username) +
+            '" data-disabled="' + (a.disabled ? "false" : "true") + '">' +
+            (a.disabled ? "启用" : "禁用") + "</button>") +
+          "</td></tr>";
+      });
+      h += "</tbody></table>";
+    }
+    return h + "</section>";
+  }
+
+  function viewAccount() {
+    var me = S.me || {};
+    if (me.via !== "password") {
+      return '<section class="panel"><div class="placeholder"><b>当前是运营令牌会话</b>' +
+        "<ul>" +
+        "<li>应急令牌不是账号，没有可修改的密码</li>" +
+        "<li>要改密码请用账号登录（运营账号或客户账号）</li>" +
+        "<li>正式上线后运营方用账号 + MFA 登录，令牌只留作救急</li>" +
+        "</ul></div></section>";
+    }
+    return '<section class="panel"><header><h2>修改密码</h2></header>' +
+      '<div class="hint">账号 <code>' + esc(me.username) + "</code>。改完后，该账号在其他浏览器上的会话会被登出。</div>" +
+      '<form class="form-row" id="password-form">' +
+      '<input name="old_password" type="password" placeholder="当前密码" autocomplete="current-password" required>' +
+      '<input name="new_password" type="password" placeholder="新密码（至少 10 位）" autocomplete="new-password" required>' +
+      '<input name="confirm" type="password" placeholder="再输一次新密码" autocomplete="new-password" required>' +
+      '<button class="primary" type="submit">保存新密码</button>' +
+      "</form></section>";
   }
 
   function viewPlaceholder(view) {
@@ -503,14 +794,22 @@
 
   function resultBox() {
     var r = S.lastResult;
-    if (!r) return '<div class="result" id="result"></div>';
-    return '<div class="result show" id="result">' +
+    if (!r) return "";
+    var h = '<div class="result show" id="result">' +
       '<div class="ttl">租户 ' + esc(r.tenant.tenant_id) + " 已创建</div>" +
-      '<div>入网码（复制后填到 vcpe.sh 的 --claim）：</div>' +
+      '<div>入网码（交给设备）：</div>' +
       '<div class="copybox"><code>' + esc(r.claim.code) + "</code>" +
-      '<button class="small" data-act="copy" data-text="' + esc(r.claim.code) + '">复制</button></div>' +
-      '<pre class="cmd">test/lab/vcpe.sh up --claim ' + esc(r.claim.code) + "</pre>" +
-      "</div>";
+      '<button class="small" data-act="copy" data-text="' + esc(r.claim.code) + '">复制</button></div>';
+    if (r.account) {
+      h += '<div style="margin-top:10px">客户账号 <code>' + esc(r.account.username) + "</code>" +
+        (r.password ? " · 一次性初始密码（只显示这一次）：" : " · 密码是你填写的值") + "</div>";
+      if (r.password) {
+        h += '<div class="copybox"><code>' + esc(r.password) + "</code>" +
+          '<button class="small" data-act="copy" data-text="' + esc(r.password) + '">复制</button></div>';
+      }
+    }
+    h += '<pre class="cmd">test/lab/vcpe.sh up --claim ' + esc(r.claim.code) + "</pre></div>";
+    return h;
   }
 
   /* ---------------- actions ---------------- */
@@ -522,14 +821,57 @@
       var f = new FormData(tf);
       api("POST", "/api/tenants", {
         tenant_id: (f.get("tenant_id") || "").trim(),
-        name: (f.get("name") || "").trim()
+        name: (f.get("name") || "").trim(),
+        account: (f.get("account") || "").trim(),
+        password: f.get("password") || ""
       }).then(function (res) {
         S.lastResult = res;
+        var msg = "租户 " + res.tenant.tenant_id + " 已创建";
+        if (res.account) msg += "，账号 " + res.account.username;
+        toast(msg);
+        tf.reset();
         load().then(function () { S.view = "tenants"; render(); });
       }).catch(function (err) { toast(err.message); });
     });
 
-    document.querySelectorAll("[data-act]").forEach(function (el) {
+    var af = $("account-form");
+    if (af) af.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var f = new FormData(af);
+      var role = f.get("role") || "tenant";
+      api("POST", "/api/accounts", {
+        username: (f.get("username") || "").trim(),
+        role: role,
+        tenant_id: role === "tenant" ? (f.get("tenant_id") || "").trim() : "",
+        password: f.get("password") || ""
+      }).then(function (res) {
+        S.lastSecret = res.password
+          ? { title: "账号 " + res.account.username + " 已创建", username: res.account.username, password: res.password }
+          : null;
+        toast("账号 " + res.account.username + " 已创建");
+        af.reset();
+        if (S.view === "accounts") load();
+      }).catch(function (err) { toast(err.message); });
+    });
+
+    var pf = $("password-form");
+    if (pf) pf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var f = new FormData(pf);
+      var np = f.get("new_password") || "";
+      if (np !== f.get("confirm")) { toast("两次输入的新密码不一致"); return; }
+      api("POST", "/api/password", {
+        old_password: f.get("old_password") || "",
+        new_password: np
+      }).then(function () {
+        toast("密码已修改，其他会话已登出");
+        pf.reset();
+        return api("GET", "/api/session").then(function (s) { S.me = s; });
+      }).then(function () { renderChrome(); render(); })
+        .catch(function (err) { toast(err.message); });
+    });
+
+    document.querySelectorAll("#content [data-act]").forEach(function (el) {
       el.addEventListener("click", function () {
         var act = el.getAttribute("data-act");
         if (act === "refresh") load().then(function () { toast("已刷新"); });
@@ -546,6 +888,25 @@
           api("POST", "/api/claims/revoke", { code: el.getAttribute("data-code") })
             .then(function () { toast("已吊销"); load(); })
             .catch(function (err) { toast(err.message); });
+        } else if (act === "reset") {
+          var user = el.getAttribute("data-user");
+          if (!confirm("为 " + user + " 生成新的临时密码？对方会被立刻登出。")) return;
+          api("POST", "/api/accounts/reset", { username: user })
+            .then(function (res) {
+              S.lastSecret = { title: "账号 " + res.account.username + " 的密码已重置",
+                username: res.account.username, password: res.password };
+              toast("已重置 " + user + " 的密码");
+              load();
+            }).catch(function (err) { toast(err.message); });
+        } else if (act === "disable") {
+          var name = el.getAttribute("data-user");
+          var off = el.getAttribute("data-disabled") === "true";
+          if (off && !confirm("禁用账号 " + name + "？该账号会立刻被登出。")) return;
+          api("POST", "/api/accounts/disable", { username: name, disabled: off })
+            .then(function () {
+              toast((off ? "已禁用 " : "已启用 ") + name);
+              load();
+            }).catch(function (err) { toast(err.message); });
         }
       });
     });
@@ -553,7 +914,9 @@
     document.querySelectorAll("#nav a[data-view]").forEach(function (a) {
       a.onclick = function (e) {
         e.preventDefault();
-        S.view = a.getAttribute("data-view");
+        var v = a.getAttribute("data-view");
+        if (!allowed(v)) return;
+        S.view = v;
         render();
       };
     });
@@ -570,9 +933,7 @@
 
   /* ---------------- start ---------------- */
 
-  api("GET", "/api/session").then(function (s) {
-    if (s && s.logged_in) { showApp(); boot(); } else { showLogin(); }
-  }).catch(showLogin);
+  api("GET", "/api/session").then(bootSession).catch(showLogin);
 })();
 </script>
 </body>

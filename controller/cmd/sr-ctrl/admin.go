@@ -32,21 +32,49 @@ var consoleHTML []byte
 //     claim code it hands out is redeemed by the device itself, over the mTLS
 //     listener, with a key the controller never sees.
 //
-// Authentication is a single operator token exchanged for a session cookie.
+// Authentication is a console account (username + password) or the operator
+// token from the command line. Both produce a session that carries an IDENTITY,
+// not just an expiry: a tenant session can only ever see its own tenant, and
+// every mutating endpoint names the role it requires.
+//
+// The operator token stays on as a break-glass login for bootstrap and recovery
+// (a lost admin password must not lock a private deployment out of its own
+// controller). It is not an account and is not stored in state.
+//
 // POSTs additionally require a JSON content type, which a cross-site form
 // cannot produce without a CORS preflight, so the cookie is not a CSRF lever.
 
 const sessionCookie = "sr_ctrl_session"
 
-type adminSession struct {
-	expires time.Time
+const (
+	roleOperator = "operator"
+	roleTenant   = "tenant"
+)
+
+// consoleIdentity is who a session belongs to. TenantID is empty for operators.
+type consoleIdentity struct {
+	Role     string
+	TenantID string
+	Username string
+	Via      string // "password" | "token"
+	expires  time.Time
 }
 
 type adminHub struct {
-	mu   sync.Mutex
-	next int
-	subs map[int]chan adminEvent
-	sess map[string]adminSession
+	mu    sync.Mutex
+	next  int
+	subs  map[int]adminSub
+	sess  map[string]consoleIdentity
+	fails map[string]*loginFail
+}
+
+// adminSub is one SSE subscriber plus the slice of the world it is allowed to
+// see. Filtering here (not in the page) matters: events carry node names, and
+// leaking another tenant's node key would tell a customer that it exists.
+type adminSub struct {
+	ch       chan adminEvent
+	role     string
+	tenantID string
 }
 
 // adminEvent is what the console's SSE stream carries. It is intentionally
@@ -54,33 +82,40 @@ type adminHub struct {
 // arriving during a refetch cannot leave the table stuck in a half-applied
 // view, and a dropped event costs one refresh interval, not correctness.
 type adminEvent struct {
-	Type string `json:"type"`
-	At   int64  `json:"at_unix"`
-	Node string `json:"node,omitempty"`
+	Type     string `json:"type"`
+	At       int64  `json:"at_unix"`
+	TenantID string `json:"tenant_id,omitempty"`
+	Node     string `json:"node,omitempty"`
 }
 
 func newAdminHub() *adminHub {
 	return &adminHub{
-		subs: map[int]chan adminEvent{},
-		sess: map[string]adminSession{},
+		subs:  map[int]adminSub{},
+		sess:  map[string]consoleIdentity{},
+		fails: map[string]*loginFail{},
 	}
 }
 
 // publish is safe to call with s.mu held: the hub never reads controller state
-// and never blocks (a full subscriber buffer drops the event).
-func (h *adminHub) publish(typ string, rec *NodeRecord) {
+// and never blocks (a full subscriber buffer drops the event). tenantID is the
+// event's owner; it is what a tenant subscriber is matched against.
+func (h *adminHub) publish(typ, tenantID string, rec *NodeRecord) {
 	if h == nil {
 		return
 	}
-	ev := adminEvent{Type: typ, At: time.Now().Unix()}
+	ev := adminEvent{Type: typ, At: time.Now().Unix(), TenantID: tenantID}
 	if rec != nil {
+		ev.TenantID = rec.TenantID
 		ev.Node = key(rec.TenantID, rec.NodeID)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, ch := range h.subs {
+	for _, sub := range h.subs {
+		if sub.role == roleTenant && sub.tenantID != ev.TenantID {
+			continue
+		}
 		select {
-		case ch <- ev:
+		case sub.ch <- ev:
 		default:
 		}
 	}
@@ -120,22 +155,105 @@ func (s *server) checkToken(presented string) bool {
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.adminToken)) == 1
 }
 
-func (s *server) sessionValid(r *http.Request) bool {
+// session returns the identity behind the request's cookie, if the session is
+// live. The zero identity (Role "") means "not logged in".
+func (s *server) session(r *http.Request) consoleIdentity {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
-		return false
+		return consoleIdentity{}
 	}
 	s.admin.mu.Lock()
 	defer s.admin.mu.Unlock()
-	se, ok := s.admin.sess[c.Value]
+	id, ok := s.admin.sess[c.Value]
 	if !ok {
-		return false
+		return consoleIdentity{}
 	}
-	if time.Now().After(se.expires) {
+	if time.Now().After(id.expires) {
 		delete(s.admin.sess, c.Value)
-		return false
+		return consoleIdentity{}
 	}
-	return true
+	return id
+}
+
+func (s *server) newSession(w http.ResponseWriter, id consoleIdentity) {
+	sid := randToken()
+	id.expires = time.Now().Add(12 * time.Hour)
+	s.admin.mu.Lock()
+	s.admin.sess[sid] = id
+	s.admin.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    sid,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   12 * 3600,
+	})
+}
+
+// dropSessions ends every session of one account. Used when a password is
+// changed, reset or an account is disabled: the old cookie must not outlive the
+// credential it was issued for.
+func (s *server) dropSessions(username string) {
+	s.admin.mu.Lock()
+	defer s.admin.mu.Unlock()
+	for sid, id := range s.admin.sess {
+		if id.Username == username {
+			delete(s.admin.sess, sid)
+		}
+	}
+}
+
+// ------------------------------------------------------------------ login throttle
+
+type loginFail struct {
+	count int
+	until time.Time
+}
+
+func loginKey(username string, r *http.Request) string {
+	host := r.RemoteAddr
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+	return username + "|" + host
+}
+
+func (s *server) loginBlocked(username string, r *http.Request) bool {
+	s.admin.mu.Lock()
+	defer s.admin.mu.Unlock()
+	f, ok := s.admin.fails[loginKey(username, r)]
+	return ok && time.Now().Before(f.until)
+}
+
+func (s *server) noteLoginFail(username string, r *http.Request) {
+	k := loginKey(username, r)
+	s.admin.mu.Lock()
+	defer s.admin.mu.Unlock()
+	f := s.admin.fails[k]
+	if f == nil {
+		f = &loginFail{}
+		s.admin.fails[k] = f
+	}
+	now := time.Now()
+	// A zero until means "never locked yet", not "the lock expired". Resetting
+	// the counter on every failure made the 5-failure lock unreachable.
+	if !f.until.IsZero() && now.After(f.until) {
+		f.count = 0
+		f.until = time.Time{}
+	}
+	f.count++
+	if f.count >= 5 {
+		f.until = now.Add(60 * time.Second)
+		f.count = 0
+		log.Printf("console login: %s locked for 60s after repeated failures", k)
+	}
+}
+
+func (s *server) clearLoginFail(username string, r *http.Request) {
+	s.admin.mu.Lock()
+	delete(s.admin.fails, loginKey(username, r))
+	s.admin.mu.Unlock()
 }
 
 func (s *server) adminHandler() http.Handler {
@@ -144,10 +262,14 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/login", s.handleAdminLogin)
 	mux.HandleFunc("/api/logout", s.handleAdminLogout)
 	mux.HandleFunc("/api/session", s.handleAdminSession)
+	mux.HandleFunc("/api/password", s.handleAdminPassword)
 	mux.HandleFunc("/api/state", s.handleAdminState)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/revoke", s.handleAdminClaimRevoke)
+	mux.HandleFunc("/api/accounts", s.handleAdminAccounts)
+	mux.HandleFunc("/api/accounts/reset", s.handleAdminAccountReset)
+	mux.HandleFunc("/api/accounts/disable", s.handleAdminAccountDisable)
 	mux.HandleFunc("/api/events", s.handleAdminEvents)
 	return mux
 }
@@ -163,7 +285,9 @@ func (s *server) handleConsolePage(w http.ResponseWriter, r *http.Request) {
 }
 
 type loginRequest struct {
-	Token string `json:"token"`
+	Token    string `json:"token"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
@@ -176,24 +300,76 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", 400)
 		return
 	}
-	if !s.checkToken(strings.TrimSpace(req.Token)) {
-		log.Printf("console login REJECTED")
-		http.Error(w, "invalid token", 401)
+
+	// Break-glass: the operator token from the command line.
+	if tok := strings.TrimSpace(req.Token); tok != "" {
+		if !s.checkToken(tok) {
+			log.Printf("console login REJECTED (bad operator token)")
+			http.Error(w, "invalid token", 401)
+			return
+		}
+		s.newSession(w, consoleIdentity{Role: roleOperator, Username: "operator", Via: "token"})
+		log.Printf("console login ok via operator token")
+		writeJSON(w, map[string]any{"ok": true})
 		return
 	}
-	sid := randToken()
-	s.admin.mu.Lock()
-	s.admin.sess[sid] = adminSession{expires: time.Now().Add(12 * time.Hour)}
-	s.admin.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    sid,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   12 * 3600,
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" || req.Password == "" {
+		http.Error(w, "username and password required", 400)
+		return
+	}
+	if s.loginBlocked(username, r) {
+		http.Error(w, "too many failed logins, retry in a minute", 429)
+		return
+	}
+
+	s.mu.Lock()
+	var acc *Account
+	if a := s.state.Accounts[username]; a != nil {
+		cp := *a
+		acc = &cp
+	}
+	s.mu.Unlock()
+
+	if acc == nil || acc.Disabled {
+		// Same work, same message: whether the username exists is not something
+		// an unauthenticated caller gets to learn.
+		burnPasswordWork(req.Password)
+		s.noteLoginFail(username, r)
+		log.Printf("console login REJECTED username=%s", username)
+		http.Error(w, "invalid username or password", 401)
+		return
+	}
+	if !verifyPassword(acc.Password, req.Password) {
+		s.noteLoginFail(username, r)
+		log.Printf("console login REJECTED username=%s", username)
+		http.Error(w, "invalid username or password", 401)
+		return
+	}
+	if acc.Role == roleTenant {
+		s.mu.Lock()
+		_, ok := s.state.Tenants[acc.TenantID]
+		s.mu.Unlock()
+		if !ok {
+			s.noteLoginFail(username, r)
+			http.Error(w, "invalid username or password", 401)
+			return
+		}
+	}
+
+	s.clearLoginFail(username, r)
+	s.mu.Lock()
+	if a := s.state.Accounts[username]; a != nil {
+		a.LastLogin = time.Now().Unix()
+	}
+	s.save()
+	s.mu.Unlock()
+
+	s.newSession(w, consoleIdentity{
+		Role: acc.Role, TenantID: acc.TenantID, Username: acc.Username, Via: "password",
 	})
-	log.Printf("console login ok")
+	log.Printf("console login ok username=%s role=%s tenant=%s", acc.Username, acc.Role, acc.TenantID)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -208,20 +384,58 @@ func (s *server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminSession(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"logged_in": s.sessionValid(r)})
+	id := s.session(r)
+	if id.Role == "" {
+		writeJSON(w, map[string]any{"logged_in": false})
+		return
+	}
+	out := map[string]any{
+		"logged_in": true,
+		"role":      id.Role,
+		"username":  id.Username,
+		"via":       id.Via,
+		"tenant_id": id.TenantID,
+	}
+	if id.Via == "password" {
+		s.mu.Lock()
+		if a := s.state.Accounts[id.Username]; a != nil {
+			out["initial_password"] = a.InitialPass
+		}
+		if t := s.state.Tenants[id.TenantID]; t != nil {
+			out["tenant_name"] = t.Name
+		}
+		s.mu.Unlock()
+	}
+	writeJSON(w, out)
 }
 
 // requireSession rejects anything that did not come from the console page.
-func (s *server) requireSession(w http.ResponseWriter, r *http.Request) bool {
-	if !s.sessionValid(r) {
+func (s *server) requireSession(w http.ResponseWriter, r *http.Request) (consoleIdentity, bool) {
+	id := s.session(r)
+	if id.Role == "" {
 		http.Error(w, "not logged in", 401)
-		return false
+		return id, false
 	}
 	if r.Method == http.MethodPost && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		http.Error(w, "application/json required", 415)
-		return false
+		return id, false
 	}
-	return true
+	return id, true
+}
+
+// requireOperator is the gate on everything that changes the world: tenants,
+// claim codes, accounts. A tenant account gets 403, not a hidden 404 -- it is
+// allowed to know the endpoint exists and is not for it.
+func (s *server) requireOperator(w http.ResponseWriter, r *http.Request) (consoleIdentity, bool) {
+	id, ok := s.requireSession(w, r)
+	if !ok {
+		return id, false
+	}
+	if id.Role != roleOperator {
+		http.Error(w, "operator role required", 403)
+		return id, false
+	}
+	return id, true
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -250,6 +464,16 @@ type consoleNode struct {
 	EnrolledAt int64  `json:"enrolled_at_unix"`
 	LastSeen   int64  `json:"last_seen_unix"`
 	Status     string `json:"status"` // online | stale | pending
+
+	// Runtime is present only for the tenant that owns the node. The operator
+	// role sees inventory (who, serial, enrolled when, online) and NOTHING about
+	// how the device is configured or what it reports -- "运营方完全看不到配置"
+	// is enforced here, not in the page, so a future config field cannot leak by
+	// being added to this struct.
+	Runtime *consoleNodeRuntime `json:"runtime,omitempty"`
+}
+
+type consoleNodeRuntime struct {
 	UDPMapping string `json:"udp_mapping"`
 	VpnPort    uint16 `json:"vpn_port"`
 	// Configured is false for every node today: enrollment is not configuration,
@@ -273,10 +497,23 @@ type consoleState struct {
 }
 
 func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
-	if !s.requireSession(w, r) {
+	id, ok := s.requireSession(w, r)
+	if !ok {
 		return
 	}
-	var out consoleState
+	// A tenant session is scoped here, before anything is rendered: tenants see
+	// their own tenant row, their own claim codes and their own devices. The
+	// page never has to filter, and a page bug cannot widen the view.
+	own := func(tenantID string) bool {
+		return id.Role == roleOperator || tenantID == id.TenantID
+	}
+	// Empty collections must serialize as [] rather than null: a tenant with no
+	// device yet is normal, and the page filters these slices unconditionally.
+	var out = consoleState{
+		Tenants: []*Tenant{},
+		Claims:  []consoleClaim{},
+		Nodes:   []consoleNode{},
+	}
 	s.mu.Lock()
 	out.Controller = consoleController{
 		TLSAddrs:     append([]string{}, s.tlsAddrs...),
@@ -284,10 +521,16 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		Epoch:        s.state.Epoch,
 	}
 	for _, t := range s.state.Tenants {
+		if !own(t.ID) {
+			continue
+		}
 		cp := *t
 		out.Tenants = append(out.Tenants, &cp)
 	}
 	for _, c := range s.state.Claims {
+		if !own(c.TenantID) {
+			continue
+		}
 		out.Claims = append(out.Claims, consoleClaim{
 			Code: c.Code, TenantID: c.TenantID, Note: c.Note,
 			CreatedAt: c.CreatedAt, ExpiresAt: c.ExpiresAt, Revoked: c.Revoked,
@@ -296,13 +539,20 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	for _, n := range s.state.Nodes {
-		out.Nodes = append(out.Nodes, consoleNode{
+		if !own(n.TenantID) {
+			continue
+		}
+		cn := consoleNode{
 			TenantID: n.TenantID, NodeID: n.NodeID, Serial: n.Serial,
 			AgentVer: n.AgentVer, EnrolledAt: n.EnrolledAt, LastSeen: n.LastSeen,
-			Status:     nodeStatus(n),
-			UDPMapping: n.UDPMapping, VpnPort: n.VpnPort,
-			Configured: false,
-		})
+			Status: nodeStatus(n),
+		}
+		if id.Role == roleTenant {
+			cn.Runtime = &consoleNodeRuntime{
+				UDPMapping: n.UDPMapping, VpnPort: n.VpnPort, Configured: false,
+			}
+		}
+		out.Nodes = append(out.Nodes, cn)
 	}
 	s.mu.Unlock()
 	out.NowUnix = time.Now().Unix()
@@ -336,15 +586,32 @@ func nodeStatus(n *NodeRecord) string {
 type createTenantRequest struct {
 	TenantID string `json:"tenant_id"`
 	Name     string `json:"name"`
+	// Account optionally creates the customer's first console login in the same
+	// step. Creating a tenant and being able to log in as that tenant are one
+	// intent in private deployments; the operator can also add accounts later.
+	Account  string `json:"account"`
+	Password string `json:"password"`
 }
 
 type createTenantResponse struct {
-	Tenant *Tenant       `json:"tenant"`
-	Claim  *consoleClaim `json:"claim"`
+	Tenant  *Tenant         `json:"tenant"`
+	Claim   *consoleClaim   `json:"claim"`
+	Account *consoleAccount `json:"account,omitempty"`
+	// Password is the one-time initial password, returned exactly once (when it
+	// was generated, i.e. the request did not supply one).
+	Password string `json:"password,omitempty"`
+}
+
+func claimView(c *Claim) *consoleClaim {
+	return &consoleClaim{
+		Code: c.Code, TenantID: c.TenantID, Note: c.Note,
+		CreatedAt: c.CreatedAt, ExpiresAt: c.ExpiresAt, Revoked: c.Revoked,
+		Serials: append([]string{}, c.Serials...), RedeemedCount: len(c.Serials),
+	}
 }
 
 func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
-	if !s.requireSession(w, r) {
+	if _, ok := s.requireOperator(w, r); !ok {
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -366,17 +633,47 @@ func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
 		name = id
 	}
 
+	username := strings.TrimSpace(req.Account)
+	pw := req.Password
+	generated := false
+	var pwHash string
+	if username != "" {
+		if !validUsername(username) {
+			http.Error(w, "account must be 3..40 chars of a-z 0-9 - _ .", 400)
+			return
+		}
+		if pw == "" {
+			pw = newPassword()
+			generated = true
+		} else if err := checkPasswordPolicy(pw); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		var err error
+		if pwHash, err = hashPassword(pw); err != nil {
+			http.Error(w, "cannot hash password", 500)
+			return
+		}
+	}
+
 	s.mu.Lock()
 	if _, exists := s.state.Tenants[id]; exists {
 		s.mu.Unlock()
 		http.Error(w, "tenant already exists", 409)
 		return
 	}
+	if username != "" {
+		if _, exists := s.state.Accounts[username]; exists {
+			s.mu.Unlock()
+			http.Error(w, "account already exists", 409)
+			return
+		}
+	}
 	now := time.Now().Unix()
 	t := &Tenant{ID: id, Name: name, CreatedAt: now}
 	s.state.Tenants[id] = t
-	// The tenant's first enrollment code ships with the tenant. Creating an
-	// account and being able to enroll a device are one intent, one step apart;
+	// The tenant's first enrollment code ships with the tenant. Creating a
+	// tenant and being able to enroll a device are one intent, one step apart;
 	// making the operator discover a second button just to get a string is
 	// friction with a support ticket attached.
 	c := &Claim{Code: newClaimCode(id), TenantID: id, Note: "created with tenant", CreatedAt: now}
@@ -384,18 +681,42 @@ func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
 		c.Code = newClaimCode(id)
 	}
 	s.state.Claims[c.Code] = c
+	var accView *consoleAccount
+	if username != "" {
+		a := &Account{
+			Username: username, Role: roleTenant, TenantID: id, Password: pwHash,
+			CreatedAt: now, InitialPass: true,
+		}
+		s.state.Accounts[username] = a
+		accView = accountView(a)
+	}
 	s.save()
 	s.mu.Unlock()
 
-	log.Printf("console: tenant %s created (claim %s)", id, c.Code)
-	s.admin.publish("tenant.created", nil)
-	writeJSON(w, createTenantResponse{
-		Tenant: t,
-		Claim: &consoleClaim{
-			Code: c.Code, TenantID: c.TenantID, Note: c.Note,
-			CreatedAt: c.CreatedAt, Serials: []string{},
-		},
-	})
+	log.Printf("console: tenant %s created (claim %s, account %q)", id, c.Code, username)
+	s.admin.publish("tenant.created", id, nil)
+	resp := createTenantResponse{Tenant: t, Claim: claimView(c), Account: accView}
+	if generated {
+		resp.Password = pw
+	}
+	writeJSON(w, resp)
+}
+
+func validUsername(u string) bool {
+	if len(u) < 3 || len(u) > 40 {
+		return false
+	}
+	for _, r := range u {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validTenantID(id string) bool {
@@ -423,7 +744,7 @@ type createClaimRequest struct {
 }
 
 func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
-	if !s.requireSession(w, r) {
+	if _, ok := s.requireOperator(w, r); !ok {
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -458,11 +779,8 @@ func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	log.Printf("console: claim %s issued for tenant %s", c.Code, c.TenantID)
-	s.admin.publish("claim.created", nil)
-	writeJSON(w, consoleClaim{
-		Code: c.Code, TenantID: c.TenantID, Note: c.Note,
-		CreatedAt: c.CreatedAt, ExpiresAt: c.ExpiresAt, Serials: []string{},
-	})
+	s.admin.publish("claim.created", c.TenantID, nil)
+	writeJSON(w, claimView(c))
 }
 
 type revokeClaimRequest struct {
@@ -470,7 +788,7 @@ type revokeClaimRequest struct {
 }
 
 func (s *server) handleAdminClaimRevoke(w http.ResponseWriter, r *http.Request) {
-	if !s.requireSession(w, r) {
+	if _, ok := s.requireOperator(w, r); !ok {
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -489,6 +807,7 @@ func (s *server) handleAdminClaimRevoke(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "unknown claim code", 404)
 		return
 	}
+	tenantID := c.TenantID
 	c.Revoked = true
 	s.save()
 	s.mu.Unlock()
@@ -497,14 +816,298 @@ func (s *server) handleAdminClaimRevoke(w http.ResponseWriter, r *http.Request) 
 	// keep their certificates: withdrawing an identity is a different action
 	// (certificate revocation), and this button must not imply it did that.
 	log.Printf("console: claim %s revoked (already-enrolled devices unaffected)", req.Code)
-	s.admin.publish("claim.revoked", nil)
+	s.admin.publish("claim.revoked", tenantID, nil)
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// ------------------------------------------------------------------ accounts
+
+// consoleAccount is the account row the console renders. It never carries the
+// password hash.
+type consoleAccount struct {
+	Username    string `json:"username"`
+	Role        string `json:"role"`
+	TenantID    string `json:"tenant_id,omitempty"`
+	CreatedAt   int64  `json:"created_at_unix"`
+	LastLogin   int64  `json:"last_login_unix,omitempty"`
+	Disabled    bool   `json:"disabled"`
+	InitialPass bool   `json:"initial_password"`
+}
+
+func accountView(a *Account) *consoleAccount {
+	return &consoleAccount{
+		Username: a.Username, Role: a.Role, TenantID: a.TenantID,
+		CreatedAt: a.CreatedAt, LastLogin: a.LastLogin,
+		Disabled: a.Disabled, InitialPass: a.InitialPass,
+	}
+}
+
+type createAccountRequest struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	TenantID string `json:"tenant_id"`
+	Password string `json:"password"`
+}
+
+func (s *server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireOperator(w, r); !ok {
+		return
+	}
+	if r.Method == http.MethodGet {
+		s.mu.Lock()
+		out := make([]*consoleAccount, 0, len(s.state.Accounts))
+		for _, a := range s.state.Accounts {
+			out = append(out, accountView(a))
+		}
+		s.mu.Unlock()
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Role != out[j].Role {
+				return out[i].Role < out[j].Role
+			}
+			return out[i].Username < out[j].Username
+		})
+		writeJSON(w, out)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "GET or POST required", 405)
+		return
+	}
+	var req createAccountRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<13)).Decode(&req); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	if !validUsername(username) {
+		http.Error(w, "account must be 3..40 chars of a-z A-Z 0-9 - _ .", 400)
+		return
+	}
+	role := req.Role
+	if role == "" {
+		role = roleTenant
+	}
+	if role != roleOperator && role != roleTenant {
+		http.Error(w, "role must be operator or tenant", 400)
+		return
+	}
+	tenantID := strings.TrimSpace(req.TenantID)
+	if role == roleTenant && tenantID == "" {
+		http.Error(w, "tenant_id required for a tenant account", 400)
+		return
+	}
+	if role == roleOperator {
+		tenantID = ""
+	}
+
+	pw := req.Password
+	generated := false
+	if pw == "" {
+		pw = newPassword()
+		generated = true
+	} else if err := checkPasswordPolicy(pw); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	pwHash, err := hashPassword(pw)
+	if err != nil {
+		http.Error(w, "cannot hash password", 500)
+		return
+	}
+
+	s.mu.Lock()
+	if _, exists := s.state.Accounts[username]; exists {
+		s.mu.Unlock()
+		http.Error(w, "account already exists", 409)
+		return
+	}
+	if role == roleTenant {
+		if _, ok := s.state.Tenants[tenantID]; !ok {
+			s.mu.Unlock()
+			http.Error(w, "unknown tenant", 404)
+			return
+		}
+	}
+	a := &Account{
+		Username: username, Role: role, TenantID: tenantID, Password: pwHash,
+		CreatedAt: time.Now().Unix(), InitialPass: true,
+	}
+	s.state.Accounts[username] = a
+	s.save()
+	view := accountView(a)
+	s.mu.Unlock()
+
+	log.Printf("console: account %q created (role=%s tenant=%s)", username, role, tenantID)
+	writeJSON(w, map[string]any{"account": view, "password": conditionalString(generated, pw)})
+}
+
+func conditionalString(include bool, v string) any {
+	if !include {
+		return nil
+	}
+	return v
+}
+
+type resetAccountRequest struct {
+	Username string `json:"username"`
+}
+
+// handleAdminAccountReset issues a fresh one-time password. Reset, disable and
+// password change all drop that account's sessions: a new credential must not
+// leave the old cookie working.
+func (s *server) handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
+	op, ok := s.requireOperator(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	var req resetAccountRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	pw := newPassword()
+	pwHash, err := hashPassword(pw)
+	if err != nil {
+		http.Error(w, "cannot hash password", 500)
+		return
+	}
+	s.mu.Lock()
+	a, ok := s.state.Accounts[username]
+	if !ok {
+		s.mu.Unlock()
+		http.Error(w, "unknown account", 404)
+		return
+	}
+	a.Password = pwHash
+	a.InitialPass = true
+	s.save()
+	view := accountView(a)
+	s.mu.Unlock()
+	s.dropSessions(username)
+
+	log.Printf("console: password reset for %q by %s", username, op.Username)
+	writeJSON(w, map[string]any{"account": view, "password": pw})
+}
+
+type disableAccountRequest struct {
+	Username string `json:"username"`
+	Disabled bool   `json:"disabled"`
+}
+
+func (s *server) handleAdminAccountDisable(w http.ResponseWriter, r *http.Request) {
+	op, ok := s.requireOperator(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	var req disableAccountRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	if username == op.Username {
+		http.Error(w, "cannot disable the account you are logged in as", 400)
+		return
+	}
+	s.mu.Lock()
+	a, ok := s.state.Accounts[username]
+	if !ok {
+		s.mu.Unlock()
+		http.Error(w, "unknown account", 404)
+		return
+	}
+	a.Disabled = req.Disabled
+	s.save()
+	view := accountView(a)
+	s.mu.Unlock()
+	if req.Disabled {
+		s.dropSessions(username)
+	}
+
+	log.Printf("console: account %q disabled=%v by %s", username, req.Disabled, op.Username)
+	writeJSON(w, map[string]any{"account": view})
+}
+
+type changePasswordRequest struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
+}
+
+// handleAdminPassword is self-service, for the logged-in account only. The
+// break-glass token session has no account and is refused.
+func (s *server) handleAdminPassword(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	if id.Via != "password" {
+		http.Error(w, "the operator token has no password to change", 400)
+		return
+	}
+	var req changePasswordRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<13)).Decode(&req); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	if err := checkPasswordPolicy(req.NewPassword); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	s.mu.Lock()
+	a := s.state.Accounts[id.Username]
+	if a == nil {
+		s.mu.Unlock()
+		http.Error(w, "unknown account", 404)
+		return
+	}
+	cur := *a
+	s.mu.Unlock()
+
+	if !verifyPassword(cur.Password, req.OldPassword) {
+		http.Error(w, "current password is incorrect", 403)
+		return
+	}
+	pwHash, err := hashPassword(req.NewPassword)
+	if err != nil {
+		http.Error(w, "cannot hash password", 500)
+		return
+	}
+	s.mu.Lock()
+	if a := s.state.Accounts[id.Username]; a != nil {
+		a.Password = pwHash
+		a.InitialPass = false
+	}
+	s.save()
+	s.mu.Unlock()
+
+	// Re-issue the caller's own session after dropping every session of the
+	// account, so changing a password on one machine logs out the others.
+	s.dropSessions(id.Username)
+	s.newSession(w, consoleIdentity{
+		Role: id.Role, TenantID: id.TenantID, Username: id.Username, Via: "password",
+	})
+	log.Printf("console: password changed for %q", id.Username)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
 // ------------------------------------------------------------------ events
 
 func (s *server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
-	if !s.sessionValid(r) {
+	id := s.session(r)
+	if id.Role == "" {
 		http.Error(w, "not logged in", 401)
 		return
 	}
@@ -515,13 +1118,13 @@ func (s *server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	ch := make(chan adminEvent, 16)
 	s.admin.mu.Lock()
-	id := s.admin.next
+	n := s.admin.next
 	s.admin.next++
-	s.admin.subs[id] = ch
+	s.admin.subs[n] = adminSub{ch: ch, role: id.Role, tenantID: id.TenantID}
 	s.admin.mu.Unlock()
 	defer func() {
 		s.admin.mu.Lock()
-		delete(s.admin.subs, id)
+		delete(s.admin.subs, n)
 		s.admin.mu.Unlock()
 	}()
 

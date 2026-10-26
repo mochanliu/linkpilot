@@ -179,6 +179,27 @@ type State struct {
 	// tenant configures in the console, so a freshly enrolled device has no key
 	// material until it has been configured.
 	PKeyRings map[string][]wire.PKey `json:"p_key_rings"`
+
+	// Accounts is the console's login table, keyed by username. A tenant account
+	// belongs to exactly one tenant and can only ever see that tenant's rows; an
+	// operator account has no tenant and manages tenants and claim codes. The
+	// operator token from the command line remains a separate break-glass login
+	// and is not stored here -- it is a startup secret, not an account.
+	Accounts map[string]*Account `json:"accounts"`
+}
+
+// Account is one console login. Passwords are stored only as PBKDF2 hashes
+// (see password.go). Role "operator" may manage tenants, claim codes and
+// accounts; role "tenant" may only read its own tenant's devices and codes.
+type Account struct {
+	Username    string `json:"username"`
+	Role        string `json:"role"`                // operator | tenant
+	TenantID    string `json:"tenant_id,omitempty"` // required for role=tenant
+	Password    string `json:"password"`            // pbkdf2$sha256$...
+	CreatedAt   int64  `json:"created_at_unix"`
+	LastLogin   int64  `json:"last_login_unix,omitempty"`
+	Disabled    bool   `json:"disabled,omitempty"`
+	InitialPass bool   `json:"initial_password,omitempty"` // true until the holder changes it
 }
 
 // Store is the persistence seam. F1 (Postgres) implements this and nothing
@@ -217,6 +238,7 @@ func seedState() *State {
 		Tenants:    map[string]*Tenant{},
 		Claims:     claimMap{},
 		PKeyRings:  map[string][]wire.PKey{},
+		Accounts:   map[string]*Account{},
 	}
 	for id, name := range map[string]string{"tenant-a": "演示租户 A", "tenant-b": "演示租户 B"} {
 		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
@@ -246,6 +268,26 @@ func normalizeState(s *State) {
 	}
 	if s.PKeyRings == nil {
 		s.PKeyRings = map[string][]wire.PKey{}
+	}
+	if s.Accounts == nil {
+		s.Accounts = map[string]*Account{}
+	}
+	// A tenant account whose tenant no longer exists authorizes nothing; drop it
+	// rather than leave a login that can only ever see an empty world.
+	for name, a := range s.Accounts {
+		if a == nil || a.Username == "" || a.Password == "" {
+			delete(s.Accounts, name)
+			continue
+		}
+		if a.Role != "operator" && a.Role != "tenant" {
+			delete(s.Accounts, name)
+			continue
+		}
+		if a.Role == "tenant" {
+			if _, ok := s.Tenants[a.TenantID]; !ok {
+				delete(s.Accounts, name)
+			}
+		}
 	}
 	now := time.Now().Unix()
 	for code, c := range s.Claims {
@@ -645,7 +687,7 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	rec.CertPEM = certPEM
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
 	s.save()
-	s.admin.publish("node.enrolled", rec)
+	s.admin.publish("node.enrolled", tenant, rec)
 
 	json.NewEncoder(w).Encode(s.enrollResponse(tenant, rec, certPEM, string(caPEM)))
 }
@@ -716,7 +758,7 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if wasStale || firstContact {
 		// Console-facing: the device table's online/stale column just flipped.
-		s.admin.publish("node.online", rec)
+		s.admin.publish("node.online", rec.TenantID, rec)
 	}
 	json.NewEncoder(w).Encode(wire.HeartbeatResponse{
 		Epoch:      s.advanceEpoch(),
@@ -1520,8 +1562,8 @@ func (s *server) ttlSweeper(ctx context.Context) {
 
 func main() {
 	var (
-		dataDir = flag.String("data", "./ctrl-data", "state directory (CA, certs, registry)")
-		listen  = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
+		dataDir  = flag.String("data", "./ctrl-data", "state directory (CA, certs, registry)")
+		listen   = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
 		hbSec    = flag.Int("hb", 5, "heartbeat interval advertised to agents")
 		extraSAN = flag.String("tls-san", "", "comma-separated extra SANs for the server certificate")
 		// The console is a SEPARATE, PLAIN-HTTP listener. A browser cannot present
@@ -1568,19 +1610,19 @@ func main() {
 	}
 
 	s := &server{
-		state:       st,
-		store:       store,
-		subs:        map[int]*subscriber{},
-		hbSec:       *hbSec,
-		tlsAddrs:    []string{*listen},
-		caCert:      ca,
-		caKey:       caKey,
-		dataDir:     *dataDir,
-		obs:         map[string]observerView{},
-		pendingObs:  map[string]map[string]*pendingObs{},
-		tel:         map[string]*nodeTelemetry{},
-		telTTLSec:   *metricsTTL,
-		adminToken:  *adminTokenF,
+		state:      st,
+		store:      store,
+		subs:       map[int]*subscriber{},
+		hbSec:      *hbSec,
+		tlsAddrs:   []string{*listen},
+		caCert:     ca,
+		caKey:      caKey,
+		dataDir:    *dataDir,
+		obs:        map[string]observerView{},
+		pendingObs: map[string]map[string]*pendingObs{},
+		tel:        map[string]*nodeTelemetry{},
+		telTTLSec:  *metricsTTL,
+		adminToken: *adminTokenF,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

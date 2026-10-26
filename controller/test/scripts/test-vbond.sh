@@ -22,6 +22,8 @@
 #      不带任何端口、overlay 地址、p-key 环或 RR 列表；旧协议版本（v2）被明确拒绝
 #  10b. 控制台管理面：建租户自动带一个入网码 → 用它 enroll 成功 → 吊销后 403；
 #      console 会话鉴权（无 token 401、错误 token 401、正确 token 拿到 cookie）
+#  10c. 多角色：租户账号只看自己（state + SSE 都在服务端过滤）、租户对运营方
+#      接口一律 403、运营方 state 不含 runtime/端口、口令策略/改密/禁用/限速
 #  11. WG 静态公钥的设备身份担保（keybinding）：控制器验签后存储并 relay 原文；
 #      签名正确但覆盖对象不对（拿别人的 tenant/node 签）必须被拒
 #  12. 观测回报 /v1/observe：按"我看到的源"归因到具体节点，逐读者渲染；
@@ -190,6 +192,51 @@ cfeq claim_serials 1 "入网码记录了用它的序列号（可审计，不是�
 cfeq revoke 200 "吊销入网码"
 cfeq claim_revoked true "状态里反映吊销"
 cfeq enroll_revoked 403 "吊销后的入网码不再授权任何设备"
+cfeq tenant_account tenant-new-admin "建租户同时开出该租户的登录账号"
+
+# 3c. 多角色的契约：权限在服务端收口，不靠页面藏按钮。
+cfeq tenant_login 200 "租户账号用用户名+口令登录"
+cfeq tenant_role tenant "租户会话的身份是 tenant"
+cfeq tenant_scope tenant-new "租户会话绑定自己的 tenant_id"
+cfeq tenant_tenants 1 "租户状态只有自己一家租户"
+cfeq tenant_nodes 1 "租户只看到自己的设备"
+cfeq tenant_claims 2 "租户只看到自己的入网码"
+cfeq tenant_foreign_nodes 0 "状态里没有别家的设备"
+cfeq tenant_foreign_claims 0 "状态里没有别家的入网码"
+cfeq tenant_node_runtime true "租户能看到自己设备的运行时信息"
+cfeq tenant_node_configured false "入网不等于配置：设备仍是未配置"
+cfeq operator_node_runtime false "运营方状态里没有 runtime 字段（看不到配置）"
+cfeq operator_config_leak false "运营方状态的原始 JSON 不含端口/配置字样"
+cfeq tenant_deny_tenants 403 "租户不能建租户"
+cfeq tenant_deny_claims 403 "租户不能签发入网码"
+cfeq tenant_deny_revoke 403 "租户不能吊销入网码"
+cfeq tenant_deny_accounts 403 "租户不能建账号"
+cfeq tenant_deny_account_list 403 "租户不能读账号列表"
+cfeq tenant_deny_account_reset 403 "租户不能重置他人口令"
+cfeq tenant_deny_account_disable 403 "租户不能禁用账号"
+cfeq account_has_password_field false "账号列表不回传口令哈希"
+cfeq account_password_generated 19 "运营方建账号时生成一次性口令（4-4-4-4）"
+cfeq account_password_returned_once true "一次性口令只在创建应答里出现"
+cfeq short_password 400 "口令长度在服务端校验（不是只拦在前端）"
+cfeq bad_password 401 "错误口令被 401 拒绝"
+cfeq unknown_user 401 "不存在的用户名也是同一个 401（不做用户名枚举）"
+cfeq token_change_password 400 "应急令牌会话没有口令可改"
+cfeq tenant_short_password 400 "租户改密同样受口令策略约束"
+cfeq password_change 200 "租户改自己的口令"
+cfeq old_cookie_after_change 401 "改密后旧会话立即失效"
+cfeq old_password_login 401 "改密后旧口令不能登录"
+cfeq new_password_login 200 "新口令能登录"
+cfeq initial_password_cleared false "改密后不再提示初始口令"
+cfeq disable_tenant_account 200 "运营方禁用租户账号"
+cfeq disabled_login 401 "被禁用的账号不能登录"
+cfeq reenable_tenant_account 200 "运营方重新启用账号"
+cfeq reenabled_login 200 "重新启用后可以登录"
+cfeq empty_nodes_is_list true "空集合序列化为 [] 而不是 null"
+cfeq empty_nodes_count 0 "新租户确实没有设备"
+cfeq sse_foreign 0 "租户的 SSE 订阅收不到别家的事件"
+cfeq sse_own 1 "租户的 SSE 订阅收到自己的事件"
+cfeq login_lock 429 "连续失败 5 次后登录被限速"
+cfeq tenant_after_logout 401 "退出登录后会话立即失效"
 
 # ==================================================================
 say "4. 第二台同租户 + 错误 claim"

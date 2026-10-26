@@ -55,7 +55,7 @@ sr-ctrl 现在有两件事——签发设备证书（`/v1/*`，mTLS :8444，设�
 
 ```
 lab-ctrl 10.99.0.200:8444   sr-ctrl（入网 / CA / 设备证书）
-         127.0.0.1:8088     sr-ctrl 控制台（宿主机回环 → 容器 8080，token 换会话）
+         127.0.0.1:8088     sr-ctrl 控制台（宿主机回环 → 容器 8080，账号或运营令牌换会话）
 lab-rr   10.99.0.100:18446  sr-rr（tenant-a 的反射器）
 lab-cpeN 10.99.0.1N         sr-route /status（1900N，sr-fib/sr-frr 从这里取）
 lab-custN 10.99.0.2N        BGP router-id
@@ -117,14 +117,26 @@ test/lab/teardown.sh --purge   # 连 test/lab/run/（含一次性 CA）一起删
 
 ## 控制台与 vCPE 入网（GUI 全流程）
 
+控制台有两种登录方式、两个角色：
+
+| 角色 | 登录方式 | 能做什么 | 看不到什么 |
+| --- | --- | --- | --- |
+| 运营方 operator | 运营令牌（应急）/ operator 账号 | 建租户、签发/吊销入网码、管理账号 | 设备的任何配置（`/api/state` 里没有 `runtime`、端口） |
+| 客户 tenant | 租户账号（用户名+口令） | 看自己的 CPE、自己的入网码、enroll 设备、改自己的口令 | 别家租户的一切；运营方接口一律 403 |
+
+建租户时可以同时开该租户的第一个账号；不给口令就由服务端生成一次性口令
+（`XXXX-XXXX-XXXX-XXXX`，只在创建应答里出现一次，登录后页面提示改密）。
+权限在服务端收口：`/api/state` 按租户过滤，SSE 订阅也按租户过滤；页面只是
+按角色显隐导航，隐藏的接口用程序点也是 403。
+
 控制台是给客户的界面：建租户 → 拿到入网码 → 设备用码入网 → 设备出现在
 列表里。入网**不下发任何配置**，所以设备行上写的「未配置」是真实状态。
 
 ```bash
-test/lab/console.sh            # 打印地址 http://127.0.0.1:8088/ 和登录 token
+test/lab/console.sh            # 打印地址 http://127.0.0.1:8088/ 和运营令牌
 test/lab/console.sh restart    # 重启 sr-ctrl（控制台 + 设备面同一个进程）
 
-# 页面里建租户后会给出入网码，然后：
+# 页面里建租户后会给出入网码和一个租户账号，然后：
 test/lab/vcpe.sh up --claim <入网码>   # 起一台只做入网+心跳的 vCPE（10.99.0.60）
 test/lab/vcpe.sh status               # 本地身份：tenant / node_id / 心跳次数
 test/lab/vcpe.sh logs                 # agent 日志
@@ -136,8 +148,12 @@ vCPE 跑的是 `controller/cmd/sr-agent`：入网一次、然后每 5 秒心跳�
 状态直接写 "none: enrollment carries no configuration"。它和 `lab-cpeN` 的区别
 只是没有 VPP —— 盒子里的 agent 以后会在这里接数据面。
 
-token 落在 `test/lab/run/console-token`，容器里也有同一份
+运营令牌是 break-glass：长期运行的生产控制器应该用 operator 账号（口令可改、
+可禁用），令牌只留给"账号进不去"的场合。令牌落在
+`test/lab/run/console-token`，容器里也有同一份
 （`/var/lib/sr-ctrl/console-token`）；容器重建后第一次 bringup 会重新生成。
+账号和口令哈希在 `state.json` 里（PBKDF2-HMAC-SHA256），控制台会话在内存里，
+重启 sr-ctrl 只会让人重新登录。
 
 分阶段调试（阶段之间可反复重跑，配置是幂等的）：
 

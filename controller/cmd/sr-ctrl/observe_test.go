@@ -28,12 +28,12 @@ func newTestServer() *server {
 		PKeyRings:  map[string][]wire.PKey{},
 	}
 	return &server{
-		state:       st,
-		hbSec:       5,
-		obs:         map[string]observerView{},
-		pendingObs:  map[string]map[string]*pendingObs{},
-		tel:         map[string]*nodeTelemetry{},
-		telTTLSec:   30,
+		state:      st,
+		hbSec:      5,
+		obs:        map[string]observerView{},
+		pendingObs: map[string]map[string]*pendingObs{},
+		tel:        map[string]*nodeTelemetry{},
+		telTTLSec:  30,
 	}
 }
 
