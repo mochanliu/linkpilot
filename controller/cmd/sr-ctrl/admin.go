@@ -129,13 +129,20 @@ func randToken() string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// newClaimCode is the code a customer pastes into a device. The alphabet has no
-// vowels and no look-alikes: it is read off a screen and typed on a console,
-// and 0/O, 1/l/I confusion is the failure that costs a support call. Entropy is
-// still 26^12.
-func newClaimCode(tenant string) string {
+const (
+	claimDefaultMaxUses = 10
+	claimMaxUsesLimit   = 10000
+)
+
+// newClaimCode is the secret a customer pastes into a device. It deliberately
+// looks like an API key: an opaque, prefix-tagged, 160-bit random string with no
+// tenant name in it, so it cannot be guessed from a tenant ID or recognized on
+// sight as belonging to someone else. The alphabet has no vowels and no
+// look-alikes: it is read off a screen and typed on a device console, and 0/O,
+// 1/l/I confusion is the failure that costs a support call.
+func newClaimCode() string {
 	const alphabet = "23456789BCDFGHJKLMNPQRSTVWXZ"
-	buf := make([]byte, 12)
+	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		log.Fatalf("console: entropy unavailable: %v", err)
 	}
@@ -143,7 +150,20 @@ func newClaimCode(tenant string) string {
 	for i, b := range buf {
 		out[i] = alphabet[int(b)%len(alphabet)]
 	}
-	return tenant + "-" + string(out)
+	return "srk_" + string(out)
+}
+
+// normalizeClaimMaxUses turns the operator's requested activation limit into the
+// stored one. 0 is the wire default, not "unlimited": an unbounded code is a code
+// that leaks once and enrolls forever, so every code carries a finite seat count.
+func normalizeClaimMaxUses(n int) (int, error) {
+	switch {
+	case n == 0:
+		return claimDefaultMaxUses, nil
+	case n < 0 || n > claimMaxUsesLimit:
+		return 0, fmt.Errorf("max_uses must be 1..%d (0 means the default %d)", claimMaxUsesLimit, claimDefaultMaxUses)
+	}
+	return n, nil
 }
 
 // ------------------------------------------------------------------ auth
@@ -267,6 +287,7 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/revoke", s.handleAdminClaimRevoke)
+	mux.HandleFunc("/api/claims/update", s.handleAdminClaimUpdate)
 	mux.HandleFunc("/api/accounts", s.handleAdminAccounts)
 	mux.HandleFunc("/api/accounts/reset", s.handleAdminAccountReset)
 	mux.HandleFunc("/api/accounts/disable", s.handleAdminAccountDisable)
@@ -452,6 +473,8 @@ type consoleClaim struct {
 	CreatedAt     int64    `json:"created_at_unix"`
 	ExpiresAt     int64    `json:"expires_at_unix,omitempty"`
 	Revoked       bool     `json:"revoked"`
+	MaxUses       int      `json:"max_uses"`
+	Uses          int      `json:"uses"`
 	Serials       []string `json:"serials"`
 	RedeemedCount int      `json:"redeemed_count"`
 }
@@ -534,6 +557,7 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		out.Claims = append(out.Claims, consoleClaim{
 			Code: c.Code, TenantID: c.TenantID, Note: c.Note,
 			CreatedAt: c.CreatedAt, ExpiresAt: c.ExpiresAt, Revoked: c.Revoked,
+			MaxUses: c.MaxUses, Uses: len(c.Serials),
 			Serials:       append([]string{}, c.Serials...),
 			RedeemedCount: len(c.Serials),
 		})
@@ -591,6 +615,9 @@ type createTenantRequest struct {
 	// intent in private deployments; the operator can also add accounts later.
 	Account  string `json:"account"`
 	Password string `json:"password"`
+	// ClaimMaxUses is the activation limit of the first enrollment code. Every
+	// code is bounded; 0 means "use the default", not "unlimited".
+	ClaimMaxUses int `json:"claim_max_uses"`
 }
 
 type createTenantResponse struct {
@@ -606,6 +633,7 @@ func claimView(c *Claim) *consoleClaim {
 	return &consoleClaim{
 		Code: c.Code, TenantID: c.TenantID, Note: c.Note,
 		CreatedAt: c.CreatedAt, ExpiresAt: c.ExpiresAt, Revoked: c.Revoked,
+		MaxUses: c.MaxUses, Uses: len(c.Serials),
 		Serials: append([]string{}, c.Serials...), RedeemedCount: len(c.Serials),
 	}
 }
@@ -632,6 +660,11 @@ func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = id
 	}
+	maxUses, err := normalizeClaimMaxUses(req.ClaimMaxUses)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 
 	username := strings.TrimSpace(req.Account)
 	pw := req.Password
@@ -649,8 +682,8 @@ func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		var err error
-		if pwHash, err = hashPassword(pw); err != nil {
+		var hashErr error
+		if pwHash, hashErr = hashPassword(pw); hashErr != nil {
 			http.Error(w, "cannot hash password", 500)
 			return
 		}
@@ -676,9 +709,9 @@ func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
 	// tenant and being able to enroll a device are one intent, one step apart;
 	// making the operator discover a second button just to get a string is
 	// friction with a support ticket attached.
-	c := &Claim{Code: newClaimCode(id), TenantID: id, Note: "created with tenant", CreatedAt: now}
+	c := &Claim{Code: newClaimCode(), TenantID: id, Note: "created with tenant", CreatedAt: now, MaxUses: maxUses}
 	for s.state.Claims[c.Code] != nil {
-		c.Code = newClaimCode(id)
+		c.Code = newClaimCode()
 	}
 	s.state.Claims[c.Code] = c
 	var accView *consoleAccount
@@ -741,6 +774,7 @@ type createClaimRequest struct {
 	TenantID   string `json:"tenant_id"`
 	Note       string `json:"note"`
 	ExpiresInH int    `json:"expires_in_hours"`
+	MaxUses    int    `json:"max_uses"`
 }
 
 func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
@@ -760,6 +794,11 @@ func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expires_in_hours must be >= 0", 400)
 		return
 	}
+	maxUses, err := normalizeClaimMaxUses(req.MaxUses)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	s.mu.Lock()
 	if _, ok := s.state.Tenants[req.TenantID]; !ok {
 		s.mu.Unlock()
@@ -767,9 +806,9 @@ func (s *server) handleAdminClaims(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	c := &Claim{Code: newClaimCode(req.TenantID), TenantID: req.TenantID, Note: strings.TrimSpace(req.Note), CreatedAt: now}
+	c := &Claim{Code: newClaimCode(), TenantID: req.TenantID, Note: strings.TrimSpace(req.Note), CreatedAt: now, MaxUses: maxUses}
 	for s.state.Claims[c.Code] != nil {
-		c.Code = newClaimCode(req.TenantID)
+		c.Code = newClaimCode()
 	}
 	if req.ExpiresInH > 0 {
 		c.ExpiresAt = now + int64(req.ExpiresInH)*3600
@@ -818,6 +857,55 @@ func (s *server) handleAdminClaimRevoke(w http.ResponseWriter, r *http.Request) 
 	log.Printf("console: claim %s revoked (already-enrolled devices unaffected)", req.Code)
 	s.admin.publish("claim.revoked", tenantID, nil)
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+type updateClaimRequest struct {
+	Code    string `json:"code"`
+	MaxUses int    `json:"max_uses"`
+}
+
+// handleAdminClaimUpdate changes a live code's activation limit. Lowering it
+// below the number of devices that already redeemed the code is refused: those
+// devices hold certificates, so "used 5 of 3" is a state the operator cannot
+// actually reach and the console must not pretend otherwise.
+func (s *server) handleAdminClaimUpdate(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireOperator(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	var req updateClaimRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	maxUses, err := normalizeClaimMaxUses(req.MaxUses)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	s.mu.Lock()
+	c, ok := s.state.Claims[req.Code]
+	if !ok {
+		s.mu.Unlock()
+		http.Error(w, "unknown claim code", 404)
+		return
+	}
+	if used := len(c.Serials); maxUses < used {
+		s.mu.Unlock()
+		http.Error(w, fmt.Sprintf("max_uses cannot be below the %d activations already used", used), 400)
+		return
+	}
+	c.MaxUses = maxUses
+	view := claimView(c)
+	s.save()
+	s.mu.Unlock()
+
+	log.Printf("console: claim %s max_uses set to %d (%d used)", req.Code, maxUses, len(view.Serials))
+	s.admin.publish("claim.updated", view.TenantID, nil)
+	writeJSON(w, view)
 }
 
 // ------------------------------------------------------------------ accounts

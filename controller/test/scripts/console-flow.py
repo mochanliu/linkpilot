@@ -16,6 +16,8 @@ A 段输出：
   tenant=tenant-new         建租户
   tenant_account=...        建租户同时得到第一个租户账号
   claim=<code>              建租户同时拿到第一个入网码
+  claim_code_shape=ok       码是 srk_ + 32 位随机串，不含租户名
+  claim_default_uses=10     没指定台数时的默认名额
   dup_tenant=409            同 ID 再建一次必须冲突
   bad_id=400                非法 tenant_id 被拒（不是"建了再报错"）
   no_json=415               非 JSON 的 POST 被拒（cookie 不是 CSRF 杠杆）
@@ -29,6 +31,16 @@ A 段输出：
   revoke=200                吊销入网码
   claim_revoked=true        状态里反映吊销
   enroll_revoked=403        吊销后不许再入网
+  quota_tenant_claim_uses=2 建租户时指定名额
+  quota_enroll_1|2=200      名额内正常入网
+  quota_enroll_3_blocked=403 名额用满后新设备被拒
+  quota_reenroll_existing=200 已入网设备重复入网不占名额
+  quota_used=2              状态里 uses 按设备计
+  quota_lower=400           名额不能降到已激活数以下
+  quota_raise=200           运营方可以调大名额
+  quota_enroll_after_raise=200 调大后可以继续入网
+  quota_update_unknown=404 / quota_update_too_big=400
+  quota_update_zero=200     0 表示默认名额
 
 B 段输出：
   tenant_login / tenant_role / tenant_scope
@@ -37,7 +49,7 @@ B 段输出：
   tenant_node_runtime=true                         租户看得到自己设备的运行时
   operator_node_runtime=false                      运营方状态里没有 runtime
   operator_config_leak=false                       原始 JSON 里没有端口/配置字样
-  tenant_deny_tenants|claims|revoke|accounts|...   全是 403
+  tenant_deny_tenants|claims|claim_update|revoke|accounts|...   全是 403
   account_password_generated=19                    一次性密码长度
   account_has_password_field=false                 账号列表不回传口令哈希
   short_password=400 / bad_password=401 / unknown_user=401
@@ -59,6 +71,7 @@ import http.client
 import http.cookiejar
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -268,6 +281,48 @@ say("claim_revoked", str(c2["revoked"]).lower() if c2 else "missing")
 code, _ = enroll(second, "vcpe-002")
 say("enroll_revoked", code)
 
+# 15. 入网码是随机密钥，不是可读的固定串
+say("claim_code_shape", "ok" if re.fullmatch(r"srk_[23456789BCDFGHJKLMNPQRSTVWXZ]{32}", claim) else claim)
+say("claim_code_hides_tenant", str("tenant-new" not in claim).lower())
+code, raw = call("GET", CONSOLE + "/api/state")
+st = jstat(code, raw)
+c1 = next((c for c in st["claims"] if c["code"] == claim), None) if st else None
+say("claim_default_uses", c1["max_uses"] if c1 else "missing")
+
+# 16. 名额按设备计：建租户时指定 2 台
+code, raw = call("POST", CONSOLE + "/api/tenants", {"tenant_id": "tenant-quota", "claim_max_uses": 2})
+res = jstat(code, raw)
+say("quota_tenant", res["tenant"]["tenant_id"] if res else "HTTP %d" % code)
+quota = res["claim"]["code"] if res else ""
+say("quota_tenant_claim_uses", res["claim"]["max_uses"] if res else "missing")
+
+say("quota_enroll_1", enroll(quota, "vcpe-q1")[0])
+say("quota_enroll_2", enroll(quota, "vcpe-q2")[0])
+say("quota_enroll_3_blocked", enroll(quota, "vcpe-q3")[0])
+# 同一台设备重入不消耗第二个名额，否则一次重启循环就能把码用光
+say("quota_reenroll_existing", enroll(quota, "vcpe-q1")[0])
+code, raw = call("GET", CONSOLE + "/api/state")
+st = jstat(code, raw)
+cq = next((c for c in st["claims"] if c["code"] == quota), None) if st else None
+say("quota_used", cq["uses"] if cq else "missing")
+
+# 17. 名额可以调整，但不能调到已激活数以下（那台设备的证书已经发出去了）
+code, _ = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 1})
+say("quota_lower", code)
+code, raw = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 3})
+res = jstat(code, raw)
+say("quota_raise", code)
+say("quota_raise_value", res["max_uses"] if res else "missing")
+say("quota_enroll_after_raise", enroll(quota, "vcpe-q3")[0])
+code, _ = call("POST", CONSOLE + "/api/claims/update", {"code": "srk_" + "X" * 32, "max_uses": 2})
+say("quota_update_unknown", code)
+code, _ = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 10001})
+say("quota_update_too_big", code)
+code, raw = call("POST", CONSOLE + "/api/claims/update", {"code": quota, "max_uses": 0})
+res = jstat(code, raw)
+say("quota_update_zero", code)
+say("quota_update_zero_value", res["max_uses"] if res else "missing")
+
 # ---------------------------------------------------------------- B. 多角色
 # B1. 第二家租户：有账号、没有设备（空集合契约）
 code, raw = call("POST", CONSOLE + "/api/tenants", {
@@ -327,6 +382,8 @@ say("tenant_nodes", len(tnodes))
 say("tenant_claims", len(tclaims))
 say("tenant_foreign_nodes", len([n for n in tnodes if n.get("tenant_id") != "tenant-new"]))
 say("tenant_foreign_claims", len([c for c in tclaims if c.get("tenant_id") != "tenant-new"]))
+tclaim = next((c for c in tclaims if c["code"] == claim), None)
+say("tenant_claim_seats", "%d/%d" % (tclaim["uses"], tclaim["max_uses"]) if tclaim else "missing")
 say("tenant_node_runtime", str(bool(tnodes and tnodes[0].get("runtime"))).lower())
 say("tenant_node_configured",
     str((tnodes[0].get("runtime") or {}).get("configured")).lower() if tnodes else "missing")
@@ -348,6 +405,7 @@ def deny(name, path, body):
 deny("tenant_deny_tenants", "/api/tenants", {"tenant_id": "evil"})
 deny("tenant_deny_claims", "/api/claims", {"tenant_id": "tenant-new"})
 deny("tenant_deny_revoke", "/api/claims/revoke", {"code": claim})
+deny("tenant_deny_claim_update", "/api/claims/update", {"code": claim, "max_uses": 999})
 deny("tenant_deny_accounts", "/api/accounts",
      {"username": "evil-admin", "role": "tenant", "tenant_id": "tenant-new", "password": "evil-pass-2026"})
 deny("tenant_deny_account_reset", "/api/accounts/reset", {"username": "tenant-other-admin"})

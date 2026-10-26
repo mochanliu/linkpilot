@@ -75,12 +75,17 @@ func enrollFixture(t *testing.T, claims claimMap) *server {
 
 func enrollReq(t *testing.T, claim string) *http.Request {
 	t.Helper()
+	return enrollReqSerial(t, claim, "sn-1")
+}
+
+func enrollReqSerial(t *testing.T, claim, serial string) *http.Request {
+	t.Helper()
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := json.Marshal(wire.EnrollRequest{
-		Serial:      "sn-1",
+		Serial:      serial,
 		ClaimCode:   claim,
 		PublicKey:   base64.StdEncoding.EncodeToString(pub),
 		ProtocolVer: wire.ProtocolVersion,
@@ -113,8 +118,8 @@ func TestEnrollRejectsClaimsThatAuthorizeNothing(t *testing.T) {
 	}
 }
 
-func TestEnrollRecordsSerialAndIsIdempotent(t *testing.T) {
-	claim := &Claim{Code: "c", TenantID: "t"}
+func TestEnrollRecordsSeatOnceAndIsIdempotent(t *testing.T) {
+	claim := &Claim{Code: "c", TenantID: "t", MaxUses: 5}
 	s := enrollFixture(t, claimMap{"c": claim})
 
 	rec := httptest.NewRecorder()
@@ -129,8 +134,8 @@ func TestEnrollRecordsSerialAndIsIdempotent(t *testing.T) {
 		t.Fatalf("claim usage not recorded: %+v", claim.Serials)
 	}
 
-	// Same serial again: same node id, same row, and the claim gains a second
-	// (historical) use. Re-enrollment must not mint node 2.
+	// Same serial again: same node id, same row, and no second seat. A seat is
+	// a device, not an enrollment; otherwise a reboot loop would exhaust the code.
 	rec = httptest.NewRecorder()
 	s.handleEnroll(rec, enrollReq(t, "c"))
 	if rec.Code != http.StatusOK {
@@ -139,7 +144,64 @@ func TestEnrollRecordsSerialAndIsIdempotent(t *testing.T) {
 	if len(s.state.Nodes) != 1 || s.state.Nodes[key("t", 1)] == nil {
 		t.Fatalf("re-enrollment created a second node: %+v", s.state.Nodes)
 	}
+	if len(claim.Serials) != 1 {
+		t.Fatalf("re-enrollment consumed a seat: %+v", claim.Serials)
+	}
+}
+
+func TestEnrollStopsAtTheActivationLimit(t *testing.T) {
+	claim := &Claim{Code: "c", TenantID: "t", MaxUses: 2}
+	s := enrollFixture(t, claimMap{"c": claim})
+
+	for _, serial := range []string{"sn-1", "sn-2"} {
+		rec := httptest.NewRecorder()
+		s.handleEnroll(rec, enrollReqSerial(t, "c", serial))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("enroll %s failed: %d %s", serial, rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	s.handleEnroll(rec, enrollReqSerial(t, "c", "sn-3"))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("enroll past the limit = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	if len(s.state.Nodes) != 2 {
+		t.Fatalf("a rejected enrollment created a node: %+v", s.state.Nodes)
+	}
 	if len(claim.Serials) != 2 {
-		t.Fatalf("claim usage = %+v, want two recorded uses", claim.Serials)
+		t.Fatalf("a rejected enrollment consumed a seat: %+v", claim.Serials)
+	}
+
+	// Already-enrolled devices are unaffected by a full code: they still hold
+	// certificates, and re-enrolling one must keep working.
+	rec = httptest.NewRecorder()
+	s.handleEnroll(rec, enrollReqSerial(t, "c", "sn-1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-enroll of an existing serial on a full code = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestNormalizeClaimMaxUses(t *testing.T) {
+	cases := []struct {
+		in      int
+		want    int
+		wantErr bool
+	}{
+		{0, claimDefaultMaxUses, false},
+		{1, 1, false},
+		{claimMaxUsesLimit, claimMaxUsesLimit, false},
+		{-1, 0, true},
+		{claimMaxUsesLimit + 1, 0, true},
+	}
+	for _, tc := range cases {
+		got, err := normalizeClaimMaxUses(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("normalizeClaimMaxUses(%d) err = %v, wantErr %v", tc.in, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Errorf("normalizeClaimMaxUses(%d) = %d, want %d", tc.in, got, tc.want)
+		}
 	}
 }

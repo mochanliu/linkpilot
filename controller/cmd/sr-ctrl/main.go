@@ -122,10 +122,9 @@ type Tenant struct {
 }
 
 // Claim is one enrollment token. Its only authority is "bind the holder to
-// TenantID" -- it carries no configuration. Codes are tenant-scoped and, for
-// now, reusable; every serial that used one is recorded so the console can show
-// what it has been used for. Single-use per-device binding is a separate,
-// not-yet-taken decision.
+// TenantID" -- it carries no configuration. Codes are tenant-scoped and reusable
+// up to MaxUses devices; Serials lists exactly the devices this code activated,
+// so len(Serials) is also the seat count the console shows.
 type Claim struct {
 	Code      string   `json:"code"`
 	TenantID  string   `json:"tenant_id"`
@@ -133,6 +132,7 @@ type Claim struct {
 	CreatedAt int64    `json:"created_at_unix"`
 	ExpiresAt int64    `json:"expires_at_unix,omitempty"`
 	Revoked   bool     `json:"revoked,omitempty"`
+	MaxUses   int      `json:"max_uses"`
 	Serials   []string `json:"serials,omitempty"`
 }
 
@@ -244,7 +244,8 @@ func seedState() *State {
 		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
 	}
 	for code, tenant := range map[string]string{"claim-a": "tenant-a", "claim-b": "tenant-a", "claim-c": "tenant-b"} {
-		s.Claims[code] = &Claim{Code: code, TenantID: tenant, Note: "demo seed", CreatedAt: now}
+		s.Claims[code] = &Claim{Code: code, TenantID: tenant, Note: "demo seed",
+			CreatedAt: now, MaxUses: claimDefaultMaxUses}
 	}
 	return s
 }
@@ -304,6 +305,27 @@ func normalizeState(s *State) {
 		if c.TenantID == "" {
 			delete(s.Claims, code)
 			continue
+		}
+		// Older records reused one list for every enrollment attempt, so the
+		// same serial can appear twice. Seats are distinct devices, and the
+		// limit must never sit below what this code has already activated.
+		seen := map[string]bool{}
+		uniq := c.Serials[:0]
+		for _, s := range c.Serials {
+			if s != "" && !seen[s] {
+				seen[s] = true
+				uniq = append(uniq, s)
+			}
+		}
+		c.Serials = uniq
+		if c.MaxUses <= 0 {
+			c.MaxUses = claimDefaultMaxUses
+		}
+		if c.MaxUses > claimMaxUsesLimit {
+			c.MaxUses = claimMaxUsesLimit
+		}
+		if c.MaxUses < len(c.Serials) {
+			c.MaxUses = len(c.Serials)
 		}
 		ensureTenant(s, c.TenantID, now)
 	}
@@ -656,6 +678,14 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if rec == nil {
+		// A seat is a device, not an enrollment: re-enrolling a serial that
+		// already belongs to this tenant is free, even when the code is full.
+		if claim.MaxUses > 0 && len(claim.Serials) >= claim.MaxUses {
+			log.Printf("enroll REJECTED serial=%s (claim %s used %d/%d)",
+				req.Serial, req.ClaimCode, len(claim.Serials), claim.MaxUses)
+			http.Error(w, "claim code has no activations left", 403)
+			return
+		}
 		id := s.state.NextNodeID[tenant]
 		if id == 0 {
 			id = 1
@@ -669,15 +699,16 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 			Reach:      "unknown",
 		}
 		s.state.Nodes[key(tenant, id)] = rec
-		log.Printf("enroll: serial=%s -> tenant=%s node=%d", req.Serial, tenant, id)
+		// Serials is both the audit trail and the seat ledger; only a device
+		// this code actually activated belongs in it.
+		claim.Serials = append(claim.Serials, req.Serial)
+		log.Printf("enroll: serial=%s -> tenant=%s node=%d (claim %d/%d)",
+			req.Serial, tenant, id, len(claim.Serials), claim.MaxUses)
 	} else {
 		log.Printf("enroll: serial=%s re-enrolled as tenant=%s node=%d", req.Serial, tenant, rec.NodeID)
 	}
 	rec.PublicKey = base64.StdEncoding.EncodeToString(pub)
 	rec.AgentVer = req.AgentVersion
-	// Record the claim code that admitted this serial. History only — the code
-	// stays usable, so re-enrollment keeps appending to its Serials.
-	claim.Serials = append(claim.Serials, req.Serial)
 
 	certPEM, err := signDevice(s.caCert, s.caKey, ed25519.PublicKey(pub), tenant, rec.NodeID)
 	if err != nil {

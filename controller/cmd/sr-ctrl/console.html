@@ -70,6 +70,11 @@
   .page-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:4px}
   .page-head h1{font-size:20px}
   .page-head .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .head-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  .head-right .who{font-size:12.5px;color:var(--muted)}
+  .seats{white-space:nowrap}
+  .seats b{font-weight:650}
+  .seats.full b{color:var(--warn)}
   .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);
     background:#fff;border-radius:999px;padding:3px 10px;font-size:12.5px;color:var(--muted)}
   .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
@@ -111,6 +116,10 @@
   .form-row input[name=account]{width:170px}
   .form-row input[name=username]{width:170px}
   .form-row input[name=password]{width:200px}
+  .form-row input[name=claim_max_uses]{width:230px}
+  .form-row input[name=max_uses]{width:120px}
+  .form-row input[name=note]{width:220px}
+  .form-row select{width:180px}
   .row-actions button{display:inline-block}
   .row-actions button + button{margin-left:6px}
   .banner{display:flex;align-items:center;justify-content:space-between;gap:12px;
@@ -189,8 +198,6 @@
     </nav>
     <div class="foot">
       <div class="me"><div class="who" id="me-who">—</div><div class="role" id="me-role"></div></div>
-      <button class="small" id="pw-btn" hidden>修改密码</button>
-      <button class="small" id="logout">退出登录</button>
       <div id="ctrl-line" class="mono" style="font-size:11px;word-break:break-all;margin-top:8px"></div>
     </div>
   </aside>
@@ -201,7 +208,11 @@
         <h1 id="view-title">概览</h1>
         <div class="sub" id="view-sub"></div>
       </div>
-      <span class="pill"><span class="dot ok" id="live-dot"></span><span id="live-text">实时</span></span>
+      <div class="head-right">
+        <span class="pill"><span class="dot ok" id="live-dot"></span><span id="live-text">实时</span></span>
+        <button class="small" id="pw-btn" hidden>修改密码</button>
+        <button class="small" id="logout">退出登录</button>
+      </div>
     </div>
     <div id="content"></div>
   </main>
@@ -215,6 +226,9 @@
 
   var S = { state: null, me: null, accounts: null, loginTab: "account",
     view: "overview", lastResult: null, lastSecret: null, html: "", timer: null, ago: null, es: null };
+
+  // Only a placeholder for the input; the server owns the real default.
+  var CLAIM_DEFAULT_USES = 10;
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -393,7 +407,7 @@
         $("live-dot").className = "dot ok";
         $("live-text").textContent = "实时";
       });
-      ["node.online", "node.enrolled", "tenant.created", "claim.created", "claim.revoked"].forEach(function (n) {
+      ["node.online", "node.enrolled", "tenant.created", "claim.created", "claim.revoked", "claim.updated"].forEach(function (n) {
         S.es.addEventListener(n, function (e) {
           var ev = {};
           try { ev = JSON.parse(e.data); } catch (_) {}
@@ -619,12 +633,14 @@
 
   function viewTenants(st) {
     var h = '<section class="panel"><header><h2>新建租户</h2></header>' +
-      '<div class="hint">新建租户会同时签发第一个入网码；填写「客户登录名」会一并建好客户账号。</div>' +
+      '<div class="hint">新建租户会同时签发第一个入网码；填写「客户登录名」会一并建好客户账号。' +
+      "入网码按台计数：一台设备占一个名额，留空为默认 " + CLAIM_DEFAULT_USES + " 台。</div>" +
       '<form class="form-row" id="tenant-form">' +
       '<input name="tenant_id" placeholder="tenant_id，如 acme" required>' +
       '<input name="name" placeholder="显示名称（可选）">' +
       '<input name="account" placeholder="客户登录名（可选）" spellcheck="false">' +
       '<input name="password" type="password" placeholder="初始密码（留空自动生成）" autocomplete="new-password">' +
+      '<input name="claim_max_uses" type="number" min="1" max="10000" placeholder="入网码可用台数（留空默认 ' + CLAIM_DEFAULT_USES + '）">' +
       '<button class="primary" type="submit">创建租户</button>' +
       "</form>" + resultBox() + "</section>";
 
@@ -656,28 +672,55 @@
   }
 
   function viewEnroll(st, isOp) {
-    var h = '<section class="panel"><header><h2>入网码</h2>' +
-      (isOp ? '<button class="small" data-act="goto" data-view="tenants">新建租户 / 签发</button>' : "") +
+    var h = "";
+    if (isOp) {
+      h += '<section class="panel"><header><h2>签发入网码</h2></header>' +
+        '<div class="hint">码是随机串（<code>srk_</code> 开头），不含租户名，无法从租户 ID 推断。名额按设备计：只有该码激活一台新设备时才消耗，同一台设备重复入网不再占名额。</div>' +
+        '<form class="form-row" id="claim-form">' +
+        '<select name="tenant_id" required>' +
+        st.tenants.map(function (t) {
+          return '<option value="' + esc(t.tenant_id) + '">' + esc(t.name || t.tenant_id) + " · " + esc(t.tenant_id) + "</option>";
+        }).join("") +
+        "</select>" +
+        '<input name="max_uses" type="number" min="1" max="10000" placeholder="可用台数（默认 ' + CLAIM_DEFAULT_USES + '）">' +
+        '<input name="note" placeholder="备注（可选）">' +
+        '<button class="primary" type="submit">生成入网码</button>' +
+        "</form></section>";
+      if (!st.tenants.length) {
+        h = '<section class="panel"><div class="empty">还没有租户：先到「租户」页建一个，再签发入网码。</div></section>';
+      }
+    }
+    h += '<section class="panel"><header><h2>入网码</h2>' +
+      (isOp ? '<button class="small" data-act="goto" data-view="tenants">新建租户</button>' : "") +
       "</header>" +
       '<div class="hint">' + (isOp
-        ? "把码交给设备即可；码可以复用，每个用过的序列号都会记在下面。吊销只阻止未来的入网，已入网设备的证书不受影响。"
-        : "入网码由运营方签发。码可以复用；用过的序列号会记在下面。") + "</div>";
+        ? "把码交给设备即可。名额用满后码自动失效；吊销只阻止未来的入网，已入网设备的证书不受影响。"
+        : "入网码由运营方签发。名额用满后码自动失效；用过的序列号会记在下面。") + "</div>";
     if (!st.claims.length) {
       h += '<div class="empty">还没有入网码。' +
         (isOp ? "" : "请联系运营方为你的租户签发一个。") + "</div>";
     } else {
-      h += "<table><thead><tr><th>入网码</th><th>租户</th><th>已入网序列号</th><th>状态</th><th></th></tr></thead><tbody>";
+      h += "<table><thead><tr><th>入网码</th><th>租户</th><th>名额（已激活 / 上限）</th><th>已入网序列号</th><th>状态</th><th></th></tr></thead><tbody>";
       st.claims.forEach(function (c) {
         var dead = c.revoked || expired(c);
+        var full = !dead && c.uses >= c.max_uses;
         var status = c.revoked ? '<span class="tag revoked">已吊销</span>'
           : expired(c) ? '<span class="tag stale">已过期</span>'
-            : '<span class="tag online">可用</span>';
+            : full ? '<span class="tag plan">已用满</span>'
+              : '<span class="tag online">可用</span>';
+        var seats = '<span class="seats' + (c.uses >= c.max_uses ? " full" : "") + '"><b>' +
+          c.uses + "</b> / " + c.max_uses + "</span>";
         h += "<tr>" +
-          '<td class="mono">' + esc(c.code) + "</td>" +
+          '<td class="mono" style="font-size:12px">' + esc(c.code) + "</td>" +
           "<td>" + esc(tenantName(c.tenant_id)) + "</td>" +
+          "<td>" + seats + "</td>" +
           '<td class="mono muted">' + (c.serials.length ? esc(c.serials.join(", ")) : "—") + "</td>" +
           "<td>" + status + "</td>" +
-          '<td><button class="small" data-act="copy" data-text="' + esc(c.code) + '">复制</button>' +
+          '<td class="row-actions"><button class="small" data-act="copy" data-text="' + esc(c.code) + '">复制</button>' +
+          (isOp
+            ? ' <button class="small" data-act="edit-max" data-code="' + esc(c.code) + '" data-used="' + c.uses +
+              '" data-max="' + c.max_uses + '">改名额</button>'
+            : "") +
           (isOp && !dead ? ' <button class="small danger" data-act="revoke" data-code="' + esc(c.code) + '">吊销</button>' : "") +
           "</td></tr>";
       });
@@ -799,7 +842,8 @@
       '<div class="ttl">租户 ' + esc(r.tenant.tenant_id) + " 已创建</div>" +
       '<div>入网码（交给设备）：</div>' +
       '<div class="copybox"><code>' + esc(r.claim.code) + "</code>" +
-      '<button class="small" data-act="copy" data-text="' + esc(r.claim.code) + '">复制</button></div>';
+      '<button class="small" data-act="copy" data-text="' + esc(r.claim.code) + '">复制</button></div>' +
+      '<div class="muted" style="font-size:12.5px">可激活 <b>' + r.claim.max_uses + "</b> 台设备（一台一个名额，可随时在「入网码」页调整）。</div>";
     if (r.account) {
       h += '<div style="margin-top:10px">客户账号 <code>' + esc(r.account.username) + "</code>" +
         (r.password ? " · 一次性初始密码（只显示这一次）：" : " · 密码是你填写的值") + "</div>";
@@ -814,16 +858,28 @@
 
   /* ---------------- actions ---------------- */
 
+  // An empty number field means "let the server pick", which is 0 on the wire;
+  // anything non-numeric is a client mistake and should not silently become 0.
+  function intField(f, name) {
+    var v = (f.get(name) || "").trim();
+    if (v === "") return 0;
+    var n = Number(v);
+    return Number.isFinite(n) ? Math.trunc(n) : NaN;
+  }
+
   function bind() {
     var tf = $("tenant-form");
     if (tf) tf.addEventListener("submit", function (e) {
       e.preventDefault();
       var f = new FormData(tf);
+      var maxUses = intField(f, "claim_max_uses");
+      if (isNaN(maxUses)) { toast("入网码可用台数必须是数字"); return; }
       api("POST", "/api/tenants", {
         tenant_id: (f.get("tenant_id") || "").trim(),
         name: (f.get("name") || "").trim(),
         account: (f.get("account") || "").trim(),
-        password: f.get("password") || ""
+        password: f.get("password") || "",
+        claim_max_uses: maxUses
       }).then(function (res) {
         S.lastResult = res;
         var msg = "租户 " + res.tenant.tenant_id + " 已创建";
@@ -854,6 +910,22 @@
       }).catch(function (err) { toast(err.message); });
     });
 
+    var cf = $("claim-form");
+    if (cf) cf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var f = new FormData(cf);
+      var maxUses = intField(f, "max_uses");
+      if (isNaN(maxUses)) { toast("可用台数必须是数字"); return; }
+      api("POST", "/api/claims", {
+        tenant_id: f.get("tenant_id") || "",
+        note: (f.get("note") || "").trim(),
+        max_uses: maxUses
+      }).then(function (c) {
+        toast("已生成入网码（可激活 " + c.max_uses + " 台）");
+        load();
+      }).catch(function (err) { toast(err.message); });
+    });
+
     var pf = $("password-form");
     if (pf) pf.addEventListener("submit", function (e) {
       e.preventDefault();
@@ -880,9 +952,19 @@
         else if (act === "claim") {
           api("POST", "/api/claims", { tenant_id: el.getAttribute("data-tenant") })
             .then(function (c) {
-              toast("已签发入网码 " + c.code);
+              toast("已签发入网码（可激活 " + c.max_uses + " 台），可在「入网码」页调整");
               load();
             }).catch(function (err) { toast(err.message); });
+        } else if (act === "edit-max") {
+          var code = el.getAttribute("data-code");
+          var used = Number(el.getAttribute("data-used")) || 0;
+          var v = prompt("可用台数（已激活 " + used + " 台，不能低于它）：", el.getAttribute("data-max"));
+          if (v === null) return;
+          var n = Number(String(v).trim());
+          if (!v.trim() || !Number.isFinite(n) || n < 1) { toast("台数必须是 1 以上的整数"); return; }
+          api("POST", "/api/claims/update", { code: code, max_uses: Math.trunc(n) })
+            .then(function (c) { toast("名额已改为 " + c.max_uses + " 台"); load(); })
+            .catch(function (err) { toast(err.message); });
         } else if (act === "revoke") {
           if (!confirm("吊销入网码 " + el.getAttribute("data-code") + "？已入网设备不受影响。")) return;
           api("POST", "/api/claims/revoke", { code: el.getAttribute("data-code") })
