@@ -762,14 +762,24 @@
     return '<span class="tag pending">未生成码</span>';
   }
 
+  // A code with neither a deadline nor an issuer predates this model (demo
+  // seed or state migrated from the old plaintext file). It still enrolls
+  // devices, but its plaintext only ever existed on the customer's side.
+  function legacyCode(c) {
+    return !c.code_expires_at_unix && !c.code_issued_by;
+  }
+
   // The operator can see THAT a customer is holding a live code and for how
   // long; the code itself is never part of this view for anyone but the tenant
   // that generated it (and only in the one-time box above).
   function grantCodeWindow(c, isOp) {
     if (c.revoked) return "授权已吊销，不能再生成码";
     if (c.code_active) {
-      // Demo seeds and codes migrated from the old model have no deadline; they
-      // stay usable until someone regenerates them, which makes them short-lived.
+      if (legacyCode(c)) {
+        return isOp
+          ? "旧版长期码：仍可入网；明文只在客户手里，这里只有哈希"
+          : "旧版长期码仍可入网（明文不在系统里）；要新码请点「生成新码」";
+      }
       if (!c.code_expires_at_unix) return "长期码（未设到期时间）；重新生成后改为短时码";
       return (c.code_issued_by && !isOp ? "由 " + esc(c.code_issued_by) + " 生成 · " : "") +
         "有效至 " + esc(hms(c.code_expires_at_unix)) + ' · <span class="ttl-now" data-expires="' +
@@ -861,7 +871,7 @@
             '<option value="86400">24 小时</option>' +
             "</select>" +
             '<button class="small primary" data-act="claim-code" data-id="' + esc(c.id) + '">' +
-            (c.code_active ? "重新生成" : "生成") + "</button>";
+            (c.code_active ? (legacyCode(c) ? "生成新码" : "重新生成") : "生成") + "</button>";
         }
         h += "</td></tr>";
       });
@@ -1141,6 +1151,14 @@
     if (a && a.blur && form.contains(a)) a.blur();
   }
 
+  // Same guard, other shape: a row action (生成 / 重置密码) can fire while the
+  // TTL <select> in that row still holds focus, which would swallow the frame
+  // that carries the one-time box.
+  function blurContent() {
+    var a = document.activeElement;
+    if (a && a.blur && a.closest && a.closest("#content")) a.blur();
+  }
+
   // An empty number field means "let the server pick", which is 0 on the wire;
   // anything non-numeric is a client mistake and should not silently become 0.
   function intField(f, name) {
@@ -1255,8 +1273,9 @@
             .then(function (res) {
               S.codeReveal = res;
               toast("入网码已生成，有效期至 " + clock(res.expires_at_unix));
-              load();
-            }).catch(function (err) {
+              blurContent();
+              return load();
+            }).then(revealIntoView).catch(function (err) {
               el.disabled = false;
               toast(err.message);
             });
@@ -1317,12 +1336,58 @@
     });
   }
 
+  // The reveal box renders at the top of the view; on a page with many grants
+  // that is above the fold, so the click looks like it did nothing.
+  function revealIntoView() {
+    var box = document.getElementById("code-reveal");
+    if (box && box.scrollIntoView) box.scrollIntoView({ block: "nearest" });
+  }
+
+  function selectCodeFor(t) {
+    var want = String(t).replace(/\s+/g, "");
+    var els = document.querySelectorAll("#content .copybox code");
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].textContent.replace(/\s+/g, "") === want) {
+        var r = document.createRange();
+        r.selectNodeContents(els[i]);
+        var s = window.getSelection();
+        s.removeAllRanges();
+        s.addRange(r);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Embedded webviews routinely deny clipboard-write (writeText rejects with
+  // NotAllowedError), so there has to be a path that does not need that
+  // permission: legacy textarea+execCommand, then "select it and say ⌘C".
   function copyText(t) {
+    function done() { toast("已复制"); }
+    function manual() {
+      if (selectCodeFor(t)) toast("浏览器不允许自动复制：内容已选中，按 ⌘C / Ctrl+C");
+      else toast("浏览器不允许自动复制，请手动选择：" + t);
+    }
+    function legacy() {
+      var ta = document.createElement("textarea");
+      ta.value = t;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      var ok = false;
+      try {
+        ta.select();
+        ok = document.execCommand("copy");
+      } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      if (ok) done();
+      else manual();
+    }
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(t).then(function () { toast("已复制"); },
-        function () { toast("复制失败，请手动选择"); });
+      navigator.clipboard.writeText(t).then(done, legacy);
     } else {
-      toast("请手动选择复制：" + t);
+      legacy();
     }
   }
 
