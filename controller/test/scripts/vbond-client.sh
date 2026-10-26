@@ -69,13 +69,13 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 open(sys.argv[2],"w").write(d["cert_pem"].replace("\\n","\n"))' "$ENR" "$CRT" 2>/dev/null || { echo "enroll: 响应里没有 cert_pem" >&2; exit 1; }
     echo "tenant=$(jget "$ENR" tenant_id) node_id=$(jget "$ENR" node_id) serial=$serial"
-    echo "hb_sec=$(jget "$ENR" heartbeat_sec) vpn_port=$(jget "$ENR" vpn_port) transit_port=$(jget "$ENR" transit_port)"
-    python3 -c '
+    echo "hb_sec=$(jget "$ENR" heartbeat_sec) epoch=$(jget "$ENR" epoch)"
+    # 入网应答只有身份。端口 / overlay 地址 / p-key 环 / RR 列表属于节点计划，
+    # 要等客户在控制台配置这台设备之后才下发 —— 这里把它们列出来，是为了让
+    # "enroll 没有下发配置" 变成一条可以断言的输出。
+    echo "enroll_keys=$(python3 -c '
 import json,sys
-d=json.load(open(sys.argv[1]))
-for k in d["p_keys"]:
-    print("p_key hmac_id=%s key_hex_len=%d" % (k["hmac_id"], len(k["key"])))' "$ENR"
-    echo "reflectors=$(jget "$ENR" udp_reflector)"
+print(",".join(sorted(json.load(open(sys.argv[1])).keys())))' "$ENR")"
     ;;
 
 bind)
@@ -121,11 +121,17 @@ print(json.dumps(b))' "$node" "$map" "$BASE/$name.bind.json")
     ;;
 
 mapping)
+    # vpn_port/transit_port 是**这台设备自己数据面的端口**，不是入网下发值：
+    # 入网现在只给身份，端口属于节点计划。真 agent 在这里报的是它实际绑上的
+    # 端口（可能因为被占而和计划不同），手工客户端默认报台子的 51820/51821，
+    # 用 VPN_PORT/TRANSIT_PORT 环境变量可以换成别的。
     m=${3:-}; lp=${4:-0}; refl=${5:-}; addrs=${6:-}
     body=$(python3 -c '
 import json,os,sys
 b={"udp_mapping":sys.argv[1],"local_port":int(sys.argv[2]),
-   "symmetric_nat":False,"reflector_addr":sys.argv[3]}
+   "symmetric_nat":False,"reflector_addr":sys.argv[3],
+   "vpn_port":int(os.environ.get("VPN_PORT","51820")),
+   "transit_port":int(os.environ.get("TRANSIT_PORT","51821"))}
 a=[x for x in sys.argv[4].split(",") if x]
 if a: b["local_addrs"]=a
 if os.path.exists(sys.argv[5]): b["key_binding"]=json.load(open(sys.argv[5]))

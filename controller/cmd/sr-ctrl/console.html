@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SROU 控制台</title>
+<style>
+  :root{
+    --bg:#f6f8fa; --card:#ffffff; --line:#d0d7de; --ink:#1f2328; --muted:#57606a;
+    --accent:#0969da; --ok:#1a7f37; --warn:#9a6700; --bad:#cf222e; --soft:#eef2f6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-size:14.5px;line-height:1.55}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+  h1,h2,h3{margin:0}
+  button{font:inherit;cursor:pointer;border-radius:6px;border:1px solid var(--line);
+    background:#fff;color:var(--ink);padding:6px 12px}
+  button:hover{background:var(--soft)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{filter:brightness(0.94)}
+  button.danger{color:var(--bad);border-color:#ffccc7}
+  button.small{padding:2px 8px;font-size:12.5px}
+  input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
+  input:focus{outline:2px solid #b6d6ff;outline-offset:-1px;border-color:var(--accent)}
+
+  /* ---------- login ---------- */
+  #login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+  #login[hidden],#app[hidden]{display:none}
+  .login-card{width:100%;max-width:420px;background:var(--card);border:1px solid var(--line);
+    border-radius:12px;padding:26px 26px 22px;box-shadow:0 8px 24px rgba(31,35,40,.06)}
+  .login-card .brand{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
+  .login-card .brand b{font-size:19px;letter-spacing:.3px}
+  .login-card .brand span{color:var(--muted);font-size:12.5px}
+  .login-card p{margin:0 0 18px;color:var(--muted);font-size:13px}
+  .login-card label{display:block;font-size:13px;color:var(--muted);margin:0 0 6px}
+  .login-card input{width:100%}
+  .login-card button{width:100%;margin-top:14px;padding:9px}
+  .err{color:var(--bad);font-size:13px;margin-top:10px;min-height:18px}
+
+  /* ---------- shell ---------- */
+  #app{display:grid;grid-template-columns:212px 1fr;min-height:100vh}
+  aside{background:var(--card);border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:0;height:100vh}
+  aside .logo{font-weight:700;font-size:16px;letter-spacing:.4px;padding:0 10px 4px}
+  aside .logo small{display:block;font-weight:400;color:var(--muted);font-size:11.5px;letter-spacing:1px}
+  nav{margin-top:16px;display:flex;flex-direction:column;gap:2px}
+  nav a{display:flex;align-items:center;justify-content:space-between;gap:8px;
+    padding:8px 10px;border-radius:6px;color:var(--ink);text-decoration:none;font-size:14px}
+  nav a:hover{background:var(--soft)}
+  nav a.active{background:#ddf4ff;color:#0550ae;font-weight:600}
+  nav a .n{font-size:12px;color:var(--muted)}
+  nav a.sect{margin-top:14px;color:var(--muted);font-size:11.5px;letter-spacing:1px;
+    padding:8px 10px 4px;pointer-events:none}
+  aside .foot{position:absolute;bottom:14px;left:12px;right:12px;font-size:12px;color:var(--muted)}
+
+  main{padding:22px 26px 60px;max-width:1180px}
+  .page-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:4px}
+  .page-head h1{font-size:20px}
+  .page-head .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);
+    background:#fff;border-radius:999px;padding:3px 10px;font-size:12.5px;color:var(--muted)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+
+  .cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:18px 0 6px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card .k{color:var(--muted);font-size:12.5px}
+  .card .v{font-size:24px;font-weight:650;margin-top:2px;letter-spacing:.3px}
+  .card .v small{font-size:12.5px;font-weight:400;color:var(--muted)}
+
+  section.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;
+    padding:16px 18px;margin-top:16px}
+  section.panel > header{display:flex;align-items:center;justify-content:space-between;
+    gap:12px;margin-bottom:12px}
+  section.panel h2{font-size:15px}
+  section.panel .hint{color:var(--muted);font-size:12.5px;margin-top:-4px;margin-bottom:12px}
+
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th{text-align:left;font-weight:600;color:var(--muted);font-size:12.5px;
+    padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:8px;border-bottom:1px solid #eaeef2;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  td .mono{color:#24292f}
+  .muted{color:var(--muted)}
+  .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;
+    border:1px solid var(--line);background:#fff;color:var(--muted)}
+  .tag.online{color:var(--ok);border-color:#aceebb;background:#dafbe1}
+  .tag.stale{color:var(--warn);border-color:#eed888;background:#fff8c5}
+  .tag.pending{color:var(--muted);background:#f6f8fa}
+  .tag.revoked{color:var(--bad);border-color:#ffcecb;background:#ffebe9}
+  .tag.plan{color:var(--warn);border-color:#eed888;background:#fff8c5}
+
+  .empty{padding:26px 8px;text-align:center;color:var(--muted);font-size:13.5px}
+
+  .form-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .form-row input[name=tenant_id]{width:180px}
+  .form-row input[name=name]{width:220px}
+
+  .result{display:none;margin-top:14px;border:1px solid #aceebb;background:#f0fff4;
+    border-radius:8px;padding:14px 16px}
+  .result.show{display:block}
+  .result .ttl{font-weight:600;color:var(--ok);margin-bottom:8px}
+  .copybox{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
+  .copybox code{background:#fff;border:1px solid var(--line);border-radius:6px;
+    padding:5px 10px;font-size:13.5px}
+  .steps{margin:10px 0 0;padding-left:20px;color:var(--muted);font-size:13px}
+  .steps li{margin:3px 0}
+  pre.cmd{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;
+    overflow-x:auto;font-size:12.5px;line-height:1.6;margin:8px 0 0}
+  .placeholder{border:1px dashed var(--line);border-radius:10px;padding:22px;
+    color:var(--muted);font-size:13.5px;background:#fcfdfe}
+  .placeholder b{color:var(--ink)}
+  .placeholder ul{margin:8px 0 0;padding-left:20px}
+  .toast{position:fixed;right:20px;bottom:20px;background:#1f2328;color:#fff;
+    padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(6px);
+    transition:opacity .18s,transform .18s;pointer-events:none;max-width:420px}
+  .toast.show{opacity:.96;transform:none}
+  @media (max-width:900px){
+    .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
+    #app{grid-template-columns:1fr}
+    aside{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
+    aside .foot{position:static;margin-top:12px}
+  }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <form class="login-card" id="login-form" autocomplete="off">
+    <div class="brand"><b>SROU 控制台</b><span>控制器管理面</span></div>
+    <p>输入控制器启动时打印的登录令牌。</p>
+    <label for="token">登录令牌</label>
+    <input id="token" name="token" type="password" placeholder="console login token" required>
+    <button class="primary" type="submit">登录</button>
+    <div class="err" id="login-err"></div>
+    <div class="muted" style="font-size:12px;margin-top:14px">
+      设备入网走另一条通道（mTLS :8444），不经过这个页面。
+    </div>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <aside>
+    <div class="logo">SROU<small>CONTROLLER</small></div>
+    <nav id="nav">
+      <a href="#overview" data-view="overview">概览 <span class="n" id="n-nodes">0</span></a>
+      <a href="#tenants" data-view="tenants">租户 <span class="n" id="n-tenants">0</span></a>
+      <a href="#enroll" data-view="enroll">入网码 <span class="n" id="n-claims">0</span></a>
+      <a href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
+      <div class="sect">配置（未实现）</div>
+      <a href="#tunnels" data-view="tunnels">隧道</a>
+      <a href="#routes" data-view="routes">路由</a>
+    </nav>
+    <div class="foot">
+      <div id="ctrl-line" class="mono" style="font-size:11.5px;word-break:break-all"></div>
+      <button class="small" id="logout" style="margin-top:8px">退出登录</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="page-head">
+      <div>
+        <h1 id="view-title">概览</h1>
+        <div class="sub" id="view-sub"></div>
+      </div>
+      <span class="pill"><span class="dot ok" id="live-dot"></span><span id="live-text">实时</span></span>
+    </div>
+    <div id="content"></div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var S = { state: null, view: "overview", lastResult: null, timer: null, es: null };
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function toast(msg) {
+    var t = $("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(t._h);
+    t._h = setTimeout(function () { t.classList.remove("show"); }, 2600);
+  }
+  function ago(unix) {
+    if (!unix) return "—";
+    var d = Math.max(0, Math.floor(Date.now() / 1000) - unix);
+    if (d < 60) return d + " 秒前";
+    if (d < 3600) return Math.floor(d / 60) + " 分钟前";
+    if (d < 86400) return Math.floor(d / 3600) + " 小时前";
+    return Math.floor(d / 86400) + " 天前";
+  }
+  function clock(unix) {
+    if (!unix) return "—";
+    var d = new Date(unix * 1000);
+    function p(n) { return n < 10 ? "0" + n : "" + n; }
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+      p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  function api(method, path, body) {
+    var opt = { method: method, credentials: "same-origin", headers: {} };
+    if (body !== undefined) {
+      opt.headers["Content-Type"] = "application/json";
+      opt.body = JSON.stringify(body);
+    }
+    return fetch(path, opt).then(function (r) {
+      if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("登录已过期"); }
+      return r.text().then(function (t) {
+        if (!r.ok) throw new Error(t.trim() || ("HTTP " + r.status));
+        return t ? JSON.parse(t) : null;
+      });
+    });
+  }
+
+  /* ---------------- login ---------------- */
+
+  function showLogin() {
+    $("app").hidden = true;
+    $("login").hidden = false;
+    $("token").focus();
+    if (S.es) { S.es.close(); S.es = null; }
+  }
+  function showApp() {
+    $("login").hidden = true;
+    $("app").hidden = false;
+  }
+
+  $("login-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    $("login-err").textContent = "";
+    api("POST", "/api/login", { token: $("token").value }).then(function () {
+      $("token").value = "";
+      showApp();
+      boot();
+    }).catch(function (err) {
+      $("login-err").textContent = /invalid token/.test(err.message) ? "令牌不正确" : err.message;
+    });
+  });
+
+  $("logout").addEventListener("click", function () {
+    api("POST", "/api/logout", {}).then(function () { location.reload(); });
+  });
+
+  /* ---------------- data ---------------- */
+
+  function load() {
+    return api("GET", "/api/state").then(function (st) {
+      S.state = st;
+      render();
+    }).catch(function (err) {
+      $("live-dot").className = "dot bad";
+      $("live-text").textContent = "离线：" + err.message;
+    });
+  }
+
+  function boot() {
+    load();
+    if (S.es) S.es.close();
+    try {
+      S.es = new EventSource("/api/events");
+      S.es.addEventListener("hello", function () {
+        $("live-dot").className = "dot ok";
+        $("live-text").textContent = "实时";
+      });
+      ["node.online", "node.enrolled", "tenant.created", "claim.created", "claim.revoked"].forEach(function (n) {
+        S.es.addEventListener(n, function (e) {
+          var ev = {};
+          try { ev = JSON.parse(e.data); } catch (_) {}
+          load();
+          if (n === "node.enrolled") toast("设备已入网，正在等待第一个心跳");
+          if (n === "node.online") toast("设备上线");
+          if (n === "claim.created" || n === "tenant.created") toast(n === "tenant.created" ? "租户已创建" : "已签发新的入网码");
+        });
+      });
+      S.es.onerror = function () {
+        $("live-dot").className = "dot warn";
+        $("live-text").textContent = "实时连接重连中";
+      };
+    } catch (_) {}
+    // Events drive the table, but "last seen 12 秒前" also ages while nothing
+    // happens; a slow refetch keeps the clock honest without hammering the API.
+    clearInterval(S.timer);
+    S.timer = setInterval(load, 10000);
+  }
+
+  /* ---------------- render ---------------- */
+
+  var VIEWS = {
+    overview: { title: "概览", sub: "租户与设备的当前状态；入网只建立归属，配置在设备页另行下发" },
+    tenants: { title: "租户", sub: "租户是设备归属的唯一依据，只有控制台能创建" },
+    enroll: { title: "入网码", sub: "入网码只决定设备属于哪个租户，不携带任何配置" },
+    nodes: { title: "设备", sub: "已入网的设备；状态来自心跳，不是配置结果" },
+    tunnels: { title: "隧道", sub: "尚未实现：需要先把节点计划（端口 / overlay 地址 / 密钥环）做出来" },
+    routes: { title: "路由", sub: "尚未实现：路由表由 RR 反射，控制器不发布路由" }
+  };
+
+  function render() {
+    var st = S.state;
+    if (!st) return;
+    var v = VIEWS[S.view] || VIEWS.overview;
+    $("view-title").textContent = v.title;
+    $("view-sub").textContent = v.sub;
+
+    var online = st.nodes.filter(function (n) { return n.status === "online"; }).length;
+    $("n-nodes").textContent = st.nodes.length;
+    $("n-tenants").textContent = st.tenants.length;
+    $("n-claims").textContent = st.claims.filter(function (c) { return !c.revoked; }).length;
+    $("n-devices").textContent = online + "/" + st.nodes.length;
+    $("ctrl-line").textContent = (st.controller.tls_addrs || []).join(" · ");
+
+    // 后台刷新（SSE + 10 秒轮询）不能把操作员正在填的表单冲掉：焦点还在
+    // #content 的输入控件上就直接跳过这一帧，下次轮询再画。表格晚 10 秒
+    // 更新是可以接受的，输入被清空不是。
+    var a = document.activeElement;
+    if (a && a.closest && a.closest("#content") && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)) return;
+
+    // 焦点不在表单上时仍然保留已填的值（例如点了页面空白处）。
+    var keep = {};
+    document.querySelectorAll("#content input, #content select").forEach(function (el) {
+      var k = el.tagName + ":" + (el.name || el.id || "");
+      if (k !== "INPUT:" && el.value) keep[k] = el.value;
+    });
+
+    var c = "";
+    if (S.view === "overview") c = viewOverview(st, online);
+    else if (S.view === "tenants") c = viewTenants(st);
+    else if (S.view === "enroll") c = viewEnroll(st);
+    else if (S.view === "nodes") c = viewNodes(st);
+    else c = viewPlaceholder(S.view);
+    $("content").innerHTML = c;
+
+    document.querySelectorAll("#content input, #content select").forEach(function (el) {
+      var k = el.tagName + ":" + (el.name || el.id || "");
+      if (!el.value && keep[k]) el.value = keep[k];
+    });
+
+    document.querySelectorAll("#nav a[data-view]").forEach(function (a) {
+      a.classList.toggle("active", a.getAttribute("data-view") === S.view);
+    });
+    bind();
+  }
+
+  function cards(st, online) {
+    return '<div class="cards">' +
+      card("租户", st.tenants.length, "个") +
+      card("已入网设备", st.nodes.length, "台") +
+      card("在线", online, "台") +
+      card("可用入网码", st.claims.filter(function (c) { return !c.revoked && !expired(c); }).length, "个") +
+      "</div>";
+  }
+  function card(k, v, u) {
+    return '<div class="card"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) +
+      ' <small>' + esc(u) + "</small></div></div>";
+  }
+  function expired(c) {
+    return c.expires_at_unix > 0 && c.expires_at_unix * 1000 < Date.now();
+  }
+
+  function deviceTable(nodes, emptyMsg) {
+    if (!nodes.length) return '<div class="empty">' + esc(emptyMsg) + "</div>";
+    var h = "<table><thead><tr><th>设备</th><th>租户</th><th>序列号</th><th>状态</th>" +
+      "<th>最后心跳</th><th>入网时间</th><th>配置</th></tr></thead><tbody>";
+    nodes.forEach(function (n) {
+      h += "<tr>" +
+        '<td><span class="mono">node-' + esc(n.node_id) + "</span></td>" +
+        "<td>" + esc(tenantName(n.tenant_id)) + "</td>" +
+        '<td class="mono">' + esc(n.serial) + "</td>" +
+        "<td>" + statusTag(n.status) + "</td>" +
+        '<td class="muted">' + esc(ago(n.last_seen_unix)) + "</td>" +
+        '<td class="muted">' + esc(clock(n.enrolled_at_unix)) + "</td>" +
+        '<td><span class="tag plan">未配置</span></td>' +
+        "</tr>";
+    });
+    return h + "</tbody></table>";
+  }
+
+  function statusTag(s) {
+    var label = { online: "在线", stale: "失联", pending: "已入网 · 未上线" }[s] || s;
+    return '<span class="tag ' + esc(s) + '">' + esc(label) + "</span>";
+  }
+  function tenantName(id) {
+    var st = S.state;
+    for (var i = 0; i < st.tenants.length; i++) if (st.tenants[i].tenant_id === id) {
+      return st.tenants[i].name ? st.tenants[i].name + " (" + id + ")" : id;
+    }
+    return id;
+  }
+
+  function viewOverview(st, online) {
+    var h = cards(st, online);
+    h += '<section class="panel"><header><h2>设备</h2>' +
+      '<button class="small" data-act="refresh">刷新</button></header>' +
+      deviceTable(st.nodes,
+        "还没有设备。到「租户」新建一个租户拿到入网码，再按「入网码」页的命令启动一个 vCPE。") +
+      "</section>";
+    h += '<section class="panel"><header><h2>这一步做了什么</h2></header>' +
+      '<div class="placeholder"><b>入网 = 设备与租户建立归属关系</b>，只签设备证书、登记一行记录，零配置。' +
+      "<ul>" +
+      "<li>控制台创建租户 → 得到一个入网码（claim code）</li>" +
+      "<li>设备用这个码入网 → 控制器返回证书与 node_id，设备出现在上面的表里</li>" +
+      "<li>之后客户在控制台配置这台设备 → 隧道 / 端口 / overlay 地址 / 密钥环才下发</li>" +
+      "</ul></div></section>";
+    return h;
+  }
+
+  function viewTenants(st) {
+    var h = '<section class="panel"><header><h2>新建租户</h2></header>' +
+      '<div class="hint">新建租户会同时签发它的第一个入网码，可以直接拿去 enroll 设备。</div>' +
+      '<form class="form-row" id="tenant-form">' +
+      '<input name="tenant_id" placeholder="tenant_id，如 acme" required>' +
+      '<input name="name" placeholder="显示名称（可选）">' +
+      '<button class="primary" type="submit">创建租户</button>' +
+      "</form>" + resultBox() + "</section>";
+
+    h += '<section class="panel"><header><h2>租户列表</h2></header>';
+    if (!st.tenants.length) {
+      h += '<div class="empty">还没有租户。</div>';
+    } else {
+      h += "<table><thead><tr><th>租户</th><th>ID</th><th>设备</th><th>入网码</th><th>创建时间</th><th></th></tr></thead><tbody>";
+      st.tenants.forEach(function (t) {
+        var devs = st.nodes.filter(function (n) { return n.tenant_id === t.tenant_id; }).length;
+        var cls = st.claims.filter(function (c) { return c.tenant_id === t.tenant_id && !c.revoked; }).length;
+        h += "<tr>" +
+          "<td>" + esc(t.name || t.tenant_id) + "</td>" +
+          '<td class="mono">' + esc(t.tenant_id) + "</td>" +
+          "<td>" + devs + "</td>" +
+          "<td>" + cls + " 个可用</td>" +
+          '<td class="muted">' + esc(clock(t.created_at_unix)) + "</td>" +
+          '<td><button class="small" data-act="claim" data-tenant="' + esc(t.tenant_id) + '">签发入网码</button></td>' +
+          "</tr>";
+      });
+      h += "</tbody></table>";
+    }
+    return h + "</section>";
+  }
+
+  function viewEnroll(st) {
+    var h = '<section class="panel"><header><h2>入网码</h2>' +
+      '<button class="small" data-act="goto" data-view="tenants">新建租户 / 签发</button></header>' +
+      '<div class="hint">把码交给设备即可；码可以复用，每个用过的序列号都会记在下面。吊销只阻止未来的入网，已入网设备的证书不受影响。</div>';
+    if (!st.claims.length) {
+      h += '<div class="empty">还没有入网码。</div>';
+    } else {
+      h += "<table><thead><tr><th>入网码</th><th>租户</th><th>已入网序列号</th><th>状态</th><th></th></tr></thead><tbody>";
+      st.claims.forEach(function (c) {
+        var dead = c.revoked || expired(c);
+        var status = c.revoked ? '<span class="tag revoked">已吊销</span>'
+          : expired(c) ? '<span class="tag stale">已过期</span>'
+            : '<span class="tag online">可用</span>';
+        h += "<tr>" +
+          '<td class="mono">' + esc(c.code) + "</td>" +
+          "<td>" + esc(tenantName(c.tenant_id)) + "</td>" +
+          '<td class="mono muted">' + (c.serials.length ? esc(c.serials.join(", ")) : "—") + "</td>" +
+          "<td>" + status + "</td>" +
+          '<td><button class="small" data-act="copy" data-text="' + esc(c.code) + '">复制</button>' +
+          (dead ? "" : ' <button class="small danger" data-act="revoke" data-code="' + esc(c.code) + '">吊销</button>') +
+          "</td></tr>";
+      });
+      h += "</tbody></table>";
+    }
+    h += "</section>";
+
+    h += '<section class="panel"><header><h2>让一台 vCPE 入网</h2></header>' +
+      '<div class="hint">vCPE 是一个容器里跑的最小 agent：只做入网 + 心跳，不碰数据面。</div>' +
+      '<div class="steps"><ol>' +
+      "<li>在「租户」页拿到入网码</li>" +
+      "<li>在宿主机仓库根目录执行下面的命令（把 CODE 换成你的入网码）</li>" +
+      "<li>大约 5 秒后设备出现在「设备」页，状态从「已入网 · 未上线」变成「在线」</li>" +
+      "<li>用 <code>docker logs -f sr-lab-vcpe</code> 可以看 agent 自己的日志</li>" +
+      "</ol></div>" +
+      "<pre class=\"cmd\">test/lab/vcpe.sh up --claim CODE\n\ntest/lab/vcpe.sh logs      # 跟进 agent 日志\ntest/lab/vcpe.sh status    # 看本地身份（tenant / node_id）\ntest/lab/vcpe.sh down</pre>" +
+      "</section>";
+    return h;
+  }
+
+  function viewNodes(st) {
+    return '<section class="panel"><header><h2>已入网设备</h2>' +
+      '<button class="small" data-act="refresh">刷新</button></header>' +
+      deviceTable(st.nodes, "还没有设备入网。") +
+      '<div class="hint" style="margin-top:12px">「未配置」是真实状态：enroll 不推任何参数，节点计划（每个隧道的端口、overlay /32、密钥环、RR 列表）还没有实现。</div>' +
+      "</section>";
+  }
+
+  function viewPlaceholder(view) {
+    var what = view === "tunnels" ? "隧道" : "路由";
+    return '<section class="panel"><div class="placeholder">' +
+      "<b>" + esc(what) + "页还没有数据来源。</b>" +
+      "<ul>" +
+      "<li>设备配置（节点计划）尚未实现：端口、overlay 地址、密钥环都还没有下发通道</li>" +
+      "<li>因此控制器现在没有任何隧道或路由事实可以展示</li>" +
+      "<li>本页保留位置，等节点计划落地后接入真实数据，不做假数据</li>" +
+      "</ul></div></section>";
+  }
+
+  function resultBox() {
+    var r = S.lastResult;
+    if (!r) return '<div class="result" id="result"></div>';
+    return '<div class="result show" id="result">' +
+      '<div class="ttl">租户 ' + esc(r.tenant.tenant_id) + " 已创建</div>" +
+      '<div>入网码（复制后填到 vcpe.sh 的 --claim）：</div>' +
+      '<div class="copybox"><code>' + esc(r.claim.code) + "</code>" +
+      '<button class="small" data-act="copy" data-text="' + esc(r.claim.code) + '">复制</button></div>' +
+      '<pre class="cmd">test/lab/vcpe.sh up --claim ' + esc(r.claim.code) + "</pre>" +
+      "</div>";
+  }
+
+  /* ---------------- actions ---------------- */
+
+  function bind() {
+    var tf = $("tenant-form");
+    if (tf) tf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var f = new FormData(tf);
+      api("POST", "/api/tenants", {
+        tenant_id: (f.get("tenant_id") || "").trim(),
+        name: (f.get("name") || "").trim()
+      }).then(function (res) {
+        S.lastResult = res;
+        load().then(function () { S.view = "tenants"; render(); });
+      }).catch(function (err) { toast(err.message); });
+    });
+
+    document.querySelectorAll("[data-act]").forEach(function (el) {
+      el.addEventListener("click", function () {
+        var act = el.getAttribute("data-act");
+        if (act === "refresh") load().then(function () { toast("已刷新"); });
+        else if (act === "goto") { S.view = el.getAttribute("data-view"); render(); }
+        else if (act === "copy") copyText(el.getAttribute("data-text"));
+        else if (act === "claim") {
+          api("POST", "/api/claims", { tenant_id: el.getAttribute("data-tenant") })
+            .then(function (c) {
+              toast("已签发入网码 " + c.code);
+              load();
+            }).catch(function (err) { toast(err.message); });
+        } else if (act === "revoke") {
+          if (!confirm("吊销入网码 " + el.getAttribute("data-code") + "？已入网设备不受影响。")) return;
+          api("POST", "/api/claims/revoke", { code: el.getAttribute("data-code") })
+            .then(function () { toast("已吊销"); load(); })
+            .catch(function (err) { toast(err.message); });
+        }
+      });
+    });
+
+    document.querySelectorAll("#nav a[data-view]").forEach(function (a) {
+      a.onclick = function (e) {
+        e.preventDefault();
+        S.view = a.getAttribute("data-view");
+        render();
+      };
+    });
+  }
+
+  function copyText(t) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(function () { toast("已复制"); },
+        function () { toast("复制失败，请手动选择"); });
+    } else {
+      toast("请手动选择复制：" + t);
+    }
+  }
+
+  /* ---------------- start ---------------- */
+
+  api("GET", "/api/session").then(function (s) {
+    if (s && s.logged_in) { showApp(); boot(); } else { showLogin(); }
+  }).catch(showLogin);
+})();
+</script>
+</body>
+</html>

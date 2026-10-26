@@ -2,7 +2,8 @@
 # test-vbond.sh -- vBOND 控制面 acceptance harness（在 Docker 里跑，不需要 VPP）
 #
 # 拓扑：复用数据面实验室已有的 docker_net_ctrl（10.10.0.0/24）。
-#   srwg-ctrl  10.10.0.5  控制器 + 两个 RFC 5389 reflector
+#   srwg-ctrl  10.10.0.7  控制器 + 两个 RFC 5389 reflector
+#   （.5 被性能台的 srwg-term-a 占着；harness 自己挑一个空地址，不跟常驻容器抢）
 #   srwg-node1 10.10.0.2  充当 CPE，用 vbond-client.sh 走协议
 # 同网段互通 ⇒ 观测到的映射必须等于真实源，这才敢把"两个证人一致"当断言。
 #
@@ -17,8 +18,10 @@
 #   8. STUN：客户端解码出的映射 == reflector 自己记下的观测源（两个证人）
 #      固定源端口时映射端口即源端口；两个 reflector 给出同一端口 ⇒ 非对称 NAT 判定为 false
 #   9. 映射上报后，同租户对端在注册表和 watch 流里都能看到
-#  10. 数据面事实下发：vpn_port/transit_port 两个显式端口 + 租户 p-key 环（hmac_id/16 字节）；
-#      旧协议版本（v2）被明确拒绝，不是"接受了但字段没人看"
+#  10. 入网=租户归属：应答只有身份（证书 / CA / TLS 地址 / 心跳 / epoch），
+#      不带任何端口、overlay 地址、p-key 环或 RR 列表；旧协议版本（v2）被明确拒绝
+#  10b. 控制台管理面：建租户自动带一个入网码 → 用它 enroll 成功 → 吊销后 403；
+#      console 会话鉴权（无 token 401、错误 token 401、正确 token 拿到 cookie）
 #  11. WG 静态公钥的设备身份担保（keybinding）：控制器验签后存储并 relay 原文；
 #      签名正确但覆盖对象不对（拿别人的 tenant/node 签）必须被拒
 #  12. 观测回报 /v1/observe：按"我看到的源"归因到具体节点，逐读者渲染；
@@ -38,12 +41,13 @@ done
 CTRL=srwg-ctrl
 N1=srwg-node1
 NET=docker_net_ctrl
-CTRL_IP=10.10.0.5
+CTRL_IP=10.10.0.7
 N1_IP=10.10.0.2
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 CTRL_DIR=$REPO/controller
 TMP=/tmp/srwg-vbond
 REFL_LOG=/tmp/stun-observed.log
+ADMIN_TOKEN=harness-console-token
 
 PASS=0
 FAIL=0
@@ -102,11 +106,11 @@ say "2. 起 reflector 与控制器"
 dx "$CTRL" "rm -f $REFL_LOG"
 dxd "$CTRL" "python3 /workspace/controller/test/stun_reflector.py 3478 >/tmp/refl1.log 2>&1"
 dxd "$CTRL" "python3 /workspace/controller/test/stun_reflector.py 3479 >/tmp/refl2.log 2>&1"
-# 注意 --udp/--udp2 现在是"对外公布的地址"，控制器自己不再监听 UDP：
-# 公布 0.0.0.0 会让 agent 拿到一个没法用的地址，所以这里必须给真实 IP。
-dxd "$CTRL" "/tmp/sr-ctrl --data /tmp/ctrl-data --listen 0.0.0.0:8444 \
-    --udp $CTRL_IP:3478 --udp2 $CTRL_IP:3479 --hb 10 \
-    --vpn-port 51820 --transit-port 51821 >/tmp/sr-ctrl.log 2>&1"
+# 入网应答里不再有任何"公布地址"，所以控制器不需要知道 reflector 在哪；
+# reflector 仍由本脚本单独拉起，第 7 节用 sr-stunprobe 直接打它。
+# 控制台监听器默认开在 127.0.0.1:8088，这一节用固定 token 方便断言。
+dxd "$CTRL" "/tmp/sr-ctrl --data /tmp/ctrl-data --listen 0.0.0.0:8444 --hb 10 \
+    --console 127.0.0.1:8088 --admin-token $ADMIN_TOKEN >/tmp/sr-ctrl.log 2>&1"
 sleep 2
 
 if dx "$CTRL" 'pgrep -f stun_reflector >/dev/null && pgrep -f sr-ctrl >/dev/null && echo UP' | grep -q UP; then
@@ -138,13 +142,13 @@ echo "$E1" | grep -q "tenant=tenant-a node_id=1" && ok "claim-a 解析到 tenant
 CERT_OK=$(dx "$N1" 'openssl verify -CAfile /opt/vbond/ca.pem /opt/vbond/dev1.pem')
 echo "$CERT_OK" | grep -q "OK" && ok "设备证书能用 CA 验证通过（链到租户）" \
     || bad "证书链验证失败：$CERT_OK"
-echo "$E1" | grep -q "vpn_port=51820 transit_port=51821" \
-    && ok "两个数据面功能端口显式下发（不再有 base+1 那种隐含算术）" \
-    || bad "端口下发不对：$(echo "$E1" | grep vpn_port)"
-echo "$E1" | grep -qE "p_key hmac_id=1 key_hex_len=32" \
-    && ok "下发租户 p-key 环：hmac_id=1、16 字节（hex 32），形状就是 sr-wg key set 的入参" \
-    || bad "p-key 环不对：$(echo "$E1" | grep p_key)"
-echo "$E1" | grep -q "reflectors=" && ok "响应带反射器地址" || bad "响应里没有反射器地址"
+# 入网只建立归属关系：应答里除了身份，多一个配置字段都是错的。
+EKEYS=$(echo "$E1" | sed -n 's/^enroll_keys=//p')
+[ "$EKEYS" = "ca_pem,cert_pem,epoch,heartbeat_sec,node_id,tenant_id,tls_addrs" ] \
+    && ok "入网应答只带身份字段：$EKEYS" \
+    || bad "入网应答字段不对：$EKEYS"
+echo "$E1" | grep -q "hb_sec=10 epoch=" && ok "心跳间隔与 epoch 随身份一起下发" \
+    || bad "心跳/epoch 缺失：$(echo "$E1" | sed -n 's/^hb_sec=//p')"
 
 # 旧协议必须被拒，而不是"接受了但字段没人看"：v2 agent 不发端口也不发观测。
 E1V2=$(dx "$N1" 'VBOND_PROTVER=2 /opt/vbond-client.sh enroll devv2 claim-a CPE-001')
@@ -157,6 +161,35 @@ if echo "$E1b" | grep -q "tenant=tenant-a node_id=1"; then
 else
     bad "重复入网换了身份：$(echo "$E1b" | grep tenant=)"
 fi
+
+# ==================================================================
+say "3b. 控制台管理面：建租户 → 入网码 → 入网 → 吊销"
+# 这一段就是客户在 GUI 里点的那几步，只不过用 HTTP 打了一遍。控制台是独立
+# 明文 listener（浏览器上不了 mTLS），鉴权是 token → HttpOnly 会话 cookie。
+docker cp "$CTRL_DIR/test/scripts/console-flow.py" "$CTRL:/tmp/console-flow.py" >/dev/null
+CF=$(dx "$CTRL" "python3 /tmp/console-flow.py $ADMIN_TOKEN")
+echo "$CF" | sed 's/^/    /'
+cfeq() {  # cfeq <key> <expected> <message>
+    local got
+    got=$(echo "$CF" | sed -n "s/^$1=//p")
+    [ "$got" = "$2" ] && ok "$3" || bad "$3（期望 $2，实际 '$got'）"
+}
+cfeq unauth_state 401 "无会话读控制台状态被 401 拒绝"
+cfeq bad_login 401 "错误 token 登录被 401 拒绝"
+cfeq login 200 "正确 token 换到控制台会话"
+cfeq page "SROU 控制台" "控制台单页能取到"
+cfeq tenant tenant-new "控制台创建租户 tenant-new"
+cfeq dup_tenant 409 "重复的 tenant_id 被 409 拒绝（不静默覆盖）"
+cfeq bad_id 400 "非法 tenant_id 被 400 拒绝"
+cfeq no_json 415 "非 JSON 的 POST 被拒（会话 cookie 不是 CSRF 杠杆）"
+cfeq enroll 200 "用控制台签发的入网码入网成功"
+cfeq enroll_tenant tenant-new "新设备落在新建的租户下，而不是种子租户"
+cfeq enroll_node 1 "新租户独立分配 node_id（从 1 开始，不与别家共享）"
+cfeq node_status pending "入网 ≠ 上线：没有心跳的设备显示 pending"
+cfeq claim_serials 1 "入网码记录了用它的序列号（可审计，不是黑盒）"
+cfeq revoke 200 "吊销入网码"
+cfeq claim_revoked true "状态里反映吊销"
+cfeq enroll_revoked 403 "吊销后的入网码不再授权任何设备"
 
 # ==================================================================
 say "4. 第二台同租户 + 错误 claim"

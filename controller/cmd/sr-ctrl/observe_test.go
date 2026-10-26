@@ -14,17 +14,21 @@ import (
 	"sdwan/controller/internal/wire"
 )
 
+const (
+	testVpnPort     = 51820
+	testTransitPort = 51821
+)
+
 func newTestServer() *server {
 	st := &State{
 		Nodes:      map[string]*NodeRecord{},
 		NextNodeID: map[string]uint16{},
-		Claims:     map[string]string{},
+		Claims:     claimMap{},
+		Tenants:    map[string]*Tenant{"t": {ID: "t"}, "t2": {ID: "t2"}},
 		PKeyRings:  map[string][]wire.PKey{},
 	}
 	return &server{
 		state:       st,
-		vpnPort:     51820,
-		transitPort: 51821,
 		hbSec:       5,
 		obs:         map[string]observerView{},
 		pendingObs:  map[string]map[string]*pendingObs{},
@@ -40,8 +44,8 @@ func addNode(s *server, tenant string, id uint16, declared []string, mapping str
 		TenantID:    tenant,
 		NodeID:      id,
 		Serial:      "serial",
-		VpnPort:     s.vpnPort,
-		TransitPort: s.transitPort,
+		VpnPort:     testVpnPort,
+		TransitPort: testTransitPort,
 		LocalAddrs:  declared,
 		UDPMapping:  mapping,
 	}
@@ -231,7 +235,7 @@ func TestPerReaderViewInRegistry(t *testing.T) {
 	if !as1.IsSelf || as2.IsSelf {
 		t.Fatal("IsSelf is reader-dependent and got it wrong")
 	}
-	if as2.VpnPort != 51820 || as2.TransitPort != 51821 {
+	if as2.VpnPort != testVpnPort || as2.TransitPort != testTransitPort {
 		t.Fatalf("peer rows must carry the ports to send to: %+v", as2)
 	}
 	// peersLocked is what /v1/registry and the watch snapshot use; every row in it

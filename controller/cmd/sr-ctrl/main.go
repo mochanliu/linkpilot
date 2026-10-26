@@ -112,19 +112,72 @@ type NodeRecord struct {
 	KeyGen  uint32              `json:"key_gen,omitempty"`
 }
 
+// Tenant is the customer account a device belongs to. Tenants are created in
+// the console; enrollment never creates one, because a claim code always points
+// at a tenant that already exists.
+type Tenant struct {
+	ID        string `json:"tenant_id"`
+	Name      string `json:"name,omitempty"`
+	CreatedAt int64  `json:"created_at_unix"`
+}
+
+// Claim is one enrollment token. Its only authority is "bind the holder to
+// TenantID" -- it carries no configuration. Codes are tenant-scoped and, for
+// now, reusable; every serial that used one is recorded so the console can show
+// what it has been used for. Single-use per-device binding is a separate,
+// not-yet-taken decision.
+type Claim struct {
+	Code      string   `json:"code"`
+	TenantID  string   `json:"tenant_id"`
+	Note      string   `json:"note,omitempty"`
+	CreatedAt int64    `json:"created_at_unix"`
+	ExpiresAt int64    `json:"expires_at_unix,omitempty"`
+	Revoked   bool     `json:"revoked,omitempty"`
+	Serials   []string `json:"serials,omitempty"`
+}
+
+// claimMap reads both the current record shape and the legacy
+// `{"claim-a":"tenant-a"}` shape, so an existing lab state file keeps working.
+type claimMap map[string]*Claim
+
+func (m *claimMap) UnmarshalJSON(b []byte) error {
+	var recs map[string]*Claim
+	if err := json.Unmarshal(b, &recs); err == nil && recs != nil {
+		// A legacy file fails this decode ("cannot unmarshal string into ..."),
+		// so reaching here means the values really are claim records.
+		*m = recs
+		return nil
+	}
+	var legacy map[string]string
+	if err := json.Unmarshal(b, &legacy); err != nil {
+		return err
+	}
+	out := make(claimMap, len(legacy))
+	for code, tenant := range legacy {
+		out[code] = &Claim{Code: code, TenantID: tenant}
+	}
+	*m = out
+	return nil
+}
+
 // State is the whole persistent world. In production these become rows in
 // Postgres; the shape is deliberately flat so the mapping is trivial.
 type State struct {
 	Nodes      map[string]*NodeRecord `json:"nodes"`
 	NextNodeID map[string]uint16      `json:"next_node_id"` // per tenant
 	Epoch      uint32                 `json:"epoch"`        // monotonic, survives restart
-	Claims     map[string]string      `json:"claims"`       // claim_code -> tenant_id
+	Tenants    map[string]*Tenant     `json:"tenants"`
+	Claims     claimMap               `json:"claims"` // claim_code -> Claim
 	// PKeyRings holds each tenant's hop-MAC key ring. This is DOMAIN material:
 	// shared across the tenant on purpose, because a node has to verify headers
 	// signed by nodes it never talked to (a transit hop). What is NOT here is any
 	// per-pair material -- the tunnel key is negotiated by the endpoints from the
 	// bindings this controller only relays, and nothing in this file could
 	// compute one.
+	//
+	// It is NOT pushed at enrollment: the key ring is part of the node plan a
+	// tenant configures in the console, so a freshly enrolled device has no key
+	// material until it has been configured.
 	PKeyRings map[string][]wire.PKey `json:"p_key_rings"`
 }
 
@@ -140,17 +193,7 @@ type fileStore struct{ path string }
 func (f *fileStore) Load() (*State, error) {
 	b, err := os.ReadFile(f.path)
 	if os.IsNotExist(err) {
-		return &State{
-			Nodes:      map[string]*NodeRecord{},
-			NextNodeID: map[string]uint16{},
-			PKeyRings:  map[string][]wire.PKey{},
-			// Seeded so the harness proves multi-tenancy out of the box.
-			Claims: map[string]string{
-				"claim-a": "tenant-a",
-				"claim-b": "tenant-a",
-				"claim-c": "tenant-b",
-			},
-		}, nil
+		return seedState(), nil
 	}
 	if err != nil {
 		return nil, err
@@ -159,19 +202,83 @@ func (f *fileStore) Load() (*State, error) {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, err
 	}
+	normalizeState(&s)
+	return &s, nil
+}
+
+// seedState is the demo world the harness and the lab start from: two tenants
+// and three claim codes, so multi-tenancy is provable out of the box. Console
+// creation appends to it; nothing here is special.
+func seedState() *State {
+	now := time.Now().Unix()
+	s := &State{
+		Nodes:      map[string]*NodeRecord{},
+		NextNodeID: map[string]uint16{},
+		Tenants:    map[string]*Tenant{},
+		Claims:     claimMap{},
+		PKeyRings:  map[string][]wire.PKey{},
+	}
+	for id, name := range map[string]string{"tenant-a": "演示租户 A", "tenant-b": "演示租户 B"} {
+		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
+	}
+	for code, tenant := range map[string]string{"claim-a": "tenant-a", "claim-b": "tenant-a", "claim-c": "tenant-b"} {
+		s.Claims[code] = &Claim{Code: code, TenantID: tenant, Note: "demo seed", CreatedAt: now}
+	}
+	return s
+}
+
+// normalizeState repairs anything a hand-edited or older state file can be
+// missing. A claim that names no tenant authorizes nothing and is dropped; a
+// tenant referenced by a node or claim exists by definition, so it is
+// backfilled instead of leaving a row the console cannot render.
+func normalizeState(s *State) {
 	if s.Nodes == nil {
 		s.Nodes = map[string]*NodeRecord{}
 	}
 	if s.NextNodeID == nil {
 		s.NextNodeID = map[string]uint16{}
 	}
+	if s.Tenants == nil {
+		s.Tenants = map[string]*Tenant{}
+	}
 	if s.Claims == nil {
-		s.Claims = map[string]string{}
+		s.Claims = claimMap{}
 	}
 	if s.PKeyRings == nil {
 		s.PKeyRings = map[string][]wire.PKey{}
 	}
-	return &s, nil
+	now := time.Now().Unix()
+	for code, c := range s.Claims {
+		if c == nil {
+			delete(s.Claims, code)
+			continue
+		}
+		if c.Code == "" {
+			c.Code = code
+		}
+		if c.CreatedAt == 0 {
+			c.CreatedAt = now
+		}
+		if c.TenantID == "" {
+			delete(s.Claims, code)
+			continue
+		}
+		ensureTenant(s, c.TenantID, now)
+	}
+	for _, n := range s.Nodes {
+		if n != nil && n.TenantID != "" {
+			ensureTenant(s, n.TenantID, now)
+		}
+	}
+}
+
+func ensureTenant(s *State, id string, now int64) *Tenant {
+	if t, ok := s.Tenants[id]; ok && t != nil {
+		return t
+	}
+	t := &Tenant{ID: id, Name: id, CreatedAt: now}
+	s.Tenants[id] = t
+	return t
 }
 
 func (f *fileStore) Save(s *State) error {
@@ -204,31 +311,18 @@ type server struct {
 	nextSub  int
 	hbSec    int
 	tlsAddrs []string
-	udpAddrs []string
-	rrs      []wire.RRAddress
 
 	caCert  *x509.Certificate
 	caKey   ed25519.PrivateKey
 	dataDir string
 
-	// vpnPort / transitPort are the tenant-wide function ports pushed at
-	// enrollment. Constraint (2) of the design makes the destination UDP port the
-	// dataplane's multiplexing key, so the controller owns the answer and no node
-	// gets to invent one.
-	vpnPort     uint16
-	transitPort uint16
-
-	// tunnelMTU is the overlay MTU pushed at enrollment, in bytes of overlay
-	// packet. Like the two ports the controller owns the answer: it is a budget
-	// over the tenant's underlay MTU and the longest path this controller is
-	// willing to compose, and a node can only guess at both. The dataplane does
-	// act on it, but the action is fragmentation, not refusal -- an oversize
-	// overlay packet is cut into pieces at the WireGuard output, each piece
-	// separately SR-encapsulated (measured on the lab dataplane 2026-10-22; see
-	// wire.EnrollResponse.TunnelMTU). So the controller's job is to push a number
-	// that keeps the OUTER frame inside the underlay, which is what
-	// wire.TunnelMTUBudget computes.
-	tunnelMTU uint16
+	// admin is the human-facing console: a separate listener with a token
+	// session, because a browser cannot present a device certificate. It reads
+	// the same state under the same mutex and never takes part in enrollment
+	// authorization -- a console user cannot mint a device identity, only a
+	// claim code that the device itself must redeem.
+	admin      *adminHub
+	adminToken string
 
 	// obs is the observation store: per (tenant, OBSERVER), the attributed outer
 	// sources that observer reported. Deliberately NOT part of State, and
@@ -486,10 +580,26 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tenant, ok := s.state.Claims[req.ClaimCode]
-	if !ok {
+	claim, ok := s.state.Claims[req.ClaimCode]
+	if !ok || claim == nil || claim.TenantID == "" {
 		log.Printf("enroll REJECTED serial=%s (unknown claim code)", req.Serial)
 		http.Error(w, "invalid claim code", 403)
+		return
+	}
+	if claim.Revoked {
+		log.Printf("enroll REJECTED serial=%s (revoked claim code %s)", req.Serial, req.ClaimCode)
+		http.Error(w, "claim code revoked", 403)
+		return
+	}
+	if claim.ExpiresAt > 0 && time.Now().Unix() > claim.ExpiresAt {
+		log.Printf("enroll REJECTED serial=%s (expired claim code %s)", req.Serial, req.ClaimCode)
+		http.Error(w, "claim code expired", 403)
+		return
+	}
+	tenant := claim.TenantID
+	if _, ok := s.state.Tenants[tenant]; !ok {
+		log.Printf("enroll REJECTED serial=%s (claim %s points at unknown tenant %s)", req.Serial, req.ClaimCode, tenant)
+		http.Error(w, "claim code references an unknown tenant", 403)
 		return
 	}
 
@@ -523,14 +633,9 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.PublicKey = base64.StdEncoding.EncodeToString(pub)
 	rec.AgentVer = req.AgentVersion
-	if rec.VpnPort == 0 {
-		// Seeded with the tenant's pushed ports, then overwritten by the node's
-		// own mapping report if it had to rebind. Only on first sight: peers may
-		// already be sending to the port this node reported, and enrollment is not
-		// a licence to move it.
-		rec.VpnPort = s.vpnPort
-		rec.TransitPort = s.transitPort
-	}
+	// Record the claim code that admitted this serial. History only — the code
+	// stays usable, so re-enrollment keeps appending to its Serials.
+	claim.Serials = append(claim.Serials, req.Serial)
 
 	certPEM, err := signDevice(s.caCert, s.caKey, ed25519.PublicKey(pub), tenant, rec.NodeID)
 	if err != nil {
@@ -540,13 +645,15 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	rec.CertPEM = certPEM
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
 	s.save()
+	s.admin.publish("node.enrolled", rec)
 
 	json.NewEncoder(w).Encode(s.enrollResponse(tenant, rec, certPEM, string(caPEM)))
 }
 
-// enrollResponse is the contract the CPE actually consumes. Split out of the
-// handler so a test can pin the pushed fields (ports, MTU, key ring, RR list)
-// without standing up the CA and the claim flow.
+// enrollResponse is IDENTITY ONLY. Enrollment connects a device to a tenant; it
+// is not a configuration channel. Ports, overlay addresses, keys and RR lists
+// are part of the node plan, and the plan is pushed only after the customer
+// configures the device in the console.
 func (s *server) enrollResponse(tenant string, rec *NodeRecord, certPEM, caPEM string) wire.EnrollResponse {
 	return wire.EnrollResponse{
 		TenantID:     tenant,
@@ -554,14 +661,8 @@ func (s *server) enrollResponse(tenant string, rec *NodeRecord, certPEM, caPEM s
 		CertPEM:      certPEM,
 		CAPEM:        caPEM,
 		TLSAddrs:     s.tlsAddrs,
-		UDPReflector: s.udpAddrs,
-		RRs:          s.rrs,
 		HeartbeatSec: s.hbSec,
 		Epoch:        s.advanceEpoch(),
-		VpnPort:      s.vpnPort,
-		TransitPort:  s.transitPort,
-		TunnelMTU:    s.tunnelMTU,
-		PKeys:        s.tenantKeyRing(tenant),
 	}
 }
 
@@ -591,6 +692,7 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wasStale := rec.Stale
+	firstContact := rec.LastSeen == 0
 	rec.LastSeen = time.Now().Unix()
 	rec.Stale = false
 	if req.UDPMapping != "" {
@@ -611,6 +713,10 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// both events peers need: their view of this node just changed.
 	if wasStale || keyChanged {
 		s.broadcastLocked(tenant, wire.WatchEvent{Type: "update", Peer: s.toPeerInfoLocked(rec, 0), SentAt: time.Now().Unix()})
+	}
+	if wasStale || firstContact {
+		// Console-facing: the device table's online/stale column just flipped.
+		s.admin.publish("node.online", rec)
 	}
 	json.NewEncoder(w).Encode(wire.HeartbeatResponse{
 		Epoch:      s.advanceEpoch(),
@@ -1410,71 +1516,20 @@ func (s *server) ttlSweeper(ctx context.Context) {
 	}
 }
 
-// rrAddresses is the -rr flag value: "id=addr", repeatable. The order is the
-// failover preference handed to every CPE, so a duplicate would make that
-// order ambiguous -- rejected instead of silently deduped.
-type rrAddresses []wire.RRAddress
-
-func (l *rrAddresses) String() string {
-	parts := make([]string, 0, len(*l))
-	for _, e := range *l {
-		parts = append(parts, e.ID+"="+e.Addr)
-	}
-	return strings.Join(parts, ",")
-}
-
-func (l *rrAddresses) Set(v string) error {
-	id, addr, ok := strings.Cut(v, "=")
-	if !ok {
-		return fmt.Errorf("want id=addr, got %q", v)
-	}
-	id, addr = strings.TrimSpace(id), strings.TrimSpace(addr)
-	if id == "" || addr == "" {
-		return fmt.Errorf("rr id and address must both be non-empty (got %q)", v)
-	}
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		return fmt.Errorf("rr %s address %q must be host:port: %w", id, addr, err)
-	}
-	for _, e := range *l {
-		if e.ID == id {
-			return fmt.Errorf("rr id %q listed twice", id)
-		}
-		if e.Addr == addr {
-			return fmt.Errorf("rr address %q listed twice", addr)
-		}
-	}
-	*l = append(*l, wire.RRAddress{ID: id, Addr: addr})
-	return nil
-}
-
 // ------------------------------------------------------------------ main
 
 func main() {
 	var (
 		dataDir = flag.String("data", "./ctrl-data", "state directory (CA, certs, registry)")
 		listen  = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
-		// 这两个地址只用于**公布给 agent**：reflector 由独立进程提供服务
-		// （controller/test/stun_reflector.py，真 RFC 5389）。控制器自己不监听 UDP。
-		udpAddr  = flag.String("udp", "0.0.0.0:3478", "advertised UDP reflector #1 address (served by stun_reflector.py)")
-		udpAddr2 = flag.String("udp2", "0.0.0.0:3479", "advertised UDP reflector #2 — a SECOND address is what makes symmetric-NAT detection possible")
 		hbSec    = flag.Int("hb", 5, "heartbeat interval advertised to agents")
 		extraSAN = flag.String("tls-san", "", "comma-separated extra SANs for the server certificate")
-		// The two dataplane function ports, pushed to every node at enrollment.
-		// Separate flags rather than one base: the plugin's VPN role (deliver into
-		// the tunnel) and transit role (verify, rewrite dst, pop a segment) are not
-		// an arithmetic pair, and the two codebases this project grew out of
-		// assigned base+0/base+1 to them in OPPOSITE orders. A node should not have
-		// to remember which convention it was born under to get its ports right.
-		vpnPort     = flag.Uint("vpn-port", 51820, "UDP port the dataplane delivers into the VPN (constraint: dst port = function key)")
-		transitPort = flag.Uint("transit-port", 51821, "UDP port the dataplane transits SR segments on")
-		// The overlay MTU pushed to every node. It is a flag, not a per-node
-		// setting, for the same reason the two ports above are: the CPE cannot
-		// derive it -- the budget depends on the tenant's underlay MTU and on the
-		// longest path this controller is willing to compose, and only the
-		// controller knows both. The default is the worst-case-safe value on a
-		// 1500-byte underlay (wire.DefaultTunnelMTU); a smaller underlay needs a
-		// smaller number here, and wire.TunnelMTUBudget says how much smaller.
-		tunnelMTU = flag.Uint("tunnel-mtu", uint(wire.DefaultTunnelMTU), "overlay MTU pushed at enrollment; must be <= wire.TunnelMTUBudget(underlayMTU, longest path)")
+		// The console is a SEPARATE, PLAIN-HTTP listener. A browser cannot present
+		// a device certificate, so it cannot use the mTLS listener without making
+		// every operator install one; the console therefore has its own token
+		// session and is meant to be published on loopback only.
+		consoleAddr = flag.String("console", "127.0.0.1:8088", "console listen address (plain HTTP; empty disables the console)")
+		adminTokenF = flag.String("admin-token", "", "console login token; empty reads $SR_CTRL_ADMIN_TOKEN, else generates one and prints it once")
 		// How long a telemetry window stays readable after its last report. It is
 		// a read-side policy, not a dataplane setting: the probe cadence comes from
 		// TunnelTelemetry, while this number only decides when the controller stops
@@ -1483,37 +1538,8 @@ func main() {
 		metricsTTL = flag.Int("metrics-ttl", 30, "seconds a telemetry window stays readable after its last report")
 	)
 
-	// The RR list is pushed to every CPE at enrollment. Repeatable so the
-	// operator's order IS the failover preference (first synced RR serves the
-	// table); duplicates are rejected rather than silently ordering one twice.
-	var rrs rrAddresses
-	flag.Var(&rrs, "rr", "route reflector as id=addr (repeatable; order = failover preference)")
 	flag.Parse()
 
-	checkPort := func(name string, p uint) uint16 {
-		// Zero is excluded because a port of 0 means "any" to bind(2) and would
-		// silently become a random port -- the exact class of quiet mismatch this
-		// project keeps rooting out.
-		if p == 0 || p > 65535 {
-			log.Fatalf("--%s must be in 1..65535 (got %d)", name, p)
-		}
-		return uint16(p)
-	}
-	vpn, transit := checkPort("vpn-port", *vpnPort), checkPort("transit-port", *transitPort)
-	if vpn == transit {
-		// They are the multiplexing key: equal values would make the two roles
-		// indistinguishable at the one place that distinguishes them.
-		log.Fatalf("--vpn-port and --transit-port must differ (both %d)", vpn)
-	}
-	// Reject an out-of-range MTU HERE rather than at each agent's NewLink: the
-	// bounds are the contract's (wire.MinTunnelMTU/MaxTunnelMTU), and a
-	// controller that happily hands out a value every agent refuses is a
-	// enrollment-time failure with N victims instead of one startup failure here.
-	mtu := uint16(*tunnelMTU)
-	if *tunnelMTU > 65535 || mtu < wire.MinTunnelMTU || mtu > wire.MaxTunnelMTU {
-		log.Fatalf("--tunnel-mtu must be in %d..%d (got %d); 0 is not accepted either -- it means \"no MTU record\" to VPP, and the agent must write a number, not clear the interface",
-			wire.MinTunnelMTU, wire.MaxTunnelMTU, *tunnelMTU)
-	}
 	if *metricsTTL < 1 {
 		log.Fatalf("--metrics-ttl must be >= 1 (got %d); zero would expire every window before it could be read", *metricsTTL)
 	}
@@ -1547,18 +1573,14 @@ func main() {
 		subs:        map[int]*subscriber{},
 		hbSec:       *hbSec,
 		tlsAddrs:    []string{*listen},
-		udpAddrs:    []string{*udpAddr, *udpAddr2},
-		rrs:         rrs,
 		caCert:      ca,
 		caKey:       caKey,
 		dataDir:     *dataDir,
-		vpnPort:     vpn,
-		transitPort: transit,
-		tunnelMTU:   mtu,
 		obs:         map[string]observerView{},
 		pendingObs:  map[string]map[string]*pendingObs{},
 		tel:         map[string]*nodeTelemetry{},
 		telTTLSec:   *metricsTTL,
+		adminToken:  *adminTokenF,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1589,6 +1611,33 @@ func main() {
 		},
 	}
 
+	var adminSrv *http.Server
+	if *consoleAddr != "" {
+		if s.adminToken == "" {
+			s.adminToken = os.Getenv("SR_CTRL_ADMIN_TOKEN")
+		}
+		generated := false
+		if s.adminToken == "" {
+			s.adminToken = randToken()
+			generated = true
+		}
+		s.admin = newAdminHub()
+		adminSrv = &http.Server{Addr: *consoleAddr, Handler: s.adminHandler()}
+		go func() {
+			log.Printf("console listening on http://%s/", *consoleAddr)
+			if generated {
+				log.Printf("console login token (generated, shown once): %s", s.adminToken)
+			}
+			if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("console listener stopped: %v", err)
+			}
+		}()
+	} else {
+		// Publishing to a hub with no subscribers keeps s.admin.publish safe on
+		// the enrollment/heartbeat paths without a nil check at every call site.
+		s.admin = newAdminHub()
+	}
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -1599,6 +1648,9 @@ func main() {
 		s.save()
 		s.mu.Unlock()
 		hs.Close()
+		if adminSrv != nil {
+			adminSrv.Close()
+		}
 	}()
 
 	log.Printf("controller listening on %s (data=%s, heartbeat=%ds)", *listen, *dataDir, *hbSec)

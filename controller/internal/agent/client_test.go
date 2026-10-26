@@ -193,16 +193,12 @@ func enrolledPair(t *testing.T) (*Identity, *stubVBOND, *Client) {
 		CertPEM:      pki.issueDevice(t, id.IdentityPublicKey(), "t1", 7),
 		CAPEM:        pki.caPEM,
 		TLSAddrs:     []string{srv.URL},
-		UDPReflector: []string{"192.0.2.10:3478"},
 		HeartbeatSec: 5,
 		Epoch:        3,
-		VpnPort:      51820,
-		TransitPort:  51821,
-		PKeys:        []wire.PKey{{HmacID: 1, Key: "00112233445566778899aabbccddeeff"}},
 	}
 	c, resp := enrollAndDial(t, id, srv.URL, pki.pool)
-	if resp.VpnPort != 51820 || len(resp.PKeys) != 1 {
-		t.Errorf("enroll 应答少了端口或 p-key 环: %+v", resp)
+	if resp.Epoch != 3 || resp.HeartbeatSec != 5 {
+		t.Errorf("enroll 应答少了身份事实: %+v", resp)
 	}
 	return id, stub, c
 }

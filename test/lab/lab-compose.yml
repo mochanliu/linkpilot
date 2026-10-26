@@ -169,6 +169,11 @@ services:
     <<: *cpe
     container_name: lab-ctrl
     hostname: lab-ctrl
+    # 控制台是给浏览器用的，走独立的明文 listener（127.0.0.1:8088 → 容器 8080）。
+    # 只发布到宿主机回环：控制台用 token 会话，不应该出现在局域网里。
+    # 设备面（/v1/*，mTLS）仍然只在容器网络上，不发布。
+    ports:
+      - "127.0.0.1:8088:8080"
     networks:
       lab_wan: { ipv4_address: 10.88.1.200 }
       lab_mgmt: { ipv4_address: 10.99.0.200 }

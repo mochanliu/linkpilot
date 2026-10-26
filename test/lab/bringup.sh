@@ -505,11 +505,19 @@ stage_enroll() {
         docker cp "$BIN/sr-frr"   "lab-cpe$n:/usr/local/bin/sr-frr"
     done
 
-    log "enroll: 启动 sr-ctrl（CA + 8444/mTLS）"
+    log "enroll: 启动 sr-ctrl（CA + 8444/mTLS + 控制台 8080）"
     stop_proc lab-ctrl sr-ctrl
+    # 控制台 token 落盘在容器里（重启沿用同一个，不然每次 bringup 都要重新登录）。
+    docker exec lab-ctrl sh -c 'mkdir -p /var/lib/sr-ctrl
+        [ -s /var/lib/sr-ctrl/console-token ] || \
+            head -c 18 /dev/urandom | base64 | tr -d "=+/\n" > /var/lib/sr-ctrl/console-token'
+    CTRL_TOKEN=$(docker exec lab-ctrl cat /var/lib/sr-ctrl/console-token)
+    # 入网应答只有身份：控制器不再需要知道 RR 地址、端口、p-key 环。RR 列表现在是
+    # 节点计划的一部分（客户在控制台配置设备时才下发），lab 里仍由 bringup 手写。
     docker exec -d lab-ctrl sh -c "mkdir -p /var/lib/sr-ctrl && /usr/local/bin/sr-ctrl \
         -data /var/lib/sr-ctrl -listen 0.0.0.0:${CTRL_PORT} \
-        -tls-san ${CTRL_ADDR},10.88.1.200,lab-ctrl -rr rr-a=${RR_ADDR}:${RR_PORT} \
+        -tls-san ${CTRL_ADDR},10.88.1.200,lab-ctrl \
+        -console 0.0.0.0:8080 -admin-token ${CTRL_TOKEN} \
         > /var/log/sr-ctrl.log 2>&1"
     local i
     for i in $(seq 1 30); do
@@ -520,6 +528,8 @@ stage_enroll() {
     docker cp lab-ctrl:/var/lib/sr-ctrl/ca.pem "$RUN/ca.pem" >/dev/null
     docker cp lab-ctrl:/var/lib/sr-ctrl/ca.key "$RUN/ca.key" >/dev/null
     note "控制器 CA 就绪（$RUN/ca.pem）"
+    printf '%s' "$CTRL_TOKEN" > "$RUN/console-token"
+    note "控制台：http://127.0.0.1:8088/  （token: $CTRL_TOKEN）"
 
     for n in 1 2 3; do
         local c=lab-cpe$n

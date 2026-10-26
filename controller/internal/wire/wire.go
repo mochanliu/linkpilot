@@ -74,76 +74,32 @@ type RRAddress struct {
 	Addr string `json:"addr"`
 }
 
-// EnrollResponse hands back the device certificate plus everything the
-// agent needs to operate. Note what is NOT here: any per-peer secret. The
-// key ring below is the tenant-wide DOMAIN material, shared on purpose because
-// every node must verify every other node's hop MAC; the pairwise tunnel key is
-// the one thing the controller never sees and never issues.
+// EnrollResponse is IDENTITY ONLY.
+//
+// Enrollment does exactly one thing: it binds this device to the tenant the
+// claim code belongs to and issues the certificate that proves the binding.
+// Everything else the device will eventually run with -- function ports,
+// overlay MTU, hop-MAC key ring, reflector list, RR neighbours, tunnels -- is
+// the tenant's configuration, and it reaches the device only after the
+// customer configures that device in the console (the node-plan contract).
+//
+// The split is not cosmetic. When enrollment also pushed configuration, a
+// device that had merely been associated with a tenant was already running a
+// dataplane nobody had asked for, and every configuration change implied a
+// re-enrollment. Instead: enroll → device shows up in the console → customer
+// configures it → the plan is pushed. A device that enrolled and was never
+// configured holds nothing but its identity and a heartbeat.
 type EnrollResponse struct {
-	TenantID     string   `json:"tenant_id"`
-	NodeID       uint16   `json:"node_id"` // matches the URI SAN of the certificate below
-	CertPEM      string   `json:"cert_pem"`
-	CAPEM        string   `json:"ca_pem"`
-	TLSAddrs     []string `json:"tls_addrs"`     // all known controller addresses (HA: >1)
-	UDPReflector []string `json:"udp_reflector"` // STUN-equivalent reflector addresses
+	TenantID string `json:"tenant_id"`
+	NodeID   uint16 `json:"node_id"` // matches the URI SAN of the certificate below
+	CertPEM  string `json:"cert_pem"`
+	CAPEM    string `json:"ca_pem"`
+	// TLSAddrs is controller reachability, not tenant configuration: an agent
+	// that just enrolled has to know which of the controller's addresses to
+	// use next. Everything a customer could configure lives in the node plan.
+	TLSAddrs     []string `json:"tls_addrs"`
 	HeartbeatSec int      `json:"heartbeat_sec"`
 	Epoch        uint32   `json:"epoch"` // controller-assigned; devices never compute this themselves
-
-	// RRs are the route-reflector neighbours this CPE must keep. They are
-	// pushed, not configured: "CPE 和云端两个 RR 建邻居" makes the controller
-	// the only party that knows where they are and how many there are. The
-	// order is the failover preference -- the CPE serves its "bgp" table from
-	// the first RR it has synced with, so element 0 must be the preferred one.
-	RRs []RRAddress `json:"rrs"`
-
-	// VpnPort and TransitPort are the tenant's UDP function ports, pushed rather
-	// than configured per node. This is constraint (2) of the design -- the
-	// destination port IS the dataplane's function-multiplexing key, so a node
-	// that guesses it writes path labels pointing at a port nobody listens on,
-	// and the symptom is "the tunnel came up and nothing flows".
-	//
-	// Two separate fields, not a base plus an offset: the two roles are not
-	// arithmetic neighbours in this dataplane (51820 = deliver into the VPN,
-	// 51821 = transit a segment and forward), and an earlier convention that
-	// derived one from the other numbered them in opposite orders in the two
-	// codebases. Anything a node has to compute is a thing it can compute
-	// differently.
-	VpnPort     uint16 `json:"vpn_port"`
-	TransitPort uint16 `json:"transit_port"`
-
-	// PKeys is the tenant's hop-MAC key ring, in the exact shape the dataplane
-	// API takes (`sr-wg key set <hmac_id> <hex>`, 16-byte key per sr_hmac.h).
-	//
-	// It is tenant-wide and deliberately so: the SR header is signed by a node
-	// the receiver may never have talked to (a transit hop), so the verifying key
-	// cannot be pairwise. That is the same argument the old E_root field made --
-	// this one just names the key the plugin actually consumes instead of a root
-	// it would have to derive from. Rotation is NOT implemented: the ring holds a
-	// single hmac_id, and when rotation lands the agent must install the new key
-	// before any path references it, because the plugin refuses to delete a key a
-	// path still cites.
-	PKeys []PKey `json:"p_keys"`
-
-	// TunnelMTU is the overlay MTU every tunnel of this tenant gets. Like the
-	// two ports above it is PUSHED, not per-node config: the agent cannot derive
-	// it, because the budget depends on the tenant's underlay MTU and on the
-	// longest path its controller is willing to compose, and only the
-	// controller knows both. Zero means "use DefaultTunnelMTU" -- the agent
-	// applies the default rather than leaving VPP's interface MTU unset, so the
-	// value a CPE runs with is always one of the two, never VPP's own default of
-	// 0 (which is what a hand-created wireguard interface comes with).
-	//
-	// What the dataplane does with it, re-measured on the lab on 2026-10-22: VPP
-	// enforces the recorded tunnel MTU by FRAGMENTING the overlay packet at the
-	// WireGuard output. An overlay packet of 1436 through a wg0 recorded at 1360
-	// left as two WireGuard packets carrying 1356 + 100, each with its own SR
-	// header, so both outer frames (1452 + 196) stayed under the 1500 underlay
-	// and the receiver reassembled the overlay packet before sr-wg4-input ever
-	// saw a piece of it. What it does NOT do is refuse the packet or answer with
-	// ICMP "fragmentation needed" -- so this number is still the budget the
-	// controller composes paths against and the value the CPE reports, but it is
-	// enforced, whereas an interface left at 0 has no record to enforce at all.
-	TunnelMTU uint16 `json:"tunnel_mtu,omitempty"`
 }
 
 // PKey is one entry of the tenant's hop-MAC key ring.

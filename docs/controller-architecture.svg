@@ -1,0 +1,262 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 1224" width="1240" height="1224" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif">
+  <style>
+    .bg      { fill: #ffffff; }
+    .box     { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.2; }
+    .inbox   { fill: #ffffff; stroke: #d0d7de; stroke-width: 1.2; }
+    .planned { fill: #fff8e1; stroke: #bf8700; stroke-width: 1.2; stroke-dasharray: 6 5; }
+    .band    { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.2; }
+    .t       { fill: #1f2328; font-size: 13.5px; font-weight: 600; }
+    .s       { fill: #444d56; font-size: 12px; }
+    .m       { fill: #57606a; font-size: 11.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .sec     { fill: #57606a; font-size: 12px; letter-spacing: 1px; }
+    .b       { fill: #444d56; font-size: 12px; }
+    .flow    { stroke: #59636e; fill: none; stroke-width: 1.4; }
+    .head    { fill: #59636e; }
+    .num     { fill: #0969da; }
+    .numt    { fill: #ffffff; font-size: 10.5px; font-weight: 700; text-anchor: middle; }
+    .h1      { fill: #1f2328; font-size: 18px; font-weight: 700; }
+    .h2      { fill: #57606a; font-size: 12.5px; }
+    .ok      { fill: #1a7f37; font-size: 11.5px; font-weight: 600; }
+    .todo    { fill: #9a6700; font-size: 11.5px; font-weight: 600; }
+  </style>
+
+  <rect class="bg" x="0" y="0" width="1240" height="1224"/>
+
+  <text class="h1" x="40" y="38">SROU 控制面架构</text>
+  <text class="h2" x="40" y="62">实线 = 已实现 · 虚线 = 计划中 · 控制器不在转发路径上（控制面失效时，已有隧道继续转发）</text>
+
+  <text class="sec" x="40" y="98">北向 / 运维</text>
+  <text class="sec" x="290" y="98">控制面</text>
+  <text class="sec" x="770" y="98">路由平面</text>
+  <text class="sec" x="40" y="546">站点侧</text>
+  <text class="sec" x="40" y="884">数据面：每一跳都是标准 UDP 帧</text>
+
+  <!-- ==================== 北向 ==================== -->
+  <rect class="inbox" x="40" y="108" width="210" height="64" rx="8"/>
+  <text class="t" x="56" y="134">Web 控制台</text>
+  <text class="s" x="56" y="154">拓扑 / 隧道 / 入网 / 路由</text>
+
+  <rect class="inbox" x="40" y="182" width="210" height="64" rx="8"/>
+  <text class="t" x="56" y="208">REST / JSONL 客户端</text>
+  <text class="s" x="56" y="228">自动化、CI、外部系统</text>
+
+  <rect class="inbox" x="40" y="256" width="210" height="64" rx="8"/>
+  <text class="t" x="56" y="282">CLI / 运维脚本</text>
+  <text class="s" x="56" y="302">vppctl · sr-* · 巡检</text>
+
+  <rect class="planned" x="40" y="330" width="210" height="146" rx="8"/>
+  <text class="t" x="56" y="356">待建</text>
+  <text class="b" x="56" y="380">· 控制台配置 → 设备下发</text>
+  <text class="b" x="56" y="402">· 审批队列 / 证书吊销</text>
+  <text class="b" x="56" y="424">· 审计日志 / 多租户权限</text>
+  <text class="b" x="56" y="446">· claim code 管理 API</text>
+
+  <!-- ==================== sr-ctrl ==================== -->
+  <rect class="box" x="290" y="108" width="440" height="422" rx="12"/>
+  <text class="t" x="306" y="136">sr-ctrl</text>
+  <text class="m" x="714" y="136" text-anchor="end">HTTPS :8444 · Go stdlib</text>
+
+  <rect class="inbox" x="306" y="148" width="194" height="64" rx="7"/>
+  <text class="t" x="320" y="171">入网 &amp; PKI</text>
+  <text class="s" x="320" y="189">claim code → mTLS 设备证书</text>
+  <text class="s" x="320" y="205">只登记租户归属 · 零配置</text>
+
+  <rect class="inbox" x="520" y="148" width="194" height="64" rx="7"/>
+  <text class="t" x="534" y="171">设备注册表</text>
+  <text class="s" x="534" y="189">nodes / claims / p-key 环</text>
+  <text class="s" x="534" y="205">tenant 取自证书 URI SAN</text>
+
+  <rect class="inbox" x="306" y="222" width="194" height="64" rx="7"/>
+  <text class="t" x="320" y="245">配置下发</text>
+  <text class="s" x="320" y="263">客户在控制台配置后才推</text>
+  <text class="s" x="320" y="279">overlay /32 · 端口 · 密钥环</text>
+
+  <rect class="inbox" x="520" y="222" width="194" height="64" rx="7"/>
+  <text class="t" x="534" y="245">遥测汇聚</text>
+  <text class="s" x="534" y="263">BFD + 探针 · RTT/抖动/丢包</text>
+  <text class="s" x="534" y="279">TTL 30 s · 仅内存</text>
+
+  <rect class="inbox" x="306" y="296" width="194" height="64" rx="7"/>
+  <text class="t" x="320" y="319">外层源观测</text>
+  <text class="s" x="320" y="337">STUN mapping / observe</text>
+  <text class="s" x="320" y="353">判定 NAT 类型与端口映射</text>
+
+  <rect class="inbox" x="520" y="296" width="194" height="64" rx="7"/>
+  <text class="t" x="534" y="319">事件总线</text>
+  <text class="s" x="534" y="337">/v1/watch JSONL 长连接</text>
+  <text class="s" x="534" y="353">epoch 版本 · 15 s 心跳</text>
+
+  <rect class="inbox" x="306" y="372" width="408" height="34" rx="7"/>
+  <text class="m" x="320" y="394">state.json 原子落盘（0600）· 无数据库</text>
+
+  <text class="sec" x="306" y="432">边界</text>
+  <text class="b" x="306" y="456">· 不碰 VPP、不下发 FIB、不保存路由表</text>
+  <text class="b" x="306" y="478">· 只在控制台配置后下发事实，enroll 不推参数</text>
+  <text class="b" x="306" y="500">· 不在转发路径上：控制面挂了，数据面照转</text>
+
+  <!-- ==================== sr-rr ==================== -->
+  <rect class="box" x="770" y="108" width="430" height="300" rx="12"/>
+  <text class="t" x="786" y="136">sr-rr</text>
+  <text class="m" x="1184" y="136" text-anchor="end">TLS :18446 · 每租户一个</text>
+
+  <rect class="inbox" x="786" y="148" width="398" height="60" rx="7"/>
+  <text class="t" x="800" y="171">会话层</text>
+  <text class="s" x="800" y="191">TLS + mTLS · hold 30 s · 双向门槛（对端也要有回程隧道边）</text>
+
+  <rect class="inbox" x="786" y="218" width="398" height="60" rx="7"/>
+  <text class="t" x="800" y="241">adj-rib-in</text>
+  <text class="s" x="800" y="261">前缀 + 隧道表；下一跳不随前缀下发，由各站点本地解析</text>
+
+  <rect class="inbox" x="786" y="288" width="398" height="60" rx="7"/>
+  <text class="t" x="800" y="311">反射策略</text>
+  <text class="s" x="800" y="331">reflect_to：只在有隧道边的方向反射 · RT 由接收侧 import 过滤</text>
+
+  <text class="b" x="786" y="374">· 无持久化：重启后由各站点重新宣告</text>
+  <text class="b" x="786" y="396">· 可多实例（主备）：站点配 RR 列表，按顺序切换</text>
+
+  <!-- ==================== 站点 CPE ==================== -->
+  <rect class="box" x="40" y="558" width="880" height="300" rx="12"/>
+  <text class="t" x="56" y="586">站点 CPE（×3，同构）</text>
+  <text class="m" x="904" y="586" text-anchor="end">VPP 26.06 + sr_wg 插件</text>
+
+  <rect class="inbox" x="56" y="600" width="200" height="106" rx="7"/>
+  <text class="t" x="70" y="624">agent</text>
+  <text class="s" x="70" y="644">enroll / heartbeat / watch</text>
+  <text class="s" x="70" y="662">metrics · mapping · observe</text>
+  <text class="m" x="70" y="686">库已就绪；独立进程接线中</text>
+
+  <rect class="inbox" x="276" y="600" width="220" height="106" rx="7"/>
+  <text class="t" x="290" y="624">sr-route</text>
+  <text class="s" x="290" y="644">双 RR 会话 · RIB</text>
+  <text class="s" x="290" y="662">隧道表 → 本地下一跳解析</text>
+  <text class="m" x="290" y="686">HTTP /status（本机）</text>
+
+  <rect class="inbox" x="276" y="718" width="100" height="62" rx="7"/>
+  <text class="t" x="288" y="742">sr-fib</text>
+  <text class="s" x="288" y="760">VPN 表</text>
+  <text class="s" x="288" y="774">label 1000</text>
+
+  <rect class="inbox" x="388" y="718" width="100" height="62" rx="7"/>
+  <text class="t" x="400" y="742">sr-frr</text>
+  <text class="s" x="400" y="760">ZAPI 写入</text>
+  <text class="s" x="400" y="774">table 1250</text>
+
+  <rect class="inbox" x="276" y="792" width="100" height="60" rx="7"/>
+  <text class="t" x="288" y="816">VPP</text>
+  <text class="s" x="288" y="834">sr_wg 插件</text>
+  <text class="s" x="288" y="848">api.sock</text>
+
+  <rect class="inbox" x="388" y="792" width="100" height="60" rx="7"/>
+  <text class="t" x="400" y="816">FRR</text>
+  <text class="s" x="400" y="834">10.7.1</text>
+  <text class="s" x="400" y="848">客户侧 BGP</text>
+
+  <text class="t" x="520" y="624">sr_wg 插件</text>
+  <text class="b" x="520" y="648">encap：按绑定表 (对端, 端口) 加 SR 头</text>
+  <text class="b" x="520" y="670">sr-wg4-input：magic 0x53 → 验签 / 弹段 / 解密</text>
+  <text class="b" x="520" y="692">sr-wg4-transit：只验签 + 改写外层 dst</text>
+  <text class="b" x="520" y="714">sr-wg probe：隧道内探针（BFD / 遥测）</text>
+  <text class="b" x="520" y="736">绑定键：精确 (endpoint, 端口) → 通配 → 接口</text>
+  <text class="b" x="520" y="758">配置全在内存：VPP 重启即丢，由 agent 重放</text>
+
+  <!-- transit：是一个角色，不是一种设备 -->
+  <rect class="inbox" x="950" y="600" width="250" height="164" rx="10"/>
+  <text class="t" x="966" y="626">transit（功能角色）</text>
+  <text class="s" x="966" y="648">身份：与 CPE 同样入网、同属租户</text>
+  <text class="s" x="966" y="668">角色：普通 CPE 可兼任 / 专用机</text>
+  <text class="s" x="966" y="688">VPP + sr_wg，只跑 sr-wg4-transit</text>
+  <text class="s" x="966" y="708">数据面仍无会话状态</text>
+  <text class="m" x="966" y="732">51821 · 51841 · 51861</text>
+
+  <!-- ==================== 数据面 ==================== -->
+  <rect class="band" x="40" y="898" width="1160" height="64" rx="10"/>
+  <rect class="inbox" x="54" y="914" width="210" height="32" rx="6"/>
+  <text class="s" x="68" y="935">外层 IP + UDP（下一跳 : 端口）</text>
+  <rect class="inbox" x="284" y="914" width="210" height="32" rx="6"/>
+  <text class="s" x="298" y="935">SR 头 36 B（明文 + SipHash）</text>
+  <rect class="inbox" x="514" y="914" width="210" height="32" rx="6"/>
+  <text class="s" x="528" y="935">WG 加密载荷（内层 overlay）</text>
+  <rect class="inbox" x="744" y="914" width="210" height="32" rx="6"/>
+  <text class="s" x="758" y="935">transit：验签 + 改外层 dst</text>
+  <rect class="inbox" x="974" y="914" width="210" height="32" rx="6"/>
+  <text class="s" x="988" y="935">对端：验签 · 弹段 · 解密</text>
+
+  <path class="flow" d="M264 930 H280" marker-end="url(#ar)"/>
+  <path class="flow" d="M494 930 H510" marker-end="url(#ar)"/>
+  <path class="flow" d="M724 930 H740" marker-end="url(#ar)"/>
+  <path class="flow" d="M954 930 H970" marker-end="url(#ar)"/>
+
+  <!-- ==================== 箭头 ==================== -->
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+  </defs>
+
+  <path class="flow" d="M250 140 H286" marker-end="url(#ar)"/>
+  <circle class="num" cx="268" cy="140" r="9"/><text class="numt" x="268" y="143.5">1</text>
+
+  <path class="flow" d="M200 600 V552 H330 V536" marker-end="url(#ar)"/>
+  <circle class="num" cx="264" cy="552" r="9"/><text class="numt" x="264" y="555.5">2</text>
+
+  <path class="flow" d="M386 600 V540 H985 V412" marker-end="url(#ar)"/>
+  <circle class="num" cx="660" cy="540" r="9"/><text class="numt" x="660" y="543.5">3</text>
+
+  <!-- transit 与 CPE 走同一条控制通道（同样 enroll、同属租户） -->
+  <path class="flow" d="M1075 600 V440 H734" marker-end="url(#ar)"/>
+
+  <path class="flow" d="M256 653 H272" marker-end="url(#ar)"/>
+  <circle class="num" cx="264" cy="638" r="8"/><text class="numt" x="264" y="641.5">4</text>
+
+  <path class="flow" d="M326 706 V714" marker-end="url(#ar)"/>
+  <circle class="num" cx="348" cy="710" r="8"/><text class="numt" x="348" y="713.5">5</text>
+
+  <path class="flow" d="M438 706 V714" marker-end="url(#ar)"/>
+  <circle class="num" cx="460" cy="710" r="8"/><text class="numt" x="460" y="713.5">6</text>
+
+  <path class="flow" d="M326 780 V788" marker-end="url(#ar)"/>
+  <circle class="num" cx="348" cy="784" r="8"/><text class="numt" x="348" y="787.5">7</text>
+
+  <path class="flow" d="M438 780 V788" marker-end="url(#ar)"/>
+  <circle class="num" cx="460" cy="784" r="8"/><text class="numt" x="460" y="787.5">8</text>
+
+  <path class="flow" d="M326 852 V894" marker-end="url(#ar)"/>
+  <circle class="num" cx="326" cy="874" r="8"/><text class="numt" x="326" y="877.5">9</text>
+
+  <!-- ==================== 图例 ==================== -->
+  <text class="sec" x="40" y="1010">图例与编号</text>
+
+  <circle class="num" cx="50" cy="1034" r="9"/><text class="numt" x="50" y="1037.5">1</text>
+  <text class="b" x="68" y="1030">北向 → sr-ctrl：HTTPS。/v1/watch 是 JSONL 长连接（15 s 心跳），</text>
+  <text class="b" x="68" y="1048">一次订阅同时拿到注册表快照与后续增量。</text>
+
+  <circle class="num" cx="50" cy="1078" r="9"/><text class="numt" x="50" y="1081.5">2</text>
+  <text class="b" x="68" y="1074">sr-ctrl ↔ 节点：enroll 只签证书、只登记租户归属，零配置；</text>
+  <text class="b" x="68" y="1092">隧道/端口等在客户于控制台配置后才推。全程 mTLS，tenant 取自 URI SAN。</text>
+
+  <circle class="num" cx="640" cy="1034" r="9"/><text class="numt" x="640" y="1037.5">3</text>
+  <text class="b" x="658" y="1030">sr-route ↔ sr-rr：路由协议 v3（JSONL over TLS），hold 30 s；</text>
+  <text class="b" x="658" y="1048">前缀与隧道表分离，下一跳在站点本地解析。</text>
+
+  <circle class="num" cx="640" cy="1078" r="9"/><text class="numt" x="640" y="1081.5">4</text>
+  <text class="b" x="658" y="1074">agent 负责身份、心跳、遥测采集与 watch 收敛；</text>
+  <text class="b" x="658" y="1092">当前是库（随 sr-route 进程），规划为独立进程。</text>
+
+  <circle class="num" cx="50" cy="1122" r="9"/><text class="numt" x="50" y="1125.5">5</text>
+  <text class="b" x="68" y="1118">sr-route → sr-fib：轮询本机 /status，把 RIB 收敛成 VPN 表路由 + MPLS 标签；</text>
+  <text class="b" x="68" y="1136">BFD down 的隧道不进 FIB。</text>
+
+  <circle class="num" cx="640" cy="1122" r="9"/><text class="numt" x="640" y="1125.5">6</text>
+  <text class="b" x="658" y="1118">sr-route → sr-frr：同一份 /status，经 ZAPI 写入 FRR 非主表 1250，</text>
+  <text class="b" x="658" y="1136">客户侧 BGP 可见。</text>
+
+  <circle class="num" cx="50" cy="1166" r="9"/><text class="numt" x="50" y="1169.5">7</text>
+  <text class="b" x="68" y="1170">sr-fib → VPP：手写二进制 API（/run/vpp/api.sock），零第三方依赖。</text>
+
+  <circle class="num" cx="640" cy="1166" r="9"/><text class="numt" x="640" y="1169.5">8</text>
+  <text class="b" x="658" y="1170">sr-frr → FRR：ZAPI（/run/frr/zserv.api），FRR 固定 10.7.1。</text>
+
+  <circle class="num" cx="50" cy="1204" r="9"/><text class="numt" x="50" y="1207.5">9</text>
+  <text class="b" x="68" y="1198">VPP → 数据面：encap 加 SR 头、transit 弹段、对端 decap；</text>
+  <text class="b" x="68" y="1216">SR 头夹在 UDP 与 WG 载荷之间，明文 + SipHash-2-4。</text>
+</svg>

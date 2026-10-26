@@ -21,10 +21,11 @@ sr-fib / sr-frr 把两套路由体系接起来。FRR 和 VPP 的接缝是 VPP �
   FRR 装内核主表（下一跳 = 客户路由器、出口 = `lcp-x0`），linux-nl 镜像成
   VPP table 0 里「via <客户路由器> <客户口>」。
 
-**这里不开发控制器。** 按 2026-10-25 的指示，凡是由控制器下发的值（每隧道
-UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
-[bringup.sh](bringup.sh) 里手写；sr-ctrl 只做它已经做好的那件事——入网签发
-设备证书。
+**控制器只做入网，不做下发。** 2026-10-26 起控制器增量按用户逐项批准推进，
+但 lab 的规矩没变：凡是由控制器下发的值（每隧道 UDP 端口、overlay /32、隧道
+计划、VRF/RT、FRR 旁路表号）仍然在 [bringup.sh](bringup.sh) 里手写。
+sr-ctrl 现在有两件事——签发设备证书（`/v1/*`，mTLS :8444，设备用）和给客户
+看的控制台（明文 :8080，浏览器用）；入网应答只有身份，没有任何配置。
 
 ## 拓扑
 
@@ -54,6 +55,7 @@ UDP 端口、overlay /32、隧道计划、VRF/RT、FRR 旁路表号）都在
 
 ```
 lab-ctrl 10.99.0.200:8444   sr-ctrl（入网 / CA / 设备证书）
+         127.0.0.1:8088     sr-ctrl 控制台（宿主机回环 → 容器 8080，token 换会话）
 lab-rr   10.99.0.100:18446  sr-rr（tenant-a 的反射器）
 lab-cpeN 10.99.0.1N         sr-route /status（1900N，sr-fib/sr-frr 从这里取）
 lab-custN 10.99.0.2N        BGP router-id
@@ -113,12 +115,36 @@ test/lab/teardown.sh           # 拆掉 lab-*，不碰 srwg-*
 test/lab/teardown.sh --purge   # 连 test/lab/run/（含一次性 CA）一起删
 ```
 
+## 控制台与 vCPE 入网（GUI 全流程）
+
+控制台是给客户的界面：建租户 → 拿到入网码 → 设备用码入网 → 设备出现在
+列表里。入网**不下发任何配置**，所以设备行上写的「未配置」是真实状态。
+
+```bash
+test/lab/console.sh            # 打印地址 http://127.0.0.1:8088/ 和登录 token
+test/lab/console.sh restart    # 重启 sr-ctrl（控制台 + 设备面同一个进程）
+
+# 页面里建租户后会给出入网码，然后：
+test/lab/vcpe.sh up --claim <入网码>   # 起一台只做入网+心跳的 vCPE（10.99.0.60）
+test/lab/vcpe.sh status               # 本地身份：tenant / node_id / 心跳次数
+test/lab/vcpe.sh logs                 # agent 日志
+test/lab/vcpe.sh down                 # 停容器，身份目录保留（下次 up 不用 claim）
+test/lab/vcpe.sh wipe                 # 连身份一起删（下次必须重新入网）
+```
+
+vCPE 跑的是 `controller/cmd/sr-agent`：入网一次、然后每 5 秒心跳，数据面
+状态直接写 "none: enrollment carries no configuration"。它和 `lab-cpeN` 的区别
+只是没有 VPP —— 盒子里的 agent 以后会在这里接数据面。
+
+token 落在 `test/lab/run/console-token`，容器里也有同一份
+（`/var/lib/sr-ctrl/console-token`）；容器重建后第一次 bringup 会重新生成。
+
 分阶段调试（阶段之间可反复重跑，配置是幂等的）：
 
 ```bash
 test/lab/bringup.sh --stage containers   # 建容器/网络、FRR 配置、客户路由器
 test/lab/bringup.sh --stage vpp          # 4 个 VPP（3 CPE + transit，含 linux-cp/linux-nl）
-test/lab/bringup.sh --stage enroll       # 编译二进制、sr-ctrl、三台入网、RR 证书
+test/lab/bringup.sh --stage enroll       # 编译二进制、sr-ctrl（含控制台）、三台入网、RR 证书
 test/lab/bringup.sh --stage dataplane    # 客户口交给 VPP + linux-cp、WG、端口、SR 路径、peer
 test/lab/bringup.sh --stage control      # sr-route + sr-fib（VPN table 0 / 标签 1000）
 test/lab/bringup.sh --stage frr          # sr-frr 正向导出 + 反向导入
@@ -195,6 +221,8 @@ docker exec lab-cpe1 vppctl show trace
 | [lab-compose.yml](lab-compose.yml) | 12 个容器、8 张网；数据面网络全部关 masquerade |
 | [Dockerfile](Dockerfile) | 在 srwg-dev 上装 FRR 10.7.1，做 `srwg-lab:latest` |
 | [bringup.sh](bringup.sh) | 分阶段搭建；所有"控制器下发值"手写在这里 |
+| [console.sh](console.sh) | 控制台地址/登录 token；重启 sr-ctrl |
+| [vcpe.sh](vcpe.sh) | 起停一台只做入网+心跳的 vCPE（容器 `sr-lab-vcpe`） |
 | [verify.sh](verify.sh) | 从容器/VPP 一直到终端到终端、双向导入的 290+ 条断言 |
 | [status.sh](status.sh) | 只读状态快照 |
 | [teardown.sh](teardown.sh) | 拆除 |
