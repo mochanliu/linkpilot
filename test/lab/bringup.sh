@@ -221,7 +221,19 @@ kernel_no_forwarding() {   # <cpe>
             [ -d "$i" ] || continue          # bonding_masters 是文件，不是网卡
             i=$(basename "$i"); [ "$i" = lo ] && continue
             sysctl -qw net.ipv4.conf."$i".forwarding=0 net.ipv4.conf."$i".rp_filter=0
-        done' || die "$c: 关内核转发失败"
+        done
+        # 反过来，交给 VPP 的那几张网卡要关死：AF_PACKET 只是旁路，内核照样收到
+        # 同一帧；地址又在 lcp TAP 上、同样算 local，弱主机模型下内核会替这个口
+        # 再回一次 ICMP，终端看到「每个包两个回包」。严格 rp_filter 让内核把从
+        # VPP 独占口进来的包全部丢掉。控制面（BGP 等）走 VPP punt → lcp TAP，
+        # TAP 的 rp_filter 仍是 0，不受影响。
+        if [ -r /tmp/lab-ifstate ]; then
+            while read -r _ ifn _; do
+                [ -n "$ifn" ] && [ -d "/sys/class/net/$ifn" ] || continue
+                sysctl -qw net.ipv4.conf."$ifn".rp_filter=1
+            done < /tmp/lab-ifstate
+        fi
+    ' || die "$c: 关内核转发失败"
 }
 
 # AF_PACKET 让内核仍收到一份网卡拷贝。地址已经在 VPP 里，内核不该再拿同一个
@@ -583,7 +595,6 @@ stage_dataplane() {
     local n c wan xc
     for n in 1 2 3; do
         c=lab-cpe$n
-        kernel_no_forwarding "$c"
         kernel_arp_owner_only "$c"
         vpp "$c" sr-wg key set 1 "$SR_KEY" >/dev/null
         vpp "$c" mpls table add 0 >/dev/null
@@ -594,6 +605,9 @@ stage_dataplane() {
         lcp_pair "$c" "$xc"
         wait_lcp_addr "$c" "${XCONN_IP[$n]}" 24
         drop_kernel_default "$c"
+        # 放在搬完口之后：它要按 /tmp/lab-ifstate（take_ip 写的）把 VPP 独占口
+        # 的 rp_filter 反过来设成严格，TAP 也是这一步才存在。
+        kernel_no_forwarding "$c"
         # 客户路由器在 stage containers 里可能已经把 10.79.N.2 解析成内核 eth1
         # 的 MAC（那时地址还在内核）。地址搬进 VPP 之后必须让它重新 ARP，否则
         # 数据包会被 VPP 按 l3 mac mismatch 丢掉。

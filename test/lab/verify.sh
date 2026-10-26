@@ -199,6 +199,20 @@ for n in 1 2 3; do
     [ "$(docker exec "$c" cat "/proc/sys/net/ipv4/conf/$kif/arp_ignore" 2>/dev/null)" = "1" ] \
         && ok "$c: $kif 上 arp_ignore=1（不会抢答 VPP 的地址）" \
         || bad "$c: $kif 上 arp_ignore 不是 1"
+    # 内核还得彻底不接收这张口的 IP 包：AF_PACKET 是旁路，内核照样拿到同一帧；
+    # 地址在 TAP 上也是 local，弱主机模型下内核会替 VPP 再回一次 ICMP（终端看到
+    # "+N duplicates"）。严格 rp_filter 关掉这条路径，TAP 上仍是 0。
+    [ "$(docker exec "$c" cat "/proc/sys/net/ipv4/conf/$kif/rp_filter" 2>/dev/null)" = "1" ] \
+        && ok "$c: $kif 上 rp_filter=1（内核不接收 VPP 独占口的包）" \
+        || bad "$c: $kif 上 rp_filter 不是 1"
+    [ "$(docker exec "$c" cat "/proc/sys/net/ipv4/conf/$LCP_IF/rp_filter" 2>/dev/null)" = "0" ] \
+        && ok "$c: $LCP_IF 上 rp_filter=0（控制面流量不被误杀）" \
+        || bad "$c: $LCP_IF 上 rp_filter 不是 0"
+    cout=$(docker exec "lab-cust$n" ping -c 3 -W 2 -i 0.3 "${XCONN_IP[$n]}" 2>/dev/null)
+    nreplies=$(echo "$cout" | grep -c 'bytes from')
+    [ "${nreplies:-0}" = "3" ] && ! echo "$cout" | grep -q duplicates \
+        && ok "$c: 客户口 ${XCONN_IP[$n]} 只有 VPP 应答（无重复回包）" \
+        || bad "$c: 客户口 ${XCONN_IP[$n]} ping 异常或出现重复回包（$(echo "$cout" | tail -1)）"
 done
 
 sect "3. WG 隧道（端口 / 路径 / 绑定 / peer）"
