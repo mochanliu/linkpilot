@@ -232,7 +232,11 @@ TAP 入 VRF 与 sysctl。zebra/staticd 写进内核的路由会被 linux-nl 镜�
 控制器把租户的草稿渲染好后导出成配置包（JSON，含 `frr` / `vpp` / `boot`
 三个片段和 `checks`）。正常路径是在控制台「配置」页点「下载配置包」，文件名
 是 `sr-cpe-node-<id>-v<版本>.json`；有未保存改动或草稿还是 v0 时页面会拒绝
-并提示先保存。等价的命令行方式：
+并提示先保存。下载成功后页面底部会出现「配置包 JSON」面板，内容与文件一致；
+面板上的「全选 / 复制」按钮走 `execCommand("copy")`，实测能写进系统剪贴板
+（`pbpaste` 校验过）。留这个面板是因为 Qoder 内嵌浏览器会静默丢弃
+`<a download>` 的保存（2026-10-27，http 链接和 blob 链接都试过，`~/Downloads`
+里没有文件），普通浏览器不受影响。等价的命令行方式：
 
 ```bash
 curl -s -b "sr_ctrl_session=<租户会话>" \

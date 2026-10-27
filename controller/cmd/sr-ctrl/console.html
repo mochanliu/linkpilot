@@ -140,8 +140,9 @@
   select.ttl{width:auto;padding:4px 6px;font-size:12.5px}
   .steps{margin:10px 0 0;padding-left:20px;color:var(--muted);font-size:13px}
   .steps li{margin:3px 0}
-  pre.cmd{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;
-    overflow-x:auto;font-size:12.5px;line-height:1.6;margin:8px 0 0}
+  pre.cmd,textarea.cmd{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;
+    overflow-x:auto;font-size:12.5px;line-height:1.6;margin:8px 0 0;
+    border:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .placeholder{border:1px dashed var(--line);border-radius:10px;padding:22px;
     color:var(--muted);font-size:13.5px;background:#fcfdfe}
   .placeholder b{color:var(--ink)}
@@ -199,7 +200,9 @@
 <body>
 
 <div id="login">
-  <form class="login-card" id="login-form" autocomplete="off">
+  <!-- The inline guard matters before the script attaches its submit listener:
+       the default GET would put the username and password in the URL. -->
+  <form class="login-card" id="login-form" autocomplete="off" onsubmit="return false">
     <div class="brand"><b>SROU 控制台</b><span>控制器管理面</span></div>
     <div class="tabs" id="login-tabs">
       <button type="button" data-tab="account" class="active">账号登录</button>
@@ -1112,7 +1115,7 @@
     if (ok && (cs.dirty || cs.view || cs.loading)) return;
     S.cfg = { nodeID: ok ? cs.nodeID : nodes[0].node_id, view: null, draft: null,
       dirty: false, layer: cs ? cs.layer : "base", edit: null, ptab: "frr", vpn: 0,
-      note: null, loading: false };
+      note: null, loading: false, bundle: null };
     loadConfig();
   }
 
@@ -1127,6 +1130,7 @@
     cs.edit = null;
     cs.vpn = 0;
     cs.note = null;
+    cs.bundle = null;
     cs.loading = false;
     render();
     loadConfig();
@@ -1144,6 +1148,7 @@
       cs.draft = cfgClone(v.config);
       cs.dirty = false;
       cs.edit = null;
+      cs.bundle = null;
       if (!cfgVPNExists(cs.draft, cs.vpn)) cs.vpn = 0;
       render();
     }).catch(function (err) {
@@ -1261,6 +1266,7 @@
     h += cfgDynamicPanel(cs, cfg);
     h += cfgChecksPanel(cs);
     h += cfgArtifactsPanel(cs);
+    h += cfgBundlePanel(cs);
     return h;
   }
 
@@ -1483,6 +1489,32 @@
       '<pre class="cmd">' + esc(text) + "</pre></section>";
   }
 
+  // The verification browser (and some locked-down clients) drop <a download>
+  // silently, so the fetched text is also shown verbatim: the tenant can
+  // select it and save the file by hand.
+  function cfgBundlePanel(cs) {
+    var b = cs.bundle;
+    if (!b) return "";
+    return '<section class="panel"><header><h2>配置包 JSON</h2>' +
+      '<span class="tag online">v' + esc(b.version) + "</span></header>" +
+      '<div class="hint">如果点「下载配置包」后浏览器没有保存文件，可以在这里全选复制，自己存成 ' +
+      esc(b.name) + "；内容和下载到的完全一致。</div>" +
+      '<textarea id="cfg-bundle-json" class="cmd" readonly spellcheck="false" ' +
+      'style="width:100%;height:220px;resize:vertical">' + esc(b.text) + "</textarea>" +
+      '<div style="margin-top:8px"><button class="small" data-act="cfg-bundle-copy">全选 / 复制</button></div>' +
+      "</section>";
+  }
+
+  function cfgBundleCopy() {
+    var ta = $("cfg-bundle-json");
+    if (!ta) return;
+    ta.focus();
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    toast(ok ? "已复制配置包 JSON" : "已全选，按 ⌘C / Ctrl+C 复制");
+  }
+
   function cfgAddVPN() {
     var cs = S.cfg;
     if (!cs || !cs.draft) return;
@@ -1643,6 +1675,7 @@
       cs.draft = cfgClone(v.config);
       cs.dirty = false;
       cs.edit = null;
+      cs.bundle = null;
       cs.note = { kind: errs ? "warn" : "",
         text: "已保存草稿 v" + v.version +
           (errs ? "；仍有 " + errs + " 个错误，下载后设备会拒绝安装（除非 --force）。"
@@ -1660,11 +1693,15 @@
     var cs = S.cfg;
     if (!cs || !cs.view) return;
     if (cs.dirty) {
+      // Drop any earlier download: it belongs to the saved version, not to
+      // what is on screen now, and copying it by mistake would be silent.
+      cs.bundle = null;
       cs.note = { kind: "warn", text: "有未保存的改动。配置包只包含已保存的草稿，先点「保存草稿」再下载。" };
       render();
       return;
     }
     if (!cs.view.version) {
+      cs.bundle = null;
       cs.note = { kind: "warn", text: "这台设备还没有保存过草稿（v0），没有可下载的配置包。" };
       render();
       return;
@@ -1688,6 +1725,7 @@
       if (S.cfg !== cs) return;
       var errs = 0;
       checks.forEach(function (x) { if (x.severity === "error") errs++; });
+      cs.bundle = { version: v, name: a.download, text: text };
       cs.note = { kind: errs ? "warn" : "",
         text: "已下载配置包 v" + v + "。设备侧执行 sr-apply apply --bundle <文件>" +
           (errs ? "；校验里有 " + errs + " 个错误，默认会被拒绝（需 --force）。" : "。") };
@@ -2037,9 +2075,11 @@
           S.cfg.dirty = false;
           S.cfg.edit = null;
           S.cfg.note = null;
+          S.cfg.bundle = null;
           render();
           loadConfig();
         } else if (act === "cfg-bundle") cfgDownloadBundle();
+        else if (act === "cfg-bundle-copy") cfgBundleCopy();
         else if (act === "cfg-note-x") { S.cfg.note = null; render(); }
         else if (act === "cfg-ptab") { S.cfg.ptab = el.getAttribute("data-ptab"); render(); }
         else if (act === "cfg-vpn-add") cfgAddVPN();
