@@ -146,6 +146,40 @@
     color:var(--muted);font-size:13.5px;background:#fcfdfe}
   .placeholder b{color:var(--ink)}
   .placeholder ul{margin:8px 0 0;padding-left:20px}
+
+  /* ---------- config ---------- */
+  .cfg-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .ltabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin:0 0 12px}
+  .ltabs button{border:none;border-bottom:2px solid transparent;border-radius:0;background:none;
+    color:var(--muted);padding:6px 2px;margin:0 14px -1px 0;font-size:13.5px}
+  .ltabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  .ltabs button:hover{background:none;color:var(--ink)}
+  .subcard{border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-top:12px}
+  .subhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .subhead .sp{color:var(--muted);font-size:12.5px}
+  .fields{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+  .field{display:flex;flex-direction:column;gap:4px}
+  .field label{font-size:12px;color:var(--muted)}
+  .field input,.field select{min-width:130px}
+  .addrow{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-top:10px}
+  .addrow .field input{width:150px}
+  .cfg-note{display:flex;align-items:center;justify-content:space-between;gap:12px;
+    border:1px solid var(--line);background:#f6f8fa;border-radius:8px;padding:9px 12px;
+    font-size:13px;margin-bottom:12px}
+  .cfg-note.warn{border-color:#eed888;background:#fff8c5}
+  .cfg-note.bad{border-color:#ffcecb;background:#ffebe9;color:var(--bad)}
+  .chk{display:flex;gap:8px;align-items:center;font-size:13px;white-space:nowrap}
+  .chk input{width:auto}
+  .chk-list{margin:10px 0 0;padding-left:20px;font-size:13px;color:var(--muted)}
+  .chk-list li{margin:3px 0}
+  .chk-list .sev{font-weight:600}
+  .chk-list .sev.error{color:var(--bad)}
+  .chk-list .sev.warning{color:var(--warn)}
+  .chk-list .sev.info{color:var(--muted)}
+  .bnd{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;padding:0;list-style:none}
+  .bnd li{width:100%;border:1px solid var(--line);border-radius:8px;padding:9px 12px;
+    font-size:13px;color:var(--muted)}
+  .bnd b{color:var(--ink)}
   .tel-node{border-top:1px solid #eaeef2;padding:14px 0 6px}
   .tel-node:first-of-type{border-top:none;padding-top:2px}
   .tel-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
@@ -202,6 +236,7 @@
       <a href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
       <div class="sect" data-roles="tenant">我的网络</div>
       <a href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
+      <a href="#config" data-view="config" data-roles="tenant">配置</a>
       <a href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a href="#tunnels" data-view="tunnels" data-roles="tenant">隧道</a>
       <a href="#routes" data-view="routes" data-roles="tenant">路由</a>
@@ -237,7 +272,7 @@
   var S = { state: null, me: null, accounts: null, loginTab: "account",
     view: "overview", lastResult: null, lastSecret: null, codeReveal: null,
     html: "", timer: null, ago: null, es: null,
-    metrics: null, fast: null };
+    metrics: null, fast: null, cfg: null };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -314,6 +349,7 @@
     S.lastSecret = null;
     S.lastResult = null;
     S.codeReveal = null;
+    S.cfg = null;
     S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
     clearInterval(S.timer);
@@ -519,6 +555,11 @@
       sub: "运营方只看库存（谁、序列号、入网时间、在线状态）",
       tenantSub: "你的设备；入网只建立归属，隧道 / 端口 / overlay 都还没有下发"
     },
+    config: {
+      title: "配置",
+      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。这一轮只做基础配置的草稿，下发通道还没有实现",
+      roles: ["tenant"]
+    },
     monitor: {
       title: "监控",
       sub: "设备存活与隧道内遥测：两端各自上报，不合并，没有上报就明说",
@@ -559,6 +600,7 @@
     else if (S.view === "accounts") c = viewAccounts(st);
     else if (S.view === "enroll") c = viewEnroll(st, isOp);
     else if (S.view === "nodes") c = viewNodes(st, isOp);
+    else if (S.view === "config") c = viewConfig(st);
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "account") c = viewAccount();
     else c = viewPlaceholder(S.view);
@@ -1034,6 +1076,597 @@
     return h;
   }
 
+  /* ---------------- config ---------------- */
+
+  function cfgClone(o) { return JSON.parse(JSON.stringify(o)); }
+
+  function cfgVal(id) {
+    var el = $(id);
+    return el ? String(el.value).trim() : "";
+  }
+
+  function cfgIPv4(s) {
+    var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(s || "").trim());
+    if (!m) return false;
+    for (var i = 1; i <= 4; i++) if (Number(m[i]) > 255) return false;
+    return true;
+  }
+
+  function cfgVPNOf(cfg, id) {
+    for (var i = 0; i < cfg.vpns.length; i++) if (cfg.vpns[i].id === id) return cfg.vpns[i];
+    return null;
+  }
+  function cfgVPNExists(cfg, id) { return !!cfgVPNOf(cfg, id); }
+
+  // The draft lives in S so the 10s state poll (which redraws this view) cannot
+  // throw edits away. Field input handlers update S; render() skips while an
+  // input has focus, so nothing fights the caret.
+  function openConfig() {
+    var nodes = (S.state && S.state.nodes) || [];
+    if (!nodes.length) { S.cfg = null; return; }
+    var cs = S.cfg;
+    var ok = cs && nodes.some(function (n) { return n.node_id === cs.nodeID; });
+    if (ok && (cs.dirty || cs.view || cs.loading)) return;
+    S.cfg = { nodeID: ok ? cs.nodeID : nodes[0].node_id, view: null, draft: null,
+      dirty: false, layer: cs ? cs.layer : "base", edit: null, ptab: "frr", vpn: 0,
+      note: null, loading: false };
+    loadConfig();
+  }
+
+  function selectCfgNode(id) {
+    var cs = S.cfg;
+    if (!cs || cs.nodeID === id) return;
+    if (cs.dirty && !confirm("切换设备会丢掉当前未保存的改动，继续？")) return;
+    cs.nodeID = id;
+    cs.view = null;
+    cs.draft = null;
+    cs.dirty = false;
+    cs.edit = null;
+    cs.vpn = 0;
+    cs.note = null;
+    cs.loading = false;
+    render();
+    loadConfig();
+  }
+
+  function loadConfig() {
+    var cs = S.cfg;
+    if (!cs || !cs.nodeID || cs.loading) return;
+    cs.loading = true;
+    var nodeID = cs.nodeID;
+    api("GET", "/api/config?node=" + nodeID).then(function (v) {
+      if (S.cfg !== cs || cs.nodeID !== nodeID) return;
+      cs.loading = false;
+      cs.view = v;
+      cs.draft = cfgClone(v.config);
+      cs.dirty = false;
+      cs.edit = null;
+      if (!cfgVPNExists(cs.draft, cs.vpn)) cs.vpn = 0;
+      render();
+    }).catch(function (err) {
+      if (S.cfg !== cs) return;
+      cs.loading = false;
+      cs.view = null;
+      cs.note = { kind: "bad", text: "读取配置失败：" + err.message };
+      render();
+    });
+  }
+
+  function cfgMetaText(cs) {
+    var v = cs.view;
+    if (!v) return "尚未读取";
+    return "草稿 v" + esc(v.version) +
+      (v.updated_at_unix ? " · 保存于 " + esc(clock(v.updated_at_unix)) : " · 尚未保存过") +
+      (v.updated_by ? " · " + esc(v.updated_by) : "");
+  }
+
+  function cfgDirtyMark(cs) {
+    return cs.dirty ? ' · <b style="color:var(--warn)">有未保存的改动</b>' : "";
+  }
+
+  // The meta line changes on every keystroke, so it is patched in place rather
+  // than through render(): a full rebuild here would steal focus mid-typing.
+  function csMarkDirty() {
+    var cs = S.cfg;
+    if (!cs) return;
+    cs.dirty = true;
+    var m = $("cfg-meta");
+    if (m) m.innerHTML = cfgMetaText(cs) + cfgDirtyMark(cs);
+  }
+
+  function viewConfig(st) {
+    if (!st.nodes.length) {
+      return '<section class="panel"><div class="empty">还没有设备。先在「入网授权」页生成一次性码接入一台，再回来配置它的客户侧。</div></section>';
+    }
+    var cs = S.cfg;
+    if (!cs) {
+      openConfig();
+      return '<section class="panel"><div class="empty">正在读取配置…</div></section>';
+    }
+    var h = cfgBar(st, cs);
+    if (cs.note) h += cfgNote(cs.note);
+    if (cs.layer !== "base") return h + cfgBoundary(cs.layer);
+    if (!cs.view) {
+      return h + '<section class="panel"><div class="empty">' +
+        (cs.loading ? "正在读取配置…" : "还没有读到配置。") + "</div></section>";
+    }
+    return h + cfgBase(cs);
+  }
+
+  function cfgBar(st, cs) {
+    var opts = st.nodes.map(function (n) {
+      var stt = n.status === "online" ? "在线" : n.status === "stale" ? "失联" : "未上线";
+      return '<option value="' + esc(n.node_id) + '"' + (n.node_id === cs.nodeID ? " selected" : "") +
+        ">node-" + esc(n.node_id) + " · " + esc(n.serial) + " · " + stt + "</option>";
+    }).join("");
+    return '<section class="panel">' +
+      '<div class="cfg-bar"><select id="cfg-node" aria-label="选择设备">' + opts + "</select>" +
+      '<span class="muted" style="font-size:12.5px" id="cfg-meta">' + cfgMetaText(cs) + cfgDirtyMark(cs) + "</span>" +
+      '<span style="flex:1"></span>' +
+      '<button class="small" data-act="cfg-reload">重新载入</button>' +
+      '<button class="small" data-act="cfg-deploy">下发到设备</button>' +
+      '<button class="small primary" data-act="cfg-save">保存草稿</button>' +
+      "</div>" + cfgTabs(cs) +
+      '<div class="hint" style="margin:0">保存只写控制器里的草稿；下发通道尚未实现，设备上不会发生任何变化。' +
+      "VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 / 1250 被 overlay 占用。</div>" +
+      "</section>";
+  }
+
+  function cfgTabs(cs) {
+    var t = [["base", "基础配置"], ["underlay", "underlay"], ["overlay", "overlay"]];
+    return '<div class="ltabs" role="tablist" aria-label="配置层次">' + t.map(function (x) {
+      return '<button type="button" role="tab" class="' + (cs.layer === x[0] ? "on" : "") +
+        '" aria-selected="' + (cs.layer === x[0]) + '" data-act="cfg-layer" data-layer="' +
+        x[0] + '">' + x[1] + "</button>";
+    }).join("") + "</div>";
+  }
+
+  function cfgNote(n) {
+    return '<div class="cfg-note ' + esc(n.kind || "") + '" role="status"><span>' + esc(n.text) + "</span>" +
+      '<button class="small" data-act="cfg-note-x">知道了</button></div>';
+  }
+
+  function cfgBoundary(which) {
+    var isUnder = which === "underlay";
+    var items = isUnder ? [
+      ["WAN 口", "上行口的地址、掩码、源地址选择。"],
+      ["隧道", "每隧道一个监听端口、对端设备、overlay /32，全部落在独立的 VPP table。"],
+      ["密钥与 MTU", "密钥环、隧道 MTU 预算、MSS clamp（MTU−44）。"],
+      ["探测", "隧道内 BFD（必须 multihop）+ 300 ms 探针；结果就是「监控」页那张表。"]
+    ] : [
+      ["RT", "每个 VPN 的 import / export RT。"],
+      ["双向导入", "FRR 导出 → sr-route（只认 tag 1001，防环）；sr-route 反射回来 → FRR。"],
+      ["选路", "本地直连 / 静态 / BGP / overlay 前缀的优先级与管理距离。"],
+      ["前缀策略", "哪些客户前缀允许进 overlay，以及跨租户的隔离边界。"]
+    ];
+    return '<section class="panel"><header><h2>' +
+      (isUnder ? "underlay：VPN 隧道承载" : "overlay：FRR 与自研路由之间的导入导出") +
+      '</h2><span class="tag plan">下一轮设计</span></header>' +
+      '<div class="hint">这一层管的是' + (isUnder ? "「盒子之间怎么通」" : "「学到了什么、怎么互相导入」") +
+      "。本页只做基础配置，先把边界摆出来，方便确认分界。</div>" +
+      '<ul class="bnd">' + items.map(function (x) {
+        return "<li><b>" + esc(x[0]) + "</b> · " + esc(x[1]) + "</li>";
+      }).join("") + "</ul></section>";
+  }
+
+  function cfgBase(cs) {
+    var cfg = cs.draft;
+    var h = cfgHostPanel(cfg);
+    h += cfgVPNPanel(cfg);
+    h += cfgIfacePanel(cs, cfg);
+    h += cfgStaticPanel(cfg);
+    h += cfgDynamicPanel(cs, cfg);
+    h += cfgChecksPanel(cs);
+    h += cfgArtifactsPanel(cs);
+    return h;
+  }
+
+  function cfgHostPanel(cfg) {
+    return '<section class="panel"><header><h2>主机名</h2></header>' +
+      '<div class="fields"><div class="field"><label for="cfg-hostname">hostname</label>' +
+      '<input id="cfg-hostname" data-cfg="hostname" value="' + esc(cfg.hostname) +
+      '" placeholder="如 cpe-sh-01" spellcheck="false" maxlength="63"></div></div>' +
+      '<div class="hint" style="margin:10px 0 0">写进 FRR 的 hostname；只影响盒子自身，不参与转发。</div></section>';
+  }
+
+  function cfgVPNPanel(cfg) {
+    var rows = cfg.vpns.map(function (v) {
+      var ni = 0, ns = 0;
+      cfg.ifaces.forEach(function (it) { if (it.vpn === v.id) ni++; });
+      cfg.statics.forEach(function (r) { if (r.vpn === v.id) ns++; });
+      var note = v.id === 0 ? "默认表" : (v.id === 250 ? "保留：overlay"
+        : (v.id === 1250 ? "保留：table-direct" : "VPP table " + v.id));
+      return "<tr>" +
+        '<td class="mono">' + esc(v.id) + "</td>" +
+        '<td><input data-cfg="vpn.name" data-vpn="' + esc(v.id) + '" value="' + esc(v.name || "") +
+        '" placeholder="—" style="width:150px"></td>' +
+        '<td class="num">' + ni + "</td>" +
+        '<td class="num">' + ns + "</td>" +
+        '<td class="muted">' + esc(note) + "</td>" +
+        '<td class="row-actions">' + (v.id === 0 ? '<span class="muted">—</span>'
+          : '<button class="small danger" data-act="cfg-vpn-del" data-id="' + esc(v.id) + '">删除</button>') +
+        "</td></tr>";
+    }).join("");
+    return '<section class="panel"><header><h2>VPN / 路由实例</h2></header>' +
+      '<div class="hint">每增加一个 VPN，就多一张独立的转发表和一套 BGP/OSPF；客户口与静态路由按 VPN 归属。</div>' +
+      "<table><thead><tr><th>VPN ID</th><th>名称</th><th>客户口</th><th>静态路由</th><th>说明</th><th></th></tr></thead><tbody>" +
+      rows + "</tbody></table>" +
+      '<div class="addrow">' +
+      '<div class="field"><label for="vpn-id">VPN ID</label><input id="vpn-id" type="number" min="1" max="65535" placeholder="如 10" style="width:110px"></div>' +
+      '<div class="field"><label for="vpn-name">名称</label><input id="vpn-name" placeholder="如 办公网" style="width:160px"></div>' +
+      '<button class="small primary" data-act="cfg-vpn-add">添加 VPN</button>' +
+      "</div></section>";
+  }
+
+  function cfgIfacePanel(cs, cfg) {
+    var rows = cfg.ifaces.length ? cfg.ifaces.map(function (it, i) {
+      return "<tr>" +
+        '<td class="mono">' + esc(it.vpp) + "</td>" +
+        '<td class="mono">' + esc(it.lcp) + "</td>" +
+        '<td class="mono">' + esc(it.ip) + "/" + esc(it.prefix_len) + "</td>" +
+        '<td class="num">' + esc(it.vpn) + "</td>" +
+        '<td class="num">' + (it.mtu ? esc(it.mtu) : "—") + "</td>" +
+        "<td>" + (it.up ? '<span class="tag online">up</span>' : '<span class="tag pending">down</span>') +
+        (it.arp_ignore ? ' <span class="muted" style="font-size:12px">arp_ignore</span>' : "") + "</td>" +
+        '<td class="row-actions"><button class="small" data-act="cfg-if-edit" data-i="' + i + '">编辑</button>' +
+        '<button class="small danger" data-act="cfg-if-del" data-i="' + i + '">删除</button></td>' +
+        "</tr>";
+    }).join("") : '<tr><td colspan="7" class="empty">还没有客户口。没有客户口，客户侧流量就没有入口。</td></tr>';
+    return '<section class="panel"><header><h2>客户口</h2>' +
+      '<button class="small" data-act="cfg-if-add">添加客户口</button></header>' +
+      '<div class="hint">接口 IP 交给 FRR（配在内核 TAP 上，linux-nl 同步进 VPP）；VPP 只管这张表、MTU、开关和 lcp。</div>' +
+      (cs.edit ? cfgIfaceEditor(cs) : "") +
+      "<table><thead><tr><th>VPP 口</th><th>内核 TAP</th><th>地址</th><th>VPN</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>" +
+      rows + "</tbody></table></section>";
+  }
+
+  function cfgIfaceEditor(cs) {
+    var v = cs.edit.v;
+    var opts = cs.draft.vpns.map(function (x) {
+      return '<option value="' + esc(x.id) + '"' + (x.id === v.vpn ? " selected" : "") + ">VPN " +
+        esc(x.id) + (x.name ? " · " + esc(x.name) : "") + "</option>";
+    }).join("");
+    return '<div class="subcard"><div class="subhead"><b>' + (cs.edit.idx >= 0 ? "编辑客户口" : "新客户口") + "</b></div>" +
+      '<div class="fields">' +
+      '<div class="field"><label for="if-vpp">VPP 口</label><input id="if-vpp" value="' + esc(v.vpp) + '" spellcheck="false" placeholder="host-eth2"></div>' +
+      '<div class="field"><label for="if-lcp">内核 TAP</label><input id="if-lcp" value="' + esc(v.lcp) + '" spellcheck="false" placeholder="lcp-x1"></div>' +
+      '<div class="field"><label for="if-ip">IPv4 地址</label><input id="if-ip" value="' + esc(v.ip) + '" spellcheck="false" placeholder="10.68.1.1"></div>' +
+      '<div class="field"><label for="if-pfx">前缀长度</label><input id="if-pfx" type="number" min="8" max="30" value="' + esc(v.prefix_len) + '" style="width:90px"></div>' +
+      '<div class="field"><label for="if-vpn">VPN</label><select id="if-vpn">' + opts + "</select></div>" +
+      '<div class="field"><label for="if-mtu">MTU</label><input id="if-mtu" type="number" min="576" max="9216" value="' + esc(v.mtu) + '" style="width:100px"></div>' +
+      '<div class="field"><label for="if-arp">arp_ignore</label><select id="if-arp"><option value="1"' +
+      (v.arp_ignore ? " selected" : "") + '>开（1）</option><option value="0"' +
+      (!v.arp_ignore ? " selected" : "") + ">关（0）</option></select></div>" +
+      '<div class="field"><label for="if-up">管理状态</label><select id="if-up"><option value="1"' +
+      (v.up ? " selected" : "") + '>up</option><option value="0"' +
+      (!v.up ? " selected" : "") + ">down</option></select></div>" +
+      "</div>" +
+      '<div class="cfg-bar" style="margin:10px 0 0"><span style="flex:1"></span>' +
+      '<button class="small" data-act="cfg-if-cancel">取消</button>' +
+      '<button class="small primary" data-act="cfg-if-save">保存客户口</button></div></div>';
+  }
+
+  function cfgStaticPanel(cfg) {
+    var rows = cfg.statics.length ? cfg.statics.map(function (r, i) {
+      return "<tr>" +
+        '<td class="mono">' + esc(r.prefix) + "</td>" +
+        '<td class="mono">' + esc(r.next_hop) + "</td>" +
+        '<td class="num">' + esc(r.vpn) + "</td>" +
+        '<td class="row-actions"><button class="small danger" data-act="cfg-st-del" data-i="' + i + '">删除</button></td>' +
+        "</tr>";
+    }).join("") : '<tr><td colspan="4" class="empty">还没有静态路由。</td></tr>';
+    return '<section class="panel"><header><h2>静态路由</h2></header>' +
+      '<div class="hint">写进 FRR，由 zebra 装进内核表；linux-nl 会把它们同步进对应 VPN 的 VPP table。</div>' +
+      "<table><thead><tr><th>目的前缀</th><th>下一跳</th><th>VPN</th><th></th></tr></thead><tbody>" +
+      rows + "</tbody></table>" +
+      '<div class="addrow">' +
+      '<div class="field"><label for="st-prefix">目的前缀</label><input id="st-prefix" placeholder="10.68.99.0/24" spellcheck="false"></div>' +
+      '<div class="field"><label for="st-nh">下一跳</label><input id="st-nh" placeholder="10.68.1.2" spellcheck="false"></div>' +
+      '<div class="field"><label for="st-vpn">VPN</label><select id="st-vpn">' + cfg.vpns.map(function (x) {
+        return '<option value="' + esc(x.id) + '">VPN ' + esc(x.id) +
+          (x.name ? " · " + esc(x.name) : "") + "</option>";
+      }).join("") + "</select></div>" +
+      '<button class="small primary" data-act="cfg-st-add">添加</button>' +
+      "</div></section>";
+  }
+
+  function cfgDynamicPanel(cs, cfg) {
+    var vpn = cfgVPNOf(cfg, cs.vpn) || cfg.vpns[0];
+    var opts = cfg.vpns.map(function (x) {
+      return '<option value="' + esc(x.id) + '"' + (x.id === vpn.id ? " selected" : "") + ">VPN " +
+        esc(x.id) + (x.name ? " · " + esc(x.name) : "") + "</option>";
+    }).join("");
+    return '<section class="panel"><header><h2>动态路由（盒内 FRR）</h2>' +
+      '<select id="cfg-vpn" class="ttl" aria-label="路由实例">' + opts + "</select></header>" +
+      '<div class="hint">这里只定义「和客户侧谁建会话」。学到的前缀要不要进 overlay、怎么打 tag，是 overlay 层的事。</div>' +
+      cfgBgpCard(vpn) + cfgOspfCard(cfg, vpn) + "</section>";
+  }
+
+  function cfgBgpCard(vpn) {
+    var b = vpn.bgp;
+    var nbrs = b.neighbors || [];
+    var body = "";
+    if (b.on) {
+      var nrows = nbrs.length ? nbrs.map(function (n, i) {
+        var mode = b.asn !== 0 && n.remote_as === b.asn
+          ? '<span class="tag plan">iBGP</span>' : '<span class="tag pending">eBGP</span>';
+        return "<tr>" +
+          '<td class="mono">' + esc(n.ip) + "</td>" +
+          '<td class="num">' + esc(n.remote_as) + "</td>" +
+          "<td>" + mode + (n.next_hop_self
+            ? ' <span class="muted" style="font-size:12px">next-hop-self</span>' : "") + "</td>" +
+          "<td>" + (n.description ? esc(n.description) : '<span class="muted">—</span>') + "</td>" +
+          '<td class="row-actions"><button class="small danger" data-act="cfg-nb-del" data-i="' + i + '">删除</button></td>' +
+          "</tr>";
+      }).join("") : '<tr><td colspan="5" class="empty">还没有邻居。</td></tr>';
+      body = '<div class="fields">' +
+        '<div class="field"><label for="bgp-asn">本地 AS</label><input id="bgp-asn" data-cfg="bgp.asn" type="number" min="1" max="4294967295" value="' + esc(b.asn || "") + '" style="width:130px"></div>' +
+        '<div class="field"><label for="bgp-rid">router-id</label><input id="bgp-rid" data-cfg="bgp.router_id" value="' + esc(b.router_id) + '" placeholder="10.0.0.1" spellcheck="false"></div>' +
+        "</div>" +
+        '<div style="margin-top:10px"><table><thead><tr><th>邻居</th><th>对端 AS</th><th>会话</th><th>描述</th><th></th></tr></thead><tbody>' +
+        nrows + "</tbody></table></div>" +
+        '<div class="addrow">' +
+        '<div class="field"><label for="nb-ip">邻居地址</label><input id="nb-ip" placeholder="10.68.1.2" spellcheck="false"></div>' +
+        '<div class="field"><label for="nb-ras">对端 AS</label><input id="nb-ras" type="number" min="1" max="4294967295" placeholder="65001" style="width:120px"></div>' +
+        '<div class="field"><label for="nb-desc">描述</label><input id="nb-desc" placeholder="customer-r1"></div>' +
+        '<label class="chk"><input type="checkbox" id="nb-nhs"> iBGP next-hop-self</label>' +
+        '<button class="small" data-act="cfg-nb-add">添加邻居</button>' +
+        "</div>" +
+        '<div class="hint" style="margin:10px 0 0">对端 AS 等于本地 AS 即 iBGP：不再要求直连，但本机必须能递归到邻居地址（直连网段或被静态路由覆盖）。eBGP 必须直连。</div>';
+    }
+    return '<div class="subcard"><div class="subhead">' +
+      '<label class="chk"><input type="checkbox" id="cfg-bgp-on" data-cfg-bool="bgp.on"' +
+      (b.on ? " checked" : "") + "> 启用 BGP（bgpd）</label>" +
+      '<span class="sp">tag / route-map 由 overlay 层生成</span></div>' + body + "</div>";
+  }
+
+  function cfgOspfCard(cfg, vpn) {
+    var o = vpn.ospf;
+    var body = "";
+    if (o.on) {
+      var nets = cfg.ifaces.filter(function (it) {
+        return it.vpn === vpn.id && cfgIPv4(it.ip);
+      }).map(function (it) { return it.ip + "/" + it.prefix_len; });
+      body = '<div class="fields">' +
+        '<div class="field"><label for="ospf-rid">router-id</label><input id="ospf-rid" data-cfg="ospf.router_id" value="' + esc(o.router_id) + '" placeholder="10.0.0.1" spellcheck="false"></div>' +
+        '<div class="field"><label for="ospf-area">area</label><input id="ospf-area" data-cfg="ospf.area" type="number" min="0" max="4294967295" value="' + esc(o.area) + '" style="width:110px"></div>' +
+        '</div><p class="hint" style="margin:10px 0 0">宣告网段取自这个 VPN 的客户口：' +
+        (nets.length ? nets.map(function (n) {
+          return '<span class="mono">' + esc(n) + "</span>";
+        }).join(" · ") : "还没有客户口") +
+        "。FRR 每个 VRF 只有一个 OSPF 实例，所以没有进程号。</p>";
+    }
+    return '<div class="subcard"><div class="subhead">' +
+      '<label class="chk"><input type="checkbox" id="cfg-ospf-on" data-cfg-bool="ospf.on"' +
+      (o.on ? " checked" : "") + "> 启用 OSPF（ospfd）</label>" +
+      '<span class="sp">与客户路由器跑区域 ' + esc(o.on ? o.area : 0) + "</span></div>" + body + "</div>";
+  }
+
+  function cfgChecksPanel(cs) {
+    var v = cs.view;
+    var list = (v && v.checks) || [];
+    var errs = 0, warns = 0;
+    list.forEach(function (x) {
+      if (x.severity === "error") errs++;
+      else if (x.severity === "warning") warns++;
+    });
+    var label = { error: "错误", warning: "警告", info: "提示" };
+    var items = list.map(function (x) {
+      return '<li><span class="sev ' + esc(x.severity) + '">' + esc(label[x.severity] || x.severity) +
+        "</span> · " + esc(x.text) + "</li>";
+    }).join("");
+    var top = errs ? '<span class="tag revoked">' + errs + " 个错误</span>"
+      : warns ? '<span class="tag stale">' + warns + " 个警告</span>"
+        : '<span class="tag online">通过</span>';
+    return '<section class="panel"><header><h2>校验</h2>' + top + "</header>" +
+      (cs.dirty ? '<div class="hint">当前有未保存的改动；下面的校验对应已保存的草稿 v' + esc(v.version) + "。</div>" : "") +
+      (items ? '<ul class="chk-list">' + items + "</ul>"
+        : '<div class="empty">没有发现需要提示的问题。</div>') +
+      "</section>";
+  }
+
+  function cfgArtifactsPanel(cs) {
+    var v = cs.view;
+    var tabs = [["frr", "FRR 配置"], ["vpp", "VPP 配置"], ["boot", "开机脚本"]];
+    var text = (v.artifacts && v.artifacts[cs.ptab]) || "";
+    return '<section class="panel"><header><h2>将下发的配置</h2></header>' +
+      '<div class="ltabs" role="tablist" aria-label="配置产物">' + tabs.map(function (x) {
+        return '<button type="button" role="tab" class="' + (cs.ptab === x[0] ? "on" : "") +
+          '" aria-selected="' + (cs.ptab === x[0]) + '" data-act="cfg-ptab" data-ptab="' +
+          x[0] + '">' + x[1] + "</button>";
+      }).join("") + "</div>" +
+      '<div class="hint">只有基础配置拥有的行：FRR 管主机名、接口地址、静态路由、BGP/OSPF；VPP 管 table、MTU、接口状态与 lcp；开机脚本由设备侧在启动时重放，避免重启后丢掉 VPP 运行时状态。' +
+      (cs.dirty ? "当前显示的是已保存草稿 v" + esc(v.version) + " 的产物。" : "") + "</div>" +
+      '<pre class="cmd">' + esc(text) + "</pre></section>";
+  }
+
+  function cfgAddVPN() {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    var id = Number(cfgVal("vpn-id"));
+    var name = cfgVal("vpn-name");
+    if (!(id >= 1 && id <= 65535) || Math.trunc(id) !== id) { toast("VPN ID 必须是 1–65535 的整数"); return; }
+    if (id === 250 || id === 1250) { toast("VPN " + id + " 被 overlay 保留，换一个"); return; }
+    if (cfgVPNExists(cs.draft, id)) { toast("VPN " + id + " 已经存在"); return; }
+    if (cs.draft.vpns.length >= 64) { toast("一个设备最多 64 个 VPN"); return; }
+    cs.draft.vpns.push({ id: id, name: name,
+      bgp: { on: false, asn: 0, router_id: "", neighbors: [] },
+      ospf: { on: false, router_id: "", area: 0 } });
+    cs.draft.vpns.sort(function (a, b) { return a.id - b.id; });
+    cs.vpn = id;
+    csMarkDirty();
+    render();
+  }
+
+  function cfgDelVPN(id) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    if (id === 0) { toast("VPN 0 是默认表，不能删除"); return; }
+    var used = cs.draft.ifaces.some(function (it) { return it.vpn === id; }) ||
+      cs.draft.statics.some(function (r) { return r.vpn === id; });
+    if (used) { toast("先把这个 VPN 下的客户口和静态路由移走或删除"); return; }
+    if (!confirm("删除 VPN " + id + "？它的 BGP / OSPF 设置会一起删除。")) return;
+    cs.draft.vpns = cs.draft.vpns.filter(function (v) { return v.id !== id; });
+    if (cs.vpn === id) cs.vpn = 0;
+    csMarkDirty();
+    render();
+  }
+
+  function cfgAddIface() {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    if (cs.draft.ifaces.length >= 64) { toast("一个设备最多 64 个客户口"); return; }
+    var maxVpp = 1, maxLcp = -1;
+    cs.draft.ifaces.forEach(function (it) {
+      var a = String(it.vpp || "").match(/(\d+)$/);
+      if (a) maxVpp = Math.max(maxVpp, Number(a[1]));
+      var b = String(it.lcp || "").match(/(\d+)$/);
+      if (b) maxLcp = Math.max(maxLcp, Number(b[1]));
+    });
+    cs.edit = { idx: -1, v: {
+      vpp: "host-eth" + (maxVpp + 1), lcp: "lcp-x" + (maxLcp + 1),
+      ip: "", prefix_len: 24, vpn: cfgVPNExists(cs.draft, cs.vpn) ? cs.vpn : 0,
+      mtu: 1500, arp_ignore: true, up: true
+    } };
+    render();
+  }
+
+  function cfgEditIface(i) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft || !cs.draft.ifaces[i]) return;
+    cs.edit = { idx: i, v: cfgClone(cs.draft.ifaces[i]) };
+    render();
+  }
+
+  function cfgDelIface(i) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    cs.draft.ifaces.splice(i, 1);
+    cs.edit = null;
+    csMarkDirty();
+    render();
+  }
+
+  function cfgSaveIface() {
+    var cs = S.cfg;
+    if (!cs || !cs.edit || !cs.draft) return;
+    var v = cs.edit.v;
+    v.vpp = cfgVal("if-vpp");
+    v.lcp = cfgVal("if-lcp");
+    v.ip = cfgVal("if-ip");
+    v.prefix_len = Number(cfgVal("if-pfx"));
+    v.vpn = Number(cfgVal("if-vpn"));
+    v.mtu = Number(cfgVal("if-mtu"));
+    v.arp_ignore = cfgVal("if-arp") === "1";
+    v.up = cfgVal("if-up") === "1";
+    if (!v.vpp || !v.lcp) { toast("VPP 口名和内核 TAP 名都要填"); return; }
+    if (!cfgIPv4(v.ip)) { toast("IP 地址不合法：" + (v.ip || "(空)")); return; }
+    if (!(v.prefix_len >= 8 && v.prefix_len <= 30)) { toast("前缀长度需在 8–30 之间"); return; }
+    if (!(v.mtu >= 576 && v.mtu <= 9216)) { toast("MTU 需在 576–9216 之间"); return; }
+    if (!cfgVPNExists(cs.draft, v.vpn)) { toast("VPN " + v.vpn + " 不存在"); return; }
+    if (cs.edit.idx >= 0) cs.draft.ifaces[cs.edit.idx] = v;
+    else cs.draft.ifaces.push(v);
+    cs.edit = null;
+    csMarkDirty();
+    render();
+  }
+
+  function cfgAddStatic() {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    var pfx = cfgVal("st-prefix"), nh = cfgVal("st-nh"), vpn = Number(cfgVal("st-vpn"));
+    if (!/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(pfx)) {
+      toast("目的前缀格式应为 a.b.c.d/len，例如 10.68.99.0/24");
+      return;
+    }
+    if (!cfgIPv4(nh)) { toast("下一跳不是合法 IPv4"); return; }
+    if (!cfgVPNExists(cs.draft, vpn)) { toast("VPN " + vpn + " 不存在"); return; }
+    if (cs.draft.statics.length >= 512) { toast("静态路由最多 512 条"); return; }
+    cs.draft.statics.push({ prefix: pfx, next_hop: nh, vpn: vpn });
+    csMarkDirty();
+    render();
+  }
+
+  function cfgDelStatic(i) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    cs.draft.statics.splice(i, 1);
+    csMarkDirty();
+    render();
+  }
+
+  function cfgAddNeighbor() {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    var vpn = cfgVPNOf(cs.draft, cs.vpn);
+    if (!vpn) return;
+    if (!vpn.bgp.neighbors) vpn.bgp.neighbors = [];
+    var ip = cfgVal("nb-ip"), ras = Number(cfgVal("nb-ras"));
+    if (!cfgIPv4(ip)) { toast("邻居地址不是合法 IPv4"); return; }
+    if (!(ras >= 1 && ras <= 4294967295) || Math.trunc(ras) !== ras) {
+      toast("对端 AS 需在 1–4294967295 之间");
+      return;
+    }
+    if (vpn.bgp.neighbors.some(function (x) { return x.ip === ip; })) {
+      toast("邻居 " + ip + " 已经存在");
+      return;
+    }
+    if (vpn.bgp.neighbors.length >= 64) { toast("一个 VPN 最多 64 个 BGP 邻居"); return; }    var nhs = $("nb-nhs");
+    vpn.bgp.neighbors.push({ ip: ip, remote_as: ras, description: cfgVal("nb-desc"),
+      next_hop_self: !!(nhs && nhs.checked) });
+    csMarkDirty();
+    render();
+  }
+
+  function cfgDelNeighbor(i) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    var vpn = cfgVPNOf(cs.draft, cs.vpn);
+    if (!vpn || !vpn.bgp.neighbors) return;
+    vpn.bgp.neighbors.splice(i, 1);
+    csMarkDirty();
+    render();
+  }
+
+  function cfgSave() {
+    var cs = S.cfg;
+    if (!cs || !cs.view) return;
+    if (!cs.dirty) { toast("没有需要保存的改动"); return; }
+    api("PUT", "/api/config", { node_id: cs.nodeID, config: cs.draft }).then(function (v) {
+      if (S.cfg !== cs) return;
+      var errs = 0;
+      (v.checks || []).forEach(function (x) { if (x.severity === "error") errs++; });
+      cs.view = v;
+      cs.draft = cfgClone(v.config);
+      cs.dirty = false;
+      cs.edit = null;
+      cs.note = { kind: errs ? "warn" : "",
+        text: "已保存草稿 v" + v.version +
+          (errs ? "；仍有 " + errs + " 个错误，下发前需要修正。"
+            : "。保存只写控制器，设备上没有任何变化。") };
+      blurContent();
+      render();
+      toast("草稿已保存 v" + v.version);
+    }).catch(function (err) { toast("保存失败：" + err.message); });
+  }
+
+  function cfgSetPath(el, val) {
+    var cs = S.cfg, cfg = cs.draft;
+    var p = el.getAttribute("data-cfg");
+    if (p === "hostname") { cfg.hostname = val; return; }
+    if (p === "vpn.name") {
+      var v = cfgVPNOf(cfg, Number(el.getAttribute("data-vpn")));
+      if (v) v.name = val;
+      return;
+    }
+    var vpn = cfgVPNOf(cfg, cs.vpn);
+    if (!vpn) return;
+    if (p === "bgp.asn") vpn.bgp.asn = val === "" ? 0 : Number(val);
+    else if (p === "bgp.router_id") vpn.bgp.router_id = val;
+    else if (p === "ospf.router_id") vpn.ospf.router_id = val;
+    else if (p === "ospf.area") vpn.ospf.area = val === "" ? 0 : Number(val);
+  }
+
   function viewAccounts() {
     var h = "";
     if (S.lastSecret) {
@@ -1245,6 +1878,39 @@
         .catch(function (err) { toast(err.message); });
     });
 
+    var cn = $("cfg-node");
+    if (cn) cn.addEventListener("change", function () {
+      blurContent();
+      selectCfgNode(Number(cn.value));
+    });
+    var cv = $("cfg-vpn");
+    if (cv) cv.addEventListener("change", function () {
+      blurContent();
+      if (S.cfg) S.cfg.vpn = Number(cv.value);
+      render();
+    });
+    document.querySelectorAll("#content [data-cfg]").forEach(function (el) {
+      el.addEventListener("input", function () {
+        if (!S.cfg || !S.cfg.draft) return;
+        cfgSetPath(el, el.value);
+        csMarkDirty();
+      });
+    });
+    document.querySelectorAll("#content [data-cfg-bool]").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var cs = S.cfg;
+        if (!cs || !cs.draft) return;
+        var vpn = cfgVPNOf(cs.draft, cs.vpn);
+        if (!vpn) return;
+        var p = el.getAttribute("data-cfg-bool");
+        if (p === "bgp.on") vpn.bgp.on = el.checked;
+        else if (p === "ospf.on") vpn.ospf.on = el.checked;
+        csMarkDirty();
+        blurContent();
+        render();
+      });
+    });
+
     document.querySelectorAll("#content [data-act]").forEach(function (el) {
       el.addEventListener("click", function () {
         var act = el.getAttribute("data-act");
@@ -1255,6 +1921,7 @@
         else if (act === "goto") {
           if (S.view === "enroll") S.codeReveal = null;
           S.view = el.getAttribute("data-view");
+          if (S.view === "config") openConfig();
           render();
         }
         else if (act === "copy") copyText(el.getAttribute("data-text"));
@@ -1310,7 +1977,41 @@
               toast("已重置 " + user + " 的密码");
               load();
             }).catch(function (err) { toast(err.message); });
-        } else if (act === "disable") {
+        } else if (act === "cfg-layer") {
+          if (!S.cfg) return;
+          S.cfg.layer = el.getAttribute("data-layer");
+          S.cfg.edit = null;
+          render();
+        } else if (act === "cfg-save") cfgSave();
+        else if (act === "cfg-reload") {
+          if (!S.cfg) return;
+          if (S.cfg.dirty && !confirm("放弃未保存的改动并重新载入？")) return;
+          S.cfg.view = null;
+          S.cfg.draft = null;
+          S.cfg.dirty = false;
+          S.cfg.edit = null;
+          S.cfg.note = null;
+          render();
+          loadConfig();
+        } else if (act === "cfg-deploy") {
+          if (!S.cfg) return;
+          S.cfg.note = { kind: "warn",
+            text: "下发通道还没有实现：agent 现在只做入网与心跳，不消费这份配置。现在能做的只有保存草稿。" };
+          render();
+        } else if (act === "cfg-note-x") { S.cfg.note = null; render(); }
+        else if (act === "cfg-ptab") { S.cfg.ptab = el.getAttribute("data-ptab"); render(); }
+        else if (act === "cfg-vpn-add") cfgAddVPN();
+        else if (act === "cfg-vpn-del") cfgDelVPN(Number(el.getAttribute("data-id")));
+        else if (act === "cfg-if-add") cfgAddIface();
+        else if (act === "cfg-if-edit") cfgEditIface(Number(el.getAttribute("data-i")));
+        else if (act === "cfg-if-del") cfgDelIface(Number(el.getAttribute("data-i")));
+        else if (act === "cfg-if-cancel") { S.cfg.edit = null; render(); }
+        else if (act === "cfg-if-save") cfgSaveIface();
+        else if (act === "cfg-st-add") cfgAddStatic();
+        else if (act === "cfg-st-del") cfgDelStatic(Number(el.getAttribute("data-i")));
+        else if (act === "cfg-nb-add") cfgAddNeighbor();
+        else if (act === "cfg-nb-del") cfgDelNeighbor(Number(el.getAttribute("data-i")));
+        else if (act === "disable") {
           var name = el.getAttribute("data-user");
           var off = el.getAttribute("data-disabled") === "true";
           if (off && !confirm("禁用账号 " + name + "？该账号会立刻被登出。")) return;
@@ -1331,6 +2032,7 @@
         // 一次性码只在该页面上保留；离开就等于放弃这次查看，要回看只能重新生成。
         if (S.view === "enroll" && v !== "enroll") S.codeReveal = null;
         S.view = v;
+        if (v === "config") openConfig();
         render();
       };
     });

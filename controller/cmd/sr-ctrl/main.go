@@ -227,6 +227,12 @@ type State struct {
 	// operator token from the command line remains a separate break-glass login
 	// and is not stored here -- it is a startup secret, not an account.
 	Accounts map[string]*Account `json:"accounts"`
+
+	// Configs holds each device's customer-side draft, keyed by "tenant|node".
+	// It is configuration, not runtime: unlike telemetry it must survive a
+	// restart, and it is scoped to the tenant that owns the device -- the
+	// operator role never reads it.
+	Configs map[string]*DeviceConfig `json:"configs"`
 }
 
 // Account is one console login. Passwords are stored only as PBKDF2 hashes
@@ -304,6 +310,7 @@ func seedState() *State {
 		Claims:     claimMap{},
 		PKeyRings:  map[string][]wire.PKey{},
 		Accounts:   map[string]*Account{},
+		Configs:    map[string]*DeviceConfig{},
 	}
 	for id, name := range map[string]string{"tenant-a": "演示租户 A", "tenant-b": "演示租户 B"} {
 		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
@@ -343,6 +350,9 @@ func normalizeState(s *State) bool {
 	}
 	if s.Accounts == nil {
 		s.Accounts = map[string]*Account{}
+	}
+	if s.Configs == nil {
+		s.Configs = map[string]*DeviceConfig{}
 	}
 	// A tenant account whose tenant no longer exists authorizes nothing; drop it
 	// rather than leave a login that can only ever see an empty world.
@@ -445,6 +455,21 @@ func normalizeState(s *State) bool {
 			ensureTenant(s, n.TenantID, now)
 		}
 	}
+	// Config drafts are keyed by tenant|node and must stay reachable: repair the
+	// key from the record and drop only entries that name no tenant at all.
+	configs := make(map[string]*DeviceConfig, len(s.Configs))
+	for _, dc := range s.Configs {
+		if dc == nil || dc.TenantID == "" || dc.NodeID == 0 {
+			continue
+		}
+		ensureTenant(s, dc.TenantID, now)
+		normalizeBasicConfig(&dc.Draft)
+		if dc.Version <= 0 {
+			dc.Version = 1
+		}
+		configs[configKey(dc.TenantID, dc.NodeID)] = dc
+	}
+	s.Configs = configs
 	return migrated
 }
 
