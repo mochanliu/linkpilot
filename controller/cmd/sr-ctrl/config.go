@@ -94,9 +94,14 @@ type ConfigStatic struct {
 	VPN     uint32 `json:"vpn"`
 }
 
-// DeviceConfig is the persisted draft for one (tenant, node). It is a DRAFT:
-// there is no delivery channel to the device yet, so nothing here claims the
-// device has it.
+// DeviceConfig is the persisted draft for one (tenant, node) plus, once the
+// tenant publishes it, the frozen bundle the device is told to install.
+//
+// The two are deliberately separate values. A draft is whatever was saved last
+// -- editing after a publish must not silently change what the device is being
+// asked to run, because "the console says v5 and the box installed v5 with
+// different content" is unpublishable evidence. Publishing snapshots the
+// rendered artifacts; saving a new draft only moves Version.
 type DeviceConfig struct {
 	TenantID  string      `json:"tenant_id"`
 	NodeID    uint16      `json:"node_id"`
@@ -104,6 +109,20 @@ type DeviceConfig struct {
 	Version   int         `json:"version"`
 	UpdatedAt int64       `json:"updated_at_unix"`
 	UpdatedBy string      `json:"updated_by,omitempty"`
+
+	Published *PublishedBundle `json:"published,omitempty"`
+}
+
+// PublishedBundle is the snapshot a device is asked to install. Checks travel
+// with it for the same reason they travel in the console bundle: the device's
+// applier refuses a bundle whose checks contain errors, and it must be able to
+// make that decision without asking the controller again.
+type PublishedBundle struct {
+	Version     int             `json:"version"`
+	PublishedAt int64           `json:"published_at_unix"`
+	PublishedBy string          `json:"published_by,omitempty"`
+	Checks      []ConfigCheck   `json:"checks"`
+	Artifacts   configArtifacts `json:"artifacts"`
 }
 
 // ConfigCheck is one server-side validation result. Errors block a future

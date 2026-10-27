@@ -17,6 +17,12 @@
 #
 # 选项：--name <容器名>（默认 sr-lab-vcpe）--ip <管理网地址>（默认 10.99.0.60）
 #       --serial <序列号>（默认容器名）
+#       --apply  让 agent 真的安装控制器发布的配置包（store 与 frr.conf 放在
+#                /var/lib/sdwan 里，FRR 重启用 true 代替；容器需要 NET_ADMIN
+#                才能跑 boot 片段里的 sysctl）。不加这个开关 agent 只心跳，
+#                和控制台里「设备未启用 -apply」一致。
+#       --id <目录>  身份目录（默认 test/lab/run/vcpe-id）。同一台宿主机上跑第二
+#                台时换一个，否则两台会共用同一份身份。
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -31,6 +37,8 @@ NAME=sr-lab-vcpe
 IP=10.99.0.60
 SERIAL=""
 CLAIM=""
+APPLY=""
+IDDIR_OPT=""
 CMD=${1:-up}
 [ $# -gt 0 ] && shift
 
@@ -40,12 +48,14 @@ while [ $# -gt 0 ]; do
         --name)   NAME=${2:-};  shift 2 ;;
         --ip)     IP=${2:-};    shift 2 ;;
         --serial) SERIAL=${2:-}; shift 2 ;;
+        --id)     IDDIR_OPT=${2:-}; shift 2 ;;
+        --apply)  APPLY=1; shift ;;
         -h|--help) awk 'NR>1 { if ($0=="set -u") exit; sub(/^# ?/,""); print }' "$0"; exit 0 ;;
         *) echo "未知参数：$1" >&2; exit 2 ;;
     esac
 done
 [ -n "$SERIAL" ] || SERIAL=$NAME
-IDDIR="${RUN}/vcpe-id"
+IDDIR="${IDDIR_OPT:-${RUN}/vcpe-id}"
 
 die() { echo "[vcpe] $*" >&2; exit 1; }
 say() { printf '\033[1;36m== %s\033[0m\n' "$*"; }
@@ -90,9 +100,17 @@ cmd_up() {
     local claimflag=""
     [ -n "$CLAIM" ] && claimflag="--claim $CLAIM"
 
-    say "启动 vCPE $NAME（$IP，serial=$SERIAL）"
+    # 空数组在 set -u 的 bash 3.2 里展开会报 unbound，所以用普通字符串，
+    # 靠不加引号让 shell 拆成多个参数。
+    local applyflags="" capargs=""
+    if [ -n "$APPLY" ]; then
+        applyflags="--apply -store /var/lib/sdwan/store -frr-conf /var/lib/sdwan/frr.conf -frr-reload true"
+        capargs="--cap-add NET_ADMIN"
+    fi
+
+    say "启动 vCPE $NAME（$IP，serial=$SERIAL${APPLY:+，-apply}）"
     docker run -d --name "$NAME" \
-        --network "$NET" --ip "$IP" \
+        --network "$NET" --ip "$IP" $capargs \
         -v "${ROOT}/controller:/workspace/controller:ro" \
         -v "${IDDIR}:/var/lib/sdwan" \
         "$IMAGE" bash -lc "
@@ -105,7 +123,7 @@ cmd_up() {
                 --ca /var/lib/sdwan/pinned_ca.pem \
                 --id /var/lib/sdwan \
                 --serial ${SERIAL} \
-                --status 127.0.0.1:8089 ${claimflag}
+                --status 127.0.0.1:8089 ${claimflag} ${applyflags}
         " >/dev/null || die "docker run 失败"
 
     local i
@@ -160,6 +178,16 @@ print("  控制器    %s" % d["controller"])
 print("  心跳      %d 次（每 %ds），最后成功 %s" % (d["heartbeats"], d["heartbeat_sec"], d.get("last_ok_unix") or "-"))
 print("  epoch     %s   peers=%s" % (d["epoch"], d["peer_count"]))
 print("  数据面    %s" % d["dataplane"])
+cfg = d.get("config") or {}
+if not cfg.get("capable"):
+    print("  配置      agent 未启用 -apply（不拉取配置）")
+else:
+    line = "v%s" % (cfg.get("version") or 0)
+    if cfg.get("applying"): line += "（正在安装 v%s）" % cfg.get("applying_version")
+    line += " · " + ("最近一次安装成功" if cfg.get("ok") else "没有成功记录")
+    if cfg.get("applied_at_unix"): line += " · %s" % cfg["applied_at_unix"]
+    print("  配置      " + line)
+    if cfg.get("error"): print("  配置错误  %s" % cfg["error"])
 if d.get("last_err"): print("  最近错误  %s" % d["last_err"])'
 }
 

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"sdwan/controller/internal/agent"
+	"sdwan/controller/internal/apply"
 	"sdwan/controller/internal/wire"
 )
 
@@ -42,6 +43,17 @@ func main() {
 		statusAddr = flag.String("status", "127.0.0.1:8089", "local status endpoint (empty disables it)")
 		once    = flag.Bool("once", false, "enroll if needed, send one heartbeat, print status, exit")
 		extraHB = flag.Int("hb", 0, "override the controller's heartbeat interval in seconds (testing only)")
+
+		// Applying configuration needs root, vppctl and FRR, so it is opt-in.
+		// Without -apply the agent still heartbeats and still REPORTS its config
+		// state (which is "capable: false"), because a device that silently
+		// ignores published versions must look different from one that has
+		// nothing to install.
+		applyCfg   = flag.Bool("apply", false, "install the controller's published config (needs root, vppctl, FRR)")
+		storeRoot  = flag.String("store", "/var/lib/sr-cpe", "sr-apply store root (versions/, current, status.json)")
+		vppctl     = flag.String("vppctl", "vppctl", "vppctl binary")
+		frrConf    = flag.String("frr-conf", "/etc/frr/frr.conf", "FRR config path")
+		frrReload  = flag.String("frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
 	)
 	flag.Parse()
 
@@ -117,15 +129,45 @@ func main() {
 		log.Fatalf("client: %v", err)
 	}
 
+	var cfg *configSync
+	if *applyCfg {
+		store := apply.Store{Root: *storeRoot}
+		applier := apply.New(store)
+		applier.VPPCtl = *vppctl
+		applier.FRRConf = *frrConf
+		applier.FRRReload = *frrReload
+		applier.Logf = log.Printf
+		cfg = newConfigSync(id.NodeID(), store, client.ConfigBundle,
+			func(ctx context.Context, b apply.Bundle) error { return applier.Apply(ctx, b, false) },
+			log.Printf, time.Now)
+		if cur := cfg.State(); cur.Version > 0 {
+			log.Printf("config sync on (store %s, running v%d)", *storeRoot, cur.Version)
+		} else {
+			log.Printf("config sync on (store %s, nothing installed yet)", *storeRoot)
+		}
+		st.cfg = cfg
+	}
+
 	if *once {
 		hbctx, hbcancel := context.WithTimeout(ctx, 15*time.Second)
-		resp, err := client.Heartbeat(hbctx, wire.HeartbeatRequest{Uptime: 0})
+		req := wire.HeartbeatRequest{Uptime: 0}
+		req.Config = st.configReport()
+		resp, err := client.Heartbeat(hbctx, req)
 		hbcancel()
 		if err != nil {
 			log.Fatalf("heartbeat: %v", err)
 		}
 		st.markOK(resp)
-		log.Printf("heartbeat ok: epoch=%d peers=%d binding_err=%q", resp.Epoch, resp.PeerCount, resp.BindingErr)
+		log.Printf("heartbeat ok: epoch=%d peers=%d binding_err=%q config_version=%d",
+			resp.Epoch, resp.PeerCount, resp.BindingErr, resp.ConfigVersion)
+		if cfg != nil && resp.ConfigVersion > 0 {
+			actx, acancel := context.WithTimeout(ctx, 5*time.Minute)
+			err := cfg.Sync(actx, resp.ConfigVersion)
+			acancel()
+			if err != nil {
+				log.Fatalf("config v%d: %v", resp.ConfigVersion, err)
+			}
+		}
 		b, _ := json.MarshalIndent(st.snapshot(), "", "  ")
 		fmt.Println(string(b))
 		return
@@ -140,7 +182,9 @@ func main() {
 	backoff := time.Duration(0)
 	for {
 		hbctx, hbcancel := context.WithTimeout(ctx, 10*time.Second)
-		resp, err := client.Heartbeat(hbctx, wire.HeartbeatRequest{Uptime: int64(time.Since(processStart).Seconds())})
+		req := wire.HeartbeatRequest{Uptime: int64(time.Since(processStart).Seconds())}
+		req.Config = st.configReport()
+		resp, err := client.Heartbeat(hbctx, req)
 		hbcancel()
 		if err != nil {
 			st.markErr(err)
@@ -159,6 +203,12 @@ func main() {
 			backoff = 0
 			if resp.BindingErr != "" {
 				log.Printf("controller rejected a key binding: %s", resp.BindingErr)
+			}
+			// Applies run in the background: an apply restarts FRR and can take
+			// tens of seconds, and a device that stops heartbeating while
+			// installing its own config looks offline at the worst moment.
+			if cfg != nil {
+				cfg.Kick(ctx, resp.ConfigVersion)
 			}
 		}
 
@@ -237,6 +287,10 @@ type agentStatus struct {
 	Controller string `json:"controller"`
 	StartedAt  int64  `json:"started_at_unix"`
 
+	// cfg is nil when the agent runs without -apply; the status view then says
+	// capable:false rather than hiding the channel.
+	cfg *configSync
+
 	hbInterval   int
 	Heartbeats   int64  `json:"heartbeats"`
 	LastOK       int64  `json:"last_ok_unix"`
@@ -244,7 +298,6 @@ type agentStatus struct {
 	Epoch        uint32 `json:"epoch"`
 	PeerCount    int    `json:"peer_count"`
 	BindingErr   string `json:"binding_err,omitempty"`
-	DataPlaneRef string `json:"dataplane"`
 }
 
 type statusView struct {
@@ -261,14 +314,16 @@ type statusView struct {
 	PeerCount  int    `json:"peer_count"`
 	BindingErr string `json:"binding_err,omitempty"`
 	DataPlane  string `json:"dataplane"`
+
+	Config *wire.ConfigState `json:"config"`
 }
 
-const noDataPlane = "none: enrollment carries no configuration, so there is nothing to install yet"
+const noDataPlane = "none: enrollment carries no configuration; -apply installs only the customer-side config, tunnels/ports still wait for the underlay plan"
 
 func (s *agentStatus) snapshot() statusView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return statusView{
+	v := statusView{
 		Serial: s.Serial, TenantID: s.TenantID, NodeID: s.NodeID,
 		Controller: s.Controller, StartedAt: s.StartedAt,
 		Heartbeats: s.Heartbeats, HBInterval: s.hbInterval,
@@ -276,6 +331,24 @@ func (s *agentStatus) snapshot() statusView {
 		Epoch: s.Epoch, PeerCount: s.PeerCount, BindingErr: s.BindingErr,
 		DataPlane: noDataPlane,
 	}
+	if s.cfg != nil {
+		cur := s.cfg.State()
+		v.Config = &cur
+	} else {
+		v.Config = &wire.ConfigState{Capable: false}
+	}
+	return v
+}
+
+// configReport is what every heartbeat carries. A device without -apply says
+// "capable:false" rather than staying silent: silence is indistinguishable from
+// an old agent, and the console would have to render it as unknown.
+func (s *agentStatus) configReport() *wire.ConfigState {
+	if s.cfg != nil {
+		cur := s.cfg.State()
+		return &cur
+	}
+	return &wire.ConfigState{Capable: false}
 }
 
 func (s *agentStatus) markOK(resp wire.HeartbeatResponse) {

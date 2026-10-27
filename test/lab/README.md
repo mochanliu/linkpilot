@@ -21,11 +21,15 @@ sr-fib / sr-frr 把两套路由体系接起来。FRR 和 VPP 的接缝是 VPP �
   FRR 装内核主表（下一跳 = 客户路由器、出口 = `lcp-x0`），linux-nl 镜像成
   VPP table 0 里「via <客户路由器> <客户口>」。
 
-**控制器只做入网，不做下发。** 2026-10-26 起控制器增量按用户逐项批准推进，
-但 lab 的规矩没变：凡是由控制器下发的值（每隧道 UDP 端口、overlay /32、隧道
-计划、VRF/RT、FRR 旁路表号）仍然在 [bringup.sh](bringup.sh) 里手写。
-sr-ctrl 现在有两件事——签发设备证书（`/v1/*`，mTLS :8444，设备用）和给客户
-看的控制台（明文 :8080，浏览器用）；入网应答只有身份，没有任何配置。
+**控制器管入网和客户侧基础配置，不管数据面计划。** 2026-10-26 起控制器增量
+按用户逐项批准推进。sr-ctrl 现在有三件事——签发设备证书（`/v1/*`，mTLS
+:8444，设备用）、给客户看的控制台（明文 :8080，浏览器用）、把租户「发布」
+的基础配置交给设备拉取（`/v1/config/bundle`，同一个 mTLS 面，见「配置发布与
+设备拉取」）。入网应答仍然只有身份。
+
+lab 的规矩没变：凡是由控制器下发的**数据面**值（每隧道 UDP 端口、overlay
+/32、隧道计划、VRF/RT、FRR 旁路表号）仍然在 [bringup.sh](bringup.sh) 里手写；
+推送通道目前只搬租户草稿渲染出的三个片段（FRR / VPP / 开机脚本），不碰隧道。
 
 ## 拓扑
 
@@ -157,15 +161,21 @@ test/lab/console.sh restart    # 重启 sr-ctrl（控制台 + 设备面同一个
 
 # 运营方建租户后会下发授权和一个租户账号；客户登录后点「生成」拿码，然后：
 test/lab/vcpe.sh up --claim <入网码>   # 起一台只做入网+心跳的 vCPE（10.99.0.60）
-test/lab/vcpe.sh status               # 本地身份：tenant / node_id / 心跳次数
+test/lab/vcpe.sh up --claim <入网码> --apply \
+                    --serial <序列号> --id <身份目录>   # 会拉取并安装发布配置的 vCPE
+test/lab/vcpe.sh status               # 本地身份：tenant / node_id / 心跳次数 / 配置状态
 test/lab/vcpe.sh logs                 # agent 日志
 test/lab/vcpe.sh down                 # 停容器，身份目录保留（下次 up 不用 claim）
 test/lab/vcpe.sh wipe                 # 连身份一起删（下次必须重新入网）
 ```
 
-vCPE 跑的是 `controller/cmd/sr-agent`：入网一次、然后每 5 秒心跳，数据面
-状态直接写 "none: enrollment carries no configuration"。它和 `lab-cpeN` 的区别
-只是没有 VPP —— 盒子里的 agent 以后会在这里接数据面。
+`--apply` 让 agent 以 root + NET_ADMIN 运行（boot 片段里有 sysctl），store 和
+frr.conf 放在容器 `/var/lib/sdwan` 下，FRR 重启用 `-frr-reload true`。同一台
+宿主机跑第二台 vCPE 时必须换 `--id`，否则两台共用一份身份、互相踢下线。
+
+vCPE 跑的是 `controller/cmd/sr-agent`：入网一次、然后每 5 秒心跳。不加
+`--apply` 时它仍会心跳并**如实上报 `capable:false`**（控制台因此能写「设备未
+启用 -apply」，而不是猜）；加了才拉取发布版本、调 `internal/apply` 安装。
 
 运营令牌是 break-glass：长期运行的生产控制器应该用 operator 账号（口令可改、
 可禁用），令牌只留给"账号进不去"的场合。令牌落在
@@ -223,9 +233,9 @@ TAP 入 VRF 与 sysctl。zebra/staticd 写进内核的路由会被 linux-nl 镜�
 两个方向都通，所以接口地址不在 VPP 片段里重复配置。页面「配置包内容」的
 三个产物（FRR / VPP / 开机脚本）就是这三份内容。
 
-**推送通道仍然没有**：agent 现在只做入网与心跳，不消费这份配置。配置页的
-按钮是「下载配置包」而不是「下发」——它只从控制器取文件，设备上什么都不会
-发生；要生效必须到设备侧执行 `sr-apply`，见下一节。
+**推送通道**：页面顶部的「发布到设备」把当前草稿冻结成设备要跑的版本（见
+下一节）；「下载配置包」仍是手工路径，两者并存。没发布过的草稿只存在于
+控制器里，设备上什么都不会发生。
 
 ## 设备侧：配置包安装与开机重放（#88）
 
@@ -283,7 +293,67 @@ MTU 1400、pair、`lcp-sync on`、两个 TAP 与 sysctl 都恢复，随后启动
 不会覆盖 `/etc/frr/frr.conf`。也就是说：自动推送还没做，而多 VPN 的真机路径
 （内核 VRF 设备 + 入 VRF + FRR vrf 段）需要在有 `vrf` 模块的宿主上再验一次。
 
-现阶段的设备仍然按手工配置运行。
+lab 的三台 `lab-cpeN` 仍然按 [bringup.sh](bringup.sh) 手写的数据面计划运行——
+推送通道搬的是客户侧基础配置，不碰隧道、端口和 VRF。
+
+## 配置发布与设备拉取（推送通道，2026-10-28）
+
+方向是设计本身：控制器**从不主动拨盒子**（CPE 在 NAT 后面，拨不到）。租户在
+控制台点「发布到设备」，控制器把当前草稿冻结成一份快照；之后每次心跳里带
+`config_version`，设备发现和自己跑的不一样，就用既有的 mTLS 身份去
+`GET /v1/config/bundle` 把包拉回来，交给 `internal/apply` 安装。入网、心跳、
+拉配置走同一个 `:8444` 面，没有第二种传输。
+
+**发布 = 冻结**。`DeviceConfig` 里草稿和 `Published` 快照是两个值：发布把
+渲染好的三个片段（FRR / VPP / boot）和 `checks` 一起存进 `Published`；之后
+再保存草稿只会推高 `version`，不会改动设备被要求运行的内容。重新发布同一
+版本是 no-op，不刷时间戳。
+
+**发布闸门**（服务端，租户专用，operator 403）：
+
+| 情况 | 结果 |
+| --- | --- |
+| 草稿还是 v0（从未保存） | 409，没有可发的配置 |
+| 草稿有任何 `error` 级校验 | 409，报文里带第一条错误；先改掉 |
+| 同版本重复发布 | 200，快照不变 |
+| 跨租户 / 不存在的节点 | 404 |
+
+强制下发**不在页面上**：`--force` 只在设备侧 `sr-apply apply --force`，因为
+控制台代表租户说话，不代替盒子前的操作员。设备拉包端点也只认证书身份：
+没有 node 参数，`GET /v1/config/bundle` 的租户/节点来自客户端证书；节点不
+存在 404，从未发布 409（节点是已知的，只是没东西可装）。
+
+**设备侧**（`sr-agent -apply`，opt-in）：`configSync` 持有三件控制器不该猜的
+事实——装的是哪版（store 的 `current`）、上次装成功没有（`status.json`，
+applier 自己写的）、有没有一次安装在飞。心跳原样上报这些；安装异步进行
+（5 分钟超时），失败按 5s→5m 指数退避重试，绝不阻塞心跳——安装会重启 FRR，
+正在变更的盒子在这时看起来掉线是最糟的。网络路径上永远
+`allowBlocking=false`：控制器已经拒绝过带错误的草稿，漏网的包由 applier 拒；
+包里的 `node_id` 不是本机就拒装。不加 `-apply` 的 agent 上报
+`capable:false`（不是沉默，也不是 v0）。
+
+**控制台不替设备猜。** 配置页顶部的下发面板只有两个来源：控制器记录的发布、
+设备心跳的回报。标签从「尚未发布 / 等待设备回报 / 设备未启用 -apply / 设备
+安装中 vN / 设备已装 vN / 设备 vN（比已发布的新）/ 设备仍是 vN」里选，设备
+没回报就写「未上报」；底部固定一句「发布不等于已生效」。SSE 的
+`node.config` / `config.published` 会刷新面板，但草稿有未保存改动时不覆盖。
+
+**实测**（2026-10-28，租户 push-e2e）：
+
+- 节点 1（`sr-lab-vcpe2`，10.99.0.61，`--apply`）：发布 v1、v2 后设备在下一
+  次心跳（5 秒内）拉取并安装；保存草稿 v2、只发布到 v1 时设备**停在 v1**
+  （冻结语义）；草稿 v3 带校验错误，发布 409，设备停在 v2；再发布 v4、v5
+  都装上了。页面上 SSE 在安装完成后约 1.2 秒把面板从 v4 刷到 v5。
+- 节点 2（`sr-lab-vcpe3`，10.99.0.62，不带 `--apply`）：心跳持续，面板写
+  「agent 没有启用 -apply：它不会拉取配置」，而不是假装它落后。
+- 设备落盘：`/var/lib/sdwan/store/versions/N/{manifest.json,frr.conf,vpp.conf,
+  boot.sh}`、`current → versions/N`、`status.json`；`/var/lib/sdwan/frr.conf`
+  是安装后 FRR 实际读的那份。agent 日志逐次打印
+  `applying config vN … installed version … frr reloaded … config vN applied`。
+
+目前**没有回滚**：发布新版本不会保留「失败自动退回」的路径，失败就停在
+`status.ok=false` 和明确错误上，等人处理。多 VPN 的包会卡在内核 VRF 一段
+（本 lab 内核没有 `vrf` 模块），这是环境限制，不是通道行为。
 
 分阶段调试（阶段之间可反复重跑，配置是幂等的）：
 
@@ -368,7 +438,7 @@ docker exec lab-cpe1 vppctl show trace
 | [Dockerfile](Dockerfile) | 在 srwg-dev 上装 FRR 10.7.1，做 `srwg-lab:latest` |
 | [bringup.sh](bringup.sh) | 分阶段搭建；所有"控制器下发值"手写在这里 |
 | [console.sh](console.sh) | 控制台地址/登录 token；重启 sr-ctrl |
-| [vcpe.sh](vcpe.sh) | 起停一台只做入网+心跳的 vCPE（容器 `sr-lab-vcpe`） |
+| [vcpe.sh](vcpe.sh) | 起停一台 vCPE（`sr-lab-vcpe`）；`--apply` 拉取发布配置，`--id` 换身份目录 |
 | [verify.sh](verify.sh) | 从容器/VPP 一直到终端到终端、双向导入的 290+ 条断言 |
 | [status.sh](status.sh) | 只读状态快照 |
 | [teardown.sh](teardown.sh) | 拆除 |

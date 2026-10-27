@@ -176,6 +176,38 @@ func (c *Client) ReportMetrics(ctx context.Context, req wire.MetricsReport) erro
 	return c.post(ctx, "/v1/metrics", req, nil)
 }
 
+// maxBundleBytes bounds what one response may hold. A bundle is a few KB of
+// text; this exists so a broken or hostile controller cannot make the box
+// allocate without limit, not because real bundles approach it.
+const maxBundleBytes = 4 << 20
+
+// ConfigBundle 拉取控制器为这台设备发布的配置包，原样返回字节。
+//
+// 解码交给调用方用 apply.DecodeBundle —— 与设备侧 CLI 同一个解析器：
+// 两种解析器是"同一份 JSON 被两边读出不同含义"的经典入口。
+func (c *Client) ConfigBundle(ctx context.Context) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/config/bundle", nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := c.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("agent: 拉取配置包: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, &Error{Status: res.StatusCode, Path: "/v1/config/bundle", Detail: readDetail(res.Body)}
+	}
+	raw, err := io.ReadAll(io.LimitReader(res.Body, maxBundleBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("agent: 读配置包: %w", err)
+	}
+	if len(raw) > maxBundleBytes {
+		return nil, fmt.Errorf("agent: 配置包超过 %d 字节，拒绝", maxBundleBytes)
+	}
+	return raw, nil
+}
+
 // RegistryView 是 /v1/registry 的一次快照（也是仪表盘拓扑页读的同一份）。
 type RegistryView struct {
 	TenantID string          `json:"tenant_id"`

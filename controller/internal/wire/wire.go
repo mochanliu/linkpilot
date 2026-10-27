@@ -384,6 +384,34 @@ type MappingReport struct {
 	Tunnels *[]TunnelEndpoint `json:"tunnels,omitempty"`
 }
 
+// ------------------------------------------------------- customer-side config
+
+// ConfigState is the DEVICE's own account of the customer-side configuration it
+// runs. Every field is a claim by the device, and the controller must never
+// derive "applied" from "published": those are two different facts, and a
+// console that conflates them reports a change as done the moment someone
+// clicked a button.
+//
+// Capable is the honest way to say "this agent was not started with -apply, so
+// it will never install anything". Without it the controller could not tell a
+// v0 device that ignores the channel from a healthy device that simply has
+// nothing to install.
+type ConfigState struct {
+	Capable bool `json:"capable"`
+	// Version is the version installed on disk (the store's current pointer),
+	// not the version that was attempted last.
+	Version int `json:"version,omitempty"`
+	// Applying is true while an apply is in flight; ApplyingVersion is what it
+	// is trying to reach. Reported so the page can say "正在应用 v4" instead of
+	// showing a stale version with no explanation.
+	Applying        bool   `json:"applying,omitempty"`
+	ApplyingVersion int    `json:"applying_version,omitempty"`
+	OK              bool   `json:"ok,omitempty"`              // last apply/boot succeeded
+	AppliedAt       int64  `json:"applied_at_unix,omitempty"` // when that attempt ran
+	Source          string `json:"source,omitempty"`          // apply | boot
+	Error           string `json:"error,omitempty"`
+}
+
 // Heartbeat is the liveness + re-registration signal. It carries the
 // mapping again because a NAT rebinding must be able to travel on the
 // heartbeat path alone (no separate re-registration round trip).
@@ -392,6 +420,10 @@ type HeartbeatRequest struct {
 	UDPMapping string              `json:"udp_mapping"`
 	Uptime     int64               `json:"uptime_sec"`
 	Binding    *keybinding.Binding `json:"key_binding,omitempty"`
+	// Config is what this device runs right now. nil means "this agent does not
+	// implement the config channel" (an older binary), which the controller must
+	// not confuse with Capable=false ("newer binary, started without -apply").
+	Config *ConfigState `json:"config,omitempty"`
 }
 
 // HeartbeatResponse returns the controller-assigned epoch and the current
@@ -407,6 +439,12 @@ type HeartbeatResponse struct {
 	// peer for it, so the agent must surface this loudly rather than leaving
 	// "tunnel is up but no traffic" unexplained.
 	BindingErr string `json:"binding_err,omitempty"`
+	// ConfigVersion is the customer-side version the tenant has PUBLISHED for
+	// this device; 0 means nothing was ever published. The device pulls the
+	// bundle over /v1/config/bundle when this differs from what it runs, which
+	// is what makes the channel work behind NAT: the controller never dials the
+	// box.
+	ConfigVersion int `json:"config_version,omitempty"`
 }
 
 // ------------------------------------------------------------------ rendezvous

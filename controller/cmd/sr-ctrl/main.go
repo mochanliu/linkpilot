@@ -118,6 +118,12 @@ type NodeRecord struct {
 	// identity key.
 	Binding *keybinding.Binding `json:"key_binding,omitempty"`
 	KeyGen  uint32              `json:"key_gen,omitempty"`
+
+	// Config is the device's own report of the customer-side configuration it
+	// runs (see wire.ConfigState). It is PERSISTED, unlike telemetry: "this box
+	// is on v7" is still true after a controller restart and while the box is
+	// offline, and the console must be able to show the last thing it said.
+	Config *wire.ConfigState `json:"config_state,omitempty"`
 }
 
 // Tenant is the customer account a device belongs to. Tenants are created in
@@ -955,6 +961,16 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		bindingErr = err.Error()
 		log.Printf("binding REJECTED tenant=%s node=%d: %v", tenant, nodeID, err)
 	}
+	// The device's account of what it runs. Stored as reported: the controller
+	// does not infer "applied" from "published", and an absent Config (an older
+	// agent) must not be turned into capable=false here -- that would accuse a
+	// device of ignoring a channel it does not implement.
+	configChanged := false
+	if req.Config != nil && (rec.Config == nil || *rec.Config != *req.Config) {
+		st := *req.Config
+		rec.Config = &st
+		configChanged = true
+	}
 	s.save()
 
 	// Coming back from stale, or offering key material peers have not seen, are
@@ -966,10 +982,15 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// Console-facing: the device table's online/stale column just flipped.
 		s.admin.publish("node.online", rec.TenantID, rec)
 	}
+	if configChanged {
+		// Console-facing: the config page's applied/failed/applying column moved.
+		s.admin.publish("node.config", rec.TenantID, rec)
+	}
 	json.NewEncoder(w).Encode(wire.HeartbeatResponse{
-		Epoch:      s.advanceEpoch(),
-		PeerCount:  len(s.peersLocked(tenant, nodeID)),
-		BindingErr: bindingErr,
+		Epoch:         s.advanceEpoch(),
+		PeerCount:     len(s.peersLocked(tenant, nodeID)),
+		BindingErr:    bindingErr,
+		ConfigVersion: s.desiredConfigVersionLocked(tenant, nodeID),
 	})
 }
 
@@ -1842,6 +1863,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/enroll", s.handleEnroll)
 	mux.HandleFunc("/v1/heartbeat", s.handleHeartbeat)
+	mux.HandleFunc("/v1/config/bundle", s.handleConfigBundle)
 	mux.HandleFunc("/v1/mapping", s.handleMapping)
 	mux.HandleFunc("/v1/observe", s.handleObserve)
 	mux.HandleFunc("/v1/metrics", s.handleMetrics)

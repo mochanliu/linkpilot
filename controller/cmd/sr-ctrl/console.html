@@ -514,15 +514,20 @@
         $("live-dot").className = "dot ok";
         $("live-text").textContent = "实时";
       });
-      ["node.online", "node.enrolled", "node.stale", "tenant.created", "claim.created", "claim.revoked", "claim.updated"].forEach(function (n) {
+      ["node.online", "node.enrolled", "node.stale", "node.config", "config.published", "tenant.created", "claim.created", "claim.revoked", "claim.updated"].forEach(function (n) {
         S.es.addEventListener(n, function (e) {
           var ev = {};
           try { ev = JSON.parse(e.data); } catch (_) {}
           load();
           if (S.view === "monitor") loadMetrics();
+          // The config page shows published vs applied, so a device report or a
+          // publish must reach it. A dirty draft still wins: reloading would
+          // throw away what the tenant is typing, and "重新载入" is right there.
+          if (S.view === "config" && S.cfg && S.cfg.view && !S.cfg.dirty) loadConfig();
           if (n === "node.enrolled") toast("设备已入网，正在等待第一个心跳");
           if (n === "node.online") toast("设备上线");
           if (n === "node.stale") toast("设备失联：心跳超时");
+          if (n === "config.published") toast("配置已发布，等待设备下一次心跳拉取");
           if (n === "claim.created" || n === "tenant.created") toast(n === "tenant.created" ? "租户已创建" : "已下发新的入网授权");
         });
       });
@@ -547,7 +552,7 @@
     overview: {
       title: "概览",
       sub: "运营侧重归属与库存；设备配置属于租户，不在这里展示",
-      tenantSub: "你的设备与入网入口；配置尚未下发，所以设备处于「未配置」"
+      tenantSub: "你的设备与入网入口；基础配置在「配置」页发布后由设备自己拉取，隧道参数（节点计划）仍未实现"
     },
     tenants: { title: "租户", sub: "租户是设备归属的唯一依据，只有控制台能创建", roles: ["operator"] },
     accounts: { title: "账号", sub: "登录控制台的账号；角色决定能看到什么、能改什么", roles: ["operator"] },
@@ -559,11 +564,11 @@
     nodes: {
       title: "设备",
       sub: "运营方只看库存（谁、序列号、入网时间、在线状态）",
-      tenantSub: "你的设备；入网只建立归属，基础配置可下载配置包后手工安装，隧道 / 端口 / overlay 仍未实现"
+      tenantSub: "你的设备；入网只建立归属，基础配置可在「配置」页发布到设备（agent 需 -apply）或下载配置包手工安装，隧道 / 端口 / overlay 仍未实现"
     },
     config: {
       title: "配置",
-      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。这一轮只做基础配置：草稿保存在控制器，下发靠下载配置包后手工安装",
+      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。这一轮只做基础配置：草稿保存在控制器，点「发布到设备」后设备在下一次心跳拉取并安装（agent 需 -apply）；也可以下载配置包手工安装",
       roles: ["tenant"]
     },
     monitor: {
@@ -1193,6 +1198,7 @@
     }
     var h = cfgBar(st, cs);
     if (cs.note) h += cfgNote(cs.note);
+    h += cfgDeliveryPanel(cs);
     if (cs.layer !== "base") return h + cfgBoundary(cs.layer);
     if (!cs.view) {
       return h + '<section class="panel"><div class="empty">' +
@@ -1213,9 +1219,10 @@
       '<span style="flex:1"></span>' +
       '<button class="small" data-act="cfg-reload">重新载入</button>' +
       '<button class="small" data-act="cfg-bundle">下载配置包</button>' +
-      '<button class="small primary" data-act="cfg-save">保存草稿</button>' +
+      '<button class="small" data-act="cfg-save">保存草稿</button>' +
+      '<button class="small primary" data-act="cfg-publish">发布到设备</button>' +
       "</div>" + cfgTabs(cs) +
-      '<div class="hint" style="margin:0">保存与下载都只动控制器；设备侧要执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 才会生效，控制器还不能自动推送。' +
+      '<div class="hint" style="margin:0">保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在 -apply 模式下于下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。' +
       "VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 / 1250 被 overlay 占用。</div>" +
       "</section>";
   }
@@ -1255,6 +1262,67 @@
       '<ul class="bnd">' + items.map(function (x) {
         return "<li><b>" + esc(x[0]) + "</b> · " + esc(x[1]) + "</li>";
       }).join("") + "</ul></section>";
+  }
+
+  // Two different facts, never merged: what the tenant told the device to run
+  // (published_version, held by the controller) and what the device says it is
+  // running (device_state, from the device's own heartbeat). A published
+  // version the device has not confirmed is shown as waiting, not as applied.
+  function cfgDeliveryPanel(cs) {
+    var v = cs.view;
+    if (!v) return "";
+    var d = v.device_state || null;
+    var pub = v.published_version || 0;
+    var hb = (S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30;
+
+    var tag = '<span class="tag pending">尚未发布</span>';
+    if (pub && !d) tag = '<span class="tag pending">等待设备回报</span>';
+    else if (pub && d && !d.capable) tag = '<span class="tag stale">设备未启用 -apply</span>';
+    else if (pub && d && d.applying) tag = '<span class="tag plan">设备安装中 v' + esc(d.applying_version) + "</span>";
+    else if (pub && d && d.version === pub && d.ok) tag = '<span class="tag online">设备已装 v' + esc(pub) + "</span>";
+    else if (pub && d && d.version > pub) tag = '<span class="tag plan">设备 v' + esc(d.version) + "（比已发布的新）</span>";
+    else if (pub && d) tag = '<span class="tag stale">设备仍是 v' + esc(d.version || 0) + "</span>";
+
+    var rows = [];
+    rows.push("<tr><th>期望版本</th><td>" + (pub
+      ? '<span class="mono">v' + esc(pub) + "</span> · 发布于 " + esc(clock(v.published_at_unix)) +
+        (v.published_by ? " · " + esc(v.published_by) : "")
+      : "尚未发布" + (v.version ? "（草稿 v" + esc(v.version) + " 只保存在控制器）" : "")) + "</td></tr>");
+
+    var note = "";
+    if (!d) {
+      rows.push('<tr><th>设备回报</th><td class="muted">还没有上报配置状态：agent 没有带 <code>-apply</code> 启动，或者还没有发过心跳。</td></tr>');
+    } else if (!d.capable) {
+      rows.push('<tr><th>设备回报</th><td class="muted">agent 没有启用 <code>-apply</code>：它不会拉取配置，版本只能靠下载配置包后手工安装。</td></tr>');
+    } else {
+      var line = d.version ? '<span class="mono">v' + esc(d.version) + "</span>" : "没有安装过";
+      if (d.applying) line += ' · <span class="tag plan">正在安装 v' + esc(d.applying_version) + "</span>";
+      else if (d.ok) line += ' · <span class="tag online">最近一次安装成功</span>';
+      else if (d.error) line += ' · <span class="tag revoked">最近一次安装失败</span>';
+      rows.push("<tr><th>设备已装</th><td>" + line + "</td></tr>");
+      if (d.applied_at_unix) {
+        rows.push("<tr><th>最近一次应用</th><td>" + esc(clock(d.applied_at_unix)) + " · " +
+          (d.source === "boot" ? "开机重放" : d.source === "apply" ? "心跳下发安装" : esc(d.source || "来源未知")) +
+          " · " + esc(ago(d.applied_at_unix)) + "</td></tr>");
+      }
+      if (d.error) rows.push('<tr><th>设备错误</th><td style="color:var(--bad)">' + esc(d.error) + "</td></tr>");
+
+      if (pub && !d.applying) {
+        if (d.version < pub) {
+          note = "设备运行 v" + d.version + "，已发布 v" + pub + "：下一次心跳（≤" + hb +
+            " 秒）会拉取并安装" + (d.error ? "（上一条错误来自上一次尝试）" : "") + "；设备离线时不会发生。";
+        } else if (d.version > pub) {
+          note = "设备运行的 v" + d.version + " 比已发布的 v" + pub +
+            " 新：可能有人在设备上手工装过。控制器不会把它改回去，除非你再次发布。";
+        }
+      }
+    }
+
+    return '<section class="panel"><header><h2>下发到设备</h2>' + tag + "</header>" +
+      '<table><tbody>' + rows.join("") + "</tbody></table>" +
+      (note ? '<div class="hint" style="margin:10px 0 0">' + esc(note) + "</div>" : "") +
+      '<div class="hint" style="margin:6px 0 0">发布不等于已生效：这张表只有两个来源——控制器记录的发布、设备心跳的回报。设备没有回报就写「未上报」，不会替它猜。</div>' +
+      "</section>";
   }
 
   function cfgBase(cs) {
@@ -1515,6 +1583,50 @@
     toast(ok ? "已复制配置包 JSON" : "已全选，按 ⌘C / Ctrl+C 复制");
   }
 
+  // Publishing is the tenant saying "make the device run this". The console
+  // refuses what the device would refuse anyway (v0, blocking errors) and keeps
+  // no force switch: force lives on the box's CLI, where someone can see it.
+  function cfgPublish() {
+    var cs = S.cfg;
+    if (!cs || !cs.view) return;
+    var v = cs.view;
+    if (cs.dirty) {
+      cs.note = { kind: "warn", text: "有未保存的改动。发布的是已保存的草稿，先点「保存草稿」。" };
+      render();
+      return;
+    }
+    if (!v.version) {
+      cs.note = { kind: "warn", text: "这台设备还没有保存过草稿（v0），没有可发布的配置。" };
+      render();
+      return;
+    }
+    var errs = 0;
+    (v.checks || []).forEach(function (x) { if (x.severity === "error") errs++; });
+    if (errs) {
+      cs.note = { kind: "bad", text: "草稿 v" + v.version + " 有 " + errs + " 个校验错误，设备会拒绝安装，所以这里不允许发布。改到没有错误再发；确实要强推只能在设备上执行 sr-apply apply --force。" };
+      render();
+      return;
+    }
+    if (!confirm("发布 v" + v.version + " 到 node-" + cs.nodeID + "？\n\n设备下一次心跳会拉取并安装，安装会重启 FRR。发布之后继续改草稿不影响设备，直到你再次发布。")) return;
+    var prev = v.published_version || 0;
+    api("POST", "/api/config/publish", { node_id: cs.nodeID }).then(function (nv) {
+      if (S.cfg !== cs) return;
+      cs.view = nv;
+      cs.draft = cfgClone(nv.config);
+      cs.dirty = false;
+      cs.edit = null;
+      cs.bundle = null;
+      var changed = (nv.published_version || 0) !== prev;
+      var hb = (S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30;
+      cs.note = changed
+        ? { kind: "", text: "已发布 v" + nv.published_version + "：设备在下一次心跳（≤" + hb + " 秒）拉取并安装，结果以设备回报为准（见「下发到设备」）。" }
+        : { kind: "", text: "v" + nv.published_version + " 这次发布没有变化。" };
+      blurContent();
+      render();
+      toast(changed ? "已发布 v" + nv.published_version : "没有变化");
+    }).catch(function (err) { toast("发布失败：" + err.message); });
+  }
+
   function cfgAddVPN() {
     var cs = S.cfg;
     if (!cs || !cs.draft) return;
@@ -1678,8 +1790,8 @@
       cs.bundle = null;
       cs.note = { kind: errs ? "warn" : "",
         text: "已保存草稿 v" + v.version +
-          (errs ? "；仍有 " + errs + " 个错误，下载后设备会拒绝安装（除非 --force）。"
-            : "。要让它生效，点「下载配置包」拿到文件，再到设备上安装。") };
+          (errs ? "；仍有 " + errs + " 个错误，设备会拒绝安装，因此也不能发布（除非在设备上用 --force）。"
+            : "。要让它生效，点「发布到设备」（设备需以 -apply 启动），或下载配置包手工安装。") };
       blurContent();
       render();
       toast("草稿已保存 v" + v.version);
@@ -2067,6 +2179,7 @@
           S.cfg.edit = null;
           render();
         } else if (act === "cfg-save") cfgSave();
+        else if (act === "cfg-publish") cfgPublish();
         else if (act === "cfg-reload") {
           if (!S.cfg) return;
           if (S.cfg.dirty && !confirm("放弃未保存的改动并重新载入？")) return;

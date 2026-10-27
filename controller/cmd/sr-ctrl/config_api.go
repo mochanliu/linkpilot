@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sdwan/controller/internal/wire"
 )
 
 type configView struct {
@@ -17,6 +19,14 @@ type configView struct {
 	Version   int             `json:"version"`
 	UpdatedAt int64           `json:"updated_at_unix"`
 	UpdatedBy string          `json:"updated_by,omitempty"`
+
+	// Published is what the device has been TOLD to install; Version above is
+	// only what was saved. They differ whenever a tenant edits after publishing,
+	// and the page must show both rather than assuming the newest draft won.
+	PublishedVersion int              `json:"published_version,omitempty"`
+	PublishedAt      int64            `json:"published_at_unix,omitempty"`
+	PublishedBy      string           `json:"published_by,omitempty"`
+	Device           *wire.ConfigState `json:"device_state,omitempty"`
 }
 
 func buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
@@ -27,7 +37,13 @@ func buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
 		v.Version = dc.Version
 		v.UpdatedAt = dc.UpdatedAt
 		v.UpdatedBy = dc.UpdatedBy
+		if dc.Published != nil {
+			v.PublishedVersion = dc.Published.Version
+			v.PublishedAt = dc.Published.PublishedAt
+			v.PublishedBy = dc.Published.PublishedBy
+		}
 	}
+	v.Device = n.Config
 	normalizeBasicConfig(&cfg)
 	v.Config = cfg
 	v.Checks = validateBasicConfig(&cfg)
