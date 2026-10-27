@@ -232,7 +232,7 @@ TAP 入 VRF 与 sysctl。zebra/staticd 写进内核的路由会被 linux-nl 镜�
 `boot` 三个片段和 `checks`）：
 
 ```bash
-curl -s -b "sr_session=<租户会话>" \
+curl -s -b "sr_ctrl_session=<租户会话>" \
      'http://127.0.0.1:8088/api/config/bundle?node=1' > bundle.json
 ```
 
