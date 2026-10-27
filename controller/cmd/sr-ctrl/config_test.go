@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"sdwan/controller/internal/apply"
 )
 
 func hasCheck(checks []ConfigCheck, severity, substr string) bool {
@@ -367,5 +370,95 @@ func TestConfigAPI(t *testing.T) {
 	}
 	if rec := configRequest(t, s, ten, http.MethodPost, "/api/config", "{}"); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST = %d, want 405", rec.Code)
+	}
+}
+
+func bundleRequest(t *testing.T, s *server, sid, method, target string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(method, target, nil)
+	// The session gate answers 415 to a POST without JSON before the handler
+	// can refuse the method, so send a body-looking request to reach it.
+	if method != http.MethodGet {
+		r.Header.Set("Content-Type", "application/json")
+	}
+	if sid != "" {
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sid})
+	}
+	rec := httptest.NewRecorder()
+	s.handleAdminConfigBundle(rec, r)
+	return rec
+}
+
+// The bundle is the contract with cmd/sr-apply: decode it with the real
+// applier type, not with a hand-written local struct.
+func TestConfigBundleAPI(t *testing.T) {
+	s := newTestServer()
+	s.store = &fileStore{path: filepath.Join(t.TempDir(), "state.json")}
+	s.state.Configs = map[string]*DeviceConfig{}
+	addNode(s, "t", 1, nil, "")
+	addNode(s, "t2", 2, nil, "")
+
+	if rec := bundleRequest(t, s, "", http.MethodGet, "/api/config/bundle?node=1"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated = %d, want 401", rec.Code)
+	}
+	op := consoleSession(t, s, consoleIdentity{Role: roleOperator, Username: "op", Via: "password"})
+	if rec := bundleRequest(t, s, op, http.MethodGet, "/api/config/bundle?node=1"); rec.Code != http.StatusForbidden {
+		t.Fatalf("operator = %d, want 403", rec.Code)
+	}
+	ten := consoleSession(t, s, consoleIdentity{Role: roleTenant, TenantID: "t", Username: "alice", Via: "password"})
+	other := consoleSession(t, s, consoleIdentity{Role: roleTenant, TenantID: "t2", Username: "bob", Via: "password"})
+	if rec := bundleRequest(t, s, other, http.MethodGet, "/api/config/bundle?node=1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant = %d, want 404", rec.Code)
+	}
+	if rec := bundleRequest(t, s, ten, http.MethodGet, "/api/config/bundle?node=1"); rec.Code != http.StatusConflict {
+		t.Fatalf("unsaved node = %d, want 409", rec.Code)
+	}
+	if rec := bundleRequest(t, s, ten, http.MethodGet, "/api/config/bundle?node=0"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("node 0 = %d, want 400", rec.Code)
+	}
+	if rec := bundleRequest(t, s, ten, http.MethodPost, "/api/config/bundle?node=1"); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST = %d, want 405", rec.Code)
+	}
+
+	body, _ := json.Marshal(saveConfigRequest{NodeID: 1, Config: baseValidConfig()})
+	if rec := configRequest(t, s, ten, http.MethodPut, "/api/config", string(body)); rec.Code != http.StatusOK {
+		t.Fatalf("save = %d, %s", rec.Code, rec.Body.String())
+	}
+	rec := bundleRequest(t, s, ten, http.MethodGet, "/api/config/bundle?node=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bundle = %d, %s", rec.Code, rec.Body.String())
+	}
+	b, err := apply.DecodeBundle(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("bundle does not decode as apply.Bundle: %v", err)
+	}
+	if b.Version != 1 || b.NodeID != 1 || b.GeneratedAt == 0 {
+		t.Fatalf("bundle header = %+v", b)
+	}
+	if !strings.Contains(b.Artifacts.FRR, "router bgp 65101") || !strings.Contains(b.Artifacts.VPP, "lcp create") {
+		t.Fatalf("bundle artifacts incomplete: %+v", b.Artifacts)
+	}
+	if errs := b.BlockingErrors(); len(errs) != 0 {
+		t.Fatalf("valid draft has blocking checks: %v", errs)
+	}
+
+	// A draft saved with errors still exports, but the applier is expected to
+	// refuse it; the bundle must carry the error for that decision.
+	bad := baseValidConfig()
+	bad.Hostname = "bad host!"
+	body, _ = json.Marshal(saveConfigRequest{NodeID: 1, Config: bad})
+	if rec := configRequest(t, s, ten, http.MethodPut, "/api/config", string(body)); rec.Code != http.StatusOK {
+		t.Fatalf("save invalid = %d", rec.Code)
+	}
+	rec = bundleRequest(t, s, ten, http.MethodGet, "/api/config/bundle?node=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bundle after invalid save = %d", rec.Code)
+	}
+	b, err = apply.DecodeBundle(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(b.BlockingErrors()) == 0 {
+		t.Fatalf("error checks did not reach the bundle: %+v", b.Checks)
 	}
 }

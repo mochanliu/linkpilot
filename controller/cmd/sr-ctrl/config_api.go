@@ -40,6 +40,19 @@ type saveConfigRequest struct {
 	Config BasicConfig `json:"config"`
 }
 
+// configBundle is what the device-side applier consumes. It deliberately
+// carries the rendered artifacts, not the model: the controller owns the
+// FRR/VPP/kernel split, and the box must not re-implement it. Checks travel
+// with the bundle so the applier can refuse a draft that still has errors.
+// The JSON shape is shared with internal/apply.Bundle.
+type configBundle struct {
+	NodeID      uint16          `json:"node_id"`
+	Version     int             `json:"version"`
+	GeneratedAt int64           `json:"generated_at_unix"`
+	Checks      []ConfigCheck   `json:"checks"`
+	Artifacts   configArtifacts `json:"artifacts"`
+}
+
 // handleAdminConfig is the basic-config draft endpoint. It is tenant-only:
 // the operator role may see that a device exists, never how it is configured.
 // Saving accepts a config that still has errors -- a half-written policy is a
@@ -113,4 +126,48 @@ func (s *server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	dc.UpdatedBy = id.Username
 	s.save()
 	writeJSON(w, buildConfigView(n, dc))
+}
+
+// handleAdminConfigBundle hands a tenant the exact artifacts the box should
+// install. Delivery is still manual (curl the bundle, copy it to the device),
+// so this is a download endpoint, not a push channel. An unsaved node has no
+// bundle: applying version 0 would claim the device has something it does not.
+func (s *server) handleAdminConfigBundle(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if id.Role != roleTenant {
+		http.Error(w, "tenant role required", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(r.URL.Query().Get("node")), 10, 16)
+	if err != nil || n == 0 {
+		http.Error(w, "node must be 1..65535", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node := s.state.Nodes[key(id.TenantID, uint16(n))]
+	if node == nil || node.TenantID != id.TenantID {
+		http.Error(w, "node not found", http.StatusNotFound)
+		return
+	}
+	view := buildConfigView(node, s.state.Configs[configKey(id.TenantID, uint16(n))])
+	if view.Version == 0 {
+		http.Error(w, "no saved draft for this node", http.StatusConflict)
+		return
+	}
+	writeJSON(w, configBundle{
+		NodeID:      view.NodeID,
+		Version:     view.Version,
+		GeneratedAt: time.Now().Unix(),
+		Checks:      view.Checks,
+		Artifacts:   view.Artifacts,
+	})
 }

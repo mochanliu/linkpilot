@@ -223,10 +223,60 @@ TAP 入 VRF 与 sysctl。zebra/staticd 写进内核的路由会被 linux-nl 镜�
 两个方向都通，所以接口地址不在 VPP 片段里重复配置。页面「将下发的配置」的
 三个产物（FRR / VPP / 开机脚本）就是这三份内容。
 
-**还没有下发通道**：agent 现在只做入网与心跳，不消费这份配置，点「下发到设备」
-会如实提示这一点；VPP 运行时状态（table/MTU/lcp）重启即丢，需要盒子侧的
-applier 持久化并在开机时重放，这一块（#88）还没做。所以现阶段的设备仍然按
-手工配置运行。
+**推送通道仍然没有**：agent 现在只做入网与心跳，不消费这份配置，点「下发到设备」
+会如实提示这一点。但配置包已经可以手动交付，见下一节。
+
+## 设备侧：配置包安装与开机重放（#88）
+
+控制器把租户的草稿渲染好后，用租户会话导出成配置包（JSON，含 `frr` / `vpp` /
+`boot` 三个片段和 `checks`）：
+
+```bash
+curl -s -b "sr_session=<租户会话>" \
+     'http://127.0.0.1:8088/api/config/bundle?node=1' > bundle.json
+```
+
+租户专用（operator 403）；跨租户 404；节点还没保存过草稿时 409，因为
+`version = 0` 的包一旦装上，盒子会声称自己有一份并不存在的配置。
+
+盒子侧用 `sr-apply` 安装，不需要控制器在线：
+
+```bash
+sr-apply apply --bundle bundle.json     # 安装并立即下发
+sr-apply boot                           # 开机重放当前版本（systemd 调用）
+sr-apply status                         # 版本、sha256、上次 apply/boot 结果
+```
+
+`apply` 的顺序是固定的：装包（落盘）→ VPP 片段 → 等 lcp TAP 出现在内核 →
+内核片段 → 写 `/etc/frr/frr.conf` → 重启 FRR。先落盘后下发，所以中途失败也
+不会出现「设备在跑一份磁盘上没有的配置」。落盘是版本目录 + sha256 清单 +
+`current` 符号链接的原子切换（`/var/lib/sr-cpe/versions/<n>`）；同版本同内容
+重装是 no-op，同版本不同内容会被拒绝（版本号归控制器，不归盒子）。`checks`
+里有 `error` 时拒绝下发，`--force` 是显式的逃生口。
+
+VPP 的 CLI 出错也返回 0，所以每条命令的输出都会被检查；已经存在的 lcp pair
+和接口所在 table 会先用 `show lcp` / `show interface address` 问清楚再决定
+跳过，而不是忽略报错。`boot` 只重放，不联系控制器；FRR 的配置在安装时已经
+写好，开机时 FRR 自己读它。systemd 单元模板在
+`controller/deploy/sr-apply.service`：`After=vpp.service`、`Before=frr.service`、
+`ExecStartPre` 等 vppctl 的 CLI socket 可用（vppctl 连不上时退出码是 1），
+没有安装过版本时 `ConditionPathExists` 直接跳过而不是报失败。
+
+实测（2026-10-27，一次性容器 `apply-probe`，srwg-lab 镜像 + linux-cp/nl）：
+重启后 VPP 的 MTU 回到 9000、lcp pair 和 TAP 全部消失；`sr-apply boot` 之后
+MTU 1400、pair、`lcp-sync on`、两个 TAP 与 sysctl 都恢复，随后启动 FRR 时
+地址和静态路由按已安装的 `frr.conf` 生效，并被 lcp-sync 镜像回 VPP。
+第二次 `apply` 会打印 `already paired ... skip` 并成功返回。
+
+**多 VPN 在本 lab 内核上无法验证**：这个 Docker Desktop 的 LinuxKit 内核
+（7.0.14-linuxkit）没有 `vrf` 模块（`ip link add name vpn100 type vrf table 100`
+报 `Unknown device type`，没有 `/lib/modules`，也没有 `modprobe`）。带 VPN 100
+的包会把 VPP 部分做完（`ip table add 100`、接口移进 table 100、lcp pair），
+然后在内核片段第一行失败；`sr-apply` 如实返回非 0、`status.ok=false`，并且
+不会覆盖 `/etc/frr/frr.conf`。也就是说：自动推送还没做，而多 VPN 的真机路径
+（内核 VRF 设备 + 入 VRF + FRR vrf 段）需要在有 `vrf` 模块的宿主上再验一次。
+
+现阶段的设备仍然按手工配置运行。
 
 分阶段调试（阶段之间可反复重跑，配置是幂等的）：
 

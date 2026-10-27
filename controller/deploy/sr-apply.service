@@ -1,0 +1,32 @@
+# Replay the installed customer configuration after VPP starts.
+#
+# Install on the box:
+#   install -m 0755 sr-apply /usr/local/bin/sr-apply
+#   install -m 0644 sr-apply.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable sr-apply.service
+#
+# The unit is ordered, not watched: VPP must be up before tables/MTU/lcp can be
+# replayed, and FRR must start after the config file has been restored, because
+# FRR reads /etc/frr/frr.conf itself at start (no reload is needed here).
+#
+# A box with no installed version exits 0: ConditionPathExists skips the unit
+# instead of reporting a failure on a device that was never configured.
+[Unit]
+Description=sr-cpe replay device configuration (VPP + kernel)
+After=vpp.service
+Wants=vpp.service
+Before=frr.service
+ConditionPathExists=/var/lib/sr-cpe/current
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# vpp.service is considered started before the CLI socket answers. vppctl exits
+# 1 with "connect: No such file or directory" until it does, so wait (bounded)
+# instead of racing the replay.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do vppctl show version >/dev/null 2>&1 && exit 0; sleep 1; done; echo "vpp CLI did not come up" >&2; exit 1'
+ExecStart=/usr/local/bin/sr-apply boot
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
