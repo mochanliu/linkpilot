@@ -322,7 +322,7 @@
     var m = Math.floor(sec / 60), s = sec % 60;
     return m + ":" + (s < 10 ? "0" + s : s);
   }
-  function api(method, path, body) {
+  function fetchText(method, path, body) {
     var opt = { method: method, credentials: "same-origin", headers: {} };
     if (body !== undefined) {
       opt.headers["Content-Type"] = "application/json";
@@ -332,9 +332,12 @@
       if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("登录已过期"); }
       return r.text().then(function (t) {
         if (!r.ok) throw new Error(t.trim() || ("HTTP " + r.status));
-        return t ? JSON.parse(t) : null;
+        return t;
       });
     });
+  }
+  function api(method, path, body) {
+    return fetchText(method, path, body).then(function (t) { return t ? JSON.parse(t) : null; });
   }
 
   /* ---------------- login ---------------- */
@@ -553,11 +556,11 @@
     nodes: {
       title: "设备",
       sub: "运营方只看库存（谁、序列号、入网时间、在线状态）",
-      tenantSub: "你的设备；入网只建立归属，隧道 / 端口 / overlay 都还没有下发"
+      tenantSub: "你的设备；入网只建立归属，基础配置可下载配置包后手工安装，隧道 / 端口 / overlay 仍未实现"
     },
     config: {
       title: "配置",
-      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。这一轮只做基础配置的草稿，下发通道还没有实现",
+      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。这一轮只做基础配置：草稿保存在控制器，下发靠下载配置包后手工安装",
       roles: ["tenant"]
     },
     monitor: {
@@ -1204,10 +1207,10 @@
       '<span class="muted" style="font-size:12.5px" id="cfg-meta">' + cfgMetaText(cs) + cfgDirtyMark(cs) + "</span>" +
       '<span style="flex:1"></span>' +
       '<button class="small" data-act="cfg-reload">重新载入</button>' +
-      '<button class="small" data-act="cfg-deploy">下发到设备</button>' +
+      '<button class="small" data-act="cfg-bundle">下载配置包</button>' +
       '<button class="small primary" data-act="cfg-save">保存草稿</button>' +
       "</div>" + cfgTabs(cs) +
-      '<div class="hint" style="margin:0">保存只写控制器里的草稿；下发通道尚未实现，设备上不会发生任何变化。' +
+      '<div class="hint" style="margin:0">保存与下载都只动控制器；设备侧要执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 才会生效，控制器还不能自动推送。' +
       "VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 / 1250 被 overlay 占用。</div>" +
       "</section>";
   }
@@ -1469,7 +1472,7 @@
     var v = cs.view;
     var tabs = [["frr", "FRR 配置"], ["vpp", "VPP 配置"], ["boot", "开机脚本"]];
     var text = (v.artifacts && v.artifacts[cs.ptab]) || "";
-    return '<section class="panel"><header><h2>将下发的配置</h2></header>' +
+    return '<section class="panel"><header><h2>配置包内容</h2></header>' +
       '<div class="ltabs" role="tablist" aria-label="配置产物">' + tabs.map(function (x) {
         return '<button type="button" role="tab" class="' + (cs.ptab === x[0] ? "on" : "") +
           '" aria-selected="' + (cs.ptab === x[0]) + '" data-act="cfg-ptab" data-ptab="' +
@@ -1642,12 +1645,55 @@
       cs.edit = null;
       cs.note = { kind: errs ? "warn" : "",
         text: "已保存草稿 v" + v.version +
-          (errs ? "；仍有 " + errs + " 个错误，下发前需要修正。"
-            : "。保存只写控制器，设备上没有任何变化。") };
+          (errs ? "；仍有 " + errs + " 个错误，下载后设备会拒绝安装（除非 --force）。"
+            : "。要让它生效，点「下载配置包」拿到文件，再到设备上安装。") };
       blurContent();
       render();
       toast("草稿已保存 v" + v.version);
     }).catch(function (err) { toast("保存失败：" + err.message); });
+  }
+
+  // Fetched rather than linked: the endpoint needs the session cookie and
+  // answers errors as JSON text, which a plain <a download> would save as if
+  // it were a bundle.
+  function cfgDownloadBundle() {
+    var cs = S.cfg;
+    if (!cs || !cs.view) return;
+    if (cs.dirty) {
+      cs.note = { kind: "warn", text: "有未保存的改动。配置包只包含已保存的草稿，先点「保存草稿」再下载。" };
+      render();
+      return;
+    }
+    if (!cs.view.version) {
+      cs.note = { kind: "warn", text: "这台设备还没有保存过草稿（v0），没有可下载的配置包。" };
+      render();
+      return;
+    }
+    var nodeID = cs.nodeID, version = cs.view.version;
+    fetchText("GET", "/api/config/bundle?node=" + encodeURIComponent(nodeID)).then(function (text) {
+      var data = null;
+      try { data = JSON.parse(text); } catch (e) { /* keep the saved version below */ }
+      // The fetched version can differ from the one on screen if another
+      // session saved in between; the payload wins.
+      var v = (data && data.version) || version;
+      var checks = (data && data.checks) || cs.view.checks || [];
+      var url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "sr-cpe-node-" + nodeID + "-v" + v + ".json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+      if (S.cfg !== cs) return;
+      var errs = 0;
+      checks.forEach(function (x) { if (x.severity === "error") errs++; });
+      cs.note = { kind: errs ? "warn" : "",
+        text: "已下载配置包 v" + v + "。设备侧执行 sr-apply apply --bundle <文件>" +
+          (errs ? "；校验里有 " + errs + " 个错误，默认会被拒绝（需 --force）。" : "。") };
+      render();
+      toast("已下载 node-" + nodeID + " 的配置包 v" + v);
+    }).catch(function (err) { toast("下载失败：" + err.message); });
   }
 
   function cfgSetPath(el, val) {
@@ -1993,12 +2039,8 @@
           S.cfg.note = null;
           render();
           loadConfig();
-        } else if (act === "cfg-deploy") {
-          if (!S.cfg) return;
-          S.cfg.note = { kind: "warn",
-            text: "下发通道还没有实现：agent 现在只做入网与心跳，不消费这份配置。现在能做的只有保存草稿。" };
-          render();
-        } else if (act === "cfg-note-x") { S.cfg.note = null; render(); }
+        } else if (act === "cfg-bundle") cfgDownloadBundle();
+        else if (act === "cfg-note-x") { S.cfg.note = null; render(); }
         else if (act === "cfg-ptab") { S.cfg.ptab = el.getAttribute("data-ptab"); render(); }
         else if (act === "cfg-vpn-add") cfgAddVPN();
         else if (act === "cfg-vpn-del") cfgDelVPN(Number(el.getAttribute("data-id")));
