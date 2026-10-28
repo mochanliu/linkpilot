@@ -26,6 +26,7 @@ func newTestServer() *server {
 		Claims:     claimMap{},
 		Tenants:    map[string]*Tenant{"t": {ID: "t"}, "t2": {ID: "t2"}},
 		PKeyRings:  map[string][]wire.PKey{},
+		Underlays:  map[string]*UnderlayConfig{},
 	}
 	return &server{
 		state:      st,

@@ -19,9 +19,9 @@ func TestCreateDirectTunnel(t *testing.T) {
 	if tun.A.Iface != "eth0" {
 		t.Fatalf("应默认用设备上报的物理端口 eth0，实际 %q", tun.A.Iface)
 	}
-	// The observed endpoint is "ip:port" from the reflector; it is what the peer
-	// is dialed at and must be carried through untouched.
-	if tun.B.Addr != "203.0.113.2:51820" {
+	// The observed endpoint is the reflector's address for the node. It is what
+	// the peer is dialed at and must be carried through untouched.
+	if tun.B.Addr != "203.0.113.2" {
 		t.Fatalf("没填地址时应使用观测值，实际 %q", tun.B.Addr)
 	}
 	if tun.MTU != wire.TunnelMTUBudget(1500, 0) {

@@ -193,6 +193,21 @@ func (s Settings) overlayPrefix() (netip.Prefix, error) {
 	return p.Masked(), nil
 }
 
+// OverlaySize is how many /32s the pool hands out. It exists separately from
+// OverlayHosts because the console asks for the total on every refresh, and
+// materializing 65k addresses to count them would make a page render quadratic.
+func (s Settings) OverlaySize() (int, error) {
+	p, err := s.overlayPrefix()
+	if err != nil {
+		return 0, err
+	}
+	count := uint64(1) << uint(32-p.Bits())
+	if p.Bits() <= 30 {
+		count -= 2
+	}
+	return int(count), nil
+}
+
 // OverlayHosts lists every usable /32 of the pool in ascending order. Network
 // and broadcast are skipped for prefixes that have them.
 func (s Settings) OverlayHosts() ([]netip.Addr, error) {

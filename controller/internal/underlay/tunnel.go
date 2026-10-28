@@ -22,9 +22,18 @@ type NodeView struct {
 	// other: each one's mapping is only valid toward the observer that created
 	// it, and a relay does not rewrite the outer source either.
 	Symmetric bool
-	// Observed is the outer "ip:port" the reflector saw, empty when unknown.
+	// Observed is the outer IPv4 the reflector saw this device send from, empty
+	// when unknown. It is an ADDRESS only: a NAT mapping is per destination port,
+	// so the port half of an observation says nothing about the tunnel's own port
+	// and is never used as an endpoint.
 	Observed string
-	// TransitPort is what the device's own dataplane reports listening on.
+	// ObservedStale marks an Observed value past its freshness window. An
+	// observation is a claim about a NAT binding that was true a minute ago; a
+	// stale one is still shown, but it cannot be used to build a tunnel without
+	// someone re-observing or typing an address.
+	ObservedStale bool
+	// TransitPort is the port the controller assigned this device (one per device,
+	// reused by every tunnel it relays).
 	TransitPort uint16
 	// Ifaces maps physical port name -> link MTU in bytes. It is nil until the
 	// agent starts reporting an inventory; len()==0 therefore means "unknown"
@@ -100,11 +109,11 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	if err != nil {
 		return Tunnel{}, err
 	}
-	addrA, err := endpointAddr("本端", req.A.Addr, va.Observed)
+	addrA, err := endpointAddr("本端", va, req.A.Addr)
 	if err != nil {
 		return Tunnel{}, err
 	}
-	addrB, err := endpointAddr("对端", req.B.Addr, vb.Observed)
+	addrB, err := endpointAddr("对端", vb, req.B.Addr)
 	if err != nil {
 		return Tunnel{}, err
 	}
@@ -217,14 +226,14 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 		t.B.Iface = iface
 	}
 	if req.AddrA != nil {
-		addr, err := endpointAddr("本端", *req.AddrA, views[t.A.NodeID].Observed)
+		addr, err := endpointAddr("本端", views[t.A.NodeID], *req.AddrA)
 		if err != nil {
 			return Tunnel{}, err
 		}
 		t.A.Addr = addr
 	}
 	if req.AddrB != nil {
-		addr, err := endpointAddr("对端", *req.AddrB, views[t.B.NodeID].Observed)
+		addr, err := endpointAddr("对端", views[t.B.NodeID], *req.AddrB)
 		if err != nil {
 			return Tunnel{}, err
 		}
@@ -317,15 +326,19 @@ func endpointIface(what string, v NodeView, name string) (string, error) {
 
 // endpointAddr resolves the outer address a peer is dialed at. An explicit
 // value wins; otherwise the reflector's observation is used. Both are "ip" or
-// "ip:port" -- a bare ip is paired with the tunnel's port at delivery time.
-func endpointAddr(what, explicit, observed string) (string, error) {
+// "ip:port" -- a bare ip is paired with the tunnel's own port at delivery time,
+// because the observed port belongs to whatever NAT binding produced it.
+func endpointAddr(what string, v NodeView, explicit string) (string, error) {
 	if a := strings.TrimSpace(explicit); a != "" {
 		if err := validateOuterAddr(a); err != nil {
 			return "", fmt.Errorf("%s地址 %q: %w", what, a, err)
 		}
 		return a, nil
 	}
-	if a := strings.TrimSpace(observed); a != "" {
+	if a := strings.TrimSpace(v.Observed); a != "" {
+		if v.ObservedStale {
+			return "", fmt.Errorf("%s观测到的外层地址 %s 已过期（超过保鲜期没有新观测）；等设备重新上报或手填地址", what, a)
+		}
 		return a, nil
 	}
 	return "", fmt.Errorf("%s还没有可用的外层地址（没有观测到，也没有手填）", what)

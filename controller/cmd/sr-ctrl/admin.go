@@ -326,6 +326,16 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/config", s.handleAdminConfig)
 	mux.HandleFunc("/api/config/bundle", s.handleAdminConfigBundle)
 	mux.HandleFunc("/api/config/publish", s.handleAdminConfigPublish)
+	// Underlay is tenant-only and never appears in /api/state; the operator role
+	// sees inventory, not a customer's network layout.
+	mux.HandleFunc("/api/underlay", s.handleAdminUnderlay)
+	mux.HandleFunc("/api/underlay/settings", s.handleAdminUnderlaySettings)
+	mux.HandleFunc("/api/underlay/settings/publish", s.handleAdminUnderlayPublish)
+	mux.HandleFunc("/api/underlay/tunnels", s.handleAdminUnderlayTunnels)
+	mux.HandleFunc("/api/underlay/auto/plan", s.handleAdminUnderlayAutoPlan)
+	mux.HandleFunc("/api/underlay/auto/apply", s.handleAdminUnderlayAutoApply)
+	mux.HandleFunc("/api/underlay/paths", s.handleAdminUnderlayPaths)
+	mux.HandleFunc("/api/underlay/topology", s.handleAdminUnderlayTopology)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/code", s.handleAdminClaimCode)

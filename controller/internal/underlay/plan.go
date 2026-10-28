@@ -52,9 +52,16 @@ type Skip struct {
 // Plan is what a batch would do (or just did). Add holds fully allocated
 // tunnels: ports and overlay /32s are already assigned, so the preview's
 // numbers are the ones the apply will produce.
+//
+// Templates lists the path template this batch used for its relayed tunnels
+// (the hub's shared template, created by an earlier batch or this one). A
+// preview needs it to name the relay hop: the template is not in the STORED
+// state until the batch is applied, so a page resolving tunnel paths against
+// that state would report its own relay as a broken reference.
 type Plan struct {
-	Add  []Tunnel `json:"add"`
-	Skip []Skip   `json:"skip"`
+	Add       []Tunnel       `json:"add"`
+	Skip      []Skip         `json:"skip"`
+	Templates []PathTemplate `json:"templates,omitempty"`
 }
 
 // Pairs is the number of device pairs the batch considered, built or not.
@@ -90,7 +97,7 @@ func (s *State) auto(req AutoRequest, views map[uint16]NodeView) (Plan, error) {
 	}
 	plan := Plan{Add: []Tunnel{}, Skip: []Skip{}}
 	hubNode := req.Hub
-	var hubTemplate string
+	var hubTemplate, hubTemplateID string
 	for _, pr := range pairs {
 		skip := func(format string, args ...any) {
 			plan.Skip = append(plan.Skip, Skip{A: pr.a, B: pr.b, Reason: fmt.Sprintf(format, args...)})
@@ -121,6 +128,10 @@ func (s *State) auto(req AutoRequest, views map[uint16]NodeView) (Plan, error) {
 			skip("缺少观测到的外层地址")
 			continue
 		}
+		if va.ObservedStale || vb.ObservedStale {
+			skip("观测到的外层地址已过期（超过保鲜期没有新观测）")
+			continue
+		}
 		if strings.TrimSpace(va.DefaultIface) == "" || strings.TrimSpace(vb.DefaultIface) == "" {
 			skip("设备没有上报可用的物理端口")
 			continue
@@ -138,6 +149,7 @@ func (s *State) auto(req AutoRequest, views map[uint16]NodeView) (Plan, error) {
 			}
 			if hubTemplate == "" {
 				hubTemplate = s.hubTemplate(hubNode, hubView, req.Now)
+				hubTemplateID = hubTemplate
 			}
 			path = &TunnelPath{TemplateID: hubTemplate}
 		}
@@ -170,6 +182,11 @@ func (s *State) auto(req AutoRequest, views map[uint16]NodeView) (Plan, error) {
 			return plan, fmt.Errorf("设备 %d <-> %d: %w", pr.a, pr.b, err)
 		}
 		plan.Add = append(plan.Add, t)
+	}
+	if hubTemplateID != "" {
+		if tpl := s.Paths[hubTemplateID]; tpl != nil && len(plan.Add) > 0 {
+			plan.Templates = append(plan.Templates, *tpl)
+		}
 	}
 	return plan, nil
 }

@@ -12,7 +12,7 @@ func testViews(ids ...uint16) map[uint16]NodeView {
 		views[id] = NodeView{
 			ID:           id,
 			Name:         fmt.Sprintf("dev%d", id),
-			Observed:     fmt.Sprintf("203.0.113.%d:51820", id),
+			Observed:     fmt.Sprintf("203.0.113.%d", id),
 			DefaultIface: "eth0",
 			Ifaces:       map[string]uint16{"eth0": 1500},
 		}

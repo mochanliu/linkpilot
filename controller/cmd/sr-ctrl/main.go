@@ -62,6 +62,7 @@ import (
 	"time"
 
 	"sdwan/controller/internal/keybinding"
+	"sdwan/controller/internal/underlay"
 	"sdwan/controller/internal/wire"
 )
 
@@ -124,6 +125,25 @@ type NodeRecord struct {
 	// is on v7" is still true after a controller restart and while the box is
 	// offline, and the console must be able to show the last thing it said.
 	Config *wire.ConfigState `json:"config_state,omitempty"`
+
+	// Ifaces is the device's interface inventory (names, L3 MTU, state, its own
+	// IPv4 addresses), reported when the agent runs with -vpp-api. Persisted for
+	// the same reason as Config: the controller needs it to plan a tunnel, and a
+	// device that has gone offline still has the interfaces it had a minute ago.
+	//
+	// It is a POINTER because "never reported" and "reported an empty table" are
+	// different facts. The underlay planner treats nil as "unknown" (the
+	// interface-name check is skipped rather than rejecting every name) and the
+	// page says 未上报 instead of drawing an empty list.
+	Ifaces      *[]wire.IfaceInfo `json:"ifaces,omitempty"`
+	InventoryAt int64             `json:"inventory_at_unix,omitempty"`
+
+	// MappingAt is when the reflector's view of this device's source address
+	// (UDPMapping) last arrived. An observation is a claim about a NAT binding
+	// that was true a minute ago, so the underlay planner refuses to build a
+	// tunnel on one older than observationTTL -- the address is still shown, with
+	// its age, so the tenant can see WHY a tunnel cannot be created.
+	MappingAt int64 `json:"mapping_at_unix,omitempty"`
 }
 
 // Tenant is the customer account a device belongs to. Tenants are created in
@@ -239,6 +259,13 @@ type State struct {
 	// restart, and it is scoped to the tenant that owns the device -- the
 	// operator role never reads it.
 	Configs map[string]*DeviceConfig `json:"configs"`
+
+	// Underlays is each tenant's tunnel layer, keyed by tenant id. It is
+	// configuration like Configs: the pools, the tunnels they allocated and the
+	// path templates several tunnels share. Kept separate from Configs because
+	// the scope is different -- a tunnel belongs to a tenant, not to one device,
+	// and it references two devices that must both exist.
+	Underlays map[string]*UnderlayConfig `json:"underlays"`
 }
 
 // Account is one console login. Passwords are stored only as PBKDF2 hashes
@@ -317,6 +344,7 @@ func seedState() *State {
 		PKeyRings:  map[string][]wire.PKey{},
 		Accounts:   map[string]*Account{},
 		Configs:    map[string]*DeviceConfig{},
+		Underlays:  map[string]*UnderlayConfig{},
 	}
 	for id, name := range map[string]string{"tenant-a": "演示租户 A", "tenant-b": "演示租户 B"} {
 		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
@@ -359,6 +387,9 @@ func normalizeState(s *State) bool {
 	}
 	if s.Configs == nil {
 		s.Configs = map[string]*DeviceConfig{}
+	}
+	if s.Underlays == nil {
+		s.Underlays = map[string]*UnderlayConfig{}
 	}
 	// A tenant account whose tenant no longer exists authorizes nothing; drop it
 	// rather than leave a login that can only ever see an empty world.
@@ -476,6 +507,22 @@ func normalizeState(s *State) bool {
 		configs[configKey(dc.TenantID, dc.NodeID)] = dc
 	}
 	s.Configs = configs
+	// Underlay rows are keyed by tenant and must prove it: a row whose tenant id
+	// disagrees with its key (or names none) is dropped rather than rehomed, since
+	// rehoming would hand one tenant another's tunnels. Everything else a decode
+	// loses -- nil maps, a zero settings block -- is repaired in place.
+	for tenantID, uc := range s.Underlays {
+		if uc == nil || tenantID == "" || (uc.TenantID != "" && uc.TenantID != tenantID) {
+			delete(s.Underlays, tenantID)
+			continue
+		}
+		uc.TenantID = tenantID
+		uc.Draft = uc.Draft.Normalize()
+		if uc.State == nil {
+			uc.State = underlay.New(underlay.DefaultSettings())
+		}
+		uc.State.Repair()
+	}
 	return migrated
 }
 
@@ -971,6 +1018,16 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		rec.Config = &st
 		configChanged = true
 	}
+	// Interface inventory. A nil report says "this agent has no VPP API client"
+	// and must NOT clear what a previous run reported: the fact that the box has
+	// an eth0 with MTU 1500 does not stop being true when the flag is dropped, and
+	// InventoryAt is what makes its age visible. An empty non-nil list is stored
+	// as such -- "the dataplane really has no interfaces" is a real answer.
+	if req.Ifaces != nil {
+		st := append([]wire.IfaceInfo(nil), (*req.Ifaces)...)
+		rec.Ifaces = &st
+		rec.InventoryAt = time.Now().Unix()
+	}
 	s.save()
 
 	// Coming back from stale, or offering key material peers have not seen, are
@@ -1015,6 +1072,12 @@ func (s *server) handleMapping(w http.ResponseWriter, r *http.Request) {
 	}
 	changed := rec.UDPMapping != rep.UDPMapping
 	rec.UDPMapping = rep.UDPMapping
+	if rep.UDPMapping != "" {
+		// The underlay planner dates its observation by this, so it is refreshed on
+		// every report even when the value did not change -- the point is that the
+		// reflector saw the binding AGAIN, not that it moved.
+		rec.MappingAt = time.Now().Unix()
+	}
 	rec.LocalPort = rep.LocalPort
 	rec.Symmetric = rep.SymmetricNAT
 	rec.Reflector = rep.Reflector
