@@ -280,6 +280,13 @@ VPP 的 CLI 出错也返回 0，所以每条命令的输出都会被检查；已
 `ExecStartPre` 等 vppctl 的 CLI socket 可用（vppctl 连不上时退出码是 1），
 没有安装过版本时 `ConditionPathExists` 直接跳过而不是报失败。
 
+配置包只**引用**接口名（`host-eth0` 之类），不创建接口：VPP 的 af-packet host
+接口属于平台启动段（开机脚本或 vpp.service 的 ExecStartPre），`sr-apply` 只改
+MTU、table、lcp 和内核脚本。漏了这一步时 `sr-apply boot` 会停在
+`set interface mtu packet 1400 host-eth0: unknown input 'packet 1400 host-eth0'`
+——vppctl 把「接口不存在」报成了解析失败；正确顺序是「VPP 起来且 host 接口
+建好 → `sr-apply boot` → FRR」。
+
 实测（2026-10-27，一次性容器 `apply-probe`，srwg-lab 镜像 + linux-cp/nl）：
 重启后 VPP 的 MTU 回到 9000、lcp pair 和 TAP 全部消失；`sr-apply boot` 之后
 MTU 1400、pair、`lcp-sync on`、两个 TAP 与 sysctl 都恢复，随后启动 FRR 时
