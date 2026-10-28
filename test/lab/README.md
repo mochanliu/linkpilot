@@ -275,7 +275,8 @@ VPP 的 CLI 出错也返回 0，所以每条命令的输出都会被检查；已
 和接口所在 table 会先用 `show lcp` / `show interface address` 问清楚再决定
 跳过，而不是忽略报错。`boot` 只重放，不联系控制器；FRR 的配置在安装时已经
 写好，开机时 FRR 自己读它。systemd 单元模板在
-`controller/deploy/sr-apply.service`：`After=vpp.service`、`Before=frr.service`、
+`controller/deploy/sr-apply.service`：`After=vpp.service`、`Before=frr.service`，
+`PartOf=` / `WantedBy=vpp.service`（VPP 单独重启也会重放，见下文），
 `ExecStartPre` 等 vppctl 的 CLI socket 可用（vppctl 连不上时退出码是 1），
 没有安装过版本时 `ConditionPathExists` 直接跳过而不是报失败。
 
@@ -315,8 +316,15 @@ Docker 才有的干扰：容器重启后 Docker 会把 10.79.0.2 / 10.100.0.2 �
 另一个实测到的边界：**只重启 VPP、不重启 FRR** 时，`sr-apply boot` 重建了
 TAP 和 lcp pair，但 host-eth0 上的地址没有回到 VPP（host-eth1 的回来了），
 VPN 0 的 ARP 全被 drop，直到 FRR 重启才恢复。完整开机没问题（FRR 本来就
-排在 `sr-apply boot` 之后启动）；`vpp.service` 单独崩溃重启的场景需要有人
-再触发一次 FRR reload，当前没有任何东西替你做这件事。
+排在 `sr-apply boot` 之后启动）；`vpp.service` 单独重启的路径现在由单元
+收口：`PartOf=` / `WantedBy=vpp.service` 让重放跟着 VPP 一起重跑，
+`ExecStartPost` 用 `systemctl --no-block restart frr.service` 让 FRR 重新
+上地址（`--no-block` 免去在本单元里同步等一个排在自己后面的 job，
+`Before=frr.service` 的先后关系仍然成立）。
+在 VM 的 systemd 255 上用同名 stub 单元验过三条路径：冷启动是
+`vpp-start → sr-apply-boot → frr-start`；`systemctl restart vpp` 和
+`stop` 再 `start` 都是 `vpp-stop → vpp-start → sr-apply-boot → frr-stop →
+frr-start`，三个单元最后都是 active。
 
 lab 的三台 `lab-cpeN` 仍然按 [bringup.sh](bringup.sh) 手写的数据面计划运行——
 推送通道搬的是客户侧基础配置，不碰隧道、端口和 VRF。
