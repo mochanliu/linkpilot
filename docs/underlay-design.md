@@ -1,7 +1,7 @@
 # underlay 配置模块设计
 
 2026-10-28 与用户逐条对齐后定稿。本文描述设计；模型与分配器的实现在 `controller/internal/underlay`。
-配置分三层：基础配置（客户侧，已实现）、underlay（隧道：模型/API/控制台/设备侧 `sr-agent -tunnels` 都已实现，2026-10-28 lab 端到端验证通过，见 §11）、overlay（路由，未开始）。
+配置分三层：基础配置（客户侧，已实现）、underlay（隧道：模型/API/控制台/设备侧 `sr-agent -tunnels` 都已实现，2026-10-28 lab 端到端验证通过，见 §11）、overlay（路由：草案在 `overlay-design-draft.md`，思科调研在 `cisco-vpn-leaking-research.md`，未开工）。
 
 underlay 三个页面：**全局配置**、**隧道配置**、**拓扑图**。
 
