@@ -305,6 +305,13 @@ normalize/validate/render 代码生成的 VPN 0 + VPN 100 包一次装成。`ip 
 10.201.0.5 通；跨 VPN 两个方向 100% 丢包，trace 停在 `fib 0 → ip4-drop`。
 VPP 的 table 0 里没有 VPN 100 的前缀，table 100 里也没有 VPN 0 的。
 
+重启也验过（同一台虚拟机，顺序照 systemd 的 `vpp → sr-apply boot → frr`）：
+`vpn100` 由开机脚本重建、`lcp-x1` 重新 enslave、MTU 回到 1400、table 100
+的 C/L/S 三条回来，两个 VPN 的 ping 都通、跨 VPN 仍 100% 丢。探针有一条
+Docker 才有的干扰：容器重启后 Docker 会把 10.79.0.2 / 10.100.0.2 重新加到
+`eth0` / `eth1`，先删掉内核 eth 上的副本（真机上这两个地址只在 VPP/TAP 里）
+再重启 FRR，否则 FRR 把静态路由的下一跳解析到 `eth0`，linux-nl 不会镜像它。
+
 lab 的三台 `lab-cpeN` 仍然按 [bringup.sh](bringup.sh) 手写的数据面计划运行——
 推送通道搬的是客户侧基础配置，不碰隧道、端口和 VRF。
 
