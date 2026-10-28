@@ -312,6 +312,12 @@ Docker 才有的干扰：容器重启后 Docker 会把 10.79.0.2 / 10.100.0.2 �
 `eth0` / `eth1`，先删掉内核 eth 上的副本（真机上这两个地址只在 VPP/TAP 里）
 再重启 FRR，否则 FRR 把静态路由的下一跳解析到 `eth0`，linux-nl 不会镜像它。
 
+另一个实测到的边界：**只重启 VPP、不重启 FRR** 时，`sr-apply boot` 重建了
+TAP 和 lcp pair，但 host-eth0 上的地址没有回到 VPP（host-eth1 的回来了），
+VPN 0 的 ARP 全被 drop，直到 FRR 重启才恢复。完整开机没问题（FRR 本来就
+排在 `sr-apply boot` 之后启动）；`vpp.service` 单独崩溃重启的场景需要有人
+再触发一次 FRR reload，当前没有任何东西替你做这件事。
+
 lab 的三台 `lab-cpeN` 仍然按 [bringup.sh](bringup.sh) 手写的数据面计划运行——
 推送通道搬的是客户侧基础配置，不碰隧道、端口和 VRF。
 
