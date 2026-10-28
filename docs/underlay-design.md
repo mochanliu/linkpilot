@@ -1,7 +1,7 @@
 # underlay 配置模块设计
 
 2026-10-28 与用户逐条对齐后定稿。本文描述设计；模型与分配器的实现在 `controller/internal/underlay`。
-配置分三层：基础配置（客户侧，已实现）、underlay（隧道：模型/API/控制台/设备侧 `sr-agent -tunnels` 都已实现，两个 CPE 的 lab 端到端还没做）、overlay（路由，未开始）。
+配置分三层：基础配置（客户侧，已实现）、underlay（隧道：模型/API/控制台/设备侧 `sr-agent -tunnels` 都已实现，2026-10-28 lab 端到端验证通过，见 §11）、overlay（路由，未开始）。
 
 underlay 三个页面：**全局配置**、**隧道配置**、**拓扑图**。
 
@@ -62,7 +62,7 @@ Tunnel
                   template_id                 引用路径模板（多条隧道共享）
                   device_id + addr(空=观测值)  内联，只影响这一条
                   中转端口不进 path：它属于设备，下发时按设备查，重新绑定后不会留下旧端口
-  tunnel_mtu    只读，由两端上报的 underlay MTU 与 path 段数算出（wire.TunnelMTUBudget）
+  tunnel_mtu    只读，由两端上报的 underlay MTU 与**最坏段数**算出（wire.TunnelMTUBudget）
   roles         { a: hub|spoke, b: ... } —— 那批 auto 在这条边上的角色，仅供显示
   batch_id      可选，仅用于回溯这批自动编排；不参与判重、不参与覆盖
   created_at / updated_at
@@ -75,8 +75,8 @@ PathTemplate（租户内可复用的一跳中转）：`id`、`name`、`device_id
 - `roles` 不是节点属性：同一台设备在第 1 批里可以是 hub、第 2 批里是 spoke，两条边各记各的。不存在"节点角色"这个持久对象。
 - 隧道状态（up/down/未知）不落配置，来自遥测（每隧道 BFD + 探针）。设备心跳另带一份 `wire.TunnelState`（本机装了几条、装的是哪一代、跳过几条、失败原因），那是设备自述，不是控制器从"已发布"推断出来的；逐条 up/down 还没接上——遥测行按数据面接口索引记账，控制器还没把每一行对到某条隧道上。
 - 一条隧道的 path 最多一跳（一个中转设备）。多跳没有实现，也没有验证过。
-- `tunnel_mtu`：path 为空 → `TunnelMTUBudget(underlay_mtu, 0)`；有一跳 → 段数 1。取两端 underlay MTU 的较小值，再与 `wire.MaxTunnelMTU` 夹取。没有需要用户填的 MTU 字段。
-- 两端都还没上报接口 MTU 时 `tunnel_mtu` 记 0（未知），下发回退到 `wire.DefaultTunnelMTU`（1360）并在界面标明"默认值"，不假装是算出来的。
+- `tunnel_mtu`：**只看两端上报的 underlay MTU，不看这条隧道路径当前几跳**，取已知一侧的较小值后按 `TunnelMTUBudget(underlay_mtu, wire.MaxSRSegments)` 算，再与 `wire.MaxTunnelMTU` 夹取；算出来低于 `wire.MinTunnelMTU` 直接拒绝创建并说明余量。理由是设备侧 `NewLink` 无条件按最坏段数校验（接口只有一个 MTU，而段列表随时可被改写；超出预算不会报错，是内层每片各自再套一层 WG+SR 头、外层又分片，静默丢包）。早先按"当前跳数"算的设计在 lab 里让每一条控制器管理的隧道都装不上：1500 的链路发 1440，设备只接受 1368。改 path 只重算 `updated_at`，不动 `tunnel_mtu`。没有需要用户填的 MTU 字段。
+- 只有一侧上报接口 MTU 时按那一侧算；**两侧都没上报**时 `tunnel_mtu` 记 0（未知），下发回退到 `wire.DefaultTunnelMTU`（1360）并在界面标明"默认值"，不假装是算出来的。
 
 ## 3. 自动编排
 
@@ -187,3 +187,26 @@ hub-spoke 的 spoke 间隧道共用一个自动生成的路径模板（`经 <设
 - 一条隧道最多一跳中转（一个设备），多跳不实现也不验证。
 - **一个设备对一条隧道**：本增量每台设备只有一把 attest 过的静态 WG 密钥，VPP 的 peer 表按公钥跨接口去重（-116）。要放开"同对多隧道"，得先把密钥粒度改成每隧道一把（`internal/underlay` 里那条拒绝和 §2 的模型注释都要一起改），不是加个字段就行。
 - 中转设备离线时，自动编排**跳过**相关隧道并报"中转设备离线"，不建一条注定 down 的隧道（早先设想的"照建并标风险"没有采用：没有风险标记字段，跳过对用户更可操作）。
+## 11. lab 端到端验证（2026-10-28，已通过）
+
+环境：`lab-ctrl`（控制器，控制台 127.0.0.1:8088 → 容器 8080，设备口 8444）+ `lab-cpe1` / `lab-cpe2`（WAN 10.88.1.11 / .12，VPP + 同盒 FRR）。**lab 里没有 reflector**，所以两台设备的外层地址是手填的，隧道两端 `matches_observation:false`——这是环境的缺口，不是控制器的判断错误。租户 `gui-check`，设备 node 2 / 3 都在全局配置**发布之后**才入网，正好覆盖 §0 决策 5 的补分配路径。
+
+流程与结果：
+
+1. 入网 → 心跳带接口清单（`inventory_reported:true`，`host-eth1` MTU 1500、地址 10.88.1.11/24）。
+2. 控制台「全局配置」设备表：两台都拿到 `中转端口 15000 · VPN 端口 20000 · 隧道 1`；没上报过的 node 1 每一列都是「未上报」，不是 0。
+3. 建隧道 t1（直连，两端 `host-eth1`）→ `mtu:1368`、`mtu_is_default:false`、overlay `10.250.0.1 ↔ 10.250.0.2`、`Gen` 自增。
+4. 设备侧 `sr-agent -tunnels` 落地成 `wg1001`：`show interface wg1001` → `up 1368/0/0/0`；`show ip table 250` 存在；`show ip fib 10.250.0.2` 显示 `10.250.0.2/32 … attached-nexthop, oper-flags:resolved … wg1001 … stacked-on entry: [@2] ipv4 via 10.88.1.12 host-eth1: mtu:1500`。
+5. overlay 互通：`vppctl ping 10.250.0.2 source wg1001`（cpe1→cpe2）和反向各 3/3、0% loss；抓到的外层头部十六进制是 `…0a58010b 0a58010c 4e20 4e20…` = 10.88.1.11 → 10.88.1.12、源/目的端口都是 20000，与分配值一致。
+6. **agent 重启后重收敛**：kill 再起（带 `-tunnels`），日志 `隧道配置 v5 已收敛`，`wg1001` 仍在且计数器继续涨——全量对齐那条规则（§8 规则 1）成立。
+7. 观测回报：控制器日志 `observe: node 2 (gui-check) reported 1 row(s), 1 attributed`，node 3 同样。
+
+这一轮暴露并修掉的三个缺陷（都有单测）：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| 每条控制器管理的隧道都装不上，设备回报本机 overlay `no '/'` | 隧道字段存的是池子里的裸地址，设备契约要前缀 | `tunnelSpecLocked` 渲染成 /32（`overlayPrefix`），地址不合法/非 IPv4 时跳过这条并写原因 |
+| MTU 1440 下发、设备只接受 1368，`NewLink` 全部拒绝 | 控制器按**当前跳数**算预算，设备按**最坏段数**校验 | `tunnelMTU()` 改用 `wire.MaxSRSegments`，见 §2；对既有隧道用 `PUT /api/underlay/tunnels` 重算 |
+| 控制器分配端口上的观测全部「对不上」 | 归属判定只读遗留的 `VpnPort/TransitPort`，不看每隧道的监听端口 | 新增 `nodePortLocked`：遗留两端口 ∪ 该节点的隧道监听端口 ∪ 它的中转端口 |
+
+仍未在 lab 覆盖的：中转（path 非空）隧道的端到端、MTU 边界包（DF / frag-needed，见 §2 与既有 MTU 缺口任务）、自动编排批量。

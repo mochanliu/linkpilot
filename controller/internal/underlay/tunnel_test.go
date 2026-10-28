@@ -8,6 +8,15 @@ import (
 	"sdwan/controller/internal/wire"
 )
 
+// agentBudget is the ceiling a device will accept: the budget for the
+// dataplane's WORST-CASE segment list, which internal/agent NewLink enforces.
+// Anything the controller hands out above it does not fail loudly -- the agent
+// refuses the tunnel, which is what the 2026-10-28 lab e2e hit when MTU came
+// from the current hop count (1440 handed out, 1368 allowed on a 1500 underlay).
+func agentBudget(underlayMTU uint16) uint16 {
+	return wire.TunnelMTUBudget(underlayMTU, wire.MaxSRSegments)
+}
+
 func TestCreateDirectTunnel(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2)
@@ -24,15 +33,15 @@ func TestCreateDirectTunnel(t *testing.T) {
 	if tun.B.Addr != "203.0.113.2" {
 		t.Fatalf("没填地址时应使用观测值，实际 %q", tun.B.Addr)
 	}
-	if tun.MTU != wire.TunnelMTUBudget(1500, 0) {
-		t.Fatalf("直连 MTU 应是 %d，实际 %d", wire.TunnelMTUBudget(1500, 0), tun.MTU)
+	if tun.MTU != agentBudget(1500) {
+		t.Fatalf("直连隧道的 MTU 也必须是设备侧的最坏预算 %d，实际 %d", agentBudget(1500), tun.MTU)
 	}
 	if tun.Path != nil {
 		t.Fatal("直连隧道不该有路径")
 	}
 }
 
-func TestCreateRelayTunnelSubtractsOneHop(t *testing.T) {
+func TestCreateRelayTunnelKeepsTheSameInterfaceMTU(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2, 3)
 	tpl, err := s.CreatePath("", 3, "", 1000)
@@ -43,12 +52,14 @@ func TestCreateRelayTunnelSubtractsOneHop(t *testing.T) {
 	if tun.Path == nil || tun.Path.TemplateID != tpl.ID {
 		t.Fatalf("路径没记下来: %+v", tun.Path)
 	}
-	want := wire.TunnelMTUBudget(1500, 1)
-	if tun.MTU != want {
-		t.Fatalf("一跳路径的 MTU 应是 %d，实际 %d", want, tun.MTU)
+	// A relay hop does NOT lower the number: the interface has one MTU and the
+	// segment list is rewritten at will, so both a direct and a relayed tunnel
+	// start at the budget for the maximum path the dataplane can build.
+	if tun.MTU != agentBudget(1500) {
+		t.Fatalf("一跳路径的 MTU 应是 %d，实际 %d", agentBudget(1500), tun.MTU)
 	}
-	if want >= wire.TunnelMTUBudget(1500, 0) {
-		t.Fatalf("预算函数没体现跳数")
+	if agentBudget(1500) > wire.TunnelMTUBudget(1500, 1) {
+		t.Fatal("最坏预算不该高于短路径预算")
 	}
 }
 
@@ -115,15 +126,40 @@ func TestCreateRejectsTwoSymmetricEnds(t *testing.T) {
 	}
 }
 
+// No device has reported a link MTU, so the tunnel carries none: delivery falls
+// back to wire.DefaultTunnelMTU and labels it as the default instead of
+// pretending a number was computed.
 func TestUnknownIfaceMTULeavesMTUUnset(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2)
-	v := views[1]
-	v.Ifaces = map[string]uint16{"eth0": 0}
-	views[1] = v
+	for _, id := range []uint16{1, 2} {
+		v := views[id]
+		v.Ifaces = map[string]uint16{"eth0": 0}
+		views[id] = v
+	}
 	tun := mustCreate(t, s, views, 1, 2, nil)
 	if tun.MTU != 0 {
 		t.Fatalf("MTU 没上报时应留 0（未知），实际 %d", tun.MTU)
+	}
+}
+
+// One side reporting is enough to bound the tunnel, and it is the side that did
+// NOT report that skips the device check: a default 1360 on a 1450-byte link is
+// what the agent rejects, so the known value has to win even when its peer is
+// silent.
+func TestOneSidedIfaceMTUStillBoundsTunnel(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+	v := views[2]
+	v.Ifaces = map[string]uint16{"eth0": 1450}
+	views[2] = v
+	w := views[1]
+	w.Ifaces = nil
+	views[1] = w
+
+	tun := mustCreate(t, s, views, 1, 2, nil)
+	if want := agentBudget(1450); tun.MTU != want {
+		t.Fatalf("只有一端上报时应按它算：%d，实际 %d", want, tun.MTU)
 	}
 }
 
@@ -141,8 +177,8 @@ func TestUpdateAndDelete(t *testing.T) {
 	if upd.Path == nil || upd.Path.TemplateID != tpl.ID {
 		t.Fatalf("路径没改上: %+v", upd.Path)
 	}
-	if upd.MTU != wire.TunnelMTUBudget(1500, 1) || upd.MTU >= directMTU {
-		t.Fatalf("改成一跳后 MTU 应变小：%d -> %d", directMTU, upd.MTU)
+	if upd.MTU != directMTU {
+		t.Fatalf("加了一跳不该改接口 MTU（最坏预算与路径无关）：%d -> %d", directMTU, upd.MTU)
 	}
 	if upd.A.Port != tun.A.Port || upd.B.Port != tun.B.Port {
 		t.Fatal("没要求改端口，端口却动了")

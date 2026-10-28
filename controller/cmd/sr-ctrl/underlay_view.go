@@ -55,9 +55,9 @@ type underlayTunnelView struct {
 	Path      *underlayResolvedPathView `json:"path,omitempty"`
 	PathError string                    `json:"path_error,omitempty"`
 
-	// MTU 0 means the devices have not reported link MTU; delivery then uses
-	// wire.DefaultTunnelMTU, and MTUIsDefault says so instead of pretending the
-	// number was computed.
+	// MTU 0 means no device on this tunnel has reported a link MTU; delivery then
+	// uses wire.DefaultTunnelMTU, and MTUIsDefault says so instead of pretending
+	// the number was computed.
 	MTU          uint16 `json:"mtu"`
 	MTUIsDefault bool   `json:"mtu_is_default"`
 

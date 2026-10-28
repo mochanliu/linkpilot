@@ -276,9 +276,13 @@ func (t *TunnelSync) Kick(ctx context.Context, desired int) {
 
 		t.mu.Lock()
 		t.applying = false
+		// A per-tunnel failure is not a convergence: Sync returns nil for those,
+		// but the device does not run the whole snapshot. Same backoff either way,
+		// or a broken tunnel is retried -- and re-logged -- every heartbeat.
+		partial := err == nil && !t.state.OK
 		wait := time.Duration(0)
 		fails := t.fails
-		if err != nil {
+		if err != nil || partial {
 			t.fails++
 			fails = t.fails
 			wait = t.backoff()
@@ -287,13 +291,17 @@ func (t *TunnelSync) Kick(ctx context.Context, desired int) {
 			t.fails = 0
 			t.nextTry = time.Time{}
 		}
+		partialErr := t.state.Error
 		t.mu.Unlock()
 
-		if err != nil {
+		switch {
+		case err != nil:
 			t.logf("隧道配置 v%d 没装上（连续 %d 次，%s 后重试）: %v", desired, fails, wait, err)
-			return
+		case partial:
+			t.logf("隧道配置 v%d 只装上一部分（连续 %d 次，%s 后重试）: %s", desired, fails, wait, partialErr)
+		default:
+			t.logf("隧道配置 v%d 已收敛", desired)
 		}
-		t.logf("隧道配置 v%d 已收敛", desired)
 	}()
 }
 

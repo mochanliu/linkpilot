@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -483,6 +485,59 @@ func TestTunnelSyncKickBacksOffAfterFailure(t *testing.T) {
 	ts.mu.Unlock()
 	ts.Kick(ctx, 3)
 	waitFor(t, "退避结束后重试", func() bool { return calls.Load() == 2 })
+}
+
+// A bundle whose spec the dataplane refuses is a partial delivery: Sync returns
+// nil (the other tunnels did land) and only state.OK says no. Saying "已收敛" to
+// that is what let the first lab run of a controller-managed tunnel hide -- the
+// agent log claimed convergence every heartbeat while VPP had no interface at all.
+func TestTunnelSyncKickReportsPartialAsNotConverged(t *testing.T) {
+	pki := newTestPKI(t)
+	f := newFakeVPP()
+	bad := tunnelSpec(t, pki, "t1", 3, 1001, 20001, "10.250.0.1", "10.250.0.3/32", "10.10.1.3:20002")
+	good := tunnelSpec(t, pki, "t2", 4, 1002, 20003, "10.250.0.2/32", "10.250.0.4/32", "10.10.1.3:20004")
+	b := testBundle(bad, good)
+
+	var calls atomic.Int32
+	var lg sync.Mutex
+	var logged []string
+	id := testIdentity(t, pki, "t1", 1)
+	ts := NewTunnelSync(f, id, func(context.Context) (wire.UnderlayBundle, error) {
+		calls.Add(1)
+		return b, nil
+	}, func(format string, args ...any) {
+		lg.Lock()
+		defer lg.Unlock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+	})
+
+	ctx := context.Background()
+	ts.Kick(ctx, b.Version)
+	waitFor(t, "部分失败被记下", func() bool {
+		st := ts.State()
+		return !st.Applying && !st.OK && st.Error != ""
+	})
+	if n := len(f.ifaces); n != 1 {
+		t.Errorf("只应装上那条好的隧道，接口表有 %d 个: %+v", n, f.ifaces)
+	}
+	waitFor(t, "日志说没全装上", func() bool {
+		lg.Lock()
+		defer lg.Unlock()
+		for _, s := range logged {
+			if strings.Contains(s, "只装上一部分") {
+				return true
+			}
+		}
+		return false
+	})
+	// The backoff applies to a partial failure too: without it every heartbeat
+	// re-ran the same refusing spec.
+	callsBefore := calls.Load()
+	ts.Kick(ctx, b.Version)
+	time.Sleep(30 * time.Millisecond)
+	if calls.Load() != callsBefore {
+		t.Fatalf("退避窗口内又去拉了配置（%d -> %d）", callsBefore, calls.Load())
+	}
 }
 
 func TestLinkKeysRejectsNonHex(t *testing.T) {

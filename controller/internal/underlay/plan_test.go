@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"sdwan/controller/internal/wire"
 )
 
 func planTunnels(p Plan) map[string]Tunnel {
@@ -56,8 +54,8 @@ func TestFullMeshIsAllDirectPairs(t *testing.T) {
 		if tun.Roles.A != "" || tun.Roles.B != "" {
 			t.Fatalf("全互联没有 hub/spoke 角色，实际 %+v", tun.Roles)
 		}
-		if tun.MTU != wire.TunnelMTUBudget(1500, 0) {
-			t.Fatalf("%s 的 MTU 应是直连预算 %d，实际 %d", tun.ID, wire.TunnelMTUBudget(1500, 0), tun.MTU)
+		if tun.MTU != agentBudget(1500) {
+			t.Fatalf("%s 的 MTU 应是设备侧强制的最坏预算 %d，实际 %d", tun.ID, agentBudget(1500), tun.MTU)
 		}
 	}
 	if len(s.TransitPorts) != 0 {
@@ -133,8 +131,8 @@ func TestHubSpokeViaHubIsFullMesh(t *testing.T) {
 		if tun.Path != nil {
 			t.Fatalf("%s 是 hub<->spoke，应直连", key)
 		}
-		if tun.MTU != wire.TunnelMTUBudget(1500, 0) {
-			t.Fatalf("%s 直连 MTU 不对: %d", key, tun.MTU)
+		if tun.MTU != agentBudget(1500) {
+			t.Fatalf("%s 直连 MTU 不对: %d，应是 %d", key, tun.MTU, agentBudget(1500))
 		}
 	}
 	for _, key := range []string{"2-3", "2-4", "3-4"} {
@@ -145,8 +143,10 @@ func TestHubSpokeViaHubIsFullMesh(t *testing.T) {
 		if tun.Path == nil || tun.Path.TemplateID == "" {
 			t.Fatalf("%s 应经 hub 中转并引用共享模板: %+v", key, tun.Path)
 		}
-		if tun.MTU != wire.TunnelMTUBudget(1500, 1) {
-			t.Fatalf("%s 一跳 MTU 不对: %d", key, tun.MTU)
+		// Same number as the direct tunnels: the interface MTU is bounded by the
+		// worst path the dataplane can build, not by this tunnel's hop count.
+		if tun.MTU != agentBudget(1500) {
+			t.Fatalf("%s 一跳 MTU 不对: %d，应是 %d", key, tun.MTU, agentBudget(1500))
 		}
 	}
 	// One template for the whole batch: editing it moves every relayed tunnel.

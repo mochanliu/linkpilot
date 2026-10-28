@@ -132,11 +132,18 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 		Iface:        self.Iface,
 		ListenPort:   self.Port,
 		PeerEndpoint: peerEp,
-		LocalOverlay: self.Overlay,
-		PeerOverlay:  peer.Overlay,
 		PeerCertPEM:  prec.CertPEM,
 		PeerBinding:  prec.Binding,
 		MTU:          t.MTU,
+	}
+	// The pool hands out bare addresses and the console renders them bare; the
+	// device contract is a /32 prefix, because the dataplane puts it ON the tunnel
+	// interface and routes the peer's /32 to it.
+	if spec.LocalOverlay, err = overlayPrefix("本端", self); err != nil {
+		return wire.TunnelSpec{}, err
+	}
+	if spec.PeerOverlay, err = overlayPrefix("对端", peer); err != nil {
+		return wire.TunnelSpec{}, err
 	}
 	// UnderlayMTU is THIS box's egress link MTU; the controller writes only what
 	// the device itself reported (each side configures its own port). The map is
@@ -225,6 +232,21 @@ func dialEndpoint(what string, ep underlay.Endpoint) (string, error) {
 		return "", fmt.Errorf("%s设备 %d 没有端口", what, ep.NodeID)
 	}
 	return net.JoinHostPort(a.String(), strconv.Itoa(int(ep.Port))), nil
+}
+
+// overlayPrefix renders one end's overlay address as the /32 the device needs.
+// A pool address that does not parse is not something to paper over: the tunnel
+// would be installed with the wrong inner identity and every packet would be
+// misrouted, so the tunnel is skipped with the reason instead.
+func overlayPrefix(what string, ep underlay.Endpoint) (string, error) {
+	a, err := netip.ParseAddr(strings.TrimSpace(ep.Overlay))
+	if err != nil {
+		return "", fmt.Errorf("%s设备 %d 的 overlay 地址 %q 不合法", what, ep.NodeID, ep.Overlay)
+	}
+	if !a.Is4() {
+		return "", fmt.Errorf("%s设备 %d 的 overlay 地址 %q 不是 IPv4", what, ep.NodeID, ep.Overlay)
+	}
+	return netip.PrefixFrom(a, 32).String(), nil
 }
 
 // tunnelInstance derives the WG user_instance from the tunnel id's never-reused

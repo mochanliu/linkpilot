@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"sdwan/controller/internal/underlay"
 	"sdwan/controller/internal/wire"
 )
 
@@ -311,6 +312,42 @@ func TestNormaliseAddrs(t *testing.T) {
 	// registry and broadcast an "update" that says nothing.
 	if equalStrings(normaliseAddrs([]string{"b", "a"}), normaliseAddrs([]string{"a", "b"})) != true {
 		t.Fatal("normaliseAddrs must sort so a reordered list compares equal")
+	}
+}
+
+// A controller-managed tunnel listens on a port from the pool, not on the VPN
+// port a device once declared. Attribution has to know the ports it allocated,
+// or every observation that arrives over such a tunnel is called "unattributed"
+// and the controller keeps claiming it never saw the peer -- the log line the
+// lab run of 2026-10-28 was full of.
+func TestAttributeAcceptsAllocatedTunnelPorts(t *testing.T) {
+	s := newTestServer()
+	addNode(s, "t", 1, []string{"10.10.1.2"}, "")
+	peer := addNode(s, "t", 2, []string{"10.10.2.2"}, "")
+	peer.VpnPort = 0 // never declared one: the pool gave it 20000
+
+	st := underlay.New(underlay.DefaultSettings())
+	st.TransitPorts[2] = 15000
+	st.Tunnels["t1"] = &underlay.Tunnel{
+		ID: "t1",
+		A:  underlay.Endpoint{NodeID: 2, Port: 20000},
+		B:  underlay.Endpoint{NodeID: 1, Port: 20000},
+	}
+	s.state.Underlays["t"] = &UnderlayConfig{TenantID: "t", Draft: st.Settings, State: st}
+
+	for _, port := range []uint16{20000, 15000} {
+		id, reason, _ := s.attributeLocked("t", 2, wire.Observation{SrcIP: "10.10.1.2", SrcPort: 41780, DstPort: port})
+		if id != 1 {
+			t.Fatalf("端口 %d 上的观测没归到设备 1: %d (%s)", port, id, reason)
+		}
+	}
+	// A port this node does not own is still refused: that is how a packet that
+	// reached the wrong service stays out of the topology.
+	if id, _, _ := s.attributeLocked("t", 2, wire.Observation{SrcIP: "10.10.1.2", SrcPort: 41780, DstPort: 20007}); id != 0 {
+		t.Fatalf("端口 20007 不属于设备 2，却归给了设备 %d", id)
+	}
+	if id, _, _ := s.attributeLocked("t", 2, wire.Observation{SrcIP: "10.10.1.2", SrcPort: 41780}); id != 0 {
+		t.Fatalf("目标端口 0（没有端口可言）竟被归给设备 %d", id)
 	}
 }
 

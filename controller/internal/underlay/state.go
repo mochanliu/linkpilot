@@ -69,10 +69,12 @@ type Tunnel struct {
 	B    Endpoint    `json:"b"`
 	Path *TunnelPath `json:"path,omitempty"`
 
-	// MTU is derived, never configured by the user: the smaller of the two
-	// underlay MTUs (from the devices' interface inventory) minus the SR/WG
-	// overhead of this path's hop count. 0 means "not known yet" -- the devices
-	// have not reported their interface MTU, so delivery falls back to
+	// MTU is derived, never configured by the user: the smaller of the underlay
+	// MTUs the devices reported (interface inventory), minus the overhead of the
+	// dataplane's WORST-CASE segment list -- not of this path's hop count, because
+	// the interface has one MTU while the segment list can be rewritten at any
+	// moment, and the agent enforces exactly this budget. 0 means "not known yet":
+	// no device on this tunnel reported an interface MTU, so delivery falls back to
 	// wire.DefaultTunnelMTU and says so instead of pretending.
 	MTU uint16 `json:"mtu,omitempty"`
 

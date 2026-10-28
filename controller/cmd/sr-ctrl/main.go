@@ -1313,6 +1313,39 @@ func (s *server) handleObserve(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// nodePortLocked answers whether a UDP port belongs to this node's dataplane.
+//
+// The legacy pair (the VPN port a device declared, the transit port it was
+// told to bind) is not enough any more: the underlay layer allocates ONE port
+// per tunnel from a pool and pushes each into the device's WG interface, so a
+// node owns as many VPN ports as it has tunnels. Reading only the legacy field
+// made every observation on a controller-managed tunnel "unattributed" -- which
+// is how the lab run of 2026-10-28 found it.
+//
+// Must be called with s.mu held.
+func (s *server) nodePortLocked(tenant string, nodeID uint16, port uint16) bool {
+	if port == 0 {
+		return false
+	}
+	if mine := s.state.Nodes[key(tenant, nodeID)]; mine != nil &&
+		(port == mine.VpnPort || port == mine.TransitPort) {
+		return true
+	}
+	uc := s.underlayConfigLocked(tenant, false)
+	if uc == nil || uc.State == nil {
+		return false
+	}
+	if uc.State.TransitPorts[nodeID] == port {
+		return true
+	}
+	for _, t := range uc.State.Tunnels {
+		if (t.A.NodeID == nodeID && t.A.Port == port) || (t.B.NodeID == nodeID && t.B.Port == port) {
+			return true
+		}
+	}
+	return false
+}
+
 // attributeLocked names the node a reported outer source belongs to.
 //
 // It is a LOOKUP, not a guess. The only evidence is an address some node declared
@@ -1339,7 +1372,7 @@ func (s *server) attributeLocked(tenant string, observer uint16, ob wire.Observa
 	// node's dataplane ports did not come from a tunnel this controller runs --
 	// and the destination port is exactly the field that says which role answered,
 	// so it gets used rather than logged and ignored.
-	if ob.DstPort != mine.VpnPort && ob.DstPort != mine.TransitPort {
+	if !s.nodePortLocked(tenant, observer, ob.DstPort) {
 		return 0, fmt.Sprintf("arrived at port %d, not this node's vpn=%d/transit=%d",
 			ob.DstPort, mine.VpnPort, mine.TransitPort), false
 	}

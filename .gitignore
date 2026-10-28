@@ -17,3 +17,6 @@ controller/vendor/
 test/unit/test_srwg
 # lab 运行时产物（生成的配置、取出的二进制、控制器 CA 与签发物）
 test/lab/run/
+# lab e2e 现场：交叉编译出来的二进制、以及顺手生成的入网码（明文只在一次 HTTP 响应里，落盘过就要挡住）
+test/.lab-bin/
+test/.lab-code

@@ -128,7 +128,6 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	if err != nil {
 		return Tunnel{}, err
 	}
-	hops := uint8(0)
 	if req.Path != nil {
 		if relayNode == req.A.NodeID || relayNode == req.B.NodeID {
 			return Tunnel{}, fmt.Errorf("中转设备 %d 同时是隧道的一端", relayNode)
@@ -143,7 +142,6 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 		if _, err := s.ensureTransitPort(relayNode); err != nil {
 			return Tunnel{}, err
 		}
-		hops = 1
 	}
 
 	// Transit first: allocPort must know it so the two never collide.
@@ -167,7 +165,7 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	if err != nil {
 		return Tunnel{}, err
 	}
-	mtu, err := tunnelMTU(va, vb, ifaceA, ifaceB, hops)
+	mtu, err := tunnelMTU(va, vb, ifaceA, ifaceB)
 	if err != nil {
 		return Tunnel{}, err
 	}
@@ -269,7 +267,6 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 	if err != nil {
 		return Tunnel{}, err
 	}
-	hops := uint8(0)
 	if t.Path != nil {
 		if relay == t.A.NodeID || relay == t.B.NodeID {
 			return Tunnel{}, fmt.Errorf("中转设备 %d 同时是隧道的一端", relay)
@@ -277,9 +274,8 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 		if _, err := c.ensureTransitPort(relay); err != nil {
 			return Tunnel{}, err
 		}
-		hops = 1
 	}
-	mtu, err := tunnelMTU(views[t.A.NodeID], views[t.B.NodeID], t.A.Iface, t.B.Iface, hops)
+	mtu, err := tunnelMTU(views[t.A.NodeID], views[t.B.NodeID], t.A.Iface, t.B.Iface)
 	if err != nil {
 		return Tunnel{}, err
 	}
@@ -385,27 +381,35 @@ func validateOuterAddr(s string) error {
 	return fmt.Errorf("需要 ip 或 ip:port")
 }
 
-// tunnelMTU is the overlay MTU this tunnel may carry. It is derived from the
-// devices' reported link MTU and the number of SR hops, using the same budget
-// function the agent enforces -- one number, one owner.
+// tunnelMTU is the overlay MTU this tunnel may carry, derived from the egress
+// links the devices reported -- never from what the operator typed.
 //
-// When either side has not reported its link MTU, the result is 0 (unknown):
-// delivery then uses wire.DefaultTunnelMTU and labels it as the default, rather
-// than pretending a computed value.
-func tunnelMTU(a, b NodeView, ifaceA, ifaceB string, hops uint8) (uint16, error) {
+// It uses the dataplane's WORST-CASE segment count, not this tunnel's current
+// path, because that is exactly what the agent refuses to exceed
+// (internal/agent/dataplane.go: NewLink). The MTU is one interface-level number
+// while the segment list is something the controller rewrites at will, so a
+// budget computed from today's hop count would hand out 1440 on a 1500-byte
+// underlay and the agent would reject the tunnel -- the mismatch the lab e2e hit
+// on 2026-10-28, where every controller-managed tunnel failed to install.
+//
+// When no side has reported its link MTU the result is 0 (unknown): delivery
+// then falls back to wire.DefaultTunnelMTU and labels it as the default. A
+// device that has not reported an MTU also gets no UnderlayMTU, so it does not
+// check the fallback either.
+func tunnelMTU(a, b NodeView, ifaceA, ifaceB string) (uint16, error) {
 	ma, oka := a.ifaceMTU(ifaceA)
 	mb, okb := b.ifaceMTU(ifaceB)
-	if !oka || !okb {
+	if !oka && !okb {
 		return 0, nil
 	}
 	underlay := ma
-	if mb < underlay {
+	if !oka || mb < ma {
 		underlay = mb
 	}
-	budget := wire.TunnelMTUBudget(underlay, hops)
+	budget := wire.TunnelMTUBudget(underlay, wire.MaxSRSegments)
 	if budget < wire.MinTunnelMTU {
-		return 0, fmt.Errorf("underlay MTU %d 扣掉 %d 跳 SR 头后只剩 %d，低于最小 %d",
-			underlay, hops, budget, wire.MinTunnelMTU)
+		return 0, fmt.Errorf("underlay MTU %d 扣掉最多 %d 段 SR 头后只剩 %d，低于最小 %d",
+			underlay, wire.MaxSRSegments, budget, wire.MinTunnelMTU)
 	}
 	if budget > wire.MaxTunnelMTU {
 		return wire.MaxTunnelMTU, nil
