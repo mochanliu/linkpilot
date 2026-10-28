@@ -7,6 +7,12 @@
 // console, and until that plan exists there is nothing for this process to
 // install. Starting VPP work from an empty plan would only produce a device
 // that looks configured and forwards nothing.
+//
+// The ONE read-only exception is the interface inventory (-vpp-api): the
+// controller cannot identify this box's underlay port from its own data, and
+// the device is the only place that knows which ports it has. It is a reading
+// of VPP's interface table, never a write, so it stays on this side of the
+// "agent does not configure the dataplane" line.
 package main
 
 import (
@@ -54,6 +60,12 @@ func main() {
 		vppctl     = flag.String("vppctl", "vppctl", "vppctl binary")
 		frrConf    = flag.String("frr-conf", "/etc/frr/frr.conf", "FRR config path")
 		frrReload  = flag.String("frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
+
+		// The interface inventory is read-only and off by default: a box whose
+		// VPP is managed by hand may not have this socket, and an agent that
+		// fails to start because an optional report is unavailable is worse
+		// than one that reports nothing.
+		vppAPI = flag.String("vpp-api", "", "VPP api.sock for the read-only interface inventory (empty disables it)")
 	)
 	flag.Parse()
 
@@ -129,6 +141,15 @@ func main() {
 		log.Fatalf("client: %v", err)
 	}
 
+	// Read-only interface inventory. Off unless -vpp-api is given, because a box
+	// whose VPP lives in another namespace may not have this socket at all --
+	// and an optional report must never be a reason the agent cannot start.
+	inv := agent.NewInventoryReporter(*vppAPI, "sr-agent", log.Printf)
+	defer inv.Close()
+	if *vppAPI != "" {
+		log.Printf("interface inventory on (vpp api %s)", *vppAPI)
+	}
+
 	var cfg *configSync
 	if *applyCfg {
 		store := apply.Store{Root: *storeRoot}
@@ -152,6 +173,7 @@ func main() {
 		hbctx, hbcancel := context.WithTimeout(ctx, 15*time.Second)
 		req := wire.HeartbeatRequest{Uptime: 0}
 		req.Config = st.configReport()
+		req.Ifaces = readInventory(ctx, inv)
 		resp, err := client.Heartbeat(hbctx, req)
 		hbcancel()
 		if err != nil {
@@ -184,6 +206,7 @@ func main() {
 		hbctx, hbcancel := context.WithTimeout(ctx, 10*time.Second)
 		req := wire.HeartbeatRequest{Uptime: int64(time.Since(processStart).Seconds())}
 		req.Config = st.configReport()
+		req.Ifaces = readInventory(ctx, inv)
 		resp, err := client.Heartbeat(hbctx, req)
 		hbcancel()
 		if err != nil {
@@ -236,6 +259,18 @@ func nextBackoff(cur time.Duration) time.Duration {
 		cur = 30 * time.Second
 	}
 	return cur
+}
+
+// readInventory takes one inventory reading for this heartbeat on its own,
+// shorter deadline: a wedged VPP must not eat the heartbeat's whole budget and
+// turn an optional report into "device went offline".
+func readInventory(ctx context.Context, inv *agent.InventoryReporter) *[]wire.IfaceInfo {
+	if inv == nil {
+		return nil
+	}
+	ictx, icancel := context.WithTimeout(ctx, 3*time.Second)
+	defer icancel()
+	return inv.Report(ictx)
 }
 
 // ctrlBase normalises --ctrl into an https URL. Bare host:port is the common

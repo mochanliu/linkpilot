@@ -424,6 +424,32 @@ type HeartbeatRequest struct {
 	// implement the config channel" (an older binary), which the controller must
 	// not confuse with Capable=false ("newer binary, started without -apply").
 	Config *ConfigState `json:"config,omitempty"`
+	// Ifaces is this box's own interface inventory, read from the dataplane.
+	// nil means "not reported" (an agent started without -vpp-api, or a VPP that
+	// could not be reached) -- an EMPTY non-nil list means "the dataplane really
+	// has no interfaces", which is a different fact and must be declarable.
+	//
+	// The addresses are the INTERFACE's own, not the NAT-translated outer source;
+	// those differ behind a NAT, and only the controller holds both facts (the
+	// reflector's observation is reported on /v1/observe). Matching them is how
+	// the underlay egress port gets identified by measurement instead of by a
+	// naming convention.
+	Ifaces *[]IfaceInfo `json:"ifaces,omitempty"`
+}
+
+// IfaceInfo is one entry of the device's interface inventory. Every field is a
+// reading from the dataplane (core's sw_interface_details / ip_address_details),
+// never a configuration claim: this is what the box HAS, not what it was told.
+type IfaceInfo struct {
+	Name      string `json:"name"`
+	SWIfIndex uint32 `json:"sw_if_index"`
+	// MTU is the L3 MTU (`show interface`'s MTU column, mtu[0]). This is the
+	// number an underlay MTU budget must be computed from -- VPP's link_mtu for
+	// an af-packet port is the default 9000 and does not describe the NIC.
+	MTU     uint32   `json:"mtu"`
+	AdminUp bool     `json:"admin_up"`
+	LinkUp  bool     `json:"link_up"`
+	Addrs   []string `json:"addrs,omitempty"` // each "a.b.c.d/len"
 }
 
 // HeartbeatResponse returns the controller-assigned epoch and the current

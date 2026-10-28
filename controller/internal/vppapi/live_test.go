@@ -910,6 +910,42 @@ func TestLiveAgainstVPP(t *testing.T) {
 		}
 		t.Logf("接口表 %d 条：%s", len(all), dumpSummary(all))
 
+		// ==================== 接口清单：地址（#105 落地） ====================
+		//
+		// 地址那一侧同样要和 CLI 对，而不是只跟自己一致：ip_address_details 里的
+		// vl_api_address_with_prefix_t 是 18 字节（af + 16 + 前缀长度），按错一行
+		// 就会读出一条**看起来合法**的假地址。清单里写着一个不存在的地址，比读不
+		// 出来更糟 —— 控制器会拿它去和反射器看到的外层源比对，从而挑错出口。
+		addrOut, err := vppctl(ctx, "show", "interface", "address")
+		if err != nil {
+			t.Fatalf("vppctl show interface address: %v", err)
+		}
+		inv, err := c.Inventory(ctx)
+		if err != nil {
+			t.Fatalf("Inventory: %v", err)
+		}
+		withAddr := 0
+		for _, i := range inv {
+			for _, p := range i.IPv4 {
+				s := fmt.Sprintf("%s/%d", p.IP, p.Len)
+				if !strings.Contains(addrOut, s) {
+					t.Errorf("接口 %s(%d) 的地址 %s 在 CLI 的 show interface address 里找不到：\n%s",
+						i.Name, i.SWIfIndex, s, addrOut)
+				}
+				withAddr++
+			}
+		}
+		// CLI 每条地址是一行 "  L3 a.b.c.d/len"。条数不一致就是"读少/读多"，
+		// 两种都会让控制器以为这台设备的地址集与事实不同。
+		if cliAddrs := strings.Count(addrOut, "L3 "); withAddr != cliAddrs {
+			t.Errorf("清单里 %d 条地址，CLI 有 %d 条（L3 行）", withAddr, cliAddrs)
+		}
+		var invLines []string
+		for _, i := range inv {
+			invLines = append(invLines, fmt.Sprintf("%d:%s/mtu%d%v", i.SWIfIndex, i.Name, i.L3MTU, i.IPv4))
+		}
+		t.Logf("接口清单 %d 张、地址 %d 条：%s", len(inv), withAddr, strings.Join(invLines, " "))
+
 		// VPP **自己不校验**这个数。客户端把 0 拦在发出之前（单测锁住了那条），所以
 		// 这里只能走 CLI 去看 VPP 的真实态度：实测 `packet 0` 照单收下，并把四个槽位
 		// 一起清零 —— 那是"取消 MTU 记录"，不是"设成 0"。客户端那层拦截因此不是

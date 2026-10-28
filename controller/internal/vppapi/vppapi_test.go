@@ -39,13 +39,17 @@ type fakeVPP struct {
 	swIfDetails int      // core 的 sw_interface_dump 回几条
 	peersRaw    [][]byte // 非空时按原样发这些 details 载荷（用来回放真 VPP 抓到的帧）
 	swIfRaw     [][]byte // 同上，但发给 sw_interface_dump
-	mssDetails  [][]byte // mss_clamp_get 回的明细净体（不含 msg_id+context）
-	probeRaw    [][]byte // sr_wg_probe_dump 回的明细净体
-	bfdRaw      [][]byte // bfd_udp_session_dump 回的明细净体
-	ipRouteRaw  [][]byte // ip_route_dump 回的明细净体
-	mplsRaw     [][]byte // mpls_route_dump 回的明细净体
-	cliReply    string   // cli_inband 的应答字符串
-	requests    chan request
+	// ipAddrs 是 ip_address_dump 的按接口答案；ipAddrRaw 非空时无视接口号原样发这些
+	// 净体（用来造"坏帧/读不全"的现场）。
+	ipAddrs    map[uint32][]fakeAddr
+	ipAddrRaw  [][]byte
+	mssDetails [][]byte // mss_clamp_get 回的明细净体（不含 msg_id+context）
+	probeRaw   [][]byte // sr_wg_probe_dump 回的明细净体
+	bfdRaw     [][]byte // bfd_udp_session_dump 回的明细净体
+	ipRouteRaw [][]byte // ip_route_dump 回的明细净体
+	mplsRaw    [][]byte // mpls_route_dump 回的明细净体
+	cliReply   string   // cli_inband 的应答字符串
+	requests   chan request
 }
 
 type request struct {
@@ -61,6 +65,10 @@ func newFake(t *testing.T) *fakeVPP {
 		requests: make(chan request, 64),
 		versions: map[string]string{},
 		retvals:  map[string]int32{},
+		ipAddrs:  map[uint32][]fakeAddr{},
+	}
+	for _, a := range fakeSwAddrs {
+		f.ipAddrs[a.idx] = a.addrs
 	}
 	for name, crc := range requiredVersions {
 		f.versions[name] = crc
@@ -269,6 +277,25 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 		for i := 0; i < f.swIfDetails; i++ {
 			f.sendFrameOf(conn, "sw_interface_details", reqCtx, swInterfaceDetailBytes(i))
 		}
+	case "ip_address_dump":
+		// 真 VPP 对 0xFFFFFFFF（core 惯例里表示"全部"）实测一帧都不回，这个假服务端
+		// 照做：只回被问的那个接口，绝不替客户端把"全部"解释成遍历。
+		if len(body) < 5 {
+			break // 短包 = 不回，客户端超时（与真 VPP 解码失败同形）
+		}
+		idx := binary.BigEndian.Uint32(body[0:4])
+		if body[4] != 0 {
+			break // 这个假 VPP 没有 IPv6 地址
+		}
+		if len(f.ipAddrRaw) > 0 {
+			for _, raw := range f.ipAddrRaw {
+				f.sendFrameOf(conn, "ip_address_details", reqCtx, raw)
+			}
+			break
+		}
+		for _, a := range f.ipAddrs[idx] {
+			f.sendFrameOf(conn, "ip_address_details", reqCtx, ipAddressDetailBytes(idx, a.ip, a.len))
+		}
 	}
 	// 未知请求：不回。客户端应当超时，而不是永远挂着。
 }
@@ -397,6 +424,33 @@ var fakeSwInterfaces = []struct {
 	{1, "local0", 0, 0x1},
 	{2, "host-eth0", 1500, 0x3},
 	{3, "wg0", 1360, 0x3},
+}
+
+type fakeAddr struct {
+	ip  string
+	len uint8
+}
+
+// fakeSwAddrs 照着 srwg-node1 的 `show interface address` 造：只有 underlay 出口和
+// wg0 有地址，local0 一个都没有 ——"没有地址"必须能读成空列表，而不是一条 0.0.0.0/0。
+var fakeSwAddrs = []struct {
+	idx   uint32
+	addrs []fakeAddr
+}{
+	{1, nil},
+	{2, []fakeAddr{{"10.10.1.2", 24}}},
+	{3, []fakeAddr{{"192.168.99.1", 24}}},
+}
+
+// ipAddressDetailBytes 造一条 ip_address_details 净体（不含 msg_id+context）：
+// sw_if_index(4) + af(1) + vl_api_address_t(17) + 前缀长度(1) = 22，帧长 28（实测）。
+func ipAddressDetailBytes(idx uint32, ip string, plen uint8) []byte {
+	b := make([]byte, ipAddressDetailsLen-6)
+	binary.BigEndian.PutUint32(b[0:4], idx)
+	// b[4] = 地址族 0 = IPv4
+	copy(b[5:9], net.ParseIP(ip).To4())
+	b[21] = plen
+	return b
 }
 
 // swInterfaceDetailBytes 造一条 core 的 sw_interface_details 净体。
@@ -1241,6 +1295,102 @@ func TestDumpInterfacesRejectsShortFrame(t *testing.T) {
 		t.Fatal("少 1 字节的 details 必须报错")
 	}
 	if !strings.Contains(err.Error(), "sw_interface_details") {
+		t.Errorf("错误要点名哪条消息，got: %v", err)
+	}
+}
+
+// ==================== 设备侧接口清单 ====================
+
+func TestInventoryPairsEachInterfaceWithItsOwnAddresses(t *testing.T) {
+	f := newFake(t)
+	f.swIfDetails = len(fakeSwInterfaces)
+	c := f.dial(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	got, err := c.Inventory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(fakeSwInterfaces) {
+		t.Fatalf("读了 %d 张接口，期望 %d", len(got), len(fakeSwInterfaces))
+	}
+	want := map[uint32][]string{
+		1: {}, // local0 没有地址
+		2: {"10.10.1.2/24"},
+		3: {"192.168.99.1/24"},
+	}
+	for _, i := range got {
+		var addrs []string
+		for _, p := range i.IPv4 {
+			addrs = append(addrs, fmt.Sprintf("%s/%d", p.IP, p.Len))
+		}
+		if strings.Join(addrs, ",") != strings.Join(want[i.SWIfIndex], ",") {
+			t.Errorf("接口 %s(%d) 的地址 = %v，期望 %v", i.Name, i.SWIfIndex, addrs, want[i.SWIfIndex])
+		}
+	}
+
+	// 每个接口单独问一次，而且问的是**具体号**：0xFFFFFFFF 在真 VPP 上什么都不回
+	// （2026-10-28 实测），所以把"全部"当遍历用会得到一份空清单而不报错。
+	var asked []uint32
+	for {
+		select {
+		case r := <-f.requests:
+			if r.name != "ip_address_dump" {
+				continue
+			}
+			if len(r.body) != 5 {
+				t.Errorf("ip_address_dump 体长 = %d，期望 5（sw_if_index 4 + is_ipv6 1）", len(r.body))
+			}
+			if r.body[4] != 0 {
+				t.Errorf("is_ipv6 = %d，期望 0（只问 IPv4）", r.body[4])
+			}
+			asked = append(asked, binary.BigEndian.Uint32(r.body[0:4]))
+		default:
+			if len(asked) != len(fakeSwInterfaces) {
+				t.Fatalf("问了 %d 张接口的地址（%v），期望 %d 张，且不能是 0xFFFFFFFF",
+					len(asked), asked, len(fakeSwInterfaces))
+			}
+			for i, idx := range asked {
+				if want := fakeSwInterfaces[i].idx; idx != want {
+					t.Errorf("第 %d 次问的是接口 %d，期望 %d", i, idx, want)
+				}
+			}
+			return
+		}
+	}
+}
+
+func TestInventoryRejectsDetailsForAnotherInterface(t *testing.T) {
+	// dump 是按号过滤的。收回别人的地址说明过滤没生效，不能当成这张口的地址
+	// —— 否则两台设备的 WAN 地址会被混进同一份清单。
+	f := newFake(t)
+	f.swIfDetails = len(fakeSwInterfaces)
+	f.ipAddrRaw = [][]byte{ipAddressDetailBytes(99, "10.0.0.9", 24)}
+	c := f.dial(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Inventory(ctx)
+	if err == nil {
+		t.Fatal("回了别的接口的地址必须报错")
+	}
+	if !strings.Contains(err.Error(), "sw_if_index=99") {
+		t.Errorf("错误要点名回了谁的地址，got: %v", err)
+	}
+}
+
+func TestInventoryRejectsShortAddressFrame(t *testing.T) {
+	f := newFake(t)
+	f.swIfDetails = len(fakeSwInterfaces)
+	f.ipAddrRaw = [][]byte{make([]byte, ipAddressDetailsLen-1)}
+	c := f.dial(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Inventory(ctx)
+	if err == nil {
+		t.Fatal("少 1 字节的 ip_address_details 必须报错")
+	}
+	if !strings.Contains(err.Error(), "ip_address_details") {
 		t.Errorf("错误要点名哪条消息，got: %v", err)
 	}
 }

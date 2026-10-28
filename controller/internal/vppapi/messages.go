@@ -75,6 +75,10 @@ var requiredVersions = map[string]string{
 	// 同一份 JSON 里的 dump/details：结构体一旦变，CRC 一定先于超时告诉我们。
 	"sw_interface_dump":    "aa610c27",
 	"sw_interface_details": "6c221fc7",
+	// 接口 IPv4 地址（设备侧接口清单）。CRC 取自 srwg-node1 的 ip.api.json，
+	// 并用 test/scripts/vpp-api-probe4.py 在运行中的 VPP 上按注册表复核过。
+	"ip_address_dump":    "2d033de4",
+	"ip_address_details": "ee29b797",
 	// TCP MSS 钳制是 VPP 自带的 mss_clamp 插件（VPP 26.06 默认就装），同样不是
 	// sr_wg 的。值取自 srwg-node1 的 /usr/share/vpp/api/plugins/mss_clamp.api.json，
 	// 并与生成的 mss_clamp.api_types.h 里的 *_CRC 宏逐条对上。
@@ -834,12 +838,18 @@ func (c *Client) SetInterfaceMTU(ctx context.Context, swIfIndex uint32, l3MTU ui
 //
 // L3MTU 就是 `show interface` 那个 MTU 列（mtu[0]，vl_api_mtu_proto_t 的 L3 槽）：
 // 写进去的 MTU 能不能读回来，看的就是它。
+//
+// IPv4 只有 Inventory 会填（DumpInterfaces 不碰地址：verifyLanded 用的是写入口的
+// 回读，不需要多打一轮 dump）。它是这张口*自己的*地址，不是 NAT 后的映射地址 ——
+// 两者在公网后面本来就不相等，所以"哪个地址是 WAN"只能由控制器拿反射器看到的
+// 外层源来比对，这个包不做猜测。
 type SwInterface struct {
 	SWIfIndex uint32
 	Name      string
 	L3MTU     uint32
 	AdminUp   bool
 	LinkUp    bool
+	IPv4      []Prefix
 }
 
 // swInterfaceDetailsLen 是 vl_api_sw_interface_details_t 的字节数。
@@ -910,6 +920,71 @@ func FindInterface(ifaces []SwInterface, swIfIndex uint32) (SwInterface, bool) {
 		}
 	}
 	return SwInterface{}, false
+}
+
+// ipAddressDetailsLen 是 vl_api_ip_address_details_t 的字节数：
+// msg_id(2)+context(4)+sw_if_index(4)+vl_api_address_with_prefix_t(18)。
+// 18 = vl_api_address_t(af 1 + 16) + 前缀长度(1)；实测帧长 28（srwg-node1）。
+const ipAddressDetailsLen = 28
+
+// DumpIPv4Addresses 读一张接口上的 IPv4 地址。
+//
+// sw_if_index 必须是**具体**接口：2026-10-28 在 srwg-node1（VPP 26.06）实测，
+// 传 0xFFFFFFFF（按 core 的惯例本应是"全部"）一条 details 都不回 —— 而
+// `show interface address` 明明有两条（10.10.1.2/24、192.168.99.1/24）。
+// 所以"全部"这条路在这里不可用，Inventory 逐张口问；一台 CPE 就几张口。
+func (c *Client) DumpIPv4Addresses(ctx context.Context, swIfIndex uint32) ([]Prefix, error) {
+	// 净体 = sw_if_index(4) + is_ipv6(1)；bool 就是 1 字节。
+	body := make([]byte, 5)
+	binary.BigEndian.PutUint32(body[0:4], swIfIndex)
+	// body[4] = is_ipv6（false）：overlay 与 underlay 至今都只有 IPv4。
+
+	frames, err := c.dump(ctx, "ip_address_dump", "ip_address_details", body)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Prefix, 0, len(frames))
+	for _, f := range frames {
+		if len(f) < ipAddressDetailsLen {
+			return nil, fmt.Errorf("vppapi: ip_address_details 太短 (%d B < %d B)，core 的地址结构变了",
+				len(f), ipAddressDetailsLen)
+		}
+		if got := binary.BigEndian.Uint32(f[6:10]); got != swIfIndex {
+			// dump 是按号过滤的，收到别人的就是"过滤没生效"，不能把它当成这张口的地址。
+			return nil, fmt.Errorf("vppapi: ip_address_details 回的 sw_if_index=%d，问的是 %d", got, swIfIndex)
+		}
+		ip := readAddress(f[10:27])
+		if ip == nil {
+			return nil, fmt.Errorf("vppapi: 接口 %d 的 IPv4 地址 dump 回了非 IP 族 %d", swIfIndex, f[10])
+		}
+		out = append(out, Prefix{IP: ip, Len: f[27]})
+	}
+	return out, nil
+}
+
+// Inventory 是设备侧的接口清单：整张接口表，加上每张口自己的 IPv4 地址。
+//
+// 为什么不在一开始就过滤"物理口"：VPP 26.06 里没有 hw_interface_dump（全表都没有
+// 这条消息），而 sw_interface_details.type 在 local0/host-eth1/wg0 上实测都是 0 ——
+// 用它在 VPP 侧分辨硬件口是假的。本机只有个位数的口，全报上去、由控制器拿反射器
+// 看到的真实外层源去比对，比这一层猜"哪张是 WAN"更诚实。
+//
+// 任何一张口读地址失败都整体失败：清单缺几行看起来仍然是合法清单，而控制器会据此
+// 以为"这台设备没有 WAN 口" —— 那种错误没人会去复查。
+func (c *Client) Inventory(ctx context.Context) ([]SwInterface, error) {
+	ifs, err := c.DumpInterfaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range ifs {
+		addrs, err := c.DumpIPv4Addresses(ctx, ifs[i].SWIfIndex)
+		if err != nil {
+			return nil, fmt.Errorf("vppapi: 读接口 %s(%d) 的 IPv4 地址: %w",
+				ifs[i].Name, ifs[i].SWIfIndex, err)
+		}
+		ifs[i].IPv4 = addrs
+	}
+	return ifs, nil
 }
 
 // ==================== TCP MSS 钳制（mss_clamp 插件，不是 sr_wg 的） ====================
