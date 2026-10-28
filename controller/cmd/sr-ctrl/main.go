@@ -907,6 +907,18 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	rec.PublicKey = base64.StdEncoding.EncodeToString(pub)
 	rec.AgentVer = req.AgentVersion
 
+	// Devices do not all enroll at once, and publishing only assigned transit
+	// ports to the ones that existed then. Assign this one's now so its first
+	// bundle already carries the tenant's published configuration. Not fatal:
+	// the identity is worth more than the port, and the heartbeat retries.
+	transitAssigned := false
+	if port, assigned, err := s.ensureNodeTransitPortLocked(tenant, rec.NodeID); err != nil {
+		log.Printf("underlay: tenant=%s node=%d 入网后补分配中转端口失败: %v", tenant, rec.NodeID, err)
+	} else if assigned {
+		log.Printf("underlay: tenant=%s node=%d 入网后补分配中转端口 %d", tenant, rec.NodeID, port)
+		transitAssigned = true
+	}
+
 	certPEM, err := signDevice(s.caCert, s.caKey, ed25519.PublicKey(pub), tenant, rec.NodeID)
 	if err != nil {
 		http.Error(w, "signing failed", 500)
@@ -916,6 +928,10 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
 	s.save()
 	s.admin.publish("node.enrolled", tenant, rec)
+	if transitAssigned {
+		// The 全局配置 page lists every device's transit port; it just changed.
+		s.admin.publish("node.underlay", tenant, rec)
+	}
 
 	json.NewEncoder(w).Encode(s.enrollResponse(tenant, rec, certPEM, string(caPEM)))
 }
@@ -1041,6 +1057,17 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		rec.Tunnel = &st
 		tunnelChanged = true
 	}
+	// Self-heal the transit port: a device that enrolled while the pool could not
+	// cover it, or one whose row predates late-enrollment assignment, is repaired
+	// on this beat -- and the beat's response advertises the new version, so the
+	// device pulls a bundle that finally carries its port.
+	transitAssigned := false
+	if port, assigned, err := s.ensureNodeTransitPortLocked(tenant, nodeID); err != nil {
+		log.Printf("underlay: tenant=%s node=%d 心跳补分配中转端口失败: %v", tenant, nodeID, err)
+	} else if assigned {
+		log.Printf("underlay: tenant=%s node=%d 心跳补分配中转端口 %d", tenant, nodeID, port)
+		transitAssigned = true
+	}
 	s.save()
 
 	// Coming back from stale, or offering key material peers have not seen, are
@@ -1056,8 +1083,9 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// Console-facing: the config page's applied/failed/applying column moved.
 		s.admin.publish("node.config", rec.TenantID, rec)
 	}
-	if tunnelChanged {
-		// Console-facing: the underlay page's applied/failed column moved.
+	if tunnelChanged || transitAssigned {
+		// Console-facing: the underlay page's applied/failed column or a device's
+		// transit port just moved.
 		s.admin.publish("node.underlay", rec.TenantID, rec)
 	}
 	json.NewEncoder(w).Encode(wire.HeartbeatResponse{

@@ -400,6 +400,35 @@ func (s *State) PublishSettings(next Settings, nodes []uint16, now int64) error 
 	return nil
 }
 
+// EnsureDevice gives one device the transit port the published configuration
+// owes it. Publishing only reaches the devices enrolled at that moment, and
+// customers do not enroll every device at once: without this, a device that
+// arrives later carries transit_port 0 forever (nothing can relay through it)
+// even though the tenant's global configuration is in force.
+//
+// Before publishing it is a no-op -- there is no configuration to attach a port
+// to yet. Afterwards it is idempotent, and a failed allocation leaves the state
+// untouched so a retry can still succeed.
+func (s *State) EnsureDevice(node uint16) (port uint16, assigned bool, err error) {
+	if node == 0 {
+		return 0, false, fmt.Errorf("设备号不能为 0")
+	}
+	if !s.Configured() {
+		return 0, false, nil
+	}
+	if p := s.TransitPorts[node]; p != 0 {
+		return p, false, nil
+	}
+	c := s.Clone()
+	p, err := c.ensureTransitPort(node)
+	if err != nil {
+		return 0, false, err
+	}
+	c.bump()
+	*s = *c
+	return p, true, nil
+}
+
 // SetSettings validates and applies a new global configuration. Existing
 // allocations are never renumbered: a range change only affects what is handed
 // out from now on. A change that would orphan a live tunnel is refused instead

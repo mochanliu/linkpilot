@@ -626,7 +626,7 @@
     },
     "underlay-settings": {
       title: "全局配置",
-      sub: "租户级的隧道参数：VPN 端口池、中转端口池、overlay 地址池与探测间隔。保存只写草稿，发布后才成为设备的目标配置，并给每台已入网设备分配唯一的中转端口",
+      sub: "租户级的隧道参数：VPN 端口池、中转端口池、overlay 地址池与探测间隔。保存只写草稿，发布后才成为设备的目标配置，并给每台已入网设备分配唯一的中转端口；发布以后才入网的设备在入网时自动补分配",
       roles: ["tenant"]
     },
     "underlay-tunnels": {
@@ -2281,7 +2281,8 @@
     if (!u || !u.doc || !u.draft) return;
     function go() {
       if (!confirm("发布全局参数？\n\n" + undSummary(u.draft) +
-        "\n\n发布后：这些参数成为设备的目标配置，并为每台已入网设备分配唯一的中转端口。" +
+        "\n\n发布后：这些参数成为设备的目标配置，并为每台已入网设备分配唯一的中转端口；" +
+        "发布以后才入网的设备在入网时自动补分配，不需要重新发布。" +
         "已经分配的端口和 overlay /32 不会被移动；池子收窄到装不下已分配值时会拒绝发布。")) return;
       api("POST", "/api/underlay/settings/publish", {}).then(function (res) {
         u.doc = res.underlay;
@@ -2482,7 +2483,7 @@
   function undNodePanel(doc) {
     var h = '<section class="panel"><header><h2>设备与中转端口</h2>' +
       '<span class="muted" style="font-size:12.5px">' +
-      (doc.published ? "中转端口在发布时分配" : "发布后才会分配中转端口") + "</span></header>";
+      (doc.published ? "中转端口在发布时分配；发布后入网的设备在入网时自动补分配" : "发布后才会分配中转端口") + "</span></header>";
     if (!doc.nodes.length) return h + '<div class="empty">还没有设备入网。</div></section>';
     h += "<table><thead><tr><th>设备</th><th>状态</th><th>观测外层地址</th><th>物理端口</th>" +
       "<th>中转端口</th><th>VPN 端口</th><th>隧道</th><th>中转</th><th>隧道下发</th></tr></thead><tbody>";

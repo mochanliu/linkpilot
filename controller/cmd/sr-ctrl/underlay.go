@@ -68,6 +68,21 @@ func (s *server) effectiveUnderlayLocked(tenant string) *underlay.State {
 	return underlay.New(underlay.DefaultSettings())
 }
 
+// ensureNodeTransitPortLocked hands one device the transit port the tenant's
+// published configuration owes it. Publishing only assigns the devices enrolled
+// at that moment, and customers enroll devices over time, so enrollment and the
+// heartbeat both call this. A tenant that never published (or never opened the
+// page) is a no-op, and so is a device that already has a port.
+//
+// Must be called with s.mu held.
+func (s *server) ensureNodeTransitPortLocked(tenant string, nodeID uint16) (uint16, bool, error) {
+	uc := s.underlayConfigLocked(tenant, false)
+	if uc == nil || uc.State == nil {
+		return 0, false, nil
+	}
+	return uc.State.EnsureDevice(nodeID)
+}
+
 // observedAddr is the address half of an observation. The port half is a NAT
 // binding that belongs to whatever destination produced it, so it never becomes
 // a tunnel endpoint; only the address is carried into NodeView. See NodeView.

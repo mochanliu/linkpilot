@@ -252,6 +252,86 @@ func TestPublishSettingsAssignsTransitPorts(t *testing.T) {
 	}
 }
 
+// A device that enrolls after publishing must still receive the configuration.
+// Its transit port is the only per-device artifact the published settings carry,
+// and a device without one can never relay anything.
+func TestEnsureDeviceAssignsForLateEnrollment(t *testing.T) {
+	s := New(DefaultSettings())
+	if _, assigned, err := s.EnsureDevice(2); err != nil || assigned {
+		t.Fatalf("未发布时补分配应什么都不做: assigned=%v err=%v", assigned, err)
+	}
+	if s.Configured() || len(s.TransitPorts) != 0 {
+		t.Fatal("未发布时补分配改动了状态")
+	}
+
+	if err := s.PublishSettings(s.Settings, []uint16{1}, 1000); err != nil {
+		t.Fatal(err)
+	}
+	gen := s.Gen
+	port, assigned, err := s.EnsureDevice(2)
+	if err != nil || !assigned || port != 15000 {
+		t.Fatalf("晚入网设备应拿到池内第一个端口 15000，实际 port=%d assigned=%v err=%v", port, assigned, err)
+	}
+	if s.Gen != gen+1 {
+		t.Fatalf("补分配必须推进下发版本，让设备重新拉取: %d -> %d", gen, s.Gen)
+	}
+
+	port, assigned, err = s.EnsureDevice(2)
+	if err != nil || assigned || port != 15000 {
+		t.Fatalf("重复补分配应幂等: port=%d assigned=%v err=%v", port, assigned, err)
+	}
+	if s.Gen != gen+1 {
+		t.Fatalf("幂等调用推进了版本: %d", s.Gen)
+	}
+	if _, _, err := s.EnsureDevice(0); err == nil {
+		t.Fatal("设备号 0 竟然补分配成功")
+	}
+}
+
+// Transit ports are per device, so a late device takes the same number the
+// early ones hold; nothing gets renumbered on the way.
+func TestEnsureDeviceNeverRenumbersExistingDevices(t *testing.T) {
+	s := New(DefaultSettings())
+	if err := s.PublishSettings(s.Settings, []uint16{1, 2}, 1000); err != nil {
+		t.Fatal(err)
+	}
+	gen := s.Gen
+	if _, assigned, err := s.EnsureDevice(3); err != nil || !assigned {
+		t.Fatalf("设备 3 应被补分配: assigned=%v err=%v", assigned, err)
+	}
+	for _, id := range []uint16{1, 2, 3} {
+		if s.TransitPorts[id] != 15000 {
+			t.Fatalf("设备 %d 的中转端口应是 15000，实际 %d", id, s.TransitPorts[id])
+		}
+	}
+	if s.Gen != gen+1 {
+		t.Fatalf("一次补分配只该推进一个版本，实际 %d -> %d", gen, s.Gen)
+	}
+}
+
+// A device whose own tunnels already fill the transit pool cannot be given a
+// port. The failure must leave the state exactly as it was so the next heartbeat
+// can retry once the operator widens the pool.
+func TestEnsureDeviceFailureLeavesStateUntouched(t *testing.T) {
+	s := New(DefaultSettings())
+	if err := s.PublishSettings(s.Settings, []uint16{1}, 1000); err != nil {
+		t.Fatal(err)
+	}
+	s.Settings.TransitPorts = PortRange{Min: 15000, Max: 15000}
+	s.Tunnels["t"] = &Tunnel{
+		ID: "t",
+		A:  Endpoint{NodeID: 2, Port: 15000},
+		B:  Endpoint{NodeID: 3, Port: 20001},
+	}
+	gen := s.Gen
+	if _, assigned, err := s.EnsureDevice(2); err == nil || assigned {
+		t.Fatalf("池子被自己的隧道占满时不该分配成功: assigned=%v err=%v", assigned, err)
+	}
+	if _, ok := s.TransitPorts[2]; ok || s.Gen != gen {
+		t.Fatalf("失败的补分配改动了状态: ports=%v gen=%d", s.TransitPorts, s.Gen)
+	}
+}
+
 func TestPublishSettingsRejectsZeroTimestampAndBadConfig(t *testing.T) {
 	s := New(DefaultSettings())
 	if err := s.PublishSettings(s.Settings, []uint16{1}, 0); err == nil {
