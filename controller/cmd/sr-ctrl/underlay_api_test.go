@@ -574,16 +574,24 @@ func TestUnderlayRelayPreviewNamesTheTemplateItWillCreate(t *testing.T) {
 
 // ------------------------------------------------------------------ topology
 
-func TestUnderlayTopologyBundlesParallelTunnelsAndShowsRelays(t *testing.T) {
+// One edge per device pair. A second tunnel on the same pair is refused with a
+// conflict rather than drawn as a parallel edge: one static WG key per device
+// makes it uninstallable in the dataplane (-116).
+func TestUnderlayTopologyBundlesOneTunnelPerPairAndShowsRelays(t *testing.T) {
 	s, ten, _ := underlayFixture(t)
 	publishDefault(t, s, ten)
 
-	for i := 0; i < 2; i++ {
-		if rec := createTunnel(t, s, ten, manualTunnel(1, 2, "wan0")); rec.Code != http.StatusCreated {
-			t.Fatalf("parallel tunnel %d = %d (%s)", i+1, rec.Code, rec.Body.String())
-		}
+	if rec := createTunnel(t, s, ten, manualTunnel(1, 2, "wan0")); rec.Code != http.StatusCreated {
+		t.Fatalf("tunnel = %d (%s)", rec.Code, rec.Body.String())
 	}
-	rec := createTunnel(t, s, ten, tunnelReq{
+	rec := createTunnel(t, s, ten, manualTunnel(2, 1, "wan0"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("同一对设备的第二条隧道应回 409，实际 %d (%s)", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "只能有一条隧道") {
+		t.Fatalf("拒绝里没说清原因: %s", body)
+	}
+	rec = createTunnel(t, s, ten, tunnelReq{
 		A:    underlaySpec{NodeID: 2, Iface: "wan0"},
 		B:    underlaySpec{NodeID: 3, Iface: "wan0"},
 		Path: &pathReq{NodeID: 1},
@@ -602,17 +610,12 @@ func TestUnderlayTopologyBundlesParallelTunnelsAndShowsRelays(t *testing.T) {
 	if len(topo.Bundles) != 2 {
 		t.Fatalf("topology has %d bundles; two pairs are two edges", len(topo.Bundles))
 	}
-	// Parallel tunnels between one pair are one edge with two details, not two
-	// lines on top of each other.
 	bundle := topo.Bundles[0]
-	if bundle.A != 1 || bundle.B != 2 || bundle.Count != 2 || len(bundle.Tunnels) != 2 {
+	if bundle.A != 1 || bundle.B != 2 || bundle.Count != 1 || len(bundle.Tunnels) != 1 {
 		t.Fatalf("first bundle = %+v", bundle)
 	}
 	if bundle.State != "unknown" {
 		t.Fatalf("bundle state = %q", bundle.State)
-	}
-	if bundle.Tunnels[0].A.Port == bundle.Tunnels[1].A.Port {
-		t.Fatalf("both parallel tunnels listen on %d; ports are unique per device", bundle.Tunnels[0].A.Port)
 	}
 	relayBundle := topo.Bundles[1]
 	if relayBundle.A != 2 || relayBundle.B != 3 || relayBundle.Tunnels[0].Path == nil ||
@@ -623,11 +626,11 @@ func TestUnderlayTopologyBundlesParallelTunnelsAndShowsRelays(t *testing.T) {
 	// A relay-only device has no edge of its own, so it is visible on the graph
 	// only through these per-node counts.
 	n1 := nodeByID(t, topo.Nodes, 1)
-	if n1.TunnelCount != 2 || n1.RelayFor != 1 || n1.TransitPort != 15000 || len(n1.Ports) != 2 {
+	if n1.TunnelCount != 1 || n1.RelayFor != 1 || n1.TransitPort != 15000 || len(n1.Ports) != 1 {
 		t.Fatalf("relay device row = %+v", n1)
 	}
-	if n2 := nodeByID(t, topo.Nodes, 2); n2.TunnelCount != 3 {
-		t.Fatalf("device 2 tunnel count = %d, want 3", n2.TunnelCount)
+	if n2 := nodeByID(t, topo.Nodes, 2); n2.TunnelCount != 2 {
+		t.Fatalf("device 2 tunnel count = %d, want 2", n2.TunnelCount)
 	}
 }
 

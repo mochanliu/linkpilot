@@ -126,6 +126,12 @@ type NodeRecord struct {
 	// offline, and the console must be able to show the last thing it said.
 	Config *wire.ConfigState `json:"config_state,omitempty"`
 
+	// Tunnel is the device's own report of the tunnel configuration it runs
+	// (wire.TunnelState). Persisted for the same reason as Config: the last
+	// thing the box said about its tunnels is still the best fact available
+	// while it is offline.
+	Tunnel *wire.TunnelState `json:"tunnel_state,omitempty"`
+
 	// Ifaces is the device's interface inventory (names, L3 MTU, state, its own
 	// IPv4 addresses), reported when the agent runs with -vpp-api. Persisted for
 	// the same reason as Config: the controller needs it to plan a tunnel, and a
@@ -1028,6 +1034,13 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		rec.Ifaces = &st
 		rec.InventoryAt = time.Now().Unix()
 	}
+	// Same rule as Config: stored as reported, never inferred from "published".
+	tunnelChanged := false
+	if req.Tunnel != nil && (rec.Tunnel == nil || *rec.Tunnel != *req.Tunnel) {
+		st := *req.Tunnel
+		rec.Tunnel = &st
+		tunnelChanged = true
+	}
 	s.save()
 
 	// Coming back from stale, or offering key material peers have not seen, are
@@ -1043,11 +1056,16 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// Console-facing: the config page's applied/failed/applying column moved.
 		s.admin.publish("node.config", rec.TenantID, rec)
 	}
+	if tunnelChanged {
+		// Console-facing: the underlay page's applied/failed column moved.
+		s.admin.publish("node.underlay", rec.TenantID, rec)
+	}
 	json.NewEncoder(w).Encode(wire.HeartbeatResponse{
 		Epoch:         s.advanceEpoch(),
 		PeerCount:     len(s.peersLocked(tenant, nodeID)),
 		BindingErr:    bindingErr,
 		ConfigVersion: s.desiredConfigVersionLocked(tenant, nodeID),
+		TunnelVersion: s.underlayVersionLocked(tenant),
 	})
 }
 
@@ -1079,7 +1097,13 @@ func (s *server) handleMapping(w http.ResponseWriter, r *http.Request) {
 		rec.MappingAt = time.Now().Unix()
 	}
 	rec.LocalPort = rep.LocalPort
-	rec.Symmetric = rep.SymmetricNAT
+	// A verdict is only stored when the reporter says it measured one. An agent
+	// that has not run the two-reflector comparison sends the zero value, and
+	// recording that as "not symmetric" would let the planner build a tunnel
+	// that cannot work.
+	if rep.SymmetricKnown {
+		rec.Symmetric = rep.SymmetricNAT
+	}
 	rec.Reflector = rep.Reflector
 	rec.LastSeen = time.Now().Unix()
 	rec.Reach = "unknown"
@@ -1927,6 +1951,7 @@ func main() {
 	mux.HandleFunc("/v1/enroll", s.handleEnroll)
 	mux.HandleFunc("/v1/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/v1/config/bundle", s.handleConfigBundle)
+	mux.HandleFunc("/v1/underlay/bundle", s.handleUnderlayBundle)
 	mux.HandleFunc("/v1/mapping", s.handleMapping)
 	mux.HandleFunc("/v1/observe", s.handleObserve)
 	mux.HandleFunc("/v1/metrics", s.handleMetrics)

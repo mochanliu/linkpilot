@@ -53,7 +53,7 @@ func mustCreate(t *testing.T, s *State, views map[uint16]NodeView, a, b uint16, 
 // route to a brand-new tunnel.
 func TestOverlayFIFOReleasesToTheBack(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/29") // .1 .. .6
-	views := testViews(1, 2)
+	views := testViews(1, 2, 3, 4)
 
 	t1 := mustCreate(t, s, views, 1, 2, nil)
 	if t1.A.Overlay != "10.9.0.1" || t1.B.Overlay != "10.9.0.2" {
@@ -66,11 +66,11 @@ func TestOverlayFIFOReleasesToTheBack(t *testing.T) {
 		t.Fatalf("释放后队尾应是 .1,.2，实际 %v", s.OverlayFreed)
 	}
 
-	t2 := mustCreate(t, s, views, 1, 2, nil)
+	t2 := mustCreate(t, s, views, 1, 3, nil)
 	if t2.A.Overlay != "10.9.0.3" || t2.B.Overlay != "10.9.0.4" {
 		t.Fatalf("释放的地址被立刻复用了：新隧道取了 %s/%s", t2.A.Overlay, t2.B.Overlay)
 	}
-	t3 := mustCreate(t, s, views, 1, 2, nil)
+	t3 := mustCreate(t, s, views, 1, 4, nil)
 	if t3.A.Overlay != "10.9.0.5" || t3.B.Overlay != "10.9.0.6" {
 		t.Fatalf("第三条隧道应取 .5/.6，实际 %s/%s", t3.A.Overlay, t3.B.Overlay)
 	}
@@ -82,11 +82,33 @@ func TestOverlayFIFOReleasesToTheBack(t *testing.T) {
 
 func TestOverlayExhaustionIsAnError(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/30") // .1, .2
-	views := testViews(1, 2)
+	views := testViews(1, 2, 3)
 	mustCreate(t, s, views, 1, 2, nil)
-	if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Now: 1000}, views); !errors.Is(err, ErrOverlayExhausted) {
+	// A different pair, so what runs out is the address pool -- not the
+	// one-tunnel-per-pair rule.
+	if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 3}, Now: 1000}, views); !errors.Is(err, ErrOverlayExhausted) {
 		t.Fatalf("池子用尽应返回 ErrOverlayExhausted，实际 %v", err)
 	}
+}
+
+// One static WG key per device: a second tunnel on the same pair cannot be
+// installed (VPP dedupes peers by pubkey across interfaces, -116), so it is
+// refused at creation rather than at apply time.
+func TestSecondTunnelOnTheSamePairIsRefused(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+	first := mustCreate(t, s, views, 1, 2, nil)
+	if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 2}, B: EndpointSpec{NodeID: 1}, Now: 1000}, views); !errors.Is(err, ErrPairTaken) {
+		t.Fatalf("同一对设备的第二条隧道应被拒（ErrPairTaken），实际 %v", err)
+	}
+	if len(s.Tunnels) != 1 {
+		t.Fatalf("被拒的创建不该留下任何东西，实际 %d 条", len(s.Tunnels))
+	}
+	// The pair becomes usable again once the tunnel is gone.
+	if err := s.Delete(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	mustCreate(t, s, views, 1, 2, nil)
 }
 
 // Ports are unique per DEVICE: both ends may hold 20000, and a second tunnel on
@@ -142,8 +164,9 @@ func TestOneTransitPortPerDevice(t *testing.T) {
 	if len(s.TransitPorts) != 1 {
 		t.Fatalf("只有设备 1 做中转，实际分配了 %v", s.TransitPorts)
 	}
-	// A tunnel that does not relay must not assign one.
-	mustCreate(t, s, views, 2, 3, nil)
+	// A tunnel that does not relay must not assign one. (Pair 1-2 is free: the
+	// relays above are 2-3 and 2-4.)
+	mustCreate(t, s, views, 1, 2, nil)
 	if len(s.TransitPorts) != 1 {
 		t.Fatalf("直连隧道不该分配中转端口，实际 %v", s.TransitPorts)
 	}

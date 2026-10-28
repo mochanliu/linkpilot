@@ -6,12 +6,12 @@ package main
 // customer, and the page cannot resolve a template id -- and nothing in this
 // file changes state.
 //
-// The one thing these views deliberately do NOT carry is a tunnel state. Tunnels
-// are configuration; liveness comes from telemetry, which is keyed by the
-// dataplane's sw_if_index. Until the tunnel section is delivered to the devices
-// (a later step) there is no sw_if_index for a configured tunnel, so every edge
-// says "unknown" and the document says why. An invented "down" would be read as
-// a measurement.
+// The one thing these views deliberately do NOT carry is a per-EDGE tunnel
+// state. Devices do report the tunnel channel (wire.TunnelState, shown per node)
+// and their own tunnel table, but telemetry is still keyed by the dataplane's
+// sw_if_index and the controller does not yet join a telemetry row to a
+// configured tunnel, so every edge says "unknown" and the document says why. An
+// invented "down" would be read as a measurement.
 
 import (
 	"sort"
@@ -22,7 +22,7 @@ import (
 
 // underlayStateNote explains the fixed "unknown" edge state. It is a sentence,
 // not a code, because it is the honest answer to "why is nothing green yet".
-const underlayStateNote = "隧道状态一律为「未知」：隧道配置还没有下发到设备，设备上报的遥测按数据面接口索引记账，控制器暂时无法把遥测行对到这里的隧道。"
+const underlayStateNote = "每条隧道的运行状态仍是「未知」：设备会回报它自己建了几条隧道（见设备表的「隧道下发」列），但遥测行按数据面接口索引记账，控制器还没把每一行对到某条隧道上。"
 
 type underlayEndpointView struct {
 	NodeID uint16 `json:"node_id"`
@@ -95,6 +95,13 @@ type underlayNodeView struct {
 	Ports       []uint16 `json:"ports"`
 	TunnelCount int      `json:"tunnel_count"`
 	RelayFor    int      `json:"relay_for"`
+
+	// TunnelDelivery is the device's OWN account of the underlay channel
+	// (wire.TunnelState), persisted with the node. nil means it never reported
+	// (an agent without -vpp-api); capable:false means the channel exists and is
+	// switched off. TunnelCount above is what the CONTROLLER configured for this
+	// node, so the page shows both: "configured" is not "running".
+	TunnelDelivery *wire.TunnelState `json:"tunnel_delivery,omitempty"`
 }
 
 type underlayTemplateView struct {
@@ -213,6 +220,7 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 			DefaultIface: v.DefaultIface, TransitPort: v.TransitPort,
 			Ports: st.PortsOnNode(n.NodeID), TunnelCount: counts[n.NodeID],
 			RelayFor: relayFor[n.NodeID], Ifaces: []wire.IfaceInfo{},
+			TunnelDelivery: n.Tunnel,
 		}
 		if n.MappingAt > 0 && now > n.MappingAt {
 			row.ObservedAgeSec = now - n.MappingAt

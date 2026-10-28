@@ -75,6 +75,16 @@ var requiredVersions = map[string]string{
 	// 同一份 JSON 里的 dump/details：结构体一旦变，CRC 一定先于超时告诉我们。
 	"sw_interface_dump":    "aa610c27",
 	"sw_interface_details": "6c221fc7",
+	// overlay 侧的四条核心消息（地址、表、admin 状态、MPLS）。CRC 取自 srwg-node1
+	// 生成的 interface.api.h / mpls.api.h 里的 _CRC 宏，见 interface.go 顶部那张表。
+	"sw_interface_set_flags":          "f5aec1b8",
+	"sw_interface_set_flags_reply":    "e8d4e804",
+	"sw_interface_add_del_address":    "5463d73b",
+	"sw_interface_add_del_address_reply": "e8d4e804",
+	"sw_interface_set_table":          "df42a577",
+	"sw_interface_set_table_reply":    "e8d4e804",
+	"sw_interface_set_mpls_enable":        "ae6cfcfb",
+	"sw_interface_set_mpls_enable_reply":  "e8d4e804",
 	// 接口 IPv4 地址（设备侧接口清单）。CRC 取自 srwg-node1 的 ip.api.json，
 	// 并用 test/scripts/vpp-api-probe4.py 在运行中的 VPP 上按注册表复核过。
 	"ip_address_dump":    "2d033de4",

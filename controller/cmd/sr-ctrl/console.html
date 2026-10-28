@@ -558,7 +558,7 @@
         $("live-dot").className = "dot ok";
         $("live-text").textContent = "实时";
       });
-      ["node.online", "node.enrolled", "node.stale", "node.config", "config.published", "tenant.created", "claim.created", "claim.revoked", "claim.updated"].forEach(function (n) {
+      ["node.online", "node.enrolled", "node.stale", "node.config", "node.underlay", "config.published", "tenant.created", "claim.created", "claim.revoked", "claim.updated"].forEach(function (n) {
         S.es.addEventListener(n, function (e) {
           var ev = {};
           try { ev = JSON.parse(e.data); } catch (_) {}
@@ -568,6 +568,10 @@
           // publish must reach it. A dirty draft still wins: reloading would
           // throw away what the tenant is typing, and "重新载入" is right there.
           if (S.view === "config" && S.cfg && S.cfg.view && !S.cfg.dirty) loadConfig();
+          // Same for the underlay pages: a device reporting which tunnel version
+          // it installed changes the 「隧道下发」 column. loadUnderlay keeps the
+          // tenant's unsaved form, so this cannot eat an edit in progress.
+          if (n === "node.underlay" && S.view && S.view.indexOf("underlay-") === 0) loadUnderlay();
           if (n === "node.enrolled") toast("设备已入网，正在等待第一个心跳");
           if (n === "node.online") toast("设备上线");
           if (n === "node.stale") toast("设备失联：心跳超时");
@@ -632,7 +636,7 @@
     },
     "underlay-topology": {
       title: "拓扑图",
-      sub: "设备与隧道连线的只读视图；隧道状态一律显示「未知」，因为隧道段还没有下发到设备，控制器无法把遥测行对到这里",
+      sub: "设备与隧道连线的只读视图；每条连线的运行状态仍显示「未知」（遥测行还没逐条对上），每台设备建了几条隧道看设备表的「隧道下发」列",
       roles: ["tenant"]
     },
     routes: { title: "路由", sub: "尚未实现：路由表由 RR 反射，控制器不发布路由", roles: ["tenant"] },
@@ -827,7 +831,7 @@
       "<li>立刻复制或手抄到设备上；码只显示这一次，重新生成后旧码立即失效</li>" +
       "<li>设备出现在「设备」页即表示归属成功；心跳变绿才代表在线</li>" +
       "<li>心跳年龄、在线时长与隧道内遥测在「监控」页；没有上报时那里会明说，不显示 0 或假数据</li>" +
-      "<li>隧道参数（端口 / overlay 地址 / 中转）在「全局配置」和「隧道配置」页编排；隧道段还没有随配置包下发到设备，所以设备暂时仍显示「未配置」</li>" +
+      "<li>隧道参数（端口 / overlay 地址 / 中转）在「全局配置」和「隧道配置」页编排；发布后隧道段随心跳下发给开着 -tunnels 的设备，设备建了几条、版本几、有没有报错在设备表的「隧道下发」列（没上报就写「未上报」，不写 0）</li>" +
       "</ul></div></section>";
   }
 
@@ -1309,7 +1313,8 @@
       return '<section class="panel"><header><h2>underlay：VPN 隧道承载</h2>' +
         '<span class="tag online">已拆成独立页面</span></header>' +
         '<div class="hint">这一层管「盒子之间怎么通」，现在有三页：全局配置（端口池 / overlay 池 / 探测参数）、' +
-        "隧道配置（自动编排、手动创建、路径模板）、拓扑图。隧道配置保存在控制器；隧道段还没有随配置包下发到设备，下一步才做。</div>" +
+        "隧道配置（自动编排、手动创建、路径模板）、拓扑图。隧道配置保存在控制器，发布后随心跳下发给开着 -tunnels 的设备；" +
+        "设备自己汇报建成了几条、用的是哪个版本，没上报就显示「未上报」。</div>" +
         '<ul class="bnd">' +
         "<li><b>端口</b> · VPN 端口按设备唯一，中转端口每台设备一个（不是每条隧道一个）。</li>" +
         "<li><b>overlay /32</b> · 先进先出分配，删除隧道后退回队尾。</li>" +
@@ -2454,13 +2459,33 @@
     return h;
   }
 
+  // 设备自己回报的隧道下发状态。四种情况分开写，因为处置完全不同：
+  //   没有 tunnel_delivery → 这台设备的 agent 没有数据面通道（没开 -vpp-api）
+  //   capable:false        → 通道在，但没开 -tunnels
+  //   有 error             → 试过但没成功，错误原文放在悬停里
+  //   其余                 → 已下发版本 + 实际建了几条（跳过的也写出来）
+  function undTunnelDeliveryCell(n) {
+    var d = n.tunnel_delivery;
+    if (!d) return '<span class="tag pending">未上报</span>';
+    if (!d.capable) return '<span class="tag pending" title="agent 在跑，但没有开 -tunnels">未启用</span>';
+    if (d.applying) return '<span class="tag pending">下发中 v' + esc(d.applying_version) + "</span>";
+    var label = "v" + esc(d.version || 0) + " · " + esc(d.tunnels || 0) + " 条";
+    if (d.skipped) label += " · 跳过 " + esc(d.skipped);
+    if (d.error) {
+      return '<span class="tag stale" title="' + esc(d.error) + '">有隧道没装上</span>' +
+        '<div class="muted" style="font-size:12px">' + label + "</div>";
+    }
+    if (!d.version) return '<span class="tag pending">还没有可下发的版本</span>';
+    return '<span class="tag online">' + label + "</span>";
+  }
+
   function undNodePanel(doc) {
     var h = '<section class="panel"><header><h2>设备与中转端口</h2>' +
       '<span class="muted" style="font-size:12.5px">' +
       (doc.published ? "中转端口在发布时分配" : "发布后才会分配中转端口") + "</span></header>";
     if (!doc.nodes.length) return h + '<div class="empty">还没有设备入网。</div></section>';
     h += "<table><thead><tr><th>设备</th><th>状态</th><th>观测外层地址</th><th>物理端口</th>" +
-      "<th>中转端口</th><th>VPN 端口</th><th>隧道</th><th>中转</th></tr></thead><tbody>";
+      "<th>中转端口</th><th>VPN 端口</th><th>隧道</th><th>中转</th><th>隧道下发</th></tr></thead><tbody>";
     doc.nodes.forEach(function (n) {
       h += "<tr>" +
         '<td><span class="mono">node-' + esc(n.node_id) + '</span><div class="muted" style="font-size:12px">' +
@@ -2472,6 +2497,7 @@
         '<td class="mono">' + (n.ports.length ? esc(n.ports.join("、")) : '<span class="muted">—</span>') + "</td>" +
         '<td class="num">' + esc(n.tunnel_count) + "</td>" +
         '<td class="num muted">' + (n.relay_for ? esc(n.relay_for) + " 条" : "—") + "</td>" +
+        "<td>" + undTunnelDeliveryCell(n) + "</td>" +
         "</tr>";
     });
     return h + "</tbody></table></section>";
@@ -2821,7 +2847,7 @@
       u.mPath = "direct";
       u.note = { kind: "", text: "隧道 " + res.tunnel.id + " 已创建（" +
         (res.tunnel.path ? "经 " + (res.tunnel.path.serial || ("node-" + res.tunnel.path.node_id)) + " 中转" : "直连") +
-        "）；隧道段还没有下发到设备。" };
+        "）；隧道段随心跳下发：开着 -tunnels 的设备下一轮心跳会拉走并把结果回报到设备表的「隧道下发」列。" };
       releaseForm(form);
       undSetDoc(res.underlay);
       toast("隧道已创建");
@@ -2918,8 +2944,8 @@
   function undDeleteTunnel(id) {
     var u = S.und;
     if (!u) return;
-    if (!confirm("删除隧道 " + id + "？\n\n两端 overlay /32 会退回地址池队尾。隧道段还没有下发到设备，" +
-      "所以这次删除只改控制器里的隧道表。")) return;
+    if (!confirm("删除隧道 " + id + "？\n\n两端 overlay /32 会退回地址池队尾。这次删除会写进控制器隧道表并把版本号加一，" +
+      "开着 -tunnels 的设备下一轮心跳会撤掉这条隧道。")) return;
     api("DELETE", "/api/underlay/tunnels?id=" + encodeURIComponent(id)).then(function (res) {
       u.note = { kind: "", text: "隧道 " + id + " 已删除；两端 overlay /32 已退回池尾。" };
       if (u.editTun === id) u.editTun = null;
@@ -3160,6 +3186,10 @@
         undKv("VPN 端口", nd.ports.length ? '<span class="mono">' + esc(nd.ports.join("、")) + "</span>" : "—") +
         undKv("隧道", esc(nd.tunnel_count) + " 条") +
         undKv("为其他隧道中转", nd.relay_for ? esc(nd.relay_for) + " 条" : "—") +
+        undKv("隧道下发", undTunnelDeliveryCell(nd)) +
+        (nd.tunnel_delivery && nd.tunnel_delivery.error
+          ? undKv("下发失败原因", '<span class="mono">' + esc(nd.tunnel_delivery.error) + "</span>")
+          : "") +
         "</dl>";
       if (nd.inventory_reported && nd.ifaces && nd.ifaces.length) {
         h += '<div class="hint" style="margin-top:12px">接口清单' +
@@ -3214,8 +3244,8 @@
     }
     h += '<div class="hint">' + esc(doc.state_note) + "</div>" +
       undTopoSVG(doc) +
-      '<div class="hint" style="margin-top:10px">实线 = 直连；虚线 = 经中转设备。同一设备对之间的多条隧道画成一条线，点开看明细。' +
-      "自动编排不会给已有隧道的设备对再建一条，第二条隧道只能手动创建。</div></section>";
+      '<div class="hint" style="margin-top:10px">实线 = 直连；虚线 = 经中转设备。每条连线对一条隧道：同一设备对之间只能有一条' +
+      "（每台设备只有一把 WireGuard 静态密钥，第二条会被数据面以 -116 拒掉），要换端口或路径就编辑或删了重建。</div></section>";
     h += undTopoDetail(doc);
     return h;
   }

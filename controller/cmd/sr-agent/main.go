@@ -32,6 +32,8 @@ import (
 
 	"sdwan/controller/internal/agent"
 	"sdwan/controller/internal/apply"
+	"sdwan/controller/internal/keybinding"
+	"sdwan/controller/internal/vppapi"
 	"sdwan/controller/internal/wire"
 )
 
@@ -41,33 +43,42 @@ var processStart = time.Now()
 
 func main() {
 	var (
-		ctrl    = flag.String("ctrl", "", "controller TLS endpoint, host:port (required)")
-		claim   = flag.String("claim", "", "enrollment claim code (required only until the device has an identity)")
-		caPath  = flag.String("ca", "", "pinned controller CA bundle for the FIRST enrollment (default <id-dir>/pinned_ca.pem)")
-		idDir   = flag.String("id", "./agent-id", "identity directory (device key, WG key, cert, CA)")
-		serial  = flag.String("serial", "", "device serial (default hostname)")
+		ctrl       = flag.String("ctrl", "", "controller TLS endpoint, host:port (required)")
+		claim      = flag.String("claim", "", "enrollment claim code (required only until the device has an identity)")
+		caPath     = flag.String("ca", "", "pinned controller CA bundle for the FIRST enrollment (default <id-dir>/pinned_ca.pem)")
+		idDir      = flag.String("id", "./agent-id", "identity directory (device key, WG key, cert, CA)")
+		serial     = flag.String("serial", "", "device serial (default hostname)")
 		statusAddr = flag.String("status", "127.0.0.1:8089", "local status endpoint (empty disables it)")
-		once    = flag.Bool("once", false, "enroll if needed, send one heartbeat, print status, exit")
-		extraHB = flag.Int("hb", 0, "override the controller's heartbeat interval in seconds (testing only)")
+		once       = flag.Bool("once", false, "enroll if needed, send one heartbeat, print status, exit")
+		extraHB    = flag.Int("hb", 0, "override the controller's heartbeat interval in seconds (testing only)")
 
 		// Applying configuration needs root, vppctl and FRR, so it is opt-in.
 		// Without -apply the agent still heartbeats and still REPORTS its config
 		// state (which is "capable: false"), because a device that silently
 		// ignores published versions must look different from one that has
 		// nothing to install.
-		applyCfg   = flag.Bool("apply", false, "install the controller's published config (needs root, vppctl, FRR)")
-		storeRoot  = flag.String("store", "/var/lib/sr-cpe", "sr-apply store root (versions/, current, status.json)")
-		vppctl     = flag.String("vppctl", "vppctl", "vppctl binary")
-		frrConf    = flag.String("frr-conf", "/etc/frr/frr.conf", "FRR config path")
-		frrReload  = flag.String("frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
+		applyCfg  = flag.Bool("apply", false, "install the controller's published config (needs root, vppctl, FRR)")
+		storeRoot = flag.String("store", "/var/lib/sr-cpe", "sr-apply store root (versions/, current, status.json)")
+		vppctl    = flag.String("vppctl", "vppctl", "vppctl binary")
+		frrConf   = flag.String("frr-conf", "/etc/frr/frr.conf", "FRR config path")
+		frrReload = flag.String("frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
 
 		// The interface inventory is read-only and off by default: a box whose
 		// VPP is managed by hand may not have this socket, and an agent that
 		// fails to start because an optional report is unavailable is worse
 		// than one that reports nothing.
 		vppAPI = flag.String("vpp-api", "", "VPP api.sock for the read-only interface inventory (empty disables it)")
+
+		// The tunnel applier WRITES to VPP, so it is a separate opt-in from the
+		// read-only inventory above: an operator who gave this agent the socket
+		// to report interfaces did not thereby hand over the dataplane.
+		tunnels = flag.Bool("tunnels", false, "install the controller's tunnel section into VPP (needs -vpp-api)")
 	)
 	flag.Parse()
+
+	if *tunnels && strings.TrimSpace(*vppAPI) == "" {
+		log.Fatal("--tunnels needs --vpp-api: the applier works through VPP's api socket")
+	}
 
 	if strings.TrimSpace(*ctrl) == "" {
 		log.Fatal("--ctrl is required (host:port of the controller's mTLS endpoint)")
@@ -150,6 +161,27 @@ func main() {
 		log.Printf("interface inventory on (vpp api %s)", *vppAPI)
 	}
 
+	// Tunnel applier. Off unless -tunnels is given because, unlike the inventory
+	// above, it WRITES to VPP. The connection is dialled lazily: a VPP that is
+	// down at start is a state to report ("capable, nothing applied yet"), not a
+	// reason to refuse to run, and the reconciler redials by itself (see
+	// TunnelSync.dropDeadConnection).
+	var tun *agent.TunnelSync
+	if *tunnels {
+		dial := func(ctx context.Context) (agent.DataPlane, error) {
+			return vppapi.Dial(ctx, *vppAPI, "sr-agent-tunnel")
+		}
+		dp, derr := dial(ctx)
+		if derr != nil {
+			log.Printf("tunnel applier: no VPP connection yet (%v); the first reconcile will retry", derr)
+		}
+		tun = agent.NewTunnelSync(dp, id, client.UnderlayBundle, log.Printf)
+		tun.SetRedial(dial)
+		log.Printf("tunnel applier on (vpp api %s)", *vppAPI)
+	}
+	st.setChannels(tun, *vppAPI != "")
+	reporter := &reportSender{client: client, id: id, tun: tun, logf: log.Printf}
+
 	var cfg *configSync
 	if *applyCfg {
 		store := apply.Store{Root: *storeRoot}
@@ -166,13 +198,15 @@ func main() {
 		} else {
 			log.Printf("config sync on (store %s, nothing installed yet)", *storeRoot)
 		}
-		st.cfg = cfg
+		st.setConfig(cfg)
 	}
 
 	if *once {
 		hbctx, hbcancel := context.WithTimeout(ctx, 15*time.Second)
 		req := wire.HeartbeatRequest{Uptime: 0}
+		req.Binding = signedBinding(id, log.Printf)
 		req.Config = st.configReport()
+		req.Tunnel = st.tunnelReport()
 		req.Ifaces = readInventory(ctx, inv)
 		resp, err := client.Heartbeat(hbctx, req)
 		hbcancel()
@@ -180,8 +214,8 @@ func main() {
 			log.Fatalf("heartbeat: %v", err)
 		}
 		st.markOK(resp)
-		log.Printf("heartbeat ok: epoch=%d peers=%d binding_err=%q config_version=%d",
-			resp.Epoch, resp.PeerCount, resp.BindingErr, resp.ConfigVersion)
+		log.Printf("heartbeat ok: epoch=%d peers=%d binding_err=%q config_version=%d tunnel_version=%d",
+			resp.Epoch, resp.PeerCount, resp.BindingErr, resp.ConfigVersion, resp.TunnelVersion)
 		if cfg != nil && resp.ConfigVersion > 0 {
 			actx, acancel := context.WithTimeout(ctx, 5*time.Minute)
 			err := cfg.Sync(actx, resp.ConfigVersion)
@@ -190,6 +224,19 @@ func main() {
 				log.Fatalf("config v%d: %v", resp.ConfigVersion, err)
 			}
 		}
+		// Applied synchronously here (not Kick'ed): -once prints the state and
+		// exits, so a tunnel left to a background goroutine would never land.
+		if tun != nil && resp.TunnelVersion > 0 {
+			tctx, tcancel := context.WithTimeout(ctx, 5*time.Minute)
+			err := tun.Sync(tctx, resp.TunnelVersion)
+			tcancel()
+			if err != nil {
+				log.Fatalf("tunnel v%d: %v", resp.TunnelVersion, err)
+			}
+		}
+		// Reported AFTER applying, so the tunnel table the controller stores is
+		// what the dataplane really has, not what the bundle asked for.
+		reporter.send(ctx, req.Ifaces)
 		b, _ := json.MarshalIndent(st.snapshot(), "", "  ")
 		fmt.Println(string(b))
 		return
@@ -205,7 +252,9 @@ func main() {
 	for {
 		hbctx, hbcancel := context.WithTimeout(ctx, 10*time.Second)
 		req := wire.HeartbeatRequest{Uptime: int64(time.Since(processStart).Seconds())}
+		req.Binding = signedBinding(id, log.Printf)
 		req.Config = st.configReport()
+		req.Tunnel = st.tunnelReport()
 		req.Ifaces = readInventory(ctx, inv)
 		resp, err := client.Heartbeat(hbctx, req)
 		hbcancel()
@@ -233,6 +282,14 @@ func main() {
 			if cfg != nil {
 				cfg.Kick(ctx, resp.ConfigVersion)
 			}
+			if tun != nil {
+				tun.Kick(ctx, resp.TunnelVersion)
+			}
+			// What this box really runs, reported every beat: the mapping table
+			// (binding + tunnel endpoints + own addresses) and one window of
+			// outer-source observations. Both are readings, so they are taken
+			// after the reconcile was Kicked rather than before it.
+			reporter.send(ctx, req.Ifaces)
 		}
 
 		wait := time.Duration(hbSec) * time.Second
@@ -271,6 +328,19 @@ func readInventory(ctx context.Context, inv *agent.InventoryReporter) *[]wire.If
 	ictx, icancel := context.WithTimeout(ctx, 3*time.Second)
 	defer icancel()
 	return inv.Report(ictx)
+}
+
+// signedBinding is the WG-key attestation carried by every heartbeat: a
+// statement signed with the device identity key, not a derived value. It can
+// only fail before enrollment, which main refuses earlier, so a nil here means
+// the controller must treat this box as unbound rather than trust the key.
+func signedBinding(id *agent.Identity, logf func(string, ...any)) *keybinding.Binding {
+	b, err := id.Binding()
+	if err != nil {
+		logf("key binding: %v", err)
+		return nil
+	}
+	return &b
 }
 
 // ctrlBase normalises --ctrl into an https URL. Bare host:port is the common
@@ -325,14 +395,19 @@ type agentStatus struct {
 	// cfg is nil when the agent runs without -apply; the status view then says
 	// capable:false rather than hiding the channel.
 	cfg *configSync
+	// tun is nil when the agent runs without -tunnels. hasVPPAPI is separate
+	// because "this binary has the channel, it is switched off" and "this
+	// binary has no dataplane at all" must not report the same thing.
+	tun       *agent.TunnelSync
+	hasVPPAPI bool
 
-	hbInterval   int
-	Heartbeats   int64  `json:"heartbeats"`
-	LastOK       int64  `json:"last_ok_unix"`
-	LastErr      string `json:"last_err,omitempty"`
-	Epoch        uint32 `json:"epoch"`
-	PeerCount    int    `json:"peer_count"`
-	BindingErr   string `json:"binding_err,omitempty"`
+	hbInterval int
+	Heartbeats int64  `json:"heartbeats"`
+	LastOK     int64  `json:"last_ok_unix"`
+	LastErr    string `json:"last_err,omitempty"`
+	Epoch      uint32 `json:"epoch"`
+	PeerCount  int    `json:"peer_count"`
+	BindingErr string `json:"binding_err,omitempty"`
 }
 
 type statusView struct {
@@ -351,9 +426,11 @@ type statusView struct {
 	DataPlane  string `json:"dataplane"`
 
 	Config *wire.ConfigState `json:"config"`
+	// Tunnel is what the box runs on the underlay channel. nil = this agent has
+	// no dataplane (no -vpp-api); capable:false = the channel exists but
+	// -tunnels is off.
+	Tunnel *wire.TunnelState `json:"tunnel"`
 }
-
-const noDataPlane = "none: enrollment carries no configuration; -apply installs only the customer-side config, tunnels/ports still wait for the underlay plan"
 
 func (s *agentStatus) snapshot() statusView {
 	s.mu.Lock()
@@ -364,7 +441,8 @@ func (s *agentStatus) snapshot() statusView {
 		Heartbeats: s.Heartbeats, HBInterval: s.hbInterval,
 		LastOK: s.LastOK, LastErr: s.LastErr,
 		Epoch: s.Epoch, PeerCount: s.PeerCount, BindingErr: s.BindingErr,
-		DataPlane: noDataPlane,
+		DataPlane: s.dataPlaneDesc(),
+		Tunnel:    s.tunnelReportLocked(),
 	}
 	if s.cfg != nil {
 		cur := s.cfg.State()
@@ -373,6 +451,56 @@ func (s *agentStatus) snapshot() statusView {
 		v.Config = &wire.ConfigState{Capable: false}
 	}
 	return v
+}
+
+// dataPlaneDesc says what this process can do to the dataplane, in the same
+// honest spirit as configReport: a box with the socket but the applier off must
+// not read like a box that owns the dataplane.
+func (s *agentStatus) dataPlaneDesc() string {
+	switch {
+	case s.tun != nil:
+		return "underlay tunnels (-tunnels): applies the controller's tunnel section; -apply adds the customer-side config"
+	case s.hasVPPAPI:
+		return "inventory only (-vpp-api): interfaces are read, nothing is installed; add -tunnels to apply the tunnel section"
+	default:
+		return "none: enrollment carries no configuration; -vpp-api and -apply are both off"
+	}
+}
+
+// tunnelReport is what every heartbeat carries about the underlay channel.
+// nil means "no dataplane to apply to at all"; capable:false means "the channel
+// exists in this binary and was switched off" -- the controller renders the two
+// differently, so collapsing them would hide a device that predates the channel.
+func (s *agentStatus) tunnelReport() *wire.TunnelState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tunnelReportLocked()
+}
+
+func (s *agentStatus) tunnelReportLocked() *wire.TunnelState {
+	if s.tun != nil {
+		cur := s.tun.State()
+		return &cur
+	}
+	if s.hasVPPAPI {
+		return &wire.TunnelState{Capable: false}
+	}
+	return nil
+}
+
+// setChannels records which dataplane channels this process runs. It takes the
+// lock because the status listener is already serving while main is wiring
+// these up.
+func (s *agentStatus) setChannels(tun *agent.TunnelSync, hasVPPAPI bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tun, s.hasVPPAPI = tun, hasVPPAPI
+}
+
+func (s *agentStatus) setConfig(cfg *configSync) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg = cfg
 }
 
 // configReport is what every heartbeat carries. A device without -apply says

@@ -363,8 +363,13 @@ type MappingReport struct {
 	UDPMapping   string              `json:"udp_mapping"` // "ip:port" as observed by the reflector
 	LocalPort    int                 `json:"local_port"`  // the node's own local port (for symmetric-NAT analysis)
 	SymmetricNAT bool                `json:"symmetric_nat"`
-	Reflector    string              `json:"reflector_addr"` // which reflector produced this mapping
-	Binding      *keybinding.Binding `json:"key_binding,omitempty"`
+	// SymmetricKnown says whether SymmetricNAT is a measurement or just the zero
+	// value. An agent that has not run the two-reflector comparison cannot tell,
+	// and reporting false would let the planner build a tunnel that cannot work.
+	// The controller only records the verdict when this is true.
+	SymmetricKnown bool                `json:"symmetric_known,omitempty"`
+	Reflector      string              `json:"reflector_addr"` // which reflector produced this mapping
+	Binding        *keybinding.Binding `json:"key_binding,omitempty"`
 
 	// VpnPort / TransitPort are what this node's dataplane REALLY listens on,
 	// which is not necessarily what enrollment pushed: a node that could not
@@ -412,6 +417,136 @@ type ConfigState struct {
 	Error           string `json:"error,omitempty"`
 }
 
+// ------------------------------------------------------ underlay delivery
+
+// OverlayRouteTable is the VPP table the tunnel interfaces and the overlay
+// routes live in. It is NOT a VPN: VPN N uses table N, and 250 is reserved for
+// the transport domain (see test/lab/bringup.sh). The controller sends it in
+// every bundle so the device never has to guess a table number.
+const OverlayRouteTable uint32 = 250
+
+// UnderlayPathIDBase keeps agent-managed SR path ids away from the ones a
+// person types by hand (the lab's manual bringup uses 1..6). path_id is
+// PathIDBase+peerNodeID, and one device pair carries one tunnel, so a single
+// base is enough for every tunnel on a box.
+const UnderlayPathIDBase uint16 = 1000
+
+// UnderlayInstanceBase is the floor of WG user_instance values the agent owns.
+// Instances at or above it may be adopted, reconfigured and deleted by the
+// device's tunnel reconciler; anything below belongs to configuration a person
+// typed and is never touched. The controller derives it the same way as the
+// path id (1000+t7) so that a restarted device can recognise its own tunnels
+// without a local state file -- VPP is the record.
+const UnderlayInstanceBase uint32 = 1000
+
+// TunnelSpec is one tunnel as ONE end has to build it. Both ends receive their
+// own copy: the peer's overlay address, the peer's listening port and the outer
+// address to dial are mirrored.
+//
+// Everything here is derived by the controller from facts the devices reported
+// (interface inventory, reflector observation) or authenticated (the peer's
+// certificate and key binding). None of it is a policy the device may
+// second-guess.
+type TunnelSpec struct {
+	TunnelID   string `json:"tunnel_id"`
+	PeerNodeID uint16 `json:"peer_node_id"`
+	PeerSerial string `json:"peer_serial,omitempty"` // for the box's own log lines
+
+	// Instance is the WG user_instance. VPP rejects a duplicate instance (-31),
+	// so it is derived from the tunnel's never-reused numeric suffix: 1000+t7.
+	Instance uint32 `json:"instance"`
+	// PathIDBase: path_id = base + PeerNodeID (see UnderlayPathIDBase).
+	PathIDBase uint16 `json:"path_id_base"`
+
+	// Iface is the physical port this tunnel leaves through, by NAME. Indices
+	// are renumbered by VPP restarts; names are not.
+	Iface string `json:"iface"`
+	// SrcIP is the encapsulation source address, set only when the controller
+	// could prove which of the device's own addresses the egress port owns
+	// (it matches the reflector's observed address). Empty means "pick the
+	// egress port's own address on the box".
+	SrcIP string `json:"src_ip,omitempty"`
+
+	// ListenPort is this end's own tunnel port; PeerEndpoint is where the peer
+	// is dialed ("ip:port", already carrying the peer's listen port unless the
+	// operator typed an explicit port).
+	ListenPort   uint16 `json:"listen_port"`
+	PeerEndpoint string `json:"peer_endpoint"`
+
+	// The overlay /32s. LocalOverlay is installed on this end's tunnel
+	// interface (in table OverlayRouteTable); PeerOverlay is routed to it.
+	LocalOverlay string `json:"local_overlay"`
+	PeerOverlay  string `json:"peer_overlay"`
+
+	// Peer identity: the certificate and the attested key binding travel with
+	// the tunnel so the device authenticates the peer itself instead of
+	// trusting the controller's word (see agent.Link.authenticate).
+	PeerCertPEM string              `json:"peer_cert_pem"`
+	PeerBinding *keybinding.Binding `json:"peer_binding,omitempty"`
+
+	// RelayEndpoint is the relay hop's outer address and transit port
+	// ("ip:port"), empty for a direct tunnel. It becomes the path's first hop
+	// segment; the peer stays the final destination.
+	RelayEndpoint string `json:"relay_endpoint,omitempty"`
+	RelayNodeID   uint16 `json:"relay_node_id,omitempty"`
+
+	// MTU is the overlay MTU; 0 means "not known yet" and the device falls back
+	// to DefaultTunnelMTU. UnderlayMTU is the egress port's real link MTU, 0
+	// when neither end has reported it.
+	MTU         uint16 `json:"mtu"`
+	UnderlayMTU uint16 `json:"underlay_mtu,omitempty"`
+}
+
+// TunnelSkip is a configured tunnel that could not be delivered to this device,
+// with the reason. It is NOT an error: one peer without a certificate must not
+// stop every other tunnel on the box from converging. The agent keeps an
+// already-installed skipped tunnel running (a momentarily stale observation is
+// not a reason to tear down a working link) and reports the reason.
+type TunnelSkip struct {
+	TunnelID   string `json:"tunnel_id"`
+	PeerNodeID uint16 `json:"peer_node_id"`
+	Reason     string `json:"reason"`
+}
+
+// UnderlayBundle is the whole tunnel view for one device: the tunnels it builds,
+// the tunnels it cannot build yet, its relay port, and the tenant's hop-MAC key
+// ring.
+//
+// It is a FULL SNAPSHOT, not a delta: reconciliation is "make the dataplane look
+// like this", which is the only shape that survives a lost fetch or a crashed
+// device. Version is the controller's underlay generation (underlay.State.Gen),
+// bumped on every tunnel/path/settings mutation.
+type UnderlayBundle struct {
+	TenantID    string `json:"tenant_id"`
+	NodeID      uint16 `json:"node_id"`
+	Version     int    `json:"version"`
+	GeneratedAt int64  `json:"generated_at_unix"`
+
+	OverlayTable uint32 `json:"overlay_table"`
+	// TransitPort is this device's relay port; 0 = it relays nothing today.
+	TransitPort uint16 `json:"transit_port,omitempty"`
+
+	PKeys   []PKey       `json:"p_keys"`
+	Tunnels []TunnelSpec `json:"tunnels"`
+	Skipped []TunnelSkip `json:"skipped"`
+}
+
+// TunnelState is the DEVICE's account of the tunnel configuration it runs, the
+// same arrangement as ConfigState: the controller never derives "applied" from
+// "published". Tunnels is how many links the device currently has installed, a
+// number that came from the box rather than from the controller's intent.
+type TunnelState struct {
+	Capable         bool   `json:"capable"`
+	Version         int    `json:"version,omitempty"` // bundle version installed
+	Applying        bool   `json:"applying,omitempty"`
+	ApplyingVersion int    `json:"applying_version,omitempty"`
+	OK              bool   `json:"ok,omitempty"`
+	AppliedAt       int64  `json:"applied_at_unix,omitempty"`
+	Error           string `json:"error,omitempty"`
+	Tunnels         int    `json:"tunnels,omitempty"`
+	Skipped         int    `json:"skipped,omitempty"`
+}
+
 // Heartbeat is the liveness + re-registration signal. It carries the
 // mapping again because a NAT rebinding must be able to travel on the
 // heartbeat path alone (no separate re-registration round trip).
@@ -435,6 +570,11 @@ type HeartbeatRequest struct {
 	// the underlay egress port gets identified by measurement instead of by a
 	// naming convention.
 	Ifaces *[]IfaceInfo `json:"ifaces,omitempty"`
+	// Tunnel is what this device runs on the underlay channel. nil means "this
+	// agent has no tunnel applier at all" (started without -apply, or with no
+	// vpp api socket); Capable=false means "newer binary, channel switched off".
+	// The distinction matters because only the first one is an old agent.
+	Tunnel *TunnelState `json:"tunnel,omitempty"`
 }
 
 // IfaceInfo is one entry of the device's interface inventory. Every field is a
@@ -471,6 +611,10 @@ type HeartbeatResponse struct {
 	// is what makes the channel work behind NAT: the controller never dials the
 	// box.
 	ConfigVersion int `json:"config_version,omitempty"`
+	// TunnelVersion is the tenant's underlay generation for this device; 0 means
+	// no underlay configuration exists yet (nothing published, no tunnels). The
+	// device pulls /v1/underlay/bundle when this differs from what it runs.
+	TunnelVersion int `json:"tunnel_version,omitempty"`
 }
 
 // ------------------------------------------------------------------ rendezvous

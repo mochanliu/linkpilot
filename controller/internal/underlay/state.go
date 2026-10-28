@@ -13,6 +13,11 @@ var (
 	ErrPortExhausted    = errors.New("端口池没有空闲端口")
 	ErrPathInUse        = errors.New("路径模板仍被隧道引用")
 	ErrNotFound         = errors.New("隧道不存在")
+	// ErrPairTaken means this device pair already has a tunnel. It is a conflict
+	// with existing state, not a malformed request: one static WG key per device
+	// makes a second tunnel on the same pair uninstallable (VPP dedupes peers by
+	// pubkey across interfaces, -116).
+	ErrPairTaken = errors.New("设备对之间已经有隧道")
 )
 
 // Endpoint is one end of a tunnel.
@@ -53,8 +58,11 @@ type Roles struct {
 // Tunnel is one WireGuard tunnel between two devices.
 //
 // ID is controller-internal: the user never types or sees it as an identity,
-// but the API needs a stable handle for edit/delete. Duplicate detection at the
-// pair level is the planner's job, not this struct's.
+// but the API needs a stable handle for edit/delete.
+//
+// One tunnel per device pair: Create refuses a second one (see pairTunnel) --
+// with one WireGuard static key per device, VPP rejects the duplicate peer on a
+// second interface.
 type Tunnel struct {
 	ID   string      `json:"id"`
 	A    Endpoint    `json:"a"`
@@ -108,6 +116,13 @@ type State struct {
 
 	// Seq makes IDs monotonic so a deleted ID is never handed out again.
 	Seq int `json:"seq,omitempty"`
+
+	// Gen is the delivery generation: every mutation that changes what a device
+	// would install bumps it, and the heartbeat advertises it as the tunnel
+	// version. It is stored rather than derived from timestamps because a
+	// device compares it for equality (and because two mutations inside one
+	// second must still be two versions).
+	Gen int `json:"gen,omitempty"`
 }
 
 // New returns an empty tenant state with defaults applied.
@@ -144,6 +159,7 @@ func (s *State) Clone() *State {
 		Paths:        make(map[string]*PathTemplate, len(s.Paths)),
 		Tunnels:      make(map[string]*Tunnel, len(s.Tunnels)),
 		Seq:          s.Seq,
+		Gen:          s.Gen,
 	}
 	for k, v := range s.TransitPorts {
 		c.TransitPorts[k] = v
@@ -162,6 +178,10 @@ func (s *State) Clone() *State {
 	}
 	return c
 }
+
+// bump advances the delivery generation. Called by every mutation whose result
+// a device would install differently -- see State.Gen.
+func (s *State) bump() { s.Gen++ }
 
 func (s *State) nextID(prefix string) string {
 	s.Seq++
@@ -247,7 +267,10 @@ func (s *State) ensureTransitPort(node uint16) (uint16, error) {
 // after a rebind, and peers must use what it really holds, not what was asked.
 func (s *State) SetTransitPort(node, port uint16) error {
 	if port == 0 {
-		delete(s.TransitPorts, node)
+		if _, had := s.TransitPorts[node]; had {
+			delete(s.TransitPorts, node)
+			s.bump()
+		}
 		return nil
 	}
 	if !s.Settings.TransitPorts.Contains(port) {
@@ -256,7 +279,10 @@ func (s *State) SetTransitPort(node, port uint16) error {
 	if s.portsOn(node)[port] {
 		return fmt.Errorf("中转端口 %d 与这台设备的一条隧道端口相同", port)
 	}
-	s.TransitPorts[node] = port
+	if s.TransitPorts[node] != port {
+		s.TransitPorts[node] = port
+		s.bump()
+	}
 	return nil
 }
 
@@ -421,6 +447,7 @@ func (s *State) SetSettings(next Settings) error {
 		s.OverlayNext = s.OverlayNext % uint64(len(hosts))
 	}
 	s.Settings = next
+	s.bump()
 	return nil
 }
 
@@ -433,6 +460,7 @@ func (s *State) CreatePath(name string, node uint16, addr string, now int64) (Pa
 	if err != nil {
 		return PathTemplate{}, err
 	}
+	c.bump()
 	*s = *c
 	return p, nil
 }
@@ -472,6 +500,7 @@ func (s *State) UpdatePath(id, name string, node uint16, addr string) error {
 	if n := trimName(name); n != "" {
 		p.Name = n
 	}
+	c.bump()
 	*s = *c
 	return nil
 }
@@ -486,6 +515,7 @@ func (s *State) DeletePath(id string) error {
 		return fmt.Errorf("%w（%d 条隧道）", ErrPathInUse, len(users))
 	}
 	delete(s.Paths, id)
+	s.bump()
 	return nil
 }
 

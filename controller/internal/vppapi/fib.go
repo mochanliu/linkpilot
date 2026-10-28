@@ -180,6 +180,11 @@ func (c *Client) IPRouteAddDel(ctx context.Context, tableID uint32, prefix netip
 			return err
 		}
 	}
+	return c.ipRouteAddDel(ctx, tableID, prefix, paths, add)
+}
+
+// ipRouteAddDel 是两条公开入口共用的消息体组装。
+func (c *Client) ipRouteAddDel(ctx context.Context, tableID uint32, prefix netip.Prefix, paths []FIBPath, add bool) error {
 	body := make([]byte, 0, ipRouteFixedLen+len(paths)*fibPathLen)
 	body = append(body, boolByte(add), 0) // is_add, is_multipath
 	body = appendU32(body, tableID)
@@ -194,6 +199,41 @@ func (c *Client) IPRouteAddDel(ctx context.Context, tableID uint32, prefix netip
 		return err
 	}
 	return c.retval("ip_route_add_del", frame)
+}
+
+// IPRouteViaInterface 加/删一条"只指定出口接口、不带下一跳"的 IPv4 路由。
+//
+// 这就是 CLI 的 `ip route add table 250 <peer>/32 via wg0`：overlay 里对端 /32
+// 是给 BFD、探针和排障用的直连条目，下一跳由 WG 自己的 allowed-ips 决定，所以
+// 这条路由没有 nh 地址（nh=0.0.0.0 + sw_if_index）。它和 IPRouteAddDel 分开，
+// 是因为后者刻意要求"非 ~0 的路径必须有 IPv4 下一跳"——那条校验保护的是 FIB
+// 加载器，不该为了这一种合法形态被放宽。
+func (c *Client) IPRouteViaInterface(ctx context.Context, tableID uint32, prefix netip.Prefix, swIfIndex uint32, add bool) error {
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("vppapi: IPRouteViaInterface 只做 IPv4，收到 %s", prefix)
+	}
+	if swIfIndex == ^uint32(0) {
+		return fmt.Errorf("vppapi: IPRouteViaInterface 需要一个具体接口，收到 ~0")
+	}
+	return c.ipRouteAddDel(ctx, tableID, prefix, []FIBPath{{SWIfIndex: swIfIndex}}, add)
+}
+
+// IPRoutes 读回一张表里的全部 IPv4 前缀（只用来核对"这条路由在不在"）。
+//
+// 不带路径细节是刻意的：调用方问的是"overlay 表里有没有它"，把整个 fib_path
+// 暴露出去会让"在不在"变成"路径长得对不对"，而后者是 FIB 加载器自己的事。
+func (c *Client) IPRoutes(ctx context.Context, tableID uint32) ([]netip.Prefix, error) {
+	rs, err := c.FIBRoutes(ctx, tableID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]netip.Prefix, 0, len(rs))
+	for _, r := range rs {
+		if r.Prefix.IsValid() {
+			out = append(out, r.Prefix)
+		}
+	}
+	return out, nil
 }
 
 // MPLSLabelAddDel 在默认 MPLS 表里加/删一条本地标签：

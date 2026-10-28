@@ -175,6 +175,30 @@ func TestUpdateAndDelete(t *testing.T) {
 	}
 }
 
+// One WireGuard static key per device means VPP's peer table (deduped by public
+// key, across interfaces) rejects a second tunnel to the same peer with -116.
+// The controller must refuse it up front, not let the device fail at apply time.
+func TestCreateRejectsSecondTunnelOnSamePair(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+	first := mustCreate(t, s, views, 1, 2, nil)
+
+	_, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 2}, B: EndpointSpec{NodeID: 1}, Now: 2000}, views)
+	if err == nil || !strings.Contains(err.Error(), "-116") || !strings.Contains(err.Error(), first.ID) {
+		t.Fatalf("同对设备第二条隧道应被拒绝并说明原因，实际 %v", err)
+	}
+	if len(s.Tunnels) != 1 {
+		t.Fatalf("被拒的请求不该留下隧道: %d", len(s.Tunnels))
+	}
+	// Deleting the first frees the pair again.
+	if err := s.Delete(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Now: 3000}, views); err != nil {
+		t.Fatalf("删掉后应该能重建: %v", err)
+	}
+}
+
 func TestUpdateRejectsPortCollisionOnSameDevice(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2, 3)

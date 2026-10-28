@@ -3,6 +3,7 @@ package underlay
 import (
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 
 	"sdwan/controller/internal/wire"
@@ -79,6 +80,7 @@ func (s *State) Create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	if err != nil {
 		return Tunnel{}, err
 	}
+	c.bump()
 	*s = *c
 	return t, nil
 }
@@ -89,6 +91,10 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	}
 	if req.A.NodeID == req.B.NodeID {
 		return Tunnel{}, fmt.Errorf("隧道两端不能是同一台设备")
+	}
+	if id, ok := s.pairTunnel(req.A.NodeID, req.B.NodeID); ok {
+		return Tunnel{}, fmt.Errorf("%w %s：设备 %d 和 %d 之间只能有一条隧道——每台设备只有一把 WireGuard 静态密钥，VPP 的 peer 表按公钥跨接口去重，第二条会被数据面以 -116 拒掉；先删掉现有隧道再建",
+			ErrPairTaken, id, req.A.NodeID, req.B.NodeID)
 	}
 	va, err := viewOf(views, "本端", req.A.NodeID)
 	if err != nil {
@@ -280,6 +286,7 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 	t.MTU = mtu
 	t.UpdatedAt = req.Now
 	c.Tunnels[id] = t
+	c.bump()
 	*s = *c
 	return *t, nil
 }
@@ -296,8 +303,32 @@ func (s *State) Delete(id string) error {
 	delete(c.Tunnels, id)
 	c.freeOverlay(t.A.Overlay)
 	c.freeOverlay(t.B.Overlay)
+	c.bump()
 	*s = *c
 	return nil
+}
+
+// pairTunnel returns the tunnel already connecting two devices, so a second
+// one can be refused before any port or overlay address is allocated.
+//
+// This is a hard limit of the delivery shape, not a policy choice: the
+// controller holds ONE attested WireGuard static key per device, and VPP's peer
+// table dedupes public keys across interfaces -- installing the same peer on a
+// second interface fails with -116. Per-tunnel keys would lift it; until then
+// the device pair is the unit this dataplane can carry.
+func (s *State) pairTunnel(a, b uint16) (string, bool) {
+	ids := make([]string, 0, len(s.Tunnels))
+	for id := range s.Tunnels {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		t := s.Tunnels[id]
+		if (t.A.NodeID == a && t.B.NodeID == b) || (t.A.NodeID == b && t.B.NodeID == a) {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 func viewOf(views map[uint16]NodeView, what string, node uint16) (NodeView, error) {

@@ -1,0 +1,273 @@
+package main
+
+// Tunnel delivery: the controller renders ONE device's whole tunnel view and the
+// device pulls it over its own certificate.
+//
+// The shape is the same as the customer-side config channel (config_push.go) and
+// for the same reason: the boxes are behind NAT, so the controller never dials
+// them. The heartbeat advertises a version, the device fetches the snapshot when
+// it differs from what it runs.
+//
+// What is DIFFERENT from the config channel: there is no draft/publish step for
+// tunnels. Tunnels are created, edited and deleted as live objects, and each
+// mutation bumps underlay.State.Gen, so the version a device sees is "the
+// controller's current intention", not "the last frozen publish". That is a
+// deliberate split: the customer-side config is a staged document somebody
+// reviews, while a tunnel is a link that already exists in the tenant's topology
+// and whose ports and overlay addresses are allocated on creation.
+//
+// Nothing here invents facts. A tunnel the controller cannot describe completely
+// (peer without certificate or key binding, relay without an address) is listed
+// in Skipped with the reason, and the rest of the device's tunnels still go out:
+// one unusable peer must not strand every other link on the box.
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/netip"
+	"strconv"
+	"strings"
+	"time"
+
+	"sdwan/controller/internal/underlay"
+	"sdwan/controller/internal/wire"
+)
+
+// errUnderlayNotConfigured means the tenant has no published global
+// configuration, so no device has a transit port and no tunnel can exist. The
+// endpoint answers 409 (the device is known, there is just nothing to install).
+var errUnderlayNotConfigured = fmt.Errorf("租户还没有发布全局配置：没有可下发的隧道配置")
+
+// underlayVersionLocked is what a heartbeat advertises. 0 means "nothing to
+// install", which the agent must not read as "install generation 0".
+//
+// Must be called with s.mu held.
+func (s *server) underlayVersionLocked(tenant string) int {
+	uc := s.underlayConfigLocked(tenant, false)
+	if uc == nil || uc.State == nil || !uc.State.Configured() {
+		return 0
+	}
+	return uc.State.Gen
+}
+
+// underlayBundleLocked renders one device's snapshot.
+//
+// Must be called with s.mu held.
+func (s *server) underlayBundleLocked(tenant string, nodeID uint16) (wire.UnderlayBundle, error) {
+	uc := s.underlayConfigLocked(tenant, false)
+	if uc == nil || uc.State == nil || !uc.State.Configured() {
+		return wire.UnderlayBundle{}, errUnderlayNotConfigured
+	}
+	st := uc.State
+	now := time.Now().Unix()
+	views := s.nodeViewsLocked(tenant, now)
+
+	out := wire.UnderlayBundle{
+		TenantID: tenant, NodeID: nodeID,
+		Version: st.Gen, GeneratedAt: now,
+		OverlayTable: wire.OverlayRouteTable,
+		TransitPort:  st.TransitPorts[nodeID],
+		PKeys:        s.tenantKeyRing(tenant),
+		Tunnels:      []wire.TunnelSpec{},
+		Skipped:      []wire.TunnelSkip{},
+	}
+	for _, t := range st.SortedTunnels() {
+		var self, peer underlay.Endpoint
+		switch nodeID {
+		case t.A.NodeID:
+			self, peer = t.A, t.B
+		case t.B.NodeID:
+			self, peer = t.B, t.A
+		default:
+			continue
+		}
+		spec, err := s.tunnelSpecLocked(tenant, st, t, self, peer, views)
+		if err != nil {
+			out.Skipped = append(out.Skipped, wire.TunnelSkip{
+				TunnelID: t.ID, PeerNodeID: peer.NodeID, Reason: err.Error(),
+			})
+			continue
+		}
+		out.Tunnels = append(out.Tunnels, spec)
+	}
+	return out, nil
+}
+
+// tunnelSpecLocked renders the view ONE end needs. Everything it cannot know is
+// an error, not a zero: a peer dialed at port 0 or an empty certificate would
+// install a peer that never completes a handshake, and the device would have no
+// way to tell "not configured yet" from "configured wrong".
+//
+// Must be called with s.mu held.
+func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay.Tunnel,
+	self, peer underlay.Endpoint, views map[uint16]underlay.NodeView) (wire.TunnelSpec, error) {
+
+	prec := s.state.Nodes[key(tenant, peer.NodeID)]
+	if prec == nil || prec.TenantID != tenant {
+		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 不在本租户下", peer.NodeID)
+	}
+	if strings.TrimSpace(prec.CertPEM) == "" {
+		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 没有证书，设备无法自己验证它", peer.NodeID)
+	}
+	if prec.Binding == nil {
+		// The binding carries the peer's WireGuard static public key. Without it
+		// there is literally nothing to install a peer with -- and inventing one
+		// would be the controller asserting a key it does not hold.
+		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 还没有上报 WireGuard 公钥担保（key binding）", peer.NodeID)
+	}
+
+	instance, err := tunnelInstance(t.ID)
+	if err != nil {
+		return wire.TunnelSpec{}, err
+	}
+	peerEp, err := dialEndpoint("对端", peer)
+	if err != nil {
+		return wire.TunnelSpec{}, err
+	}
+
+	spec := wire.TunnelSpec{
+		TunnelID: t.ID, PeerNodeID: peer.NodeID, PeerSerial: prec.Serial,
+		Instance: instance, PathIDBase: wire.UnderlayPathIDBase,
+		Iface:        self.Iface,
+		ListenPort:   self.Port,
+		PeerEndpoint: peerEp,
+		LocalOverlay: self.Overlay,
+		PeerOverlay:  peer.Overlay,
+		PeerCertPEM:  prec.CertPEM,
+		PeerBinding:  prec.Binding,
+		MTU:          t.MTU,
+	}
+	// UnderlayMTU is THIS box's egress link MTU; the controller writes only what
+	// the device itself reported (each side configures its own port). The map is
+	// empty until the agent has reported an inventory, and then the field stays 0
+	// ("unknown"), which makes the device keep VPP's own MTU record untouched.
+	if mtu, ok := views[self.NodeID].Ifaces[self.Iface]; ok && mtu > 0 {
+		spec.UnderlayMTU = mtu
+	}
+	// The encapsulation source is the egress port's own address, and the only one
+	// the controller can prove is on that port is the address the reflector saw
+	// (nodeViewsLocked only names a default interface when exactly one interface
+	// owns it). Otherwise the device picks from its own inventory.
+	if v := views[self.NodeID]; !v.ObservedStale && v.Observed != "" && v.DefaultIface == self.Iface {
+		spec.SrcIP = v.Observed
+	}
+
+	if t.Path != nil {
+		relayEp, relayNode, err := relayEndpoint(st, t, views)
+		if err != nil {
+			return wire.TunnelSpec{}, err
+		}
+		spec.RelayEndpoint, spec.RelayNodeID = relayEp, relayNode
+	}
+	return spec, nil
+}
+
+// relayEndpoint names the relay hop as the box must dial it: the hop's outer
+// address plus its transit port. A relay that cannot be named is an error -- the
+// alternative, quietly building a direct tunnel, would move the traffic onto a
+// path nobody selected.
+func relayEndpoint(st *underlay.State, t *underlay.Tunnel, views map[uint16]underlay.NodeView) (string, uint16, error) {
+	rp, has, err := st.PathFor(t.Path)
+	if err != nil {
+		return "", 0, fmt.Errorf("中转路径无法解析：%v", err)
+	}
+	if !has || rp.NodeID == 0 {
+		return "", 0, fmt.Errorf("中转路径没有指定设备")
+	}
+	addr := strings.TrimSpace(rp.Addr)
+	if addr == "" {
+		v := views[rp.NodeID]
+		switch {
+		case v.Observed == "":
+			return "", 0, fmt.Errorf("中转设备 %d 还没有外层地址（没有观测到，也没有手填）", rp.NodeID)
+		case v.ObservedStale:
+			return "", 0, fmt.Errorf("中转设备 %d 的观测地址 %s 已过期", rp.NodeID, v.Observed)
+		}
+		addr = v.Observed
+	}
+	port := st.TransitPorts[rp.NodeID]
+	if port == 0 {
+		return "", 0, fmt.Errorf("中转设备 %d 还没有分配中转端口", rp.NodeID)
+	}
+	if _, err := netip.ParseAddrPort(addr); err == nil {
+		return addr, rp.NodeID, nil
+	}
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
+		return "", 0, fmt.Errorf("中转设备 %d 的地址 %q 不合法", rp.NodeID, addr)
+	}
+	return net.JoinHostPort(a.String(), strconv.Itoa(int(port))), rp.NodeID, nil
+}
+
+// dialEndpoint turns a stored endpoint address into "ip:port".
+//
+// A stored value is either a bare ip (the reflector's observation, whose port
+// half belongs to whichever NAT binding produced it and MUST NOT be dialed) or an
+// explicit ip:port the operator typed. Only the second form already carries a
+// port; the first is paired with the peer's own listen port.
+func dialEndpoint(what string, ep underlay.Endpoint) (string, error) {
+	addr := strings.TrimSpace(ep.Addr)
+	if addr == "" {
+		return "", fmt.Errorf("%s设备 %d 还没有可用的外层地址", what, ep.NodeID)
+	}
+	if _, err := netip.ParseAddrPort(addr); err == nil {
+		return addr, nil
+	}
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
+		return "", fmt.Errorf("%s设备 %d 的外层地址 %q 不合法", what, ep.NodeID, addr)
+	}
+	if !a.Is4() {
+		return "", fmt.Errorf("%s设备 %d 的外层地址 %q 不是 IPv4", what, ep.NodeID, addr)
+	}
+	if ep.Port == 0 {
+		return "", fmt.Errorf("%s设备 %d 没有端口", what, ep.NodeID)
+	}
+	return net.JoinHostPort(a.String(), strconv.Itoa(int(ep.Port))), nil
+}
+
+// tunnelInstance derives the WG user_instance from the tunnel id's never-reused
+// numeric suffix (t7 -> 1007). Reusing an instance is an error the dataplane
+// reports as -31, and deriving it from the id keeps it stable across restarts and
+// unrelated tunnel deletions. It stays at or above wire.UnderlayInstanceBase,
+// which is what tells the device these interfaces are its to manage.
+func tunnelInstance(id string) (uint32, error) {
+	n, err := strconv.Atoi(strings.TrimPrefix(id, "t"))
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("隧道 ID %q 读不出序号，无法分配 WG 实例号", id)
+	}
+	if uint64(n)+uint64(wire.UnderlayInstanceBase) > uint64(^uint32(0)) {
+		return 0, fmt.Errorf("隧道 ID %q 的序号过大，实例号装不进 uint32", id)
+	}
+	return wire.UnderlayInstanceBase + uint32(n), nil
+}
+
+// handleUnderlayBundle is the device-facing half of tunnel delivery. Identity
+// comes from the client certificate, so a device cannot ask for another node's
+// tunnels.
+func (s *server) handleUnderlayBundle(w http.ResponseWriter, r *http.Request) {
+	tenant, nodeID, err := peerTenantFromCert(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Nodes[key(tenant, nodeID)]; !ok {
+		http.Error(w, "unknown node", http.StatusNotFound)
+		return
+	}
+	b, err := s.underlayBundleLocked(tenant, nodeID)
+	if err != nil {
+		// 409 and not 404: the node is known, the tenant just has nothing to
+		// deliver yet. The agent keys its retry on this distinction.
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, b)
+}

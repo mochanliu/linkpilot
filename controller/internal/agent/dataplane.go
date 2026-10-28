@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,23 @@ type DataPlane interface {
 	// 字节都不改（见 vppapi.SetMSSClamp）。
 	SetMSSClamp(ctx context.Context, swIfIndex uint32, mss uint16) error
 	MSSClamp(ctx context.Context, swIfIndex uint32) (vppapi.MSSClampInfo, bool, error)
+
+	// overlay 侧：隧道接口要进 overlay 表、带自己的 /32、admin-up、开 MPLS；
+	// 对端 /32 作为直连条目落在同一张表里。这些都是 core 消息，不是插件的。
+	//
+	// IPTableAddDel 必须先于 SetInterfaceIPTable：后者对不存在的表回
+	// "no such table"（2026-10-28 在 vpplab 实测），而重复建表是幂等的。
+	IPTableAddDel(ctx context.Context, tableID uint32, add bool) error
+	SetInterfaceUp(ctx context.Context, swIfIndex uint32, up bool) error
+	AddDelInterfaceAddress(ctx context.Context, swIfIndex uint32, prefix netip.Prefix, add bool) error
+	SetInterfaceIPTable(ctx context.Context, swIfIndex uint32, tableID uint32) error
+	SetInterfaceMPLS(ctx context.Context, swIfIndex uint32, enable bool) error
+	IPv4Addresses(ctx context.Context, swIfIndex uint32) ([]netip.Prefix, error)
+	IPRoutes(ctx context.Context, tableID uint32) ([]netip.Prefix, error)
+	IPRouteViaInterface(ctx context.Context, tableID uint32, prefix netip.Prefix, swIfIndex uint32, add bool) error
+	// DeleteInterface 删一张 WG 接口。它只在撤掉一条隧道时用：删接口会连带清掉
+	// 它的全部 peer 与绑定，所以调用方必须已经决定"这条隧道不要了"。
+	DeleteInterface(ctx context.Context, swIfIndex uint32) error
 
 	AddPeer(ctx context.Context, p vppapi.PeerParams) (uint32, error)
 	RemovePeer(ctx context.Context, peerIndex uint32) error
@@ -182,6 +200,26 @@ type LinkConfig struct {
 	// node_id) 决定，两条隧道到同一个人若共用 base 就会抢同一条路径 —— 后写的
 	// 把前一条的段列表换掉，症状是"第一条隧道忽然不中转了"。
 	PathIDBase uint16
+
+	// ---- overlay 侧（表 + 两个 /32）----
+	//
+	// 一条隧道不只是"一张 WG 口 + 一个 peer"：这条口必须住在 overlay 表里、
+	// 带着自己的 overlay /32、admin-up、开 MPLS，对端 /32 才有一条路可解析。
+	// 少了任何一件，数据面表现都是"隧道在、包不来"或"能 ping 通、跑不了大包"，
+	// 而这些都不会自己冒出来（见本文件规则 6/7）。
+	//
+	// OverlayTable=0 表示调用方不用 overlay 模型（纯 over-WG 调试），此时后两个
+	// 前缀不生效。LocalOverlay 必须与 OverlayTable 同时给：只给表不给地址，等于
+	// 把接口放进一张自己没有任何条目的表。
+	OverlayTable uint32
+	LocalOverlay netip.Prefix // 本机在这条隧道上的 overlay /32
+	// PeerOverlay 是对端的 overlay /32。它作为直连条目（via 本接口）落在
+	// OverlayTable 里，给 BFD/探针和排障用；转发下一跳仍由控制面显式下发。
+	PeerOverlay netip.Prefix
+	// RelayIP/RelayPort 是中转跳的外层地址与 transit 端口，direct 隧道留空。
+	// 它进路径段列表的**最后**一段（segments[0] 是终点，最后一段是第一个跳）。
+	RelayIP   net.IP
+	RelayPort uint16
 }
 
 // Link 是这台 CPE 的数据面句柄：一个 WG 接口，加上它上面的密钥、路径与 peers。
@@ -270,6 +308,38 @@ func NewLink(cfg LinkConfig) (*Link, error) {
 		}
 	}
 	cfg.TunnelMTU = mtu
+
+	// overlay 三件套要么都给，要么都不给。只给表不给地址会把接口放进一张它
+	// 自己没有任何条目的表里：peer 都能建，overlay 却一条路都不通。
+	switch {
+	case cfg.OverlayTable == 0 && (cfg.LocalOverlay.IsValid() || cfg.PeerOverlay.IsValid()):
+		return nil, errors.New("agent: 给了 overlay 前缀却没给 overlay 表号")
+	case cfg.OverlayTable != 0 && !cfg.LocalOverlay.IsValid():
+		return nil, errors.New("agent: 给了 overlay 表号却没给本机 overlay /32")
+	}
+	if cfg.LocalOverlay.IsValid() {
+		// 不是 /32 就不叫 overlay 地址了：它会被当成一张子网的 connected 路由，
+		// 把同网段的邻居整段吸进这张隧道。
+		if !cfg.LocalOverlay.Addr().Is4() || cfg.LocalOverlay.Bits() != 32 {
+			return nil, fmt.Errorf("agent: 本机 overlay 地址必须是 IPv4 /32，给了 %s", cfg.LocalOverlay)
+		}
+	}
+	if cfg.PeerOverlay.IsValid() && (!cfg.PeerOverlay.Addr().Is4() || cfg.PeerOverlay.Bits() != 32) {
+		return nil, fmt.Errorf("agent: 对端 overlay 地址必须是 IPv4 /32，给了 %s", cfg.PeerOverlay)
+	}
+	if cfg.PeerOverlay.IsValid() && cfg.PeerOverlay == cfg.LocalOverlay {
+		return nil, fmt.Errorf("agent: 本机与对端的 overlay 地址相同（%s）", cfg.LocalOverlay)
+	}
+	// 中转跳：地址与端口是一体的，半个中转比没有中转更难查（路径会指向 0 端口）。
+	if (cfg.RelayIP != nil) != (cfg.RelayPort != 0) {
+		return nil, fmt.Errorf("agent: 中转跳要给全地址与端口，收到 ip=%v port=%d", cfg.RelayIP, cfg.RelayPort)
+	}
+	if cfg.RelayIP != nil && cfg.RelayIP.To4() == nil {
+		return nil, fmt.Errorf("agent: 中转跳地址必须是 IPv4，给了 %v", cfg.RelayIP)
+	}
+	if cfg.RelayIP != nil {
+		cfg.RelayIP = append(net.IP(nil), cfg.RelayIP.To4()...)
+	}
 	k, err := ecdh.X25519().NewPrivateKey(cfg.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("agent: WG 私钥不合法: %w", err)
@@ -381,6 +451,9 @@ func (l *Link) Open(ctx context.Context) (bool, error) {
 	if err := l.verifyLanded(ctx, idx); err != nil {
 		return false, err
 	}
+	if err := l.applyOverlay(ctx, idx); err != nil {
+		return false, err
+	}
 	l.swIfIndex = idx
 	l.adopted = false
 	l.ready = true
@@ -427,6 +500,12 @@ func (l *Link) adopt(ctx context.Context, want vppapi.InterfaceParams) (bool, er
 			return false, err
 		}
 		if err := l.verifyLanded(ctx, ifi.SWIfIndex); err != nil {
+			return false, err
+		}
+		// 认回的接口同样要过 overlay：VPP 重启后接口表还在（config 在内存里，
+		// 重启就没了，但 agent 认回的通常是同一次 VPP 起会里的接口），而"地址还在
+		// 不等于它还在 table 250"—— 操作员可以把口挪表。applyOverlay 会读回判断。
+		if err := l.applyOverlay(ctx, ifi.SWIfIndex); err != nil {
 			return false, err
 		}
 		l.swIfIndex = ifi.SWIfIndex
@@ -559,6 +638,125 @@ func (l *Link) verifyLanded(ctx context.Context, tunnelSwIfIndex uint32) error {
 	return nil
 }
 
+// applyOverlay 把这条隧道的 overlay 身份落进 VPP：接口进 OverlayTable、带本机 /32、
+// admin-up、开 MPLS。这就是 bringup.sh 里 wg_to_overlay 的那几步。
+//
+// 为什么要读回而不是每次都重放一遍：
+//   - 重复 AddDelInterfaceAddress(add) 的语义没有实测过（可能覆盖、可能报重复），
+//     不该拿生产机的接口表去试；
+//   - "地址在"不等于"接口在 table 250"：ip_address_details 里没有表号，唯一的证据
+//     是去 overlay 表里读 FIB，看这条 /32 的 connected 路由在不在（见下）；
+//   - 操作员可能把这张口挪去别的表调试。读回能发现，并把它挪回来。
+//
+// 顺序是硬的：删地址 → 改表 → 加地址。表里有地址时 VPP 拒绝改表（实测），所以
+// 不能反过来。删的只是本机那个 /32：接口上若有别的地址，说明有人在手工改这张口，
+// 这时直接报错交给人，而不是把别人的配置一起删掉。
+func (l *Link) applyOverlay(ctx context.Context, tunnelSwIfIndex uint32) error {
+	if l.cfg.OverlayTable == 0 {
+		return nil // 不用 overlay 模型的调用方（见 OverlayTable 注释）
+	}
+	// 表要先存在：实测 `set interface ip table` 对未建的表回 "no such table"。
+	// 重复建是幂等的（ip_table_add_del 的注释：A table can be added multiple times）。
+	if err := l.dp.IPTableAddDel(ctx, l.cfg.OverlayTable, true); err != nil {
+		return fmt.Errorf("agent: 建 overlay 表 %d: %w", l.cfg.OverlayTable, err)
+	}
+
+	addrs, err := l.dp.IPv4Addresses(ctx, tunnelSwIfIndex)
+	if err != nil {
+		return fmt.Errorf("agent: 读隧道接口 %d 的 IPv4 地址: %w", tunnelSwIfIndex, err)
+	}
+	want := l.cfg.LocalOverlay.Masked()
+	hasOurAddr := false
+	for _, a := range addrs {
+		if a == want {
+			hasOurAddr = true
+			continue
+		}
+		return fmt.Errorf("agent: 隧道接口 %d 上除了本机的 %s 还有地址 %s —— 这张口是 agent 管的，"+
+			"别处配的地址会让改表失败；请人工确认后删掉（现有 %v）", tunnelSwIfIndex, want, a, addrs)
+	}
+
+	// 地址在，还要确认接口真的在 OverlayTable 里：读 overlay 表的 FIB，本机 /32
+	// 应当作为 connected 条目出现在那儿。查不到就是接口挂在别的表上（或地址别的
+	// 接口也在用），必须挪。
+	if hasOurAddr {
+		ok, err := l.routeInTable(ctx, l.cfg.OverlayTable, want)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return l.finishOverlay(ctx, tunnelSwIfIndex)
+		}
+		if err := l.dp.AddDelInterfaceAddress(ctx, tunnelSwIfIndex, want, false); err != nil {
+			return fmt.Errorf("agent: 挪表前先删掉隧道接口 %d 上的地址 %s: %w", tunnelSwIfIndex, want, err)
+		}
+	}
+	if err := l.dp.SetInterfaceIPTable(ctx, tunnelSwIfIndex, l.cfg.OverlayTable); err != nil {
+		return fmt.Errorf("agent: 把隧道接口 %d 放进 overlay 表 %d: %w",
+			tunnelSwIfIndex, l.cfg.OverlayTable, err)
+	}
+	if err := l.dp.AddDelInterfaceAddress(ctx, tunnelSwIfIndex, want, true); err != nil {
+		return fmt.Errorf("agent: 给隧道接口 %d 加 overlay 地址 %s: %w", tunnelSwIfIndex, want, err)
+	}
+	if err := l.finishOverlay(ctx, tunnelSwIfIndex); err != nil {
+		return err
+	}
+	// 读回：地址回来了、overlay 表里有这条 connected 路由，才算落地。
+	addrs, err = l.dp.IPv4Addresses(ctx, tunnelSwIfIndex)
+	if err != nil {
+		return fmt.Errorf("agent: 读回隧道接口 %d 的 IPv4 地址: %w", tunnelSwIfIndex, err)
+	}
+	found := false
+	for _, a := range addrs {
+		if a == want {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("agent: overlay 地址 %s 写进去了，但读回隧道接口 %d 只有 %v",
+			want, tunnelSwIfIndex, addrs)
+	}
+	ok, err := l.routeInTable(ctx, l.cfg.OverlayTable, want)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("agent: overlay 地址 %s 在表 %d 里没有 connected 路由："+
+			"接口可能还在别的表（改表被静默忽略？）", want, l.cfg.OverlayTable)
+	}
+	return nil
+}
+
+// finishOverlay 做"接口可用"的两步：admin-up 与开 MPLS。
+//
+// admin-down 的症状是"配置全对、零流量"——地址、路由、peer 全都在，接口就是不发。
+// MPLS 只有在表里带标签转发时才有意义（VPN 的标签栈落在这张口上），但把它关掉
+// 不会报错、只会在 RFC 路由那天丢包，所以无条件开。
+func (l *Link) finishOverlay(ctx context.Context, tunnelSwIfIndex uint32) error {
+	if err := l.dp.SetInterfaceUp(ctx, tunnelSwIfIndex, true); err != nil {
+		return fmt.Errorf("agent: admin-up 隧道接口 %d: %w", tunnelSwIfIndex, err)
+	}
+	if err := l.dp.SetInterfaceMPLS(ctx, tunnelSwIfIndex, true); err != nil {
+		return fmt.Errorf("agent: 在隧道接口 %d 上开 MPLS: %w", tunnelSwIfIndex, err)
+	}
+	return nil
+}
+
+// routeInTable 回答"这张表的 FIB 里有没有这个前缀"。它不区分下一跳：applyOverlay
+// 只问"接口在不在那张表"，前缀唯一（每条隧道的 /32 由控制器的分配器保证不重复）。
+func (l *Link) routeInTable(ctx context.Context, tableID uint32, prefix netip.Prefix) (bool, error) {
+	routes, err := l.dp.IPRoutes(ctx, tableID)
+	if err != nil {
+		return false, fmt.Errorf("agent: 读表 %d 的 FIB: %w", tableID, err)
+	}
+	for _, r := range routes {
+		if r == prefix {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // interfaceSummary 把接口表压成一行，只用于报错时让操作员看见"VPP 到底有哪些口"。
 func interfaceSummary(ifs []vppapi.SwInterface) string {
 	out := make([]string, 0, len(ifs))
@@ -573,6 +771,14 @@ func (l *Link) SWIfIndex() uint32 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.swIfIndex
+}
+
+// Ready 表示这条隧道已经在数据面里立起来了（Open/adopt 成功过）。上报与撤销
+// 决策都只认这个位：一个建了一半的 Link 没有任何可宣告的地址。
+func (l *Link) Ready() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ready
 }
 
 // WGPublicKey 是装进数据面的那把私钥对应的公钥（要交给控制器与对端的就是它）。
@@ -691,11 +897,19 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 
 	// 路径与隧道成对下发：绑定条目里的 endpoint 是绑定自己那份拷贝，不会跟着
 	// 路径的段列表走（真机验过），所以只 AddPath 会让包发往旧地址。
+	//
+	// 段序：segments[0] 是**终点**（对端的外层 ip:port），最后一段是第一个跳。
+	// 中转隧道就在末尾再挂一跳 relay:transit_port，和实验室手敲的
+	// `sr-wg path add P via PEER:port via TRANSIT:tport` 逐字对应。
+	segments := []vppapi.Segment{{IP: ep.IP, Port: ep.Port}}
+	if l.cfg.RelayIP != nil {
+		segments = append(segments, vppapi.Segment{IP: l.cfg.RelayIP, Port: l.cfg.RelayPort})
+	}
 	if err := l.dp.AddPath(ctx, vppapi.PathParams{
 		PathID:   pathID,
 		HmacID:   l.hmacID,
 		Active:   true,
-		Segments: []vppapi.Segment{{IP: ep.IP, Port: ep.Port}},
+		Segments: segments,
 	}); err != nil {
 		return "", fmt.Errorf("agent: 节点 %d 的路径（path_id=%d → %s）: %w", p.NodeID, pathID, ep, err)
 	}
@@ -734,7 +948,40 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 		SWIfIndex:  l.swIfIndex,
 		AllowedIPs: allowedIPsAny,
 	}
-	return l.installPeer(ctx, p.NodeID, ep, want)
+	change, err := l.installPeer(ctx, p.NodeID, ep, want)
+	if err != nil {
+		return "", err
+	}
+	// peer 装好之后才铺对端 /32 的路由：反过来的话路由先指到一个还没有 peer 的
+	// 接口上，中间窗口里发往对端的包会被 WG 丢掉（不报错）。
+	if err := l.applyPeerRoute(ctx); err != nil {
+		return "", fmt.Errorf("agent: 节点 %d: %w", p.NodeID, err)
+	}
+	return change, nil
+}
+
+// applyPeerRoute 把对端的 overlay /32 作为直连条目（via 本隧道接口）放进 overlay
+// 表。BFD/探针和排障要往对端 overlay 地址发包时，靠的就是这一条。
+//
+// 每次都是"整条替换"（ipRouteAddDel 的 is_multipath=0），所以不复用旧状态：
+// 这条 /32 归控制器分配、由 agent 独占，重新写一遍就等于让数据面回到声明态。
+func (l *Link) applyPeerRoute(ctx context.Context) error {
+	if l.cfg.OverlayTable == 0 || !l.cfg.PeerOverlay.IsValid() {
+		return nil
+	}
+	peer := l.cfg.PeerOverlay.Masked()
+	if err := l.dp.IPRouteViaInterface(ctx, l.cfg.OverlayTable, peer, l.swIfIndex, true); err != nil {
+		return fmt.Errorf("把对端 overlay %s 指到隧道接口 %d（表 %d）: %w",
+			peer, l.swIfIndex, l.cfg.OverlayTable, err)
+	}
+	ok, err := l.routeInTable(ctx, l.cfg.OverlayTable, peer)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("对端 overlay %s 的路由写进去了，但表 %d 的 FIB 里读不到", peer, l.cfg.OverlayTable)
+	}
+	return nil
 }
 
 // installPeer 把一个 peer 装成 want 的样子，并报告它到底动没动。
@@ -869,6 +1116,11 @@ func (l *Link) DropPeer(ctx context.Context, p PeerTarget) error {
 	if !l.ready {
 		return errors.New("agent: 还没 Open")
 	}
+	return l.dropPeerLocked(ctx, p)
+}
+
+// dropPeerLocked 是 DropPeer 去掉锁之后的样子；Teardown 复用它（已经持锁）。
+func (l *Link) dropPeerLocked(ctx context.Context, p PeerTarget) error {
 	wgPub, err := l.authenticate(p)
 	if err != nil {
 		return err
@@ -919,6 +1171,125 @@ func (l *Link) DropPeer(ctx context.Context, p PeerTarget) error {
 	}
 	if err := l.dp.DelPath(ctx, pathID); err != nil && !isNoSuchEntry(err) {
 		return fmt.Errorf("agent: 删 path_id=%d（它上面的绑定会被一并摘掉）: %w", pathID, err)
+	}
+	return nil
+}
+
+// Teardown 把整条隧道从数据面撤掉：peer → 绑定/路径 → 对端路由 → 接口。
+//
+// 与 DropPeer 的区别是**不需要对端身份**：走到这里是因为控制器已经把这条隧道
+// 从 bundle 里删了，此时没有证书可验；"不验就不删"会让接口永久留在 VPP 里，
+// 而它占着 user_instance、端口和 overlay /32，下一条隧道分到同一个号就再也起不来。
+//
+// 敢按"这条接口上的一切"删，是因为接口是 agent 按 user_instance ≥ 1000 自己建的
+// （wire.UnderlayInstanceBase），其上的 peer 与绑定只可能属于这条隧道。
+//
+// 顺序：先解引用（peer、绑定），再删路径，最后删接口。删接口本会级联清掉 peer
+// 与绑定，但反过来的顺序在"路径还被别的接口引用"时会误伤别人，所以路径只在
+// 没有其他引用者时才删。
+func (l *Link) Teardown(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if !l.ready {
+		return nil
+	}
+	if err := teardownTunnel(ctx, l.dp, l.swIfIndex, l.cfg.ListenPort,
+		l.cfg.OverlayTable, l.cfg.PeerOverlay); err != nil {
+		return err
+	}
+	l.ready = false
+	l.adopted = false
+	l.swIfIndex = 0
+	return nil
+}
+
+// teardownTunnel 是撤销步骤本身，抽出来给两条路径共用：Link.Teardown（配置里
+// 还认得这条隧道）和 TunnelSync 的孤儿清理（控制器已经删了它，手上只剩 VPP 里
+// 那行 user_instance）。后者不知道对端 overlay，传无效前缀即可 —— 删接口时 VPP
+// 会把经它的路由一起摘掉。
+func teardownTunnel(ctx context.Context, dp DataPlane, swIf uint32, listenPort uint16,
+	overlayTable uint32, peerOverlay netip.Prefix) error {
+
+	peers, err := dp.Peers(ctx)
+	if err != nil {
+		return fmt.Errorf("agent: 撤隧道接口 %d 时读 peer: %w", swIf, err)
+	}
+	for _, pe := range peers {
+		if pe.SWIfIndex != swIf {
+			continue
+		}
+		if err := dp.RemovePeer(ctx, pe.PeerIndex); err != nil && !isNoSuchEntry(err) {
+			return fmt.Errorf("agent: 撤隧道接口 %d 时删 peer（index %d）: %w", swIf, pe.PeerIndex, err)
+		}
+	}
+
+	binds, err := dp.Tunnels(ctx, ^uint32(0))
+	if err != nil {
+		return fmt.Errorf("agent: 撤隧道接口 %d 时读隧道绑定表: %w", swIf, err)
+	}
+	paths := map[uint16]bool{}
+	for _, b := range binds {
+		if b.SWIfIndex == swIf {
+			paths[b.PathID] = true
+		}
+	}
+	if len(paths) > 0 {
+		if err := dp.ClearTunnel(ctx, swIf); err != nil && !isNoSuchEntry(err) {
+			return fmt.Errorf("agent: 撤隧道接口 %d 时解绑: %w", swIf, err)
+		}
+	}
+	for pathID := range paths {
+		shared := false
+		for _, b := range binds {
+			if b.PathID == pathID && b.SWIfIndex != swIf {
+				shared = true
+				break
+			}
+		}
+		if shared {
+			continue
+		}
+		if err := dp.DelPath(ctx, pathID); err != nil && !isNoSuchEntry(err) {
+			return fmt.Errorf("agent: 撤隧道接口 %d 时删 path_id=%d: %w", swIf, pathID, err)
+		}
+	}
+
+	if overlayTable != 0 && peerOverlay.IsValid() {
+		peer := peerOverlay.Masked()
+		if err := dp.IPRouteViaInterface(ctx, overlayTable, peer, swIf, false); err != nil &&
+			!isNoSuchEntry(err) {
+			return fmt.Errorf("agent: 撤隧道接口 %d 时删对端 overlay 路由 %s（表 %d）: %w",
+				swIf, peer, overlayTable, err)
+		}
+	}
+
+	if err := dp.DeleteInterface(ctx, swIf); err != nil && !isNoSuchEntry(err) {
+		return fmt.Errorf("agent: 删隧道接口 %d: %w", swIf, err)
+	}
+
+	// 监听端口从 vpn 集合里摘掉：接口都没了，这个端口不该再被 sr-wg 抢走。
+	// 但集合只按 (kind, port) 记、没有接口身份，同一个号可能正被操作员手配的
+	// 接口用着，所以先读接口表确认没人在听它。
+	//
+	// transit 端口**不动**：它是整台设备共用的一个号（underlay.ensureTransitPort），
+	// 别的隧道还在拿它收中转包，按隧道撤掉会把它们一起打死。
+	ifs, err := dp.Interfaces(ctx, false)
+	if err != nil {
+		return fmt.Errorf("agent: 撤隧道接口 %d 后读 WG 接口表: %w", swIf, err)
+	}
+	inUse := false
+	for _, i := range ifs {
+		if i.Port == listenPort {
+			inUse = true
+			break
+		}
+	}
+	if !inUse {
+		if err := dp.DelPort(ctx, vppapi.PortKindVPN, listenPort); err != nil &&
+			!isNoSuchEntry(err) {
+			return fmt.Errorf("agent: 把端口 %d 从 vpn 集合里摘掉: %w", listenPort, err)
+		}
 	}
 	return nil
 }

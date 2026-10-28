@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -53,6 +54,17 @@ type fakeVPP struct {
 	swIfs   []vppapi.SwInterface
 	dumpIfs []vppapi.SwInterface // 非空时 DumpInterfaces 原样回它：用来造"记录不符"
 	dumpErr error
+	// ---- overlay 侧的核心接口状态 ----
+	//
+	// 脾气照抄真 VPP：改表前表必须已存在（实测 "no such table"）；接口上有地址时
+	// 改表会被拒（实测）；加地址会顺带生出 connected 路由（所以"路由在"是"接口
+	// 真在那张表里"的唯一读回证据，ip_address_details 里没有表号）。
+	tables  map[uint32]bool
+	ifTable map[uint32]uint32
+	addrs   map[uint32][]netip.Prefix
+	routes  map[uint32]map[netip.Prefix]uint32 // 表 → 前缀 → 出口
+	up      map[uint32]bool
+	mpls    map[uint32]bool
 	ports   []vppapi.PortInfo
 	rebinds int
 	// transitPort 是最后一次 SetTransit 的端口（真机的 transit_enabled 是全局开关，
@@ -74,6 +86,12 @@ func newFakeVPP() *fakeVPP {
 		encap:   map[uint32]bool{},
 		nextIdx: 1,
 		nextPi:  1,
+		tables:  map[uint32]bool{},
+		ifTable: map[uint32]uint32{},
+		addrs:   map[uint32][]netip.Prefix{},
+		routes:  map[uint32]map[netip.Prefix]uint32{},
+		up:      map[uint32]bool{},
+		mpls:    map[uint32]bool{},
 		// underlay 出口按真机的出生样子摆在这儿：af-packet 口 VPP 默认记 9000，
 		// 容器网卡只有 1500。这样"写完读回来"测的才是读回，而不是 map 里本来就对。
 		swIfs: []vppapi.SwInterface{{
@@ -374,6 +392,149 @@ func (f *fakeVPP) ClearTunnel(ctx context.Context, swIfIndex uint32) error {
 		return vppapi.APIError{Op: "sr_wg_tunnel_set_path", Retval: -6}
 	}
 	delete(f.tunnels, swIfIndex)
+	return nil
+}
+
+// ---- overlay 侧：core 的接口/表/地址/路由 ----
+
+func (f *fakeVPP) IPTableAddDel(ctx context.Context, tableID uint32, add bool) error {
+	f.log("IPTableAddDel %d=%v", tableID, add)
+	if !add {
+		delete(f.tables, tableID)
+		delete(f.routes, tableID)
+		return nil
+	}
+	f.tables[tableID] = true
+	return nil
+}
+
+// SetInterfaceIPTable 照抄实测的两条拒绝：表不存在（vpplab 实测 "no such table"）、
+// 接口上有地址（真 VPP 不给改表）。
+func (f *fakeVPP) SetInterfaceIPTable(ctx context.Context, swIfIndex uint32, tableID uint32) error {
+	f.log("SetInterfaceIPTable %d=%d", swIfIndex, tableID)
+	if !f.tables[tableID] {
+		return vppapi.APIError{Op: "sw_interface_set_table", Retval: -2}
+	}
+	if len(f.addrs[swIfIndex]) > 0 {
+		return vppapi.APIError{Op: "sw_interface_set_table", Retval: -1}
+	}
+	f.ifTable[swIfIndex] = tableID
+	return nil
+}
+
+// AddDelInterfaceAddress 顺带记账 connected 路由：地址属于哪张表，就在那张表的
+// FIB 里生出一条 /32。applyOverlay 的"接口真在表里"就是靠读这条路由判断的。
+func (f *fakeVPP) AddDelInterfaceAddress(ctx context.Context, swIfIndex uint32,
+	prefix netip.Prefix, add bool) error {
+
+	prefix = prefix.Masked()
+	f.log("AddDelInterfaceAddress %d %s add=%v", swIfIndex, prefix, add)
+	if add {
+		for _, a := range f.addrs[swIfIndex] {
+			if a == prefix {
+				// 重复加的语义在真机上没测过，测试不该依赖它。
+				panic("fakeVPP: 重复添加地址 " + prefix.String())
+			}
+		}
+		f.addrs[swIfIndex] = append(f.addrs[swIfIndex], prefix)
+		tbl := f.ifTable[swIfIndex]
+		if f.routes[tbl] == nil {
+			f.routes[tbl] = map[netip.Prefix]uint32{}
+		}
+		f.routes[tbl][prefix] = swIfIndex
+		return nil
+	}
+	for i, a := range f.addrs[swIfIndex] {
+		if a != prefix {
+			continue
+		}
+		f.addrs[swIfIndex] = append(f.addrs[swIfIndex][:i], f.addrs[swIfIndex][i+1:]...)
+		if rs := f.routes[f.ifTable[swIfIndex]]; rs != nil && rs[prefix] == swIfIndex {
+			delete(rs, prefix)
+		}
+		return nil
+	}
+	return vppapi.APIError{Op: "sw_interface_add_del_address", Retval: -6}
+}
+
+func (f *fakeVPP) SetInterfaceUp(ctx context.Context, swIfIndex uint32, up bool) error {
+	f.log("SetInterfaceUp %d=%v", swIfIndex, up)
+	f.up[swIfIndex] = up
+	return nil
+}
+
+func (f *fakeVPP) SetInterfaceMPLS(ctx context.Context, swIfIndex uint32, enable bool) error {
+	f.log("SetInterfaceMPLS %d=%v", swIfIndex, enable)
+	f.mpls[swIfIndex] = enable
+	return nil
+}
+
+func (f *fakeVPP) IPv4Addresses(ctx context.Context, swIfIndex uint32) ([]netip.Prefix, error) {
+	f.log("IPv4Addresses %d", swIfIndex)
+	return append([]netip.Prefix(nil), f.addrs[swIfIndex]...), nil
+}
+
+func (f *fakeVPP) IPRoutes(ctx context.Context, tableID uint32) ([]netip.Prefix, error) {
+	f.log("IPRoutes %d", tableID)
+	out := make([]netip.Prefix, 0, len(f.routes[tableID]))
+	for p := range f.routes[tableID] {
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (f *fakeVPP) IPRouteViaInterface(ctx context.Context, tableID uint32,
+	prefix netip.Prefix, swIfIndex uint32, add bool) error {
+
+	prefix = prefix.Masked()
+	f.log("IPRouteViaInterface %d %s via %d add=%v", tableID, prefix, swIfIndex, add)
+	if add {
+		if f.routes[tableID] == nil {
+			f.routes[tableID] = map[netip.Prefix]uint32{}
+		}
+		f.routes[tableID][prefix] = swIfIndex
+		return nil
+	}
+	if _, ok := f.routes[tableID][prefix]; !ok {
+		return vppapi.APIError{Op: "ip_route_add_del", Retval: -6}
+	}
+	delete(f.routes[tableID], prefix)
+	return nil
+}
+
+// DeleteInterface 照抄"删接口会连带清掉它的地址、路由、peer 与绑定"。
+func (f *fakeVPP) DeleteInterface(ctx context.Context, swIfIndex uint32) error {
+	f.log("DeleteInterface %d", swIfIndex)
+	found := false
+	for i, ifi := range f.ifaces {
+		if ifi.SWIfIndex == swIfIndex {
+			f.ifaces = append(f.ifaces[:i], f.ifaces[i+1:]...)
+			found = true
+			break
+		}
+	}
+	for _, rs := range f.routes {
+		for p, sw := range rs {
+			if sw == swIfIndex {
+				delete(rs, p)
+			}
+		}
+	}
+	delete(f.addrs, swIfIndex)
+	delete(f.ifTable, swIfIndex)
+	delete(f.up, swIfIndex)
+	delete(f.mpls, swIfIndex)
+	for i := 0; i < len(f.peers); {
+		if f.peers[i].SWIfIndex == swIfIndex {
+			f.peers = append(f.peers[:i], f.peers[i+1:]...)
+			continue
+		}
+		i++
+	}
+	delete(f.tunnels, swIfIndex)
+	if !found {
+		return vppapi.APIError{Op: "wireguard_interface_delete", Retval: -6}
+	}
 	return nil
 }
 

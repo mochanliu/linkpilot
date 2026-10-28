@@ -301,9 +301,9 @@ func contains(list []uint16, v uint16) bool {
 	return false
 }
 
-// HasPair reports whether any tunnel already connects two devices. Duplicate
-// detection is at the PAIR level: a second tunnel between the same two devices
-// is a deliberate manual act, never something a batch re-creates.
+// HasPair reports whether any tunnel already connects two devices. The pair is
+// the unit of uniqueness (one WireGuard key per device, VPP dedupes peers by
+// key across interfaces), so a batch skips a pair Create would refuse.
 func (s *State) HasPair(a, b uint16) bool {
 	for _, t := range s.Tunnels {
 		if (t.A.NodeID == a && t.B.NodeID == b) || (t.A.NodeID == b && t.B.NodeID == a) {

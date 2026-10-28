@@ -208,6 +208,31 @@ func (c *Client) ConfigBundle(ctx context.Context) ([]byte, error) {
 	return raw, nil
 }
 
+// ErrNoUnderlay is the 409 from /v1/underlay/bundle: the controller knows this
+// device, it just has no published global configuration, so there is nothing to
+// install. It is a state ("zero tunnels"), not a failure -- retrying with
+// backoff would only delay the first successful pull after somebody publishes.
+var ErrNoUnderlay = errors.New("agent: 控制器还没有可下发的隧道配置")
+
+// UnderlayBundle 拉这台设备当前的隧道快照。身份来自客户端证书：设备无法索取
+// 别的节点的隧道。
+func (c *Client) UnderlayBundle(ctx context.Context) (wire.UnderlayBundle, error) {
+	var b wire.UnderlayBundle
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/underlay/bundle", nil)
+	if err != nil {
+		return b, err
+	}
+	err = c.do(req, &b)
+	var e *Error
+	if errors.As(err, &e) && e.Status == http.StatusConflict {
+		return wire.UnderlayBundle{}, ErrNoUnderlay
+	}
+	if err != nil {
+		return wire.UnderlayBundle{}, err
+	}
+	return b, nil
+}
+
 // RegistryView 是 /v1/registry 的一次快照（也是仪表盘拓扑页读的同一份）。
 type RegistryView struct {
 	TenantID string          `json:"tenant_id"`
