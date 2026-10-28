@@ -1,0 +1,378 @@
+package underlay
+
+import (
+	"fmt"
+	"net/netip"
+	"strings"
+
+	"sdwan/controller/internal/wire"
+)
+
+// NodeView is what the controller knows about a device at this moment: who it
+// is, whether it is currently reachable, which interfaces it has, and where the
+// reflector saw it. It is passed in rather than stored here because it is
+// runtime state (it changes with every report), not configuration.
+type NodeView struct {
+	ID   uint16
+	Name string
+
+	// Stale marks a device that has not reported within the freshness window.
+	Stale bool
+	// Symmetric is the NAT verdict. Two symmetric devices can never reach each
+	// other: each one's mapping is only valid toward the observer that created
+	// it, and a relay does not rewrite the outer source either.
+	Symmetric bool
+	// Observed is the outer "ip:port" the reflector saw, empty when unknown.
+	Observed string
+	// TransitPort is what the device's own dataplane reports listening on.
+	TransitPort uint16
+	// Ifaces maps physical port name -> link MTU in bytes. It is nil until the
+	// agent starts reporting an inventory; len()==0 therefore means "unknown"
+	// and disables the interface-name check rather than rejecting everything.
+	Ifaces map[string]uint16 `json:"ifaces,omitempty"`
+	// DefaultIface is the physical port the device says tunnels leave through.
+	// Auto batches need it because "choose a port" is not a question a batch can
+	// ask the operator per pair.
+	DefaultIface string `json:"default_iface,omitempty"`
+}
+
+func (v NodeView) ifaceMTU(name string) (uint16, bool) {
+	if len(v.Ifaces) == 0 {
+		return 0, false
+	}
+	mtu, ok := v.Ifaces[name]
+	return mtu, ok && mtu > 0
+}
+
+// EndpointSpec is the user-facing half of one tunnel end.
+type EndpointSpec struct {
+	NodeID uint16
+	Iface  string
+	Addr   string // optional, "ip" or "ip:port"; empty = use the observed address
+	Port   uint16 // 0 = allocate from the pool
+}
+
+// CreateRequest is one manual tunnel. The same fields back the topology editor,
+// so both entry points validate identically.
+type CreateRequest struct {
+	A, B    EndpointSpec
+	Path    *TunnelPath // nil = direct
+	BatchID string
+	Roles   Roles
+	Now     int64
+}
+
+// Create validates, allocates and stores one tunnel. It runs on a clone, so a
+// failure leaves no allocated ports or overlay addresses behind.
+func (s *State) Create(req CreateRequest, views map[uint16]NodeView) (Tunnel, error) {
+	c := s.Clone()
+	t, err := c.create(req, views)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	*s = *c
+	return t, nil
+}
+
+func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, error) {
+	if !s.Configured() {
+		return Tunnel{}, fmt.Errorf("还没有发布全局配置：先保存并发布“全局配置”，中转端口随它一起下发")
+	}
+	if req.A.NodeID == req.B.NodeID {
+		return Tunnel{}, fmt.Errorf("隧道两端不能是同一台设备")
+	}
+	va, err := viewOf(views, "本端", req.A.NodeID)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	vb, err := viewOf(views, "对端", req.B.NodeID)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	if va.Symmetric && vb.Symmetric {
+		return Tunnel{}, fmt.Errorf("两端都是对称 NAT，这条隧道不可能建立（中转也不改外层源）")
+	}
+	ifaceA, err := endpointIface("本端", va, req.A.Iface)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	ifaceB, err := endpointIface("对端", vb, req.B.Iface)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	addrA, err := endpointAddr("本端", req.A.Addr, va.Observed)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	addrB, err := endpointAddr("对端", req.B.Addr, vb.Observed)
+	if err != nil {
+		return Tunnel{}, err
+	}
+
+	relayNode, _, err := s.resolve(req.Path)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	hops := uint8(0)
+	if req.Path != nil {
+		if relayNode == req.A.NodeID || relayNode == req.B.NodeID {
+			return Tunnel{}, fmt.Errorf("中转设备 %d 同时是隧道的一端", relayNode)
+		}
+		rv, err := viewOf(views, "中转设备", relayNode)
+		if err != nil {
+			return Tunnel{}, err
+		}
+		if rv.Stale {
+			return Tunnel{}, fmt.Errorf("中转设备 %d 当前离线", relayNode)
+		}
+		if _, err := s.ensureTransitPort(relayNode); err != nil {
+			return Tunnel{}, err
+		}
+		hops = 1
+	}
+
+	// Transit first: allocPort must know it so the two never collide.
+	portA, err := s.allocPort(req.A.NodeID, req.A.Port)
+	if err != nil {
+		return Tunnel{}, fmt.Errorf("本端端口: %w", err)
+	}
+	portB, err := s.allocPort(req.B.NodeID, req.B.Port)
+	if err != nil {
+		return Tunnel{}, fmt.Errorf("对端端口: %w", err)
+	}
+	reservedOverlay := map[netip.Addr]bool{}
+	ovA, err := s.allocOverlay(reservedOverlay)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	if a, err := netip.ParseAddr(ovA); err == nil {
+		reservedOverlay[a] = true
+	}
+	ovB, err := s.allocOverlay(reservedOverlay)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	mtu, err := tunnelMTU(va, vb, ifaceA, ifaceB, hops)
+	if err != nil {
+		return Tunnel{}, err
+	}
+
+	t := &Tunnel{
+		ID:        s.nextID("t"),
+		A:         Endpoint{NodeID: req.A.NodeID, Iface: ifaceA, Addr: addrA, Port: portA, Overlay: ovA},
+		B:         Endpoint{NodeID: req.B.NodeID, Iface: ifaceB, Addr: addrB, Port: portB, Overlay: ovB},
+		Path:      clonePath(req.Path),
+		MTU:       mtu,
+		Roles:     req.Roles,
+		BatchID:   req.BatchID,
+		CreatedAt: req.Now,
+		UpdatedAt: req.Now,
+	}
+	s.Tunnels[t.ID] = t
+	out := *t
+	return out, nil
+}
+
+// UpdateRequest changes a tunnel in place. Zero values mean "keep": an empty
+// iface, a nil address, a zero port and a nil path all leave the current value
+// alone, while ClearPath is the explicit way to go back to a direct tunnel.
+type UpdateRequest struct {
+	IfaceA, IfaceB string
+	AddrA, AddrB   *string
+	PortA, PortB   uint16
+	Path           *TunnelPath
+	ClearPath      bool
+	Now            int64
+}
+
+func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) (Tunnel, error) {
+	c := s.Clone()
+	t, ok := c.Tunnels[id]
+	if !ok {
+		return Tunnel{}, ErrNotFound
+	}
+	if _, err := viewOf(views, "本端", t.A.NodeID); err != nil {
+		return Tunnel{}, err
+	}
+	if _, err := viewOf(views, "对端", t.B.NodeID); err != nil {
+		return Tunnel{}, err
+	}
+	// Take it out of the table first: its own ports must not count as "taken"
+	// while we re-validate them. The clone is thrown away on any error, so
+	// nothing has to be put back.
+	delete(c.Tunnels, id)
+
+	if req.IfaceA != "" {
+		iface, err := endpointIface("本端", views[t.A.NodeID], req.IfaceA)
+		if err != nil {
+			return Tunnel{}, err
+		}
+		t.A.Iface = iface
+	}
+	if req.IfaceB != "" {
+		iface, err := endpointIface("对端", views[t.B.NodeID], req.IfaceB)
+		if err != nil {
+			return Tunnel{}, err
+		}
+		t.B.Iface = iface
+	}
+	if req.AddrA != nil {
+		addr, err := endpointAddr("本端", *req.AddrA, views[t.A.NodeID].Observed)
+		if err != nil {
+			return Tunnel{}, err
+		}
+		t.A.Addr = addr
+	}
+	if req.AddrB != nil {
+		addr, err := endpointAddr("对端", *req.AddrB, views[t.B.NodeID].Observed)
+		if err != nil {
+			return Tunnel{}, err
+		}
+		t.B.Addr = addr
+	}
+	if req.PortA != 0 {
+		port, err := c.allocPort(t.A.NodeID, req.PortA)
+		if err != nil {
+			return Tunnel{}, fmt.Errorf("本端端口: %w", err)
+		}
+		t.A.Port = port
+	}
+	if req.PortB != 0 {
+		port, err := c.allocPort(t.B.NodeID, req.PortB)
+		if err != nil {
+			return Tunnel{}, fmt.Errorf("对端端口: %w", err)
+		}
+		t.B.Port = port
+	}
+
+	if req.ClearPath {
+		t.Path = nil
+	} else if req.Path != nil {
+		t.Path = clonePath(req.Path)
+	}
+	relay, _, err := c.resolve(t.Path)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	hops := uint8(0)
+	if t.Path != nil {
+		if relay == t.A.NodeID || relay == t.B.NodeID {
+			return Tunnel{}, fmt.Errorf("中转设备 %d 同时是隧道的一端", relay)
+		}
+		if _, err := c.ensureTransitPort(relay); err != nil {
+			return Tunnel{}, err
+		}
+		hops = 1
+	}
+	mtu, err := tunnelMTU(views[t.A.NodeID], views[t.B.NodeID], t.A.Iface, t.B.Iface, hops)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	t.MTU = mtu
+	t.UpdatedAt = req.Now
+	c.Tunnels[id] = t
+	*s = *c
+	return *t, nil
+}
+
+// Delete removes a tunnel and puts both overlay /32s back at the back of the
+// queue. The transit port is NOT released: the device keeps listening on it,
+// and the same port serves every other tunnel relayed through it.
+func (s *State) Delete(id string) error {
+	c := s.Clone()
+	t, ok := c.Tunnels[id]
+	if !ok {
+		return ErrNotFound
+	}
+	delete(c.Tunnels, id)
+	c.freeOverlay(t.A.Overlay)
+	c.freeOverlay(t.B.Overlay)
+	*s = *c
+	return nil
+}
+
+func viewOf(views map[uint16]NodeView, what string, node uint16) (NodeView, error) {
+	v, ok := views[node]
+	if !ok || node == 0 {
+		return NodeView{}, fmt.Errorf("%s设备 %d 不存在或未入网", what, node)
+	}
+	return v, nil
+}
+
+func endpointIface(what string, v NodeView, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = strings.TrimSpace(v.DefaultIface)
+	}
+	if name == "" {
+		return "", fmt.Errorf("%s需要选择物理端口（设备也没有上报可用的端口）", what)
+	}
+	if len(v.Ifaces) > 0 {
+		if _, ok := v.Ifaces[name]; !ok {
+			return "", fmt.Errorf("%s设备上没有接口 %q", what, name)
+		}
+	}
+	return name, nil
+}
+
+// endpointAddr resolves the outer address a peer is dialed at. An explicit
+// value wins; otherwise the reflector's observation is used. Both are "ip" or
+// "ip:port" -- a bare ip is paired with the tunnel's port at delivery time.
+func endpointAddr(what, explicit, observed string) (string, error) {
+	if a := strings.TrimSpace(explicit); a != "" {
+		if err := validateOuterAddr(a); err != nil {
+			return "", fmt.Errorf("%s地址 %q: %w", what, a, err)
+		}
+		return a, nil
+	}
+	if a := strings.TrimSpace(observed); a != "" {
+		return a, nil
+	}
+	return "", fmt.Errorf("%s还没有可用的外层地址（没有观测到，也没有手填）", what)
+}
+
+func validateOuterAddr(s string) error {
+	if _, err := netip.ParseAddrPort(s); err == nil {
+		return nil
+	}
+	if _, err := netip.ParseAddr(s); err == nil {
+		return nil
+	}
+	return fmt.Errorf("需要 ip 或 ip:port")
+}
+
+// tunnelMTU is the overlay MTU this tunnel may carry. It is derived from the
+// devices' reported link MTU and the number of SR hops, using the same budget
+// function the agent enforces -- one number, one owner.
+//
+// When either side has not reported its link MTU, the result is 0 (unknown):
+// delivery then uses wire.DefaultTunnelMTU and labels it as the default, rather
+// than pretending a computed value.
+func tunnelMTU(a, b NodeView, ifaceA, ifaceB string, hops uint8) (uint16, error) {
+	ma, oka := a.ifaceMTU(ifaceA)
+	mb, okb := b.ifaceMTU(ifaceB)
+	if !oka || !okb {
+		return 0, nil
+	}
+	underlay := ma
+	if mb < underlay {
+		underlay = mb
+	}
+	budget := wire.TunnelMTUBudget(underlay, hops)
+	if budget < wire.MinTunnelMTU {
+		return 0, fmt.Errorf("underlay MTU %d 扣掉 %d 跳 SR 头后只剩 %d，低于最小 %d",
+			underlay, hops, budget, wire.MinTunnelMTU)
+	}
+	if budget > wire.MaxTunnelMTU {
+		return wire.MaxTunnelMTU, nil
+	}
+	return budget, nil
+}
+
+func clonePath(p *TunnelPath) *TunnelPath {
+	if p == nil {
+		return nil
+	}
+	c := *p
+	return &c
+}
