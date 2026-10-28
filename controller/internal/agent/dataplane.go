@@ -365,17 +365,8 @@ func NewLink(cfg LinkConfig) (*Link, error) {
 // 今天的环里只有一条（见 wire.EnrollResponse.PKeys 的注释），所以这里记住那个
 // hmac_id 给后面的路径用。**先装密钥再建路径**不是风格问题：路径签名要用它。
 func (l *Link) InstallKeys(ctx context.Context, keys []Key) error {
-	if len(keys) == 0 {
-		return errors.New("agent: 租户没下发 hop-MAC 密钥，装不出能签名的路径")
-	}
-	for _, k := range keys {
-		if len(k.Key) != 16 {
-			return fmt.Errorf("agent: hmac_id=%d 的密钥应是 16 字节（SR_PKEY_LEN），实际 %d 字节",
-				k.HmacID, len(k.Key))
-		}
-		if err := l.dp.SetPKey(ctx, k.HmacID, k.Key); err != nil {
-			return fmt.Errorf("agent: 装 hmac_id=%d 的密钥: %w", k.HmacID, err)
-		}
+	if err := installPKeys(ctx, l.dp, keys); err != nil {
+		return err
 	}
 	// 环里到今天只有一条（wire.EnrollResponse.PKeys 明说轮转还没实现）。取第 0 条
 	// 只是为了**确定性**：任一条都能用，因为路径里写的就是这个 hmac_id、对端也有同一把。
@@ -384,6 +375,24 @@ func (l *Link) InstallKeys(ctx context.Context, keys []Key) error {
 	l.hmacID = keys[0].HmacID
 	l.hmacSet = true
 	l.mu.Unlock()
+	return nil
+}
+
+// installPKeys 是密钥环的装载本身，不含任何"这条链路"的状态，所以一台不当任何
+// 隧道端点的中转盒也能用它 —— 中转要验的是别人签的路径头，同样得先有钥匙。
+func installPKeys(ctx context.Context, dp DataPlane, keys []Key) error {
+	if len(keys) == 0 {
+		return errors.New("agent: 租户没下发 hop-MAC 密钥，装不出能签名的路径")
+	}
+	for _, k := range keys {
+		if len(k.Key) != 16 {
+			return fmt.Errorf("agent: hmac_id=%d 的密钥应是 16 字节（SR_PKEY_LEN），实际 %d 字节",
+				k.HmacID, len(k.Key))
+		}
+		if err := dp.SetPKey(ctx, k.HmacID, k.Key); err != nil {
+			return fmt.Errorf("agent: 装 hmac_id=%d 的密钥: %w", k.HmacID, err)
+		}
+	}
 	return nil
 }
 

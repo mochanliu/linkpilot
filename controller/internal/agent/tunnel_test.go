@@ -540,6 +540,64 @@ func TestTunnelSyncKickReportsPartialAsNotConverged(t *testing.T) {
 	}
 }
 
+// 一台只做中转的盒子：一条隧道端点都不是，但每条经过它的路径都要在它身上验签、
+// 弹一段。这两件事以前只在建 Link 的路上做，所以这种形态什么都没配 —— 选中它做
+// 中转的那些隧道变成静默黑洞，而控制台的回执仍然写着"已收敛"。
+func TestTunnelSyncOpensTransitWithoutAnyTunnel(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	b := testBundle()
+	b.TransitPort = 15000
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if f.transitPort != 15000 {
+		t.Fatalf("零隧道时中转端口没打开，实际 %d", f.transitPort)
+	}
+	if len(f.keys) != len(b.PKeys) {
+		t.Fatalf("中转要验别人的签名，密钥环必须先装上，实际 %d 条", len(f.keys))
+	}
+	if st := ts.State(); !st.OK || st.Tunnels != 0 || st.Error != "" {
+		t.Fatalf("这台盒子该报告「已收敛、零条隧道」，实际 %+v", st)
+	}
+
+	// 没给中转端口就一次都不该碰 transit API：不能把"控制器没说要中转"读成"关掉它"。
+	f2 := newFakeVPP()
+	ts2, _ := newTunnelSync(t, f2, pki, testBundle())
+	if err := ts2.Sync(context.Background(), 3); err != nil {
+		t.Fatalf("Sync(无中转): %v", err)
+	}
+	if n := len(f2.callWith("SetTransit")); n != 0 {
+		t.Fatalf("transit_port 为 0 却调了 SetTransit（%d 次）", n)
+	}
+	if n := len(f2.callWith("SetPKey")); n != 0 {
+		t.Fatalf("既没有隧道也没有中转时不该装密钥（%d 次）", n)
+	}
+}
+
+// 中转没配成不是可以忽略的一行日志：这台设备确实没有收敛，回执必须说没收敛。
+func TestTunnelSyncReportsTransitFailureAsNotConverged(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	b := testBundle()
+	b.TransitPort = 15000
+	b.PKeys = []wire.PKey{{HmacID: 9001, Key: "zz"}}
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	st := ts.State()
+	if st.OK || !strings.Contains(st.Error, "中转端口 15000") {
+		t.Fatalf("中转失败应报成没收敛并带原因，实际 %+v", st)
+	}
+	if f.transitPort != 0 {
+		t.Fatalf("密钥没装成就不该去开中转端口，实际 %d", f.transitPort)
+	}
+}
+
 func TestLinkKeysRejectsNonHex(t *testing.T) {
 	if _, err := linkKeys([]wire.PKey{{HmacID: 1, Key: "zz"}}); err == nil {
 		t.Fatal("不是 hex 的密钥必须报错（截断签名会让每个包都失败而没有计数器指向它）")

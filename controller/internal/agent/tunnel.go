@@ -392,6 +392,22 @@ func (t *TunnelSync) fetchAndApply(ctx context.Context, desired int) (
 		return 0, 0, 0, nil, fmt.Errorf("读接口表（解析隧道出口）: %w", err)
 	}
 
+	// 中转是设备角色，不是隧道属性：`hub 仅中转`那种盒子一条隧道端点都不是，
+	// 但每条经它的路径都要在它身上验签、弹一段。这两件事（密钥环 + transit 端口）
+	// 原先只在建 Link 的路上做，所以零隧道的中转盒什么都不会配 —— 把它选中做中转
+	// 的那些隧道变成静默黑洞，控制器这边还一切"已下发"。失败记进 errs：这条设备
+	// 级的事没做成，就不算收敛。
+	if b.TransitPort != 0 {
+		keys, kerr := linkKeys(b.PKeys)
+		if kerr != nil {
+			errs = append(errs, fmt.Sprintf("中转端口 %d 要用的密钥环: %v", b.TransitPort, kerr))
+		} else if err := installPKeys(ctx, dp, keys); err != nil {
+			errs = append(errs, fmt.Sprintf("中转端口 %d 要用的密钥环: %v", b.TransitPort, err))
+		} else if err := dp.SetTransit(ctx, b.TransitPort); err != nil {
+			errs = append(errs, fmt.Sprintf("开中转端口 %d: %v", b.TransitPort, err))
+		}
+	}
+
 	keep := map[string]bool{}
 	keepInst := map[uint32]bool{}
 	for _, spec := range b.Tunnels {

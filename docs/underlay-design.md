@@ -1,7 +1,7 @@
 # underlay 配置模块设计
 
 2026-10-28 与用户逐条对齐后定稿。本文描述设计；模型与分配器的实现在 `controller/internal/underlay`。
-配置分三层：基础配置（客户侧，已实现）、underlay（隧道：模型/API/控制台/设备侧 `sr-agent -tunnels` 都已实现，2026-10-28 lab 端到端验证通过，见 §11）、overlay（路由：草案在 `overlay-design-draft.md`，思科调研在 `cisco-vpn-leaking-research.md`，未开工）。
+配置分三层：基础配置（客户侧，已实现）、underlay（隧道：模型/API/控制台/设备侧 `sr-agent -tunnels` 都已实现，2026-10-28 lab 端到端验证通过见 §11，含零隧道中转盒的 A/B 见 §12）、overlay（路由：草案在 `overlay-design-draft.md`，思科调研在 `cisco-vpn-leaking-research.md`，未开工）。
 
 underlay 三个页面：**全局配置**、**隧道配置**、**拓扑图**。
 
@@ -209,4 +209,30 @@ hub-spoke 的 spoke 间隧道共用一个自动生成的路径模板（`经 <设
 | MTU 1440 下发、设备只接受 1368，`NewLink` 全部拒绝 | 控制器按**当前跳数**算预算，设备按**最坏段数**校验 | `tunnelMTU()` 改用 `wire.MaxSRSegments`，见 §2；对既有隧道用 `PUT /api/underlay/tunnels` 重算 |
 | 控制器分配端口上的观测全部「对不上」 | 归属判定只读遗留的 `VpnPort/TransitPort`，不看每隧道的监听端口 | 新增 `nodePortLocked`：遗留两端口 ∪ 该节点的隧道监听端口 ∪ 它的中转端口 |
 
-仍未在 lab 覆盖的：中转（path 非空）隧道的端到端、MTU 边界包（DF / frag-needed，见 §2 与既有 MTU 缺口任务）、自动编排批量。
+### 11.1 还没在 lab 覆盖的
+
+MTU 边界包（DF / frag-needed，见 §2 与既有 MTU 缺口任务）、自动编排批量。
+
+## 12. 中转盒的 lab 端到端（2026-10-29，已通过，含一组 A/B）
+
+`lab-transit`（WAN 10.88.1.3，VPP + sr_wg 插件，**不当任何隧道端点**）以 node 4 `LAB-TRANSIT-01` 入网 `gui-check`：入网即拿到 `中转端口 15000`（§0 决策 5），控制器视角 `tunnel_count:0、relay_for:1`。起 `sr-agent -vpp-api … -tunnels` 后日志 `隧道配置 v6 已收敛`，`show sr-wg ports` 里 transit 集合含 15000、`show sr-wg keys` 有 1 条 hmac_id=1 —— 这台盒子的中转配置**全部**来自「bundle 给了中转端口」这一条，而不是某条隧道的建 Link 路径。
+
+把 t1 改成经它中转：`PUT /api/underlay/tunnels {"id":"t1","path":{"node_id":4,"addr":"10.88.1.3"}}` → `path` 回读为 `{node_id:4, serial:"LAB-TRANSIT-01", addr:"10.88.1.3"}`，`mtu` 仍是 1368（§2 的最坏段数预算与跳数无关）。三台设备都报 `隧道配置 v7 已收敛`，两端 SR 路径各变两跳：
+
+```
+cpe1  path_id=1003 seg_count=2   seg[0]: 10.88.1.12:20000   seg[1]: 10.88.1.3:15000
+cpe2  path_id=1002 seg_count=2   seg[0]: 10.88.1.11:20000   seg[1]: 10.88.1.3:15000
+```
+
+overlay ping 双向各 4/4、0% loss；中转盒 `show sr-wg stats` 的 `Transit: ok` 恰好 +16（两个方向各 4 个请求 + 4 个应答）、`hmac_fail:0` —— 路径头的签名用装在它身上的密钥环验过了，验完弹一段再改外层目的地址。
+
+**A/B（这一条是修动的证据，不是运行的副产品）**：同一台盒子、同一份控制器状态，只换设备侧二进制，并先把 VPP 恢复成"刚开机"的样子（`set sr-wg port del transit 15000`、`sr-wg key del 1`）：
+
+| 二进制 | `show sr-wg ports` | `show sr-wg keys` | overlay ping | `Transit ok` | agent 回执 |
+|---|---|---|---|---|---|
+| 修复前（HEAD 9bcc3d5 编出的 `sr-agent`） | 无 15000 | 0 条 | 4 发 0 收，100% loss | 0 | **隧道配置 v7 已收敛** |
+| 修复后 | 含 15000 | 1 条 | 双向各 4/4，0% loss | 16（hmac_fail 0） | 隧道配置 v7 已收敛 |
+
+两行回执相同、数据面一行通一行全断，这就是"零隧道中转盒"以前是静默黑洞的原因：装密钥环和开中转端口的动作原先只挂在 `Link.Open()` 那条路上，一条隧道端点都不是的设备根本走不到那里。改在 `fetchAndApply` 里按 bundle 的 `TransitPort` 做（密钥环 → `SetTransit` 的次序保持不变，路径签名要用它），失败写进 errs，于是这台设备的回执变成"没收敛"并带上 `中转端口 15000 …` 的原因。
+
+验证完把 t1 改回直连（`{"clear_path":true}`），三台 `v8 已收敛`、双向 ping 各 4/4，中转盒 `Transit ok` 归 0；实验残留的旧观测表已 `clear sr-wg observed`。
