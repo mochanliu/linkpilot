@@ -285,13 +285,25 @@ MTU 1400、pair、`lcp-sync on`、两个 TAP 与 sysctl 都恢复，随后启动
 地址和静态路由按已安装的 `frr.conf` 生效，并被 lcp-sync 镜像回 VPP。
 第二次 `apply` 会打印 `already paired ... skip` 并成功返回。
 
-**多 VPN 在本 lab 内核上无法验证**：这个 Docker Desktop 的 LinuxKit 内核
+**多 VPN 需要带 `vrf` 模块的内核**：这个 Docker Desktop 的 LinuxKit 内核
 （7.0.14-linuxkit）没有 `vrf` 模块（`ip link add name vpn100 type vrf table 100`
 报 `Unknown device type`，没有 `/lib/modules`，也没有 `modprobe`）。带 VPN 100
 的包会把 VPP 部分做完（`ip table add 100`、接口移进 table 100、lcp pair），
 然后在内核片段第一行失败；`sr-apply` 如实返回非 0、`status.ok=false`，并且
-不会覆盖 `/etc/frr/frr.conf`。也就是说：自动推送还没做，而多 VPN 的真机路径
-（内核 VRF 设备 + 入 VRF + FRR vrf 段）需要在有 `vrf` 模块的宿主上再验一次。
+不会覆盖 `/etc/frr/frr.conf`。
+
+这条路径在 Ubuntu 24.04 上验过一遍（2026-10-28；colima 的 vz 虚拟机，
+6.8.0-117 内核，同一份 `srwg-lab` 镜像）：装
+`linux-modules-extra-6.8.0-117-generic` 后 `modprobe vrf` 可用，由同一套
+normalize/validate/render 代码生成的 VPN 0 + VPN 100 包一次装成。`ip -d link show lcp-x1` 是
+`master vpn100 ... vrf_slave table 100`，内核 table 100 有
+`10.100.0.0/24` 和静态 `10.200.0.0/24 via 10.100.0.3`，VPP 的 table 100
+镜像出同一条 `arp-ipv4: via 10.100.0.3 host-eth1`，`vtysh show vrf` 是
+`vrf vpn100 id 6 table 100`，`show ip route vrf vpn100` 有 C/L/S 三条。
+数据面：VPN 100 内 10.100.0.4 → 10.200.0.5 通（trace 里 `fib 1` 查表、
+`ip4-rewrite ... via 10.100.0.3 host-eth1`）；VPN 0 内 10.79.0.4 →
+10.201.0.5 通；跨 VPN 两个方向 100% 丢包，trace 停在 `fib 0 → ip4-drop`。
+VPP 的 table 0 里没有 VPN 100 的前缀，table 100 里也没有 VPN 0 的。
 
 lab 的三台 `lab-cpeN` 仍然按 [bringup.sh](bringup.sh) 手写的数据面计划运行——
 推送通道搬的是客户侧基础配置，不碰隧道、端口和 VRF。
@@ -352,8 +364,9 @@ applier 自己写的）、有没有一次安装在飞。心跳原样上报这些
   `applying config vN … installed version … frr reloaded … config vN applied`。
 
 目前**没有回滚**：发布新版本不会保留「失败自动退回」的路径，失败就停在
-`status.ok=false` 和明确错误上，等人处理。多 VPN 的包会卡在内核 VRF 一段
-（本 lab 内核没有 `vrf` 模块），这是环境限制，不是通道行为。
+`status.ok=false` 和明确错误上，等人处理。多 VPN 的包在本 lab 内核上会卡在内核
+VRF 一段（没有 `vrf` 模块），这是环境限制，不是通道行为；带 `vrf` 模块的
+Ubuntu 上同样的包装成了，见上一节。
 
 分阶段调试（阶段之间可反复重跑，配置是幂等的）：
 
