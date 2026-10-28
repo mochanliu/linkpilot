@@ -148,6 +148,46 @@
   .placeholder b{color:var(--ink)}
   .placeholder ul{margin:8px 0 0;padding-left:20px}
 
+  /* ---------- underlay ---------- */
+  .und-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .und-box{border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .und-box h3{font-size:13.5px;margin-bottom:8px}
+  .und-box .hint{margin:8px 0 0}
+  .node-pick{display:flex;flex-wrap:wrap;gap:6px 16px;margin:0;padding:0;list-style:none}
+  .node-pick label{display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap}
+  .node-pick input{width:auto}
+  .avoid-list{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0;padding:0;list-style:none}
+  .avoid-list li{display:flex;align-items:center;gap:6px;border:1px solid var(--line);
+    border-radius:999px;padding:2px 4px 2px 10px;font-size:12.5px}
+  .usage{display:flex;flex-wrap:wrap;gap:8px 26px;margin-top:4px;font-size:13px}
+  .usage b{font-variant-numeric:tabular-nums}
+  .usage .k{color:var(--muted);font-size:12.5px}
+  .topo-wrap{overflow-x:auto;margin-top:10px}
+  svg.topo{display:block;min-width:640px;width:100%;height:auto;border:1px solid var(--line);
+    border-radius:10px;background:#fcfdfe}
+  svg.topo .edge{stroke:#8c959f;stroke-width:2;pointer-events:none}
+  svg.topo .edge.relay{stroke-dasharray:6 5}
+  svg.topo .edge.sel{stroke:var(--accent);stroke-width:3}
+  svg.topo .hit{stroke:transparent;stroke-width:16;cursor:pointer}
+  svg.topo .edge-label{font-size:11px;fill:#57606a;text-anchor:middle;pointer-events:none;
+    paint-order:stroke;stroke:#fcfdfe;stroke-width:4px;stroke-linejoin:round}
+  svg.topo .node{cursor:pointer}
+  svg.topo .node rect{fill:#fff;stroke:#8c959f;stroke-width:1.5;rx:9}
+  svg.topo .node.online rect{stroke:var(--ok)}
+  svg.topo .node.stale rect{stroke:var(--warn)}
+  svg.topo .node.pending rect{stroke:#afb8c1;stroke-dasharray:4 3}
+  svg.topo .node.sel rect{stroke:var(--accent);stroke-width:2.5}
+  svg.topo .node .dotmark{fill:#8c959f}
+  svg.topo .node.online .dotmark{fill:var(--ok)}
+  svg.topo .node.stale .dotmark{fill:var(--warn)}
+  svg.topo .node.pending .dotmark{fill:#afb8c1}
+  svg.topo .node text{text-anchor:middle;font-size:12px;fill:var(--ink);pointer-events:none}
+  svg.topo .node text.cap{font-size:10.5px;fill:#57606a}
+  .kv{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:5px 16px;
+    font-size:13px;margin:10px 0 0}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0;word-break:break-all}
+
   /* ---------- config ---------- */
   .cfg-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
   .ltabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin:0 0 12px}
@@ -239,9 +279,11 @@
       <a href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
       <div class="sect" data-roles="tenant">我的网络</div>
       <a href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
-      <a href="#config" data-view="config" data-roles="tenant">配置</a>
+      <a href="#config" data-view="config" data-roles="tenant">基础配置</a>
+      <a href="#underlay-settings" data-view="underlay-settings" data-roles="tenant">全局配置</a>
+      <a href="#underlay-tunnels" data-view="underlay-tunnels" data-roles="tenant">隧道配置</a>
+      <a href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
       <a href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
-      <a href="#tunnels" data-view="tunnels" data-roles="tenant">隧道</a>
       <a href="#routes" data-view="routes" data-roles="tenant">路由</a>
     </nav>
     <div class="foot">
@@ -275,7 +317,7 @@
   var S = { state: null, me: null, accounts: null, loginTab: "account",
     view: "overview", lastResult: null, lastSecret: null, codeReveal: null,
     html: "", timer: null, ago: null, es: null,
-    metrics: null, fast: null, cfg: null };
+    metrics: null, fast: null, cfg: null, und: null, topo: null };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -356,6 +398,8 @@
     S.lastResult = null;
     S.codeReveal = null;
     S.cfg = null;
+    S.und = null;
+    S.topo = null;
     S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
     clearInterval(S.timer);
@@ -552,7 +596,7 @@
     overview: {
       title: "概览",
       sub: "运营侧重归属与库存；设备配置属于租户，不在这里展示",
-      tenantSub: "你的设备与入网入口；基础配置在「配置」页发布后由设备自己拉取，隧道参数（节点计划）仍未实现"
+      tenantSub: "你的设备与入网入口；基础配置、全局配置与隧道配置都在左侧，发布后由设备自己拉取"
     },
     tenants: { title: "租户", sub: "租户是设备归属的唯一依据，只有控制台能创建", roles: ["operator"] },
     accounts: { title: "账号", sub: "登录控制台的账号；角色决定能看到什么、能改什么", roles: ["operator"] },
@@ -564,11 +608,11 @@
     nodes: {
       title: "设备",
       sub: "运营方只看库存（谁、序列号、入网时间、在线状态）",
-      tenantSub: "你的设备；入网只建立归属，基础配置可在「配置」页发布到设备（agent 需 -apply）或下载配置包手工安装，隧道 / 端口 / overlay 仍未实现"
+      tenantSub: "你的设备；入网只建立归属。基础配置在「基础配置」页、隧道参数在「全局配置 / 隧道配置」页，发布后由设备自己拉取（agent 需 -apply），也可以下载配置包手工安装"
     },
     config: {
-      title: "配置",
-      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。这一轮只做基础配置：草稿保存在控制器，点「发布到设备」后设备在下一次心跳拉取并安装（agent 需 -apply）；也可以下载配置包手工安装",
+      title: "基础配置",
+      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。本页编辑基础配置；underlay 已拆成「全局配置 / 隧道配置 / 拓扑图」三页。保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装",
       roles: ["tenant"]
     },
     monitor: {
@@ -576,16 +620,32 @@
       sub: "设备存活与隧道内遥测：两端各自上报，不合并，没有上报就明说",
       roles: ["tenant"]
     },
-    tunnels: { title: "隧道", sub: "尚未实现：需要先把节点计划（端口 / overlay 地址 / 密钥环）做出来", roles: ["tenant"] },
+    "underlay-settings": {
+      title: "全局配置",
+      sub: "租户级的隧道参数：VPN 端口池、中转端口池、overlay 地址池与探测间隔。保存只写草稿，发布后才成为设备的目标配置，并给每台已入网设备分配唯一的中转端口",
+      roles: ["tenant"]
+    },
+    "underlay-tunnels": {
+      title: "隧道配置",
+      sub: "设备对之间的隧道：可以按拓扑自动成批编排（先预览再落库），也可以一台对一台手动创建；中转路径可以内联或用共享模板",
+      roles: ["tenant"]
+    },
+    "underlay-topology": {
+      title: "拓扑图",
+      sub: "设备与隧道连线的只读视图；隧道状态一律显示「未知」，因为隧道段还没有下发到设备，控制器无法把遥测行对到这里",
+      roles: ["tenant"]
+    },
     routes: { title: "路由", sub: "尚未实现：路由表由 RR 反射，控制器不发布路由", roles: ["tenant"] },
     account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" }
   };
+
 
   function render() {
     var st = S.state;
     if (!st) return;
     var me = S.me || {};
     var isOp = me.role === "operator";
+    if (!VIEWS[S.view]) S.view = "overview";
     if (!allowed(S.view)) S.view = "overview";
     var v = VIEWS[S.view] || VIEWS.overview;
     $("view-title").textContent = v.title;
@@ -612,6 +672,9 @@
     else if (S.view === "enroll") c = viewEnroll(st, isOp);
     else if (S.view === "nodes") c = viewNodes(st, isOp);
     else if (S.view === "config") c = viewConfig(st);
+    else if (S.view === "underlay-settings") c = viewUnderlaySettings();
+    else if (S.view === "underlay-tunnels") c = viewUnderlayTunnels();
+    else if (S.view === "underlay-topology") c = viewUnderlayTopology();
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "account") c = viewAccount();
     else c = viewPlaceholder(S.view);
@@ -764,7 +827,7 @@
       "<li>立刻复制或手抄到设备上；码只显示这一次，重新生成后旧码立即失效</li>" +
       "<li>设备出现在「设备」页即表示归属成功；心跳变绿才代表在线</li>" +
       "<li>心跳年龄、在线时长与隧道内遥测在「监控」页；没有上报时那里会明说，不显示 0 或假数据</li>" +
-      "<li>设备配置（隧道 / 端口 / overlay 地址 / 密钥环）尚未实现，所以设备暂时显示「未配置」</li>" +
+      "<li>隧道参数（端口 / overlay 地址 / 中转）在「全局配置」和「隧道配置」页编排；隧道段还没有随配置包下发到设备，所以设备暂时仍显示「未配置」</li>" +
       "</ul></div></section>";
   }
 
@@ -1242,23 +1305,32 @@
   }
 
   function cfgBoundary(which) {
-    var isUnder = which === "underlay";
-    var items = isUnder ? [
-      ["WAN 口", "上行口的地址、掩码、源地址选择。"],
-      ["隧道", "每隧道一个监听端口、对端设备、overlay /32，全部落在独立的 VPP table。"],
-      ["密钥与 MTU", "密钥环、隧道 MTU 预算、MSS clamp（MTU−44）。"],
-      ["探测", "隧道内 BFD（必须 multihop）+ 300 ms 探针；结果就是「监控」页那张表。"]
-    ] : [
+    if (which === "underlay") {
+      return '<section class="panel"><header><h2>underlay：VPN 隧道承载</h2>' +
+        '<span class="tag online">已拆成独立页面</span></header>' +
+        '<div class="hint">这一层管「盒子之间怎么通」，现在有三页：全局配置（端口池 / overlay 池 / 探测参数）、' +
+        "隧道配置（自动编排、手动创建、路径模板）、拓扑图。隧道配置保存在控制器；隧道段还没有随配置包下发到设备，下一步才做。</div>" +
+        '<ul class="bnd">' +
+        "<li><b>端口</b> · VPN 端口按设备唯一，中转端口每台设备一个（不是每条隧道一个）。</li>" +
+        "<li><b>overlay /32</b> · 先进先出分配，删除隧道后退回队尾。</li>" +
+        "<li><b>路径</b> · 直连、inline 中转或共享模板；最多 1 跳。</li>" +
+        "<li><b>MTU</b> · 按两端上报的链路 MTU 扣 SR 头计算；没上报就按默认值投递并标注。</li>" +
+        "</ul>" +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' +
+        '<button class="small" data-act="goto" data-view="underlay-settings">全局配置</button>' +
+        '<button class="small" data-act="goto" data-view="underlay-tunnels">隧道配置</button>' +
+        '<button class="small" data-act="goto" data-view="underlay-topology">拓扑图</button>' +
+        "</div></section>";
+    }
+    var items = [
       ["RT", "每个 VPN 的 import / export RT。"],
       ["双向导入", "FRR 导出 → sr-route（只认 tag 1001，防环）；sr-route 反射回来 → FRR。"],
       ["选路", "本地直连 / 静态 / BGP / overlay 前缀的优先级与管理距离。"],
       ["前缀策略", "哪些客户前缀允许进 overlay，以及跨租户的隔离边界。"]
     ];
-    return '<section class="panel"><header><h2>' +
-      (isUnder ? "underlay：VPN 隧道承载" : "overlay：FRR 与自研路由之间的导入导出") +
-      '</h2><span class="tag plan">下一轮设计</span></header>' +
-      '<div class="hint">这一层管的是' + (isUnder ? "「盒子之间怎么通」" : "「学到了什么、怎么互相导入」") +
-      "。本页只做基础配置，先把边界摆出来，方便确认分界。</div>" +
+    return '<section class="panel"><header><h2>overlay：FRR 与自研路由之间的导入导出</h2>' +
+      '<span class="tag plan">下一轮设计</span></header>' +
+      '<div class="hint">这一层管的是「学到了什么、怎么互相导入」。本页只做基础配置，先把边界摆出来，方便确认分界。</div>' +
       '<ul class="bnd">' + items.map(function (x) {
         return "<li><b>" + esc(x[0]) + "</b> · " + esc(x[1]) + "</li>";
       }).join("") + "</ul></section>";
@@ -1937,14 +2009,16 @@
   }
 
   function viewPlaceholder(view) {
-    var what = view === "tunnels" ? "隧道" : "路由";
-    return '<section class="panel"><div class="placeholder">' +
-      "<b>" + esc(what) + "页还没有数据来源。</b>" +
-      "<ul>" +
-      "<li>设备配置（节点计划）尚未实现：端口、overlay 地址、密钥环都还没有下发通道</li>" +
-      "<li>因此控制器现在没有任何隧道或路由事实可以展示</li>" +
-      "<li>设备是否活着、设备数据面有没有上报遥测，在「监控」页</li>" +
-      "</ul></div></section>";
+    if (view === "routes") {
+      return '<section class="panel"><div class="placeholder">' +
+        "<b>路由页还没有数据来源。</b>" +
+        "<ul>" +
+        "<li>路由由 RR 反射，控制器不发布路由</li>" +
+        "<li>overlay 层的导入导出（FRR ↔ sr-route）还没有北向视图</li>" +
+        "<li>设备是否活着、数据面有没有上报遥测，在「监控」页</li>" +
+        "</ul></div></section>";
+    }
+    return '<section class="panel"><div class="empty">这个页面不存在。</div></section>';
   }
 
   function resultBox() {
@@ -1966,6 +2040,1184 @@
       }
     }
     return h + "</div>";
+  }
+
+  /* ---------------- underlay ---------------- */
+
+  // The underlay pages read two server documents (GET /api/underlay and
+  // /api/underlay/topology) and never derive a fact the server did not send.
+  // A device that never reported says "未上报"; a tunnel's liveness says
+  // "未知" with the server's own explanation. The pages also keep a settings
+  // draft in S: the 10-second poll rebuilds the view, so form values must live
+  // in S rather than only in the DOM.
+
+  function nowSec() { return Math.floor(Date.now() / 1000); }
+
+  function undRole() { return !!(S.me && S.me.role === "tenant"); }
+
+  function undClone(v) { return JSON.parse(JSON.stringify(v)); }
+
+  // Errors from the underlay API carry JSON bodies ({"error","checks"} or
+  // {"error","users"}), because those payloads are what the page shows after a
+  // refused save/delete. fetchText hands back the raw body, so parse it here.
+  function undErrNote(err) {
+    var msg = err && err.message ? err.message : String(err);
+    var checks = null, users = null;
+    try {
+      var o = JSON.parse(msg);
+      if (o) {
+        if (o.error) msg = o.error;
+        if (o.checks) checks = o.checks;
+        if (o.users) users = o.users;
+      }
+    } catch (_) {}
+    if (users && users.length) msg += "（引用它的隧道：" + users.join("、") + "）";
+    return { kind: "bad", text: msg, checks: checks };
+  }
+
+  function undCheckRow(c) {
+    var sev = c.severity || "info";
+    var label = { error: "错误", warning: "警告", info: "提示" }[sev] || sev;
+    return '<li><span class="sev ' + esc(sev) + '">' + esc(label) + "</span> · " + esc(c.text) + "</li>";
+  }
+
+  function undNote(n) {
+    if (!n) return "";
+    var h = '<div class="cfg-note ' + esc(n.kind || "") + '" role="status"><div>' + esc(n.text);
+    if (n.checks && n.checks.length) {
+      h += '<ul class="chk-list">' + n.checks.map(undCheckRow).join("") + "</ul>";
+    }
+    h += '</div><button class="small" data-act="und-note-x">知道了</button></div>';
+    return h;
+  }
+
+  function undDirtyMark(u) {
+    return u && u.dirty ? ' · <b style="color:var(--warn)">有未保存的改动</b>' : "";
+  }
+
+  function undStore() {
+    if (!S.und) {
+      S.und = { doc: null, draft: null, dirty: false, loading: false, at: 0,
+        note: null, auto: null, autoSel: [], autoMode: "full-mesh", autoHub: 0,
+        autoSpoke: "none", mPath: "direct", mA: 0, mB: 0, editTun: null,
+        editPathMode: null, editPath: null };
+    }
+    return S.und;
+  }
+
+  function ensureUnderlay() {
+    var u = undStore();
+    if (!undRole()) return u;
+    if (u.loading) return u;
+    if (!u.doc || nowSec() - u.at >= 10) loadUnderlay();
+    return u;
+  }
+
+  function loadUnderlay() {
+    var u = undStore();
+    if (!undRole() || u.loading) return;
+    u.loading = true;
+    api("GET", "/api/underlay").then(function (doc) {
+      u.loading = false;
+      u.doc = doc;
+      u.at = nowSec();
+      if (u.note && u.note.fromLoad) u.note = null;
+      if (!u.dirty) u.draft = undClone(doc.settings);
+      undPruneSelection(doc);
+      render();
+    }).catch(function (err) {
+      u.loading = false;
+      u.note = undErrNote(err);
+      u.note.fromLoad = true;
+      render();
+    });
+  }
+
+  function undPruneSelection(doc) {
+    var ids = {};
+    (doc.nodes || []).forEach(function (n) { ids[n.node_id] = true; });
+    var u = undStore();
+    u.autoSel = u.autoSel.filter(function (id) { return ids[id]; });
+    if (!ids[u.autoHub]) u.autoHub = 0;
+    if (!ids[u.mA]) u.mA = 0;
+    if (!ids[u.mB]) u.mB = 0;
+  }
+
+  function undTopoStore() {
+    if (!S.topo) S.topo = { doc: null, loading: false, at: 0, sel: null, err: null };
+    return S.topo;
+  }
+
+  function ensureTopo() {
+    var t = undTopoStore();
+    if (!undRole()) return t;
+    if (t.loading) return t;
+    if (!t.doc || nowSec() - t.at >= 10) loadTopo();
+    return t;
+  }
+
+  function loadTopo() {
+    var t = undTopoStore();
+    if (!undRole() || t.loading) return;
+    t.loading = true;
+    t.err = null;
+    api("GET", "/api/underlay/topology").then(function (doc) {
+      t.loading = false;
+      t.doc = doc;
+      t.at = nowSec();
+      render();
+    }).catch(function (err) {
+      t.loading = false;
+      t.err = undErrNote(err).text;
+      render();
+    });
+  }
+
+  function undInvalidateTopo() {
+    if (S.topo) { S.topo.doc = null; S.topo.at = 0; }
+  }
+
+  function undSetDoc(doc) {
+    var u = undStore();
+    u.doc = doc;
+    u.at = nowSec();
+    u.loading = false;
+    if (!u.dirty) u.draft = undClone(doc.settings);
+    undPruneSelection(doc);
+    undInvalidateTopo();
+    render();
+  }
+
+  function undSetField(el) {
+    var u = S.und;
+    if (!u || !u.draft) return;
+    var path = el.getAttribute("data-und");
+    var segs = path.split(".");
+    var obj = u.draft;
+    for (var i = 0; i < segs.length - 1; i++) obj = obj[segs[i]];
+    var last = segs[segs.length - 1];
+    if (el.getAttribute("data-und-num") === "true") {
+      var raw = String(el.value || "").trim();
+      var n = raw === "" ? 0 : Math.trunc(Number(raw));
+      obj[last] = Number.isFinite(n) ? n : 0;
+    } else {
+      obj[last] = el.value;
+    }
+    u.dirty = true;
+    var m = $("und-meta");
+    if (m && u.doc) m.innerHTML = undMetaText(u, u.doc) + undDirtyMark(u);
+  }
+
+  function undMetaText(u, doc) {
+    if (!doc.published) {
+      if (doc.draft_at_unix) {
+        return "草稿保存于 " + clock(doc.draft_at_unix) + (doc.draft_by ? " · " + doc.draft_by : "");
+      }
+      return "还没有发布过全局配置";
+    }
+    var s = "已发布于 " + clock(doc.published_at_unix) + (doc.published_by ? " · " + doc.published_by : "");
+    if (doc.changes && doc.changes.length) s += " · 草稿有 " + doc.changes.length + " 项未发布改动";
+    return s;
+  }
+
+  function undSummary(s) {
+    if (!s) return "";
+    return "VPN 端口池 " + s.vpn_ports.min + "-" + s.vpn_ports.max +
+      " · 中转端口池 " + s.transit_ports.min + "-" + s.transit_ports.max +
+      " · overlay " + s.overlay_cidr + " · 探针 " + s.probe_interval_ms + " ms";
+  }
+
+  function undCheckDraft(d) {
+    var nums = [
+      ["VPN 端口池起点", d.vpn_ports.min, true],
+      ["VPN 端口池终点", d.vpn_ports.max, true],
+      ["中转端口池起点", d.transit_ports.min, true],
+      ["中转端口池终点", d.transit_ports.max, true],
+      ["探针间隔", d.probe_interval_ms, false],
+      ["BFD 最小发送间隔", d.bfd_min_tx_ms, false],
+      ["BFD 最小接收间隔", d.bfd_min_rx_ms, false],
+      ["BFD 检测倍数", d.bfd_detect_mult, false]
+    ];
+    for (var i = 0; i < nums.length; i++) {
+      var v = Number(nums[i][1]);
+      if (!Number.isFinite(v) || v <= 0) return nums[i][0] + "必须是大于 0 的整数";
+      if (nums[i][2] && v > 65535) return nums[i][0] + "最大 65535";
+    }
+    if (!String(d.overlay_cidr || "").trim()) return "overlay 地址池不能为空";
+    return "";
+  }
+
+  function undSave(quiet) {
+    var u = S.und;
+    if (!u || !u.doc || !u.draft) return Promise.reject(new Error("尚未读取配置"));
+    var bad = undCheckDraft(u.draft);
+    if (bad) {
+      u.note = { kind: "bad", text: bad };
+      render();
+      return Promise.reject(new Error(bad));
+    }
+    return api("PUT", "/api/underlay/settings", u.draft).then(function (res) {
+      u.doc = res.underlay;
+      u.at = nowSec();
+      u.draft = undClone(res.underlay.settings);
+      u.dirty = false;
+      u.note = { kind: "", text: "草稿已保存；发布之后才会成为设备的目标配置。" };
+      if (!quiet) toast("草稿已保存");
+      render();
+    }).catch(function (err) {
+      u.note = undErrNote(err);
+      render();
+      throw err;
+    });
+  }
+
+  function undPublish() {
+    var u = S.und;
+    if (!u || !u.doc || !u.draft) return;
+    function go() {
+      if (!confirm("发布全局参数？\n\n" + undSummary(u.draft) +
+        "\n\n发布后：这些参数成为设备的目标配置，并为每台已入网设备分配唯一的中转端口。" +
+        "已经分配的端口和 overlay /32 不会被移动；池子收窄到装不下已分配值时会拒绝发布。")) return;
+      api("POST", "/api/underlay/settings/publish", {}).then(function (res) {
+        u.doc = res.underlay;
+        u.at = nowSec();
+        u.draft = undClone(res.underlay.settings);
+        u.dirty = false;
+        u.note = { kind: "", text: "已发布全局配置" +
+          (res.underlay.published_at_unix ? "（" + clock(res.underlay.published_at_unix) + "）" : "") +
+          "；中转端口已分配给 " + res.underlay.usage.transit_assigned + " 台设备。" };
+        undInvalidateTopo();
+        toast("全局配置已发布");
+        render();
+      }).catch(function (err) {
+        u.note = undErrNote(err);
+        render();
+      });
+    }
+    if (!u.dirty) { go(); return; }
+    undSave(true).then(go).catch(function () { /* the failure is already shown */ });
+  }
+
+  function undReload() {
+    var u = S.und;
+    if (!u) return;
+    if (u.dirty && !confirm("放弃未保存的改动并重新载入？")) return;
+    u.dirty = false;
+    u.note = null;
+    u.auto = null;
+    u.editTun = null;
+    u.editPath = null;
+    loadUnderlay();
+  }
+
+  function undAddAvoid() {
+    var u = S.und;
+    if (!u || !u.draft) return;
+    var minEl = $("und-avoid-min"), maxEl = $("und-avoid-max");
+    var lo = Math.trunc(Number(minEl && minEl.value));
+    var hi = Math.trunc(Number(maxEl && maxEl.value));
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo <= 0 || hi <= 0) {
+      toast("填写排除段的起点和终点");
+      return;
+    }
+    if (lo > hi) { toast("排除段起点不能大于终点"); return; }
+    u.draft.vpn_avoid = (u.draft.vpn_avoid || []).concat([{ min: lo, max: hi }]);
+    u.dirty = true;
+    if (minEl) minEl.value = "";
+    if (maxEl) maxEl.value = "";
+    blurContent();
+    render();
+  }
+
+  function undDelAvoid(i) {
+    var u = S.und;
+    if (!u || !u.draft || !u.draft.vpn_avoid) return;
+    u.draft.vpn_avoid.splice(i, 1);
+    u.dirty = true;
+    blurContent();
+    render();
+  }
+
+  function undField(label, path, val, text) {
+    var id = "und-" + path.replace(/\./g, "-");
+    return '<div class="field"><label for="' + id + '">' + esc(label) + "</label>" +
+      '<input id="' + id + '" type="' + (text ? "text" : "number") + '" data-und="' + path + '"' +
+      (text ? "" : ' data-und-num="true" min="1" step="1"') +
+      ' value="' + esc(val) + '" spellcheck="false"></div>';
+  }
+
+  function undSettingsForm(u, doc) {
+    var d = u.draft || doc.settings;
+    var h = '<div class="und-cols">' +
+      '<div class="und-box"><h3>端口池</h3><div class="fields">' +
+      undField("VPN 端口池起点", "vpn_ports.min", d.vpn_ports.min) +
+      undField("VPN 端口池终点", "vpn_ports.max", d.vpn_ports.max) +
+      undField("中转端口池起点", "transit_ports.min", d.transit_ports.min) +
+      undField("中转端口池终点", "transit_ports.max", d.transit_ports.max) +
+      '</div><div class="hint">端口按设备唯一：两台设备可以用同一个端口号。两个池不能重叠，也不能落在 1024 以下或内核临时端口段 32768-60999。</div></div>' +
+      '<div class="und-box"><h3>overlay 地址池与探测</h3><div class="fields">' +
+      undField("overlay CIDR", "overlay_cidr", d.overlay_cidr, true) +
+      undField("探针间隔（ms）", "probe_interval_ms", d.probe_interval_ms) +
+      undField("BFD 最小发送（ms）", "bfd_min_tx_ms", d.bfd_min_tx_ms) +
+      undField("BFD 最小接收（ms）", "bfd_min_rx_ms", d.bfd_min_rx_ms) +
+      undField("BFD 检测倍数", "bfd_detect_mult", d.bfd_detect_mult) +
+      '</div><div class="hint">overlay /32 先进先出分配，删除隧道后回到队尾，避免旧路由落在新隧道上；池子至少 /16。</div></div>' +
+      "</div>";
+    var rows = (d.vpn_avoid || []).map(function (r, i) {
+      return '<li><span class="mono">' + esc(r.min) + "-" + esc(r.max) + "</span>" +
+        '<button class="small" data-act="und-avoid-del" data-i="' + i + '">移除</button></li>';
+    }).join("");
+    h += '<div class="subcard"><div class="subhead"><b>VPN 端口排除段</b>' +
+      '<span class="sp">客户已经在用的端口段；必须落在 VPN 端口池内，不能与中转端口池重叠。</span></div>' +
+      (rows ? '<ul class="avoid-list">' + rows + "</ul>"
+        : '<div class="muted" style="font-size:12.5px;margin-top:8px">没有排除段。</div>') +
+      '<div class="addrow"><div class="field"><label for="und-avoid-min">起点</label>' +
+      '<input id="und-avoid-min" type="number" min="1" max="65535" placeholder="如 22000"></div>' +
+      '<div class="field"><label for="und-avoid-max">终点</label>' +
+      '<input id="und-avoid-max" type="number" min="1" max="65535" placeholder="如 22010"></div>' +
+      '<button class="small" type="button" data-act="und-avoid-add">加入排除段</button></div></div>';
+    return h;
+  }
+
+  function undChangesPanel(doc) {
+    var ch = doc.changes || [];
+    var h = '<section class="panel"><header><h2>草稿与已发布</h2></header>';
+    if (!doc.published) {
+      h += '<div class="empty">还没有发布过全局配置：当前草稿是唯一的一份。</div>';
+    } else if (!ch.length) {
+      h += '<div class="empty">草稿与已发布一致。</div>';
+    } else {
+      h += '<ul class="chk-list" style="padding-left:18px">' + ch.map(function (x) {
+        return "<li>" + esc(x) + "</li>";
+      }).join("") + "</ul>";
+    }
+    return h + "</section>";
+  }
+
+  function undChecksPanel(doc) {
+    var list = doc.checks || [];
+    var h = '<section class="panel"><header><h2>保存前的检查</h2>' +
+      '<span class="muted" style="font-size:12.5px">按当前草稿计算</span></header>';
+    if (!list.length) return h + '<div class="empty">没有发现问题。</div></section>';
+    return h + '<ul class="chk-list" style="padding-left:18px">' +
+      list.map(undCheckRow).join("") + "</ul></section>";
+  }
+
+  function usageItem(k, used, total) {
+    return '<div><div class="k">' + esc(k) + "</div><div><b>" + esc(used) + "</b>" +
+      (total == null ? "" : ' <span class="muted">/ ' + esc(total) + "</span>") + "</div></div>";
+  }
+
+  function undUsagePanel(doc) {
+    var pub = doc.published || doc.settings;
+    var u = doc.usage || {};
+    return '<section class="panel"><header><h2>用量</h2></header>' +
+      '<div class="usage">' +
+      usageItem("overlay /32（整个租户）", u.overlay_used, u.overlay_total) +
+      usageItem("单设备 VPN 端口峰值", u.vpn_ports_max, u.vpn_ports_total) +
+      usageItem("中转端口已分配（台）", u.transit_assigned, doc.nodes.length) +
+      "</div>" +
+      '<div class="hint" style="margin-top:10px">VPN 端口按设备唯一，池总量是每台设备的上限；overlay /32 由整个租户共享；中转端口每台设备一个（' +
+      esc(pub.transit_ports.min) + "-" + esc(pub.transit_ports.max) +
+      "），不是每条隧道一个。总量取自" + (doc.published ? "已发布的参数" : "默认参数（还没有发布）") + "。</div></section>";
+  }
+
+  function undObservedCell(n) {
+    if (!n.observed_addr) {
+      if (n.udp_mapping) {
+        return '<span class="mono">' + esc(n.udp_mapping) + '</span> <span class="tag stale">只有端口、无地址</span>';
+      }
+      return '<span class="tag pending">未上报</span>';
+    }
+    var h = '<span class="mono">' + esc(n.observed_addr) + "</span>";
+    if (n.observed_stale) {
+      h += ' <span class="tag stale">已过期' +
+        (n.observed_age_sec > 0 ? " · " + esc(dur(n.observed_age_sec)) + "前" : "") + "</span>";
+    } else if (n.observed_age_sec > 0) {
+      h += ' <span class="muted">' + esc(dur(n.observed_age_sec)) + "前</span>";
+    }
+    if (n.symmetric_nat) h += ' <span class="tag plan">对称 NAT</span>';
+    return h;
+  }
+
+  function undIfaceCell(n) {
+    if (!n.inventory_reported) return '<span class="tag pending">未上报接口清单</span>';
+    if (!n.ifaces || !n.ifaces.length) return '<span class="tag stale">数据面没有接口</span>';
+    var h = n.default_iface
+      ? '<b class="mono">' + esc(n.default_iface) + "</b> <span class=\"muted\">默认出口</span><br>"
+      : "";
+    h += '<span class="muted" style="font-size:12px">' + n.ifaces.map(function (i) {
+      var s = esc(i.name) + (i.link_up ? "" : ' <span class="tag stale">down</span>');
+      s += i.mtu ? ' <span class="mono">' + esc(i.mtu) + "</span>" : ' <span class="tag pending">MTU 未知</span>';
+      return s;
+    }).join("<br>") + "</span>";
+    return h;
+  }
+
+  function undNodePanel(doc) {
+    var h = '<section class="panel"><header><h2>设备与中转端口</h2>' +
+      '<span class="muted" style="font-size:12.5px">' +
+      (doc.published ? "中转端口在发布时分配" : "发布后才会分配中转端口") + "</span></header>";
+    if (!doc.nodes.length) return h + '<div class="empty">还没有设备入网。</div></section>';
+    h += "<table><thead><tr><th>设备</th><th>状态</th><th>观测外层地址</th><th>物理端口</th>" +
+      "<th>中转端口</th><th>VPN 端口</th><th>隧道</th><th>中转</th></tr></thead><tbody>";
+    doc.nodes.forEach(function (n) {
+      h += "<tr>" +
+        '<td><span class="mono">node-' + esc(n.node_id) + '</span><div class="muted" style="font-size:12px">' +
+        esc(n.serial) + "</div></td>" +
+        "<td>" + statusTag(n.status) + "</td>" +
+        "<td>" + undObservedCell(n) + "</td>" +
+        "<td>" + undIfaceCell(n) + "</td>" +
+        '<td class="mono">' + (n.transit_port ? esc(n.transit_port) : '<span class="tag pending">未分配</span>') + "</td>" +
+        '<td class="mono">' + (n.ports.length ? esc(n.ports.join("、")) : '<span class="muted">—</span>') + "</td>" +
+        '<td class="num">' + esc(n.tunnel_count) + "</td>" +
+        '<td class="num muted">' + (n.relay_for ? esc(n.relay_for) + " 条" : "—") + "</td>" +
+        "</tr>";
+    });
+    return h + "</tbody></table></section>";
+  }
+
+  function viewUnderlaySettings() {
+    var u = ensureUnderlay();
+    var doc = u.doc;
+    if (!doc) {
+      return '<section class="panel"><div class="empty">' +
+        esc(u.note ? u.note.text : "正在读取 underlay 配置…") + "</div></section>";
+    }
+    var h = "";
+    if (!doc.configured) {
+      h += '<div class="banner"><span>还没有发布全局配置：端口池与 overlay 地址池尚未生效，现在建不了隧道。</span>' +
+        '<button class="small primary" data-act="und-publish">发布全局配置</button></div>';
+    }
+    if (u.note) h += undNote(u.note);
+    h += '<section class="panel"><header><h2>全局参数</h2>' +
+      '<span class="muted" style="font-size:12.5px" id="und-meta">' + undMetaText(u, doc) + undDirtyMark(u) + "</span></header>" +
+      '<div class="hint">草稿可以随时改；「保存并发布」把当前草稿发布给设备。已分配的端口和 overlay /32 不会因为重发而被移动：池子收窄到装不下它们的发布会直接被拒绝。</div>' +
+      undSettingsForm(u, doc) +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center">' +
+      '<button class="small" data-act="und-reload">重新载入</button>' +
+      '<button class="small" data-act="und-save">保存草稿</button>' +
+      '<button class="small primary" data-act="und-publish">保存并发布</button>' +
+      "</div></section>";
+    h += undChangesPanel(doc);
+    h += undChecksPanel(doc);
+    h += undUsagePanel(doc);
+    h += undNodePanel(doc);
+    return h;
+  }
+
+  function undNodeOptions(nodes, sel, emptyLabel) {
+    var h = emptyLabel ? '<option value="0">' + esc(emptyLabel) + "</option>" : "";
+    nodes.forEach(function (n) {
+      h += '<option value="' + esc(n.node_id) + '"' + (n.node_id === sel ? " selected" : "") + ">node-" +
+        esc(n.node_id) + " · " + esc(n.serial) + "</option>";
+    });
+    return h;
+  }
+
+  function undNodeOf(doc, id) {
+    for (var i = 0; i < doc.nodes.length; i++) if (doc.nodes[i].node_id === id) return doc.nodes[i];
+    return null;
+  }
+
+  // undIfaceOptions lists the physical ports a device reported. The empty value
+  // is the default: the controller then uses the device's own egress port, which
+  // is what a device that reports no inventory at all can still accept. Ports
+  // whose link MTU is unknown are left out: the controller refuses them, so
+  // offering them would only produce an error the operator cannot act on.
+  function undIfaceOptions(nd, sel) {
+    var list = ((nd && nd.ifaces) || []).filter(function (i) { return i.mtu > 0; });
+    var h = '<option value=""' + (sel ? "" : " selected") + ">" + (list.length
+      ? "默认 · " + (nd.default_iface ? esc(nd.default_iface) : "设备没有上报出口端口")
+      : "默认（设备未上报出口）") + "</option>";
+    var found = false;
+    list.forEach(function (i) {
+      if (i.name === sel) found = true;
+      h += '<option value="' + esc(i.name) + '"' + (i.name === sel ? " selected" : "") + ">" +
+        esc(i.name) + (i.link_up ? "" : "（down）") +
+        (i.mtu ? " · MTU " + esc(i.mtu) : " · MTU 未知") + "</option>";
+    });
+    if (sel && !found) {
+      h += '<option value="' + esc(sel) + '" selected>' + esc(sel) + "（不在当前清单里）</option>";
+    }
+    return h;
+  }
+
+  function undPathModeOptions(mode) {
+    return [["direct", "直连"], ["inline", "经中转设备（inline）"], ["template", "引用路径模板"]]
+      .map(function (x) {
+        return '<option value="' + x[0] + '"' + (mode === x[0] ? " selected" : "") + ">" + x[1] + "</option>";
+      }).join("");
+  }
+
+  function undTemplateOptions(doc, sel) {
+    var ps = doc.paths || [];
+    if (!ps.length) return '<option value="">（还没有路径模板）</option>';
+    return ps.map(function (p) {
+      return '<option value="' + esc(p.id) + '"' + (p.id === sel ? " selected" : "") + ">" +
+        esc(p.name) + " · 经 " + esc(p.serial || ("node-" + p.node_id)) +
+        (p.users.length ? " · 被 " + p.users.length + " 条隧道引用" : "") + "</option>";
+    }).join("");
+  }
+
+  function undPathExtraFields(doc, mode, prefix) {
+    if (mode === "inline") {
+      return '<div class="field"><label for="' + prefix + '-relay">中转设备</label>' +
+        '<select id="' + prefix + '-relay" name="relay">' +
+        undNodeOptions(doc.nodes, 0, "选择中转设备…") + "</select></div>" +
+        '<div class="field"><label for="' + prefix + '-relay-addr">中转地址（可选）</label>' +
+        '<input id="' + prefix + '-relay-addr" name="relay_addr" placeholder="ip 或 ip:port"></div>';
+    }
+    if (mode === "template") {
+      return '<div class="field"><label for="' + prefix + '-template">路径模板</label>' +
+        '<select id="' + prefix + '-template" name="template">' +
+        undTemplateOptions(doc, "") + "</select></div>";
+    }
+    return "";
+  }
+
+  function undAutoPanel(doc, u) {
+    var boxes = doc.nodes.map(function (n) {
+      var on = u.autoSel.indexOf(n.node_id) >= 0;
+      return '<li><label><input type="checkbox" data-und-node="' + esc(n.node_id) + '"' +
+        (on ? " checked" : "") + "> node-" + esc(n.node_id) + " · " + esc(n.serial) +
+        ' <span class="muted">' + esc(n.status === "online" ? "在线" : n.status === "stale" ? "失联" : "未上线") + "</span></label></li>";
+    }).join("");
+    var modes = [["full-mesh", "full-mesh（任意两台之间）"], ["hub-spoke", "hub-spoke（以 hub 为中心）"]]
+      .map(function (x) {
+        return '<option value="' + x[0] + '"' + (u.autoMode === x[0] ? " selected" : "") + ">" + x[1] + "</option>";
+      }).join("");
+    var spokes = [["none", "spoke 间不建隧道"], ["via-hub", "spoke 间经 hub 中转"], ["hub-transit-only", "hub 仅中转（hub 与 spoke 不建隧道）"]]
+      .map(function (x) {
+        return '<option value="' + x[0] + '"' + (u.autoSpoke === x[0] ? " selected" : "") + ">" + x[1] + "</option>";
+      }).join("");
+    var h = '<section class="panel"><header><h2>自动编排</h2>' +
+      '<span class="muted" style="font-size:12.5px">先预览，确认后才写入</span></header>' +
+      '<form id="und-auto-form">' +
+      '<div class="und-box"><h3>选择设备</h3>' +
+      (boxes ? '<ul class="node-pick">' + boxes + "</ul>"
+        : '<div class="empty">还没有设备。</div>') +
+      "</div>" +
+      '<div class="fields" style="margin-top:12px">' +
+      '<div class="field"><label for="und-auto-mode">拓扑模型</label><select id="und-auto-mode" name="mode">' + modes + "</select></div>" +
+      '<div class="field"><label for="und-auto-hub">hub（仅 hub-spoke 用）</label>' +
+      '<select id="und-auto-hub" name="hub">' + undNodeOptions(doc.nodes, u.autoHub, "选择 hub…") + "</select></div>" +
+      '<div class="field"><label for="und-auto-spoke">spoke 间隧道（仅 hub-spoke 用）</label>' +
+      '<select id="und-auto-spoke" name="spoke">' + spokes + "</select></div>" +
+      '<button class="primary" type="submit">预览（不写入）</button>' +
+      "</div>" +
+      '<div class="hint" style="margin:10px 0 0">预览走的是与落库相同的分配器，所以预览里的端口和 /32 就是落库时会拿到的值。' +
+      "设备离线、缺少观测、两端都是对称 NAT、两端已有隧道等情况会列在「跳过」里，不会静默丢对。</div>" +
+      "</form>" + undPlanResult(doc, u) + "</section>";
+    return h;
+  }
+
+  // undEndpointCell shows one end. "differs from the observation" only means
+  // something when there IS an observation; with none, the address is the one
+  // somebody typed, and the cell says that instead of implying a mismatch.
+  function undEndpointCell(ep, doc) {
+    var nd = doc ? undNodeOf(doc, ep.node_id) : null;
+    var h = '<b class="mono">' + esc(ep.serial || ("node-" + ep.node_id)) + "</b>";
+    if (ep.overlay) h += ' <span class="mono muted">' + esc(ep.overlay) + "</span>";
+    h += '<div class="muted" style="font-size:12px">' + esc(ep.iface || "端口未知") + " · " +
+      (ep.addr ? '<span class="mono">' + esc(ep.addr) + "</span>" : "无外层地址") + "</div>";
+    if (ep.port) h += '<div class="muted" style="font-size:12px">UDP <span class="mono">' + esc(ep.port) + "</span></div>";
+    if (ep.addr && nd && !nd.observed_addr) {
+      h += '<div><span class="tag pending">手填 · 设备未上报观测</span></div>';
+    } else if (ep.addr && !ep.matches_observation) {
+      h += '<div><span class="tag stale">与当前观测不同</span></div>';
+    }
+    return h;
+  }
+
+  function undPathText(t) {
+    if (t.path_error) {
+      return '<span class="tag revoked">模板失效</span><div class="muted" style="font-size:12px">' + esc(t.path_error) + "</div>";
+    }
+    if (!t.path) return '<span class="tag">直连</span>';
+    var p = t.path;
+    return '<span class="tag plan">经中转</span> <span class="mono">' +
+      esc(p.serial || ("node-" + p.node_id)) + "</span>" +
+      (p.addr ? ' <span class="mono muted">' + esc(p.addr) + "</span>" : "") +
+      '<div class="muted" style="font-size:12px">' +
+      (p.template_name ? "模板 " + esc(p.template_name) : "inline 中转") + "</div>";
+  }
+
+  function undMTUCell(t, doc) {
+    if (!t.mtu_is_default && t.mtu) return '<span class="num">' + esc(t.mtu) + "</span>";
+    if (doc && doc.default_tunnel_mtu) {
+      return '<span class="tag pending">未知</span><div class="muted" style="font-size:12px">投递用默认 ' +
+        esc(doc.default_tunnel_mtu) + "</div>";
+    }
+    // The topology document does not carry the default, so it says default
+    // without a number rather than implying one.
+    return '<span class="tag pending">未知</span><div class="muted" style="font-size:12px">按默认 MTU 投递</div>';
+  }
+
+  function undStateTag(note) {
+    return '<span class="tag pending" title="' + esc(note || "") + '">未知</span>';
+  }
+
+  function undPlanResult(doc, u) {
+    var a = u.auto;
+    if (!a) return "";
+    var p = a.plan;
+    var h = '<div class="subcard"><div class="subhead"><b>' +
+      (a.applied ? "已创建" : "预览结果") + "</b><span class=\"sp\">" +
+      p.pairs + " 对设备 · 新增 " + p.add.length + " 条 · 跳过 " + p.skip.length +
+      " 对 · overlay /32 用 " + p.usage.overlay_used + (a.applied ? "" : " → " + p.overlay_after) +
+      " / " + p.usage.overlay_total + "</span></div>";
+    if (p.add.length) {
+      h += "<table style=\"margin-top:10px\"><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>MTU</th></tr></thead><tbody>";
+      p.add.forEach(function (t) {
+        h += "<tr><td>" + undEndpointCell(t.a, doc) + "</td><td>" + undEndpointCell(t.b, doc) + "</td>" +
+          "<td>" + undPathText(t) + "</td><td>" + undMTUCell(t, doc) + "</td></tr>";
+      });
+      h += "</tbody></table>";
+    } else {
+      h += '<div class="empty">这一批没有可新建的隧道。</div>';
+    }
+    if (p.skip.length) {
+      h += "<table style=\"margin-top:10px\"><thead><tr><th>跳过</th><th>原因</th></tr></thead><tbody>";
+      p.skip.forEach(function (s) {
+        h += "<tr><td>" + esc(s.serial_a || ("node-" + s.a)) + " ↔ " + esc(s.serial_b || ("node-" + s.b)) +
+          '</td><td class="muted">' + esc(s.reason) + "</td></tr>";
+      });
+      h += "</tbody></table>";
+    }
+    if (!a.applied && p.add.length) {
+      h += '<div style="margin-top:10px"><button class="small primary" data-act="und-auto-apply">按预览创建 ' +
+        p.add.length + " 条隧道</button></div>";
+    }
+    return h + "</div>";
+  }
+
+  function undAutoPreview(form) {
+    var u = S.und;
+    if (!u || !u.doc) return;
+    var f = new FormData(form);
+    u.autoMode = String(f.get("mode") || "full-mesh");
+    u.autoHub = Number(f.get("hub") || 0);
+    u.autoSpoke = String(f.get("spoke") || "none");
+    if (u.autoSel.length < 2) { toast("至少勾选 2 台设备"); return; }
+    var req = { nodes: u.autoSel.slice(), mode: u.autoMode, hub: u.autoHub, spoke_mode: u.autoSpoke };
+    api("POST", "/api/underlay/auto/plan", req).then(function (res) {
+      u.auto = { plan: res.plan, applied: false, req: req };
+      u.note = null;
+      render();
+    }).catch(function (err) {
+      u.auto = null;
+      u.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function undAutoApply() {
+    var u = S.und, a = u && u.auto;
+    if (!a || !a.req) { toast("先预览一次"); return; }
+    var p = a.plan;
+    if (!confirm("按预览创建 " + p.add.length + " 条隧道、跳过 " + p.skip.length + " 对？\n\n" +
+      "端口与 overlay /32 按预览分配；已有隧道的设备对不会重复创建。")) return;
+    api("POST", "/api/underlay/auto/apply", a.req).then(function (res) {
+      u.auto = { plan: res.plan, applied: true, req: a.req };
+      u.note = { kind: "", text: "已创建 " + res.plan.add.length + " 条隧道，跳过 " + res.plan.skip.length + " 对。" };
+      undSetDoc(res.underlay);
+      toast("已写入 " + res.plan.add.length + " 条隧道");
+    }).catch(function (err) {
+      u.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function undManualPanel(doc, u) {
+    var mode = u.mPath || "direct";
+    var a = undNodeOf(doc, u.mA) ? u.mA : (doc.nodes[0] ? doc.nodes[0].node_id : 0);
+    var b = undNodeOf(doc, u.mB) ? u.mB : (doc.nodes[1] ? doc.nodes[1].node_id : 0);
+    return '<section class="panel"><header><h2>手动创建</h2>' +
+      '<span class="muted" style="font-size:12.5px">一台对一台；端口与 overlay /32 由分配器给</span></header>' +
+      '<form id="und-tun-form"><div class="fields">' +
+      '<div class="field"><label for="und-tun-a">本端设备</label>' +
+      '<select id="und-tun-a" name="a" data-und-dev="a">' + undNodeOptions(doc.nodes, a, null) + "</select></div>" +
+      '<div class="field"><label for="und-tun-a-iface">本端物理端口</label>' +
+      '<select id="und-tun-a-iface" name="a_iface">' + undIfaceOptions(undNodeOf(doc, a), "") + "</select></div>" +
+      '<div class="field"><label for="und-tun-a-addr">本端外层地址（留空用观测）</label>' +
+      '<input id="und-tun-a-addr" name="a_addr" placeholder="ip 或 ip:port"></div>' +
+      '<div class="field"><label for="und-tun-b">对端设备</label>' +
+      '<select id="und-tun-b" name="b" data-und-dev="b">' + undNodeOptions(doc.nodes, b, null) + "</select></div>" +
+      '<div class="field"><label for="und-tun-b-iface">对端物理端口</label>' +
+      '<select id="und-tun-b-iface" name="b_iface">' + undIfaceOptions(undNodeOf(doc, b), "") + "</select></div>" +
+      '<div class="field"><label for="und-tun-b-addr">对端外层地址（留空用观测）</label>' +
+      '<input id="und-tun-b-addr" name="b_addr" placeholder="ip 或 ip:port"></div>' +
+      '<div class="field"><label for="und-tun-pathmode">路径</label>' +
+      '<select id="und-tun-pathmode">' + undPathModeOptions(mode) + "</select></div>" +
+      undPathExtraFields(doc, mode, "und-tun") +
+      "</div>" +
+      '<div class="hint" style="margin:10px 0 0">物理端口可以留「默认」，由设备上报的出口决定；也可以指定它上报过的其他端口。' +
+      "地址留空就用反射器最近一次观测到的外层地址；观测过期时创建会被拒绝，需要手填地址或等设备重新上报。" +
+      "两端不能都是对称 NAT；中转设备不能是隧道的一端。</div>" +
+      '<div style="margin-top:10px"><button class="primary" type="submit">创建隧道</button></div>' +
+      "</form></section>";
+  }
+
+  function undTunnelPathMode(t) {
+    if (!t.path) return "direct";
+    return t.path.template_id ? "template" : "inline";
+  }
+
+  function undTunnelOf(doc, id) {
+    for (var i = 0; i < doc.tunnels.length; i++) if (doc.tunnels[i].id === id) return doc.tunnels[i];
+    return null;
+  }
+
+  function undTunnelTable(doc) {
+    var h = '<section class="panel"><header><h2>已创建的隧道</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + doc.tunnels.length + " 条</span></header>";
+    if (!doc.tunnels.length) {
+      return h + '<div class="empty">还没有隧道。' +
+        (doc.configured ? "用上面的自动编排或手动表单创建。" : "先发布全局配置。") + "</div></section>";
+    }
+    h += "<table><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>";
+    doc.tunnels.forEach(function (t) {
+      h += "<tr>" +
+        "<td>" + undEndpointCell(t.a, doc) + "</td>" +
+        "<td>" + undEndpointCell(t.b, doc) + "</td>" +
+        "<td>" + undPathText(t) + "</td>" +
+        "<td>" + undMTUCell(t, doc) + "</td>" +
+        "<td>" + undStateTag(doc.state_note) +
+        '<div class="muted" style="font-size:12px">' + esc(t.id) + " · " + esc(clock(t.created_at_unix)) + "</div></td>" +
+        '<td class="row-actions">' +
+        '<button class="small" data-act="und-tun-edit" data-id="' + esc(t.id) + '">编辑</button>' +
+        '<button class="small danger" data-act="und-tun-del" data-id="' + esc(t.id) + '">删除</button>' +
+        "</td></tr>";
+    });
+    return h + "</tbody></table></section>";
+  }
+
+  function undCreateTunnel(form) {
+    var u = S.und;
+    if (!u || !u.doc) return;
+    var f = new FormData(form);
+    var a = Number(f.get("a")), b = Number(f.get("b"));
+    if (!a || !b || a === b) { toast("选两台不同的设备"); return; }
+    var body = {
+      a: { node_id: a, iface: String(f.get("a_iface") || "").trim(), addr: String(f.get("a_addr") || "").trim() },
+      b: { node_id: b, iface: String(f.get("b_iface") || "").trim(), addr: String(f.get("b_addr") || "").trim() }
+    };
+    var mode = u.mPath || "direct";
+    if (mode === "inline") {
+      var relay = Number(f.get("relay") || 0);
+      if (!relay) { toast("选择中转设备"); return; }
+      body.path = {
+        node_id: relay,
+        addr: String(f.get("relay_addr") || "").trim(),
+        save_as: String(f.get("save_as") || "").trim()
+      };
+    } else if (mode === "template") {
+      var tpl = String(f.get("template") || "");
+      if (!tpl) { toast("选择路径模板"); return; }
+      body.path = { template_id: tpl };
+    }
+    api("POST", "/api/underlay/tunnels", body).then(function (res) {
+      u.mPath = "direct";
+      u.note = { kind: "", text: "隧道 " + res.tunnel.id + " 已创建（" +
+        (res.tunnel.path ? "经 " + (res.tunnel.path.serial || ("node-" + res.tunnel.path.node_id)) + " 中转" : "直连") +
+        "）；隧道段还没有下发到设备。" };
+      releaseForm(form);
+      undSetDoc(res.underlay);
+      toast("隧道已创建");
+    }).catch(function (err) {
+      u.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function undTunnelEditor(doc, u) {
+    var t = undTunnelOf(doc, u.editTun);
+    if (!t) { u.editTun = null; return ""; }
+    var mode = u.editPathMode || undTunnelPathMode(t);
+    var relay = t.path && !t.path.template_id ? t.path.node_id : 0;
+    var tpl = t.path && t.path.template_id ? t.path.template_id : "";
+    var h = '<section class="panel"><header><h2>编辑隧道 ' + esc(t.id) + "</h2>" +
+      '<span class="muted" style="font-size:12.5px">' + esc(t.a.serial || ("node-" + t.a.node_id)) + " ↔ " +
+      esc(t.b.serial || ("node-" + t.b.node_id)) + "</span></header>" +
+      '<form id="und-tun-edit-form"><div class="fields">' +
+      '<div class="field"><label for="und-edit-a-iface">本端物理端口</label>' +
+      '<select id="und-edit-a-iface" name="a_iface">' +
+      undIfaceOptions(undNodeOf(doc, t.a.node_id), t.a.iface) + "</select></div>" +
+      '<div class="field"><label for="und-edit-a-addr">本端外层地址（留空用观测）</label>' +
+      '<input id="und-edit-a-addr" name="a_addr" value="' + esc(t.a.addr) + '" placeholder="ip 或 ip:port"></div>' +
+      '<div class="field"><label for="und-edit-b-iface">对端物理端口</label>' +
+      '<select id="und-edit-b-iface" name="b_iface">' +
+      undIfaceOptions(undNodeOf(doc, t.b.node_id), t.b.iface) + "</select></div>" +
+      '<div class="field"><label for="und-edit-b-addr">对端外层地址（留空用观测）</label>' +
+      '<input id="und-edit-b-addr" name="b_addr" value="' + esc(t.b.addr) + '" placeholder="ip 或 ip:port"></div>' +
+      '<div class="field"><label for="und-edit-pathmode">路径</label>' +
+      '<select id="und-edit-pathmode">' + undPathModeOptions(mode) + "</select></div>";
+    if (mode === "inline") {
+      h += '<div class="field"><label for="und-edit-relay">中转设备</label>' +
+        '<select id="und-edit-relay" name="relay">' + undNodeOptions(doc.nodes, relay, "选择中转设备…") + "</select></div>" +
+        '<div class="field"><label for="und-edit-relay-addr">中转地址（可选）</label>' +
+        '<input id="und-edit-relay-addr" name="relay_addr" value="' +
+        esc(t.path && !t.path.template_id ? t.path.addr : "") + '" placeholder="ip 或 ip:port"></div>';
+    } else if (mode === "template") {
+      h += '<div class="field"><label for="und-edit-template">路径模板</label>' +
+        '<select id="und-edit-template" name="template">' + undTemplateOptions(doc, tpl) + "</select></div>";
+    }
+    h += "</div>" +
+      '<div class="hint" style="margin:10px 0 0">端口和 overlay /32 不在这里改：端口由池分配，overlay 地址跟着隧道走。' +
+      "改成「直连」会丢掉中转；地址留空表示改回使用观测地址。" +
+      "物理端口只在改动时提交：选「默认」表示交回设备上报的出口。</div>" +
+      '<div style="margin-top:10px"><button class="primary" type="submit">保存修改</button> ' +
+      '<button class="small" type="button" data-act="und-tun-cancel">取消</button></div>' +
+      "</form></section>";
+    return h;
+  }
+
+  function undUpdateTunnel(form) {
+    var u = S.und;
+    if (!u || !u.doc || !u.editTun) return;
+    var t = undTunnelOf(u.doc, u.editTun);
+    if (!t) { u.editTun = null; render(); return; }
+    var f = new FormData(form);
+    var body = {
+      id: t.id,
+      a: { node_id: t.a.node_id, addr: String(f.get("a_addr") || "").trim() },
+      b: { node_id: t.b.node_id, addr: String(f.get("b_addr") || "").trim() }
+    };
+    // "默认" resolves to the device's own egress port: the API treats an empty
+    // iface as "keep", so clearing back to the default has to name it.
+    var ndA = undNodeOf(u.doc, t.a.node_id), ndB = undNodeOf(u.doc, t.b.node_id);
+    var ifA = String(f.get("a_iface") || "").trim() || (ndA && ndA.default_iface) || "";
+    var ifB = String(f.get("b_iface") || "").trim() || (ndB && ndB.default_iface) || "";
+    if (ifA && ifA !== t.a.iface) body.a.iface = ifA;
+    if (ifB && ifB !== t.b.iface) body.b.iface = ifB;
+    var mode = u.editPathMode || undTunnelPathMode(t);
+    if (mode === "direct") {
+      body.clear_path = true;
+    } else if (mode === "inline") {
+      var relay = Number(f.get("relay") || 0);
+      if (!relay) { toast("选择中转设备"); return; }
+      body.path = { node_id: relay, addr: String(f.get("relay_addr") || "").trim() };
+    } else {
+      var tpl = String(f.get("template") || "");
+      if (!tpl) { toast("选择路径模板"); return; }
+      body.path = { template_id: tpl };
+    }
+    api("PUT", "/api/underlay/tunnels", body).then(function (res) {
+      u.editTun = null;
+      u.editPathMode = null;
+      u.note = { kind: "", text: "隧道 " + t.id + " 已更新。" };
+      undSetDoc(res.underlay);
+      toast("隧道已更新");
+    }).catch(function (err) {
+      u.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function undDeleteTunnel(id) {
+    var u = S.und;
+    if (!u) return;
+    if (!confirm("删除隧道 " + id + "？\n\n两端 overlay /32 会退回地址池队尾。隧道段还没有下发到设备，" +
+      "所以这次删除只改控制器里的隧道表。")) return;
+    api("DELETE", "/api/underlay/tunnels?id=" + encodeURIComponent(id)).then(function (res) {
+      u.note = { kind: "", text: "隧道 " + id + " 已删除；两端 overlay /32 已退回池尾。" };
+      if (u.editTun === id) u.editTun = null;
+      undSetDoc(res.underlay);
+      toast("已删除");
+    }).catch(function (err) {
+      u.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function undPathPanel(doc, u) {
+    var h = '<section class="panel"><header><h2>路径模板</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + doc.paths.length + " 个</span></header>" +
+      '<div class="hint">模板是共享的中转跳：编辑模板会同时移动所有引用它的隧道，删除前必须先解除引用。</div>';
+    if (doc.paths.length) {
+      h += "<table><thead><tr><th>名称</th><th>中转设备</th><th>地址</th><th>引用</th><th>创建</th><th></th></tr></thead><tbody>";
+      doc.paths.forEach(function (p) {
+        h += "<tr>" +
+          "<td><b>" + esc(p.name) + '</b><div class="muted" style="font-size:12px">' + esc(p.id) + "</div></td>" +
+          "<td>" + esc(p.serial || ("node-" + p.node_id)) + "</td>" +
+          '<td class="mono muted">' + esc(p.addr || "用观测地址") + "</td>" +
+          "<td>" + (p.users.length ? p.users.length + " 条" : "—") + "</td>" +
+          '<td class="muted">' + esc(clock(p.created_at_unix)) + "</td>" +
+          '<td class="row-actions">' +
+          '<button class="small" data-act="und-path-edit" data-id="' + esc(p.id) + '">编辑</button>' +
+          '<button class="small danger" data-act="und-path-del" data-id="' + esc(p.id) + '">删除</button>' +
+          "</td></tr>";
+      });
+      h += "</tbody></table>";
+    } else {
+      h += '<div class="empty">还没有路径模板。手动创建时填「存为模板」也会建一个。</div>';
+    }
+    if (u.editPath) h += undPathEditForm(doc, u);
+    h += undPathCreateForm(doc);
+    return h + "</section>";
+  }
+
+  function undPathCreateForm(doc) {
+    return '<form id="und-path-form" class="addrow">' +
+      '<div class="field"><label for="und-path-name">模板名称</label>' +
+      '<input id="und-path-name" name="name" placeholder="如 经上海中转" maxlength="60"></div>' +
+      '<div class="field"><label for="und-path-node">中转设备</label>' +
+      '<select id="und-path-node" name="node">' + undNodeOptions(doc.nodes, 0, "选择中转设备…") + "</select></div>" +
+      '<div class="field"><label for="und-path-addr">中转地址（可选）</label>' +
+      '<input id="und-path-addr" name="addr" placeholder="ip 或 ip:port"></div>' +
+      '<button class="small" type="submit">新建模板</button></form>';
+  }
+
+  function undPathEditForm(doc, u) {
+    var p = null;
+    doc.paths.forEach(function (x) { if (x.id === u.editPath) p = x; });
+    if (!p) { u.editPath = null; return ""; }
+    return '<div class="subcard"><div class="subhead"><b>编辑模板「' + esc(p.name) + "」</b>" +
+      '<span class="sp">被 ' + p.users.length + " 条隧道引用" +
+      (p.users.length ? "：" + esc(p.users.join("、")) : "") + "</span></div>" +
+      '<form id="und-path-edit-form"><div class="fields">' +
+      '<div class="field"><label for="und-path-edit-name">名称</label>' +
+      '<input id="und-path-edit-name" name="name" value="' + esc(p.name) + '" maxlength="60"></div>' +
+      '<div class="field"><label for="und-path-edit-node">中转设备</label>' +
+      '<select id="und-path-edit-node" name="node">' + undNodeOptions(doc.nodes, p.node_id, null) + "</select></div>" +
+      '<div class="field"><label for="und-path-edit-addr">中转地址（可选）</label>' +
+      '<input id="und-path-edit-addr" name="addr" value="' + esc(p.addr) + '" placeholder="ip 或 ip:port"></div>' +
+      "</div>" +
+      '<div style="margin-top:10px"><button class="primary" type="submit">保存模板</button> ' +
+      '<button class="small" type="button" data-act="und-path-cancel">取消</button></div>' +
+      "</form></div>";
+  }
+
+  function undSavePath(form, id) {
+    var u = S.und;
+    if (!u || !u.doc) return;
+    var f = new FormData(form);
+    var name = String(f.get("name") || "").trim();
+    var node = Number(f.get("node") || 0);
+    if (!name) { toast("给模板起个名字"); return; }
+    if (!node) { toast("选择中转设备"); return; }
+    var body = { name: name, node_id: node, addr: String(f.get("addr") || "").trim() };
+    if (id) body.id = id;
+    api(id ? "PUT" : "POST", "/api/underlay/paths", body).then(function (res) {
+      u.editPath = null;
+      u.note = { kind: "", text: id
+        ? "模板「" + name + "」已更新" + (res.users && res.users.length ? "，引用它的 " + res.users.length + " 条隧道会跟着变" : "") + "。"
+        : "模板「" + name + "」已创建。" };
+      releaseForm(form);
+      undSetDoc(res.underlay);
+      toast(id ? "模板已更新" : "模板已创建");
+    }).catch(function (err) {
+      u.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function undDeletePath(id) {
+    var u = S.und;
+    if (!u) return;
+    if (!confirm("删除路径模板 " + id + "？被隧道引用时会被拒绝，需要先把那些隧道改成直连或别的模板。")) return;
+    api("DELETE", "/api/underlay/paths?id=" + encodeURIComponent(id)).then(function (res) {
+      u.note = { kind: "", text: "路径模板 " + id + " 已删除。" };
+      if (u.editPath === id) u.editPath = null;
+      undSetDoc(res.underlay);
+      toast("模板已删除");
+    }).catch(function (err) {
+      u.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function viewUnderlayTunnels() {
+    var u = ensureUnderlay();
+    var doc = u.doc;
+    if (!doc) {
+      return '<section class="panel"><div class="empty">' +
+        esc(u.note ? u.note.text : "正在读取 underlay 配置…") + "</div></section>";
+    }
+    var h = "";
+    if (!doc.configured) {
+      h += '<div class="banner"><span>全局配置还没有发布：隧道建不了（中转端口随全局配置一起下发）。</span>' +
+        '<button class="small" data-act="goto" data-view="underlay-settings">去全局配置</button></div>';
+    }
+    if (u.note) h += undNote(u.note);
+    if (!doc.nodes.length) {
+      h += '<section class="panel"><div class="empty">还没有设备。先到「入网授权」页接入设备，隧道才有两端。</div></section>';
+    } else if (doc.configured) {
+      h += undAutoPanel(doc, u);
+      h += undManualPanel(doc, u);
+    }
+    if (u.editTun) h += undTunnelEditor(doc, u);
+    h += undTunnelTable(doc);
+    h += undPathPanel(doc, u);
+    return h;
+  }
+
+  function undTrunc(s, n) {
+    s = String(s == null ? "" : s);
+    return s.length > n ? s.slice(0, n - 1) + "…" : s;
+  }
+
+  function undStatusText(s) {
+    return { online: "在线", stale: "失联", pending: "已入网 · 未上线" }[s] || s;
+  }
+
+  function undTopoSVG(doc) {
+    var W = 760, H = 420;
+    var n = doc.nodes.length;
+    var pos = {};
+    if (n === 1) {
+      pos[doc.nodes[0].node_id] = { x: W / 2, y: H / 2 };
+    } else {
+      doc.nodes.forEach(function (nd, i) {
+        var ang = -Math.PI / 2 + (2 * Math.PI * i) / n;
+        pos[nd.node_id] = { x: W / 2 + Math.cos(ang) * 290, y: H / 2 + Math.sin(ang) * 150 };
+      });
+    }
+    var sel = S.topo && S.topo.sel;
+    var edges = "";
+    doc.bundles.forEach(function (b) {
+      var pa = pos[b.a], pb = pos[b.b];
+      if (!pa || !pb) return;
+      var relay = false, names = {};
+      b.tunnels.forEach(function (t) {
+        if (t.path) {
+          relay = true;
+          names[t.path.serial || ("node-" + t.path.node_id)] = true;
+        }
+        if (t.path_error) relay = true;
+      });
+      var relayNames = Object.keys(names);
+      var label = b.count > 1 ? b.count + " 条" : "";
+      if (relayNames.length) label += (label ? " · " : "") + "经 " + relayNames.join("、");
+      var isSel = sel && sel.kind === "bundle" && sel.a === b.a && sel.b === b.b;
+      var x1 = Math.round(pa.x), y1 = Math.round(pa.y), x2 = Math.round(pb.x), y2 = Math.round(pb.y);
+      edges += '<line class="edge' + (relay ? " relay" : "") + (isSel ? " sel" : "") +
+        '" x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '"/>';
+      edges += '<line class="hit" data-act="topo-bundle" data-a="' + b.a + '" data-b="' + b.b +
+        '" x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '"><title>' +
+        esc((b.serial_a || ("node-" + b.a)) + " 与 " + (b.serial_b || ("node-" + b.b)) + "：" +
+          (label || "1 条直连隧道") + " · 状态未知") + "</title></line>";
+      if (label) {
+        edges += '<text class="edge-label" x="' + Math.round((pa.x + pb.x) / 2) + '" y="' +
+          Math.round((pa.y + pb.y) / 2 - 8) + '">' + esc(label) + "</text>";
+      }
+    });
+    var nodes = "";
+    doc.nodes.forEach(function (nd) {
+      var p = pos[nd.node_id];
+      var isSel = sel && sel.kind === "node" && sel.id === nd.node_id;
+      var name = nd.serial || ("node-" + nd.node_id);
+      nodes += '<g class="node ' + esc(nd.status) + (isSel ? " sel" : "") +
+        '" data-act="topo-node" data-id="' + nd.node_id + '" transform="translate(' +
+        Math.round(p.x) + "," + Math.round(p.y) + ')">' +
+        "<title>" + esc(name + " · node-" + nd.node_id + " · " + undStatusText(nd.status)) + "</title>" +
+        '<rect x="-52" y="-17" width="104" height="34" rx="9"/>' +
+        '<circle class="dotmark" cx="-38" cy="0" r="4"/>' +
+        '<text x="6" y="4">' + esc(undTrunc(name, 14)) + "</text>" +
+        '<text class="cap" x="6" y="18">node-' + nd.node_id + "</text>" +
+        "</g>";
+    });
+    return '<div class="topo-wrap"><svg class="topo" viewBox="0 0 ' + W + " " + H +
+      '" role="img" aria-label="' + esc("设备拓扑：" + doc.nodes.length + " 台设备、" + doc.bundles.length + " 条连接") + '">' +
+      edges + nodes + "</svg></div>";
+  }
+
+  function undTopoNode(doc, id) {
+    var out = null;
+    doc.nodes.forEach(function (n) { if (n.node_id === id) out = n; });
+    return out;
+  }
+
+  function undTopoBundle(doc, a, b) {
+    var out = null;
+    doc.bundles.forEach(function (x) { if (x.a === a && x.b === b) out = x; });
+    return out;
+  }
+
+  function undKv(k, v) {
+    return "<dt>" + esc(k) + "</dt><dd>" + v + "</dd>";
+  }
+
+  function undTopoDetail(doc) {
+    var sel = S.topo && S.topo.sel;
+    if (!sel) return '<section class="panel"><div class="empty">点击设备或连线查看详情。</div></section>';
+    if (sel.kind === "node") {
+      var nd = undTopoNode(doc, sel.id);
+      if (!nd) { S.topo.sel = null; return '<section class="panel"><div class="empty">点击设备或连线查看详情。</div></section>'; }
+      var h = '<section class="panel"><header><h2>' + esc(nd.serial || ("node-" + nd.node_id)) + " · node-" +
+        nd.node_id + "</h2>" + statusTag(nd.status) + "</header>" +
+        '<dl class="kv">' +
+        undKv("最后心跳", nd.last_seen_unix ? esc(clock(nd.last_seen_unix)) + "（" + esc(ago(nd.last_seen_unix)) + "）" : "从未上报") +
+        undKv("观测外层地址", nd.observed_addr ? '<span class="mono">' + esc(nd.observed_addr) + "</span>"
+          : (nd.udp_mapping ? '<span class="mono">' + esc(nd.udp_mapping) + '</span> <span class="tag stale">无地址</span>' : "未上报")) +
+        undKv("观测时效", nd.observed_age_sec > 0
+          ? esc(dur(nd.observed_age_sec)) + "前" + (nd.observed_stale ? ' <span class="tag stale">已过期</span>' : "")
+          : "—") +
+        undKv("对称 NAT", nd.symmetric_nat ? "是（不能与另一台对称 NAT 设备建隧道）" : "否") +
+        undKv("默认出口", nd.default_iface ? '<span class="mono">' + esc(nd.default_iface) + "</span>" : "未选择") +
+        undKv("中转端口", nd.transit_port ? '<span class="mono">' + esc(nd.transit_port) + "</span>" : '<span class="tag pending">未分配</span>') +
+        undKv("VPN 端口", nd.ports.length ? '<span class="mono">' + esc(nd.ports.join("、")) + "</span>" : "—") +
+        undKv("隧道", esc(nd.tunnel_count) + " 条") +
+        undKv("为其他隧道中转", nd.relay_for ? esc(nd.relay_for) + " 条" : "—") +
+        "</dl>";
+      if (nd.inventory_reported && nd.ifaces && nd.ifaces.length) {
+        h += '<div class="hint" style="margin-top:12px">接口清单' +
+          (nd.inventory_age_sec > 0 ? "（" + esc(dur(nd.inventory_age_sec)) + "前上报）" : "") + "</div>" +
+          "<table><thead><tr><th>接口</th><th>MTU</th><th>状态</th><th>地址</th></tr></thead><tbody>" +
+          nd.ifaces.map(function (i) {
+            return '<tr><td class="mono">' + esc(i.name) + "</td>" +
+              "<td>" + (i.mtu ? esc(i.mtu) : '<span class="tag pending">未知</span>') + "</td>" +
+              "<td>" + (i.link_up ? '<span class="tag online">up</span>' : '<span class="tag stale">down</span>') + "</td>" +
+              '<td class="mono muted">' + esc((i.addrs || []).join("、") || "—") + "</td></tr>";
+          }).join("") + "</tbody></table>";
+      } else if (!nd.inventory_reported) {
+        h += '<div class="hint" style="margin-top:12px">设备还没有上报接口清单，所以无法判断默认出口与链路 MTU。</div>';
+      }
+      return h + "</section>";
+    }
+    var b = undTopoBundle(doc, sel.a, sel.b);
+    if (!b) { S.topo.sel = null; return '<section class="panel"><div class="empty">点击设备或连线查看详情。</div></section>'; }
+    var h2 = '<section class="panel"><header><h2>' + esc(b.serial_a || ("node-" + b.a)) + " 与 " +
+      esc(b.serial_b || ("node-" + b.b)) + " 之间</h2>" + undStateTag(doc.state_note) + "</header>" +
+      '<div class="hint">' + esc(doc.state_note) + "</div>" +
+      "<table><thead><tr><th>隧道</th><th>本端</th><th>对端</th><th>路径</th><th>MTU</th><th>更新</th></tr></thead><tbody>";
+    b.tunnels.forEach(function (t) {
+      h2 += "<tr>" +
+        '<td class="mono">' + esc(t.id) + "</td>" +
+        "<td>" + undEndpointCell(t.a, doc) + "</td>" +
+        "<td>" + undEndpointCell(t.b, doc) + "</td>" +
+        "<td>" + undPathText(t) + "</td>" +
+        "<td>" + undMTUCell(t, doc) + "</td>" +
+        '<td class="muted">' + esc(clock(t.updated_at_unix)) + "</td></tr>";
+    });
+    return h2 + "</tbody></table></section>";
+  }
+
+  function viewUnderlayTopology() {
+    var t = ensureTopo();
+    var doc = t.doc;
+    if (!doc) {
+      return '<section class="panel"><div class="empty">' +
+        esc(t.err ? "读取拓扑失败：" + t.err : "正在读取拓扑…") + "</div></section>";
+    }
+    var h = "";
+    if (!doc.configured) {
+      h += '<div class="banner"><span>全局配置还没有发布：拓扑里不会有隧道。</span>' +
+        '<button class="small" data-act="goto" data-view="underlay-settings">去全局配置</button></div>';
+    }
+    h += '<section class="panel"><header><h2>拓扑</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + doc.nodes.length + " 台设备 · " +
+      doc.bundles.length + " 条连接</span></header>";
+    if (!doc.nodes.length) {
+      return h + '<div class="empty">还没有设备。设备入网后才会出现在拓扑里。</div></section>';
+    }
+    h += '<div class="hint">' + esc(doc.state_note) + "</div>" +
+      undTopoSVG(doc) +
+      '<div class="hint" style="margin-top:10px">实线 = 直连；虚线 = 经中转设备。同一设备对之间的多条隧道画成一条线，点开看明细。' +
+      "自动编排不会给已有隧道的设备对再建一条，第二条隧道只能手动创建。</div></section>";
+    h += undTopoDetail(doc);
+    return h;
   }
 
   /* ---------------- actions ---------------- */
@@ -2107,6 +3359,96 @@
       });
     });
 
+    document.querySelectorAll("#content [data-und]").forEach(function (el) {
+      el.addEventListener("input", function () { undSetField(el); });
+    });
+    document.querySelectorAll("#content [data-und-node]").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var u = S.und;
+        if (!u) return;
+        var id = Number(el.getAttribute("data-und-node"));
+        var i = u.autoSel.indexOf(id);
+        if (el.checked && i < 0) u.autoSel.push(id);
+        if (!el.checked && i >= 0) u.autoSel.splice(i, 1);
+        u.auto = null;
+        blurContent();
+        render();
+      });
+    });
+    var uam = $("und-auto-mode");
+    if (uam) uam.addEventListener("change", function () {
+      if (!S.und) return;
+      S.und.autoMode = uam.value;
+      S.und.auto = null;
+      blurContent();
+      render();
+    });
+    var uah = $("und-auto-hub");
+    if (uah) uah.addEventListener("change", function () {
+      if (!S.und) return;
+      S.und.autoHub = Number(uah.value) || 0;
+      S.und.auto = null;
+      blurContent();
+      render();
+    });
+    var uas = $("und-auto-spoke");
+    if (uas) uas.addEventListener("change", function () {
+      if (!S.und) return;
+      S.und.autoSpoke = uas.value;
+      S.und.auto = null;
+      blurContent();
+      render();
+    });
+    document.querySelectorAll("#content [data-und-dev]").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var u = S.und;
+        if (!u) return;
+        if (el.getAttribute("data-und-dev") === "a") u.mA = Number(el.value) || 0;
+        else u.mB = Number(el.value) || 0;
+        blurContent();
+        render();
+      });
+    });
+    var ump = $("und-tun-pathmode");
+    if (ump) ump.addEventListener("change", function () {
+      if (!S.und) return;
+      S.und.mPath = ump.value;
+      blurContent();
+      render();
+    });
+    var uep = $("und-edit-pathmode");
+    if (uep) uep.addEventListener("change", function () {
+      if (!S.und) return;
+      S.und.editPathMode = uep.value;
+      blurContent();
+      render();
+    });
+    var uaf = $("und-auto-form");
+    if (uaf) uaf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      undAutoPreview(uaf);
+    });
+    var utf = $("und-tun-form");
+    if (utf) utf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      undCreateTunnel(utf);
+    });
+    var uef = $("und-tun-edit-form");
+    if (uef) uef.addEventListener("submit", function (e) {
+      e.preventDefault();
+      undUpdateTunnel(uef);
+    });
+    var upf = $("und-path-form");
+    if (upf) upf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      undSavePath(upf, "");
+    });
+    var upef = $("und-path-edit-form");
+    if (upef) upef.addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (S.und) undSavePath(upef, S.und.editPath);
+    });
+
     document.querySelectorAll("#content [data-act]").forEach(function (el) {
       el.addEventListener("click", function () {
         var act = el.getAttribute("data-act");
@@ -2206,6 +3548,52 @@
         else if (act === "cfg-st-del") cfgDelStatic(Number(el.getAttribute("data-i")));
         else if (act === "cfg-nb-add") cfgAddNeighbor();
         else if (act === "cfg-nb-del") cfgDelNeighbor(Number(el.getAttribute("data-i")));
+        else if (act === "und-reload") undReload();
+        else if (act === "und-save") undSave(false).catch(function () {});
+        else if (act === "und-publish") undPublish();
+        else if (act === "und-note-x") {
+          if (S.und) S.und.note = null;
+          render();
+        }
+        else if (act === "und-avoid-add") undAddAvoid();
+        else if (act === "und-avoid-del") undDelAvoid(Number(el.getAttribute("data-i")));
+        else if (act === "und-auto-apply") undAutoApply();
+        else if (act === "und-tun-edit") {
+          if (!S.und || !S.und.doc) return;
+          var et = undTunnelOf(S.und.doc, el.getAttribute("data-id"));
+          if (!et) return;
+          S.und.editTun = et.id;
+          S.und.editPathMode = undTunnelPathMode(et);
+          blurContent();
+          render();
+        }
+        else if (act === "und-tun-cancel") {
+          if (!S.und) return;
+          S.und.editTun = null;
+          S.und.editPathMode = null;
+          render();
+        }
+        else if (act === "und-tun-del") undDeleteTunnel(el.getAttribute("data-id"));
+        else if (act === "und-path-edit") {
+          if (!S.und) return;
+          S.und.editPath = el.getAttribute("data-id");
+          blurContent();
+          render();
+        }
+        else if (act === "und-path-cancel") {
+          if (!S.und) return;
+          S.und.editPath = null;
+          render();
+        }
+        else if (act === "und-path-del") undDeletePath(el.getAttribute("data-id"));
+        else if (act === "topo-node") {
+          S.topo.sel = { kind: "node", id: Number(el.getAttribute("data-id")) };
+          render();
+        }
+        else if (act === "topo-bundle") {
+          S.topo.sel = { kind: "bundle", a: Number(el.getAttribute("data-a")), b: Number(el.getAttribute("data-b")) };
+          render();
+        }
         else if (act === "disable") {
           var name = el.getAttribute("data-user");
           var off = el.getAttribute("data-disabled") === "true";
