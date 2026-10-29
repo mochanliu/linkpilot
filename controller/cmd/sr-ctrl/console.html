@@ -62,8 +62,14 @@
   nav a:hover{background:var(--soft)}
   nav a.active{background:var(--accent-bg);color:var(--accent);font-weight:500}
   nav a .n{font-size:12px;color:var(--muted)}
-  nav a.sect{margin-top:12px;color:var(--muted);font-size:11px;letter-spacing:1px;
-    padding:6px 10px 2px;pointer-events:none}
+  nav .sect{margin-top:15px;color:var(--muted);font-size:11px;letter-spacing:1px;
+    font-weight:500;padding:6px 10px 2px;pointer-events:none}
+  nav a.child{padding-left:22px;font-size:13px}
+  nav a.dis{color:var(--muted);pointer-events:none}
+  nav button.navbtn{display:block;width:100%;text-align:left;font:inherit;font-size:13px;
+    padding:7px 10px 7px 22px;border:none;background:none;color:var(--ink);
+    border-radius:6px;cursor:pointer}
+  nav button.navbtn:hover{background:var(--soft)}
   aside .foot{position:absolute;bottom:14px;left:10px;right:10px;font-size:12px;color:var(--muted);
     border-top:1px solid var(--line2);padding-top:12px}
   aside .me{font-size:12.5px;line-height:1.4;color:var(--ink);margin-bottom:8px}
@@ -282,19 +288,25 @@
   <aside>
     <div class="logo">SROU<small>CONTROLLER</small></div>
     <nav id="nav">
-      <a href="#overview" data-view="overview">概览</a>
+      <a href="#dashboard" data-view="dashboard">Dashboard</a>
       <div class="sect" data-roles="operator">运营</div>
-      <a href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
-      <a href="#accounts" data-view="accounts" data-roles="operator">账号 <span class="n" id="n-accounts">0</span></a>
-      <a href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
-      <div class="sect" data-roles="tenant">我的网络</div>
-      <a href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
+      <a class="child" href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
+      <div class="sect">资产</div>
+      <a class="child" href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
+      <a class="child" href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
       <a href="#config" data-view="config" data-roles="tenant">基础配置</a>
-      <a href="#underlay-settings" data-view="underlay-settings" data-roles="tenant">全局配置</a>
-      <a href="#underlay-tunnels" data-view="underlay-tunnels" data-roles="tenant">隧道配置</a>
-      <a href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
-      <a href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
-      <a href="#routes" data-view="routes" data-roles="tenant">路由</a>
+      <div class="sect" data-roles="tenant">Underlay 配置</div>
+      <a class="child" href="#underlay-settings" data-view="underlay-settings" data-roles="tenant">全局配置</a>
+      <a class="child" href="#underlay-tunnels" data-view="underlay-tunnels" data-roles="tenant">隧道配置</a>
+      <div class="sect" data-roles="tenant">监控与管理</div>
+      <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
+      <a class="child" href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
+      <div class="sect" data-roles="tenant">Overlay 配置</div>
+      <a class="child dis" data-roles="tenant">路由 · 尚未规划</a>
+      <div class="sect">账号管理</div>
+      <a class="child" href="#accounts" data-view="accounts" data-roles="operator">账号 <span class="n" id="n-accounts">0</span></a>
+      <a class="child" href="#account" data-view="account" id="nav-account">账号设置</a>
+      <button class="navbtn" type="button" id="logout">退出登录</button>
     </nav>
     <div class="foot">
       <div class="me"><div class="who" id="me-who">—</div><div class="role" id="me-role"></div></div>
@@ -305,13 +317,11 @@
   <main>
     <div class="page-head">
       <div>
-        <h1 id="view-title">概览</h1>
+        <h1 id="view-title">Dashboard</h1>
         <div class="sub" id="view-sub"></div>
       </div>
       <div class="head-right">
         <span class="pill"><span class="dot ok" id="live-dot"></span><span id="live-text">实时</span></span>
-        <button class="small" id="pw-btn" hidden>修改密码</button>
-        <button class="small" id="logout">退出登录</button>
       </div>
     </div>
     <div id="content"></div>
@@ -325,7 +335,7 @@
   "use strict";
 
   var S = { state: null, me: null, accounts: null, loginTab: "account",
-    view: "overview", lastResult: null, lastSecret: null, codeReveal: null,
+    view: "dashboard", lastResult: null, lastSecret: null, codeReveal: null,
     html: "", timer: null, ago: null, es: null,
     metrics: null, fast: null, cfg: null, und: null, topo: null, sites: null };
 
@@ -468,18 +478,13 @@
     api("POST", "/api/logout", {}).then(function () { location.reload(); });
   });
 
-  $("pw-btn").addEventListener("click", function () {
-    S.view = "account";
-    render();
-  });
-
   /* ---------------- session ---------------- */
 
   function bootSession(s) {
     if (!s || !s.logged_in) { showLogin(); return; }
     S.me = s;
     S.html = "";
-    if (!allowed(S.view)) S.view = "overview";
+    if (!allowed(S.view)) S.view = "dashboard";
     showApp();
     renderChrome();
     boot();
@@ -551,7 +556,8 @@
     var me = S.me || {};
     $("me-who").textContent = me.username || "";
     $("me-role").textContent = me.role ? roleLine(me) : "";
-    $("pw-btn").hidden = me.via !== "password";
+    // 改密码进「账号管理」；令牌会话没有密码可改，所以连入口一起藏掉。
+    $("nav-account").hidden = me.via !== "password";
     document.querySelectorAll("#nav [data-roles]").forEach(function (el) {
       el.hidden = (el.getAttribute("data-roles") || "").split(",").indexOf(me.role) < 0;
     });
@@ -608,10 +614,10 @@
   // roles omitted = both roles. The role gate is also enforced by the API; this
   // table only keeps a view from being drawn for a role that has no data for it.
   var VIEWS = {
-    overview: {
-      title: "概览",
-      sub: "运营侧重归属与库存；设备配置属于租户，不在这里展示",
-      tenantSub: "你的设备与入网入口；基础配置、全局配置与隧道配置都在左侧，发布后由设备自己拉取"
+    dashboard: {
+      title: "Dashboard",
+      sub: "运营侧只看归属与库存；隧道、配置与遥测属于租户，不在这里展示",
+      tenantSub: "一眼看清现在有没有要处理的事。设备清单在「资产 › 设备」，心跳明细与隧道内遥测在「监控与管理 › 监控」"
     },
     tenants: { title: "租户", sub: "租户是设备归属的唯一依据，只有控制台能创建", roles: ["operator"] },
     accounts: { title: "账号", sub: "登录控制台的账号；角色决定能看到什么、能改什么", roles: ["operator"] },
@@ -623,11 +629,11 @@
     nodes: {
       title: "设备",
       sub: "运营方只看库存（谁、序列号、入网时间、在线状态）",
-      tenantSub: "你的设备；入网只建立归属。基础配置在「基础配置」页、隧道参数在「全局配置 / 隧道配置」页，发布后由设备自己拉取（agent 需 -apply），也可以下载配置包手工安装"
+      tenantSub: "你的设备；入网只建立归属。基础参数在「基础配置」、隧道参数在「Underlay 配置」，发布后由设备自己拉取（agent 需 -apply），也可以下载配置包手工安装；站点位置就在下表每行的「站点」列里选"
     },
     config: {
       title: "基础配置",
-      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。本页编辑基础配置；underlay 已拆成「全局配置 / 隧道配置 / 拓扑图」三页。保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装",
+      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。本页编辑基础配置；underlay 在「Underlay 配置」组（全局配置 / 隧道配置），拓扑图在「监控与管理」组。保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装",
       roles: ["tenant"]
     },
     monitor: {
@@ -650,7 +656,6 @@
       sub: "设备与隧道连线的只读视图；每条连线的运行状态仍显示「未知」（遥测行还没逐条对上），每台设备建了几条隧道看设备表的「隧道下发」列",
       roles: ["tenant"]
     },
-    routes: { title: "路由", sub: "尚未实现：路由表由 RR 反射，控制器不发布路由", roles: ["tenant"] },
     account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" }
   };
 
@@ -660,9 +665,9 @@
     if (!st) return;
     var me = S.me || {};
     var isOp = me.role === "operator";
-    if (!VIEWS[S.view]) S.view = "overview";
-    if (!allowed(S.view)) S.view = "overview";
-    var v = VIEWS[S.view] || VIEWS.overview;
+    if (!VIEWS[S.view]) S.view = "dashboard";
+    if (!allowed(S.view)) S.view = "dashboard";
+    var v = VIEWS[S.view] || VIEWS.dashboard;
     $("view-title").textContent = v.title;
     $("view-sub").textContent = (isOp ? v.sub : (v.tenantSub || v.sub));
     syncFast();
@@ -684,7 +689,7 @@
     if (undMapDragging()) return;
 
     var c = "";
-    if (S.view === "overview") c = viewOverview(st, online, isOp);
+    if (S.view === "dashboard") c = viewDashboard(st, online, isOp);
     else if (S.view === "tenants") c = viewTenants(st);
     else if (S.view === "accounts") c = viewAccounts(st);
     else if (S.view === "enroll") c = viewEnroll(st, isOp);
@@ -695,7 +700,7 @@
     else if (S.view === "underlay-topology") c = viewUnderlayTopology();
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "account") c = viewAccount();
-    else c = viewPlaceholder(S.view);
+    else c = viewPlaceholder();
     if (me.initial_password) c = initialPassBanner() + c;
 
     // 结构没变就只刷新相对时间，不重建 DOM：重建会让正在点的按钮在半路
@@ -753,21 +758,26 @@
     return st.claims.filter(function (c) { return !c.revoked; });
   }
 
+  // Dashboard 只回答一个问题：现在有没有要处理的事。数字全部来自 /api/state 的心跳，
+  // 不取遥测 —— 遥测要 5 秒快轮询，那是「监控」页的事。
   function cards(st, online, isOp) {
-    var grants = liveGrants(st).length;
+    var pending = st.nodes.filter(function (n) { return n.status === "pending"; }).length;
+    var stale = st.nodes.filter(function (n) { return n.status === "stale"; }).length;
     if (isOp) {
       return '<div class="cards">' +
         card("租户", st.tenants.length, "个") +
         card("已入网设备", st.nodes.length, "台") +
         card("在线", online, "台") +
-        card("入网授权", grants, "个") +
+        card("失联", stale, "台") +
+        card("待心跳", pending, "台") +
         "</div>";
     }
     var unconfigured = st.nodes.filter(function (n) { return n.runtime && !n.runtime.configured; }).length;
     return '<div class="cards">' +
       card("我的设备", st.nodes.length, "台") +
       card("在线", online, "台") +
-      card("入网授权", grants, "个") +
+      card("失联", stale, "台") +
+      card("待心跳", pending, "台") +
       card("待配置", unconfigured, "台") +
       "</div>";
   }
@@ -819,25 +829,82 @@
     return id;
   }
 
-  function viewOverview(st, online, isOp) {
-    var h = cards(st, online, isOp);
-    h += '<section class="panel"><header><h2>' + (isOp ? "设备库存" : "我的设备") + "</h2>" +
-      '<button class="small" data-act="refresh">刷新</button></header>' +
-      deviceTable(st.nodes, isOp
-        ? "还没有设备。先到「租户」页新建租户（同时下发第一个入网授权），客户生成一次性码后设备即可入网。"
-        : "还没有设备。到「入网授权」页为一条授权生成一次性码，再按命令启动设备。", isOp) +
-      "</section>";
-    h += isOp ? operatorSteps() : tenantSteps();
-    return h;
+  // 设备清单只在「资产 › 设备」，心跳明细与遥测只在「监控与管理 › 监控」：
+  // Dashboard 只给数字和该去哪儿，不再重复一遍表。
+  function viewDashboard(st, online, isOp) {
+    return cards(st, online, isOp) +
+      (isOp ? operatorAttention(st) : tenantAttention(st)) +
+      (isOp ? operatorSteps() : tenantSteps());
+  }
+
+  function attentionRow(what, count, unit, detail, view, label) {
+    if (!count) return "";
+    return "<tr><td>" + esc(what) + '</td><td class="num"><b>' + esc(count) + "</b> " + esc(unit) +
+      '</td><td class="muted">' + (detail || "—") + "</td><td>" +
+      (view ? '<button class="small" data-act="goto" data-view="' + esc(view) + '">' + esc(label) + "</button>" : "") +
+      "</td></tr>";
+  }
+
+  function lastSeenDetail(n) {
+    if (!n) return "";
+    return '<span class="mono">node-' + esc(n.node_id) + "</span> " +
+      (n.last_seen_unix ? '<span data-ago="' + esc(n.last_seen_unix) + '"></span>' : "从未心跳");
+  }
+
+  // 失联里挑最久没动静的那一台代表：它最需要先看。
+  function oldest(list) {
+    var out = null;
+    list.forEach(function (n) {
+      var t = n.last_seen_unix || 0;
+      if (!out || t < (out.last_seen_unix || 0)) out = n;
+    });
+    return out;
+  }
+
+  function attentionPanel(rows, okMsg) {
+    var h = '<section class="panel"><header><h2>需要关注</h2>' +
+      '<button class="small" data-act="refresh">刷新</button></header>';
+    if (!rows) return h + '<div class="empty">' + esc(okMsg) + "</div></section>";
+    return h + '<table><thead><tr><th>事项</th><th>数量</th><th>最近一例</th><th></th></tr></thead>' +
+      "<tbody>" + rows + "</tbody></table></section>";
+  }
+
+  function tenantAttention(st) {
+    var stale = st.nodes.filter(function (n) { return n.status === "stale"; });
+    var pending = st.nodes.filter(function (n) { return n.status === "pending"; });
+    var unconfigured = st.nodes.filter(function (n) { return n.runtime && !n.runtime.configured; });
+    var unsited = st.nodes.filter(function (n) { return !(n.runtime && n.runtime.site_id); });
+    var rows = attentionRow("失联", stale.length, "台", lastSeenDetail(oldest(stale)), "monitor", "看监控") +
+      attentionRow("待心跳", pending.length, "台", lastSeenDetail(pending[0]), "nodes", "看设备") +
+      attentionRow("未配置", unconfigured.length, "台", "", "config", "去基础配置") +
+      attentionRow("未定位", unsited.length, "台", "", "nodes", "去设备页放站点");
+    return attentionPanel(rows, st.nodes.length
+      ? "没有要处理的事：设备都在线、已配置、已定位。"
+      : "还没有设备。到「资产 › 入网授权」为一条授权生成一次性码，再按命令启动设备。");
+  }
+
+  function operatorAttention(st) {
+    var stale = st.nodes.filter(function (n) { return n.status === "stale"; });
+    var pending = st.nodes.filter(function (n) { return n.status === "pending"; });
+    var grants = liveGrants(st);
+    var noGrant = st.tenants.filter(function (t) {
+      return !grants.some(function (c) { return c.tenant_id === t.tenant_id; });
+    });
+    var rows = attentionRow("失联设备", stale.length, "台", lastSeenDetail(oldest(stale)), "nodes", "看库存") +
+      attentionRow("待心跳设备", pending.length, "台", lastSeenDetail(pending[0]), "nodes", "看库存") +
+      attentionRow("没有活跃授权的租户", noGrant.length, "个", "", "tenants", "去租户页补授权");
+    return attentionPanel(rows, st.tenants.length
+      ? "没有要处理的事：每个租户都有活跃授权，设备都在线。"
+      : "还没有租户。到「运营 › 租户」新建第一个租户（同时下发第一个入网授权）。");
   }
 
   function operatorSteps() {
     return '<section class="panel"><header><h2>运营方做什么</h2></header>' +
       '<div class="placeholder"><b>入网 = 设备与租户建立归属关系</b>，只签设备证书、登记一行记录，零配置。' +
       "<ul>" +
-      "<li>新建租户 → 同时下发第一个入网授权（名称 + 可激活台数），并可选建客户登录账号</li>" +
+      "<li>「运营 › 租户」新建租户 → 同时下发第一个入网授权（名称 + 可激活台数），并可选建客户登录账号</li>" +
       "<li>客户在真正激活设备时自己生成一次性入网码；运营方看不到码的明文</li>" +
-      "<li>设备出现在「设备」页，只显示归属与库存信息</li>" +
+      "<li>设备出现在「资产 › 设备」，只显示归属与库存信息</li>" +
       "<li>隧道 / 端口 / overlay / 密钥属于租户的网络配置，运营方看不到</li>" +
       "</ul></div></section>";
   }
@@ -846,11 +913,11 @@
     return '<section class="panel"><header><h2>接下来</h2></header>' +
       '<div class="placeholder"><b>设备入网只建立归属，不带任何配置。</b>' +
       "<ul>" +
-      "<li>在「入网授权」页选一条授权，点「生成」拿到一次性入网码（默认 5 分钟有效）</li>" +
+      "<li>在「资产 › 入网授权」选一条授权，点「生成」拿到一次性入网码（默认 5 分钟有效）</li>" +
       "<li>立刻复制或手抄到设备上；码只显示这一次，重新生成后旧码立即失效</li>" +
-      "<li>设备出现在「设备」页即表示归属成功；心跳变绿才代表在线</li>" +
-      "<li>心跳年龄、在线时长与隧道内遥测在「监控」页；没有上报时那里会明说，不显示 0 或假数据</li>" +
-      "<li>隧道参数（端口 / overlay 地址 / 中转）在「全局配置」和「隧道配置」页编排；发布后隧道段随心跳下发给开着 -tunnels 的设备，设备建了几条、版本几、有没有报错在设备表的「隧道下发」列（没上报就写「未上报」，不写 0）</li>" +
+      "<li>设备出现在「资产 › 设备」即表示归属成功；心跳变绿才代表在线</li>" +
+      "<li>心跳年龄、在线时长与隧道内遥测在「监控与管理 › 监控」；没有上报时那里会明说，不显示 0 或假数据</li>" +
+      "<li>隧道参数（端口 / overlay 地址 / 中转）在「Underlay 配置」里编排；发布后隧道段随心跳下发给开着 -tunnels 的设备，设备建了几条、版本几、有没有报错在设备表的「隧道下发」列（没上报就写「未上报」，不写 0）</li>" +
       "</ul></div></section>";
   }
 
@@ -2039,16 +2106,7 @@
       "</form></section>";
   }
 
-  function viewPlaceholder(view) {
-    if (view === "routes") {
-      return '<section class="panel"><div class="placeholder">' +
-        "<b>路由页还没有数据来源。</b>" +
-        "<ul>" +
-        "<li>路由由 RR 反射，控制器不发布路由</li>" +
-        "<li>overlay 层的导入导出（FRR ↔ sr-route）还没有北向视图</li>" +
-        "<li>设备是否活着、数据面有没有上报遥测，在「监控」页</li>" +
-        "</ul></div></section>";
-    }
+  function viewPlaceholder() {
     return '<section class="panel"><div class="empty">这个页面不存在。</div></section>';
   }
 
