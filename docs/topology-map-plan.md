@@ -200,12 +200,15 @@ lab 控制台在宿主机 `http://127.0.0.1:8088/`（端口发布到 lab-ctrl �
 一处**照做了但表里没写**：`.cfg-note` 换成了原型的"3px 状态色左竖条 + 浅色底"
 （`border-left:3px solid var(--accent|warn|bad)`），因为原来整圈同色描边的写法在原型里已经不存在了。
 
+2026-10-29 他确认：这三处偏离连同上面那条照做的，**按现状保留，不回改**。
+
 ## 10. 第 6 步规模预演的实测结果（2026-10-29，`louis-gui` 登录 lab 控制台真实页面）
 
 ### 怎么量的（先把证据边界说清）
 
 - **页面代码一行没改**。发生器 `window.__gen118(N)` / `__mock118(N)` 只注入在这个标签页的内存里
-  （宿主脚本 `/tmp/mock118.js`，169 行，不进仓库、不进控制器），它只替换 `window.fetch` 对
+  （脚本已入库：`controller/tools/topo-scale-mock/mock118.js`，注入与复跑姿势见同目录 `README.md`；
+  它喂的是内存里的文档，不进控制器、不进仓库数据），它只替换 `window.fetch` 对
   `/api/underlay/topology` 这一个路径的响应，其它请求照走真实控制器。真实页面的
   `ensureTopo → loadTopo → render → undMapAttach → undMapDraw` 全程跑的是发布出去的那份源码。
 - **帧延迟** = 同步 `svg.dispatchEvent(new WheelEvent('wheel',{deltaY…}))` 前后的
@@ -295,7 +298,11 @@ lab 控制台在宿主机 `http://127.0.0.1:8088/`（端口发布到 lab-ctrl �
    `/api/underlay/topology` 一次 **1.4 MB** JSON 而且 10 秒一轮询（服务端每次都要拼这份文档）；
    拓扑页与设备页那份**不分页的站点表**（1000 台时 597 行、651 个 `<tr>`，整页 HTML 2 MB）。
 
-发生器我留在宿主 `/tmp/mock118.js`（`/tmp` 会被清）。如果你要以后每次改渲染都能复跑这套量测，
-我把它挪进 `controller/tools/` 当第三个工具（和 `world-basemap` 并列），这样规模预演就不只是
-存在于这一次对话里的一串数字。
+### 拍板结果（2026-10-29）
+
+**第 1 条视口裁剪与第 3 条按站点聚合一起做**：结论 1 和结论 3 是同一个病的两面——每帧重建整幅、
+缩略档又没有地方放逐设备的点，分开做会得到一个"裁剪后仍然要画 952 个站点簇"的中间态。
+第 2 条（拆层 + rAF 合帧）与第 4 条（canvas）还没拍，等这两条复跑量测之后再判。
+发生器已经挪进 `controller/tools/topo-scale-mock/`，和 `world-basemap` 并列成第三个工具，
+这套量测从此可以复跑。第 5 条那两笔债（1.4 MB × 10s 轮询、不分页的站点表）仍然没排。
 
