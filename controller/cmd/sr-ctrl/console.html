@@ -772,13 +772,13 @@
         card("待心跳", pending, "台") +
         "</div>";
     }
-    var unconfigured = st.nodes.filter(function (n) { return n.runtime && !n.runtime.configured; }).length;
+    var unsited = st.nodes.filter(function (n) { return !(n.runtime && n.runtime.site_id); }).length;
     return '<div class="cards">' +
       card("我的设备", st.nodes.length, "台") +
       card("在线", online, "台") +
       card("失联", stale, "台") +
       card("待心跳", pending, "台") +
-      card("待配置", unconfigured, "台") +
+      card("未定位", unsited, "台") +
       "</div>";
   }
   function card(k, v, u) {
@@ -790,7 +790,7 @@
     if (!nodes.length) return '<div class="empty">' + esc(emptyMsg) + "</div>";
     var cols = isOp
       ? ["设备", "租户", "序列号", "状态", "入网时间"]
-      : ["设备", "序列号", "状态", "最后心跳", "入网时间", "配置"];
+      : ["设备", "序列号", "状态", "最后心跳", "入网时间", "外层映射"];
     if (withSite) cols.splice(3, 0, "站点");
     var h = "<table><thead><tr>" + cols.map(function (c) {
       return "<th>" + esc(c) + "</th>";
@@ -806,10 +806,9 @@
       if (!isOp) h += '<td class="muted"><span data-ago="' + esc(n.last_seen_unix) + '"></span></td>';
       h += '<td class="muted">' + esc(clock(n.enrolled_at_unix)) + "</td>";
       if (!isOp) {
-        h += "<td>" + (rt && rt.configured
-          ? '<span class="tag online">已配置</span>'
-          : '<span class="tag plan">未配置</span>') +
-          (rt && rt.udp_mapping ? ' <span class="mono muted">' + esc(rt.udp_mapping) + "</span>" : "") +
+        h += "<td>" + (rt && rt.udp_mapping
+          ? '<span class="mono">' + esc(rt.udp_mapping) + "</span>"
+          : '<span class="tag plan">未上报</span>') +
           "</td>";
       }
       h += "</tr>";
@@ -872,14 +871,12 @@
   function tenantAttention(st) {
     var stale = st.nodes.filter(function (n) { return n.status === "stale"; });
     var pending = st.nodes.filter(function (n) { return n.status === "pending"; });
-    var unconfigured = st.nodes.filter(function (n) { return n.runtime && !n.runtime.configured; });
     var unsited = st.nodes.filter(function (n) { return !(n.runtime && n.runtime.site_id); });
     var rows = attentionRow("失联", stale.length, "台", lastSeenDetail(oldest(stale)), "monitor", "看监控") +
       attentionRow("待心跳", pending.length, "台", lastSeenDetail(pending[0]), "nodes", "看设备") +
-      attentionRow("未配置", unconfigured.length, "台", "", "config", "去基础配置") +
       attentionRow("未定位", unsited.length, "台", "", "nodes", "去设备页放站点");
     return attentionPanel(rows, st.nodes.length
-      ? "没有要处理的事：设备都在线、已配置、已定位。"
+      ? "没有要处理的事：设备都在线、已定位。"
       : "还没有设备。到「资产 › 入网授权」为一条授权生成一次性码，再按命令启动设备。");
   }
 
@@ -1106,7 +1103,7 @@
       deviceTable(st.nodes, isOp ? "还没有设备入网。" : "还没有设备入网，先在「入网授权」页生成一次性码接入一台。", isOp, !isOp) +
       '<div class="hint" style="margin-top:12px">' + (isOp
         ? "运营方只保留归属信息（租户、序列号、入网时间、在线状态）。心跳明细与设备配置属于租户，接口对运营方不下发这些字段。"
-        : "「未配置」是真实状态：enroll 不推任何参数，节点计划（每个隧道的端口、overlay /32、密钥环、RR 列表）还没有实现。心跳年龄、在线时长与隧道内遥测在「监控」页。") +
+        : "「外层映射」是控制器记下的设备 NAT 外层地址:端口，来源是心跳里的上报或观测回报；没记到就写「未上报」，页面不猜。配置是否已落到设备上以设备回报为准，看「基础配置」页的「下发到设备」；心跳年龄与隧道内遥测在「监控与管理 › 监控」页。") +
       "</div></section>";
     if (t) {
       h += undNote(t.note);

@@ -503,8 +503,14 @@ say("tenant_foreign_claims", len([c for c in tclaims if c.get("tenant_id") != "t
 tclaim = next((c for c in tclaims if c["id"] == claim_id), None)
 say("tenant_claim_seats", "%d/%d" % (tclaim["uses"], tclaim["max_uses"]) if tclaim else "missing")
 say("tenant_node_runtime", str(bool(tnodes and tnodes[0].get("runtime"))).lower())
-say("tenant_node_configured",
-    str((tnodes[0].get("runtime") or {}).get("configured")).lower() if tnodes else "missing")
+# 入网不等于配置：用真实的配置版本口径来断言，而不是页面上一个写死的字样。
+# 新入网的设备既没有草稿（version）也没有已发布（published_version omitempty→0）。
+tnode_id = tnodes[0].get("node_id") if tnodes else 0
+cfg_code, cfg_raw = call("GET", "%s/api/config?node=%s" % (CONSOLE, tnode_id), opener_=topener)
+cvt = jstat(cfg_code, cfg_raw) or {}
+say("tenant_config_http", cfg_code)
+say("tenant_config_draft", cvt.get("version"))
+say("tenant_config_published", cvt.get("published_version", 0))
 
 # B6b. 监控：租户专用；没上报遥测时报空集合，而不是编一行
 code, raw = call("GET", CONSOLE + "/api/metrics", opener_=topener)
@@ -535,7 +541,7 @@ onodes = ost.get("nodes") or []
 say("operator_node_runtime", str(any("runtime" in n for n in onodes)).lower())
 say("operator_config_leak",
     str(any(k in raw.decode(errors="replace")
-            for k in ("udp_mapping", "vpn_port", "configured"))).lower())
+            for k in ("udp_mapping", "vpn_port", "site_id"))).lower())
 
 # B8. 租户不能做运营方的任何事（403 是明确告知，不是隐藏 404）
 def deny(name, path, body):

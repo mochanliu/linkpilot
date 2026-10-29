@@ -573,10 +573,6 @@ type consoleNode struct {
 type consoleNodeRuntime struct {
 	UDPMapping string `json:"udp_mapping"`
 	VpnPort    uint16 `json:"vpn_port"`
-	// Configured is false for every node today: enrollment is not configuration,
-	// and the node plan (ports, overlay address, keys, RR list) does not exist
-	// yet. The console says so rather than implying a device is ready to tunnel.
-	Configured bool `json:"configured"`
 	// Site is where the box physically sits, for the map. It lives in Runtime so
 	// the operator role cannot receive it by accident: a location is part of how
 	// the customer drew their own network, and an empty SiteID means "未定位",
@@ -647,7 +643,7 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		}
 		if id.Role == roleTenant {
 			rt := consoleNodeRuntime{
-				UDPMapping: n.UDPMapping, VpnPort: n.VpnPort, Configured: false,
+				UDPMapping: n.UDPMapping, VpnPort: n.VpnPort,
 				SiteID: n.SiteID,
 			}
 			// Resolve the name here rather than in the page: a site row can be
