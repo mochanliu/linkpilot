@@ -166,17 +166,20 @@
   .und-box{border:1px solid var(--line);border-radius:8px;padding:12px 14px}
   .und-box h3{font-size:13.5px;margin-bottom:8px}
   .und-box .hint{margin:8px 0 0}
-  /* 设备选择器：过滤条件 + 可见列表。设备一多，下拉框要翻很久，
-     所以所有"选设备"的地方统一成这一组控件（见 dpHtml）。 */
+  /* 设备选择器（见 dpHtml）。分两种形态：
+     只能选一台 → 过滤输入框 + 一个折叠下拉，占一行，页面不因此变高；
+     能选好几台 → 过滤输入框 + 状态下拉 + 看得见多行的列表框，多选才有意义。
+     列表框仍是原生 <select>，选中值照旧从 el.value / selectedOptions 读。 */
   .devpick{display:flex;flex-direction:column;gap:5px;min-width:260px}
   .devpick .dp-tools{display:flex;gap:5px}
   .devpick .dp-tools input{flex:1;min-width:0;padding:5px 8px;font-size:12.5px}
   .devpick .dp-tools select{padding:4px 6px;font-size:12.5px;min-width:0}
   .devpick select.devlist{padding:3px;font-size:12.5px;width:100%;max-width:360px}
   .devpick select.devlist option{padding:2px 5px}
+  .devpick select.devpick-one{width:100%;max-width:360px;padding:5px 8px;font-size:12.5px}
   .devpick .dp-count{font-size:11.5px;color:var(--muted)}
-  /* 配置页顶栏里的设备列表比一行高，所以整栏按顶部对齐：左边是能过滤的设备
-     列表，右边是版本说明与按钮，贴在上方而不是被列表拽到垂直居中。 */
+  /* 配置页顶栏：左边是选设备（过滤框 + 下拉，加计数一共三行），右边是版本说明
+     与按钮。整栏按顶部对齐，否则右侧按钮会被左边的行数拽到垂直居中。 */
   .cfg-bar.haspick{align-items:flex-start}
   .cfg-bar.haspick>.devpick{flex:0 1 340px}
   .cfg-bar.haspick>.cfg-side{flex:1;min-width:230px;display:flex;flex-direction:column;
@@ -245,10 +248,6 @@
   .chk-list .sev.error{color:var(--bad)}
   .chk-list .sev.warning{color:var(--warn)}
   .chk-list .sev.info{color:var(--muted)}
-  .bnd{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;padding:0;list-style:none}
-  .bnd li{width:100%;border:1px solid var(--line);border-radius:8px;padding:9px 12px;
-    font-size:13px;color:var(--muted)}
-  .bnd b{color:var(--ink)}
   .tel-node{border-top:1px solid var(--line2);padding:14px 0 6px}
   .tel-node:first-of-type{border-top:none;padding-top:2px}
   .tel-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
@@ -644,7 +643,7 @@
     },
     config: {
       title: "基础配置",
-      sub: "设备配置分三层：基础配置（客户侧）、underlay（隧道）、overlay（路由导入导出）。本页编辑基础配置；underlay 在「Underlay 配置」组（全局配置 / 隧道配置），拓扑图在「监控与管理」组。保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装",
+      sub: "只编辑设备的基础配置：主机名、VPN、接口地址、静态路由、BGP/OSPF 开关。保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装。隧道参数在「Underlay 配置」组；路由导入导出属于「Overlay 配置」，那组还没规划好，这里不放入口",
       roles: ["tenant"]
     },
     monitor: {
@@ -1314,7 +1313,7 @@
     S.cfg = { nodeID: ok && !cs.pa ? cs.nodeID : (nodes[0] ? nodes[0].node_id : 0),
       pa: ok ? (cs.pa || "") : "",
       view: null, draft: null,
-      dirty: false, layer: cs ? cs.layer : "base", edit: null, ptab: "frr", vpn: 0,
+      dirty: false, edit: null, ptab: "frr", vpn: 0,
       note: null, loading: false, bundle: null };
     loadConfig();
   }
@@ -1429,7 +1428,6 @@
     var h = cfgBar(st, cs);
     if (cs.note) h += cfgNote(cs.note);
     h += cfgDeliveryPanel(cs);
-    if (cs.layer !== "base") return h + cfgBoundary(cs.layer);
     if (!cs.view) {
       return h + '<section class="panel"><div class="empty">' +
         (cs.loading ? "正在读取配置…" : "还没有读到配置。") + "</div></section>";
@@ -1448,11 +1446,11 @@
     }
     return '<section class="panel">' +
       '<div class="cfg-bar haspick">' +
-      dpHtml("cfg-node", "", items, cfgTarget(cs), { size: 8 }) +
+      dpHtml("cfg-node", "", items, cfgTarget(cs)) +
       '<div class="cfg-side">' +
       '<span class="muted" style="font-size:12.5px" id="cfg-meta">' + cfgMetaText(cs) + cfgDirtyMark(cs) + "</span>" +
       '<div>' + acts + "</div>" +
-      "</div></div>" + cfgTabs(cs) +
+      "</div></div>" +
       '<div class="hint" style="margin:0">' +
       (cfgIsPA(cs)
         ? "这台设备还没有入网：保存只写控制器的草稿，没有「发布」也没有配置包，因为接收方还不存在。现场工程师用 <code>sr-agent --preauth 「这台设备的索引」</code> 认领它之后，这份草稿会原样挪到它的 node 上（版本不变），那时候才能发布。"
@@ -1461,51 +1459,9 @@
       "</section>";
   }
 
-  function cfgTabs(cs) {
-    var t = [["base", "基础配置"], ["underlay", "underlay"], ["overlay", "overlay"]];
-    return '<div class="ltabs" role="tablist" aria-label="配置层次">' + t.map(function (x) {
-      return '<button type="button" role="tab" class="' + (cs.layer === x[0] ? "on" : "") +
-        '" aria-selected="' + (cs.layer === x[0]) + '" data-act="cfg-layer" data-layer="' +
-        x[0] + '">' + x[1] + "</button>";
-    }).join("") + "</div>";
-  }
-
   function cfgNote(n) {
     return '<div class="cfg-note ' + esc(n.kind || "") + '" role="status"><span>' + esc(n.text) + "</span>" +
       '<button class="small" data-act="cfg-note-x">知道了</button></div>';
-  }
-
-  function cfgBoundary(which) {
-    if (which === "underlay") {
-      return '<section class="panel"><header><h2>underlay：VPN 隧道承载</h2>' +
-        '<span class="tag online">已拆成独立页面</span></header>' +
-        '<div class="hint">这一层管「盒子之间怎么通」，现在有三页：全局配置（端口池 / overlay 池 / 探测参数）、' +
-        "隧道配置（自动编排、手动创建、路径模板）、拓扑图。隧道配置保存在控制器，发布后随心跳下发给开着 -tunnels 的设备；" +
-        "设备自己汇报建成了几条、用的是哪个版本，没上报就显示「未上报」。</div>" +
-        '<ul class="bnd">' +
-        "<li><b>端口</b> · VPN 端口按设备唯一，中转端口每台设备一个（不是每条隧道一个）。</li>" +
-        "<li><b>overlay /32</b> · 先进先出分配，删除隧道后退回队尾。</li>" +
-        "<li><b>路径</b> · 直连、inline 中转或共享模板；最多 1 跳。</li>" +
-        "<li><b>MTU</b> · 按两端上报的链路 MTU 扣 SR 头计算；没上报就按默认值投递并标注。</li>" +
-        "</ul>" +
-        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' +
-        '<button class="small" data-act="goto" data-view="underlay-settings">全局配置</button>' +
-        '<button class="small" data-act="goto" data-view="underlay-tunnels">隧道配置</button>' +
-        '<button class="small" data-act="goto" data-view="underlay-topology">拓扑图</button>' +
-        "</div></section>";
-    }
-    var items = [
-      ["RT", "每个 VPN 的 import / export RT。"],
-      ["双向导入", "FRR 导出 → sr-route（只认 tag 1001，防环）；sr-route 反射回来 → FRR。"],
-      ["选路", "本地直连 / 静态 / BGP / overlay 前缀的优先级与管理距离。"],
-      ["前缀策略", "哪些客户前缀允许进 overlay，以及跨租户的隔离边界。"]
-    ];
-    return '<section class="panel"><header><h2>overlay：FRR 与自研路由之间的导入导出</h2>' +
-      '<span class="tag plan">下一轮设计</span></header>' +
-      '<div class="hint">这一层管的是「学到了什么、怎么互相导入」。本页只做基础配置，先把边界摆出来，方便确认分界。</div>' +
-      '<ul class="bnd">' + items.map(function (x) {
-        return "<li><b>" + esc(x[0]) + "</b> · " + esc(x[1]) + "</li>";
-      }).join("") + "</ul></section>";
   }
 
   // Two different facts, never merged: what the tenant told the device to run
@@ -3241,10 +3197,16 @@
     return h;
   }
 
-  /* ---------------- device picker：可过滤的设备列表 ---------------- */
+  /* ---------------- device picker：选设备的两套形态，按能不能多选分 ---------------- */
 
-  // 设备一多，下拉框的问题就不是样式而是找不到。所以每一处"选设备"都渲染成
-  // 同一组控件：过滤输入 + 状态条件 + 能看见多行的列表框。
+  // 设备一多，"找不到那一台"就成了主要问题；但设备不多的时候，看得见十行的
+  // 列表框又让页面显得乱。所以只有一种区分：这个字段允不允许选多台。
+  //
+  //   单选 → 过滤输入框 + 一个折叠下拉。打几个字就把列表缩到那一两台，
+  //          页面占的高度回到一行。状态不用单独一个下拉：每台设备的选项文本里
+  //          就带着「在线 / 失联 / 未上线」，打进过滤框即按状态过滤。
+  //   多选 → 过滤输入框 + 状态下拉 + 多行列表框（按住 Ctrl/⌘）。必须看得见
+  //          多行才知道选了几台、选了谁，折叠下拉在这里是帮倒忙。
   //
   // 列表框还是原生 <select>，选中值仍然从 el.value / selectedOptions 读，所以
   // 挂在各 id 上的既有处理函数不用改名；换掉的只是渲染和事件绑定。
@@ -3340,7 +3302,16 @@
 
   function dpCountText(id) {
     var d = DP[id];
-    return "共 " + d.items.length + " 台 · 符合 " + d.hit + " 台" + (d.multi ? " · 按住 Ctrl/⌘ 多选" : "");
+    if (d.multi) {
+      return "共 " + d.items.length + " 台 · 符合 " + d.hit + " 台 · 按住 Ctrl/⌘ 多选";
+    }
+    return "符合 " + d.hit + " / " + d.items.length + " 台";
+  }
+
+  // 单选那一行平时就是「共 128 台」这种没人要的字数，所以只在真的过滤了、或者
+  // 本来就是多选列表时才显示。
+  function dpCountShown(d) {
+    return d.multi || !!(d.q || "").trim() || !!d.st;
   }
 
   // dpHtml：id 沿用调用方原来的 select id，name 沿用原来的表单字段名
@@ -3349,19 +3320,26 @@
   function dpHtml(id, name, items, sel, o) {
     o = o || {};
     var d = dpState(id, items, o);
-    return '<div class="devpick">' +
-      '<div class="dp-tools">' +
+    var attrs = o.attrs ? " " + o.attrs : "";
+    var tools = '<div class="dp-tools">' +
       '<input class="devfilter" id="dpf-' + id + '" data-dp-q="' + id + '" value="' + esc(d.q) +
-        '" placeholder="过滤：名称 / 序列号 / 站点 / 状态" autocomplete="off" aria-label="过滤设备列表">' +
-      '<select id="dps-' + id + '" data-dp-st="' + id + '" aria-label="按状态过滤设备">' +
-      '<option value="">全部状态</option>' +
-      dpStatuses(items).map(function (s) {
-        return '<option value="' + esc(s) + '"' + (d.st === s ? " selected" : "") + ">" + esc(s) + "</option>";
-      }).join("") + "</select></div>" +
-      '<select id="' + esc(id) + '" name="' + esc(name || id) + '" class="devlist" size="' + (o.size || 6) + '"' +
-      (d.multi ? " multiple" : "") + (o.attrs ? " " + o.attrs : "") + ' data-dp-list="' + id + '">' +
-      dpOptions(id, sel) + "</select>" +
-      '<div class="dp-count" data-dp-count="' + id + '">' + dpCountText(id) + "</div></div>";
+      '" placeholder="' + (d.multi ? "过滤：名称 / 序列号 / 站点 / 状态" :
+        "先打几个字：名称 / 序列号 / 站点 / 状态") +
+      '" autocomplete="off" aria-label="过滤设备列表">' +
+      (d.multi ? '<select id="dps-' + id + '" data-dp-st="' + id + '" aria-label="按状态过滤设备">' +
+        '<option value="">全部状态</option>' +
+        dpStatuses(items).map(function (s) {
+          return '<option value="' + esc(s) + '"' + (d.st === s ? " selected" : "") + ">" + esc(s) + "</option>";
+        }).join("") + "</select>" : "") +
+      "</div>";
+    var list = d.multi
+      ? '<select id="' + esc(id) + '" name="' + esc(name || id) + '" class="devlist" size="' +
+        (o.size || 8) + '" multiple' + attrs + ' data-dp-list="' + id + '">' + dpOptions(id, sel) + "</select>"
+      : '<select id="' + esc(id) + '" name="' + esc(name || id) + '" class="devpick-one"' + attrs +
+        ' data-dp-list="' + id + '">' + dpOptions(id, sel) + "</select>";
+    return '<div class="devpick">' + tools + list +
+      '<div class="dp-count" data-dp-count="' + id + '"' + (dpCountShown(d) ? "" : " hidden") + ">" +
+      dpCountText(id) + "</div></div>";
   }
 
   // 过滤时只换列表框里的 option，不重建整页：一边打字一边全页重建会把光标
@@ -3375,7 +3353,7 @@
       : list.value;
     list.innerHTML = dpOptions(id, sel);
     var c = document.querySelector('#content [data-dp-count="' + id + '"]');
-    if (c) c.textContent = dpCountText(id);
+    if (c) { c.textContent = dpCountText(id); c.hidden = !dpCountShown(d); }
   }
 
   function undNodeOf(doc, id) {
@@ -3593,13 +3571,13 @@
       '<span class="muted" style="font-size:12.5px">一台对一台；端口与 overlay /32 由分配器给</span></header>' +
       '<form id="und-tun-form"><div class="fields">' +
       '<div class="field"><label for="und-tun-a">本端设备</label>' +
-      dpHtml("und-tun-a", "a", dpNodeItems(doc.nodes), a, { size: 5, attrs: 'data-und-dev="a"' }) + "</div>" +
+      dpHtml("und-tun-a", "a", dpNodeItems(doc.nodes), a, { attrs: 'data-und-dev="a"' }) + "</div>" +
       '<div class="field"><label for="und-tun-a-iface">本端物理端口</label>' +
       '<select id="und-tun-a-iface" name="a_iface">' + undIfaceOptions(undNodeOf(doc, a), "") + "</select></div>" +
       '<div class="field"><label for="und-tun-a-addr">本端外层地址（留空用观测）</label>' +
       '<input id="und-tun-a-addr" name="a_addr" placeholder="ip 或 ip:port"></div>' +
       '<div class="field"><label for="und-tun-b">对端设备</label>' +
-      dpHtml("und-tun-b", "b", dpNodeItems(doc.nodes), b, { size: 5, attrs: 'data-und-dev="b"' }) + "</div>" +
+      dpHtml("und-tun-b", "b", dpNodeItems(doc.nodes), b, { attrs: 'data-und-dev="b"' }) + "</div>" +
       '<div class="field"><label for="und-tun-b-iface">对端物理端口</label>' +
       '<select id="und-tun-b-iface" name="b_iface">' + undIfaceOptions(undNodeOf(doc, b), "") + "</select></div>" +
       '<div class="field"><label for="und-tun-b-addr">对端外层地址（留空用观测）</label>' +
@@ -3712,7 +3690,7 @@
     if (mode === "inline") {
       h += '<div class="field"><label for="und-edit-relay">中转设备</label>' +
         dpHtml("und-edit-relay", "relay", dpNodeItems(doc.nodes), relay,
-          { size: 5, empty: "选择中转设备…" }) + "</div>" +
+          { empty: "选择中转设备…" }) + "</div>" +
         '<div class="field"><label for="und-edit-relay-addr">中转地址（可选）</label>' +
         '<input id="und-edit-relay-addr" name="relay_addr" value="' +
         esc(t.path && !t.path.template_id ? t.path.addr : "") + '" placeholder="ip 或 ip:port"></div>';
@@ -3821,7 +3799,7 @@
       '<input id="und-path-name" name="name" placeholder="如 经上海中转" maxlength="60"></div>' +
       '<div class="field"><label for="und-path-node">中转设备</label>' +
       dpHtml("und-path-node", "node", dpNodeItems(doc.nodes), 0,
-        { size: 4, empty: "选择中转设备…" }) + "</div>" +
+        { empty: "选择中转设备…" }) + "</div>" +
       '<div class="field"><label for="und-path-addr">中转地址（可选）</label>' +
       '<input id="und-path-addr" name="addr" placeholder="ip 或 ip:port"></div>' +
       '<button class="small" type="submit">新建模板</button></form>';
@@ -3838,7 +3816,7 @@
       '<div class="field"><label for="und-path-edit-name">名称</label>' +
       '<input id="und-path-edit-name" name="name" value="' + esc(p.name) + '" maxlength="60"></div>' +
       '<div class="field"><label for="und-path-edit-node">中转设备</label>' +
-      dpHtml("und-path-edit-node", "node", dpNodeItems(doc.nodes), p.node_id, { size: 5 }) + "</div>" +
+      dpHtml("und-path-edit-node", "node", dpNodeItems(doc.nodes), p.node_id) + "</div>" +
       '<div class="field"><label for="und-path-edit-addr">中转地址（可选）</label>' +
       '<input id="und-path-edit-addr" name="addr" value="' + esc(p.addr) + '" placeholder="ip 或 ip:port"></div>' +
       "</div>" +
@@ -4924,11 +4902,6 @@
               toast("已重置 " + user + " 的密码");
               load();
             }).catch(function (err) { toast(err.message); });
-        } else if (act === "cfg-layer") {
-          if (!S.cfg) return;
-          S.cfg.layer = el.getAttribute("data-layer");
-          S.cfg.edit = null;
-          render();
         } else if (act === "cfg-save") cfgSave();
         else if (act === "cfg-publish") cfgPublish();
         else if (act === "cfg-reload") {
