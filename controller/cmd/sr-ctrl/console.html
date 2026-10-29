@@ -162,27 +162,30 @@
   .usage{display:flex;flex-wrap:wrap;gap:8px 26px;margin-top:4px;font-size:13px}
   .usage b{font-variant-numeric:tabular-nums}
   .usage .k{color:var(--muted);font-size:12.5px}
-  .topo-wrap{overflow-x:auto;margin-top:10px}
-  svg.topo{display:block;min-width:640px;width:100%;height:auto;border:1px solid var(--line);
-    border-radius:10px;background:#fcfdfe}
-  svg.topo .edge{stroke:#8c959f;stroke-width:2;pointer-events:none}
-  svg.topo .edge.relay{stroke-dasharray:6 5}
-  svg.topo .edge.sel{stroke:var(--accent);stroke-width:3}
-  svg.topo .hit{stroke:transparent;stroke-width:16;cursor:pointer}
-  svg.topo .edge-label{font-size:11px;fill:#57606a;text-anchor:middle;pointer-events:none;
-    paint-order:stroke;stroke:#fcfdfe;stroke-width:4px;stroke-linejoin:round}
-  svg.topo .node{cursor:pointer}
-  svg.topo .node rect{fill:#fff;stroke:#8c959f;stroke-width:1.5;rx:9}
-  svg.topo .node.online rect{stroke:var(--ok)}
-  svg.topo .node.stale rect{stroke:var(--warn)}
-  svg.topo .node.pending rect{stroke:#afb8c1;stroke-dasharray:4 3}
-  svg.topo .node.sel rect{stroke:var(--accent);stroke-width:2.5}
-  svg.topo .node .dotmark{fill:#8c959f}
-  svg.topo .node.online .dotmark{fill:var(--ok)}
-  svg.topo .node.stale .dotmark{fill:var(--warn)}
-  svg.topo .node.pending .dotmark{fill:#afb8c1}
-  svg.topo .node text{text-anchor:middle;font-size:12px;fill:var(--ink);pointer-events:none}
-  svg.topo .node text.cap{font-size:10.5px;fill:#57606a}
+  .map-area{position:relative;border:1px solid var(--line);border-radius:10px;overflow:hidden;
+    background:#eaeff5;margin-top:10px}
+  svg.topo{display:block;width:100%;height:560px;cursor:grab;touch-action:none}
+  svg.topo.dragging{cursor:grabbing}
+  .map-ctl{position:absolute;right:10px;top:10px;display:flex;flex-direction:column;gap:4px}
+  .map-ctl button{font-size:12px;padding:3px 9px;background:#fff;box-shadow:0 1px 2px rgba(31,35,40,.08)}
+  .map-ctl button.zm{width:32px;font-size:14px;padding:2px 0}
+  .map-legend{position:absolute;left:10px;bottom:10px;background:rgba(255,255,255,.92);
+    border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11.5px;color:var(--muted)}
+  .map-legend .lg+.lg{margin-top:4px}
+  .map-legend b{color:var(--ink);margin-right:6px;font-weight:400}
+  .map-legend i.w{display:inline-block;width:22px;height:0;border-top:2px solid #8c959f;
+    vertical-align:middle;margin:0 4px 0 8px}
+  .map-legend i.w.relay{border-top-style:dashed}
+  .map-legend i.d{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);
+    vertical-align:middle;margin:0 4px 0 8px}
+  .map-legend i.d.warn{background:var(--warn)}
+  .map-legend i.d.pend{background:#afb8c1}
+  .zoomhint{color:var(--muted);font-size:12px;margin-top:8px;min-height:18px}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}
+  .seg button{border:0;border-radius:0;background:none;color:var(--muted);padding:4px 12px;font-size:12.5px}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button.on{background:#ddf4ff;color:var(--accent);font-weight:600}
+  .seg button:hover{background:none;color:var(--ink)}
   .kv{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:5px 16px;
     font-size:13px;margin:10px 0 0}
   .kv dt{color:var(--muted)}
@@ -317,7 +320,7 @@
   var S = { state: null, me: null, accounts: null, loginTab: "account",
     view: "overview", lastResult: null, lastSecret: null, codeReveal: null,
     html: "", timer: null, ago: null, es: null,
-    metrics: null, fast: null, cfg: null, und: null, topo: null };
+    metrics: null, fast: null, cfg: null, und: null, topo: null, sites: null };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -400,6 +403,7 @@
     S.cfg = null;
     S.und = null;
     S.topo = null;
+    S.sites = null;
     S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
     clearInterval(S.timer);
@@ -668,6 +672,9 @@
     // 更新是可以接受的，输入被清空不是。
     var a = document.activeElement;
     if (a && a.closest && a.closest("#content") && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)) return;
+    // 同一理由的地图版：正在拖动画布时重建 #content 会把 <svg> 换掉，指针捕获
+    // 随之丢失，拖动变成跳跃。
+    if (undMapDragging()) return;
 
     var c = "";
     if (S.view === "overview") c = viewOverview(st, online, isOp);
@@ -692,8 +699,11 @@
     }
 
     // 结构要重建时，先把已填的值记下来（例如点了页面空白处）。
+    // data-keep 是控件自己声明的例外：它的值是服务端状态算出来的（下拉框当前
+    // 归属），不是用户还没提交的手艺。留着会把「清掉位置」重新填回旧站点，
+    // 而且没有 name/id 的控件全部共用一个键，一行改的选项会串到别的行。
     var keep = {};
-    document.querySelectorAll("#content input, #content select").forEach(function (el) {
+    document.querySelectorAll("#content input:not([data-keep]), #content select:not([data-keep])").forEach(function (el) {
       var k = el.tagName + ":" + (el.name || el.id || "");
       if (k !== "INPUT:" && el.value) keep[k] = el.value;
     });
@@ -701,7 +711,7 @@
     S.html = c;
     $("content").innerHTML = c;
 
-    document.querySelectorAll("#content input, #content select").forEach(function (el) {
+    document.querySelectorAll("#content input:not([data-keep]), #content select:not([data-keep])").forEach(function (el) {
       var k = el.tagName + ":" + (el.name || el.id || "");
       if (!el.value && keep[k]) el.value = keep[k];
     });
@@ -759,11 +769,12 @@
       ' <small>' + esc(u) + "</small></div></div>";
   }
 
-  function deviceTable(nodes, emptyMsg, isOp) {
+  function deviceTable(nodes, emptyMsg, isOp, withSite) {
     if (!nodes.length) return '<div class="empty">' + esc(emptyMsg) + "</div>";
     var cols = isOp
       ? ["设备", "租户", "序列号", "状态", "入网时间"]
       : ["设备", "序列号", "状态", "最后心跳", "入网时间", "配置"];
+    if (withSite) cols.splice(3, 0, "站点");
     var h = "<table><thead><tr>" + cols.map(function (c) {
       return "<th>" + esc(c) + "</th>";
     }).join("") + "</tr></thead><tbody>";
@@ -772,8 +783,9 @@
       h += "<tr>" +
         '<td><span class="mono">node-' + esc(n.node_id) + "</span></td>";
       if (isOp) h += "<td>" + esc(tenantName(n.tenant_id)) + "</td>";
-      h += '<td class="mono">' + esc(n.serial) + "</td>" +
-        "<td>" + statusTag(n.status) + "</td>";
+      h += '<td class="mono">' + esc(n.serial) + "</td>";
+      if (withSite) h += "<td>" + undSiteCell(n) + "</td>";
+      h += "<td>" + statusTag(n.status) + "</td>";
       if (!isOp) h += '<td class="muted"><span data-ago="' + esc(n.last_seen_unix) + '"></span></td>';
       h += '<td class="muted">' + esc(clock(n.enrolled_at_unix)) + "</td>";
       if (!isOp) {
@@ -1014,13 +1026,20 @@
   }
 
   function viewNodes(st, isOp) {
-    return '<section class="panel"><header><h2>' + (isOp ? "已入网设备（库存）" : "已入网设备") + "</h2>" +
+    var t = isOp ? null : ensureSites();
+    var h = '<section class="panel"><header><h2>' + (isOp ? "已入网设备（库存）" : "已入网设备") + "</h2>" +
       '<button class="small" data-act="refresh">刷新</button></header>' +
-      deviceTable(st.nodes, isOp ? "还没有设备入网。" : "还没有设备入网，先在「入网授权」页生成一次性码接入一台。", isOp) +
+      deviceTable(st.nodes, isOp ? "还没有设备入网。" : "还没有设备入网，先在「入网授权」页生成一次性码接入一台。", isOp, !isOp) +
       '<div class="hint" style="margin-top:12px">' + (isOp
         ? "运营方只保留归属信息（租户、序列号、入网时间、在线状态）。心跳明细与设备配置属于租户，接口对运营方不下发这些字段。"
         : "「未配置」是真实状态：enroll 不推任何参数，节点计划（每个隧道的端口、overlay /32、密钥环、RR 列表）还没有实现。心跳年龄、在线时长与隧道内遥测在「监控」页。") +
       "</div></section>";
+    if (t) {
+      h += undNote(t.note);
+      h += undSiteFormPanel(t);
+      h += undSiteListPanel(t);
+    }
+    return h;
   }
 
   function dur(sec) {
@@ -2148,8 +2167,13 @@
     if (!ids[u.mB]) u.mB = 0;
   }
 
+  // The map's viewport lives here too. The page is rebuilt from a string on
+  // every data change, and a rebuilt <svg> starts at 1x centred on the world --
+  // so zoom and pan have to be state, not DOM, or the operator gets snapped back
+  // to the whole planet by a heartbeat landing while they were looking at 深圳湾.
   function undTopoStore() {
-    if (!S.topo) S.topo = { doc: null, loading: false, at: 0, sel: null, err: null };
+    if (!S.topo) S.topo = { doc: null, loading: false, at: 0, sel: null, err: null,
+      view: "geo", k: 1, x: 0, y: 0 };
     return S.topo;
   }
 
@@ -2180,6 +2204,270 @@
 
   function undInvalidateTopo() {
     if (S.topo) { S.topo.doc = null; S.topo.at = 0; }
+  }
+
+  /* ---------------- 站点：设备的物理位置（只用来画拓扑） ---------------- */
+
+  // The device page needs the tenant's site list for its dropdown. It is a
+  // separate, tiny read rather than another field on /api/state: a location is
+  // underlay data, and the operator's pages should not grow a dependency on it
+  // just because one tenant column wants it.
+  function undSitesStore() {
+    if (!S.sites) {
+      S.sites = { list: null, unplaced: 0, loading: false, at: 0, note: null,
+        form: null, edit: null };
+    }
+    return S.sites;
+  }
+
+  function ensureSites() {
+    var t = undSitesStore();
+    if (!undRole()) return t;
+    if (t.loading) return t;
+    if (!t.list || nowSec() - t.at >= 10) loadSites();
+    return t;
+  }
+
+  function loadSites() {
+    var t = undSitesStore();
+    if (!undRole() || t.loading) return;
+    t.loading = true;
+    api("GET", "/api/underlay/sites").then(function (doc) {
+      t.loading = false;
+      undApplySites(doc, null);
+    }).catch(function (err) {
+      t.loading = false;
+      t.note = undErrNote(err);
+      render();
+    });
+  }
+
+  // Every site write answers with the whole list -- that is exactly what a
+  // placement changes -- so the page takes it and drops the map's cached doc:
+  // a device that just moved must not stay drawn where it was.
+  function undApplySites(doc, msg) {
+    var t = undSitesStore();
+    if (!doc) { render(); return; }
+    t.list = doc.sites || [];
+    t.unplaced = Number(doc.unplaced_nodes) || 0;
+    t.at = nowSec();
+    t.loading = false;
+    if (msg) t.note = { kind: "", text: msg };
+    undPatchNodeSite(t, doc);
+    undInvalidateTopo();
+    render();
+  }
+
+  // /api/state carries the device's site, and it only refreshes on the next
+  // poll. Without this the dropdown would snap back to the old value for up to
+  // ten seconds after a click that clearly worked.
+  function undPatchNodeSite(t, doc) {
+    if (!S.state || doc.node_id == null) return;
+    var name = "";
+    (doc.sites || []).forEach(function (si) {
+      if (si.id === doc.site_id) name = si.name;
+    });
+    S.state.nodes.forEach(function (n) {
+      if (n.node_id === doc.node_id && n.runtime) {
+        n.runtime.site_id = doc.site_id || "";
+        n.runtime.site_name = name;
+      }
+    });
+  }
+
+  function undAssignSite(nodeID, siteID) {
+    var t = undSitesStore();
+    t.form = null;
+    t.loading = true;
+    t.note = null;
+    api("PUT", "/api/underlay/node-site", { node_id: nodeID, site_id: siteID })
+      .then(function (doc) {
+        undApplySites(doc, siteID
+          ? "node-" + nodeID + " 已放到「" + undSiteName(doc, siteID) + "」。"
+          : "node-" + nodeID + " 的位置已清掉，它会回到未定位清单。");
+      })
+      .catch(function (err) { t.loading = false; t.note = undErrNote(err); render(); });
+  }
+
+  function undSiteName(doc, id) {
+    var name = id;
+    ((doc && doc.sites) || []).forEach(function (si) { if (si.id === id) name = si.name; });
+    return name;
+  }
+
+  function undSiteFormBody(form) {
+    var f = new FormData(form);
+    var name = String(f.get("name") || "").trim();
+    var lon = String(f.get("lon") || "").trim();
+    var lat = String(f.get("lat") || "").trim();
+    if (!name) return { err: "站点名不能为空" };
+    // Empty is refused here as well as by the API: "leave it blank and it
+    // defaults to 0" would put the box in the Gulf of Guinea.
+    if (!lon || !lat) return { err: "经度和纬度都要填，留空不会被当成 0" };
+    var a = Number(lon), b = Number(lat);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return { err: "经纬度必须是数字" };
+    return { body: { name: name, lon: a, lat: b } };
+  }
+
+  function undCreateSite(form) {
+    var t = undSitesStore();
+    var r = undSiteFormBody(form);
+    if (r.err) { undSiteErr(t, "und-site-new-err", r.err); return; }
+    var node = t.form ? t.form.node : 0;
+    t.loading = true;
+    t.note = null;
+    api("POST", "/api/underlay/sites", r.body).then(function (doc) {
+      // The write is accepted: the form has done its job, so it closes and gives
+      // up focus. Without the blur the next render() would be skipped as a
+      // "user is still typing" frame and the page would look unchanged.
+      undSiteDone(t);
+      if (!doc || !doc.site) { undApplySites(doc, null); return; }
+      if (!node) {
+        undApplySites(doc, "站点「" + doc.site.name + "」已建好，还没有放到设备上。");
+        return;
+      }
+      // Place it in the same click: a site created from a device row is meant
+      // for that device, and making the user pick again invites a wrong box.
+      t.loading = false;
+      api("PUT", "/api/underlay/node-site", { node_id: node, site_id: doc.site.id })
+        .then(function (d2) {
+          undApplySites(d2, "node-" + node + " 已放到新建的「" + doc.site.name + "」。");
+        })
+        .catch(function (err) {
+          undApplySites(doc, null);
+          t.note = undErrNote(err);
+          render();
+        });
+    }).catch(function (err) { t.loading = false; undSiteErr(t, "und-site-new-err", undErrNote(err).text); });
+  }
+
+  function undUpdateSite(form) {
+    var t = undSitesStore();
+    var r = undSiteFormBody(form);
+    if (r.err) { undSiteErr(t, "und-site-edit-err", r.err); return; }
+    var id = t.edit;
+    r.body.id = id;
+    t.loading = true;
+    t.note = null;
+    api("PUT", "/api/underlay/sites", r.body).then(function (doc) {
+      undSiteDone(t);
+      undApplySites(doc, "站点「" + undSiteName(doc, id) + "」已更新。");
+    }).catch(function (err) { t.loading = false; undSiteErr(t, "und-site-edit-err", undErrNote(err).text); });
+  }
+
+  // A site form's own error slot, not the page banner: render() skips a frame
+  // while focus sits inside #content so it never eats what is being typed, and a
+  // banner written behind that guard only appears after the user clicks away --
+  // which reads as "the button did nothing".
+  function undSiteErr(t, slotId, text) {
+    var el = $(slotId);
+    if (el) {
+      el.textContent = text;
+      return;
+    }
+    t.note = { kind: "bad", text: text };
+    render();
+  }
+
+  function undSiteDone(t) {
+    t.form = null;
+    t.edit = null;
+    blurContent();
+  }
+
+  function undDeleteSite(id, name) {
+    var t = undSitesStore();
+    if (!confirm("删除站点「" + name + "」？只有还没有设备的位置能删掉。")) return;
+    // Same reason as the cancel buttons: this click has to repaint, and a focus
+    // still sitting in an open site form would hold the frame back.
+    blurContent();
+    t.loading = true;
+    t.note = null;
+    api("POST", "/api/underlay/sites/delete", { id: id }).then(function (doc) {
+      undApplySites(doc, "站点「" + name + "」已删除。");
+    }).catch(function (err) { t.loading = false; t.note = undErrNote(err); render(); });
+  }
+
+  // One dropdown per device row. The list is the tenant's own sites; "未定位"
+  // is a real choice, not a placeholder -- clearing it is how a box that moved
+  // out of a rack leaves the map.
+  function undSiteCell(n) {
+    var t = undSitesStore();
+    if (!t.list) return '<span class="muted">正在读取站点…</span>';
+    var cur = (n.runtime && n.runtime.site_id) || "";
+    var h = '<select data-act="node-site" data-node="' + esc(n.node_id) + '" data-keep="no"' +
+      ' aria-label="设备 node-' + esc(n.node_id) + ' 的站点">';
+    h += '<option value=""' + (cur ? "" : " selected") + ">未定位</option>";
+    t.list.forEach(function (si) {
+      h += '<option value="' + esc(si.id) + '"' + (si.id === cur ? " selected" : "") + ">" +
+        esc(si.name) + "</option>";
+    });
+    h += '<option value="__new">＋ 新建站点…</option></select>';
+    return h;
+  }
+
+  function undSiteFields(v) {
+    v = v || { name: "", lon: "", lat: "" };
+    return '<div class="field"><label for="und-site-name">站点名</label>' +
+      '<input id="und-site-name" name="name" value="' + esc(v.name) + '" placeholder="北京 · 国贸" maxlength="80"></div>' +
+      '<div class="field"><label for="und-site-lon">经度（东经为正）</label>' +
+      '<input id="und-site-lon" name="lon" value="' + esc(v.lon) + '" placeholder="116.46" inputmode="decimal"></div>' +
+      '<div class="field"><label for="und-site-lat">纬度（北纬为正）</label>' +
+      '<input id="und-site-lat" name="lat" value="' + esc(v.lat) + '" placeholder="39.91" inputmode="decimal"></div>';
+  }
+
+  var SITE_COORD_HINT = "经纬度是手填的：控制器不测量、也不猜。留空会被拒绝，因为 (0,0) 是几内亚湾的真实坐标，" +
+    "填 0 会被画到那里。位置只用于画拓扑和运维认路，不会进配置包、不会下发给设备。";
+
+  function undSiteFormPanel(t) {
+    if (!t.form) return "";
+    var n = null;
+    (S.state ? S.state.nodes : []).forEach(function (x) { if (x.node_id === t.form.node) n = x; });
+    var who = n ? "node-" + n.node_id + "（" + (n.serial || "未上报序列号") + "）" : "这台设备";
+    return '<section class="panel"><header><h2>新建站点</h2>' +
+      '<span class="muted" style="font-size:12.5px">建好后直接放到 ' + esc(who) + "</span></header>" +
+      '<form id="und-site-new-form"><div class="fields">' + undSiteFields(null) + "</div>" +
+      '<div class="hint" style="margin:10px 0 0">' + SITE_COORD_HINT + "</div>" +
+      '<div class="err" id="und-site-new-err" role="alert"></div>' +
+      '<div style="margin-top:10px"><button class="primary" type="submit">保存并放到 ' + esc(who) + "</button> " +
+      '<button class="small" type="button" data-act="site-form-x">取消</button></div></form></section>';
+  }
+
+  function undSiteListPanel(t) {
+    if (!t.list) return "";
+    var h = '<section class="panel"><header><h2>站点</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + t.list.length + " 个 · 未定位 " +
+      esc(t.unplaced) + " 台</span></header>";
+    if (!t.list.length) {
+      return h + '<div class="empty">还没有站点。在上面的设备行里把「站点」选成「＋ 新建站点…」建第一个。</div></section>';
+    }
+    h += '<table><thead><tr><th>站点</th><th>经纬度</th><th>设备</th><th>操作</th></tr></thead><tbody>';
+    t.list.forEach(function (si) {
+      h += "<tr>" +
+        "<td><b>" + esc(si.name) + '</b> <span class="muted mono">' + esc(si.id) + "</span></td>" +
+        '<td class="mono">' + esc(si.lon.toFixed(2)) + ", " + esc(si.lat.toFixed(2)) + "</td>" +
+        "<td>" + esc(si.devices) + "</td>" +
+        "<td>";
+      if (t.edit === si.id) {
+        h += '<span class="muted">正在编辑…</span>';
+      } else {
+        h += '<button class="small" data-act="site-edit" data-id="' + esc(si.id) + '">编辑</button> ' +
+          '<button class="small danger" data-act="site-del" data-id="' + esc(si.id) +
+          '" data-name="' + esc(si.name) + '">删除</button>';
+      }
+      h += "</td></tr>";
+      if (t.edit === si.id) {
+        h += '<tr><td colspan="4"><form id="und-site-edit-form"><div class="fields">' +
+          undSiteFields(si) + "</div>" +
+          '<div class="hint" style="margin:10px 0 0">' + SITE_COORD_HINT + "</div>" +
+          '<div class="err" id="und-site-edit-err" role="alert"></div>' +
+          '<div style="margin-top:10px"><button class="primary" type="submit">保存</button> ' +
+          '<button class="small" type="button" data-act="site-edit-x">取消</button></div></form></td></tr>';
+      }
+    });
+    return h + "</tbody></table>" +
+      '<div class="hint" style="margin-top:8px">改经纬度只影响地图上的位置，不动设备本身；' +
+      "删除只对 0 台设备的站点开放，还有设备在里面的会拒绝并告诉你原因。</div></section>";
   }
 
   function undSetDoc(doc) {
@@ -3089,66 +3377,491 @@
     return { online: "在线", stale: "失联", pending: "已入网 · 未上线" }[s] || s;
   }
 
-  function undTopoSVG(doc) {
-    var W = 760, H = 420;
-    var n = doc.nodes.length;
-    var pos = {};
-    if (n === 1) {
-      pos[doc.nodes[0].node_id] = { x: W / 2, y: H / 2 };
-    } else {
-      doc.nodes.forEach(function (nd, i) {
-        var ang = -Math.PI / 2 + (2 * Math.PI * i) / n;
-        pos[nd.node_id] = { x: W / 2 + Math.cos(ang) * 290, y: H / 2 + Math.sin(ang) * 150 };
+  /* ---------------- 拓扑图：世界底图上的设备与隧道 ---------------- */
+
+  // The basemap is a compiled-in asset (cmd/sr-ctrl/assets, generated by
+  // controller/tools/world-basemap/gen.mjs) and it carries the projection
+  // parameters, so without it the geographic view has no frame to put devices
+  // in. That is a load failure, not an empty map: the page says so and falls
+  // back to the logical layout instead of drawing a blank planet with dots.
+  var MAP = { world: null, world50: null, loading: null, err: null,
+    g50: null, err50: null };
+
+  var MAP_K_MIN = 1, MAP_K_MAX = 14;
+  var MAP_L1 = 1.8, MAP_L2 = 4.5;
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var el = document.createElement("script");
+      el.src = src;
+      el.onload = function () { resolve(); };
+      el.onerror = function () { reject(new Error(src)); };
+      document.head.appendChild(el);
+    });
+  }
+
+  function ensureWorld() {
+    if (MAP.world) return Promise.resolve(MAP.world);
+    if (MAP.loading) return MAP.loading;
+    MAP.err = null;
+    MAP.loading = loadScript("/assets/world-110m.js").then(function () {
+      var wd = window.SR_WORLD;
+      if (!wd || typeof wd.scale !== "number" || typeof wd.land !== "string") {
+        MAP.err = "底图内容不完整（读不到 scale 或 land）";
+        return null;
+      }
+      MAP.world = wd;
+      return wd;
+    }).catch(function () {
+      MAP.err = "底图脚本没能加载：/assets/world-110m.js";
+      return null;
+    }).then(function (wd) {
+      MAP.loading = null;
+      // The whole panel depends on whether the frame exists now, so it is a
+      // structure change, not a redraw.
+      if (S.view === "underlay-topology") render();
+      return wd;
+    });
+    return MAP.loading;
+  }
+
+  // The detail tier is only worth 680 KB (214 KB gzipped) once the operator has
+  // zoomed past the point where a 110m coastline reads as a polygon; fetching it
+  // any earlier would stall the first paint of the page for nothing.
+  function ensureWorld50() {
+    if (MAP.world50 || MAP.g50 || MAP.err50) return;
+    MAP.g50 = loadScript("/assets/world-50m.js").then(function () {
+      MAP.world50 = window.SR_WORLD_50M || null;
+      if (!MAP.world50) MAP.err50 = "明细底图内容不完整";
+    }).catch(function () {
+      MAP.err50 = "明细底图没能加载：/assets/world-50m.js";
+    }).then(function () {
+      MAP.g50 = null;
+      undMapDraw();
+    });
+  }
+
+  // Natural Earth I, forward form. gen.mjs proves this against d3 to under
+  // 0.01 px when it generates the two layers, which is what lets the coastlines
+  // and the device points share one frame.
+  function mapProject(wd, lon, lat) {
+    var phi = lat * Math.PI / 180, lam = lon * Math.PI / 180;
+    var q = phi * phi, f4 = q * q;
+    return [wd.tx + wd.scale * (lam * (0.8707 - 0.131979 * q +
+      f4 * (-0.013791 + f4 * (0.003971 * q - 0.001529 * f4)))),
+    wd.ty - wd.scale * (phi * (1.007226 +
+      q * (0.015085 + f4 * (-0.044475 + 0.028874 * q - 0.005916 * f4))))];
+  }
+
+  function mapFrame() {
+    return { w: MAP.world ? MAP.world.w : 2000, h: MAP.world ? MAP.world.h : 1040 };
+  }
+
+  // viewBox units per CSS px. getScreenCTM is the svg root's own matrix, so it
+  // already includes the letterboxing that preserveAspectRatio does and does not
+  // include the pan/zoom we put on the inner <g>.
+  function undMapUnit() {
+    var svg = $("tp-svg");
+    if (!svg) return 1;
+    var m = svg.getScreenCTM ? svg.getScreenCTM() : null;
+    if (m && m.a) return 1 / m.a;
+    return mapFrame().w / (svg.clientWidth || 900);
+  }
+
+  function undMapLevel(geo) {
+    var t = S.topo;
+    var lv = t.k < MAP_L1 ? 0 : (t.k < MAP_L2 ? 1 : 2);
+    // 逻辑视图没有地图可看，第一档就没有存在的理由：它本来是为了在 lab 里
+    // 把同城设备摊开，一上来该看到站名。
+    if (!geo && lv === 0) lv = 1;
+    return lv;
+  }
+
+  function undMapClamp() {
+    var t = S.topo, f = mapFrame();
+    if (t.k < MAP_K_MIN) t.k = MAP_K_MIN;
+    if (t.k > MAP_K_MAX) t.k = MAP_K_MAX;
+    var pad = 200;
+    t.x = Math.min(pad, Math.max(f.w - pad - f.w * t.k, t.x));
+    t.y = Math.min(pad, Math.max(f.h - pad - f.h * t.k, t.y));
+  }
+
+  // Where each device goes in the current view. The geographic view is the
+  // server's has_location flag, not a guess: an unplaced device has no point and
+  // appears in the 未定位 list. The logical view is the other half of the same
+  // honesty -- it can put every device somewhere, so it does.
+  function undMapPos(doc, geo) {
+    var out = {}, unplaced = [];
+    if (geo) {
+      doc.nodes.forEach(function (nd) {
+        if (nd.has_location) out[nd.node_id] = mapProject(MAP.world, nd.lon, nd.lat);
+        else unplaced.push(nd);
       });
+      return { pos: out, unplaced: unplaced };
     }
-    var sel = S.topo && S.topo.sel;
-    var edges = "";
+    var order = doc.nodes.slice().sort(function (a, b) {
+      return (b.tunnel_count || 0) - (a.tunnel_count || 0);
+    });
+    var f = mapFrame(), cx = f.w / 2, cy = f.h / 2;
+    var rx = f.w * 0.37, ry = f.h * 0.35;
+    order.forEach(function (nd, i) {
+      var ang = (i / order.length) * Math.PI * 2 - Math.PI / 2;
+      out[nd.node_id] = order.length === 1 ? [cx, cy] : [cx + Math.cos(ang) * rx, cy + Math.sin(ang) * ry];
+    });
+    return { pos: out, unplaced: [] };
+  }
+
+  function r1(v) { return Math.round(v * 10) / 10; }
+
+  function undMapNodeName(nd) { return nd.serial || ("node-" + nd.node_id); }
+
+  // One edge per device pair. Several VPNs between the same two boxes are one
+  // line until the operator is deep enough into the zoom that the pair is more
+  // than 100 CSS px across, and only then does it split into one line per tunnel.
+  function undMapEdges(doc, pos, lv, inv, sel) {
+    var out = [];
     doc.bundles.forEach(function (b) {
       var pa = pos[b.a], pb = pos[b.b];
       if (!pa || !pb) return;
-      var relay = false, names = {};
-      b.tunnels.forEach(function (t) {
-        if (t.path) {
-          relay = true;
-          names[t.path.serial || ("node-" + t.path.node_id)] = true;
-        }
-        if (t.path_error) relay = true;
-      });
-      var relayNames = Object.keys(names);
-      var label = b.count > 1 ? b.count + " 条" : "";
-      if (relayNames.length) label += (label ? " · " : "") + "经 " + relayNames.join("、");
       var isSel = sel && sel.kind === "bundle" && sel.a === b.a && sel.b === b.b;
-      var x1 = Math.round(pa.x), y1 = Math.round(pa.y), x2 = Math.round(pb.x), y2 = Math.round(pb.y);
-      edges += '<line class="edge' + (relay ? " relay" : "") + (isSel ? " sel" : "") +
-        '" x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '"/>';
-      edges += '<line class="hit" data-act="topo-bundle" data-a="' + b.a + '" data-b="' + b.b +
-        '" x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '"><title>' +
-        esc((b.serial_a || ("node-" + b.a)) + " 与 " + (b.serial_b || ("node-" + b.b)) + "：" +
-          (label || "1 条直连隧道") + " · 状态未知") + "</title></line>";
-      if (label) {
-        edges += '<text class="edge-label" x="' + Math.round((pa.x + pb.x) / 2) + '" y="' +
-          Math.round((pa.y + pb.y) / 2 - 8) + '">' + esc(label) + "</text>";
+      var items = [];
+      if (lv >= 2) {
+        b.tunnels.forEach(function (t, i) {
+          items.push({ t: t, key: i, label: t.id + " · " + (t.a.port || "—") + "→" + (t.b.port || "—") });
+        });
+      } else {
+        var relayNames = {}, anyRelay = false;
+        b.tunnels.forEach(function (t) {
+          if (t.path) { anyRelay = true; relayNames[t.path.serial || ("node-" + t.path.node_id)] = true; }
+          if (t.path_error) anyRelay = true;
+        });
+        var lb = b.count + " 条";
+        var ks = Object.keys(relayNames);
+        if (ks.length) lb += (lb ? " · " : "") + "经 " + ks.join("、");
+        items.push({ t: b.tunnels[0], key: 0, relay: anyRelay, label: lv >= 1 ? lb : "" });
       }
+      var m = items.length, span = 11 * inv;
+      items.forEach(function (it, idx) {
+        var off = (it.key - (m - 1) / 2) * span;
+        var geo = undMapPath(it.t, pos, pa, pb, off, inv);
+        if (!geo) return;
+        var dash = (it.relay || (it.t && (it.t.path || it.t.path_error))) ?
+          ' stroke-dasharray="' + r1(8 * inv) + " " + r1(6 * inv) + '"' : "";
+        var col = isSel ? "#0969da" : (it.t && it.t.path_error ? "#cf222e" : "#8c959f");
+        var wdt = r1((isSel ? 3 : (lv === 0 ? 1.4 : 2)) * inv);
+        out.push('<path d="' + geo.d + '" fill="none" stroke="' + col + '" stroke-width="' + wdt +
+          '" stroke-linecap="round" stroke-opacity="' + (lv === 0 ? "0.6" : "0.95") + '"' + dash + "/>");
+        out.push('<path data-pick="bundle" data-a="' + b.a + '" data-b="' + b.b + '" d="' + geo.d +
+          '" fill="none" stroke="transparent" stroke-width="' + r1(16 * inv) + '"><title>' +
+          esc((b.serial_a || ("node-" + b.a)) + " 与 " + (b.serial_b || ("node-" + b.b)) + "：" +
+            (it.label || "1 条隧道") + " · 状态未知") + "</title></path>");
+        if (it.label) {
+          out.push('<text x="' + r1(geo.mx) + '" y="' + r1(geo.my - 5 * inv) + '" font-size="' +
+            r1(11 * inv) + '" fill="#57606a" stroke="#eef4f9" text-anchor="middle" paint-order="stroke" ' +
+            'stroke-width="' + r1(4 * inv) + '" stroke-linejoin="round">' + esc(it.label) + "</text>");
+        }
+      });
     });
-    var nodes = "";
-    doc.nodes.forEach(function (nd) {
-      var p = pos[nd.node_id];
-      var isSel = sel && sel.kind === "node" && sel.id === nd.node_id;
-      var name = nd.serial || ("node-" + nd.node_id);
-      nodes += '<g class="node ' + esc(nd.status) + (isSel ? " sel" : "") +
-        '" data-act="topo-node" data-id="' + nd.node_id + '" transform="translate(' +
-        Math.round(p.x) + "," + Math.round(p.y) + ')">' +
-        "<title>" + esc(name + " · node-" + nd.node_id + " · " + undStatusText(nd.status)) + "</title>" +
-        '<rect x="-52" y="-17" width="104" height="34" rx="9"/>' +
-        '<circle class="dotmark" cx="-38" cy="0" r="4"/>' +
-        '<text x="6" y="4">' + esc(undTrunc(name, 14)) + "</text>" +
-        '<text class="cap" x="6" y="18">node-' + nd.node_id + "</text>" +
-        "</g>";
-    });
-    return '<div class="topo-wrap"><svg class="topo" viewBox="0 0 ' + W + " " + H +
-      '" role="img" aria-label="' + esc("设备拓扑：" + doc.nodes.length + " 台设备、" + doc.bundles.length + " 条连接") + '">' +
-      edges + nodes + "</svg></div>";
+    return out.join("");
   }
+
+  // The line for one tunnel, offset sideways by idx*span so a split bundle reads
+  // as parallel wires rather than one thick stroke, and bowed through the relay
+  // box when the tunnel is source-routed.
+  function undMapPath(t, pos, pa, pb, off, inv) {
+    var dx = pb[0] - pa[0], dy = pb[1] - pa[1];
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (!len) return null;
+    var nx = -dy / len, ny = dx / len;
+    var a = [pa[0] + nx * off, pa[1] + ny * off], b = [pb[0] + nx * off, pb[1] + ny * off];
+    var hop = t && t.path ? pos[t.path.node_id] : null;
+    if (hop) {
+      return { d: "M" + r1(a[0]) + "," + r1(a[1]) + "Q" + r1(hop[0]) + "," + r1(hop[1]) + " " + r1(b[0]) + "," + r1(b[1]),
+        mx: (a[0] + 2 * hop[0] + b[0]) / 4, my: (a[1] + 2 * hop[1] + b[1]) / 4 };
+    }
+    return { d: "M" + r1(a[0]) + "," + r1(a[1]) + "L" + r1(b[0]) + "," + r1(b[1]),
+      mx: (a[0] + b[0]) / 2, my: (a[1] + b[1]) / 2 };
+  }
+
+  function undMapNodes(doc, pos, lv, inv, sel) {
+    var out = [], labels = [];
+    // 隧道多的设备最后画：它们的标签最该占住位置，也最容易被邻居挡住。
+    var order = doc.nodes.slice().sort(function (a, b) {
+      return (a.tunnel_count || 0) - (b.tunnel_count || 0);
+    });
+    order.forEach(function (nd) {
+      var p = pos[nd.node_id];
+      if (!p) return;
+      var isSel = sel && sel.kind === "node" && sel.id === nd.node_id;
+      var r = (lv === 0 ? 4.5 : (lv === 1 ? 6 : 7.5)) * inv;
+      var fill = nd.status === "online" ? "#1a7f37" : (nd.status === "stale" ? "#9a6700" : "#afb8c1");
+      var g = ['<g data-pick="node" data-id="' + nd.node_id + '">'];
+      g.push('<circle cx="' + r1(p[0]) + '" cy="' + r1(p[1]) + '" r="' + r1(r * 3.2) + '" fill="transparent"/>');
+      if (nd.relay_for) {
+        g.push('<circle cx="' + r1(p[0]) + '" cy="' + r1(p[1]) + '" r="' + r1(r + 3.5 * inv) +
+          '" fill="none" stroke="#0969da" stroke-width="' + r1(1.3 * inv) + '" stroke-dasharray="' +
+          r1(3 * inv) + " " + r1(3 * inv) + '"><title>' + esc("为 " + nd.relay_for + " 条隧道中转") + "</title></circle>");
+      }
+      g.push('<circle cx="' + r1(p[0]) + '" cy="' + r1(p[1]) + '" r="' + r1(r) + '" fill="' + fill +
+        '" stroke="#ffffff" stroke-width="' + r1(1.6 * inv) + '"' +
+        (nd.status === "pending" ? ' stroke-dasharray="' + r1(3 * inv) + " " + r1(2.4 * inv) + '"' : "") + "/>");
+      if (isSel) {
+        g.push('<circle cx="' + r1(p[0]) + '" cy="' + r1(p[1]) + '" r="' + r1(r + 5 * inv) +
+          '" fill="none" stroke="#0969da" stroke-width="' + r1(2 * inv) + '"/>');
+      }
+      g.push('<title>' + esc(undMapNodeName(nd) + " · node-" + nd.node_id + " · " + undStatusText(nd.status)) + "</title>");
+      var name = undMapNodeName(nd);
+      var lx = p[0], ly = p[1] - r - 7 * inv, clash = false;
+      for (var i = 0; i < labels.length; i++) {
+        if (Math.abs(labels[i][0] - lx) < 58 * inv && Math.abs(labels[i][1] - ly) < 16 * inv) { clash = true; break; }
+      }
+      if (!clash) {
+        labels.push([lx, ly]);
+        g.push('<text x="' + r1(lx) + '" y="' + r1(ly) + '" font-size="' + r1((lv === 0 ? 11 : 12) * inv) +
+          '" font-weight="500" fill="#1f2328" text-anchor="middle" stroke="#eef4f9" paint-order="stroke" ' +
+          'stroke-width="' + r1(4.5 * inv) + '" stroke-linejoin="round">' + esc(undTrunc(name, 22)) + "</text>");
+      } else if (lv >= 2) {
+        // 挤不下的名字往下挪一行而不是删掉：一个点没有标签，运维只会以为那台设备
+        // 不在图上；标签压在海岸线上至少还是个可见的取舍。
+        g.push('<text x="' + r1(lx) + '" y="' + r1(ly + 14 * inv) + '" font-size="' + r1(10.5 * inv) +
+          '" fill="#57606a" text-anchor="middle" stroke="#eef4f9" paint-order="stroke" stroke-width="' +
+          r1(4 * inv) + '">' + esc(undTrunc(name, 22)) + "</text>");
+      }
+      if (lv >= 2) {
+        g.push('<text x="' + r1(p[0]) + '" y="' + r1(p[1] + r + 13 * inv) + '" font-size="' + r1(10.5 * inv) +
+          '" fill="#57606a" text-anchor="middle" stroke="#eef4f9" paint-order="stroke" stroke-width="' +
+          r1(4 * inv) + '">' + esc("node-" + nd.node_id + " · " + (nd.transit_port ? "中转 " + nd.transit_port : "中转未分配")) +
+          (nd.site_name ? " · " + esc(nd.site_name) : "") + "</text>");
+      }
+      g.push("</g>");
+      out.push(g.join(""));
+    });
+    return out.join("");
+  }
+
+  function undMapDraw() {
+    var svg = $("tp-svg");
+    var t = S.topo;
+    if (!svg || !t || !t.doc) return;
+    var doc = t.doc;
+    var wd = MAP.world;
+    var f = mapFrame();
+    var geo = t.view === "geo" && !!wd;   // 底图没到位就退回逻辑摆放，横幅已写明原因
+    var lv = undMapLevel(geo);
+    var inv = undMapUnit() / t.k;
+    var spot = undMapPos(doc, geo);
+    var parts = [];
+    parts.push('<rect x="-6000" y="-6000" width="14000" height="13000" fill="#eaeff5"/>');
+    if (geo) {
+      parts.push('<path d="' + wd.graticule + '" fill="none" stroke="#d8e2ea" stroke-opacity="' +
+        (lv === 0 ? "0.9" : "0.6") + '"/>');
+      // 50m 海岸线只在放大到看得出差别的那一档才叠上去，画在 110m 同一坐标系里。
+      if (lv >= 2 && MAP.world50) {
+        parts.push('<path d="' + MAP.world50.land + '" fill="#fbfcfd" stroke="#c9d1d9" stroke-width="' +
+          r1(1.1 * inv) + '"/>');
+      } else {
+        parts.push('<path d="' + wd.land + '" fill="#fbfcfd" stroke="#c9d1d9" stroke-width="' + r1(1.1 * inv) + '"/>');
+        parts.push('<path d="' + wd.borders + '" fill="none" stroke="#d5dbe1" stroke-width="' + r1(0.8 * inv) + '"/>');
+      }
+    }
+    parts.push(undMapEdges(doc, spot.pos, lv, inv, t.sel));
+    parts.push(undMapNodes(doc, spot.pos, lv, inv, t.sel));
+    svg.setAttribute("viewBox", "0 0 " + f.w + " " + f.h);
+    svg.innerHTML = '<g transform="translate(' + r1(t.x) + "," + r1(t.y) + ") scale(" + r1(t.k) + ')">' +
+      parts.join("") + "</g>";
+    var aria = "设备拓扑：" + (geo
+      ? "地理视图，" + (doc.nodes.length - spot.unplaced.length) + " 台已定位设备"
+      : "逻辑视图，" + doc.nodes.length + " 台设备") +
+      "、" + doc.bundles.length + " 组连接";
+    svg.setAttribute("aria-label", aria);
+    var z = $("tp-zoom"), lvel = $("tp-level"), hint = $("tp-hint");
+    if (z) z.textContent = t.k.toFixed(1) + "×";
+    if (lvel) lvel.textContent = ["缩略", "站点", "隧道明细"][lv];
+    if (hint) hint.textContent = undMapHint(lv, geo, spot.unplaced.length, t.k);
+  }
+
+  function undMapHint(lv, geo, unplaced, k) {
+    if (!geo) return "逻辑视图：不看经纬度，按隧道多少把设备摊开。同城、同机房或者还没填位置的设备在这种视角下看得清。";
+    if (lv === 0) return "缩略层级：海岸线 + 设备点，站名按能不能放下来决定（挤不下的先隐藏）。放大到 " + MAP_L1 + "× 起在连线上标隧道条数与中转。" +
+      (unplaced ? " 有 " + unplaced + " 台设备没有位置，只在下方清单里，不做猜测摆放。" : "");
+    if (lv === 1) return "站点层级：站名 + 每组设备一条线，标「N 条」和经过的中转设备。放大到 " + MAP_L2 +
+      "× 起每组连线拆成逐条隧道，补上两端监听端口。" + (unplaced ? " 未定位 " + unplaced + " 台。" : "");
+    return "隧道明细层级：一条隧道一条线，标隧道号与本端→对端监听端口；虚线是经过中转设备的 SR 路径，红色是路径模板已经失效。" +
+      (MAP.world50 ? " 底图已切到 1:50m 明细海岸线。" : (MAP.err50 ? " " + MAP.err50 + "，仍用 1:110m 海岸线。" : " 明细海岸线加载中…")) +
+      (unplaced ? " 未定位 " + unplaced + " 台。" : "") + " 当前 " + k.toFixed(1) + "×。";
+  }
+
+  function undMapZoomTo(vb, factor) {
+    var t = undTopoStore();
+    var k = Math.min(MAP_K_MAX, Math.max(MAP_K_MIN, t.k * factor));
+    factor = k / t.k;
+    var bx = (vb[0] - t.x) / t.k, by = (vb[1] - t.y) / t.k;
+    t.k = k; t.x = vb[0] - bx * t.k; t.y = vb[1] - by * t.k;
+    undMapClamp();
+    if (t.view === "geo" && MAP.world && t.k >= MAP_L2) ensureWorld50();
+    undMapDraw();
+  }
+
+  function undMapPoint(ev) {
+    var svg = $("tp-svg");
+    var m = svg.getScreenCTM ? svg.getScreenCTM() : null;
+    if (!m) return [mapFrame().w / 2, mapFrame().h / 2];
+    return [(ev.clientX - m.e) / m.a, (ev.clientY - m.f) / m.d];
+  }
+
+  // 缩到刚够把所有有位置的设备框进来。设备集中在一个城市时这会比全图有用得多，
+  // 全图里一整个国家只是一个点。
+  function undMapFit() {
+    var t = undTopoStore();
+    if (!t.doc) return;
+    var spot = undMapPos(t.doc, t.view === "geo" && !!MAP.world);
+    var xs = [], ys = [];
+    Object.keys(spot.pos).forEach(function (id) {
+      xs.push(spot.pos[id][0]); ys.push(spot.pos[id][1]);
+    });
+    if (!xs.length) { t.k = 1; t.x = 0; t.y = 0; undMapDraw(); return; }
+    var x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+    var y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
+    var f = mapFrame();
+    var padX = (x1 - x0) * 0.25 + 90, padY = (y1 - y0) * 0.25 + 90;
+    var k = Math.min(f.w / ((x1 - x0) + 2 * padX), f.h / ((y1 - y0) + 2 * padY));
+    t.k = Math.max(MAP_K_MIN, Math.min(MAP_K_MAX, k));
+    t.x = f.w / 2 - ((x0 + x1) / 2) * t.k;
+    t.y = f.h / 2 - ((y0 + y1) / 2) * t.k;
+    undMapClamp();
+    undMapDraw();
+  }
+
+  function undMapReset() {
+    var t = undTopoStore();
+    t.k = 1; t.x = 0; t.y = 0;
+    undMapClamp();
+    undMapDraw();
+  }
+
+  // Pointer state lives on the element, not in S: a page rebuild between the
+  // pointerdown and the pointerup must not leave a stale flag behind.
+  function undMapAttach() {
+    var svg = $("tp-svg");
+    if (!svg || svg._tp) return;
+    svg._tp = true;
+    if (S.topo && S.topo.view === "geo" && !MAP.world) ensureWorld();
+    var drag = null, moved = 0, suppress = false;
+    svg.addEventListener("pointerdown", function (ev) {
+      if (ev.button !== 0) return;
+      drag = { sx: ev.clientX, sy: ev.clientY, x: S.topo.x, y: S.topo.y };
+      moved = 0;
+      S.topo.drag = true;
+      svg.classList.add("dragging");
+      if (svg.setPointerCapture) { try { svg.setPointerCapture(ev.pointerId); } catch (e) {} }
+    });
+    svg.addEventListener("pointermove", function (ev) {
+      if (!drag) return;
+      var m = svg.getScreenCTM ? svg.getScreenCTM() : null;
+      if (!m) return;
+      moved = Math.max(moved, Math.abs(ev.clientX - drag.sx) + Math.abs(ev.clientY - drag.sy));
+      S.topo.x = drag.x + (ev.clientX - drag.sx) / m.a;
+      S.topo.y = drag.y + (ev.clientY - drag.sy) / m.d;
+      undMapClamp();
+      undMapDraw();
+    });
+    function end(ev) {
+      if (drag && moved > 4) suppress = true;
+      drag = null;
+      S.topo.drag = false;
+      svg.classList.remove("dragging");
+      if (svg.releasePointerCapture) { try { svg.releasePointerCapture(ev.pointerId); } catch (e) {} }
+    }
+    svg.addEventListener("pointerup", end);
+    svg.addEventListener("pointercancel", function () {
+      drag = null; S.topo.drag = false; svg.classList.remove("dragging");
+    });
+    svg.addEventListener("wheel", function (ev) {
+      ev.preventDefault();
+      undMapZoomTo(undMapPoint(ev), Math.pow(1.0016, -ev.deltaY));
+    }, { passive: false });
+    svg.addEventListener("dblclick", function (ev) {
+      ev.preventDefault();
+      undMapZoomTo(undMapPoint(ev), 1.8);
+    });
+    svg.addEventListener("click", function (ev) {
+      // 拖动结束时浏览器还会补一个 click：那不该被当成选中。
+      if (suppress) { suppress = false; return; }
+      var el = ev.target.closest ? ev.target.closest("[data-pick]") : null;
+      if (!el) return;
+      var t = undTopoStore();
+      var kind = el.getAttribute("data-pick");
+      if (kind === "node") {
+        var id = Number(el.getAttribute("data-id"));
+        t.sel = (t.sel && t.sel.kind === "node" && t.sel.id === id) ? null : { kind: "node", id: id };
+      } else {
+        var a = Number(el.getAttribute("data-a")), b = Number(el.getAttribute("data-b"));
+        t.sel = (t.sel && t.sel.kind === "bundle" && t.sel.a === a && t.sel.b === b)
+          ? null : { kind: "bundle", a: a, b: b };
+      }
+      blurContent();
+      render();
+    });
+    if (S.topo.view === "geo" && MAP.world && S.topo.k >= MAP_L2) ensureWorld50();
+    undMapDraw();
+  }
+
+  function undMapDragging() {
+    return !!(S.topo && S.topo.drag);
+  }
+
+  function undMapViewSeg() {
+    var t = undTopoStore();
+    return '<span class="seg" role="group" aria-label="视图">' +
+      '<button data-act="topo-view" data-v="geo"' + (t.view === "geo" ? ' class="on"' : "") + ">地理</button>" +
+      '<button data-act="topo-view" data-v="logical"' + (t.view !== "geo" ? ' class="on"' : "") + ">逻辑</button>" +
+      "</span>";
+  }
+
+  function undUnplacedPanel(doc) {
+    var rows = doc.nodes.filter(function (nd) { return !nd.has_location; });
+    var h = '<section class="panel"><header><h2>未定位设备</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + rows.length + " 台</span></header>";
+    if (!rows.length) {
+      return h + '<div class="empty">全部设备都有位置。</div></section>';
+    }
+    h += "<table><thead><tr><th>设备</th><th>状态</th><th>位置</th><th>隧道</th></tr></thead><tbody>";
+    rows.forEach(function (nd) {
+      h += "<tr><td><b class=\"mono\">" + esc(undMapNodeName(nd)) + "</b> <span class=\"muted\">node-" +
+        nd.node_id + "</span></td><td>" + statusTag(nd.status) + "</td>" +
+        '<td><span class="tag pending">未上报</span></td><td>' + esc(nd.tunnel_count) + "</td></tr>";
+    });
+    h += "</tbody></table>";
+    h += '<div class="hint">位置在「设备」页按站点填写。这里列出的设备不会出现在地理视图里（逻辑视图会画全部设备），' +
+      "控制器也不会替它们猜一个坐标。</div>";
+    return h + "</section>";
+  }
+
+  function undZoomTierTable() {
+    return '<section class="panel"><header><h2>缩放分级</h2></header><table><thead><tr>' +
+      "<th>缩放</th><th>画什么</th></tr></thead><tbody>" +
+      "<tr><td class=\"mono\">1.0–" + MAP_L1 + '×</td><td>缩略：1:110m 海岸线 + 设备点，站名只画放得下的</td></tr>' +
+      "<tr><td class=\"mono\">" + MAP_L1 + "–" + MAP_L2 + '×</td><td>站点：站名 + 每组设备一条线，标「N 条」与经过的中转设备</td></tr>' +
+      "<tr><td class=\"mono\">≥ " + MAP_L2 + '×</td><td>隧道明细：逐条隧道分线，标隧道号与两端监听端口；底图切到 1:50m 海岸线</td></tr>' +
+      "</tbody></table><div class=\"hint\">放得越细画得越多，是为了上千台设备的网络缩小时还能看清整体、放大时能读出每一条线。</div></section>";
+  }
+
+  function undSitePanel(doc) {
+    var h = '<section class="panel"><header><h2>站点</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + doc.sites.length + " 个 " +
+      '<button class="small" data-act="goto" data-view="nodes">在「设备」页编辑</button></span></header>';
+    if (!doc.sites.length) {
+      return h + '<div class="empty">还没有站点。在「设备」页给设备填位置就会建出来。</div></section>';
+    }
+    h += "<table><thead><tr><th>站点</th><th>经纬度</th><th>设备</th></tr></thead><tbody>";
+    doc.sites.forEach(function (si) {
+      h += '<tr><td><b>' + esc(si.name) + '</b> <span class="muted mono">' + esc(si.id) + "</span></td>" +
+        '<td class="mono">' + esc(si.lon.toFixed(2)) + ", " + esc(si.lat.toFixed(2)) + "</td>" +
+        "<td>" + esc(si.devices) + "</td></tr>";
+    });
+    return h + "</tbody></table></section>";
+  }
+
 
   function undTopoNode(doc, id) {
     var out = null;
@@ -3181,6 +3894,11 @@
         undKv("观测时效", nd.observed_age_sec > 0
           ? esc(dur(nd.observed_age_sec)) + "前" + (nd.observed_stale ? ' <span class="tag stale">已过期</span>' : "")
           : "—") +
+        undKv("位置", nd.has_location
+          ? (nd.site_name ? "<b>" + esc(nd.site_name) + "</b> " : "") +
+            '<span class="mono muted">' + esc(nd.lon.toFixed(2)) + ", " + esc(nd.lat.toFixed(2)) + "</span>" +
+            (S.topo.view === "geo" ? "" : ' <button class="small" data-act="topo-view" data-v="geo">切到地理视图</button>')
+          : '<span class="tag pending">未上报</span> <button class="small" data-act="goto" data-view="nodes">去设备页填位置</button>') +
         undKv("对称 NAT", nd.symmetric_nat ? "是（不能与另一台对称 NAT 设备建隧道）" : "否") +
         undKv("默认出口", nd.default_iface ? '<span class="mono">' + esc(nd.default_iface) + "</span>" : "未选择") +
         undKv("中转端口", nd.transit_port ? '<span class="mono">' + esc(nd.transit_port) + "</span>" : '<span class="tag pending">未分配</span>') +
@@ -3237,17 +3955,50 @@
       h += '<div class="banner"><span>全局配置还没有发布：拓扑里不会有隧道。</span>' +
         '<button class="small" data-act="goto" data-view="underlay-settings">去全局配置</button></div>';
     }
-    h += '<section class="panel"><header><h2>拓扑</h2>' +
-      '<span class="muted" style="font-size:12.5px">' + doc.nodes.length + " 台设备 · " +
-      doc.bundles.length + " 条连接</span></header>";
     if (!doc.nodes.length) {
-      return h + '<div class="empty">还没有设备。设备入网后才会出现在拓扑里。</div></section>';
+      return h + '<section class="panel"><header><h2>拓扑</h2></header>' +
+        '<div class="empty">还没有设备。设备入网后才会出现在拓扑里。</div></section>';
     }
-    h += '<div class="hint">' + esc(doc.state_note) + "</div>" +
-      undTopoSVG(doc) +
-      '<div class="hint" style="margin-top:10px">实线 = 直连；虚线 = 经中转设备。每条连线对一条隧道：同一设备对之间只能有一条' +
-      "（每台设备只有一把 WireGuard 静态密钥，第二条会被数据面以 -116 拒掉），要换端口或路径就编辑或删了重建。</div></section>";
+    var geo = t.view === "geo";
+    var placed = doc.nodes.length - doc.unplaced_nodes;
+    if (geo && MAP.err) {
+      h += '<div class="banner"><span>' + esc(MAP.err) +
+        "。地理视图需要底图里的投影参数才能摆放设备，所以现在画的是逻辑视图。</span>" +
+        '<button class="small" data-act="topo-world-retry">重试加载</button></div>';
+    } else if (geo && !MAP.world) {
+      h += '<div class="banner"><span>世界底图加载中（132 KB，编译在控制器里，只加载一次）。' +
+        "在加载好之前先画逻辑视图。</span></div>";
+    }
+    h += '<section class="panel"><header><h2>' + (geo && MAP.world ? "地理视图" : "逻辑视图") + "</h2>" +
+      '<div class="meta">' + undMapViewSeg() +
+      '<span class="muted" style="font-size:12.5px">滚轮或 + − 缩放 · 拖动平移 · 双击放大</span>' +
+      '<span class="tag pending" id="tp-level">缩略</span>' +
+      '<span class="tag pending" id="tp-zoom">' + t.k.toFixed(1) + "×</span></div></header>" +
+      '<div class="hint">' + esc(doc.state_note) + "</div>" +
+      '<div class="map-area">' +
+      '<svg id="tp-svg" class="topo" viewBox="0 0 2000 1040" preserveAspectRatio="xMidYMid meet" ' +
+      'role="img" aria-label="设备拓扑"></svg>' +
+      '<div class="map-ctl">' +
+      '<button class="zm" data-act="topo-zoom" data-d="1" aria-label="放大">+</button>' +
+      '<button class="zm" data-act="topo-zoom" data-d="-1" aria-label="缩小">−</button>' +
+      '<button data-act="topo-fit">适应设备</button>' +
+      '<button data-act="topo-world">全图</button></div>' +
+      '<div class="map-legend">' +
+      '<div class="lg"><b>连线</b><i class="w"></i>直连<i class="w relay"></i>经中转</div>' +
+      '<div class="lg"><b>设备</b><i class="d"></i>在线<i class="d warn"></i>失联<i class="d pend"></i>已入网未上线</div>' +
+      "</div></div>" +
+      '<div class="zoomhint" id="tp-hint" aria-live="polite"></div>' +
+      '<div class="usage" style="margin-top:8px"><span><span class="k">图上</span> <b>' +
+      (geo && MAP.world ? placed : doc.nodes.length) + "</b> / " + doc.nodes.length + " 台</span>" +
+      "<span><span class=\"k\">连接</span> <b>" + doc.bundles.length + "</b> 组</span>" +
+      "<span><span class=\"k\">站点</span> <b>" + doc.sites.length + "</b> 个</span>" +
+      '<span><span class="k">未定位</span> <b>' + doc.unplaced_nodes + "</b> 台</span></div>" +
+      '<div class="hint" style="margin-top:10px">每组连线是一个设备对：同一设备对之间只能有一条隧道' +
+      "（每台设备只有一把 WireGuard 静态密钥，第二条会被数据面以 -116 拒掉），要换端口或路径就编辑或删了重建。" +
+      "外圈虚线环 = 这台设备在为别的隧道做中转。</div></section>";
     h += undTopoDetail(doc);
+    h += '<div class="und-cols">' + undZoomTierTable() + undUnplacedPanel(doc) + "</div>";
+    h += undSitePanel(doc);
     return h;
   }
 
@@ -3480,6 +4231,51 @@
       if (S.und) undSavePath(upef, S.und.editPath);
     });
 
+    var snf = $("und-site-new-form");
+    if (snf) snf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      undCreateSite(snf);
+    });
+    var sef = $("und-site-edit-form");
+    if (sef) sef.addEventListener("submit", function (e) {
+      e.preventDefault();
+      undUpdateSite(sef);
+    });
+    // A correction should retire the message it corrects.
+    [snf, sef].forEach(function (f) {
+      if (!f) return;
+      f.addEventListener("input", function () {
+        var slot = $(f.id.replace("-form", "-err"));
+        if (slot) slot.textContent = "";
+      });
+    });
+    // A dropdown's value only exists on "change"; the generic [data-act] click
+    // handler below would read it before the user has picked anything.
+    document.querySelectorAll('#content select[data-act="node-site"]').forEach(function (el) {
+      el.addEventListener("change", function () {
+        var node = Number(el.getAttribute("data-node"));
+        var v = el.value;
+        blurContent();
+        if (v === "__new") {
+          var t = undSitesStore();
+          t.form = { node: node };
+          t.edit = null;
+          t.note = null;
+          render();
+          var name = $("und-site-name");
+          if (name) name.focus();
+          return;
+        }
+        undAssignSite(node, v);
+      });
+    });
+
+    // The map is the one part of the console that is not a string: panning and
+    // zooming must repaint at pointer rate, and a 10s frame that rebuilds
+    // #content from HTML would throw the viewport away. The shell above is the
+    // string; this attaches the behaviour and paints the canvas from S.topo.
+    if (S.view === "underlay-topology") undMapAttach();
+
     document.querySelectorAll("#content [data-act]").forEach(function (el) {
       el.addEventListener("click", function () {
         var act = el.getAttribute("data-act");
@@ -3584,7 +4380,36 @@
         else if (act === "und-publish") undPublish();
         else if (act === "und-note-x") {
           if (S.und) S.und.note = null;
+          if (S.sites) S.sites.note = null;
+          blurContent();
           render();
+        }
+        // Every one of these three is a request to repaint a form that the click
+        // just ended. render() skips its frame while focus sits in #content, so
+        // without the blur the button visibly does nothing; the typed values
+        // survive the rebuild through the keep pass above.
+        else if (act === "site-form-x") {
+          var ts = undSitesStore();
+          ts.form = null;
+          ts.note = null;
+          blurContent();
+          render();
+        }
+        else if (act === "site-edit") {
+          var te = undSitesStore();
+          te.edit = (te.edit === el.getAttribute("data-id")) ? null : el.getAttribute("data-id");
+          te.form = null;
+          blurContent();
+          render();
+        }
+        else if (act === "site-edit-x") {
+          var tx = undSitesStore();
+          tx.edit = null;
+          blurContent();
+          render();
+        }
+        else if (act === "site-del") {
+          undDeleteSite(el.getAttribute("data-id"), el.getAttribute("data-name") || "该站点");
         }
         else if (act === "und-avoid-add") undAddAvoid();
         else if (act === "und-avoid-del") undDelAvoid(Number(el.getAttribute("data-i")));
@@ -3617,12 +4442,26 @@
           render();
         }
         else if (act === "und-path-del") undDeletePath(el.getAttribute("data-id"));
-        else if (act === "topo-node") {
-          S.topo.sel = { kind: "node", id: Number(el.getAttribute("data-id")) };
-          render();
+        else if (act === "topo-view") {
+          // 换视图 = 换整套摆法，缩放与平移对它没有意义，所以回到全图；
+          // 选中项留着，两视图里指的是同一台设备。
+          var tv = el.getAttribute("data-v") === "logical" ? "logical" : "geo";
+          if (S.topo.view !== tv) {
+            S.topo.view = tv;
+            S.topo.k = 1; S.topo.x = 0; S.topo.y = 0;
+            blurContent();
+            render();
+          }
         }
-        else if (act === "topo-bundle") {
-          S.topo.sel = { kind: "bundle", a: Number(el.getAttribute("data-a")), b: Number(el.getAttribute("data-b")) };
+        else if (act === "topo-zoom") {
+          var f0 = mapFrame();
+          undMapZoomTo([f0.w / 2, f0.h / 2], el.getAttribute("data-d") === "1" ? 1.6 : 1 / 1.6);
+        }
+        else if (act === "topo-fit") undMapFit();
+        else if (act === "topo-world") undMapReset();
+        else if (act === "topo-world-retry") {
+          MAP.err = null; MAP.loading = null; MAP.world = null;
+          ensureWorld();
           render();
         }
         else if (act === "disable") {

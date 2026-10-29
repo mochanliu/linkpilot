@@ -96,6 +96,17 @@ type underlayNodeView struct {
 	TunnelCount int      `json:"tunnel_count"`
 	RelayFor    int      `json:"relay_for"`
 
+	// Where the box physically sits, for the map. HasLocation is the honest flag:
+	// Lon/Lat are always emitted (a real site can legitimately be at lon 0 or
+	// lat 0), and the page draws a device only when this is true. SiteID empty
+	// means the tenant never placed this device, so the topology lists it as
+	// 未上报 instead of guessing a point.
+	SiteID      string  `json:"site_id,omitempty"`
+	SiteName    string  `json:"site_name,omitempty"`
+	Lon         float64 `json:"lon"`
+	Lat         float64 `json:"lat"`
+	HasLocation bool    `json:"has_location"`
+
 	// TunnelDelivery is the device's OWN account of the underlay channel
 	// (wire.TunnelState), persisted with the node. nil means it never reported
 	// (an agent without -vpp-api); capable:false means the channel exists and is
@@ -139,6 +150,13 @@ type underlayView struct {
 	Nodes   []underlayNodeView     `json:"nodes"`
 	Tunnels []underlayTunnelView   `json:"tunnels"`
 	Paths   []underlayTemplateView `json:"paths"`
+
+	// Sites is the tenant's location table with device counts, and UnplacedNodes
+	// is how many devices stand outside it. The topology needs both so it can
+	// draw what is known and name what is not, instead of showing a smaller map
+	// and letting the missing devices look like they do not exist.
+	Sites         []underlaySiteView `json:"sites"`
+	UnplacedNodes int                `json:"unplaced_nodes"`
 }
 
 // underlayTopology is the graph page's document. Edges are bundled per device
@@ -150,6 +168,13 @@ type underlayTopology struct {
 	StateNote  string               `json:"state_note"`
 	Nodes      []underlayNodeView   `json:"nodes"`
 	Bundles    []underlayTopoBundle `json:"bundles"`
+	Sites      []underlaySiteView   `json:"sites"`
+
+	// UnplacedNodes is the count behind the "未定位设备" list the page renders from
+	// Nodes (has_location:false). It is stated here too because the honest caption
+	// for the map is "3 台设备已定位 · 1 台未定位", and a page should not have to
+	// re-derive that from rows it already has.
+	UnplacedNodes int `json:"unplaced_nodes"`
 }
 
 type underlayTopoBundle struct {
@@ -181,6 +206,7 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 		Nodes:            []underlayNodeView{},
 		Tunnels:          []underlayTunnelView{},
 		Paths:            []underlayTemplateView{},
+		Sites:            []underlaySiteView{},
 	}
 	if uc != nil {
 		draft = uc.Draft
@@ -225,6 +251,16 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 		if n.MappingAt > 0 && now > n.MappingAt {
 			row.ObservedAgeSec = now - n.MappingAt
 		}
+		// A device references a site of ITS tenant; anything else is treated as
+		// unplaced rather than drawn at the wrong position. normalizeSites clears
+		// such a reference at load, so reaching here means the file was written
+		// while the server was running.
+		if si := s.siteLocked(tenant, n.SiteID); si != nil {
+			row.SiteID, row.SiteName = si.ID, si.Name
+			row.Lon, row.Lat, row.HasLocation = si.Lon, si.Lat, true
+		} else {
+			out.UnplacedNodes++
+		}
 		if n.Ifaces != nil {
 			row.InventoryReported = true
 			row.Ifaces = append(row.Ifaces, (*n.Ifaces)...)
@@ -241,6 +277,9 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 	for _, p := range st.SortedPaths() {
 		out.Paths = append(out.Paths, buildTemplateView(st, p, serials))
 	}
+	// Built after the devices so a site's device count reflects what this same
+	// document shows.
+	out.Sites = s.tenantSitesLocked(tenant)
 	return out
 }
 
@@ -293,11 +332,13 @@ func buildEndpointView(views map[uint16]underlay.NodeView, ep underlay.Endpoint)
 func (s *server) underlayTopologyLocked(tenant string, now int64) underlayTopology {
 	v := s.underlayViewLocked(tenant, now)
 	out := underlayTopology{
-		NowUnix:    now,
-		Configured: v.Configured,
-		StateNote:  v.StateNote,
-		Nodes:      v.Nodes,
-		Bundles:    []underlayTopoBundle{},
+		NowUnix:       now,
+		Configured:    v.Configured,
+		StateNote:     v.StateNote,
+		Nodes:         v.Nodes,
+		Bundles:       []underlayTopoBundle{},
+		Sites:         v.Sites,
+		UnplacedNodes: v.UnplacedNodes,
 	}
 	serials := make(map[uint16]string, len(v.Nodes))
 	for _, n := range v.Nodes {

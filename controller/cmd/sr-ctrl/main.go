@@ -150,6 +150,13 @@ type NodeRecord struct {
 	// tunnel on one older than observationTTL -- the address is still shown, with
 	// its age, so the tenant can see WHY a tunnel cannot be created.
 	MappingAt int64 `json:"mapping_at_unix,omitempty"`
+
+	// SiteID is which of the tenant's sites this box physically sits in, and it is
+	// the only reason the topology can be drawn on a map. Console-only: a
+	// coordinate never enters a config bundle and never reaches a device. Empty
+	// means the tenant never placed this device, and the topology lists it as
+	// 未上报 rather than inventing a point for it.
+	SiteID string `json:"site_id,omitempty"`
 }
 
 // Tenant is the customer account a device belongs to. Tenants are created in
@@ -272,6 +279,12 @@ type State struct {
 	// the scope is different -- a tunnel belongs to a tenant, not to one device,
 	// and it references two devices that must both exist.
 	Underlays map[string]*UnderlayConfig `json:"underlays"`
+
+	// Sites is each tenant's location table, keyed by site id. Console-only:
+	// nothing here is pushed to a device, because a coordinate means nothing to
+	// the dataplane. It exists so several boxes in one building share one position
+	// instead of each carrying its own typed-in copy.
+	Sites map[string]*Site `json:"sites"`
 }
 
 // Account is one console login. Passwords are stored only as PBKDF2 hashes
@@ -310,6 +323,21 @@ func newClaimID() string {
 		out[i] = alphabet[int(b)%len(alphabet)]
 	}
 	return "clm_" + string(out)
+}
+
+// newSiteID is a site's public handle. Same rule as a grant id: random so ids do
+// not invite enumeration, and carrying no authority of its own.
+func newSiteID() string {
+	const alphabet = "23456789BCDFGHJKLMNPQRSTVWXZ"
+	buf := make([]byte, 10)
+	if _, err := rand.Read(buf); err != nil {
+		log.Fatalf("console: entropy unavailable: %v", err)
+	}
+	out := make([]byte, len(buf))
+	for i, b := range buf {
+		out[i] = alphabet[int(b)%len(alphabet)]
+	}
+	return "site_" + string(out)
 }
 
 func (f *fileStore) Load() (*State, error) {
@@ -351,6 +379,7 @@ func seedState() *State {
 		Accounts:   map[string]*Account{},
 		Configs:    map[string]*DeviceConfig{},
 		Underlays:  map[string]*UnderlayConfig{},
+		Sites:      map[string]*Site{},
 	}
 	for id, name := range map[string]string{"tenant-a": "演示租户 A", "tenant-b": "演示租户 B"} {
 		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
@@ -528,6 +557,13 @@ func normalizeState(s *State) bool {
 			uc.State = underlay.New(underlay.DefaultSettings())
 		}
 		uc.State.Repair()
+	}
+	// Sites are console-only, but a stale reference is still a lie: a device
+	// pointing at a site that no longer exists (or belongs to another tenant)
+	// would be drawn at someone else's coordinates. Clear those and let the
+	// topology say 未上报.
+	if normalizeSites(s) {
+		migrated = true
 	}
 	return migrated
 }

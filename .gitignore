@@ -20,3 +20,6 @@ test/lab/run/
 # lab e2e 现场：交叉编译出来的二进制、以及顺手生成的入网码（明文只在一次 HTTP 响应里，落盘过就要挡住）
 test/.lab-bin/
 test/.lab-code
+# 世界底图生成器的第三方输入（d3/topojson/world-atlas）。生成物 world-110m.js、
+# world-50m.js 已入库，构建 sr-ctrl 不需要 node，所以输入物不入库。
+controller/tools/world-basemap/vendor/

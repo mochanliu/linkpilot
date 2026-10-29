@@ -317,6 +317,10 @@ func (s *server) clearLoginFail(username string, r *http.Request) {
 func (s *server) adminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleConsolePage)
+	// The world basemap. More specific than the "/" catch-all above, and the only
+	// console URL that is not behind a session -- it carries no tenant data, and
+	// a map with no points on it says nothing about anybody's network.
+	mux.HandleFunc("/assets/", s.handleConsoleAsset)
 	mux.HandleFunc("/api/login", s.handleAdminLogin)
 	mux.HandleFunc("/api/logout", s.handleAdminLogout)
 	mux.HandleFunc("/api/session", s.handleAdminSession)
@@ -336,6 +340,12 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/underlay/auto/apply", s.handleAdminUnderlayAutoApply)
 	mux.HandleFunc("/api/underlay/paths", s.handleAdminUnderlayPaths)
 	mux.HandleFunc("/api/underlay/topology", s.handleAdminUnderlayTopology)
+	// Sites are the map's only input and are tenant-only like the rest of the
+	// underlay layer: a location is where the customer's building is, which the
+	// operator has no business editing.
+	mux.HandleFunc("/api/underlay/sites", s.handleAdminUnderlaySites)
+	mux.HandleFunc("/api/underlay/sites/delete", s.handleAdminUnderlaySiteDelete)
+	mux.HandleFunc("/api/underlay/node-site", s.handleAdminUnderlayNodeSite)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/code", s.handleAdminClaimCode)
@@ -567,6 +577,12 @@ type consoleNodeRuntime struct {
 	// and the node plan (ports, overlay address, keys, RR list) does not exist
 	// yet. The console says so rather than implying a device is ready to tunnel.
 	Configured bool `json:"configured"`
+	// Site is where the box physically sits, for the map. It lives in Runtime so
+	// the operator role cannot receive it by accident: a location is part of how
+	// the customer drew their own network, and an empty SiteID means "未定位",
+	// which is a state the page shows rather than a field it hides.
+	SiteID   string `json:"site_id,omitempty"`
+	SiteName string `json:"site_name,omitempty"`
 }
 
 type consoleController struct {
@@ -630,9 +646,20 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 			Status: nodeStatus(n),
 		}
 		if id.Role == roleTenant {
-			cn.Runtime = &consoleNodeRuntime{
+			rt := consoleNodeRuntime{
 				UDPMapping: n.UDPMapping, VpnPort: n.VpnPort, Configured: false,
+				SiteID: n.SiteID,
 			}
+			// Resolve the name here rather than in the page: a site row can be
+			// renamed while this response is in flight, and a stale name printed
+			// next to a live id is the kind of contradiction the map already
+			// refuses to draw.
+			if n.SiteID != "" {
+				if si := s.siteLocked(n.TenantID, n.SiteID); si != nil {
+					rt.SiteName = si.Name
+				}
+			}
+			cn.Runtime = &rt
 		}
 		out.Nodes = append(out.Nodes, cn)
 	}
