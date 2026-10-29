@@ -17,6 +17,10 @@
 #
 # 选项：--name <容器名>（默认 sr-lab-vcpe）--ip <管理网地址>（默认 10.99.0.60）
 #       --serial <序列号>（默认容器名）
+#       --preauth <名称>  认领控制台里预先建好的「预授权」记录（资产 › 设备 › 预授权）。
+#                只有第一次 enroll 会用得上：node_id 是入网那一刻才产生的。索引找
+#                不到、登记的序列号不符、或这条记录已被别的设备认领，控制器一律拒绝
+#                入网并把原因回给 agent（不静默降级成普通入网）。
 #       --apply  让 agent 真的安装控制器发布的配置包（store 与 frr.conf 放在
 #                /var/lib/sdwan 里，FRR 重启用 true 代替；容器需要 NET_ADMIN
 #                才能跑 boot 片段里的 sysctl）。不加这个开关 agent 只心跳，
@@ -37,6 +41,7 @@ NAME=sr-lab-vcpe
 IP=10.99.0.60
 SERIAL=""
 CLAIM=""
+PREAUTH=""
 APPLY=""
 IDDIR_OPT=""
 CMD=${1:-up}
@@ -48,6 +53,7 @@ while [ $# -gt 0 ]; do
         --name)   NAME=${2:-};  shift 2 ;;
         --ip)     IP=${2:-};    shift 2 ;;
         --serial) SERIAL=${2:-}; shift 2 ;;
+        --preauth) PREAUTH=${2:-}; shift 2 ;;
         --id)     IDDIR_OPT=${2:-}; shift 2 ;;
         --apply)  APPLY=1; shift ;;
         -h|--help) awk 'NR>1 { if ($0=="set -u") exit; sub(/^# ?/,""); print }' "$0"; exit 0 ;;
@@ -99,6 +105,12 @@ cmd_up() {
 
     local claimflag=""
     [ -n "$CLAIM" ] && claimflag="--claim $CLAIM"
+    # 预授权索引只在真正 enroll 的那一次有意义（node_id 是那时才产生的）。
+    local preauthflag=""
+    if [ -n "$PREAUTH" ]; then
+        preauthflag="--preauth '${PREAUTH}'"
+        [ "$fresh" = "0" ] && note "本地已有身份，--preauth 不会重发 enroll；agent 会打印同样的警告"
+    fi
 
     # 空数组在 set -u 的 bash 3.2 里展开会报 unbound，所以用普通字符串，
     # 靠不加引号让 shell 拆成多个参数。
@@ -123,7 +135,7 @@ cmd_up() {
                 --ca /var/lib/sdwan/pinned_ca.pem \
                 --id /var/lib/sdwan \
                 --serial ${SERIAL} \
-                --status 127.0.0.1:8089 ${claimflag} ${applyflags}
+                --status 127.0.0.1:8089 ${claimflag} ${preauthflag} ${applyflags}
         " >/dev/null || die "docker run 失败"
 
     local i

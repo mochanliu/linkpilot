@@ -20,18 +20,27 @@ type configView struct {
 	UpdatedAt int64           `json:"updated_at_unix"`
 	UpdatedBy string          `json:"updated_by,omitempty"`
 
+	// PreAuthID is set when this view is a 预授权 record's draft: NodeID is then 0
+	// and Serial carries the record's name, because that name is the only handle
+	// the site engineer has. The page must show which of the two it is editing --
+	// a pre-authorization cannot be published.
+	PreAuthID string `json:"preauth_id,omitempty"`
+
 	// Published is what the device has been TOLD to install; Version above is
 	// only what was saved. They differ whenever a tenant edits after publishing,
 	// and the page must show both rather than assuming the newest draft won.
-	PublishedVersion int              `json:"published_version,omitempty"`
-	PublishedAt      int64            `json:"published_at_unix,omitempty"`
-	PublishedBy      string           `json:"published_by,omitempty"`
+	PublishedVersion int               `json:"published_version,omitempty"`
+	PublishedAt      int64             `json:"published_at_unix,omitempty"`
+	PublishedBy      string            `json:"published_by,omitempty"`
 	Device           *wire.ConfigState `json:"device_state,omitempty"`
 }
 
-func buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
+// configViewOf renders one draft for the page. Everything a device would install
+// -- checks, artifacts -- is derived here rather than stored twice, so a draft
+// that has not been saved can be shown as the empty-but-valid config it is.
+func configViewOf(nodeID uint16, serial string, dc *DeviceConfig, device *wire.ConfigState) configView {
 	cfg := defaultBasicConfig()
-	v := configView{NodeID: n.NodeID, Serial: n.Serial}
+	v := configView{NodeID: nodeID, Serial: serial}
 	if dc != nil {
 		cfg = dc.Draft
 		v.Version = dc.Version
@@ -43,11 +52,21 @@ func buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
 			v.PublishedBy = dc.Published.PublishedBy
 		}
 	}
-	v.Device = n.Config
+	v.Device = device
 	normalizeBasicConfig(&cfg)
 	v.Config = cfg
 	v.Checks = validateBasicConfig(&cfg)
 	v.Artifacts = renderArtifacts(&cfg)
+	return v
+}
+
+func buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
+	return configViewOf(n.NodeID, n.Serial, dc, n.Config)
+}
+
+func buildPreAuthConfigView(p *PreAuth, dc *DeviceConfig) configView {
+	v := configViewOf(0, p.Name, dc, nil)
+	v.PreAuthID = p.ID
 	return v
 }
 

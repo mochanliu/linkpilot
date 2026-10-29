@@ -103,8 +103,12 @@ type ConfigStatic struct {
 // different content" is unpublishable evidence. Publishing snapshots the
 // rendered artifacts; saving a new draft only moves Version.
 type DeviceConfig struct {
-	TenantID  string      `json:"tenant_id"`
-	NodeID    uint16      `json:"node_id"`
+	TenantID string `json:"tenant_id"`
+	NodeID   uint16 `json:"node_id"`
+	// PreAuthID is set only while the draft hangs off a 预授权 record: there is no
+	// node yet, so NodeID stays 0. The binding clears it when the draft moves into
+	// Configs, which is also what makes the move provable in the state file.
+	PreAuthID string      `json:"preauth_id,omitempty"`
 	Draft     BasicConfig `json:"draft"`
 	Version   int         `json:"version"`
 	UpdatedAt int64       `json:"updated_at_unix"`

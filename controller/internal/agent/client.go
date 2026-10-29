@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"sdwan/controller/internal/wire"
 )
@@ -112,7 +113,10 @@ func enrollTLS(roots *x509.CertPool, serverName string) *tls.Config {
 //
 // public_key 交的是**身份密钥**（Ed25519）而不是 WG 公钥：证书要绑的是"这台设备是谁"。
 // WG 公钥走 key binding，等知道 (tenant, node_id) 之后才有意义 —— 见 wire 包注释。
-func (id *Identity) EnrollRequest(claimCode, agentVersion string, reflectors int) wire.EnrollRequest {
+//
+// preAuth 是控制台里预授权记录的索引（设备名称），空串表示普通入网。它只搭第一次
+// enroll 走：node_id 那一刻才产生，预授权在此之前不能假装自己有一台设备。
+func (id *Identity) EnrollRequest(claimCode, agentVersion string, reflectors int, preAuth string) wire.EnrollRequest {
 	pub := id.IdentityPublicKey()
 	return wire.EnrollRequest{
 		Serial:        id.Serial(),
@@ -121,6 +125,7 @@ func (id *Identity) EnrollRequest(claimCode, agentVersion string, reflectors int
 		ProtocolVer:   wire.ProtocolVersion,
 		AgentVersion:  agentVersion,
 		UDPRelfectorN: reflectors,
+		PreAuth:       strings.TrimSpace(preAuth),
 	}
 }
 

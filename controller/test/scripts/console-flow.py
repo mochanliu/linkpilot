@@ -101,6 +101,32 @@ B 段输出：
   login_lock=429                                   连续失败锁定
   tenant_logout=200 / tenant_after_logout=401      退出后会话立即失效
 
+C 段输出（预授权：设备还没到货，先在控制器登记 + 配置）：
+  pa_tenant=tenant-pa / pa_grant=clm_... / pa_login=200
+  pa_create=200                 租户能预授权一台还没到货的设备
+  pa_bound_empty=true           新登记不绑定任何 node
+  pa_seat_after_create=1/2      名额在建号这一刻就被占掉（D2）
+  pa_reserved_reported=1        授权行把 reserved 一起回传，页面不会停在旧名额
+  pa_dup_name=409               同一租户内索引唯一
+  pa_state_rows=1 / pa_state_config_version=0      状态里看得见，版本还是 v0
+  pa_operator_no_records=true   运营方状态里不含任何一家的登记
+  pa_draft=200 / pa_draft_version=1 / pa_draft_node=0 / pa_draft_no_publish=true
+                                只写控制器草稿；published_version 这个键压根不存在，
+                                因为没有设备可发布
+  pa_draft_reread=1:pa-edge-1   重新读回同一份草稿
+  pa_row_config_version=1       登记行带版本，设备页才敢写「已配置 · 草稿 v1」
+  pa_publish_needs_node=400     对不存在的设备发布是被拒，不是静默成功
+  pa_enroll_bad_index=403       现场输错索引 → 拒绝并报错（D3）
+  pa_enroll_bad_index_says_why=yes   理由里列出可输入的正确索引
+  pa_enroll=200 / pa_enroll_node=1 / pa_enroll_echoes_name=CPE-仓库门口
+  pa_bound_node=1               入网即认领，登记绑到这个 node
+  pa_seat_after_claim=1+0/2     名额从纸面转成真实设备，总数不变
+  pa_moved_version=1 / pa_moved_no_publish=true / pa_moved_hostname=pa-edge-1
+                                草稿连着版本号挪到 node 上，但不自动发布（D4）
+  pa_draft_after_bind=409       已认领的登记不再接受改写
+  pa_second_create=200 / pa_plain_enroll_blocked=403 / pa_blocked_says_paper=yes
+  pa_revoke=200 / pa_plain_enroll_after_revoke=200  撤销释放名额
+
 入网用的公钥是 32 字节随机数（控制器只校验长度与 base64）：这个脚本要证明的是
 "授权 + 一次性码能不能放设备进来"，真设备证书链由 test-vbond.sh 里 openssl
 那几条负责。码本身只在这里出现一次，后面所有断言都在确认它没有落进状态、
@@ -168,7 +194,7 @@ def cookie_header(j):
     return "; ".join("%s=%s" % (c.name, c.value) for c in j)
 
 
-def enroll(claim, serial):
+def enroll(claim, serial, preauth=""):
     # 32 bytes, base64: 控制器只校验长度。见文件头说明。
     pub = base64.b64encode(os.urandom(32)).decode()
     body = json.dumps({
@@ -177,6 +203,7 @@ def enroll(claim, serial):
         "public_key": pub,
         "protocol_ver": 3,
         "agent_version": "console-flow",
+        "preauth": preauth,
     }).encode()
     req = urllib.request.Request(CTRL + "/v1/enroll", data=body, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -647,3 +674,143 @@ code, _ = call("POST", CONSOLE + "/api/logout", {}, opener_=topener)
 say("tenant_logout", code)
 code, _ = call("GET", CONSOLE + "/api/state", opener_=topener)
 say("tenant_after_logout", code)
+
+# ---------------------------------------------------------------- C. 预授权
+# 设备还没到货，先在控制器上登记 + 配置；盒子到货时现场多带一个索引参数认领。
+# 这一段就是照着 GUI 上「资产 › 设备 › 预授权」那几步走的：建登记（占名额）→
+# 写配置（只有草稿）→ 生成码 → 用 --preauth 入网 → 配置跟着 node 走但不自动发布。
+code, raw = call("POST", CONSOLE + "/api/tenants", {
+    "tenant_id": "tenant-pa", "name": "预授权租户",
+    "account": "tenant-pa-admin", "password": "tenant-pa-pass-2026",
+    "claim_max_uses": 2,
+})
+pa = jstat(code, raw)
+if not pa:
+    say("pa_tenant", "HTTP %d: %s" % (code, raw.decode(errors="replace")))
+    sys.exit(1)
+pa_claim = pa["claim"]["id"]
+say("pa_tenant", pa["tenant"]["tenant_id"])
+say("pa_grant", pa_claim)
+
+pjar = http.cookiejar.CookieJar()
+popener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(pjar))
+code, _ = call("POST", CONSOLE + "/api/login",
+               {"username": "tenant-pa-admin", "password": "tenant-pa-pass-2026"},
+               opener_=popener)
+say("pa_login", code)
+if code != 200:
+    sys.exit(1)
+
+# C1. 建一条登记：名称是现场要输入的索引，序列号可选（填了就必须对上）
+code, raw = call("POST", CONSOLE + "/api/preauth",
+                 {"claim_id": pa_claim, "name": "CPE-仓库门口", "serial": "SN-PA-1"},
+                 opener_=popener)
+pres = jstat(code, raw)
+say("pa_create", code)
+if not pres or not pres.get("preauth"):
+    say("pa_create_body", raw.decode(errors="replace")[:200])
+    sys.exit(1)
+pa_id = pres["preauth"]["id"]
+say("pa_id", pa_id)
+say("pa_bound_empty", str(not pres["preauth"].get("bound_node_id")).lower())
+# 名额在建登记的这一刻就被占掉（D2），而且响应里要把新的授权行带回来，
+# 否则页面上的「已入网 x + 预授权 y」会停在写入前的旧数字。
+pc = [c for c in pres.get("claims", []) if c["id"] == pa_claim]
+say("pa_seat_after_create",
+    "%s/%s" % (pc[0]["uses"] + pc[0]["reserved"], pc[0]["max_uses"]) if pc else "no-claims")
+say("pa_reserved_reported", pc[0]["reserved"] if pc else "no-claims")
+
+# C2. 名称在同一租户里唯一：重名是 409，不是"再建一条"
+code, _ = call("POST", CONSOLE + "/api/preauth",
+               {"claim_id": pa_claim, "name": "CPE-仓库门口"}, opener_=popener)
+say("pa_dup_name", code)
+
+# C3. 状态里租户看得到这条登记；运营方看不到任何一家的登记
+code, raw = call("GET", CONSOLE + "/api/state", opener_=popener)
+pst = jstat(code, raw) or {}
+rows = [r for r in (pst.get("preauths") or []) if r["id"] == pa_id]
+say("pa_state_rows", len(rows))
+say("pa_state_config_version", rows[0].get("config_version") if rows else "none")
+code, raw = call("GET", CONSOLE + "/api/state")
+ostaraw = raw.decode(errors="replace")
+say("pa_operator_no_records", str(pa_id not in ostaraw).lower())
+
+# C4. 给它写配置：只有草稿，没有发布（接收方还不存在）
+pa_cfg = {"hostname": "pa-edge-1",
+          "vpns": [{"id": 0, "name": "default"}],
+          "ifaces": [], "statics": []}
+code, raw = call("PUT", CONSOLE + "/api/preauth/config",
+                 {"preauth_id": pa_id, "config": pa_cfg}, opener_=popener)
+cview = jstat(code, raw) or {}
+say("pa_draft", code)
+say("pa_draft_version", cview.get("version"))
+say("pa_draft_node", cview.get("node_id"))
+# published_version 是 omitempty：键根本不存在，才说明这条草稿没有任何发布目标。
+say("pa_draft_no_publish", str("published_version" not in cview).lower())
+code, raw = call("GET", CONSOLE + "/api/preauth/config?preauth=" + urllib.parse.quote(pa_id),
+                 opener_=popener)
+gview = jstat(code, raw) or {}
+say("pa_draft_reread", "%s:%s" % (gview.get("version"),
+                                  (gview.get("config") or {}).get("hostname")))
+# 设备页现在能说「已配置 · 草稿 vN」，而不是假称有一台离线设备
+code, raw = call("GET", CONSOLE + "/api/preauth", opener_=popener)
+prow = [r for r in (jstat(code, raw) or {}).get("preauths", []) if r["id"] == pa_id]
+say("pa_row_config_version", prow[0].get("config_version") if prow else "none")
+
+# C5. 没有 node 就没有发布这件事：400 而不是"发了一条不存在的设备"
+code, _ = call("POST", CONSOLE + "/api/config/publish",
+               {"node_id": 0}, opener_=popener)
+say("pa_publish_needs_node", code)
+
+# C6. 认领之前，先用错索引入网：必须拒绝并说清原因（D3），不能静默当普通入网
+code, raw = call("POST", CONSOLE + "/api/claims/code", {"id": pa_claim, "ttl_sec": 600},
+                 opener_=popener)
+pa_code = (jstat(code, raw) or {}).get("code", "")
+ec, eb = enroll(pa_code, "SN-WRONG-INDEX", "CPE-不存在的名字")
+say("pa_enroll_bad_index", ec)
+why = eb.decode(errors="replace") if isinstance(eb, bytes) else str(eb)
+say("pa_enroll_bad_index_says_why",
+    "yes" if ("没有名为" in why and "CPE-仓库门口" in why) else why[:160])
+
+# C7. 正确索引 + 正确序列号：入网即认领，配置跟着 node 走（D5），但不自动发布（D4）
+ec, eb = enroll(pa_code, "SN-PA-1", "CPE-仓库门口")
+say("pa_enroll", ec)
+pa_node = (eb or {}).get("node_id") if isinstance(eb, dict) else "none"
+say("pa_enroll_node", pa_node)
+say("pa_enroll_echoes_name", str((eb or {}).get("preauth_name") if isinstance(eb, dict) else ""))
+
+code, raw = call("GET", CONSOLE + "/api/state", opener_=popener)
+bst = jstat(code, raw) or {}
+brow = [r for r in (bst.get("preauths") or []) if r["id"] == pa_id]
+say("pa_bound_node", brow[0].get("bound_node_id") if brow else "none")
+bclaim = [c for c in (bst.get("claims") or []) if c["id"] == pa_claim]
+say("pa_seat_after_claim",
+    "%s+%s/%s" % (bclaim[0]["uses"], bclaim[0]["reserved"], bclaim[0]["max_uses"]) if bclaim else "none")
+
+code, raw = call("GET", CONSOLE + "/api/config?node=%s" % pa_node, opener_=popener)
+nview = jstat(code, raw) or {}
+say("pa_moved_version", nview.get("version"))
+say("pa_moved_no_publish", str("published_version" not in nview).lower())
+say("pa_moved_hostname", (nview.get("config") or {}).get("hostname"))
+say("pa_moved_serial", nview.get("serial"))
+# 草稿只有份：认领之后原来那条不能再被改写，避免页面上出现两份配置
+code, _ = call("PUT", CONSOLE + "/api/preauth/config",
+               {"preauth_id": pa_id, "config": pa_cfg}, opener_=popener)
+say("pa_draft_after_bind", code)
+
+# C8. 纸面设备也占名额（D2）：登记第二条之后已满，普通入网必须被拒并且说清
+# 是哪一半被纸占着；撤销那条登记，名额立刻释放，入网就能过。
+code, raw = call("POST", CONSOLE + "/api/preauth",
+                 {"claim_id": pa_claim, "name": "CPE-第二台"}, opener_=popener)
+pa2 = (jstat(code, raw) or {}).get("preauth") or {}
+say("pa_second_create", code)
+ec3, eb3 = enroll(pa_code, "SN-IMPULSE")
+say("pa_plain_enroll_blocked", ec3)
+why3 = eb3.decode(errors="replace") if isinstance(eb3, bytes) else str(eb3)
+say("pa_blocked_says_paper",
+    "yes" if ("预授权未认领 1 个" in why3 and "2/2" in why3 and "撤销一条预授权" in why3) else why3[:160])
+code, _ = call("POST", CONSOLE + "/api/preauth/revoke", {"id": pa2.get("id", "")},
+               opener_=popener)
+say("pa_revoke", code)
+ec4, _ = enroll(pa_code, "SN-IMPULSE")
+say("pa_plain_enroll_after_revoke", ec4)

@@ -330,6 +330,12 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/config", s.handleAdminConfig)
 	mux.HandleFunc("/api/config/bundle", s.handleAdminConfigBundle)
 	mux.HandleFunc("/api/config/publish", s.handleAdminConfigPublish)
+	// 预授权: devices the tenant registers before they exist. Tenant-only, like the
+	// config layer -- the operator hands out seats and never names a customer's
+	// boxes; it sees a grant's reserved count, not the names behind it.
+	mux.HandleFunc("/api/preauth", s.handleAdminPreAuth)
+	mux.HandleFunc("/api/preauth/revoke", s.handleAdminPreAuthRevoke)
+	mux.HandleFunc("/api/preauth/config", s.handleAdminPreAuthConfig)
 	// Underlay is tenant-only and never appears in /api/state; the operator role
 	// sees inventory, not a customer's network layout.
 	mux.HandleFunc("/api/underlay", s.handleAdminUnderlay)
@@ -545,6 +551,10 @@ type consoleClaim struct {
 	Uses          int      `json:"uses"`
 	Serials       []string `json:"serials"`
 	RedeemedCount int      `json:"redeemed_count"`
+	// Reserved is how many seats are held by 预授权 records with no device yet. The
+	// operator sees the count and nothing else: which names the tenant reserved
+	// and what they configured for them is not this role's view.
+	Reserved int `json:"reserved"`
 
 	CodeActive    bool   `json:"code_active"`
 	CodeIssuedAt  int64  `json:"code_issued_at_unix,omitempty"`
@@ -592,7 +602,10 @@ type consoleState struct {
 	Tenants    []*Tenant         `json:"tenants"`
 	Claims     []consoleClaim    `json:"claims"`
 	Nodes      []consoleNode     `json:"nodes"`
-	NowUnix    int64             `json:"now_unix"`
+	// PreAuths is tenant-only, like Runtime: an operator sees that a grant has
+	// seats held, never which devices the customer named.
+	PreAuths []consolePreAuth `json:"preauths"`
+	NowUnix  int64            `json:"now_unix"`
 }
 
 func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
@@ -609,9 +622,10 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 	// Empty collections must serialize as [] rather than null: a tenant with no
 	// device yet is normal, and the page filters these slices unconditionally.
 	var out = consoleState{
-		Tenants: []*Tenant{},
-		Claims:  []consoleClaim{},
-		Nodes:   []consoleNode{},
+		Tenants:  []*Tenant{},
+		Claims:   []consoleClaim{},
+		Nodes:    []consoleNode{},
+		PreAuths: []consolePreAuth{},
 	}
 	s.mu.Lock()
 	out.Controller = consoleController{
@@ -658,6 +672,12 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 			cn.Runtime = &rt
 		}
 		out.Nodes = append(out.Nodes, cn)
+	}
+	// 预授权 rows are the tenant's own list, and they are separate from Nodes on
+	// purpose: a record with no device must not be counted as an offline box, an
+	// unplaced device, or a pending heartbeat anywhere in the page.
+	if id.Role == roleTenant {
+		out.PreAuths = s.preAuthListLocked(id.TenantID)
 	}
 	s.mu.Unlock()
 	out.NowUnix = time.Now().Unix()
@@ -717,6 +737,7 @@ func claimView(c *Claim) *consoleClaim {
 		CreatedAt: c.CreatedAt, Revoked: c.Revoked,
 		MaxUses: c.MaxUses, Uses: len(c.Serials),
 		Serials: append([]string{}, c.Serials...), RedeemedCount: len(c.Serials),
+		Reserved: len(c.Reserved),
 
 		// Expiry is evaluated here as well as in the sweeper: the two-second
 		// sweep interval must not show a dead code as live to the tenant.
@@ -726,6 +747,21 @@ func claimView(c *Claim) *consoleClaim {
 		CodeIssuedBy:  c.CodeIssuedBy,
 		CodeUsedAt:    c.CodeUsedAt,
 	}
+}
+
+// tenantClaimViewsLocked is the same row set /api/state builds, so a write that
+// moves a seat (create/revoke a pre-authorization) can hand the page the fresh
+// counts instead of leaving the grant table showing the pre-write numbers.
+func (s *server) tenantClaimViewsLocked(tenant string) []consoleClaim {
+	out := []consoleClaim{}
+	for _, c := range s.state.Claims {
+		if c.TenantID != tenant {
+			continue
+		}
+		out = append(out, *claimView(c))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out
 }
 
 func (s *server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
@@ -1071,9 +1107,10 @@ func (s *server) handleAdminClaimUpdate(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "unknown grant", 404)
 		return
 	}
-	if used := len(c.Serials); maxUses < used {
+	if used := seatsTakenLocked(c); maxUses < used {
 		s.mu.Unlock()
-		http.Error(w, fmt.Sprintf("max_uses cannot be below the %d activations already used", used), 400)
+		http.Error(w, fmt.Sprintf("max_uses cannot be below the %d seats already taken (%d 已入网 + %d 预授权未认领)",
+			used, len(c.Serials), len(c.Reserved)), 400)
 		return
 	}
 	c.MaxUses = maxUses

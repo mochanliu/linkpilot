@@ -40,9 +40,10 @@ type nodeSiteRequest struct {
 // to stop showing a stale number.
 func (s *server) sitesResponseLocked(w http.ResponseWriter, tenant string, extra map[string]any) {
 	out := map[string]any{
-		"ok":             true,
-		"sites":          s.tenantSitesLocked(tenant),
-		"unplaced_nodes": s.unplacedNodesLocked(tenant),
+		"ok":                true,
+		"sites":             s.tenantSitesLocked(tenant),
+		"unplaced_nodes":    s.unplacedNodesLocked(tenant),
+		"unplaced_preauths": s.unplacedPreAuthsLocked(tenant),
 	}
 	for k, v := range extra {
 		out[k] = v
@@ -61,9 +62,10 @@ func (s *server) handleAdminUnderlaySites(w http.ResponseWriter, r *http.Request
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		writeJSON(w, map[string]any{
-			"sites":          s.tenantSitesLocked(id.TenantID),
-			"unplaced_nodes": s.unplacedNodesLocked(id.TenantID),
-			"now_unix":       time.Now().Unix(),
+			"sites":             s.tenantSitesLocked(id.TenantID),
+			"unplaced_nodes":    s.unplacedNodesLocked(id.TenantID),
+			"unplaced_preauths": s.unplacedPreAuthsLocked(id.TenantID),
+			"now_unix":          time.Now().Unix(),
 		})
 		return
 	case http.MethodPost, http.MethodPut:
@@ -155,6 +157,11 @@ func (s *server) handleAdminUnderlaySiteDelete(w http.ResponseWriter, r *http.Re
 			http.StatusConflict)
 		return
 	}
+	if held := s.sitePreAuthsLocked(siteID); held > 0 {
+		http.Error(w, fmt.Sprintf("该站点还有 %d 台预授权设备（还没到货，但位置已经定了），先撤销或改到别的站点", held),
+			http.StatusConflict)
+		return
+	}
 	delete(s.state.Sites, si.ID)
 	s.save()
 	log.Printf("console: tenant %s deleted site %s (%s)", id.TenantID, si.ID, si.Name)
@@ -211,7 +218,29 @@ func siteViewOf(si *Site, devices int) underlaySiteView {
 }
 
 func (s *server) siteViewLocked(si *Site) underlaySiteView {
-	return siteViewOf(si, s.siteDevicesLocked(si.ID))
+	return underlaySiteView{
+		ID: si.ID, Name: si.Name, Lon: si.Lon, Lat: si.Lat,
+		Devices: s.siteDevicesLocked(si.ID), PreAuths: s.sitePreAuthsLocked(si.ID),
+		CreatedAt: si.CreatedAt, UpdatedAt: si.UpdatedAt,
+	}
+}
+
+// sitePreAuthsLocked counts the on-paper devices standing in a site. They are
+// deliberately not added into Devices -- the map draws boxes that exist, and a
+// site row saying "3 台设备" over two dots is a contradiction this console already
+// refuses to render. They do, however, hold the location: deleting a site out
+// from under one would silently turn a planned placement into 未定位.
+func (s *server) sitePreAuthsLocked(siteID string) int {
+	if siteID == "" {
+		return 0
+	}
+	n := 0
+	for _, p := range s.state.PreAuths {
+		if p != nil && p.SiteID == siteID && !p.claimed() {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *server) siteDevicesLocked(siteID string) int {
@@ -249,4 +278,20 @@ func (s *server) nodeByIDLocked(tenant string, nodeID uint16) *NodeRecord {
 		}
 	}
 	return nil
+}
+
+// unplacedPreAuthsLocked counts the tenant's on-paper devices with no location
+// the map could use. Claimed records are excluded: their placement moved onto the
+// node, so counting them here would double-report one box.
+func (s *server) unplacedPreAuthsLocked(tenant string) int {
+	n := 0
+	for _, p := range s.state.PreAuths {
+		if p == nil || p.TenantID != tenant || p.claimed() {
+			continue
+		}
+		if s.siteLocked(tenant, p.SiteID) == nil {
+			n++
+		}
+	}
+	return n
 }

@@ -207,7 +207,7 @@ func enrollAndDial(t *testing.T, id *Identity, base string, roots *x509.CertPool
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := Enroll(ctx, base, roots, id.EnrollRequest("CLAIM-1", "0.3.0", 2))
+	resp, err := Enroll(ctx, base, roots, id.EnrollRequest("CLAIM-1", "0.3.0", 2, ""))
 	if err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestEnrollRequestCarriesIdentityKeyNotWGKey(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := Enroll(ctx, srv.URL, pki.pool, id.EnrollRequest("CLAIM-1", "0.3.0", 2)); err != nil {
+	if _, err := Enroll(ctx, srv.URL, pki.pool, id.EnrollRequest("CLAIM-1", "0.3.0", 2, "")); err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
 
@@ -287,15 +287,15 @@ func TestEnrollRefusesUnpinnedCA(t *testing.T) {
 	// 拿别人的 CA 当根去连：必须握手失败。这里没有 trust-on-first-use ——
 	// enroll 应答里装的是整套信任根，第一次就无条件接受，等于把"伪造整个租户"
 	// 的成本降到一次抓包。
-	if _, err := Enroll(ctx, srv.URL, other.pool, id.EnrollRequest("CLAIM-1", "0.3.0", 2)); err == nil {
+	if _, err := Enroll(ctx, srv.URL, other.pool, id.EnrollRequest("CLAIM-1", "0.3.0", 2, "")); err == nil {
 		t.Fatal("用了没固定过的 CA 居然 enroll 成功")
 	} else if !strings.Contains(err.Error(), "unknown authority") {
 		t.Errorf("错误没点明是证书链问题: %v", err)
 	}
-	if _, err := Enroll(ctx, srv.URL, nil, id.EnrollRequest("CLAIM-1", "0.3.0", 2)); err == nil {
+	if _, err := Enroll(ctx, srv.URL, nil, id.EnrollRequest("CLAIM-1", "0.3.0", 2, "")); err == nil {
 		t.Error("roots 为 nil 也照样发请求")
 	}
-	if _, err := Enroll(ctx, "no-scheme-host", pki.pool, id.EnrollRequest("CLAIM-1", "0.3.0", 2)); err == nil {
+	if _, err := Enroll(ctx, "no-scheme-host", pki.pool, id.EnrollRequest("CLAIM-1", "0.3.0", 2, "")); err == nil {
 		t.Error("地址里没有主机名却成功了")
 	}
 }

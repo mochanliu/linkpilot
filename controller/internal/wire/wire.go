@@ -65,6 +65,14 @@ type EnrollRequest struct {
 	ProtocolVer   int    `json:"protocol_ver"`
 	AgentVersion  string `json:"agent_version"`
 	UDPRelfectorN int    `json:"udp_reflectors"` // how many reflector addrs the agent can probe
+	// PreAuth is the index of a 预授权 record the tenant created in advance --
+	// today its name, typed by whoever is standing at the rack. Optional: an
+	// empty value is an ordinary enrollment. It is NOT a protocol-version change
+	// (a controller that does not know the field behaves exactly as before), which
+	// is why the response echoes what was actually bound -- the agent has to be
+	// able to tell "no controller-side record" from "an old controller dropped my
+	// argument".
+	PreAuth string `json:"preauth,omitempty"`
 }
 
 // RRAddress names one route reflector. ID is for humans and session logs; Addr
@@ -100,6 +108,12 @@ type EnrollResponse struct {
 	TLSAddrs     []string `json:"tls_addrs"`
 	HeartbeatSec int      `json:"heartbeat_sec"`
 	Epoch        uint32   `json:"epoch"` // controller-assigned; devices never compute this themselves
+
+	// PreAuthName echoes the 预授权 index this enrollment bound, if any. It exists
+	// so the agent can prove the hand-over happened: an agent that asked for an
+	// index and gets an empty echo did NOT receive the configuration waiting
+	// behind it, which is otherwise invisible from the box.
+	PreAuthName string `json:"preauth_name,omitempty"`
 }
 
 // PKey is one entry of the tenant's hop-MAC key ring.
@@ -360,9 +374,9 @@ func NormaliseTunnelEndpoints(self uint16, in []TunnelEndpoint) ([]TunnelEndpoin
 // what that does and does not protect: it stops key substitution in transit, it
 // does not stop an attacker who owns the tenant CA).
 type MappingReport struct {
-	UDPMapping   string              `json:"udp_mapping"` // "ip:port" as observed by the reflector
-	LocalPort    int                 `json:"local_port"`  // the node's own local port (for symmetric-NAT analysis)
-	SymmetricNAT bool                `json:"symmetric_nat"`
+	UDPMapping   string `json:"udp_mapping"` // "ip:port" as observed by the reflector
+	LocalPort    int    `json:"local_port"`  // the node's own local port (for symmetric-NAT analysis)
+	SymmetricNAT bool   `json:"symmetric_nat"`
 	// SymmetricKnown says whether SymmetricNAT is a measurement or just the zero
 	// value. An agent that has not run the two-reflector comparison cannot tell,
 	// and reporting false would let the planner build a tunnel that cannot work.

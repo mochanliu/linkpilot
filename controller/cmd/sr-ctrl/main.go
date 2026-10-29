@@ -196,6 +196,11 @@ type Claim struct {
 	CodeIssuedBy  string `json:"code_issued_by,omitempty"`
 	CodeUsedAt    int64  `json:"code_used_at_unix,omitempty"`
 
+	// Reserved lists the 预授权 records (see preauth.go) that hold a seat on this
+	// grant but have no device yet. It is a ledger of record ids, so a seat is
+	// never counted twice and revoking a record releases exactly what it took.
+	Reserved []string `json:"reserved,omitempty"`
+
 	// Legacy fields, read-only migration input. State files written before
 	// codes became ephemeral keep the plaintext code (as the map key and in
 	// "code"), a note, and a grant-level expiry. normalizeState turns them into
@@ -285,6 +290,19 @@ type State struct {
 	// the dataplane. It exists so several boxes in one building share one position
 	// instead of each carrying its own typed-in copy.
 	Sites map[string]*Site `json:"sites"`
+
+	// PreAuths is the tenant's on-paper device list: names and site assignments
+	// for boxes that have not enrolled yet, keyed by pre-authorization id. It is
+	// deliberately NOT a NodeRecord with a reserved node id -- a node id only ever
+	// comes into existence during enrollment, and inventing one early would put
+	// the console ahead of the one fact the dataplane depends on.
+	PreAuths map[string]*PreAuth `json:"preauths"`
+
+	// PreAuthConfigs holds each pre-authorization's draft, keyed by
+	// "tenant|preauth". Separate from Configs because its key has no node: the
+	// draft moves into Configs at the enrollment that claims the record, and a
+	// draft that never got claimed is dropped with the record.
+	PreAuthConfigs map[string]*DeviceConfig `json:"preauth_configs"`
 }
 
 // Account is one console login. Passwords are stored only as PBKDF2 hashes
@@ -380,6 +398,9 @@ func seedState() *State {
 		Configs:    map[string]*DeviceConfig{},
 		Underlays:  map[string]*UnderlayConfig{},
 		Sites:      map[string]*Site{},
+		PreAuths:   map[string]*PreAuth{},
+
+		PreAuthConfigs: map[string]*DeviceConfig{},
 	}
 	for id, name := range map[string]string{"tenant-a": "演示租户 A", "tenant-b": "演示租户 B"} {
 		s.Tenants[id] = &Tenant{ID: id, Name: name, CreatedAt: now}
@@ -563,6 +584,9 @@ func normalizeState(s *State) bool {
 	// would be drawn at someone else's coordinates. Clear those and let the
 	// topology say 未上报.
 	if normalizeSites(s) {
+		migrated = true
+	}
+	if normalizePreAuths(s) {
 		migrated = true
 	}
 	return migrated
@@ -909,13 +933,46 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// 预授权认领: the engineer at the rack named the record this box should take
+	// over. D3 -- an index that does not resolve is a refusal, never a quiet
+	// fallback to a plain enrollment: the alternative is a box that enrolls,
+	// receives none of the configuration waiting for it, and looks fine.
+	paName := strings.TrimSpace(req.PreAuth)
+	var pa *PreAuth
+	if paName != "" {
+		pa = s.preAuthByNameLocked(tenant, paName)
+		if pa == nil {
+			msg := fmt.Sprintf("租户 %s 下没有名为「%s」的预授权；未认领的索引：%s",
+				tenant, paName, s.unclaimedPreAuthNamesLocked(tenant))
+			log.Printf("enroll REJECTED serial=%s (预授权 %s)", req.Serial, paName)
+			http.Error(w, msg, 403)
+			return
+		}
+	}
 	if rec == nil {
+		if pa != nil {
+			if refusal := s.preAuthRefusalLocked(claim, pa, req.Serial); refusal != "" {
+				log.Printf("enroll REJECTED serial=%s (预授权 %s): %s", req.Serial, pa.ID, refusal)
+				http.Error(w, refusal, 403)
+				return
+			}
+			// The seat is already reserved (D2): releasing it before the check is
+			// what turns "reserved" into "activated" without charging twice.
+			claim.Reserved = removeString(claim.Reserved, pa.ID)
+		}
 		// A seat is a device, not an enrollment: re-enrolling a serial that
 		// already belongs to this tenant is free, even when the code is full.
-		if claim.MaxUses > 0 && len(claim.Serials) >= claim.MaxUses {
-			log.Printf("enroll REJECTED serial=%s (grant %s used %d/%d)",
-				req.Serial, claim.ID, len(claim.Serials), claim.MaxUses)
-			http.Error(w, "claim code has no activations left", 403)
+		if claim.MaxUses > 0 && seatsTakenLocked(claim) >= claim.MaxUses {
+			log.Printf("enroll REJECTED serial=%s (grant %s used %d/%d, 预授权未认领 %d)",
+				req.Serial, claim.ID, len(claim.Serials), claim.MaxUses, len(claim.Reserved))
+			msg := "claim code has no activations left"
+			if len(claim.Reserved) > 0 {
+				// Telling the site which half of the limit is paper is the only
+				// way this failure becomes actionable from a console log.
+				msg = fmt.Sprintf("%s（已入网 %d 台 + 预授权未认领 %d 个 = %d/%d；先在控制台撤销一条预授权或提高名额）",
+					msg, len(claim.Serials), len(claim.Reserved), seatsTakenLocked(claim), claim.MaxUses)
+			}
+			http.Error(w, msg, 403)
 			return
 		}
 		id := s.state.NextNodeID[tenant]
@@ -935,10 +992,28 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		// this grant actually activated belongs in it.
 		claim.Serials = append(claim.Serials, req.Serial)
 		claim.CodeUsedAt = time.Now().Unix()
-		log.Printf("enroll: serial=%s -> tenant=%s node=%d (grant %s %d/%d)",
-			req.Serial, tenant, id, claim.ID, len(claim.Serials), claim.MaxUses)
+		if pa != nil {
+			s.bindPreAuthLocked(rec, pa, claim, req.Serial, time.Now().Unix())
+			log.Printf("enroll: serial=%s -> tenant=%s node=%d 认领预授权「%s」(grant %s %d/%d)",
+				req.Serial, tenant, id, pa.Name, claim.ID, len(claim.Serials), claim.MaxUses)
+		} else {
+			log.Printf("enroll: serial=%s -> tenant=%s node=%d (grant %s %d/%d)",
+				req.Serial, tenant, id, claim.ID, len(claim.Serials), claim.MaxUses)
+		}
 	} else {
 		log.Printf("enroll: serial=%s re-enrolled as tenant=%s node=%d", req.Serial, tenant, rec.NodeID)
+		if pa != nil && (pa.BoundNodeID != rec.NodeID || pa.BoundSerial != req.Serial) {
+			// Re-presenting the index that already claimed THIS node is normal (an
+			// agent restart replays its flags). Anything else is a mistake worth a
+			// refusal: silently moving a pre-authorized config onto a device that
+			// already has its own would overwrite one tenant-visible config with
+			// another without anyone publishing either.
+			msg := fmt.Sprintf("这台设备已入网为 node %d；预授权「%s」还没有被它认领，配置不会自动挪过来。要合并请先在控制台撤销其一",
+				rec.NodeID, pa.Name)
+			log.Printf("enroll REJECTED serial=%s (预授权 %s 与已入网 node %d 冲突)", req.Serial, pa.ID, rec.NodeID)
+			http.Error(w, msg, 403)
+			return
+		}
 	}
 	rec.PublicKey = base64.StdEncoding.EncodeToString(pub)
 	rec.AgentVer = req.AgentVersion
@@ -969,7 +1044,13 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		s.admin.publish("node.underlay", tenant, rec)
 	}
 
-	json.NewEncoder(w).Encode(s.enrollResponse(tenant, rec, certPEM, string(caPEM)))
+	resp := s.enrollResponse(tenant, rec, certPEM, string(caPEM))
+	if pa != nil {
+		// The echo is the agent's proof that the configuration it asked for is
+		// the one attached to this identity.
+		resp.PreAuthName = pa.Name
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 // findClaimByCodeLocked resolves a presented code to its grant. The caller must

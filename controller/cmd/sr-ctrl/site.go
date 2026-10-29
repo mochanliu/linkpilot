@@ -44,6 +44,11 @@ type underlaySiteView struct {
 	Devices   int     `json:"devices"`
 	CreatedAt int64   `json:"created_at_unix"`
 	UpdatedAt int64   `json:"updated_at_unix,omitempty"`
+	// PreAuths is how many 预授权 records stand here with no device yet. It is a
+	// separate number, not added into Devices, because the map only draws boxes
+	// that exist: a site page that said "3 台设备" over 2 dots would be the kind of
+	// contradiction this console already refuses to render.
+	PreAuths int `json:"preauths"`
 }
 
 func validSiteName(name string) bool {
@@ -95,6 +100,14 @@ func (s *server) tenantSitesLocked(tenant string) []underlaySiteView {
 			counts[n.SiteID]++
 		}
 	}
+	// An unclaimed record still occupies the building the admin chose for it; a
+	// claimed one lives on the node now, so it must not be counted twice.
+	paCounts := map[string]int{}
+	for _, p := range s.state.PreAuths {
+		if p != nil && p.TenantID == tenant && p.SiteID != "" && !p.claimed() {
+			paCounts[p.SiteID]++
+		}
+	}
 	out := []underlaySiteView{}
 	for _, si := range s.state.Sites {
 		if si == nil || si.TenantID != tenant {
@@ -102,7 +115,8 @@ func (s *server) tenantSitesLocked(tenant string) []underlaySiteView {
 		}
 		out = append(out, underlaySiteView{
 			ID: si.ID, Name: si.Name, Lon: si.Lon, Lat: si.Lat,
-			Devices: counts[si.ID], CreatedAt: si.CreatedAt, UpdatedAt: si.UpdatedAt,
+			Devices: counts[si.ID], PreAuths: paCounts[si.ID],
+			CreatedAt: si.CreatedAt, UpdatedAt: si.UpdatedAt,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

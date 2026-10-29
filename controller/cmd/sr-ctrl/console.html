@@ -166,9 +166,21 @@
   .und-box{border:1px solid var(--line);border-radius:8px;padding:12px 14px}
   .und-box h3{font-size:13.5px;margin-bottom:8px}
   .und-box .hint{margin:8px 0 0}
-  .node-pick{display:flex;flex-wrap:wrap;gap:6px 16px;margin:0;padding:0;list-style:none}
-  .node-pick label{display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap}
-  .node-pick input{width:auto}
+  /* 设备选择器：过滤条件 + 可见列表。设备一多，下拉框要翻很久，
+     所以所有"选设备"的地方统一成这一组控件（见 dpHtml）。 */
+  .devpick{display:flex;flex-direction:column;gap:5px;min-width:260px}
+  .devpick .dp-tools{display:flex;gap:5px}
+  .devpick .dp-tools input{flex:1;min-width:0;padding:5px 8px;font-size:12.5px}
+  .devpick .dp-tools select{padding:4px 6px;font-size:12.5px;min-width:0}
+  .devpick select.devlist{padding:3px;font-size:12.5px;width:100%;max-width:360px}
+  .devpick select.devlist option{padding:2px 5px}
+  .devpick .dp-count{font-size:11.5px;color:var(--muted)}
+  /* 配置页顶栏里的设备列表比一行高，所以整栏按顶部对齐：左边是能过滤的设备
+     列表，右边是版本说明与按钮，贴在上方而不是被列表拽到垂直居中。 */
+  .cfg-bar.haspick{align-items:flex-start}
+  .cfg-bar.haspick>.devpick{flex:0 1 340px}
+  .cfg-bar.haspick>.cfg-side{flex:1;min-width:230px;display:flex;flex-direction:column;
+    gap:8px;align-items:flex-end;text-align:right}
   .avoid-list{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0;padding:0;list-style:none}
   .avoid-list li{display:flex;align-items:center;gap:6px;border:1px solid var(--line);
     border-radius:999px;padding:2px 4px 2px 10px;font-size:12.5px}
@@ -289,20 +301,19 @@
     <div class="logo">SROU<small>CONTROLLER</small></div>
     <nav id="nav">
       <a href="#dashboard" data-view="dashboard">Dashboard</a>
-      <div class="sect" data-roles="operator">运营</div>
-      <a class="child" href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
-      <div class="sect">资产</div>
-      <a class="child" href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
-      <a class="child" href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
       <a href="#config" data-view="config" data-roles="tenant">基础配置</a>
       <div class="sect" data-roles="tenant">Underlay 配置</div>
       <a class="child" href="#underlay-settings" data-view="underlay-settings" data-roles="tenant">全局配置</a>
       <a class="child" href="#underlay-tunnels" data-view="underlay-tunnels" data-roles="tenant">隧道配置</a>
+      <div class="sect" data-roles="tenant">Overlay 配置</div>
+      <a class="child dis" data-roles="tenant">路由 · 尚未规划</a>
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a class="child" href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
-      <div class="sect" data-roles="tenant">Overlay 配置</div>
-      <a class="child dis" data-roles="tenant">路由 · 尚未规划</a>
+      <div class="sect">资产</div>
+      <a class="child" href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
+      <a class="child" href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
+      <a class="child" href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
       <div class="sect">账号管理</div>
       <a class="child" href="#accounts" data-view="accounts" data-roles="operator">账号 <span class="n" id="n-accounts">0</span></a>
       <a class="child" href="#account" data-view="account" id="nav-account">账号设置</a>
@@ -337,7 +348,7 @@
   var S = { state: null, me: null, accounts: null, loginTab: "account",
     view: "dashboard", lastResult: null, lastSecret: null, codeReveal: null,
     html: "", timer: null, ago: null, es: null,
-    metrics: null, fast: null, cfg: null, und: null, topo: null, sites: null };
+    metrics: null, fast: null, cfg: null, und: null, topo: null, sites: null, pa: null };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -1035,20 +1046,26 @@
       (isOp ? '<button class="small" data-act="goto" data-view="tenants">新建租户</button>' : "") +
       "</header>" +
       '<div class="hint">' + (isOp
-        ? "「当前码」只显示客户是否生成过、还有多久失效；码本身不在这里，也不会出现在接口或日志里。名额按设备计：每激活一台新设备占一个名额，同一台设备重复入网不再占名额。吊销只阻止未来的入网，已入网设备的证书不受影响。"
-        : "要激活设备时点「生成」并选有效期；码只显示这一次，重新生成或过期后旧码立即失效。名额按设备计：每激活一台新设备占一个名额，同一台设备重复入网不再占名额。") + "</div>";
+        ? "「当前码」只显示客户是否生成过、还有多久失效；码本身不在这里，也不会出现在接口或日志里。名额按设备计：每激活一台新设备占一个名额，同一台设备重复入网不再占名额；客户先做的「预授权」也占一个名额，直到盒子认领或登记被撤销。吊销只阻止未来的入网，已入网设备的证书不受影响。"
+        : "要激活设备时点「生成」并选有效期；码只显示这一次，重新生成或过期后旧码立即失效。名额按设备计：每激活一台新设备占一个名额，同一台设备重复入网不再占名额；在「设备」页预授权一台还没到货的盒子，从创建那一刻就占名额（撤销登记会放回来）。") + "</div>";
     if (!st.claims.length) {
       h += '<div class="empty">' + (isOp ? "还没有下发授权。" : "运营方还没有为你的租户下发入网授权。") + "</div>";
     } else {
       var cols = isOp
-        ? ["授权名称", "租户", "名额（已激活 / 上限）", "当前码", "已入网序列号", ""]
-        : ["授权名称", "名额（已激活 / 上限）", "当前码", "已入网序列号", ""];
+        ? ["授权名称", "租户", "名额（已占用 / 上限）", "当前码", "已入网序列号", ""]
+        : ["授权名称", "名额（已占用 / 上限）", "当前码", "已入网序列号", ""];
       h += "<table><thead><tr>" + cols.map(function (x) { return "<th>" + esc(x) + "</th>"; }).join("") +
         "</tr></thead><tbody>";
       st.claims.forEach(function (c) {
-        var full = c.uses >= c.max_uses;
+        // 名额是两笔账：真设备占的，和预授权先占的（D2：创建就占，不等到货）。
+        // 只显示前者会让人以为还有余量，然后在预授权那一步被拒绝。
+        var reserved = c.reserved || 0;
+        var used = (c.uses || 0) + reserved;
+        var full = c.max_uses && used >= c.max_uses;
         var seats = '<span class="seats' + (full ? " full" : "") + '"><b>' +
-          c.uses + "</b> / " + c.max_uses + "</span>";
+          used + "</b> / " + c.max_uses + "</span>" +
+          '<div class="muted" style="font-size:12px">已入网 ' + (c.uses || 0) + " 台" +
+          (reserved ? " · 预授权占 " + reserved + " 个" : "") + "</div>";
         h += "<tr>" +
           "<td><b>" + esc(c.name || "入网授权") + "</b>" +
           (c.revoked ? ' <span class="tag revoked">已吊销</span>'
@@ -1057,11 +1074,12 @@
         h += "<td>" + seats + "</td>" +
           "<td>" + grantCodeState(c) +
           '<div class="muted" style="font-size:12px;margin-top:2px">' + grantCodeWindow(c, isOp) + "</div></td>" +
-          '<td class="mono muted">' + (c.serials.length ? esc(c.serials.join(", ")) : "—") + "</td>" +
+          '<td class="mono muted">' + (c.serials.length ? esc(c.serials.join(", ")) : "—") +
+          (isOp ? "" : paWaitingCell(st, c.id)) + "</td>" +
           '<td class="row-actions">';
         if (isOp) {
           h += '<button class="small" data-act="edit-max" data-id="' + esc(c.id) +
-            '" data-used="' + c.uses + '" data-max="' + c.max_uses +
+            '" data-used="' + used + '" data-reserved="' + reserved + '" data-max="' + c.max_uses +
             '" data-name="' + esc(c.name || "入网授权") + '">改名额</button>' +
             (c.revoked ? "" : '<button class="small danger" data-act="revoke" data-id="' +
               esc(c.id) + '" data-name="' + esc(c.name || "入网授权") + '">吊销</button>');
@@ -1106,6 +1124,7 @@
         : "「外层映射」是控制器记下的设备 NAT 外层地址:端口，来源是心跳里的上报或观测回报；没记到就写「未上报」，页面不猜。配置是否已落到设备上以设备回报为准，看「基础配置」页的「下发到设备」；心跳年龄与隧道内遥测在「监控与管理 › 监控」页。") +
       "</div></section>";
     if (t) {
+      h += paPanel(st);
       h += undNote(t.note);
       h += undSiteFormPanel(t);
       h += undSiteListPanel(t);
@@ -1269,23 +1288,48 @@
   // The draft lives in S so the 10s state poll (which redraws this view) cannot
   // throw edits away. Field input handlers update S; render() skips while an
   // input has focus, so nothing fights the caret.
+  //
+  // 配置页的目标有两种：一台已入网设备，或者一条还没到货的预授权。预授权没有
+  // node 号（node_id 只在入网那一刻产生），所以用 cs.pa 存它的 id，此时
+  // cs.nodeID = 0。两种目标共用同一份草稿编辑器，但只有设备能发布：见 cfgIsPA。
+  function cfgIsPA(cs) { return !!cs.pa; }
+
+  function cfgTarget(cs) { return cs.pa ? "pa:" + cs.pa : String(cs.nodeID); }
+
+  // 已认领的预授权不再出现在配置页的设备列表里：它已经是一台设备，草稿也
+  // 已经挪到 node 上，再列一次会出现两个入口指向同一个盒子。
+  function cfgPreAuths() {
+    return ((S.state && S.state.preauths) || []).filter(function (p) { return !p.bound_node_id; });
+  }
+
   function openConfig() {
     var nodes = (S.state && S.state.nodes) || [];
-    if (!nodes.length) { S.cfg = null; return; }
+    var pas = cfgPreAuths();
+    if (!nodes.length && !pas.length) { S.cfg = null; return; }
     var cs = S.cfg;
-    var ok = cs && nodes.some(function (n) { return n.node_id === cs.nodeID; });
+    var ok = cs && (cs.pa
+      ? pas.some(function (p) { return p.id === cs.pa; })
+      : nodes.some(function (n) { return n.node_id === cs.nodeID; }));
     if (ok && (cs.dirty || cs.view || cs.loading)) return;
-    S.cfg = { nodeID: ok ? cs.nodeID : nodes[0].node_id, view: null, draft: null,
+    S.cfg = { nodeID: ok && !cs.pa ? cs.nodeID : (nodes[0] ? nodes[0].node_id : 0),
+      pa: ok ? (cs.pa || "") : "",
+      view: null, draft: null,
       dirty: false, layer: cs ? cs.layer : "base", edit: null, ptab: "frr", vpn: 0,
       note: null, loading: false, bundle: null };
     loadConfig();
   }
 
-  function selectCfgNode(id) {
+  // val 是设备列表框的值："12" 是 node 12，"pa:xxxx" 是预授权。
+  function selectCfgTarget(val) {
     var cs = S.cfg;
-    if (!cs || cs.nodeID === id) return;
+    if (!cs) return;
+    var s = String(val || "");
+    var isPA = s.indexOf("pa:") === 0;
+    var id = isPA ? s.slice(3) : (Number(s) || 0);
+    if (cs.pa ? cs.pa === id : (!cs.pa && cs.nodeID === id)) return;
     if (cs.dirty && !confirm("切换设备会丢掉当前未保存的改动，继续？")) return;
-    cs.nodeID = id;
+    cs.pa = isPA ? id : "";
+    cs.nodeID = isPA ? 0 : id;
     cs.view = null;
     cs.draft = null;
     cs.dirty = false;
@@ -1298,13 +1342,36 @@
     loadConfig();
   }
 
+  // 从设备页或预授权表跳到基础配置，并选中同一台。已经有配置状态就复用它的
+  // 草稿缓存（切换目标时 selectCfgTarget 会先问要不要丢掉未保存的改动）。
+  function cfgGotoTarget(val) {
+    var s = String(val || "");
+    var isPA = s.indexOf("pa:") === 0;
+    blurContent();
+    if (!S.cfg) {
+      S.cfg = { nodeID: isPA ? 0 : (Number(s) || 0), pa: isPA ? s.slice(3) : "",
+        view: null, draft: null, dirty: false, layer: "base", edit: null, ptab: "frr",
+        vpn: 0, note: null, loading: false, bundle: null };
+      S.view = "config";
+      render();
+      loadConfig();
+      return;
+    }
+    selectCfgTarget(s);
+    S.view = "config";
+    render();
+  }
+
   function loadConfig() {
     var cs = S.cfg;
-    if (!cs || !cs.nodeID || cs.loading) return;
+    if (!cs || cs.loading) return;
+    if (!cs.pa && !cs.nodeID) return;
     cs.loading = true;
-    var nodeID = cs.nodeID;
-    api("GET", "/api/config?node=" + nodeID).then(function (v) {
-      if (S.cfg !== cs || cs.nodeID !== nodeID) return;
+    var want = cfgTarget(cs);
+    var url = cs.pa ? "/api/preauth/config?preauth=" + encodeURIComponent(cs.pa)
+      : "/api/config?node=" + cs.nodeID;
+    api("GET", url).then(function (v) {
+      if (S.cfg !== cs || cfgTarget(cs) !== want) return;
       cs.loading = false;
       cs.view = v;
       cs.draft = cfgClone(v.config);
@@ -1324,8 +1391,11 @@
 
   function cfgMetaText(cs) {
     var v = cs.view;
-    if (!v) return "尚未读取";
-    return "草稿 v" + esc(v.version) +
+    // 这行说明是页面上唯一一直看得见「在编辑谁」的地方：设备列表可能被过滤到
+    // 只剩一台，也可能被滚出视野。
+    var head = cfgIsPA(cs) ? "预授权（设备未入网）" : "node-" + esc(cs.nodeID);
+    if (!v) return head + " · 尚未读取";
+    return head + " · 草稿 v" + esc(v.version) +
       (v.updated_at_unix ? " · 保存于 " + esc(clock(v.updated_at_unix)) : " · 尚未保存过") +
       (v.updated_by ? " · " + esc(v.updated_by) : "");
   }
@@ -1345,8 +1415,11 @@
   }
 
   function viewConfig(st) {
-    if (!st.nodes.length) {
-      return '<section class="panel"><div class="empty">还没有设备。先在「入网授权」页生成一次性码接入一台，再回来配置它的客户侧。</div></section>';
+    var pas = cfgPreAuths();
+    if (!st.nodes.length && !pas.length) {
+      return '<section class="panel"><div class="empty">还没有设备，也还没有预授权。' +
+        "可以先在「资产 › 设备」页预授权一台（不用等盒子到货，配置就先存在这里），" +
+        "或者在「入网授权」页生成一次性码接入一台。</div></section>";
     }
     var cs = S.cfg;
     if (!cs) {
@@ -1365,21 +1438,25 @@
   }
 
   function cfgBar(st, cs) {
-    var opts = st.nodes.map(function (n) {
-      var stt = n.status === "online" ? "在线" : n.status === "stale" ? "失联" : "未上线";
-      return '<option value="' + esc(n.node_id) + '"' + (n.node_id === cs.nodeID ? " selected" : "") +
-        ">node-" + esc(n.node_id) + " · " + esc(n.serial) + " · " + stt + "</option>";
-    }).join("");
+    var items = dpNodeItems(st.nodes).concat(dpPreAuthItems(cfgPreAuths()));
+    var acts = '<button class="small" data-act="cfg-reload">重新载入</button>' +
+      '<button class="small" data-act="cfg-save">保存草稿</button>';
+    // 预授权没有设备，所以没有「发布」和「下载配置包」：这两个动作的对象是盒子。
+    if (!cfgIsPA(cs)) {
+      acts += '<button class="small" data-act="cfg-bundle">下载配置包</button>' +
+        '<button class="small primary" data-act="cfg-publish">发布到设备</button>';
+    }
     return '<section class="panel">' +
-      '<div class="cfg-bar"><select id="cfg-node" aria-label="选择设备">' + opts + "</select>" +
+      '<div class="cfg-bar haspick">' +
+      dpHtml("cfg-node", "", items, cfgTarget(cs), { size: 8 }) +
+      '<div class="cfg-side">' +
       '<span class="muted" style="font-size:12.5px" id="cfg-meta">' + cfgMetaText(cs) + cfgDirtyMark(cs) + "</span>" +
-      '<span style="flex:1"></span>' +
-      '<button class="small" data-act="cfg-reload">重新载入</button>' +
-      '<button class="small" data-act="cfg-bundle">下载配置包</button>' +
-      '<button class="small" data-act="cfg-save">保存草稿</button>' +
-      '<button class="small primary" data-act="cfg-publish">发布到设备</button>' +
-      "</div>" + cfgTabs(cs) +
-      '<div class="hint" style="margin:0">保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在 -apply 模式下于下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。' +
+      '<div>' + acts + "</div>" +
+      "</div></div>" + cfgTabs(cs) +
+      '<div class="hint" style="margin:0">' +
+      (cfgIsPA(cs)
+        ? "这台设备还没有入网：保存只写控制器的草稿，没有「发布」也没有配置包，因为接收方还不存在。现场工程师用 <code>sr-agent --preauth 「这台设备的索引」</code> 认领它之后，这份草稿会原样挪到它的 node 上（版本不变），那时候才能发布。"
+        : "保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在 -apply 模式下于下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。") +
       "VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 / 1250 被 overlay 占用。</div>" +
       "</section>";
   }
@@ -1438,6 +1515,19 @@
   function cfgDeliveryPanel(cs) {
     var v = cs.view;
     if (!v) return "";
+    // 预授权没有设备，所以这张表里两个来源都没有：既没有发布记录，也没有心跳
+    // 回报。与其显示一排「未上报」，不如直接说它在等什么。
+    if (cfgIsPA(cs)) {
+      return '<section class="panel"><header><h2>下发到设备</h2>' +
+        '<span class="tag pending">预授权 · 等待设备</span></header>' +
+        '<table><tbody><tr><th>配置在哪</th><td>控制器的草稿' +
+        (v.version ? " v" + esc(v.version) : "（还没有保存过）") + "</td></tr>" +
+        '<tr><th>设备回报</th><td class="muted">这台设备还没有入网，没有任何设备向控制器回报过它。</td></tr>' +
+        "</tbody></table>" +
+        '<div class="hint" style="margin:10px 0 0">设备认领这条预授权后，草稿会连着版本号一起挪到它的 node 上；' +
+        "之后这一栏才谈「发布」与「已装」。认领不会自动发布，控制器不会替现场决定什么时候重启设备。</div>" +
+        "</section>";
+    }
     var d = v.device_state || null;
     var pub = v.published_version || 0;
     var hb = (S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30;
@@ -1756,6 +1846,7 @@
   function cfgPublish() {
     var cs = S.cfg;
     if (!cs || !cs.view) return;
+    if (cfgIsPA(cs)) { toast("这台设备还没有入网，没有可发布的目标"); return; }
     var v = cs.view;
     if (cs.dirty) {
       cs.note = { kind: "warn", text: "有未保存的改动。发布的是已保存的草稿，先点「保存草稿」。" };
@@ -1946,8 +2037,12 @@
     var cs = S.cfg;
     if (!cs || !cs.view) return;
     if (!cs.dirty) { toast("没有需要保存的改动"); return; }
-    api("PUT", "/api/config", { node_id: cs.nodeID, config: cs.draft }).then(function (v) {
-      if (S.cfg !== cs) return;
+    var isPA = cfgIsPA(cs);
+    var url = isPA ? "/api/preauth/config" : "/api/config";
+    var body = isPA ? { preauth_id: cs.pa, config: cs.draft } : { node_id: cs.nodeID, config: cs.draft };
+    var want = cfgTarget(cs);
+    api("PUT", url, body).then(function (v) {
+      if (S.cfg !== cs || cfgTarget(cs) !== want) return;
       var errs = 0;
       (v.checks || []).forEach(function (x) { if (x.severity === "error") errs++; });
       cs.view = v;
@@ -1958,7 +2053,8 @@
       cs.note = { kind: errs ? "warn" : "",
         text: "已保存草稿 v" + v.version +
           (errs ? "；仍有 " + errs + " 个错误，设备会拒绝安装，因此也不能发布（除非在设备上用 --force）。"
-            : "。要让它生效，点「发布到设备」（设备需以 -apply 启动），或下载配置包手工安装。") };
+            : (isPA ? "。设备还没有入网，这份草稿存在控制器上等材料；盒子认领这条预授权时它会跟着走，那时再发布。"
+              : "。要让它生效，点「发布到设备」（设备需以 -apply 启动），或下载配置包手工安装。")) };
       blurContent();
       render();
       toast("草稿已保存 v" + v.version);
@@ -2532,6 +2628,268 @@
       "删除只对 0 台设备的站点开放，还有设备在里面的会拒绝并告诉你原因。</div></section>";
   }
 
+  /* ---------------- 预授权：纸面上先登记的设备 ---------------- */
+
+  // 预授权是「这台盒子下个月才到，但名称、站点和配置现在就想要」。它不是设备行
+  // 的伪装：node 号只在入网那一刻产生，所以草稿挂在登记记录上（配置页把这两种
+  // 目标都叫"设备"，但只有已入网的那种能发布）。
+  //
+  // 列表本身来自 /api/state 的 preauths 字段（只有租户角色拿得到），每一次写
+  // 也会带着整份新列表回来，所以这里只存交互状态。
+  function paStore() {
+    if (!S.pa) S.pa = { note: null, loading: false, edit: null };
+    return S.pa;
+  }
+
+  function paRows(st) { return (st && st.preauths) || []; }
+
+  function paWaiting(st) {
+    return paRows(st).filter(function (p) { return !p.bound_node_id; });
+  }
+
+  // 占名额的那几条登记要写在授权行里：只给一个数字，改名额的人不知道是哪几条
+  // 纸面记录把位置占了。
+  function paWaitingCell(st, claimID) {
+    var names = paRows(st).filter(function (p) {
+      return p.claim_id === claimID && !p.bound_node_id;
+    }).map(function (p) { return p.name; });
+    if (!names.length) return "";
+    return '<div style="margin-top:4px">预授权等待认领：' + esc(names.join("、")) + "</div>";
+  }
+
+  // 名额在创建预授权的那一刻就被占用，所以这里必须拆成两个数：真设备几台、
+  // 纸面记录几台。只报一个合计数会让人以为到货的设备比实际多。
+  function paSeatText(c) {
+    var used = (c.uses || 0) + (c.reserved || 0);
+    return "已入网 " + (c.uses || 0) + " + 预授权 " + (c.reserved || 0) + " / " + c.max_uses +
+      (c.max_uses && used >= c.max_uses ? " · 已满" : "");
+  }
+
+  function paStatusTag(p) {
+    if (p.bound_node_id) {
+      return '<span class="tag online">已认领 · node-' + esc(p.bound_node_id) + "</span>" +
+        '<div class="muted" style="font-size:12px">序列号 ' + esc(p.bound_serial || "未上报") +
+        (p.bound_at_unix ? " · " + esc(ago(p.bound_at_unix)) : "") + "</div>";
+    }
+    if (p.claim_revoked) {
+      return '<span class="tag revoked">授权已吊销</span>' +
+        '<div class="muted" style="font-size:12px">这条索引在现场会被拒绝</div>';
+    }
+    return '<span class="tag pending">预授权 · 等待设备</span>';
+  }
+
+  // 「已配置 / 未配置」只看控制器里的草稿版本：设备还没到货，能诚实报的只有
+  // 「草稿存了几版」，不能报「装上了」。
+  function paConfigCell(p) {
+    if (p.bound_node_id) return '<span class="muted">已交给设备页</span>';
+    if (!p.config_version) return '<span class="muted">未配置</span>';
+    return '<span class="mono">已配置 · 草稿 v' + esc(p.config_version) + "</span>" +
+      (p.config_updated_at_unix
+        ? '<div class="muted" style="font-size:12px">' + esc(ago(p.config_updated_at_unix)) +
+          (p.config_updated_by ? " · " + esc(p.config_updated_by) : "") + "</div>"
+        : "");
+  }
+
+  // 表单字段名带 pa- 前缀而不是复用 name/serial/site_id：这一页同时有站点表单
+  // 和预授权的新建/编辑表单，而整页重建时保留输入值的键就是字段名，撞名会把
+  // 站点名填进设备名称里。
+  function paSiteSelect(name, cur) {
+    var t = undSitesStore();
+    if (!t.list) return '<span class="muted" style="font-size:12.5px">正在读取站点…</span>';
+    var h = '<select id="' + name + '" name="' + name + '" data-keep="no" ' +
+      'aria-label="这台预授权设备的站点">' +
+      '<option value=""' + (cur ? "" : " selected") + ">不放到站点</option>";
+    t.list.forEach(function (si) {
+      h += '<option value="' + esc(si.id) + '"' + (si.id === cur ? " selected" : "") + ">" +
+        esc(si.name) + "</option>";
+    });
+    return h + "</select>";
+  }
+
+  function paErr(slot, text) {
+    var el = $(slot);
+    if (el) { el.textContent = text; return; }
+    var p = paStore();
+    p.note = { kind: "bad", text: text };
+    render();
+  }
+
+  function paApply(res, msg) {
+    var p = paStore();
+    p.loading = false;
+    if (S.state && res && res.preauths) S.state.preauths = res.preauths;
+    // 名额是记在授权上的：新建/撤销一条登记会立刻挪动 uses+reserved，
+    // 不把它一起写回来，「入网授权」页和这里下拉框里的「已入网 x + 预授权 y」
+    // 会一直停在写入前的旧数字。
+    if (S.state && res && res.claims) S.state.claims = res.claims;
+    // 站点上的预授权计数和地图上的「未上报」清单都会跟着变，作废缓存让下一帧
+    // 重新取，不然页面上会出现一台根本不存在的设备。
+    if (S.sites) S.sites.at = 0;
+    undInvalidateTopo();
+    if (msg) p.note = { kind: "", text: msg };
+    blurContent();
+    render();
+  }
+
+  function paFail(slot, err) {
+    var p = paStore();
+    p.loading = false;
+    paErr(slot, err.message);
+  }
+
+  function paCreate(form) {
+    var p = paStore();
+    var f = new FormData(form);
+    var body = {
+      claim_id: String(f.get("pa-claim") || ""),
+      name: String(f.get("pa-name") || "").trim(),
+      serial: String(f.get("pa-serial") || "").trim(),
+      site_id: String(f.get("pa-site") || "")
+    };
+    if (!body.claim_id) { paErr("pa-new-err", "先选一条入网授权：预授权要挂在它的名额里"); return; }
+    if (!body.name) { paErr("pa-new-err", "设备名称是现场工程师要输入的索引，不能空"); return; }
+    if (p.loading) return;
+    p.loading = true;
+    p.note = null;
+    api("POST", "/api/preauth", body).then(function (res) {
+      releaseForm(form);
+      paApply(res, "已预授权「" + body.name + "」，占用该授权的一个名额。现在就能给它写基础配置；" +
+        "盒子到货时现场多带一个参数 --preauth 「" + body.name + "」 认领。");
+    }).catch(function (err) { paFail("pa-new-err", err); });
+  }
+
+  function paEditStart(id) {
+    var p = paStore();
+    if (p.edit && p.edit.id === id) { p.edit = null; render(); return; }
+    var row = null;
+    paRows(S.state).forEach(function (x) { if (x.id === id) row = x; });
+    if (!row) return;
+    p.edit = { id: row.id, name: row.name, serial: row.serial || "", site_id: row.site_id || "" };
+    blurContent();
+    render();
+  }
+
+  function paSaveEdit(form) {
+    var p = paStore(), e = p.edit;
+    if (!e) return;
+    var f = new FormData(form);
+    var body = {
+      id: e.id,
+      name: String(f.get("pa-e-name") || "").trim(),
+      serial: String(f.get("pa-e-serial") || "").trim(),
+      site_id: String(f.get("pa-e-site") || "")
+    };
+    if (!body.name) { paErr("pa-edit-err", "设备名称不能空"); return; }
+    if (p.loading) return;
+    p.loading = true;
+    api("PUT", "/api/preauth", body).then(function (res) {
+      p.edit = null;
+      paApply(res, "预授权「" + body.name + "」已更新。");
+    }).catch(function (err) { paFail("pa-edit-err", err); });
+  }
+
+  function paRevoke(id, name, nodeID) {
+    var p = paStore();
+    if (!confirm(nodeID
+      ? "撤销「" + name + "」？它已经被 node-" + nodeID + " 认领：撤销只删掉这条登记，" +
+        "设备和它的配置都不受影响。"
+      : "撤销「" + name + "」？它在控制器里的配置草稿会一起删掉，并释放该授权的 1 个名额。")) return;
+    p.loading = true;
+    p.note = null;
+    api("POST", "/api/preauth/revoke", { id: id }).then(function (res) {
+      // 正在配置页编辑的就是这条：目标已经不在了，回到设备列表重建。
+      if (S.cfg && S.cfg.pa === id) S.cfg = null;
+      paApply(res, "已撤销预授权「" + name + "」。");
+    }).catch(function (err) { paFail("", err); });
+  }
+
+  function paPanel(st) {
+    var p = paStore();
+    var rows = paRows(st);
+    var claims = liveGrants(st);
+    var h = '<section class="panel"><header><h2>预授权（还没到货的设备）</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + paWaiting(st).length + " 台等待入网 · 共 " +
+      rows.length + " 条登记</span></header>" +
+      '<div class="hint">先把名称、序列号和站点登记进控制器，配置就能在盒子到货之前做完。' +
+      "现场入网时多带一个参数——这个参数就是下面这个索引（一般是设备名称）：" +
+      '<code>sr-agent … --preauth 「索引」</code>。入网码还是要在「入网授权」页生成：码决定这台盒子属于哪个租户，' +
+      "索引决定它认领哪一条登记。控制器按索引找到登记后，把配置原样交给这台设备" +
+      "（认领不会自动发布，设备什么时候重启由你决定）。名称在同一租户里唯一，改了名称等于换了一台设备。</div>";
+    if (claims.length) {
+      h += '<form id="pa-new-form"><div class="fields">' +
+        '<div class="field"><label for="pa-claim">挂在授权下（占用它的一个名额）</label>' +
+        '<select id="pa-claim" name="pa-claim">' +
+        claims.map(function (c) {
+          return '<option value="' + esc(c.id) + '">' + esc(c.name || "入网授权") + " · " + paSeatText(c) + "</option>";
+        }).join("") + "</select></div>" +
+        '<div class="field"><label for="pa-name">设备名称（现场输入的索引）</label>' +
+        '<input id="pa-name" name="pa-name" placeholder="CPE-01" maxlength="64"></div>' +
+        '<div class="field"><label for="pa-serial">登记序列号（可选）</label>' +
+        '<input id="pa-serial" name="pa-serial" placeholder="纸箱上那个，看不清可以不填" maxlength="64"></div>' +
+        '<div class="field"><label for="pa-site">站点</label>' + paSiteSelect("pa-site", "") + "</div>" +
+        '<button class="primary" type="submit">预授权这台设备</button>' +
+        "</div>" +
+        '<div class="hint" style="margin:8px 0 0">序列号一旦填了，入网时设备自报的序列号必须和它一致，' +
+        "否则会被拒绝——填错名称会让配置跑到另一台盒子上，这一条是防它的。名称中间可以有空格，" +
+        "但现场输入时要整体加引号。</div>" +
+        '<div class="err" id="pa-new-err" role="alert"></div>' +
+        "</form>";
+    } else {
+      h += '<div class="empty">还没有可用的入网授权：预授权必须挂在一条没被吊销的授权上。</div>';
+    }
+    h += p.note ? undNote(p.note) : "";
+    if (!rows.length) {
+      return h + '<div class="empty" style="margin-top:10px">还没有预授权。' +
+        "上面登记一台，配置就能先做完，不用等盒子。</div></section>";
+    }
+    h += '<table><thead><tr><th>索引名称</th><th>登记序列号</th><th>授权</th><th>站点</th>' +
+      "<th>配置</th><th>状态</th><th></th></tr></thead><tbody>";
+    rows.forEach(function (r) {
+      h += "<tr>" +
+        "<td><b>" + esc(r.name) + '</b> <span class="muted mono">' + esc(r.id) + "</span>" +
+        (r.created_at_unix ? '<div class="muted" style="font-size:12px">登记于 ' +
+          esc(clock(r.created_at_unix)) + (r.created_by ? " · " + esc(r.created_by) : "") + "</div>" : "") +
+        "</td>" +
+        '<td class="mono">' + (r.serial ? esc(r.serial) : '<span class="muted">未登记</span>') + "</td>" +
+        "<td>" + esc(r.claim_name || r.claim_id) + "</td>" +
+        "<td>" + (r.site_name ? esc(r.site_name) : '<span class="muted">未放到站点</span>') + "</td>" +
+        "<td>" + paConfigCell(r) + "</td>" +
+        "<td>" + paStatusTag(r) + "</td>" +
+        '<td class="row-actions">';
+      if (r.bound_node_id) {
+        h += '<button class="small" data-act="pa-goto-node" data-node="' + esc(r.bound_node_id) +
+          '">去设备配置</button>' +
+          '<button class="small danger" data-act="pa-revoke" data-id="' + esc(r.id) +
+          '" data-name="' + esc(r.name) + '" data-node="' + esc(r.bound_node_id) + '">撤销登记</button>';
+      } else {
+        h += '<button class="small primary" data-act="pa-config" data-id="' + esc(r.id) + '">写配置</button>' +
+          '<button class="small" data-act="pa-edit" data-id="' + esc(r.id) + '">' +
+          (p.edit && p.edit.id === r.id ? "收起" : "改名称/站点") + "</button>" +
+          '<button class="small danger" data-act="pa-revoke" data-id="' + esc(r.id) +
+          '" data-name="' + esc(r.name) + '">撤销</button>';
+      }
+      h += "</td></tr>";
+      if (p.edit && p.edit.id === r.id) {
+        h += '<tr><td colspan="7"><form id="pa-edit-form"><div class="fields">' +
+          '<div class="field"><label for="pa-e-name">设备名称</label>' +
+          '<input id="pa-e-name" name="pa-e-name" value="' + esc(p.edit.name) + '" maxlength="64"></div>' +
+          '<div class="field"><label for="pa-e-serial">登记序列号</label>' +
+          '<input id="pa-e-serial" name="pa-e-serial" value="' + esc(p.edit.serial) + '" maxlength="64"></div>' +
+          '<div class="field"><label for="pa-e-site">站点</label>' + paSiteSelect("pa-e-site", p.edit.site_id) + "</div>" +
+          '<button class="primary" type="submit">保存</button> ' +
+          '<button class="small" type="button" data-act="pa-edit-x">取消</button>' +
+          "</div>" +
+          '<div class="hint" style="margin:8px 0 0">改名称等于换索引：现场要用新名字认领。' +
+          "挂在哪个授权下不能改——名额是在那条授权上占的。</div>" +
+          '<div class="err" id="pa-edit-err" role="alert"></div></form></td></tr>';
+      }
+    });
+    h += "</tbody></table>" +
+      '<div class="hint" style="margin-top:8px">撤销一条没认领的登记会连带删掉它的草稿并释放名额；' +
+      "撤销一条已认领的只删登记，设备与配置不动。配置页的设备列表里，这些预授权和真设备混在一起按条件过滤。";
+    return h + "</section>";
+  }
+
   function undSetDoc(doc) {
     var u = undStore();
     u.doc = doc;
@@ -2883,13 +3241,141 @@
     return h;
   }
 
-  function undNodeOptions(nodes, sel, emptyLabel) {
-    var h = emptyLabel ? '<option value="0">' + esc(emptyLabel) + "</option>" : "";
-    nodes.forEach(function (n) {
-      h += '<option value="' + esc(n.node_id) + '"' + (n.node_id === sel ? " selected" : "") + ">node-" +
-        esc(n.node_id) + " · " + esc(n.serial) + "</option>";
+  /* ---------------- device picker：可过滤的设备列表 ---------------- */
+
+  // 设备一多，下拉框的问题就不是样式而是找不到。所以每一处"选设备"都渲染成
+  // 同一组控件：过滤输入 + 状态条件 + 能看见多行的列表框。
+  //
+  // 列表框还是原生 <select>，选中值仍然从 el.value / selectedOptions 读，所以
+  // 挂在各 id 上的既有处理函数不用改名；换掉的只是渲染和事件绑定。
+  //
+  // 过滤词存在 JS 里而不是 DOM 上：整页每 10 秒重建一次（SSE 与显式 render
+  // 也会），一边打字一边重建会既丢焦点又丢过滤条件。id 在每次重建里是固定的，
+  // 所以按 id 存。
+  var DP = {};
+
+  function dpStatusText(n) {
+    return n.status === "online" ? "在线" : n.status === "stale" ? "失联" : "未上线";
+  }
+
+  // dpNodeItems 把设备视图变成列表项。站点没填就写「未定位」而不是留空：
+  // "在哪儿"是最常用的过滤条件之一，空值会让人以为过滤坏了。
+  function dpNodeItems(nodes) {
+    return (nodes || []).map(function (n) {
+      var id = String(n.node_id);
+      var name = n.serial || ("node-" + id);
+      var site = n.site_name || "未定位";
+      var st = dpStatusText(n);
+      return { value: id, text: "node-" + id + " · " + name + " · " + st + " · " + site, tags: st };
     });
-    return h;
+  }
+
+  // dpPreAuthItems 是还没到货的设备：列表里必须看得见，而且要一眼看出它不是
+  // 一台真设备（已入网的设备有 node 号，预授权没有）。
+  function dpPreAuthItems(rows) {
+    return (rows || []).map(function (p) {
+      var site = p.site_name || "未定位";
+      var st = p.bound_node_id ? "已认领" : (p.claim_revoked ? "授权已吊销" : "等待设备");
+      return {
+        value: "pa:" + p.id,
+        text: "预授权 " + p.name + " · " + (p.serial || "序列号未登记") + " · " + st + " · " + site,
+        tags: st
+      };
+    });
+  }
+
+  function dpState(id, items, o) {
+    o = o || {};
+    var keep = DP[id];
+    DP[id] = {
+      items: items, multi: !!o.multiple, empty: o.empty || "",
+      q: keep ? keep.q : "", st: keep ? keep.st : ""
+    };
+    return DP[id];
+  }
+
+  function dpStatuses(items) {
+    var out = [];
+    items.forEach(function (it) { if (out.indexOf(it.tags) < 0) out.push(it.tags); });
+    return out;
+  }
+
+  function dpMatch(d, it) {
+    if (d.st && it.tags !== d.st) return false;
+    var q = (d.q || "").trim().toLowerCase();
+    if (!q) return true;
+    // 空格分隔的多个词是 AND：输 "上海 down" 就能在一堆名字里捞出那一台。
+    return q.split(/\s+/).every(function (w) { return it.text.toLowerCase().indexOf(w) >= 0; });
+  }
+
+  function dpOption(it, isSel, pinned) {
+    return '<option value="' + esc(it.value) + '"' + (isSel(it.value) ? " selected" : "") + ">" +
+      esc(it.text) + (pinned ? "（当前选择，被过滤条件挡住了）" : "") + "</option>";
+  }
+
+  function dpOptions(id, sel) {
+    var d = DP[id];
+    var head = "";
+    if (d.empty) {
+      head = '<option value="0"' + (String(sel) === "0" || sel === null || sel === undefined ? " selected" : "") +
+        ">" + esc(d.empty) + "</option>";
+    }
+    var isSel = d.multi
+      ? function (v) { return (sel || []).map(String).indexOf(v) >= 0; }
+      : function (v) { return v === String(sel === null || sel === undefined ? "" : sel); };
+    var hit = d.items.filter(function (it) { return dpMatch(d, it); });
+    var shown = {};
+    var body = "";
+    hit.forEach(function (it) { shown[it.value] = 1; body += dpOption(it, isSel, false); });
+    // 被过滤掉的当前选择必须留在列表里：否则一次轮询重建就会把用户选中的设备
+    // 变成"第一项"，保存时写下去的是另一台。
+    if (!d.multi && String(sel) !== "" && String(sel) !== "0" && isSel(String(sel)) && !shown[String(sel)]) {
+      for (var i = 0; i < d.items.length; i++) {
+        if (d.items[i].value === String(sel)) { body = dpOption(d.items[i], isSel, true) + body; break; }
+      }
+    }
+    d.hit = hit.length;
+    return head + (body || (d.empty ? "" : '<option value="" disabled>没有符合条件的设备</option>'));
+  }
+
+  function dpCountText(id) {
+    var d = DP[id];
+    return "共 " + d.items.length + " 台 · 符合 " + d.hit + " 台" + (d.multi ? " · 按住 Ctrl/⌘ 多选" : "");
+  }
+
+  // dpHtml：id 沿用调用方原来的 select id，name 沿用原来的表单字段名
+  // （提交走 FormData，改名字会静默丢字段），attrs 把原来挂在 select 上的
+  // 事件标记（data-und-dev 之类）带到列表框上，处理器不用改名。
+  function dpHtml(id, name, items, sel, o) {
+    o = o || {};
+    var d = dpState(id, items, o);
+    return '<div class="devpick">' +
+      '<div class="dp-tools">' +
+      '<input class="devfilter" id="dpf-' + id + '" data-dp-q="' + id + '" value="' + esc(d.q) +
+        '" placeholder="过滤：名称 / 序列号 / 站点 / 状态" autocomplete="off" aria-label="过滤设备列表">' +
+      '<select id="dps-' + id + '" data-dp-st="' + id + '" aria-label="按状态过滤设备">' +
+      '<option value="">全部状态</option>' +
+      dpStatuses(items).map(function (s) {
+        return '<option value="' + esc(s) + '"' + (d.st === s ? " selected" : "") + ">" + esc(s) + "</option>";
+      }).join("") + "</select></div>" +
+      '<select id="' + esc(id) + '" name="' + esc(name || id) + '" class="devlist" size="' + (o.size || 6) + '"' +
+      (d.multi ? " multiple" : "") + (o.attrs ? " " + o.attrs : "") + ' data-dp-list="' + id + '">' +
+      dpOptions(id, sel) + "</select>" +
+      '<div class="dp-count" data-dp-count="' + id + '">' + dpCountText(id) + "</div></div>";
+  }
+
+  // 过滤时只换列表框里的 option，不重建整页：一边打字一边全页重建会把光标
+  // 弹走，也会把同一张表单里其他人正在填的字段重置。
+  function dpRepaint(id) {
+    var d = DP[id];
+    var list = document.querySelector('#content select[data-dp-list="' + id + '"]');
+    if (!d || !list) return;
+    var sel = d.multi
+      ? Array.prototype.slice.call(list.selectedOptions).map(function (op) { return op.value; })
+      : list.value;
+    list.innerHTML = dpOptions(id, sel);
+    var c = document.querySelector('#content [data-dp-count="' + id + '"]');
+    if (c) c.textContent = dpCountText(id);
   }
 
   function undNodeOf(doc, id) {
@@ -2940,8 +3426,7 @@
   function undPathExtraFields(doc, mode, prefix) {
     if (mode === "inline") {
       return '<div class="field"><label for="' + prefix + '-relay">中转设备</label>' +
-        '<select id="' + prefix + '-relay" name="relay">' +
-        undNodeOptions(doc.nodes, 0, "选择中转设备…") + "</select></div>" +
+        dpHtml(prefix + "-relay", "relay", dpNodeItems(doc.nodes), 0, { empty: "选择中转设备…" }) + "</div>" +
         '<div class="field"><label for="' + prefix + '-relay-addr">中转地址（可选）</label>' +
         '<input id="' + prefix + '-relay-addr" name="relay_addr" placeholder="ip 或 ip:port"></div>';
     }
@@ -2954,12 +3439,6 @@
   }
 
   function undAutoPanel(doc, u) {
-    var boxes = doc.nodes.map(function (n) {
-      var on = u.autoSel.indexOf(n.node_id) >= 0;
-      return '<li><label><input type="checkbox" data-und-node="' + esc(n.node_id) + '"' +
-        (on ? " checked" : "") + "> node-" + esc(n.node_id) + " · " + esc(n.serial) +
-        ' <span class="muted">' + esc(n.status === "online" ? "在线" : n.status === "stale" ? "失联" : "未上线") + "</span></label></li>";
-    }).join("");
     var modes = [["full-mesh", "full-mesh（任意两台之间）"], ["hub-spoke", "hub-spoke（以 hub 为中心）"]]
       .map(function (x) {
         return '<option value="' + x[0] + '"' + (u.autoMode === x[0] ? " selected" : "") + ">" + x[1] + "</option>";
@@ -2972,13 +3451,13 @@
       '<span class="muted" style="font-size:12.5px">先预览，确认后才写入</span></header>' +
       '<form id="und-auto-form">' +
       '<div class="und-box"><h3>选择设备</h3>' +
-      (boxes ? '<ul class="node-pick">' + boxes + "</ul>"
+      (doc.nodes.length ? dpHtml("und-auto-nodes", "nodes", dpNodeItems(doc.nodes), u.autoSel, { multiple: true, size: 8 })
         : '<div class="empty">还没有设备。</div>') +
       "</div>" +
       '<div class="fields" style="margin-top:12px">' +
       '<div class="field"><label for="und-auto-mode">拓扑模型</label><select id="und-auto-mode" name="mode">' + modes + "</select></div>" +
       '<div class="field"><label for="und-auto-hub">hub（仅 hub-spoke 用）</label>' +
-      '<select id="und-auto-hub" name="hub">' + undNodeOptions(doc.nodes, u.autoHub, "选择 hub…") + "</select></div>" +
+      dpHtml("und-auto-hub", "hub", dpNodeItems(doc.nodes), u.autoHub, { empty: "选择 hub…" }) + "</div>" +
       '<div class="field"><label for="und-auto-spoke">spoke 间隧道（仅 hub-spoke 用）</label>' +
       '<select id="und-auto-spoke" name="spoke">' + spokes + "</select></div>" +
       '<button class="primary" type="submit">预览（不写入）</button>' +
@@ -3114,13 +3593,13 @@
       '<span class="muted" style="font-size:12.5px">一台对一台；端口与 overlay /32 由分配器给</span></header>' +
       '<form id="und-tun-form"><div class="fields">' +
       '<div class="field"><label for="und-tun-a">本端设备</label>' +
-      '<select id="und-tun-a" name="a" data-und-dev="a">' + undNodeOptions(doc.nodes, a, null) + "</select></div>" +
+      dpHtml("und-tun-a", "a", dpNodeItems(doc.nodes), a, { size: 5, attrs: 'data-und-dev="a"' }) + "</div>" +
       '<div class="field"><label for="und-tun-a-iface">本端物理端口</label>' +
       '<select id="und-tun-a-iface" name="a_iface">' + undIfaceOptions(undNodeOf(doc, a), "") + "</select></div>" +
       '<div class="field"><label for="und-tun-a-addr">本端外层地址（留空用观测）</label>' +
       '<input id="und-tun-a-addr" name="a_addr" placeholder="ip 或 ip:port"></div>' +
       '<div class="field"><label for="und-tun-b">对端设备</label>' +
-      '<select id="und-tun-b" name="b" data-und-dev="b">' + undNodeOptions(doc.nodes, b, null) + "</select></div>" +
+      dpHtml("und-tun-b", "b", dpNodeItems(doc.nodes), b, { size: 5, attrs: 'data-und-dev="b"' }) + "</div>" +
       '<div class="field"><label for="und-tun-b-iface">对端物理端口</label>' +
       '<select id="und-tun-b-iface" name="b_iface">' + undIfaceOptions(undNodeOf(doc, b), "") + "</select></div>" +
       '<div class="field"><label for="und-tun-b-addr">对端外层地址（留空用观测）</label>' +
@@ -3232,7 +3711,8 @@
       '<select id="und-edit-pathmode">' + undPathModeOptions(mode) + "</select></div>";
     if (mode === "inline") {
       h += '<div class="field"><label for="und-edit-relay">中转设备</label>' +
-        '<select id="und-edit-relay" name="relay">' + undNodeOptions(doc.nodes, relay, "选择中转设备…") + "</select></div>" +
+        dpHtml("und-edit-relay", "relay", dpNodeItems(doc.nodes), relay,
+          { size: 5, empty: "选择中转设备…" }) + "</div>" +
         '<div class="field"><label for="und-edit-relay-addr">中转地址（可选）</label>' +
         '<input id="und-edit-relay-addr" name="relay_addr" value="' +
         esc(t.path && !t.path.template_id ? t.path.addr : "") + '" placeholder="ip 或 ip:port"></div>';
@@ -3340,7 +3820,8 @@
       '<div class="field"><label for="und-path-name">模板名称</label>' +
       '<input id="und-path-name" name="name" placeholder="如 经上海中转" maxlength="60"></div>' +
       '<div class="field"><label for="und-path-node">中转设备</label>' +
-      '<select id="und-path-node" name="node">' + undNodeOptions(doc.nodes, 0, "选择中转设备…") + "</select></div>" +
+      dpHtml("und-path-node", "node", dpNodeItems(doc.nodes), 0,
+        { size: 4, empty: "选择中转设备…" }) + "</div>" +
       '<div class="field"><label for="und-path-addr">中转地址（可选）</label>' +
       '<input id="und-path-addr" name="addr" placeholder="ip 或 ip:port"></div>' +
       '<button class="small" type="submit">新建模板</button></form>';
@@ -3357,7 +3838,7 @@
       '<div class="field"><label for="und-path-edit-name">名称</label>' +
       '<input id="und-path-edit-name" name="name" value="' + esc(p.name) + '" maxlength="60"></div>' +
       '<div class="field"><label for="und-path-edit-node">中转设备</label>' +
-      '<select id="und-path-edit-node" name="node">' + undNodeOptions(doc.nodes, p.node_id, null) + "</select></div>" +
+      dpHtml("und-path-edit-node", "node", dpNodeItems(doc.nodes), p.node_id, { size: 5 }) + "</div>" +
       '<div class="field"><label for="und-path-edit-addr">中转地址（可选）</label>' +
       '<input id="und-path-edit-addr" name="addr" value="' + esc(p.addr) + '" placeholder="ip 或 ip:port"></div>' +
       "</div>" +
@@ -4173,7 +4654,7 @@
     var cn = $("cfg-node");
     if (cn) cn.addEventListener("change", function () {
       blurContent();
-      selectCfgNode(Number(cn.value));
+      selectCfgTarget(cn.value);
     });
     var cv = $("cfg-vpn");
     if (cv) cv.addEventListener("change", function () {
@@ -4206,18 +4687,36 @@
     document.querySelectorAll("#content [data-und]").forEach(function (el) {
       el.addEventListener("input", function () { undSetField(el); });
     });
-    document.querySelectorAll("#content [data-und-node]").forEach(function (el) {
-      el.addEventListener("change", function () {
-        var u = S.und;
-        if (!u) return;
-        var id = Number(el.getAttribute("data-und-node"));
-        var i = u.autoSel.indexOf(id);
-        if (el.checked && i < 0) u.autoSel.push(id);
-        if (!el.checked && i >= 0) u.autoSel.splice(i, 1);
-        u.auto = null;
-        blurContent();
-        render();
+    // 设备列表的三个处理器。过滤条件写进 DP（JS 状态）而不是只写进 DOM：
+    // 整页每 10 秒重建，只存在于 input 里的词会在下一次重建时消失。
+    document.querySelectorAll("#content [data-dp-q]").forEach(function (el) {
+      el.addEventListener("input", function () {
+        var id = el.getAttribute("data-dp-q");
+        if (!DP[id]) return;
+        DP[id].q = el.value;
+        dpRepaint(id);
       });
+    });
+    document.querySelectorAll("#content [data-dp-st]").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var id = el.getAttribute("data-dp-st");
+        if (!DP[id]) return;
+        DP[id].st = el.value;
+        blurContent();
+        dpRepaint(id);
+      });
+    });
+    var uan = $("und-auto-nodes");
+    if (uan) uan.addEventListener("change", function () {
+      var u = S.und;
+      if (!u) return;
+      // 选中项就是这次的设备集合；旧预览必须作废，因为「按预览创建」提交的是
+      // 预览时冻结的那一份 req，不是眼前的选择。
+      u.autoSel = Array.prototype.slice.call(uan.selectedOptions)
+        .map(function (op) { return Number(op.value) || 0; })
+        .filter(function (v) { return v > 0; });
+      u.auto = null;
+      render();
     });
     var uam = $("und-auto-mode");
     if (uam) uam.addEventListener("change", function () {
@@ -4311,6 +4810,24 @@
         if (slot) slot.textContent = "";
       });
     });
+
+    var pnf = $("pa-new-form");
+    if (pnf) pnf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      paCreate(pnf);
+    });
+    var peef = $("pa-edit-form");
+    if (peef) peef.addEventListener("submit", function (e) {
+      e.preventDefault();
+      paSaveEdit(peef);
+    });
+    [pnf, peef].forEach(function (f) {
+      if (!f) return;
+      f.addEventListener("input", function () {
+        var slot = $(f.id.replace("-form", "-err"));
+        if (slot) slot.textContent = "";
+      });
+    });
     // A dropdown's value only exists on "change"; the generic [data-act] click
     // handler below would read it before the user has picked anything.
     document.querySelectorAll('#content select[data-act="node-site"]').forEach(function (el) {
@@ -4380,7 +4897,10 @@
           var gid = el.getAttribute("data-id");
           var gname = el.getAttribute("data-name") || "入网授权";
           var used = Number(el.getAttribute("data-used")) || 0;
-          var v = prompt("「" + gname + "」的可激活台数（已激活 " + used + " 台，不能低于它）：", el.getAttribute("data-max"));
+          var rsv = Number(el.getAttribute("data-reserved")) || 0;
+          var v = prompt("「" + gname + "」的可激活台数（已占用 " + used + " 个" +
+            (rsv ? "，其中预授权 " + rsv + " 个还没到货" : "") + "，不能低于已占用）：",
+            el.getAttribute("data-max"));
           if (v === null) return;
           var n = Number(String(v).trim());
           if (!v.trim() || !Number.isFinite(n) || n < 1) { toast("台数必须是 1 以上的整数"); return; }
@@ -4443,6 +4963,7 @@
         else if (act === "und-note-x") {
           if (S.und) S.und.note = null;
           if (S.sites) S.sites.note = null;
+          if (S.pa) S.pa.note = null;
           blurContent();
           render();
         }
@@ -4472,6 +4993,24 @@
         }
         else if (act === "site-del") {
           undDeleteSite(el.getAttribute("data-id"), el.getAttribute("data-name") || "该站点");
+        }
+        else if (act === "pa-config") {
+          cfgGotoTarget("pa:" + el.getAttribute("data-id"));
+        }
+        else if (act === "pa-goto-node") {
+          cfgGotoTarget(el.getAttribute("data-node"));
+        }
+        else if (act === "pa-edit") {
+          paEditStart(el.getAttribute("data-id"));
+        }
+        else if (act === "pa-edit-x") {
+          paStore().edit = null;
+          blurContent();
+          render();
+        }
+        else if (act === "pa-revoke") {
+          paRevoke(el.getAttribute("data-id"), el.getAttribute("data-name") || "该设备",
+            Number(el.getAttribute("data-node")) || 0);
         }
         else if (act === "und-avoid-add") undAddAvoid();
         else if (act === "und-avoid-del") undDelAvoid(Number(el.getAttribute("data-i")));

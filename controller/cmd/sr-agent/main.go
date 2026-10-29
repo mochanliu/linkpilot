@@ -48,6 +48,7 @@ func main() {
 		caPath     = flag.String("ca", "", "pinned controller CA bundle for the FIRST enrollment (default <id-dir>/pinned_ca.pem)")
 		idDir      = flag.String("id", "./agent-id", "identity directory (device key, WG key, cert, CA)")
 		serial     = flag.String("serial", "", "device serial (default hostname)")
+		preAuth    = flag.String("preauth", "", "claim a 预授权 record created in the console, by its device name (first enrollment only)")
 		statusAddr = flag.String("status", "127.0.0.1:8089", "local status endpoint (empty disables it)")
 		once       = flag.Bool("once", false, "enroll if needed, send one heartbeat, print status, exit")
 		extraHB    = flag.Int("hb", 0, "override the controller's heartbeat interval in seconds (testing only)")
@@ -116,7 +117,7 @@ func main() {
 		// Zero reflectors requested: the agent has no dataplane to send probes
 		// from, so asking the controller to pick reflectors would be asking for a
 		// fact it cannot use.
-		req := id.EnrollRequest(*claim, agentVersion, 0)
+		req := id.EnrollRequest(*claim, agentVersion, 0, *preAuth)
 		ectx, ecancel := context.WithTimeout(ctx, 20*time.Second)
 		resp, err := agent.Enroll(ectx, base, roots, req)
 		ecancel()
@@ -130,8 +131,24 @@ func main() {
 			hbSec = resp.HeartbeatSec
 		}
 		log.Printf("enrolled: tenant=%s node=%d serial=%s epoch=%d", resp.TenantID, resp.NodeID, idSerial, resp.Epoch)
+		// 预授权 hand-over is only finished when the controller says so. An agent
+		// that asked for an index and got an empty echo did NOT get the config
+		// waiting behind it -- and from a rack, that is otherwise invisible.
+		if *preAuth != "" {
+			if resp.PreAuthName == "" {
+				log.Printf("WARNING: 控制器没有认领预授权「%s」（应答里没有回显）；这台设备按普通入网处理，控制器上等它的配置不会下发", *preAuth)
+			} else {
+				log.Printf("预授权「%s」已认领到 node %d；配置仍在控制器上，等租户显式发布后随 -apply 下发", resp.PreAuthName, resp.NodeID)
+			}
+		}
 	} else {
 		log.Printf("using existing identity: tenant=%s node=%d serial=%s", id.TenantID(), id.NodeID(), idSerial)
+		if *preAuth != "" {
+			// The index rides the enrollment request and nothing else, so saying
+			// nothing here would let someone believe a re-run had claimed it.
+			log.Printf("WARNING: 设备已有身份（node %d），本次没有发送 enroll，-preauth「%s」未生效；要认领这条预授权，需要一台还没有身份的盒子（或先清掉 %s）",
+				id.NodeID(), *preAuth, *idDir)
+		}
 	}
 
 	st := &agentStatus{
