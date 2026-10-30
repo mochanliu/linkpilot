@@ -14,6 +14,10 @@ package vppapi
 //	sw_interface_set_table          df42a577   reply e8d4e804
 //	sw_interface_set_mpls_enable    ae6cfcfb   reply e8d4e804
 //
+// （feature_is_enabled 55db09e2/reply 03f284b5 本来在这张表里：它的 CRC 与 VPP 消息表
+// 一致，可这条 API 在这份 26.06 上不回帧，四次请求全部超时，2026-10-30 实测之后退回
+// 用 CLI 读弧 —— 见 MPLSEnabled 的注释。）
+//
 // The packed layouts matter more than they look: flags and vrf ids are NOT
 // u8-sized even though they are "one small number", and getting one wrong shifts
 // everything after it, which VPP answers with a timeout rather than an error.
@@ -22,6 +26,8 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strconv"
+	"strings"
 )
 
 // SetInterfaceUp brings a tunnel interface admin-up (or down).
@@ -107,6 +113,51 @@ func (c *Client) SetInterfaceMPLS(ctx context.Context, swIfIndex uint32, enable 
 		return err
 	}
 	return c.retval("sw_interface_set_mpls_enable", frame)
+}
+
+// MPLSEnabled 回答"这张口的 mpls-input 弧现在还能丢标签包吗"：true = 弧已摘掉
+// 丢弃路径，带标签的帧能进 MPLS 转发；false = 弧上还挂着 mpls-not-enabled。
+//
+// 为什么必须单独问弧：`sw_interface_set_mpls_enable` 在一张**继承了别人 sw_if_index**
+// 的口上是静默空操作（VPP 的 MPLS 开关按 index 记引用计数、只在 0↔1 翻转时才动弧，
+// 而计数不随接口删除清零），retval 照样是 0。而 `show mpls interface` 读的正是那份
+// 计数，所以它也撒谎：2026-10-30 在 lab-cpe1 上 wg1001 被列成 "MPLS enabled"，弧上
+// 却还挂着 mpls-not-enabled（同一次测量里 loop0 enable 之后弧变成 none configured，
+// disable 又变回来 —— 弧这一段是唯一说真话的）。判据与坑的来龙去脉见
+// docs/overlay-design-draft.md §2.8。
+//
+// 为什么走 CLI 而不是 feature_is_enabled 那条 API：这条 API 在这份 VPP 26.06 上
+// **根本不回帧**（同日实测：消息表里它的 CRC 与我们注册的一致，所以不是版本对不上，
+// 但 local0/wg0..wg1003 四次请求全部超时）。`show interface features` 的 mpls-input
+// 段是现成、可读、且已经被 harness 用同一条判据验过的口子：
+//
+//	mpls-input:
+//	  none configured      ← 开好了
+//	  mpls-not-enabled     ← 还挂着，带标签的包到这里就丢
+//
+// 注意 CLI 会把错误吞成 retval=0（见 Client.CLI 的注释），所以"读不到 mpls-input 段"
+// 一律当错误返回，不能当成"没开"。
+func (c *Client) MPLSEnabled(ctx context.Context, swIfIndex uint32) (bool, error) {
+	out, err := c.CLI(ctx, "show interface features "+strconv.FormatUint(uint64(swIfIndex), 10))
+	if err != nil {
+		return false, fmt.Errorf("vppapi: 读接口 %d 的 feature 弧: %w", swIfIndex, err)
+	}
+	lines := strings.Split(out, "\n")
+	for i, raw := range lines {
+		if strings.TrimSpace(raw) != "mpls-input:" {
+			continue
+		}
+		for j := i + 1; j < len(lines); j++ {
+			body := strings.TrimSpace(lines[j])
+			if body == "" {
+				continue
+			}
+			return !strings.Contains(body, "mpls-not-enabled"), nil
+		}
+		// 段头是最后一行：这份输出被截断了，宁可报错也不猜。
+		return false, fmt.Errorf("vppapi: 接口 %d 的 mpls-input 段没有正文: %q", swIfIndex, out)
+	}
+	return false, fmt.Errorf("vppapi: 接口 %d 的输出里没有 mpls-input 段: %q", swIfIndex, out)
 }
 
 // IPv4Addresses 读一张接口上的 IPv4 地址，按 netip 前缀返回。

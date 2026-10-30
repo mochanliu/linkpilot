@@ -194,26 +194,60 @@ show interface features <wg>     # mpls-input 弧下面是 "none configured" 才
 同样是 `MPLS enabled`，而在 `show interface features` 里弧上是 `none configured`。
 ⇒ 前者读的就是那份残计数，它说"开了"不等于弧真的在收；只有后者是真相。
 
+**对照实验（同日，真 VPP 26.06，lab-cpe2）**：同一张临时 loopback 上把两件事各做一次，
+差别只有"删口前有没有 disable"，其余全同（同一个 `sw_if_index` 7、同样新建后 enable）：
+
+| 步骤 | B) 先 disable 再删 | A) 直接删 |
+| --- | --- | --- |
+| 新口 enable 后弧上 | `none configured`（可用） | `mpls-not-enabled`（**空操作**） |
+| 同时 `show mpls interface` | 列它 enabled | **照样列它 enabled** |
+| 反复 disable/enable 三次 | — | 还是 `mpls-not-enabled`（救不回来） |
+
+两段的"基准"（第一张口 enable 之后弧上可用 = true）都过了，所以这个号在实验前是干净的 ——
+这不是"号本来就坏"，是**上一任没 disable 就交出去的**。实验程序是临时的，跑完就删了。
+
+⇒ 顺带测出**反向的同一个坑**：对一张**从没 enable 过**的口敲一次 `disable`，计数被打到 0 以下，
+下一个持有者 enable 时照样不是 0↔1 翻转 ⇒ 一样静默空操作（在 lab-cpe1 上用真 WG 接口撞到过一次）。
+所以"disable 只在 enable 之后成对出现"不只是整洁问题，**乱敲 vppctl 也能给下一个租户下毒**。
+
 **证据强度要如实写**：上面 `src/vnet/mpls/interface.c` 那两条是早前一轮读 VPP 源码得到的机理
 判断；本轮在实验室镜像里 `find` 过 `vpplab` / `srwg-node1` / `lcp-probe` 三个容器，
-**都没有 VPP 源码树**，所以我没法在这里逐行复核。下面这些是**今天实测到的症状**，与那个机理
-判断一致但不由它证明：重建口 enable 后弧仍挂着 `mpls-not-enabled`、disable 反复调清不掉、
-只有重启 VPP 恢复。
+**都没有 VPP 源码树**，所以我没法在这里逐行复核。上面表格里那些是**今天实测到的症状**，与那个机理
+判断一致但不由它证明。
 
 ⇒ **这不只是 lab 脚本的坑，我们的生产路径天天在踩**（2026-10-30 核对代码）：
 `agent` 建完隧道在 `finishOverlay` 里无条件 `SetInterfaceMPLS(..., true)`
-（`controller/internal/agent/dataplane.go:766`），
-撤隧道走 `DeleteInterface`（同文件 `:1297`）**没有先 disable** ⇒ 撤一条再建一条、
+（`controller/internal/agent/dataplane.go:784`），
+撤隧道走 `DeleteInterface`（同文件 `:1338`）**曾经没有先 disable** ⇒ 撤一条再建一条、
 `sw_if_index` 被复用，新隧道就开不了 MPLS。而 `SetInterfaceMPLS` 的注释
-（`controller/internal/vppapi/interface.go:95-99`）早就写了少这条的表现是
+（`controller/internal/vppapi/interface.go:101-105`）早就写了少这条的表现是
 "能 ping 通、跑不了 VPN 流量" —— 正是这个坑的现场症状，overlay 纯 IPv4 不受影响所以最容易误判成好了。
+现场照片（同日）：lab-cpe1 上 agent 建的 wg1001（idx 6）至今是 `show mpls interface` 列它
+"MPLS enabled"、弧上挂着 `mpls-not-enabled` —— 同机跑 `tools/mpls-arc` 与 `vppctl` 对拍出来的。
 
-⇒ **产品侧缺口，三选一**（拍完就开 #145 实现，排在 O3 之前，因为 O3/O4 的判据都要真流量）：
-- (a) **装表前核验**：读 `interface_features_dump`，弧上还是 `mpls-not-enabled` 就报错并把
-  "这张隧道口开不了 MPLS，需要重启 VPP"如实报给控制台，不让它静默黑洞。
-- (b) **删口前先 disable**：在撤隧道那一步 `DeleteInterface` 之前补
-  `SetInterfaceMPLS(swIf, false)`，从源头不产生残计数。改动最小、且在根因侧。
-- (c) (a)+(b) 都做。(a) 兜住"人工/别的脚本重建过口"的情况，代价是要在 vppapi 加一个 feature-arc 读取。
+⇒ **对策：(c) 两条都做，已落地（#145）**
+- (b) **删口前先 disable**（`teardownTunnel`，`dataplane.go:1328-1336`）：disable 失败就**不删口** ——
+  宁可这条暂时撤不掉，也不能把残计数交出去。
+- (a) **开完向弧本身核验**（`finishOverlay` → `vppapi.Client.MPLSEnabled`）：弧上还挂着
+  `mpls-not-enabled` 就报错、拒绝装路由，并把"这个号是从没 disable 就删掉的口继承来的，
+  只有重启 VPP 能清"写进错误里，不给它变黑洞的机会。
+
+**读弧为什么走 CLI 而不是 API**：`feature_is_enabled` 这条二进制 API 在这份 VPP 26.06 上
+**永不回帧**（同日实测：它的 CRC 与我们注册表一致，`checkVersions` 从没报过它 —— 不是版本对不上，
+可 local0/wg0/wg1/wg1003 四次请求全部 4.003s 超时；lab-cpe1 里 `vat2` 又载不上 feature 模块，
+连旁证都拿不到）。所以 `MPLSEnabled` 用 `cli_inband` 读 `show interface features <idx>` 的
+`mpls-input` 段，判据与 harness 第 0 步同一条；注册表里那两条 CRC 已删，拨号不该校验一条用不上的消息。
+`cli_inband` 会把错误吞成 retval=0，所以"输出里没有 mpls-input 段"当**错误**返回，绝不当"没开"。
+
+**验证（同日都过）**：`internal/vppapi` `TestMPLSEnabledReadsFeatureArc` 5 例，样例取的是 lab-cpe1
+上 wg1001 的原样输出；`internal/agent/dataplane_mpls_test.go` 4 例（撤隧道里 disable 必须排在删口前、
+复用同一个号重建后弧是干净的、继承了残计数就拒绝开隧、disable 失败则不删口），假数据面把 VPP 的
+引用计数字性照抄进 `fakeVPP.mplsCount`（跨 `DeleteInterface` 存活、只在 0↔1 翻弧），所以这四条是真回归。
+**变异测试**：把 `teardownTunnel` 里那句 disable 改成 enable，三条立刻变红，报错正是那句诊断。
+
+**lab 里留下的坏号**（这些实验的代价，别当成新 bug）：lab-cpe2 的 `sw_if_index` 7（上表 A 段）、
+lab-cpe1 的 10/11/12（临时 loopback 试验）。它们谁接上都是"开不了 MPLS"，只有重启该盒 VPP 才清得掉；
+真撞上了会看见 agent 报"隧道接口 N 开不了 MPLS" —— 那是检测在工作，不是又一个新坑。
 
 ---
 

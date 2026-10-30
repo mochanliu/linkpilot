@@ -85,6 +85,11 @@ var requiredVersions = map[string]string{
 	"sw_interface_set_table_reply":       "e8d4e804",
 	"sw_interface_set_mpls_enable":       "ae6cfcfb",
 	"sw_interface_set_mpls_enable_reply": "e8d4e804",
+	// 弧本身才是 MPLS 的唯一真假判据，但读它走 CLI（interface.go 的 MPLSEnabled），
+	// 不走 API：feature_is_enabled 在这份 VPP 26.06 上永不回帧（2026-10-30 实测四次
+	// 请求全超时，而 CRC 与消息表对得上）。所以这张表里不留它 —— checkVersions
+	// 不该让拨号依赖一条我们用不上的消息。
+
 	// 接口 IPv4 地址（设备侧接口清单）。CRC 取自 srwg-node1 的 ip.api.json，
 	// 并用 test/scripts/vpp-api-probe4.py 在运行中的 VPP 上按注册表复核过。
 	"ip_address_dump":    "2d033de4",

@@ -88,6 +88,11 @@ type DataPlane interface {
 	AddDelInterfaceAddress(ctx context.Context, swIfIndex uint32, prefix netip.Prefix, add bool) error
 	SetInterfaceIPTable(ctx context.Context, swIfIndex uint32, tableID uint32) error
 	SetInterfaceMPLS(ctx context.Context, swIfIndex uint32, enable bool) error
+	// MPLSEnabled 读 mpls-input 弧本身回答"这张口的标签收包路径通了没"：
+	// true = 弧已摘掉丢弃路径。它是 MPLS 唯一的真假判据 —— `show mpls interface`
+	// 读的是那份跨接口删除存活的引用计数，会撒谎。真实现走 CLI（vppapi.MPLSEnabled），
+	// 因为 feature_is_enabled 那条 API 在这份 VPP 26.06 上永不回帧。
+	MPLSEnabled(ctx context.Context, swIfIndex uint32) (bool, error)
 	IPv4Addresses(ctx context.Context, swIfIndex uint32) ([]netip.Prefix, error)
 	IPRoutes(ctx context.Context, tableID uint32) ([]netip.Prefix, error)
 	IPRouteViaInterface(ctx context.Context, tableID uint32, prefix netip.Prefix, swIfIndex uint32, add bool) error
@@ -119,6 +124,10 @@ var _ DataPlane = (*vppapi.Client)(nil)
 // 但 0 就没有探针了），也要小于常见 NAT 的 UDP 映射超时 —— 25 秒与实验室手工
 // 配置一致。
 const defaultKeepaliveSec = 25
+
+// VPP 的 MPLS 收包开关就是往 mpls-input 这条 feature 弧上摘掉
+// "mpls-not-enabled" 这一条 feature，所以弧上还有这个名字 = 这张口在丢带标签的包。
+const featMPLSNotEnabled = "mpls-not-enabled"
 
 // 隧道 MTU 的合法区间用契约包里的 wire.MinTunnelMTU / MaxTunnelMTU，本层不另立
 // 一套数：控制器下发前与 agent 落地前必须拿同一把尺子，否则"控制器能发、agent
@@ -754,17 +763,36 @@ func (l *Link) applyOverlay(ctx context.Context, tunnelSwIfIndex uint32) error {
 	return nil
 }
 
-// finishOverlay 做"接口可用"的两步：admin-up 与开 MPLS。
+// finishOverlay 做"接口可用"的三步：admin-up、开 MPLS、然后向弧本身核验。
 //
 // admin-down 的症状是"配置全对、零流量"——地址、路由、peer 全都在，接口就是不发。
 // MPLS 只有在表里带标签转发时才有意义（VPN 的标签栈落在这张口上），但把它关掉
 // 不会报错、只会在 RFC 路由那天丢包，所以无条件开。
+//
+// 核验不是可有可无的：VPP 的 MPLS 开关按 sw_if_index 记引用计数，只在 0↔1 翻转时
+// 才真的挂/摘弧，而**计数不随接口删除清零**。一张 index 被复用给新建的隧道时，
+// enable 回成功、`show mpls interface` 照样列它，弧上却还挂着丢弃路径 ——
+// 带标签的 VPN 流量在收端全丢，而 overlay 的纯 IPv4 照 ping，现场看起来就像
+// "ECMP 坏了/配置没下发"（2026-10-30 在 lab 与 vpplab 各复现一次，判据见
+// docs/overlay-design-draft.md §2.8）。我们自己的撤隧道路径已经先 disable 再删，
+// 所以核验失败只可能是外部（手敲 vppctl、别的进程）留下的残留计数：
+// 那种情况必须报错，不能把路由装上去等黑洞。
 func (l *Link) finishOverlay(ctx context.Context, tunnelSwIfIndex uint32) error {
 	if err := l.dp.SetInterfaceUp(ctx, tunnelSwIfIndex, true); err != nil {
 		return fmt.Errorf("agent: admin-up 隧道接口 %d: %w", tunnelSwIfIndex, err)
 	}
 	if err := l.dp.SetInterfaceMPLS(ctx, tunnelSwIfIndex, true); err != nil {
 		return fmt.Errorf("agent: 在隧道接口 %d 上开 MPLS: %w", tunnelSwIfIndex, err)
+	}
+	enabled, err := l.dp.MPLSEnabled(ctx, tunnelSwIfIndex)
+	if err != nil {
+		return fmt.Errorf("agent: 核验隧道接口 %d 的 MPLS 弧: %w", tunnelSwIfIndex, err)
+	}
+	if !enabled {
+		return fmt.Errorf("agent: 隧道接口 %d 开不了 MPLS（弧上还挂着 %s）："+
+			"这个 sw_if_index 是从一张没先 disable 就被删掉的接口继承来的，"+
+			"VPP 把 enable 当空操作，只有重启 VPP 能清掉那份残留计数",
+			tunnelSwIfIndex, featMPLSNotEnabled)
 	}
 	return nil
 }
@@ -1292,6 +1320,19 @@ func teardownTunnel(ctx context.Context, dp DataPlane, swIf uint32, listenPort u
 			return fmt.Errorf("agent: 撤隧道接口 %d 时删对端 overlay 路由 %s（表 %d）: %w",
 				swIf, peer, overlayTable, err)
 		}
+	}
+
+	// 删口之前**必须**先把 MPLS 关掉。VPP 的 MPLS 开关按 sw_if_index 记引用计数、
+	// 只在 0↔1 翻转时才动 feature 弧，而这个计数不随接口删除清零：直接删掉一张开过
+	// MPLS 的口，下一个复用这个 index 的接口（改配置/换端口/换对端重建出来的隧道）
+	// 一出生就"已经开着"，enable 变成静默空操作、弧上还挂着丢弃路径，带标签的 VPN
+	// 流量在收端全丢。2026-10-30 实测：只有先 disable 再删能防住，事后 disable
+	// 多少次都救不回来（docs/overlay-design-draft.md §2.8）。
+	// 这一步失败就**不删**：带着没清零的计数删掉它等于把这个 sw_if_index 永久毒给
+	// 下一条重建到同一个号上的隧道，那比这条撤不掉难查得多；报错让操作员看得见。
+	if err := dp.SetInterfaceMPLS(ctx, swIf, false); err != nil && !isNoSuchEntry(err) {
+		return fmt.Errorf("agent: 删隧道接口 %d 前关不掉 MPLS（所以没有删它，"+
+			"否则这个 sw_if_index 会带着残计数交给下一条隧道）: %w", swIf, err)
 	}
 
 	if err := dp.DeleteInterface(ctx, swIf); err != nil && !isNoSuchEntry(err) {

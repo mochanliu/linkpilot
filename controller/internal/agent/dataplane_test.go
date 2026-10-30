@@ -64,7 +64,19 @@ type fakeVPP struct {
 	addrs   map[uint32][]netip.Prefix
 	routes  map[uint32]map[netip.Prefix]uint32 // 表 → 前缀 → 出口
 	up      map[uint32]bool
-	mpls    map[uint32]bool
+	// mpls 记的是**弧本身**的状态（true = mpls-input 上没有 mpls-not-enabled，
+	// 也就是真开着），不是"操作员点过 enable"。这个区分是整个坑的关键：真 VPP 的
+	// MPLS 开关按 sw_if_index 记引用计数、只在 0↔1 翻转时才动弧，而计数**不随接口
+	// 删除清零**（2026-10-30 在 lab 与 vpplab 各实测一次，docs/overlay-design-draft.md
+	// §2.8）。mplsCount 就是那份跨删除活下来的计数 —— 它只在 SetInterfaceMPLS 里增减，
+	// DeleteInterface 故意不清它。于是"没 disable 就删口 → 同一个 index 建第二条隧道
+	// → enable 静默空操作"这个坑会在假数据面里自己长出来，不需要测试去手动置位；
+	// 撤隧道路径里那句"删口前先 disable"一旦被人删掉，下面的重建测试立刻变红。
+	mpls      map[uint32]bool
+	mplsCount map[uint32]int
+	// mplsErr 让 SetInterfaceMPLS 一律失败：用来测"关不掉 MPLS 就不删口"那半条
+	// 规则（带着残计数删口，等于把这个号永久毒给下一条重建到同号上的隧道）。
+	mplsErr error
 	ports   []vppapi.PortInfo
 	rebinds int
 	// transitPort 是最后一次 SetTransit 的端口（真机的 transit_enabled 是全局开关，
@@ -80,18 +92,19 @@ type fakeVPP struct {
 
 func newFakeVPP() *fakeVPP {
 	return &fakeVPP{
-		paths:   map[uint16]vppapi.PathInfo{},
-		tunnels: map[uint32]vppapi.TunnelInfo{},
-		keys:    map[uint16][]byte{},
-		encap:   map[uint32]bool{},
-		nextIdx: 1,
-		nextPi:  1,
-		tables:  map[uint32]bool{},
-		ifTable: map[uint32]uint32{},
-		addrs:   map[uint32][]netip.Prefix{},
-		routes:  map[uint32]map[netip.Prefix]uint32{},
-		up:      map[uint32]bool{},
-		mpls:    map[uint32]bool{},
+		paths:     map[uint16]vppapi.PathInfo{},
+		tunnels:   map[uint32]vppapi.TunnelInfo{},
+		keys:      map[uint16][]byte{},
+		encap:     map[uint32]bool{},
+		nextIdx:   1,
+		nextPi:    1,
+		tables:    map[uint32]bool{},
+		ifTable:   map[uint32]uint32{},
+		addrs:     map[uint32][]netip.Prefix{},
+		routes:    map[uint32]map[netip.Prefix]uint32{},
+		up:        map[uint32]bool{},
+		mpls:      map[uint32]bool{},
+		mplsCount: map[uint32]int{},
 		// underlay 出口按真机的出生样子摆在这儿：af-packet 口 VPP 默认记 9000，
 		// 容器网卡只有 1500。这样"写完读回来"测的才是读回，而不是 map 里本来就对。
 		swIfs: []vppapi.SwInterface{{
@@ -176,6 +189,10 @@ func (f *fakeVPP) CreateInterface(ctx context.Context, p vppapi.InterfaceParams)
 	}
 	idx := f.nextIdx
 	f.nextIdx++
+	// 新建的口一出生弧上就挂着 mpls-not-enabled（真机默认就是这样）。
+	// mplsCount 不清：这个号要是从一张没先 disable 就被删掉的接口继承来的，
+	// 残留计数跟着号一起过来，下面那次 enable 就翻不动弧 —— 正是要测的坑。
+	delete(f.mpls, idx)
 	k, err := ecdh.X25519().NewPrivateKey(p.PrivateKeys)
 	if err != nil {
 		return 0, err
@@ -463,10 +480,34 @@ func (f *fakeVPP) SetInterfaceUp(ctx context.Context, swIfIndex uint32, up bool)
 	return nil
 }
 
+// SetInterfaceMPLS 照抄真 VPP 的引用计数字性（见 mplsCount 注释）：只有 0↔1 那次
+// 翻转才真的动弧，其余时候回成功却什么都不做。
 func (f *fakeVPP) SetInterfaceMPLS(ctx context.Context, swIfIndex uint32, enable bool) error {
 	f.log("SetInterfaceMPLS %d=%v", swIfIndex, enable)
-	f.mpls[swIfIndex] = enable
+	if f.mplsErr != nil {
+		return f.mplsErr
+	}
+	if enable {
+		if f.mplsCount[swIfIndex] == 0 {
+			f.mpls[swIfIndex] = true
+		}
+		f.mplsCount[swIfIndex]++
+		return nil
+	}
+	if f.mplsCount[swIfIndex] > 0 {
+		f.mplsCount[swIfIndex]--
+		if f.mplsCount[swIfIndex] == 0 {
+			f.mpls[swIfIndex] = false
+		}
+	}
 	return nil
+}
+
+// MPLSEnabled 读的是弧，不是那份计数 —— 所以它是假数据面里唯一诚实的读数
+// （`show mpls interface` 在真机上读计数，被毒的接口照样说"MPLS enabled"）。
+func (f *fakeVPP) MPLSEnabled(ctx context.Context, swIfIndex uint32) (bool, error) {
+	f.log("MPLSEnabled %d", swIfIndex)
+	return f.mpls[swIfIndex], nil
 }
 
 func (f *fakeVPP) IPv4Addresses(ctx context.Context, swIfIndex uint32) ([]netip.Prefix, error) {
@@ -523,6 +564,8 @@ func (f *fakeVPP) DeleteInterface(ctx context.Context, swIfIndex uint32) error {
 	delete(f.addrs, swIfIndex)
 	delete(f.ifTable, swIfIndex)
 	delete(f.up, swIfIndex)
+	// 清掉这张口的弧状态，但**不动 mplsCount**：真 VPP 删口不清那份计数，
+	// 这个"不清"就是整个坑的根源。假数据面留着它，重建到同一个号上才会中毒。
 	delete(f.mpls, swIfIndex)
 	for i := 0; i < len(f.peers); {
 		if f.peers[i].SWIfIndex == swIfIndex {
