@@ -11,10 +11,12 @@ package main
 
 import (
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/wire"
@@ -110,5 +112,163 @@ func TestBundleSkipsAPeerWithNoBinding(t *testing.T) {
 	}
 	if len(b.Skipped) != 1 || !strings.Contains(b.Skipped[0].Reason, "公钥担保") {
 		t.Fatalf("node 1 应看到对端缺担保的跳过项，实际 %+v", b.Skipped)
+	}
+}
+
+// enrollExtra adds a device to tenant "t" the way the fixture adds its three:
+// an observation, a serial and one WAN port with an address. Node 4 is needed by
+// any test that wants two relay boxes.
+func enrollExtra(t *testing.T, s *server, id uint16, ip string) {
+	t.Helper()
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := addNode(s, "t", id, nil, ip+":40000")
+	n.Serial = fmt.Sprintf("cpe-%d", id)
+	n.MappingAt = now
+	n.Ifaces = &[]wire.IfaceInfo{{
+		Name: "wan0", SWIfIndex: uint32(id), MTU: 1500,
+		AdminUp: true, LinkUp: true, Addrs: []string{ip + "/24"},
+	}}
+	n.InventoryAt = now
+}
+
+// A relay chain reaches the box as one ordered list, each hop paired with THAT
+// hop's transit port. Two things this locks: the order (the agent reverses it into
+// the segment list, so a sorted copy silently changes which box the packet pops
+// first) and the per-hop port (a chain that borrowed one port for every hop would
+// send the packet to a device that is not listening for it).
+func TestBundleRendersEveryHopWithItsOwnTransitPort(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	// Enrolled AFTER the publish: a late device must still get a transit port the
+	// moment a path starts using it, or the whole tunnel would be undeliverable.
+	enrollExtra(t, s, 4, "198.51.100.14")
+	enrollExtra(t, s, 5, "198.51.100.15")
+
+	rec := createTunnel(t, s, ten, tunnelReq{
+		A:    underlaySpec{NodeID: 1, Iface: "wan0"},
+		B:    underlaySpec{NodeID: 2, Iface: "wan0"},
+		Path: via(3, 4, 5),
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("three-hop tunnel = %d (%s)", rec.Code, rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2)
+
+	want := []string{"198.51.100.13:15000", "198.51.100.14:15000", "198.51.100.15:15000"}
+	for _, node := range []uint16{1, 2} {
+		b := bundleOf(t, s, "t", node)
+		if len(b.Tunnels) != 1 {
+			t.Fatalf("node %d: %d tunnel(s), skipped=%+v", node, len(b.Tunnels), b.Skipped)
+		}
+		relays := b.Tunnels[0].Relays
+		if len(relays) != 3 {
+			t.Fatalf("node %d: 中转链应有 3 跳，实际 %+v", node, relays)
+		}
+		for i, r := range relays {
+			if r.NodeID != uint16(i+3) || r.Endpoint != want[i] {
+				t.Fatalf("node %d: 第 %d 跳 = %+v，应是 node %d %s",
+					node, i+1, r, i+3, want[i])
+			}
+		}
+	}
+}
+
+// A hop that cannot be named fails the WHOLE tunnel, not just that hop: a chain
+// delivered with one link missing is a different path than the one the tenant
+// chose, and it would look identical in the console.
+func TestBundleSkipsTunnelWhenOneHopIsUnnameable(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	enrollExtra(t, s, 4, "198.51.100.14")
+	rec := createTunnel(t, s, ten, tunnelReq{
+		A:    underlaySpec{NodeID: 1, Iface: "wan0"},
+		B:    underlaySpec{NodeID: 2, Iface: "wan0"},
+		Path: via(3, 4),
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", rec.Code, rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2)
+	// 第二跳的观测过期了（第一跳仍然可用）。
+	s.mu.Lock()
+	s.state.Nodes[key("t", 4)].MappingAt = 0
+	s.mu.Unlock()
+
+	b := bundleOf(t, s, "t", 1)
+	if len(b.Tunnels) != 0 {
+		t.Fatalf("有一跳说不清时不该下发: %+v", b.Tunnels)
+	}
+	if len(b.Skipped) != 1 || !strings.Contains(b.Skipped[0].Reason, "第 2 跳") ||
+		!strings.Contains(b.Skipped[0].Reason, "已过期") {
+		t.Fatalf("跳过项要指出是第几跳、为什么，实际 %+v", b.Skipped)
+	}
+}
+
+// A direct tunnel carries no relay list at all. It must not be an empty-but-
+// present field either: the agent reads len(Relays)==0 as "no SR hop", and a
+// stale single-hop field left in the JSON would rebuild every direct tunnel.
+func TestBundleDirectTunnelHasNoRelays(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	if rec := createTunnel(t, s, ten, manualTunnel(1, 2, "wan0")); rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", rec.Code, rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2, 3)
+	b := bundleOf(t, s, "t", 1)
+	if len(b.Tunnels) != 1 || len(b.Tunnels[0].Relays) != 0 {
+		t.Fatalf("直连隧道带了中转: %+v", b.Tunnels)
+	}
+	// 同一台设备上的两条隧道：一条经中转、一条直连，各自的段列表不能互相污染。
+	if rec := createTunnel(t, s, ten, tunnelReq{
+		A: underlaySpec{NodeID: 1, Iface: "wan0"}, B: underlaySpec{NodeID: 3, Iface: "wan0"},
+		Path: via(2),
+	}); rec.Code != http.StatusCreated {
+		t.Fatalf("relayed = %d (%s)", rec.Code, rec.Body.String())
+	}
+	b = bundleOf(t, s, "t", 1)
+	byPeer := map[uint16]wire.TunnelSpec{}
+	for _, sp := range b.Tunnels {
+		byPeer[sp.PeerNodeID] = sp
+	}
+	if len(byPeer[2].Relays) != 0 {
+		t.Fatalf("直连那条被写进了中转: %+v", byPeer[2].Relays)
+	}
+	if len(byPeer[3].Relays) != 1 || byPeer[3].Relays[0].NodeID != 2 {
+		t.Fatalf("中转那条的链不对: %+v", byPeer[3].Relays)
+	}
+}
+
+// Editing a shared template's hop ORDER must move the delivered segment list.
+// Two chains over the same two boxes are two different routes, and a page that
+// shows 4→3 while the box dials 3→4 is worse than no page at all -- the tenant
+// has no other way to see which one the traffic actually takes.
+func TestBundleFollowsAReorderedTemplate(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	enrollExtra(t, s, 4, "198.51.100.14")
+	rec := createTunnel(t, s, ten, tunnelReq{
+		A:    underlaySpec{NodeID: 1, Iface: "wan0"},
+		B:    underlaySpec{NodeID: 2, Iface: "wan0"},
+		Path: &pathReq{Hops: []hopReq{{NodeID: 3}, {NodeID: 4}}, SaveAs: "主路径"},
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", rec.Code, rec.Body.String())
+	}
+	tun := tunnelFrom(t, rec)
+	giveIdentity(t, s, "t", 1, 2)
+
+	flip := mustJSON(t, underlayPathRequest{
+		ID:   tun.Path.TemplateID,
+		Hops: []underlayHopSpec{{NodeID: 4}, {NodeID: 3}},
+	})
+	if r := underlayDo(t, s.handleAdminUnderlayPaths, ten, http.MethodPut, "/api/underlay/paths", flip); r.Code != http.StatusOK {
+		t.Fatalf("swap hops = %d (%s)", r.Code, r.Body.String())
+	}
+	relays := bundleOf(t, s, "t", 1).Tunnels[0].Relays
+	if len(relays) != 2 || relays[0].NodeID != 4 || relays[1].NodeID != 3 ||
+		relays[0].Endpoint != "198.51.100.14:15000" || relays[1].Endpoint != "198.51.100.13:15000" {
+		t.Fatalf("模板换序后下发的中转链没跟着换: %+v", relays)
 	}
 }

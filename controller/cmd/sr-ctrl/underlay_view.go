@@ -14,6 +14,7 @@ package main
 // invented "down" would be read as a measurement.
 
 import (
+	"fmt"
 	"sort"
 
 	"sdwan/controller/internal/underlay"
@@ -23,6 +24,17 @@ import (
 // underlayStateNote explains the fixed "unknown" edge state. It is a sentence,
 // not a code, because it is the honest answer to "why is nothing green yet".
 const underlayStateNote = "每条隧道的运行状态仍是「未知」：设备会回报它自己建了几条隧道（见设备表的「隧道下发」列），但遥测行按数据面接口索引记账，控制器还没把每一行对到某条隧道上。"
+
+// relayHopNote is the ceiling the relay-chain editor needs next to its button.
+// The number alone reads as arbitrary: the dataplane's own limit is 8 segments
+// with one reserved for the tunnel destination (so 7 relays), and the value we
+// expose is lower on purpose. Putting the sentence here keeps the page from
+// inventing a reason for a constant it does not own.
+func relayHopNote() string {
+	return fmt.Sprintf("一条隧道最多 %d 跳中转：数据面的段表容 %d 段，其中一段必须留给隧道终点，"+
+		"所以物理上能到 %d 跳。这里取的是实测过的深度，要加深需要新的实测，不是改这个数。",
+		underlay.MaxRelayHops, wire.MaxSRSegments, wire.MaxSRSegments-1)
+}
 
 type underlayEndpointView struct {
 	NodeID uint16 `json:"node_id"`
@@ -38,22 +50,32 @@ type underlayEndpointView struct {
 	Overlay            string `json:"overlay"`
 }
 
+// underlayHopView is one relay hop named for the page: the device number, the
+// serial the tenant actually reads, and an explicit address override if it has one.
+type underlayHopView struct {
+	NodeID uint16 `json:"node_id"`
+	Serial string `json:"serial"`
+	Addr   string `json:"addr,omitempty"`
+}
+
 type underlayResolvedPathView struct {
-	TemplateID   string `json:"template_id,omitempty"`
-	TemplateName string `json:"template_name,omitempty"`
-	NodeID       uint16 `json:"node_id"`
-	Serial       string `json:"serial"`
-	Addr         string `json:"addr,omitempty"`
+	TemplateID   string            `json:"template_id,omitempty"`
+	TemplateName string            `json:"template_name,omitempty"`
+	Hops         []underlayHopView `json:"hops"`
 }
 
 type underlayTunnelView struct {
 	ID string               `json:"id"`
 	A  underlayEndpointView `json:"a"`
 	B  underlayEndpointView `json:"b"`
-	// Path is the relay hop; nil means the tunnel is direct. PathError is a
+	// Path is the relay chain; nil means the tunnel is direct. PathError is a
 	// reference that no longer resolves -- shown, not silently drawn as direct.
 	Path      *underlayResolvedPathView `json:"path,omitempty"`
 	PathError string                    `json:"path_error,omitempty"`
+
+	// Color is the tunnel's SD-WAN color: the number the page shows in the 颜色
+	// column and the one the device turns into a VPP preference (230+颜色).
+	Color uint8 `json:"color"`
 
 	// MTU 0 means no device on this tunnel has reported a link MTU; delivery then
 	// uses wire.DefaultTunnelMTU, and MTUIsDefault says so instead of pretending
@@ -116,13 +138,12 @@ type underlayNodeView struct {
 }
 
 type underlayTemplateView struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	NodeID    uint16   `json:"node_id"`
-	Serial    string   `json:"serial"`
-	Addr      string   `json:"addr,omitempty"`
-	Users     []string `json:"users"`
-	CreatedAt int64    `json:"created_at_unix"`
+	ID    string            `json:"id"`
+	Name  string            `json:"name"`
+	Hops  []underlayHopView `json:"hops"`
+	Users []string          `json:"users"`
+
+	CreatedAt int64 `json:"created_at_unix"`
 }
 
 type underlayView struct {
@@ -146,6 +167,15 @@ type underlayView struct {
 
 	DefaultTunnelMTU uint16 `json:"default_tunnel_mtu"`
 	StateNote        string `json:"state_note"`
+	// RelayHopLimit is the policy ceiling the relay-chain editor stops at, and
+	// RelayHopNote is why. The page owns the widget but not the number.
+	RelayHopLimit int    `json:"relay_hop_limit"`
+	RelayHopNote  string `json:"relay_hop_note"`
+
+	// MaxTunnelColor is the ceiling the color dropdown stops at. Same reason as
+	// the hop limit: the page owns the widget, the backend owns the number that
+	// the table-number formula and the u8 preference were checked against.
+	MaxTunnelColor uint8 `json:"max_tunnel_color"`
 
 	Nodes   []underlayNodeView     `json:"nodes"`
 	Tunnels []underlayTunnelView   `json:"tunnels"`
@@ -201,6 +231,9 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 		Settings:         draft,
 		DefaultTunnelMTU: wire.DefaultTunnelMTU,
 		StateNote:        underlayStateNote,
+		RelayHopLimit:    underlay.MaxRelayHops,
+		RelayHopNote:     relayHopNote(),
+		MaxTunnelColor:   underlay.MaxTunnelColor,
 		Changes:          []string{},
 		Checks:           []ConfigCheck{},
 		Nodes:            []underlayNodeView{},
@@ -231,7 +264,9 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 		counts[t.A.NodeID]++
 		counts[t.B.NodeID]++
 		if rp, has, err := st.PathFor(t.Path); has && err == nil {
-			relayFor[rp.NodeID]++
+			for _, h := range rp.Hops {
+				relayFor[h.NodeID]++
+			}
 		}
 	}
 
@@ -283,10 +318,26 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 	return out
 }
 
+// hopViews names a relay chain for the page, in traversal order. An unenrolled
+// hop still gets a row, named as what it is, rather than a shortened chain: a path
+// that quietly lost a hop would look valid on the topology and undeliverable on
+// the device.
+func hopViews(hops []underlay.PathHop, serials map[uint16]string) []underlayHopView {
+	out := make([]underlayHopView, 0, len(hops))
+	for _, h := range hops {
+		name := serials[h.NodeID]
+		if name == "" {
+			name = fmt.Sprintf("设备 %d（不在设备表里）", h.NodeID)
+		}
+		out = append(out, underlayHopView{NodeID: h.NodeID, Serial: name, Addr: h.Addr})
+	}
+	return out
+}
+
 func buildTemplateView(st *underlay.State, p *underlay.PathTemplate, serials map[uint16]string) underlayTemplateView {
 	return underlayTemplateView{
-		ID: p.ID, Name: p.Name, NodeID: p.NodeID, Serial: serials[p.NodeID],
-		Addr: p.Addr, Users: st.PathUsers(p.ID), CreatedAt: p.CreatedAt,
+		ID: p.ID, Name: p.Name, Hops: hopViews(p.Hops, serials),
+		Users: st.PathUsers(p.ID), CreatedAt: p.CreatedAt,
 	}
 }
 
@@ -295,6 +346,7 @@ func buildTunnelView(st *underlay.State, t *underlay.Tunnel, serials map[uint16]
 		ID:           t.ID,
 		A:            buildEndpointView(views, t.A),
 		B:            buildEndpointView(views, t.B),
+		Color:        t.Color,
 		MTU:          t.MTU,
 		MTUIsDefault: t.MTU == 0,
 		Roles:        t.Roles,
@@ -309,7 +361,7 @@ func buildTunnelView(st *underlay.State, t *underlay.Tunnel, serials map[uint16]
 		} else {
 			v.Path = &underlayResolvedPathView{
 				TemplateID: rp.TemplateID, TemplateName: rp.TemplateName,
-				NodeID: rp.NodeID, Serial: serials[rp.NodeID], Addr: rp.Addr,
+				Hops: hopViews(rp.Hops, serials),
 			}
 		}
 	}
@@ -447,7 +499,7 @@ func (s *server) underlayAutoViewLocked(tenant string, req underlay.AutoRequest,
 				if tpl.ID == t.Path.TemplateID {
 					tv.Path = &underlayResolvedPathView{
 						TemplateID: tpl.ID, TemplateName: tpl.Name,
-						NodeID: tpl.NodeID, Serial: serials[tpl.NodeID], Addr: tpl.Addr,
+						Hops: hopViews(tpl.Hops, serials),
 					}
 					tv.PathError = ""
 					break

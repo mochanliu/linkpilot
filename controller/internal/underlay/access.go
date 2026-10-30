@@ -72,30 +72,29 @@ func (s *State) PortsOnNode(node uint16) []uint16 {
 	return out
 }
 
-// ResolvedPath is a tunnel's relay hop with the template already looked up. The
-// console and the topology need the hop as a NODE, not as "template p3": the
-// page cannot resolve ids, and a template edit must show up on every tunnel that
-// uses it on the next read.
+// ResolvedPath is a tunnel's relay chain with the template already looked up, in
+// traversal order. The console and the topology need the hops as NODES, not as
+// "template p3": the page cannot resolve ids, and a template edit must show up on
+// every tunnel that uses it on the next read.
 type ResolvedPath struct {
-	TemplateID   string `json:"template_id,omitempty"`
-	TemplateName string `json:"template_name,omitempty"`
-	NodeID       uint16 `json:"node_id"`
-	Addr         string `json:"addr,omitempty"`
+	TemplateID   string    `json:"template_id,omitempty"`
+	TemplateName string    `json:"template_name,omitempty"`
+	Hops         []PathHop `json:"hops"`
 }
 
 // PathFor resolves a tunnel's path against the current template table. has is
 // false for a direct tunnel; err means a reference that does not resolve (the
-// template is gone), which the page shows instead of drawing the tunnel as
-// direct.
+// template is gone, or it has no usable hops), which the page shows instead of
+// drawing the tunnel as direct.
 func (s *State) PathFor(p *TunnelPath) (rp ResolvedPath, has bool, err error) {
 	if p == nil {
 		return ResolvedPath{}, false, nil
 	}
-	node, addr, err := s.resolve(p)
+	hops, err := s.resolve(p)
 	if err != nil {
 		return ResolvedPath{}, true, err
 	}
-	rp = ResolvedPath{TemplateID: p.TemplateID, NodeID: node, Addr: addr}
+	rp = ResolvedPath{TemplateID: p.TemplateID, Hops: hops}
 	if p.TemplateID != "" {
 		if tpl := s.Paths[p.TemplateID]; tpl != nil {
 			rp.TemplateName = tpl.Name

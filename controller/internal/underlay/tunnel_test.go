@@ -1,6 +1,7 @@
 package underlay
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -44,7 +45,7 @@ func TestCreateDirectTunnel(t *testing.T) {
 func TestCreateRelayTunnelKeepsTheSameInterfaceMTU(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2, 3)
-	tpl, err := s.CreatePath("", 3, "", 1000)
+	tpl, err := s.CreatePath("", hopList(3), 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,22 @@ func TestCreateChecks(t *testing.T) {
 			A: EndpointSpec{NodeID: 1, Iface: "eth9"}, B: EndpointSpec{NodeID: 2}}, "没有接口"},
 		{"中转就是端点", CreateRequest{
 			A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
-			Path: &TunnelPath{NodeID: 1}}, "同时是隧道的一端"},
+			Path: via(1)}, "同时是隧道的一端"},
+		{"第 2 跳是端点", CreateRequest{
+			A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+			Path: via(3, 2)}, "第 2 跳"},
+		{"中转设备未入网", CreateRequest{
+			A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+			Path: via(3, 77)}, "不存在或未入网"},
+		{"同一条链绕回同一台", CreateRequest{
+			A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+			Path: via(3, 5, 3)}, "出现了两次"},
+		{"超过跳数上限", CreateRequest{
+			A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+			Path: via(3, 5, 7, 12)}, "最多 3 跳"},
+		{"空路径", CreateRequest{
+			A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+			Path: &TunnelPath{}}, "至少一个中转设备"},
 		{"模板不存在", CreateRequest{
 			A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
 			Path: &TunnelPath{TemplateID: "p99"}}, "不存在"},
@@ -168,7 +184,7 @@ func TestUpdateAndDelete(t *testing.T) {
 	views := testViews(1, 2, 3)
 	tun := mustCreate(t, s, views, 1, 2, nil)
 	directMTU := tun.MTU
-	tpl, _ := s.CreatePath("", 3, "", 1000)
+	tpl, _ := s.CreatePath("", hopList(3), 1000)
 
 	upd, err := s.Update(tun.ID, UpdateRequest{Path: &TunnelPath{TemplateID: tpl.ID}, Now: 2000}, views)
 	if err != nil {
@@ -182,6 +198,21 @@ func TestUpdateAndDelete(t *testing.T) {
 	}
 	if upd.A.Port != tun.A.Port || upd.B.Port != tun.B.Port {
 		t.Fatal("没要求改端口，端口却动了")
+	}
+
+	// Two hops on the same tunnel: an update has to carry the WHOLE chain. A
+	// resolve that returned only the first hop would save a 2-hop edit as a 1-hop
+	// route and the device would install it without complaining.
+	wide := testViews(1, 2, 3, 5)
+	two, err := s.Update(tun.ID, UpdateRequest{Path: via(3, 5), Now: 2500}, wide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(two.Path.Hops) != 2 || two.Path.Hops[0].NodeID != 3 || two.Path.Hops[1].NodeID != 5 {
+		t.Fatalf("两跳路径没整条存下来: %+v", two.Path)
+	}
+	if s.TransitPorts[5] != 15000 {
+		t.Fatalf("第二跳没拿到中转端口: %v", s.TransitPorts)
 	}
 
 	// Back to direct without touching anything else.
@@ -247,8 +278,8 @@ func TestUpdateRejectsPortCollisionOnSameDevice(t *testing.T) {
 
 func TestPathTemplateFanOut(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
-	views := testViews(1, 2, 3, 4)
-	tpl, _ := s.CreatePath("主用路径", 3, "", 1000)
+	views := testViews(1, 2, 3, 4, 5)
+	tpl, _ := s.CreatePath("主用路径", hopList(3), 1000)
 	t1 := mustCreate(t, s, views, 1, 2, &TunnelPath{TemplateID: tpl.ID})
 	t2 := mustCreate(t, s, views, 1, 4, &TunnelPath{TemplateID: tpl.ID})
 
@@ -260,12 +291,29 @@ func TestPathTemplateFanOut(t *testing.T) {
 	}
 	// Pointing the shared path at a device that is one of the ends must fail for
 	// the whole fan-out, not just the first tunnel.
-	if err := s.UpdatePath(tpl.ID, "", 1, ""); err == nil {
+	if err := s.UpdatePath(tpl.ID, "", hopList(1)); err == nil {
 		t.Fatal("把中转设备改成隧道端点，竟然通过了")
 	}
-	if err := s.UpdatePath(tpl.ID, "", 4, ""); err != nil && !strings.Contains(err.Error(), "一端") {
+	if err := s.UpdatePath(tpl.ID, "", hopList(4)); err != nil && !strings.Contains(err.Error(), "一端") {
 		t.Fatalf("改成另一台中转设备应被端点检查拦下: %v", err)
 	}
+	// A shared template may be re-pointed at a whole chain: every tunnel that uses
+	// it moves together, and each new hop is checked against every user's own ends
+	// -- node 1 is an end of both tunnels and node 4 of one of them, so a chain
+	// through 3→5 is the one that is legal for both.
+	if err := s.UpdatePath(tpl.ID, "", hopList(3, 5)); err != nil {
+		t.Fatalf("换成 3→5 两跳（与四条端点都不冲突）应通过: %v", err)
+	}
+	for _, id := range []string{t1.ID, t2.ID} {
+		if got, _, err := s.PathFor(s.Tunnels[id].Path); err != nil {
+			t.Fatalf("模板改多跳后 %s 解析失败: %v", id, err)
+		} else if len(got.Hops) != 2 || got.Hops[0].NodeID != 3 || got.Hops[1].NodeID != 5 {
+			t.Fatalf("%s 应继承模板的两跳，实际 %+v", id, got.Hops)
+		}
+	}
+	// UpdatePath deliberately does not hand out a transit port for a hop it just
+	// gained: enrollment and publish own that port, and re-granting it here would
+	// undo an operator's clear. Delivery is what reports a hop with no port.
 	for _, id := range []string{t1.ID, t2.ID} {
 		if err := s.Delete(id); err != nil {
 			t.Fatal(err)
@@ -273,5 +321,115 @@ func TestPathTemplateFanOut(t *testing.T) {
 	}
 	if err := s.DeletePath(tpl.ID); err != nil {
 		t.Fatalf("没有隧道引用后应能删除模板: %v", err)
+	}
+}
+
+// Color is the one tunnel field that means nothing to the underlay and
+// everything to the FIB (preference = 230+颜色), so the two things that must
+// hold are: it survives create/update/restart, and recoloring to 0 is possible.
+func TestTunnelColorIsStoredAndRecolorable(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+
+	tun, err := s.Create(CreateRequest{
+		A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Color: 3, Now: 1000,
+	}, views)
+	if err != nil {
+		t.Fatalf("带颜色建隧道失败: %v", err)
+	}
+	if tun.Color != 3 {
+		t.Fatalf("颜色应存成 3，实际 %d", tun.Color)
+	}
+
+	// A request that says nothing about color keeps it -- the page edits the path
+	// and the ports through the same form.
+	got, err := s.Update(tun.ID, UpdateRequest{Now: 1100}, views)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Color != 3 {
+		t.Fatalf("没写颜色的更新不该动颜色，实际 %d", got.Color)
+	}
+
+	// 0 is a real color, so it has to be settable.
+	zero := uint8(0)
+	got, err = s.Update(tun.ID, UpdateRequest{Color: &zero, Now: 1200}, views)
+	if err != nil {
+		t.Fatalf("改回颜色 0 失败: %v", err)
+	}
+	if got.Color != 0 {
+		t.Fatalf("颜色应改成 0，实际 %d", got.Color)
+	}
+
+	// It is configuration: it must survive the state round trip.
+	blob, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back State
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatal(err)
+	}
+	if bt := back.Tunnels[tun.ID]; bt == nil || bt.Color != 0 {
+		t.Fatalf("重启后颜色丢了: %+v", bt)
+	}
+}
+
+// Colors above 7 have no verified table-number segment behind them
+// (颜色*1000+10000+主表号), and a color that overflowed the u8 preference would
+// quietly invert the order -- the failure docs/overlay-design-draft.md §2.7
+// measured on the FRR side (kernel metric 300 => VPP preference 44).
+func TestColorOutOfRangeIsRefused(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+
+	if _, err := s.Create(CreateRequest{
+		A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Color: MaxTunnelColor + 1, Now: 1000,
+	}, views); err == nil || !strings.Contains(err.Error(), "0..") {
+		t.Fatalf("颜色 %d 应被拒，实际 %v", MaxTunnelColor+1, err)
+	}
+	if len(s.Tunnels) != 0 {
+		t.Fatalf("被拒的创建不该留下隧道，实际 %d 条", len(s.Tunnels))
+	}
+
+	tun := mustCreate(t, s, views, 1, 2, nil)
+	bad := uint8(200)
+	if _, err := s.Update(tun.ID, UpdateRequest{Color: &bad, Now: 1100}, views); err == nil {
+		t.Fatal("把颜色改成 200 应被拒")
+	}
+	if s.Tunnels[tun.ID].Color != 0 {
+		t.Fatalf("失败的改色不该写库，实际颜色 %d", s.Tunnels[tun.ID].Color)
+	}
+}
+
+// A batch colors every tunnel it makes: "从 A 到这几台都走颜色 1" is one question,
+// and a color that is out of range fails the batch once instead of per peer.
+func TestFanAppliesOneColorToTheWholeBatch(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2, 3, 4)
+
+	res, err := s.Fan(FanRequest{
+		Local: EndpointSpec{NodeID: 1}, Peers: []uint16{2, 3, 4}, Color: 1, Now: 1000,
+	}, views)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Created) != 3 {
+		t.Fatalf("应建 3 条，实际 %d", len(res.Created))
+	}
+	for _, tun := range res.Created {
+		if tun.Color != 1 {
+			t.Fatalf("隧道 %s 颜色 %d，批量应统一成 1", tun.ID, tun.Color)
+		}
+	}
+
+	before := len(s.Tunnels)
+	if _, err := s.Fan(FanRequest{
+		Local: EndpointSpec{NodeID: 1}, Peers: []uint16{5}, Color: MaxTunnelColor + 1, Now: 1000,
+	}, testViews(1, 2, 3, 4, 5)); err == nil {
+		t.Fatal("越界颜色的批量应整体报错，而不是每台记一条 skip")
+	}
+	if len(s.Tunnels) != before {
+		t.Fatalf("越界颜色的批量不该建任何隧道，%d -> %d", before, len(s.Tunnels))
 	}
 }

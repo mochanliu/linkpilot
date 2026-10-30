@@ -216,10 +216,16 @@ type LinkConfig struct {
 	// PeerOverlay 是对端的 overlay /32。它作为直连条目（via 本接口）落在
 	// OverlayTable 里，给 BFD/探针和排障用；转发下一跳仍由控制面显式下发。
 	PeerOverlay netip.Prefix
-	// RelayIP/RelayPort 是中转跳的外层地址与 transit 端口，direct 隧道留空。
-	// 它进路径段列表的**最后**一段（segments[0] 是终点，最后一段是第一个跳）。
-	RelayIP   net.IP
-	RelayPort uint16
+	// Relays 是中转链，按行走顺序：Relays[0] 是包碰到的第一台盒子，direct 隧道留空。
+	// 它们进段列表时要**倒序**追加（segments[0] 是终点，最后一段才是第一跳），
+	// 见 ApplyPeer 里的段序注释。
+	Relays []RelayHop
+}
+
+// RelayHop 是一个中转跳的外层地址与它的 transit 端口，一对必须给全。
+type RelayHop struct {
+	IP   net.IP
+	Port uint16
 }
 
 // Link 是这台 CPE 的数据面句柄：一个 WG 接口，加上它上面的密钥、路径与 peers。
@@ -331,14 +337,26 @@ func NewLink(cfg LinkConfig) (*Link, error) {
 		return nil, fmt.Errorf("agent: 本机与对端的 overlay 地址相同（%s）", cfg.LocalOverlay)
 	}
 	// 中转跳：地址与端口是一体的，半个中转比没有中转更难查（路径会指向 0 端口）。
-	if (cfg.RelayIP != nil) != (cfg.RelayPort != 0) {
-		return nil, fmt.Errorf("agent: 中转跳要给全地址与端口，收到 ip=%v port=%d", cfg.RelayIP, cfg.RelayPort)
+	// 段数上限不在这里判：AddPath 会按 vppapi 的固定段数组拒绝。
+	for i, r := range cfg.Relays {
+		switch {
+		case r.IP == nil || r.Port == 0:
+			return nil, fmt.Errorf("agent: 第 %d 跳中转要给全地址与端口，收到 ip=%v port=%d", i+1, r.IP, r.Port)
+		case r.IP.To4() == nil:
+			return nil, fmt.Errorf("agent: 第 %d 跳中转地址必须是 IPv4，给了 %v", i+1, r.IP)
+		}
+		for j := i + 1; j < len(cfg.Relays); j++ {
+			if cfg.Relays[j].Port == r.Port && cfg.Relays[j].IP.Equal(r.IP) {
+				return nil, fmt.Errorf("agent: 设备中转链里 %s:%d 出现了两次：同一跳不能串两次", r.IP, r.Port)
+			}
+		}
 	}
-	if cfg.RelayIP != nil && cfg.RelayIP.To4() == nil {
-		return nil, fmt.Errorf("agent: 中转跳地址必须是 IPv4，给了 %v", cfg.RelayIP)
-	}
-	if cfg.RelayIP != nil {
-		cfg.RelayIP = append(net.IP(nil), cfg.RelayIP.To4()...)
+	if len(cfg.Relays) > 0 {
+		relays := make([]RelayHop, 0, len(cfg.Relays))
+		for _, r := range cfg.Relays {
+			relays = append(relays, RelayHop{IP: append(net.IP(nil), r.IP.To4()...), Port: r.Port})
+		}
+		cfg.Relays = relays
 	}
 	k, err := ecdh.X25519().NewPrivateKey(cfg.PrivateKey)
 	if err != nil {
@@ -908,11 +926,14 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 	// 路径的段列表走（真机验过），所以只 AddPath 会让包发往旧地址。
 	//
 	// 段序：segments[0] 是**终点**（对端的外层 ip:port），最后一段是第一个跳。
-	// 中转隧道就在末尾再挂一跳 relay:transit_port，和实验室手敲的
-	// `sr-wg path add P via PEER:port via TRANSIT:tport` 逐字对应。
+	// 中转链就是按行走顺序**倒着**挂到末尾：Relays[0]（第一跳）落在最后一段，
+	// 和实验室手敲的
+	// `sr-wg path add P via PEER:port via H2:tport via H1:tport` 逐字对应。
 	segments := []vppapi.Segment{{IP: ep.IP, Port: ep.Port}}
-	if l.cfg.RelayIP != nil {
-		segments = append(segments, vppapi.Segment{IP: l.cfg.RelayIP, Port: l.cfg.RelayPort})
+	for i := len(l.cfg.Relays) - 1; i >= 0; i-- {
+		segments = append(segments, vppapi.Segment{
+			IP: l.cfg.Relays[i].IP, Port: l.cfg.Relays[i].Port,
+		})
 	}
 	if err := l.dp.AddPath(ctx, vppapi.PathParams{
 		PathID:   pathID,

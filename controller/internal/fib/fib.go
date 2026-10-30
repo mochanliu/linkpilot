@@ -48,6 +48,14 @@ const MaxVRFID uint8 = 255
 // 所以 VPN ID 取 250 会把客户路由装进 overlay 表，静默破坏隧道。
 const OverlayTable uint8 = 250
 
+// PrefBase 是 SD-WAN 路径的 VPP preference 起始值（0 最优，u8 上限 255）。
+// preference = PrefBase + 颜色（0..7 ⇒ 230..237），作用仅限 API 源内部排序。
+const PrefBase uint8 = 230
+
+// MaxColor 是颜色上限（PrefBase + MaxColor ≤ 255 ⇒ 25）。设计上限是 7，
+// 这里取 u8 数学上限做断言；更小的业务上限由调用方/配置层校验。
+const MaxColor uint8 = 255 - PrefBase
+
 // LabelFor 是"这个 VRF 的 VPN 标签"的唯一算法。收端登记本地标签、发端压标签
 // 都用它 —— 两边各算一次还长得一样，是这套方案不需要信令的原因。
 func LabelFor(vrf uint8) uint32 { return LabelBase + uint32(vrf) }
@@ -67,13 +75,15 @@ type RIBRoute struct {
 type Tunnel struct {
 	NextHop   string
 	Interface string
+	Color     uint8
 }
 
 // Path 是一条可下发的路径。Label 是压入的 VPN 标签。
 type Path struct {
-	NextHop   netip.Addr
-	Interface string
-	Label     uint32
+	NextHop    netip.Addr
+	Interface  string
+	Label      uint32
+	Preference uint8
 }
 
 // Route 是一条要落进 VPP 的前缀。
@@ -133,6 +143,9 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 		if t.Interface == "" {
 			return p, fmt.Errorf("fib: 隧道 %s 没有接口名", t.NextHop)
 		}
+		if t.Color > MaxColor {
+			return p, fmt.Errorf("fib: 隧道 %s 颜色 %d 超出上限（PrefBase %d + 颜色 ≤ 255 ⇒ 最大 %d）", t.NextHop, t.Color, PrefBase, MaxColor)
+		}
 		if _, dup := tunnelOf[addr.String()]; dup {
 			return p, fmt.Errorf("fib: 隧道下一跳 %s 配了两次（同一对端只能有一条隧道映射到同一个 overlay 地址）", addr)
 		}
@@ -184,7 +197,7 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 				continue
 			}
 			k := key{table: uint32(r.VRF), prefix: prefix}
-			grouped[k] = append(grouped[k], Path{NextHop: nh, Interface: t.Interface, Label: LabelFor(r.VRF)})
+			grouped[k] = append(grouped[k], Path{NextHop: nh, Interface: t.Interface, Label: LabelFor(r.VRF), Preference: PrefBase + t.Color})
 		}
 	}
 
@@ -314,6 +327,10 @@ func (a *Applier) Apply(ctx context.Context, next Plan) (Result, error) {
 	}
 
 	// 3. 路由：按 (表, 前缀) 整条替换。
+	//    身份集合没变、只有 preference 变了时先删后加。注意这条规则的**前提已经站不住**：
+	//    docs/overlay-design-draft.md §2.2（2026-10-30 重测）表明我们发的
+	//    is_multipath=0 整条替换自己会重算选路，删加反而是改色瞬间窗口的唯一来源；
+	//    留不留等用户重拍，拍之前先保证这条分支有单测覆盖（O1 已落的那条负向单测）。
 	prevRoutes := map[string]Route{}
 	for _, r := range a.prev.Routes {
 		prevRoutes[routeKey(r)] = r
@@ -321,8 +338,16 @@ func (a *Applier) Apply(ctx context.Context, next Plan) (Result, error) {
 	nextRoutes := map[string]Route{}
 	for _, r := range next.Routes {
 		nextRoutes[routeKey(r)] = r
-		if old, ok := prevRoutes[routeKey(r)]; ok && equalPaths(old.Paths, r.Paths) {
+		old, exists := prevRoutes[routeKey(r)]
+		if exists && equalPaths(old.Paths, r.Paths) {
 			continue
+		}
+		if exists && pathIdentityEqual(old.Paths, r.Paths) {
+			oldPaths := fibPaths(old, a.ifMap)
+			if err := a.dp.IPRouteAddDel(ctx, r.Table, r.Prefix, oldPaths, false); err != nil {
+				return res, fmt.Errorf("fib: 删(改色) %s 到表 %d: %w", r.Prefix, r.Table, err)
+			}
+			res.RoutesRemoved++
 		}
 		paths := fibPaths(r, a.ifMap)
 		if err := a.dp.IPRouteAddDel(ctx, r.Table, r.Prefix, paths, true); err != nil {
@@ -383,7 +408,7 @@ func (a *Applier) refreshInterfaces(ctx context.Context) error {
 func fibPaths(r Route, ifMap map[string]uint32) []vppapi.FIBPath {
 	paths := make([]vppapi.FIBPath, 0, len(r.Paths))
 	for _, p := range r.Paths {
-		fp := vppapi.FIBPath{SWIfIndex: ifMap[p.Interface], NextHop: p.NextHop}
+		fp := vppapi.FIBPath{SWIfIndex: ifMap[p.Interface], NextHop: p.NextHop, Preference: p.Preference}
 		if p.Label != 0 {
 			fp.Labels = []uint32{p.Label}
 		}
@@ -402,6 +427,18 @@ func equalPaths(a, b []Path) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func pathIdentityEqual(a, b []Path) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Interface != b[i].Interface || a[i].NextHop != b[i].NextHop || a[i].Label != b[i].Label {
 			return false
 		}
 	}

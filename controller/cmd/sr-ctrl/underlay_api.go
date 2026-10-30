@@ -196,12 +196,18 @@ type underlaySpec struct {
 	Port   uint16  `json:"port"`
 }
 
+// underlayHopSpec is one relay hop as the form submits it, in the order the
+// operator read the route. Addr empty means "use what the reflector observed".
+type underlayHopSpec struct {
+	NodeID uint16 `json:"node_id"`
+	Addr   string `json:"addr,omitempty"`
+}
+
 type underlayPathSpec struct {
-	TemplateID string `json:"template_id,omitempty"`
-	NodeID     uint16 `json:"node_id,omitempty"`
-	Addr       string `json:"addr,omitempty"`
-	// SaveAs names a NEW template for the inline hop ("存为模板"). It is only
-	// valid together with node_id and without template_id.
+	TemplateID string            `json:"template_id,omitempty"`
+	Hops       []underlayHopSpec `json:"hops,omitempty"`
+	// SaveAs names a NEW template for the inline hop chain ("存为模板"). It is
+	// only valid together with hops and without template_id.
 	SaveAs string `json:"save_as,omitempty"`
 }
 
@@ -212,9 +218,17 @@ type underlayTunnelRequest struct {
 	A    underlaySpec      `json:"a"`
 	B    underlaySpec      `json:"b"`
 	Path *underlayPathSpec `json:"path,omitempty"`
+	// Peers is the batch shape: one local end (A), one path, many far ends. When it
+	// is present B is ignored and the request fans out one tunnel per peer, sharing
+	// a batch id. Peers that cannot take a tunnel are reported per peer instead of
+	// failing the whole request.
+	Peers []uint16 `json:"peers,omitempty"`
 	// ClearPath turns a relayed tunnel into a direct one; a nil path with
 	// ClearPath=false keeps the current path.
 	ClearPath bool `json:"clear_path,omitempty"`
+	// Color is the tunnel's SD-WAN color. Pointer because 0 is a real color: on
+	// update "absent" means keep while "0" means recolor this tunnel to 0.
+	Color *uint8 `json:"color,omitempty"`
 }
 
 func strPtr(p *string) string {
@@ -222,6 +236,13 @@ func strPtr(p *string) string {
 		return ""
 	}
 	return strings.TrimSpace(*p)
+}
+
+func u8Val(p *uint8) uint8 {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 // tunnelPathLocked validates the path half of a request and, for "存为模板",
@@ -234,24 +255,35 @@ func (s *server) tunnelPathLocked(st *underlay.State, ps *underlayPathSpec, now 
 	if ps == nil {
 		return nil, "", nil
 	}
+	hops := pathHops(ps.Hops)
 	if ps.TemplateID != "" {
-		if ps.NodeID != 0 || strings.TrimSpace(ps.Addr) != "" || strings.TrimSpace(ps.SaveAs) != "" {
-			return nil, "", fmt.Errorf("路径模板不能和 inline 中转设备/地址/存为模板同时填写")
+		if len(hops) > 0 || strings.TrimSpace(ps.SaveAs) != "" {
+			return nil, "", fmt.Errorf("路径模板不能和 inline 中转设备/存为模板同时填写")
 		}
 		return &underlay.TunnelPath{TemplateID: ps.TemplateID}, "", nil
 	}
-	if ps.NodeID == 0 {
-		return nil, "", fmt.Errorf("路径需要指定一个中转设备或引用一个路径模板")
+	if len(hops) == 0 {
+		return nil, "", fmt.Errorf("路径需要至少一个中转设备，或引用一个路径模板")
 	}
-	addr := strings.TrimSpace(ps.Addr)
 	if name := strings.TrimSpace(ps.SaveAs); name != "" {
-		tpl, err := st.CreatePath(name, ps.NodeID, addr, now)
+		tpl, err := st.CreatePath(name, hops, now)
 		if err != nil {
 			return nil, "", err
 		}
 		return &underlay.TunnelPath{TemplateID: tpl.ID}, tpl.ID, nil
 	}
-	return &underlay.TunnelPath{NodeID: ps.NodeID, Addr: addr}, "", nil
+	return &underlay.TunnelPath{Hops: hops}, "", nil
+}
+
+// pathHops turns form hops into the model's ordered chain. The order is kept as
+// submitted: the page is what decides which hop is first, and re-sorting here
+// would build a different route than the one the operator read.
+func pathHops(specs []underlayHopSpec) []underlay.PathHop {
+	out := make([]underlay.PathHop, 0, len(specs))
+	for _, h := range specs {
+		out = append(out, underlay.PathHop{NodeID: h.NodeID, Addr: strings.TrimSpace(h.Addr)})
+	}
+	return out
 }
 
 // serialMap names devices for a view. NodeView.Name is the serial the agent
@@ -293,8 +325,8 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 	views := s.nodeViewsLocked(id.TenantID, now)
 
 	if r.Method == http.MethodPost {
-		if req.A.NodeID == 0 || req.B.NodeID == 0 {
-			http.Error(w, "两端都需要指定设备", http.StatusBadRequest)
+		if req.A.NodeID == 0 {
+			http.Error(w, "本端需要指定设备", http.StatusBadRequest)
 			return
 		}
 		path, created, err := s.tunnelPathLocked(st, req.Path, now)
@@ -302,11 +334,20 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 			writeUnderlayErr(w, err)
 			return
 		}
+		if len(req.Peers) > 0 {
+			s.saveUnderlayFan(w, id, st, views, req, path, created, now)
+			return
+		}
+		if req.B.NodeID == 0 {
+			http.Error(w, "两端都需要指定设备", http.StatusBadRequest)
+			return
+		}
 		tun, err := st.Create(underlay.CreateRequest{
-			A:    underlay.EndpointSpec{NodeID: req.A.NodeID, Iface: req.A.Iface, Addr: strPtr(req.A.Addr), Port: req.A.Port},
-			B:    underlay.EndpointSpec{NodeID: req.B.NodeID, Iface: req.B.Iface, Addr: strPtr(req.B.Addr), Port: req.B.Port},
-			Path: path,
-			Now:  now,
+			A:     underlay.EndpointSpec{NodeID: req.A.NodeID, Iface: req.A.Iface, Addr: strPtr(req.A.Addr), Port: req.A.Port},
+			B:     underlay.EndpointSpec{NodeID: req.B.NodeID, Iface: req.B.Iface, Addr: strPtr(req.B.Addr), Port: req.B.Port},
+			Path:  path,
+			Color: u8Val(req.Color),
+			Now:   now,
 		}, views)
 		if err != nil {
 			if created != "" {
@@ -337,6 +378,7 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 		AddrA: req.A.Addr, AddrB: req.B.Addr,
 		PortA: req.A.Port, PortB: req.B.Port,
 		ClearPath: req.ClearPath,
+		Color:     req.Color,
 		Now:       now,
 	}
 	created := ""
@@ -360,6 +402,57 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 	writeJSON(w, map[string]any{
 		"ok":       true,
 		"tunnel":   buildTunnelView(st, &tun, serialMap(views), views),
+		"underlay": s.underlayViewLocked(id.TenantID, time.Now().Unix()),
+	})
+}
+
+// saveUnderlayFan is the batch shape: one local end, one path, many peers.
+//
+// Every peer is committed or refused on its own (underlay.State.Fan), and the
+// answer names both. That is the whole point of the batch: "从 A 经这条路径到
+// B C D E" where D already has a tunnel is a success with one line of explanation,
+// not a failed request that makes the operator start over.
+//
+// Must be called with s.mu held.
+func (s *server) saveUnderlayFan(w http.ResponseWriter, id consoleIdentity, st *underlay.State,
+	views map[uint16]underlay.NodeView, req underlayTunnelRequest, path *underlay.TunnelPath, createdTmpl string, now int64) {
+	res, err := st.Fan(underlay.FanRequest{
+		Local: underlay.EndpointSpec{NodeID: req.A.NodeID, Iface: req.A.Iface, Addr: strPtr(req.A.Addr), Port: req.A.Port},
+		Peers: req.Peers,
+		Path:  path,
+		Color: u8Val(req.Color),
+		Now:   now,
+	}, views)
+	if err != nil {
+		if createdTmpl != "" {
+			_ = st.DeletePath(createdTmpl)
+		}
+		writeUnderlayErr(w, err)
+		return
+	}
+	// A "存为模板" that ended up on no tunnel at all is clutter nobody asked for.
+	if len(res.Created) == 0 && createdTmpl != "" {
+		_ = st.DeletePath(createdTmpl)
+	}
+	if len(res.Created) > 0 {
+		s.save()
+	}
+	log.Printf("underlay: tenant=%s fanned tunnels from device %d to %d peer(s): %d created, %d skipped, batch %s by %s",
+		id.TenantID, req.A.NodeID, len(req.Peers), len(res.Created), len(res.Skipped), res.BatchID, id.Username)
+
+	serials := serialMap(views)
+	tunnels := make([]underlayTunnelView, 0, len(res.Created))
+	for i := range res.Created {
+		t := res.Created[i]
+		tunnels = append(tunnels, buildTunnelView(st, &t, serials, views))
+	}
+	// 200, not 201: a batch that skipped a peer is still a completed request, and
+	// a caller that tests "status == 201" would read a partial success as a failure.
+	writeJSON(w, map[string]any{
+		"ok":       true,
+		"batch_id": res.BatchID,
+		"tunnels":  tunnels,
+		"skipped":  res.Skipped,
 		"underlay": s.underlayViewLocked(id.TenantID, time.Now().Unix()),
 	})
 }
@@ -466,10 +559,25 @@ func (s *server) runUnderlayAuto(w http.ResponseWriter, r *http.Request, apply b
 // -------------------------------------------------------------------- paths
 
 type underlayPathRequest struct {
-	ID     string `json:"id,omitempty"`
-	Name   string `json:"name,omitempty"`
-	NodeID uint16 `json:"node_id"`
-	Addr   string `json:"addr,omitempty"`
+	ID   string            `json:"id,omitempty"`
+	Name string            `json:"name,omitempty"`
+	Hops []underlayHopSpec `json:"hops"`
+}
+
+// checkPathHops rejects a chain that names a device the tenant does not have. The
+// template itself is allowed to hold a device that is offline (it may come back),
+// but not one that was never enrolled -- that is a typo, and a typo in a shared
+// template moves every tunnel that uses it.
+func checkPathHops(views map[uint16]underlay.NodeView, hops []underlay.PathHop) error {
+	if len(hops) == 0 {
+		return fmt.Errorf("路径需要至少一个中转设备")
+	}
+	for _, h := range hops {
+		if _, ok := views[h.NodeID]; !ok {
+			return fmt.Errorf("中转设备 %d 不存在或未入网", h.NodeID)
+		}
+	}
+	return nil
 }
 
 func (s *server) handleAdminUnderlayPaths(w http.ResponseWriter, r *http.Request) {
@@ -499,12 +607,13 @@ func (s *server) createUnderlayPath(w http.ResponseWriter, r *http.Request, id c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	views := s.nodeViewsLocked(id.TenantID, now)
-	if _, ok := views[req.NodeID]; !ok {
-		http.Error(w, "中转设备不存在或未入网", http.StatusBadRequest)
+	hops := pathHops(req.Hops)
+	if err := checkPathHops(views, hops); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	uc := s.underlayConfigLocked(id.TenantID, true)
-	tpl, err := uc.State.CreatePath(req.Name, req.NodeID, req.Addr, now)
+	tpl, err := uc.State.CreatePath(req.Name, hops, now)
 	if err != nil {
 		writeUnderlayErr(w, err)
 		return
@@ -534,12 +643,13 @@ func (s *server) updateUnderlayPath(w http.ResponseWriter, r *http.Request, id c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	views := s.nodeViewsLocked(id.TenantID, time.Now().Unix())
-	if _, ok := views[req.NodeID]; !ok {
-		http.Error(w, "中转设备不存在或未入网", http.StatusBadRequest)
+	hops := pathHops(req.Hops)
+	if err := checkPathHops(views, hops); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	uc := s.underlayConfigLocked(id.TenantID, true)
-	if err := uc.State.UpdatePath(pathID, req.Name, req.NodeID, req.Addr); err != nil {
+	if err := uc.State.UpdatePath(pathID, req.Name, hops); err != nil {
 		writeUnderlayErr(w, err)
 		return
 	}

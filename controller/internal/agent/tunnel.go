@@ -568,12 +568,14 @@ func (t *TunnelSync) linkConfig(ctx context.Context, b wire.UnderlayBundle,
 		OverlayTable: b.OverlayTable,
 		LocalOverlay: local, PeerOverlay: peer,
 	}
-	if spec.RelayEndpoint != "" {
-		ip, port, err := parseAddr(spec.RelayEndpoint)
+	// 中转链按行走顺序原样进 cfg.Relays：倒序是段列表的事，这里翻了顺序就等于
+	// 让控制器和盒子对"第一跳是谁"各有各的理解。
+	for i, r := range spec.Relays {
+		ip, port, err := parseAddr(r.Endpoint)
 		if err != nil {
-			return LinkConfig{}, fmt.Errorf("中转跳 %q: %w", spec.RelayEndpoint, err)
+			return LinkConfig{}, fmt.Errorf("第 %d 跳中转 %q: %w", i+1, r.Endpoint, err)
 		}
-		cfg.RelayIP, cfg.RelayPort = ip, port
+		cfg.Relays = append(cfg.Relays, RelayHop{IP: ip, Port: port})
 	}
 	return cfg, nil
 }
@@ -650,8 +652,7 @@ func sameLinkConfig(a, b LinkConfig) bool {
 		a.TransitPort != b.TransitPort || a.EncapIfIndex != b.EncapIfIndex ||
 		a.PathIDBase != b.PathIDBase || a.OverlayTable != b.OverlayTable ||
 		a.LocalOverlay != b.LocalOverlay || a.PeerOverlay != b.PeerOverlay ||
-		a.RelayPort != b.RelayPort || !a.SrcIP.Equal(b.SrcIP) ||
-		!a.RelayIP.Equal(b.RelayIP) {
+		!relaysEqual(a.Relays, b.Relays) || !a.SrcIP.Equal(b.SrcIP) {
 		return false
 	}
 	amtu, bmtu := a.TunnelMTU, b.TunnelMTU
@@ -662,4 +663,20 @@ func sameLinkConfig(a, b LinkConfig) bool {
 		bmtu = wire.DefaultTunnelMTU
 	}
 	return amtu == bmtu && a.UnderlayMTU == b.UnderlayMTU
+}
+
+// relaysEqual compares two relay chains element by element, order included: a
+// path that only swapped its hops is a different path, and treating it as "same"
+// would leave the running AddPath segment list pointing at the old first hop
+// forever.
+func relaysEqual(a, b []RelayHop) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Port != b[i].Port || !a[i].IP.Equal(b[i].IP) {
+			return false
+		}
+	}
+	return true
 }

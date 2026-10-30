@@ -48,6 +48,18 @@ func mustCreate(t *testing.T, s *State, views map[uint16]NodeView, a, b uint16, 
 	return tun
 }
 
+// hopList builds an inline relay chain from device numbers, in traversal order.
+func hopList(nodes ...uint16) []PathHop {
+	out := make([]PathHop, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, PathHop{NodeID: n})
+	}
+	return out
+}
+
+// via is an inline relay chain on a tunnel: via(3, 5) means "经 3 再到 5".
+func via(nodes ...uint16) *TunnelPath { return &TunnelPath{Hops: hopList(nodes...)} }
+
 // The released address must come back only after every never-used one: peers
 // still route to a freed /32, and reusing it immediately would hand a stale
 // route to a brand-new tunnel.
@@ -152,7 +164,7 @@ func TestAvoidedPortsAreSkipped(t *testing.T) {
 func TestOneTransitPortPerDevice(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2, 3, 4)
-	tpl, err := s.CreatePath("", 1, "", 1000)
+	tpl, err := s.CreatePath("", hopList(1), 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,16 +375,22 @@ func TestCreateRequiresPublishedGlobalConfig(t *testing.T) {
 
 func TestCloneIsDeep(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
-	tpl, _ := s.CreatePath("p", 3, "", 1000)
-	t1 := mustCreate(t, s, testViews(1, 2, 3), 1, 2, &TunnelPath{TemplateID: tpl.ID})
+	tpl, _ := s.CreatePath("p", hopList(3, 5), 1000)
+	t1 := mustCreate(t, s, testViews(1, 2, 3, 5), 1, 2, &TunnelPath{TemplateID: tpl.ID})
+	t2 := mustCreate(t, s, testViews(1, 4, 3, 5), 1, 4, via(3, 5))
 
 	c := s.Clone()
 	c.Tunnels[t1.ID].A.Port = 1
-	c.Paths[tpl.ID].NodeID = 9
+	c.Paths[tpl.ID].Hops[0].NodeID = 9
+	// A tunnel's inline chain is the aliasing risk multi-hop adds: a rejected
+	// request that reordered or re-pointed one hop of the CLONE would otherwise
+	// rewrite the route the running tunnel is installed with.
+	c.Tunnels[t2.ID].Path.Hops[1].Addr = "198.51.100.99"
 	c.OverlayFreed = append(c.OverlayFreed, "x")
 	c.TransitPorts[42] = 1
 
-	if s.Tunnels[t1.ID].A.Port == 1 || s.Paths[tpl.ID].NodeID == 9 || len(s.OverlayFreed) != 0 {
+	if s.Tunnels[t1.ID].A.Port == 1 || s.Paths[tpl.ID].Hops[0].NodeID == 9 ||
+		s.Tunnels[t2.ID].Path.Hops[1].Addr != "" || len(s.OverlayFreed) != 0 {
 		t.Fatal("Clone 共享了底层数据，失败请求会污染真实状态")
 	}
 	if _, ok := s.TransitPorts[42]; ok {

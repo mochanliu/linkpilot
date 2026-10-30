@@ -36,12 +36,28 @@ type fileConfig struct {
 }
 
 // tunnelConfig 是控制面分配的隧道映射。下一跳必须与 RIB 里 next_hops 的某个元素逐字相同。
+//
+// Color 是这条隧道的 SD-WAN 颜色：它决定这条下一跳的 VPP preference（230+颜色），
+// 颜色 0 最优、颜色 0 全 down 时由 VPP 自己抬到存活的最小颜色。缺省 0，所以现存的
+// 配置文件不必改就能继续跑。
 type tunnelConfig struct {
 	NextHop   string `json:"next_hop"`
 	Interface string `json:"interface"`
+	Color     uint8  `json:"color,omitempty"`
 }
 
 const defaultVPPSocket = "/run/vpp/api.sock"
+
+// fibTunnels is the one place the box's own tunnel table becomes FIB input. It is
+// a function because a color that gets dropped here fails silently: the paths
+// still install, every one of them at preference 230.
+func fibTunnels(cfgs []tunnelConfig) []fib.Tunnel {
+	out := make([]fib.Tunnel, 0, len(cfgs))
+	for _, t := range cfgs {
+		out = append(out, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color})
+	}
+	return out
+}
 
 func loadConfig(path string) (*fileConfig, error) {
 	f, err := os.Open(path)
@@ -147,10 +163,7 @@ func main() {
 		return
 	}
 
-	tunnels := make([]fib.Tunnel, 0, len(cfg.Tunnels))
-	for _, t := range cfg.Tunnels {
-		tunnels = append(tunnels, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface})
-	}
+	tunnels := fibTunnels(cfg.Tunnels)
 	applier := fib.NewApplier(vc)
 	hc := &http.Client{Timeout: 5 * time.Second}
 	var lastWarn string

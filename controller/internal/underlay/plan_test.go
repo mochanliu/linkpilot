@@ -154,8 +154,8 @@ func TestHubSpokeViaHubIsFullMesh(t *testing.T) {
 		t.Fatalf("一批 spoke 间隧道应共用一个模板，实际 %d 个", len(s.Paths))
 	}
 	for _, tpl := range s.Paths {
-		if tpl.NodeID != 1 {
-			t.Fatalf("模板的中转设备应是 hub 1，实际 %d", tpl.NodeID)
+		if len(tpl.Hops) != 1 || tpl.Hops[0].NodeID != 1 {
+			t.Fatalf("模板的中转设备应是 hub 1，实际 %+v", tpl.Hops)
 		}
 		if tpl.Name != "经 dev1 中转" {
 			t.Fatalf("模板名应带设备名，实际 %q", tpl.Name)

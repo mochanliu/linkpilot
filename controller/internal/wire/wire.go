@@ -453,6 +453,15 @@ const UnderlayPathIDBase uint16 = 1000
 // without a local state file -- VPP is the record.
 const UnderlayInstanceBase uint32 = 1000
 
+// RelayHop is one relay device on a tunnel's path, named the way the box has to
+// dial it: the hop's outer address and its transit port, already joined. NodeID
+// travels with it so a device's logs and its skip reasons can name the hop instead
+// of a bare ip:port.
+type RelayHop struct {
+	NodeID   uint16 `json:"node_id"`
+	Endpoint string `json:"endpoint"`
+}
+
 // TunnelSpec is one tunnel as ONE end has to build it. Both ends receive their
 // own copy: the peer's overlay address, the peer's listening port and the outer
 // address to dial are mirrored.
@@ -498,11 +507,14 @@ type TunnelSpec struct {
 	PeerCertPEM string              `json:"peer_cert_pem"`
 	PeerBinding *keybinding.Binding `json:"peer_binding,omitempty"`
 
-	// RelayEndpoint is the relay hop's outer address and transit port
-	// ("ip:port"), empty for a direct tunnel. It becomes the path's first hop
-	// segment; the peer stays the final destination.
-	RelayEndpoint string `json:"relay_endpoint,omitempty"`
-	RelayNodeID   uint16 `json:"relay_node_id,omitempty"`
+	// Relays is the relay chain, in traversal order: Relays[0] is the FIRST box
+	// the packet touches, and the peer is the destination behind all of them.
+	// Empty means a direct tunnel. Each Endpoint is the hop's outer address plus
+	// its transit port ("ip:port").
+	//
+	// The agent puts these into the path's segment list REVERSED, because segment
+	// 0 is the destination; the order here is the order the operator read.
+	Relays []RelayHop `json:"relays,omitempty"`
 
 	// MTU is the overlay MTU; 0 means "not known yet" and the device falls back
 	// to DefaultTunnelMTU. UnderlayMTU is the egress port's real link MTU, 0

@@ -61,10 +61,12 @@ const (
 //   - MPLS 本地标签的 lookup-in-table 路径：SWIfIndex=^0，TableID=要查的表，
 //     NextHop 留空。实测 CLI 生成的就是这个形状。
 type FIBPath struct {
-	SWIfIndex uint32
-	TableID   uint32
-	NextHop   netip.Addr
-	Labels    []uint32
+	SWIfIndex  uint32
+	TableID    uint32
+	NextHop    netip.Addr
+	Labels     []uint32
+	Weight     uint8
+	Preference uint8
 }
 
 // IPRoute 是 ip_route_details 读回来的一条（只保留本系统会写的那些字段）。
@@ -100,13 +102,17 @@ func appendIPv4Prefix(b []byte, p netip.Prefix) []byte {
 // appendFIBPath 写一条 vl_api_fib_path_t。
 func appendFIBPath(b []byte, p FIBPath) []byte {
 	b = appendU32(b, p.SWIfIndex)
-	b = appendU32(b, p.TableID) // table_id：MPLS lookup-in-table 用它，IP 路由路径为 0
-	b = appendU32(b, 0)         // rpf_id
-	b = append(b, 1)            // weight
-	b = append(b, 0)            // preference
-	b = appendU32(b, 0)         // type = FIB_API_PATH_TYPE_NORMAL
-	b = appendU32(b, 0)         // flags = FIB_API_PATH_FLAG_NONE
-	b = appendU32(b, 0)         // proto = FIB_API_PATH_NH_PROTO_IP4
+	b = appendU32(b, p.TableID)
+	b = appendU32(b, 0) // rpf_id
+	wt := p.Weight
+	if wt == 0 {
+		wt = 1
+	}
+	b = append(b, wt)
+	b = append(b, p.Preference)
+	b = appendU32(b, 0) // type = FIB_API_PATH_TYPE_NORMAL
+	b = appendU32(b, 0) // flags = FIB_API_PATH_FLAG_NONE
+	b = appendU32(b, 0) // proto = FIB_API_PATH_NH_PROTO_IP4
 
 	// nh.address：union 从偏移 0 开始，v4 之后补 12 个 0；没有下一跳就是全 0。
 	nh := make([]byte, 16)
@@ -336,8 +342,10 @@ func readPrefix(b []byte) netip.Prefix {
 // readFIBPath 解析一条 vl_api_fib_path_t（167 字节）。
 func readFIBPath(b []byte) FIBPath {
 	p := FIBPath{
-		SWIfIndex: binary.BigEndian.Uint32(b[0:4]),
-		TableID:   binary.BigEndian.Uint32(b[4:8]),
+		SWIfIndex:  binary.BigEndian.Uint32(b[0:4]),
+		TableID:    binary.BigEndian.Uint32(b[4:8]),
+		Weight:     b[12],
+		Preference: b[13],
 	}
 	var nh [16]byte
 	copy(nh[:], b[26:42])

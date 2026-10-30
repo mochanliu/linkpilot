@@ -710,6 +710,21 @@ func TestNewLinkRejectsBadInputs(t *testing.T) {
 		// 把身份交出去，所以这一条必须由本层拦住。
 		{"私钥全零", func(c *LinkConfig) { c.PrivateKey = make([]byte, 32) }},
 		{"源地址是 IPv6", func(c *LinkConfig) { c.SrcIP = net.ParseIP("fe80::1") }},
+		// 中转链的半个中转比没有中转更难查：段列表会指向 0 端口或 0 地址，包照样
+		// 封装发出去，只是谁也不收。
+		{"中转只给了地址", func(c *LinkConfig) {
+			c.Relays = []RelayHop{{IP: net.IPv4(10, 10, 9, 9)}}
+		}},
+		{"中转只给了端口", func(c *LinkConfig) {
+			c.Relays = []RelayHop{{Port: 15000}}
+		}},
+		{"中转地址是 IPv6", func(c *LinkConfig) {
+			c.Relays = []RelayHop{{IP: net.ParseIP("fe80::2"), Port: 15000}}
+		}},
+		{"中转链里同一段出现两次", func(c *LinkConfig) {
+			c.Relays = []RelayHop{{IP: net.IPv4(10, 10, 9, 9), Port: 15000},
+				{IP: net.IPv4(10, 10, 9, 9), Port: 15000}}
+		}},
 	}
 	for _, tc := range cases {
 		cfg := base

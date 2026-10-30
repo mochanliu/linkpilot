@@ -165,7 +165,7 @@ func TestPlanFrom(t *testing.T) {
 	if r.Table != 100 || r.Prefix != netip.MustParsePrefix("10.1.0.0/24") {
 		t.Errorf("route = %d %s, want 100 10.1.0.0/24", r.Table, r.Prefix)
 	}
-	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100}
+	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100, Preference: 230}
 	if len(r.Paths) != 1 || r.Paths[0] != want {
 		t.Errorf("paths = %+v, want [%+v]", r.Paths, want)
 	}
@@ -517,5 +517,115 @@ func TestApplyVPN0UsesGlobalTable(t *testing.T) {
 	if len(remote) != 1 || remote[0].SWIfIndex != 10 ||
 		len(remote[0].Labels) != 1 || remote[0].Labels[0] != 1000 {
 		t.Errorf("remote = %+v, want 压 1000 走 wg0(10)", remote)
+	}
+}
+
+func TestPlanFromColorPreference(t *testing.T) {
+	plan, err := PlanFrom(
+		[]uint8{100},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2", "10.255.0.3"}}},
+		[]Tunnel{
+			{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
+			{NextHop: "10.255.0.3", Interface: "wg1", Color: 7},
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := plan.Routes[0].Paths
+	if len(paths) != 2 {
+		t.Fatalf("paths = %d, want 2", len(paths))
+	}
+	if paths[0].Preference != 230 {
+		t.Errorf("wg0(Color 0) pref = %d, want 230", paths[0].Preference)
+	}
+	if paths[1].Preference != 237 {
+		t.Errorf("wg1(Color 7) pref = %d, want 237", paths[1].Preference)
+	}
+}
+
+func TestPlanFromRejectsBadColor(t *testing.T) {
+	_, err := PlanFrom(
+		[]uint8{100},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}},
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 230}}, nil)
+	if err == nil {
+		t.Fatal("Color 230 (230+230 > 255) must fail")
+	}
+	if !strings.Contains(err.Error(), "超出上限") {
+		t.Errorf("err = %v, want mention color overflow", err)
+	}
+}
+
+func TestApplyDeleteThenAddOnPrefChange(t *testing.T) {
+	dp := newFakeDP()
+	a := NewApplier(dp)
+	ctx := context.Background()
+
+	planA, err := PlanFrom(
+		[]uint8{100},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}},
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 0}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Apply(ctx, planA); err != nil {
+		t.Fatal(err)
+	}
+
+	planB, err := PlanFrom(
+		[]uint8{100},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}},
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 5}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(ctx, planB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RoutesRemoved != 1 || res.RoutesSet != 1 {
+		t.Errorf("res = %+v, want RoutesRemoved=1 + RoutesSet=1 (delete-then-add)", res)
+	}
+	paths := dp.routes["100|10.1.0.0/24"]
+	if len(paths) != 1 || paths[0].Preference != 235 {
+		t.Errorf("path pref = %+v, want single path with Preference=235", paths)
+	}
+}
+
+func TestApplyAddRemovePathNoExtraDelete(t *testing.T) {
+	dp := newFakeDP()
+	a := NewApplier(dp)
+	ctx := context.Background()
+
+	planA, err := PlanFrom(
+		[]uint8{100},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2"}}},
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 0}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Apply(ctx, planA); err != nil {
+		t.Fatal(err)
+	}
+
+	planB, err := PlanFrom(
+		[]uint8{100},
+		[]RIBRoute{{VRF: 100, Prefix: "10.1.0.0/24", NextHops: []string{"10.255.0.2", "10.255.0.3"}}},
+		[]Tunnel{
+			{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
+			{NextHop: "10.255.0.3", Interface: "wg1", Color: 1},
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(ctx, planB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RoutesRemoved != 0 {
+		t.Errorf("path-set changed should not trigger delete-then-add, got RoutesRemoved=%d", res.RoutesRemoved)
+	}
+	if res.RoutesSet != 1 {
+		t.Errorf("RoutesSet = %d, want 1 (replace)", res.RoutesSet)
 	}
 }

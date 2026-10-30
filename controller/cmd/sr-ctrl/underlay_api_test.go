@@ -153,15 +153,30 @@ type tunnelReq struct {
 	ID        string       `json:"id,omitempty"`
 	A         underlaySpec `json:"a"`
 	B         underlaySpec `json:"b"`
+	Peers     []uint16     `json:"peers,omitempty"`
 	Path      *pathReq     `json:"path,omitempty"`
 	ClearPath bool         `json:"clear_path,omitempty"`
+	Color     *uint8       `json:"color,omitempty"`
+}
+
+type hopReq struct {
+	NodeID uint16 `json:"node_id,omitempty"`
+	Addr   string `json:"addr,omitempty"`
 }
 
 type pathReq struct {
-	TemplateID string `json:"template_id,omitempty"`
-	NodeID     uint16 `json:"node_id,omitempty"`
-	Addr       string `json:"addr,omitempty"`
-	SaveAs     string `json:"save_as,omitempty"`
+	TemplateID string   `json:"template_id,omitempty"`
+	Hops       []hopReq `json:"hops,omitempty"`
+	SaveAs     string   `json:"save_as,omitempty"`
+}
+
+// via names the relay chain in submission order; the API must not reorder it.
+func via(nodes ...uint16) *pathReq {
+	p := &pathReq{}
+	for _, n := range nodes {
+		p.Hops = append(p.Hops, hopReq{NodeID: n})
+	}
+	return p
 }
 
 func manualTunnel(a, b uint16, iface string) tunnelReq {
@@ -572,6 +587,274 @@ func TestUnderlayRelayPreviewNamesTheTemplateItWillCreate(t *testing.T) {
 	}
 }
 
+// ------------------------------------------------------------------ 批量建隧道
+
+// fanResp is what POST /api/underlay/tunnels answers for a batch: the tunnels it
+// built, the peers it refused (with the reason each would have failed), and the
+// batch id that labels them all.
+type fanResp struct {
+	OK       bool                 `json:"ok"`
+	BatchID  string               `json:"batch_id"`
+	Tunnels  []underlayTunnelView `json:"tunnels"`
+	Skipped  []underlay.FanSkip   `json:"skipped"`
+	Underlay underlayView         `json:"underlay"`
+}
+
+func fanTunnels(t *testing.T, s *server, sid string, req tunnelReq) fanResp {
+	t.Helper()
+	rec := createTunnel(t, s, sid, req)
+	// 200, not 201: a batch that skipped a peer is a completed request. A page
+	// that tested for 201 would read "5 built, 1 already existed" as a failure and
+	// roll its own display back.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("批量 = %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	var out fanResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("批量响应: %v (%s)", err, rec.Body.String())
+	}
+	if !out.OK {
+		t.Fatalf("批量 ok=false: %s", rec.Body.String())
+	}
+	return out
+}
+
+// 本端单选、对端多选、共用一条路径 -- 「从 CPE A 经同一条路径到 B C D E F」。
+// What the endpoint owes the page beyond a count: a batch id to point at, and the
+// SAME chain in the SAME order on every tunnel. A per-tunnel re-sort would make
+// the topology draw a route the dataplane does not take.
+func TestFanEndpointBuildsOneTunnelPerPeerOnTheSharedPath(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	// 中转设备在发布之后才入网：批量建隧道要给晚到的设备补中转端口，
+	// 否则整批隧道都下发不了。
+	enrollExtra(t, s, 4, "198.51.100.14")
+	enrollExtra(t, s, 5, "198.51.100.15")
+
+	out := fanTunnels(t, s, ten, tunnelReq{
+		A:     underlaySpec{NodeID: 1, Iface: "wan0"},
+		Peers: []uint16{3, 2, 3},
+		Path:  via(4, 5),
+	})
+	if out.BatchID == "" {
+		t.Fatal("批量没有返回 batch_id，页面无法说明这几条隧道是同一批建的")
+	}
+	// 三个对端里有一个重复：去重后两条，按设备号排列（点选顺序不是隧道顺序）。
+	if len(out.Tunnels) != 2 || len(out.Skipped) != 0 {
+		t.Fatalf("built %d / skipped %+v, want 2 条且没有跳过", len(out.Tunnels), out.Skipped)
+	}
+	for i, wantPeer := range []uint16{2, 3} {
+		tv := out.Tunnels[i]
+		if tv.A.NodeID != 1 || tv.B.NodeID != wantPeer || tv.BatchID != out.BatchID {
+			t.Fatalf("第 %d 条 = A %d / B %d / batch %q，本端和对端都属于这一批",
+				i, tv.A.NodeID, tv.B.NodeID, tv.BatchID)
+		}
+		p := tv.Path
+		if p == nil || tv.PathError != "" {
+			t.Fatalf("第 %d 条没带上可解析的路径: %+v / %q", i, p, tv.PathError)
+		}
+		if len(p.Hops) != 2 || p.Hops[0].NodeID != 4 || p.Hops[0].Serial != "cpe-4" ||
+			p.Hops[1].NodeID != 5 || p.Hops[1].Serial != "cpe-5" {
+			t.Fatalf("第 %d 条的中转链不是 4→5: %+v", i, p.Hops)
+		}
+	}
+	// 一台设备一个监听端口：本端是同一台设备，两条隧道必须各占一个端口和一段
+	// overlay，不然第二条会把第一条顶掉。
+	if a, b := out.Tunnels[0], out.Tunnels[1]; a.A.Port == b.A.Port || a.B.Overlay == b.B.Overlay {
+		t.Fatalf("两条隧道共用了本端端口或对端 overlay: %+v / %+v", a, b)
+	}
+	// 链上每台中转设备都要拿到端口。它们可以是同一个号（每台都先取池底，
+	// 靠外层地址区分），但不能是 0 —— 0 意味着这一跳没人监听。
+	for _, hop := range []uint16{4, 5} {
+		if p := nodeByID(t, out.Underlay.Nodes, hop).TransitPort; p == 0 {
+			t.Fatalf("中转设备 %d 没有分到端口", hop)
+		}
+	}
+	if len(out.Underlay.Tunnels) != 2 {
+		t.Fatalf("文档里 %d 条隧道，批量之后应只有这两条", len(out.Underlay.Tunnels))
+	}
+}
+
+// 「从 A 到 B C D」而 C 早就有隧道，是一次成功加一句解释，不是一个失败请求：
+// 建成的必须留下，没建成的要指名是哪台设备、为什么。
+func TestFanEndpointSkipsTakenPeersAndKeepsWhatItBuilt(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	enrollExtra(t, s, 4, "198.51.100.14")
+	if rec := createTunnel(t, s, ten, manualTunnel(1, 3, "wan0")); rec.Code != http.StatusCreated {
+		t.Fatalf("预置 1↔3 = %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	out := fanTunnels(t, s, ten, tunnelReq{
+		A:     underlaySpec{NodeID: 1, Iface: "wan0"},
+		Peers: []uint16{2, 3},
+		Path:  via(4),
+	})
+	if len(out.Tunnels) != 1 || out.Tunnels[0].B.NodeID != 2 {
+		t.Fatalf("该建的没建全: %+v", out.Tunnels)
+	}
+	if len(out.Skipped) != 1 || out.Skipped[0].NodeID != 3 ||
+		!strings.Contains(out.Skipped[0].Reason, "只能有一条隧道") {
+		t.Fatalf("跳过项要指名设备 3 并说清是一对设备只能一条: %+v", out.Skipped)
+	}
+	// 已有那条不会因为这一批被改动或删除。
+	if len(out.Underlay.Tunnels) != 2 {
+		t.Fatalf("批量后文档里 %d 条隧道，应是预置那条 + 新建那条", len(out.Underlay.Tunnels))
+	}
+	st := s.state.Underlays["t"].State
+	var direct *underlay.Tunnel
+	for _, tv := range st.Tunnels {
+		if tv.B.NodeID == 3 {
+			direct = tv
+		}
+	}
+	if direct == nil || direct.Path != nil {
+		t.Fatalf("预置的直连隧道被批量改了: %+v", direct)
+	}
+}
+
+// 对端列表和中转链来自同一张设备表，勾选时很容易把中转也当成对端。这种对端建不
+// 成（隧道的一端同时当自己的中转），但其余对端照建。
+func TestFanEndpointSkipsAPeerThatIsAlsoAHop(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	enrollExtra(t, s, 4, "198.51.100.14")
+
+	out := fanTunnels(t, s, ten, tunnelReq{
+		A:     underlaySpec{NodeID: 1, Iface: "wan0"},
+		Peers: []uint16{2, 4},
+		Path:  via(4),
+	})
+	if len(out.Tunnels) != 1 || out.Tunnels[0].B.NodeID != 2 {
+		t.Fatalf("对端 2 应建成: %+v", out.Tunnels)
+	}
+	if len(out.Skipped) != 1 || out.Skipped[0].NodeID != 4 ||
+		!strings.Contains(out.Skipped[0].Reason, "同时是隧道的一端") {
+		t.Fatalf("对端 4 的跳过要说是它同时是中转: %+v", out.Skipped)
+	}
+}
+
+// peers 缺省 = 「没有要批量」，不是「批量了个空」：只写本端的请求仍然要按单条
+// 隧道拒绝，否则页面上「一个对端都没勾」会变成一次静默的成功。
+func TestFanEndpointRefusesAnEmptyPeerListInsteadOfBuildingNothing(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	st := s.state.Underlays["t"].State
+
+	empty := []uint16{}
+	for _, peers := range [][]uint16{nil, empty} {
+		rec := createTunnel(t, s, ten, tunnelReq{
+			A:     underlaySpec{NodeID: 1, Iface: "wan0"},
+			Peers: peers,
+			Path:  via(2),
+		})
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "两端都需要指定设备") {
+			t.Fatalf("peers=%v 应回 400 说缺少对端，实际 %d (%s)", peers, rec.Code, rec.Body.String())
+		}
+	}
+	if len(st.Tunnels) != 0 {
+		t.Fatalf("被拒绝的批量留下了 %d 条隧道", len(st.Tunnels))
+	}
+}
+
+// 整批都失败的原因只有两种写法：一个对所有对端都成立的错误（本端没入网），或
+// 每个对端各自被拒。前者必须一次报错、什么都不写；两者都带着「存为模板」时，
+// 没人用到的那个模板不能留在列表里。
+func TestFanHardErrorAndEmptyResultRollBackTheTemplate(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	enrollExtra(t, s, 4, "198.51.100.14")
+	st := s.state.Underlays["t"].State
+
+	// 本端不存在：对每个对端都会失败，所以是一次 400 而不是 N 条跳过。
+	rec := createTunnel(t, s, ten, tunnelReq{
+		A:     underlaySpec{NodeID: 9, Iface: "wan0"},
+		Peers: []uint16{2, 3},
+		Path:  &pathReq{Hops: []hopReq{{NodeID: 4}}, SaveAs: "整批失败"},
+	})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "本端设备 9") {
+		t.Fatalf("本端没入网 = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if len(st.Paths) != 0 || len(st.Tunnels) != 0 {
+		t.Fatalf("硬错误之后残留 %d 条隧道 / %d 个模板", len(st.Tunnels), len(st.Paths))
+	}
+
+	// 每个对端各自被拒（这里把自己当成了对端）：请求是成功的，但没有任何东西
+	// 用到那个新建的模板。
+	out := fanTunnels(t, s, ten, tunnelReq{
+		A:     underlaySpec{NodeID: 1, Iface: "wan0"},
+		Peers: []uint16{1},
+		Path:  &pathReq{Hops: []hopReq{{NodeID: 4}}, SaveAs: "没人用的模板"},
+	})
+	if len(out.Tunnels) != 0 || len(out.Skipped) != 1 {
+		t.Fatalf("自连的对端应全部跳过: %+v / %+v", out.Tunnels, out.Skipped)
+	}
+	if len(st.Paths) != 0 {
+		t.Fatalf("一条隧道都没建成，模板 %v 却留下了", st.Paths)
+	}
+}
+
+// 批量和模板是同一个动作：勾 6 个对端 + 存为模板。每条隧道都要指向同一个模板 id
+// ——这才是之后改一次能动到全部的前提；而改模板那次必须一次动完整批。
+func TestFanSaveAsTemplateMovesTheWholeBatchOnLaterEdit(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	enrollExtra(t, s, 4, "198.51.100.14")
+	enrollExtra(t, s, 5, "198.51.100.15")
+	st := s.state.Underlays["t"].State
+
+	out := fanTunnels(t, s, ten, tunnelReq{
+		A:     underlaySpec{NodeID: 1, Iface: "wan0"},
+		Peers: []uint16{2, 3},
+		Path:  &pathReq{Hops: []hopReq{{NodeID: 4}}, SaveAs: "主用中转"},
+	})
+	if len(out.Tunnels) != 2 {
+		t.Fatalf("built %d", len(out.Tunnels))
+	}
+	tpl := out.Tunnels[0].Path.TemplateID
+	if tpl == "" || out.Tunnels[0].Path.TemplateName != "主用中转" {
+		t.Fatalf("批量没记住自己存的模板: %+v", out.Tunnels[0].Path)
+	}
+	for _, tv := range out.Tunnels[1:] {
+		if tv.Path.TemplateID != tpl {
+			t.Fatalf("两条隧道指向了不同模板: %q / %q", tpl, tv.Path.TemplateID)
+		}
+	}
+	if len(st.Paths) != 1 {
+		t.Fatalf("存为模板写了 %d 个，应是 1 个共享", len(st.Paths))
+	}
+	if len(out.Underlay.Paths) != 1 || len(out.Underlay.Paths[0].Users) != 2 {
+		t.Fatalf("模板列表 = %+v，两条隧道都应挂在它下面", out.Underlay.Paths)
+	}
+
+	// 改模板 = 改这一批：链换成 4→5 之后，两条隧道同时变成两跳，顺序按提交的来。
+	rec := underlayDo(t, s.handleAdminUnderlayPaths, ten, http.MethodPut, "/api/underlay/paths",
+		mustJSON(t, underlayPathRequest{ID: tpl, Hops: []underlayHopSpec{{NodeID: 4}, {NodeID: 5}}}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("改模板 = %d (%s)", rec.Code, rec.Body.String())
+	}
+	var moved struct {
+		Users    []string             `json:"users"`
+		Path     underlayTemplateView `json:"path"`
+		Underlay underlayView         `json:"underlay"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &moved); err != nil {
+		t.Fatalf("改模板响应: %v (%s)", err, rec.Body.String())
+	}
+	if len(moved.Users) != 2 {
+		t.Fatalf("改模板动到 %d 条隧道，批量建的这两条都要在里面", len(moved.Users))
+	}
+	if len(moved.Path.Hops) != 2 || moved.Path.Hops[0].NodeID != 4 || moved.Path.Hops[1].NodeID != 5 {
+		t.Fatalf("模板自己的链不对: %+v", moved.Path.Hops)
+	}
+	for _, tv := range moved.Underlay.Tunnels {
+		p := tv.Path
+		if p == nil || len(p.Hops) != 2 || p.Hops[0].NodeID != 4 || p.Hops[1].NodeID != 5 {
+			t.Fatalf("隧道 %s 没跟上模板的两跳: %+v", tv.ID, p)
+		}
+	}
+}
+
 // ------------------------------------------------------------------ topology
 
 // One edge per device pair. A second tunnel on the same pair is refused with a
@@ -594,7 +877,7 @@ func TestUnderlayTopologyBundlesOneTunnelPerPairAndShowsRelays(t *testing.T) {
 	rec = createTunnel(t, s, ten, tunnelReq{
 		A:    underlaySpec{NodeID: 2, Iface: "wan0"},
 		B:    underlaySpec{NodeID: 3, Iface: "wan0"},
-		Path: &pathReq{NodeID: 1},
+		Path: via(1),
 	})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("relayed tunnel = %d (%s)", rec.Code, rec.Body.String())
@@ -618,8 +901,9 @@ func TestUnderlayTopologyBundlesOneTunnelPerPairAndShowsRelays(t *testing.T) {
 		t.Fatalf("bundle state = %q", bundle.State)
 	}
 	relayBundle := topo.Bundles[1]
-	if relayBundle.A != 2 || relayBundle.B != 3 || relayBundle.Tunnels[0].Path == nil ||
-		relayBundle.Tunnels[0].Path.NodeID != 1 || relayBundle.Tunnels[0].Path.Serial != "cpe-1" {
+	p := relayBundle.Tunnels[0].Path
+	if relayBundle.A != 2 || relayBundle.B != 3 || p == nil ||
+		len(p.Hops) != 1 || p.Hops[0].NodeID != 1 || p.Hops[0].Serial != "cpe-1" {
 		t.Fatalf("relay bundle = %+v", relayBundle)
 	}
 
@@ -643,7 +927,7 @@ func TestUnderlayPersistsThroughAnAtomicReload(t *testing.T) {
 	rec := createTunnel(t, s, ten, tunnelReq{
 		A:    underlaySpec{NodeID: 1, Iface: "wan0"},
 		B:    underlaySpec{NodeID: 2, Iface: "wan0"},
-		Path: &pathReq{NodeID: 3, SaveAs: "经 cpe-3 中转"},
+		Path: &pathReq{Hops: []hopReq{{NodeID: 3}}, SaveAs: "经 cpe-3 中转"},
 	})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create relayed tunnel = %d (%s)", rec.Code, rec.Body.String())
@@ -712,4 +996,61 @@ func TestUnderlayPersistsThroughAnAtomicReload(t *testing.T) {
 	if x == nil || x.State == nil || x.Draft.OverlayCIDR == "" || x.State.Tunnels == nil {
 		t.Fatalf("a well-keyed row was not repaired: %+v", x)
 	}
+}
+
+// 隧道配置页的颜色列：创建时带上、编辑时能改回 0、越界报 400。
+// Color 是 *uint8，因为「没填」和「填了 0」在改色时是两件事——页面对已入库的
+// 隧道总是回填当前值，而把一条昂贵颜色改回 0 是一次真实操作。
+func TestTunnelEndpointStoresAndEditsColor(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+
+	blue := uint8(1)
+	rec := createTunnel(t, s, ten, tunnelReq{
+		A:     underlaySpec{NodeID: 1, Iface: "wan0"},
+		B:     underlaySpec{NodeID: 2, Iface: "wan0"},
+		Color: &blue,
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("带颜色创建 = %d (%s)", rec.Code, rec.Body.String())
+	}
+	tv := tunnelFrom(t, rec)
+	if tv.Color != 1 {
+		t.Fatalf("响应里的颜色 = %d, want 1", tv.Color)
+	}
+
+	// 只改端口、不提交颜色：颜色必须原地不动。
+	keep := putTunnelView(t, s, ten, tunnelReq{ID: tv.ID, A: underlaySpec{Iface: "wan0"}})
+	if keep.Color != 1 {
+		t.Fatalf("不带颜色的编辑把颜色改成了 %d, want 保持 1", keep.Color)
+	}
+
+	zero := uint8(0)
+	back := putTunnelView(t, s, ten, tunnelReq{ID: tv.ID, Color: &zero})
+	if back.Color != 0 {
+		t.Fatalf("改回颜色 0 失败: %d", back.Color)
+	}
+
+	bad := uint8(underlay.MaxTunnelColor + 1)
+	rec = putTunnel(t, s, ten, tunnelReq{ID: tv.ID, Color: &bad})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("越界颜色 = %d (%s), want 400", rec.Code, rec.Body.String())
+	}
+	if got := tunnelFrom(t, putTunnel(t, s, ten, tunnelReq{ID: tv.ID})); got.Color != 0 {
+		t.Fatalf("被拒的改色写进了库: %d", got.Color)
+	}
+}
+
+func putTunnel(t *testing.T, s *server, ten string, req tunnelReq) *httptest.ResponseRecorder {
+	t.Helper()
+	return underlayDo(t, s.handleAdminUnderlayTunnels, ten, http.MethodPut, "/api/underlay/tunnels", mustJSON(t, req))
+}
+
+func putTunnelView(t *testing.T, s *server, ten string, req tunnelReq) underlayTunnelView {
+	t.Helper()
+	rec := putTunnel(t, s, ten, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("编辑隧道 = %d (%s)", rec.Code, rec.Body.String())
+	}
+	return tunnelFrom(t, rec)
 }

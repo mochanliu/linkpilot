@@ -192,14 +192,21 @@ func (s *State) auto(req AutoRequest, views map[uint16]NodeView) (Plan, error) {
 }
 
 // hubTemplate reuses the auto template for a hub if one exists, so a second
-// batch through the same hub shares it and an edit moves both batches.
+// batch through the same hub shares it and an edit moves both batches. Matching
+// on the template's single hop is what makes it recognisable as "the one auto
+// made for this hub": a hand-made multi-hop template that happens to start at the
+// same device has a different name and different hops, and must not be reused.
 func (s *State) hubTemplate(hub uint16, v NodeView, now int64) string {
+	name := autoTemplateName(hub, v)
 	for _, tpl := range s.Paths {
-		if tpl.NodeID == hub && tpl.Addr == "" && tpl.Name == autoTemplateName(hub, v) {
+		if len(tpl.Hops) != 1 || tpl.Name != name {
+			continue
+		}
+		if tpl.Hops[0].NodeID == hub && tpl.Hops[0].Addr == "" {
 			return tpl.ID
 		}
 	}
-	tpl, err := s.createPath(autoTemplateName(hub, v), hub, "", now)
+	tpl, err := s.createPath(name, []PathHop{{NodeID: hub}}, now)
 	if err != nil {
 		return ""
 	}

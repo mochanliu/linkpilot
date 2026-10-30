@@ -6,10 +6,10 @@
 <title>SROU 控制台</title>
 <style>
   :root{
-    --bg:#f6f8fa; --card:#ffffff; --line:#d0d7de; --line2:#eaeef2; --ink:#1f2328;
-    --muted:#57606a; --accent:#0969da; --accent-bg:#ddf4ff; --ok:#1a7f37; --ok-bg:#dafbe1;
-    --warn:#9a6700; --warn-bg:#fff8c5; --bad:#cf222e; --bad-bg:#ffebe9;
-    --soft:#eef2f6; --inset:#f6f8fa;
+    --bg:#0d1117; --card:#161b22; --line:#30363d; --line2:#21262d; --ink:#c9d1d9;
+    --muted:#8b949e; --accent:#58a6ff; --accent-bg:rgba(56,139,253,.15); --ok:#3fb950; --ok-bg:rgba(63,185,80,.15);
+    --warn:#d29922; --warn-bg:rgba(210,153,34,.15); --bad:#f85149; --bad-bg:rgba(248,81,73,.15);
+    --soft:#21262d; --inset:#0d1117;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
@@ -21,21 +21,21 @@
   /* 字重上限 500：原型里最粗的也就是这个，600/650/700 混用会把整页变成"都在强调"。 */
   b,strong{font-weight:500}
   button{font:inherit;cursor:pointer;border-radius:6px;border:1px solid var(--line);
-    background:#fff;color:var(--ink);padding:6px 12px}
+    background:var(--card);color:var(--ink);padding:6px 12px}
   button:hover{background:var(--soft)}
   button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
   button.primary:hover{filter:brightness(0.94)}
-  button.danger{color:var(--bad);border-color:#ffccc7}
+  button.danger{color:var(--bad);border-color:rgba(248,81,73,.4)}
   button.small{padding:2px 8px;font-size:12.5px}
-  input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
-  select{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
-  input:focus,select:focus{outline:2px solid #b6d6ff;outline-offset:-1px;border-color:var(--accent)}
+  input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--inset);color:var(--ink)}
+  select{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--inset);color:var(--ink)}
+  input:focus,select:focus{outline:2px solid rgba(56,139,253,.55);outline-offset:-1px;border-color:var(--accent)}
 
   /* ---------- login ---------- */
   #login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
   #login[hidden],#app[hidden]{display:none}
   .login-card{width:100%;max-width:420px;background:var(--card);border:1px solid var(--line);
-    border-radius:12px;padding:26px 26px 22px;box-shadow:0 8px 24px rgba(31,35,40,.06)}
+    border-radius:12px;padding:26px 26px 22px;box-shadow:0 8px 24px rgba(1,4,9,.5)}
   .login-card .brand{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
   .login-card .brand b{font-size:19px;letter-spacing:.3px}
   .login-card .brand span{color:var(--muted);font-size:12.5px}
@@ -111,15 +111,15 @@
     padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
   td{padding:7px 8px;border-bottom:1px solid var(--line2);vertical-align:middle}
   tr:last-child td{border-bottom:none}
-  td .mono{color:#24292f}
+  td .mono{color:var(--ink)}
   .muted{color:var(--muted);font-size:12.5px}
   .tag{display:inline-block;padding:0 7px;border-radius:999px;font-size:11.5px;
     border:1px solid var(--line);background:var(--card);color:var(--muted)}
-  .tag.online{color:var(--ok);border-color:#aceebb;background:var(--ok-bg)}
-  .tag.stale{color:var(--warn);border-color:#eed888;background:var(--warn-bg)}
+  .tag.online{color:var(--ok);border-color:rgba(63,185,80,.4);background:var(--ok-bg)}
+  .tag.stale{color:var(--warn);border-color:rgba(210,153,34,.4);background:var(--warn-bg)}
   .tag.pending{color:var(--muted);background:var(--inset)}
-  .tag.revoked{color:var(--bad);border-color:#ffcecb;background:var(--bad-bg)}
-  .tag.plan{color:var(--warn);border-color:#eed888;background:var(--warn-bg)}
+  .tag.revoked{color:var(--bad);border-color:rgba(248,81,73,.4);background:var(--bad-bg)}
+  .tag.plan{color:var(--warn);border-color:rgba(210,153,34,.4);background:var(--warn-bg)}
 
   .empty{padding:26px 8px;text-align:center;color:var(--muted);font-size:13px}
 
@@ -136,17 +136,17 @@
   .row-actions button + button{margin-left:6px}
   .row-actions select{margin-right:6px}
   .banner{display:flex;align-items:center;justify-content:space-between;gap:12px;
-    border:1px solid #eed888;background:var(--warn-bg);border-radius:8px;padding:10px 14px;
+    border:1px solid rgba(210,153,34,.4);background:var(--warn-bg);border-radius:8px;padding:10px 14px;
     font-size:13px;margin-top:14px}
 
-  .result{display:none;margin-top:14px;border:1px solid #aceebb;background:#f0fff4;
+  .result{display:none;margin-top:14px;border:1px solid rgba(63,185,80,.4);background:var(--ok-bg);
     border-radius:8px;padding:14px 16px}
   .result.show{display:block}
   .result .ttl{font-weight:500;color:var(--ok);margin-bottom:8px}
   .copybox{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
   .copybox code{background:var(--card);border:1px solid var(--line);border-radius:6px;
     padding:5px 10px;font-size:13px}
-  .bigcode{display:inline-block;background:var(--card);border:1px solid #aceebb;border-radius:8px;
+  .bigcode{display:inline-block;background:var(--card);border:1px solid rgba(63,185,80,.4);border-radius:8px;
     padding:10px 14px;font-size:17px;letter-spacing:1.6px;user-select:all;word-break:break-all}
   .ttl-now{font-variant-numeric:tabular-nums;font-weight:500;color:var(--warn)}
   .ttl-now.dead{color:var(--bad)}
@@ -187,17 +187,27 @@
   .avoid-list{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0;padding:0;list-style:none}
   .avoid-list li{display:flex;align-items:center;gap:6px;border:1px solid var(--line);
     border-radius:999px;padding:2px 4px 2px 10px;font-size:12.5px}
+  /* 中转链：包按这个顺序一台一台弹，反序就是另一条路。所以列表按顺序竖着排，
+     每一行都看得见自己是第几跳，并能单独上移/下移/移除。 */
+  .hop-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+  .hop-list li{display:flex;flex-wrap:wrap;align-items:center;gap:8px;border:1px solid var(--line);
+    border-radius:8px;padding:6px 8px;font-size:12.5px}
+  .hop-list .hop-no{min-width:18px;text-align:center;font-weight:600;color:var(--muted)}
+  .hop-list .hop-dev{flex:1 1 280px;min-width:240px}
+  .hop-list input{flex:1 1 190px;min-width:150px;padding:4px 7px;font-size:12.5px}
+  .hop-list .hop-ops{display:flex;gap:4px;margin-left:auto}
+  .hop-add{margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .usage{display:flex;flex-wrap:wrap;gap:8px 26px;margin-top:4px;font-size:13px}
   .usage b{font-variant-numeric:tabular-nums}
   .usage .k{color:var(--muted);font-size:12.5px}
   .map-area{position:relative;border:1px solid var(--line);border-radius:10px;overflow:hidden;
-    background:#eaeff5;margin-top:10px}
+    background:var(--inset);margin-top:10px}
   svg.topo{display:block;width:100%;height:560px;cursor:grab;touch-action:none}
   svg.topo.dragging{cursor:grabbing}
   .map-ctl{position:absolute;right:10px;top:10px;display:flex;flex-direction:column;gap:4px}
-  .map-ctl button{font-size:12px;padding:3px 9px;background:var(--card);box-shadow:0 1px 2px rgba(31,35,40,.08)}
+  .map-ctl button{font-size:12px;padding:3px 9px;background:var(--card);box-shadow:0 1px 2px rgba(1,4,9,.5)}
   .map-ctl button.zm{width:32px;font-size:14px;padding:2px 0}
-  .map-legend{position:absolute;left:10px;bottom:10px;background:rgba(255,255,255,.92);
+  .map-legend{position:absolute;left:10px;bottom:10px;background:rgba(22,27,34,.92);
     border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11.5px;color:var(--muted)}
   .map-legend .lg+.lg{margin-top:4px}
   .map-legend b{color:var(--ink);margin-right:6px;font-weight:400}
@@ -252,7 +262,8 @@
   .tel-node:first-of-type{border-top:none;padding-top:2px}
   .tel-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
   .num{white-space:nowrap;font-variant-numeric:tabular-nums}
-  .toast{position:fixed;right:20px;bottom:20px;background:#1f2328;color:#fff;
+  .toast{position:fixed;right:20px;bottom:20px;background:#21262d;color:var(--ink);
+    border:1px solid var(--line);box-shadow:0 4px 12px rgba(1,4,9,.5);
     padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(6px);
     transition:opacity .18s,transform .18s;pointer-events:none;max-width:420px}
   .toast.show{opacity:.96;transform:none}
@@ -2237,8 +2248,9 @@
     if (!S.und) {
       S.und = { doc: null, draft: null, dirty: false, loading: false, at: 0,
         note: null, auto: null, autoSel: [], autoMode: "full-mesh", autoHub: 0,
-        autoSpoke: "none", mPath: "direct", mA: 0, mB: 0, editTun: null,
-        editPathMode: null, editPath: null };
+        autoSpoke: "none", mPath: "direct", mA: 0, mPeers: [], batch: null,
+        mHops: [], editHops: null, editTun: null,
+        editPathMode: null, editPath: null, pHops: [], pEditHops: [] };
     }
     return S.und;
   }
@@ -2278,7 +2290,15 @@
     u.autoSel = u.autoSel.filter(function (id) { return ids[id]; });
     if (!ids[u.autoHub]) u.autoHub = 0;
     if (!ids[u.mA]) u.mA = 0;
-    if (!ids[u.mB]) u.mB = 0;
+    u.mPeers = (u.mPeers || []).filter(function (id) { return ids[id] && id !== u.mA; });
+    // 一条链里的设备下架了，这一跳只能删掉：留着它，提交时只会换来一句
+    // "中转设备 N 不存在或未入网"，而操作者看不出是哪一跳。刚点「＋ 添加一跳」
+    // 还没选设备的行 node 是空的，必须留着——否则一次心跳重绘就把操作者正在填的
+    // 那一行吃掉，页面看起来像按钮没反应。
+    ["mHops", "editHops", "pHops", "pEditHops"].forEach(function (k) {
+      if (!u[k]) return;
+      u[k] = u[k].filter(function (h) { return !h.node || ids[h.node]; });
+    });
   }
 
   // The map's viewport lives here too. The page is rebuilt from a string on
@@ -3391,22 +3411,134 @@
       }).join("");
   }
 
+  // ---------------------------------------------------------- 中转链编辑器
+  //
+  // u[key] 是一条链，每项 {node, addr}。顺序就是包被弹的顺序：A→B→C 和 C→B→A
+  // 是两条不同的路，所以这里必须能上移下移，也必须在每一行写清「第几跳」。
+  function undHopItems(doc, hops, i, exclude) {
+    return dpNodeItems(doc.nodes).filter(function (it) {
+      var n = Number(it.value);
+      if (exclude.indexOf(n) >= 0) return false;
+      for (var k = 0; k < hops.length; k++) {
+        if (k !== i && Number(hops[k].node) === n) return false;
+      }
+      return true;
+    });
+  }
+
+  function undHopsEditor(doc, key, o) {
+    o = o || {};
+    var u = undStore();
+    var hops = u[key] || [];
+    var limit = doc.relay_hop_limit || 1;
+    var h = '<div class="und-box"><h3>中转链 · 第 1 跳先经过</h3>';
+    if (!hops.length) {
+      h += '<div class="empty">还没有中转设备。加一跳，或把路径改回「直连」。</div>';
+    } else {
+      h += '<ol class="hop-list">';
+      hops.forEach(function (hop, i) {
+        var items = undHopItems(doc, hops, i, o.exclude || []);
+        h += '<li><span class="hop-no">' + (i + 1) + "</span>" +
+          '<div class="hop-dev">' + dpHtml(key + "-hop-" + i, "hop" + i, items, hop.node,
+            { empty: "选择中转设备…",
+              attrs: 'data-hop-key="' + key + '" data-hop-i="' + i + '"' }) + "</div>" +
+          '<input class="hop-addr" data-hop-addr="' + key + ":" + i + '" value="' + esc(hop.addr || "") +
+          '" placeholder="中转地址（可选，留空用观测）" autocomplete="off" ' +
+          'aria-label="第 ' + (i + 1) + ' 跳的中转地址">' +
+          '<span class="hop-ops">' +
+          '<button class="small" type="button" data-act="hop-up" data-key="' + key + '" data-i="' + i + '"' +
+          (i === 0 ? " disabled" : "") + ">上移</button>" +
+          '<button class="small" type="button" data-act="hop-down" data-key="' + key + '" data-i="' + i + '"' +
+          (i === hops.length - 1 ? " disabled" : "") + ">下移</button>" +
+          '<button class="small danger" type="button" data-act="hop-del" data-key="' + key + '" data-i="' + i + '">移除</button>' +
+          "</span></li>";
+      });
+      h += "</ol>";
+    }
+    h += '<div class="hop-add"><button class="small" type="button" data-act="hop-add" data-key="' + key + '"' +
+      (hops.length >= limit ? " disabled" : "") + ">＋ 添加一跳</button>" +
+      '<span class="muted" style="font-size:12px">最多 ' + limit + " 跳" +
+      (hops.length >= limit ? "（已到上限）" : "") + "</span></div>";
+    if (doc.relay_hop_note) h += '<div class="hint">' + esc(doc.relay_hop_note) + "</div>";
+    return h + "</div>";
+  }
+
+  function undHopAdd(key) {
+    var u = undStore();
+    if (!u.doc) return;
+    var hops = u[key] || [];
+    if (hops.length >= (u.doc.relay_hop_limit || 1)) {
+      toast("一条隧道最多 " + u.doc.relay_hop_limit + " 跳中转");
+      return;
+    }
+    u[key] = hops.concat([{ node: 0, addr: "" }]);
+    blurContent();
+    render();
+  }
+
+  function undHopDel(key, i) {
+    var u = undStore();
+    if (!u[key]) return;
+    u[key].splice(i, 1);
+    blurContent();
+    render();
+  }
+
+  function undHopMove(key, i, d) {
+    var u = undStore();
+    var hops = u[key] || [];
+    var j = i + d;
+    if (j < 0 || j >= hops.length) return;
+    var t = hops[i];
+    hops[i] = hops[j];
+    hops[j] = t;
+    blurContent();
+    render();
+  }
+
+  // 提交前把编辑器变成 API 的 hops 数组：没选设备的行、以及重复的设备都会被
+  // 挡在这里，而不是让控制器回一句操作者看不懂的话。
+  function undHopsBody(u, key) {
+    var hops = u[key] || [];
+    if (!hops.length) return { err: "加至少一跳，或把路径改回「直连」" };
+    var out = [], seen = {};
+    for (var i = 0; i < hops.length; i++) {
+      var n = Number(hops[i].node) || 0;
+      if (!n) return { err: "第 " + (i + 1) + " 跳还没选中转设备" };
+      if (seen[n]) return { err: "设备 " + n + " 在链里出现了两次，中转链不能绕回同一台" };
+      seen[n] = true;
+      out.push({ node_id: n, addr: String(hops[i].addr || "").trim() });
+    }
+    return { hops: out };
+  }
+
+  // undHopChain 把视图里的 hops（或编辑器里的 {node,addr}）写成 "A → B"。
+  // 模板列表、隧道表格、拓扑图都要同一句人话，口径只能有一处。
+  function undHopChain(hops, useAddr) {
+    return (hops || []).map(function (x) {
+      return String(x.serial || ("node-" + (x.node_id != null ? x.node_id : x.node))) +
+        (useAddr && x.addr ? "（" + x.addr + "）" : "");
+    }).join(" → ");
+  }
+
   function undTemplateOptions(doc, sel) {
     var ps = doc.paths || [];
     if (!ps.length) return '<option value="">（还没有路径模板）</option>';
     return ps.map(function (p) {
       return '<option value="' + esc(p.id) + '"' + (p.id === sel ? " selected" : "") + ">" +
-        esc(p.name) + " · 经 " + esc(p.serial || ("node-" + p.node_id)) +
+        esc(p.name) + " · 经 " + esc(undHopChain(p.hops)) +
+        "（" + ((p.hops || []).length) + " 跳）" +
         (p.users.length ? " · 被 " + p.users.length + " 条隧道引用" : "") + "</option>";
     }).join("");
   }
 
-  function undPathExtraFields(doc, mode, prefix) {
+  // undPathExtraFields：inline 那一支是一个链编辑器（不是「一台设备 + 一个地址」
+  // 两个字段），所以它排在 .fields 之外，占满整幅。
+  function undPathExtraFields(doc, mode, prefix, key, exclude) {
     if (mode === "inline") {
-      return '<div class="field"><label for="' + prefix + '-relay">中转设备</label>' +
-        dpHtml(prefix + "-relay", "relay", dpNodeItems(doc.nodes), 0, { empty: "选择中转设备…" }) + "</div>" +
-        '<div class="field"><label for="' + prefix + '-relay-addr">中转地址（可选）</label>' +
-        '<input id="' + prefix + '-relay-addr" name="relay_addr" placeholder="ip 或 ip:port"></div>';
+      return undHopsEditor(doc, key, { exclude: exclude }) +
+        '<div class="field" style="margin-top:10px"><label for="' + prefix + '-save-as">存为路径模板（可选）</label>' +
+        '<input id="' + prefix + '-save-as" name="save_as" placeholder="留空 = 这条链只给这条隧道用" maxlength="60"></div>';
     }
     if (mode === "template") {
       return '<div class="field"><label for="' + prefix + '-template">路径模板</label>' +
@@ -3470,11 +3602,17 @@
     }
     if (!t.path) return '<span class="tag">直连</span>';
     var p = t.path;
-    return '<span class="tag plan">经中转</span> <span class="mono">' +
-      esc(p.serial || ("node-" + p.node_id)) + "</span>" +
-      (p.addr ? ' <span class="mono muted">' + esc(p.addr) + "</span>" : "") +
+    // 顺序必须原样显示：段表按这个顺序一台一台弹，写成集合就是把另一条路说成
+    // 了这条路。
+    var hops = p.hops || [];
+    var h = '<span class="tag plan">经 ' + hops.length + " 跳中转</span> " +
+      hops.map(function (x) {
+        return '<span class="mono">' + esc(x.serial || ("node-" + x.node_id)) +
+          (x.addr ? ' <span class="muted">' + esc(x.addr) + "</span>" : "") + "</span>";
+      }).join('<span class="muted"> → </span>') +
       '<div class="muted" style="font-size:12px">' +
       (p.template_name ? "模板 " + esc(p.template_name) : "inline 中转") + "</div>";
+    return h;
   }
 
   function undMTUCell(t, doc) {
@@ -3563,34 +3701,89 @@
     });
   }
 
+  // undColorOptions 的取值范围由后端给（doc.max_tunnel_color），页面不自己写死
+  // 0..7：这个上限是表号公式和 u8 preference 一起算出来的，改它的人不会来改这里。
+  function undColorOptions(doc, sel) {
+    var max = (doc && doc.max_tunnel_color) || 0;
+    var h = "";
+    for (var c = 0; c <= max; c++) {
+      h += '<option value="' + c + '"' + (c === sel ? " selected" : "") + ">" + c + "</option>";
+    }
+    return h;
+  }
+
+  // undManualPanel 一次可以只建一条，也可以「本端一台 + 对端多台 + 同一条路径」
+  // 建一批。对端的物理端口/外层地址只对一条隧道有意义，所以选了多台时这两个
+  // 字段就不出现：批量里每台用各自的观测地址与默认出口端口，这是控制器的行为，
+  // 页面上要讲清楚，不能留两个看起来还会生效的框。
   function undManualPanel(doc, u) {
     var mode = u.mPath || "direct";
     var a = undNodeOf(doc, u.mA) ? u.mA : (doc.nodes[0] ? doc.nodes[0].node_id : 0);
-    var b = undNodeOf(doc, u.mB) ? u.mB : (doc.nodes[1] ? doc.nodes[1].node_id : 0);
-    return '<section class="panel"><header><h2>手动创建</h2>' +
-      '<span class="muted" style="font-size:12.5px">一台对一台；端口与 overlay /32 由分配器给</span></header>' +
+    var peers = (u.mPeers || []).filter(function (id) { return id !== a && undNodeOf(doc, id); });
+    var one = peers.length === 1 ? undNodeOf(doc, peers[0]) : null;
+    var peerItems = dpNodeItems(doc.nodes).filter(function (it) { return Number(it.value) !== a; });
+    var batch = peers.length > 1;
+    var h = '<section class="panel"><header><h2>手动创建</h2>' +
+      '<span class="muted" style="font-size:12.5px">' +
+      (batch ? "本端一台 · 对端 " + peers.length + " 台 · 同一条路径，一次建 " + peers.length + " 条"
+        : "一台对一台；端口与 overlay /32 由分配器给") + "</span></header>" +
       '<form id="und-tun-form"><div class="fields">' +
       '<div class="field"><label for="und-tun-a">本端设备</label>' +
       dpHtml("und-tun-a", "a", dpNodeItems(doc.nodes), a, { attrs: 'data-und-dev="a"' }) + "</div>" +
-      '<div class="field"><label for="und-tun-a-iface">本端物理端口</label>' +
+      '<div class="field"><label for="und-tun-b">对端设备（可多选）</label>' +
+      dpHtml("und-tun-b", "b", peerItems, peers, { multiple: true, size: 6, attrs: 'data-und-dev="peers"' }) +
+      "</div>";
+    if (one) {
+      h += '<div class="field"><label for="und-tun-b-iface">对端物理端口</label>' +
+        '<select id="und-tun-b-iface" name="b_iface">' + undIfaceOptions(one, "") + "</select></div>" +
+        '<div class="field"><label for="und-tun-b-addr">对端外层地址（留空用观测）</label>' +
+        '<input id="und-tun-b-addr" name="b_addr" placeholder="ip 或 ip:port"></div>';
+    }
+    h += '<div class="field"><label for="und-tun-a-iface">本端物理端口</label>' +
       '<select id="und-tun-a-iface" name="a_iface">' + undIfaceOptions(undNodeOf(doc, a), "") + "</select></div>" +
       '<div class="field"><label for="und-tun-a-addr">本端外层地址（留空用观测）</label>' +
       '<input id="und-tun-a-addr" name="a_addr" placeholder="ip 或 ip:port"></div>' +
-      '<div class="field"><label for="und-tun-b">对端设备</label>' +
-      dpHtml("und-tun-b", "b", dpNodeItems(doc.nodes), b, { attrs: 'data-und-dev="b"' }) + "</div>" +
-      '<div class="field"><label for="und-tun-b-iface">对端物理端口</label>' +
-      '<select id="und-tun-b-iface" name="b_iface">' + undIfaceOptions(undNodeOf(doc, b), "") + "</select></div>" +
-      '<div class="field"><label for="und-tun-b-addr">对端外层地址（留空用观测）</label>' +
-      '<input id="und-tun-b-addr" name="b_addr" placeholder="ip 或 ip:port"></div>' +
       '<div class="field"><label for="und-tun-pathmode">路径</label>' +
       '<select id="und-tun-pathmode">' + undPathModeOptions(mode) + "</select></div>" +
-      undPathExtraFields(doc, mode, "und-tun") +
-      "</div>" +
+      '<div class="field"><label for="und-tun-color">颜色</label>' +
+      '<select id="und-tun-color" name="color">' + undColorOptions(doc, 0) + "</select></div>" +
+      "</div>" + undPathExtraFields(doc, mode, "und-tun", "mHops", [a].concat(peers)) +
       '<div class="hint" style="margin:10px 0 0">物理端口可以留「默认」，由设备上报的出口决定；也可以指定它上报过的其他端口。' +
       "地址留空就用反射器最近一次观测到的外层地址；观测过期时创建会被拒绝，需要手填地址或等设备重新上报。" +
-      "两端不能都是对称 NAT；中转设备不能是隧道的一端。</div>" +
-      '<div style="margin-top:10px"><button class="primary" type="submit">创建隧道</button></div>' +
-      "</form></section>";
+      "两端不能都是对称 NAT；中转设备不能是隧道的一端。" +
+      // 颜色说清三件事：它变成什么、0 意味着可以叠加、以及它今天走到哪里。
+      // 最后一条必须写：这一列只写控制器的隧道表，设备上的 FIB 隧道表还是设备
+      // 自己那份配置，两边不一致时数据面按设备上的算。
+      "颜色是这条隧道的 SD-WAN 颜色：设备按 230+颜色 写成 VPP 的 preference，颜色 0 最优，" +
+      "0 全 down 时自动抬到存活的最小颜色；同色多条是并用的。" +
+      "这一列今天写的是控制器的隧道表；设备上生效的还是它自己那份 FIB 隧道配置，两边要人工对齐。" +
+      (batch ? "批量创建时对端用各自的观测地址与默认出口端口，逐台指定请只选一台对端。" +
+        "已经有隧道的对端会被跳过并列在结果里，不会让整批失败。" : "") + "</div>" +
+      '<div style="margin-top:10px"><button class="primary" type="submit">' +
+      (batch ? "批量创建 " + peers.length + " 条隧道" : "创建隧道") + "</button></div>" +
+      "</form>" + undBatchResult(doc, u) + "</section>";
+    return h;
+  }
+
+  // 上一次批量创建的结果留在原地：哪些对端被跳过、为什么。操作者需要知道
+  // "少了两条" 不是 bug。
+  function undBatchResult(doc, u) {
+    var b = u.batch;
+    if (!b) return "";
+    var h = '<div class="subcard"><div class="subhead"><b>' + (b.applied ? "批量创建结果" : "这次会创建") + "</b>" +
+      '<span class="sp">批次 ' + esc(b.batch_id || "—") + " · 新增 " + b.created + " 条 · 跳过 " +
+      (b.skipped || []).length + " 台</span></div>";
+    if ((b.skipped || []).length) {
+      h += '<table style="margin-top:10px"><thead><tr><th>跳过的对端</th><th>原因</th></tr></thead><tbody>';
+      b.skipped.forEach(function (s) {
+        var nd = undNodeOf(doc, s.node_id);
+        h += "<tr><td>" + esc((nd && nd.serial) || ("node-" + s.node_id)) +
+          '</td><td class="muted">' + esc(s.reason) + "</td></tr>";
+      });
+      h += "</tbody></table>";
+    }
+    if (b.text) h += '<div class="hint" style="margin-top:8px">' + esc(b.text) + "</div>";
+    return h + "</div>";
   }
 
   function undTunnelPathMode(t) {
@@ -3610,15 +3803,22 @@
       return h + '<div class="empty">还没有隧道。' +
         (doc.configured ? "用上面的自动编排或手动表单创建。" : "先发布全局配置。") + "</div></section>";
     }
-    h += "<table><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>";
+    h += "<table><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>颜色</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>";
     doc.tunnels.forEach(function (t) {
       h += "<tr>" +
         "<td>" + undEndpointCell(t.a, doc) + "</td>" +
         "<td>" + undEndpointCell(t.b, doc) + "</td>" +
         "<td>" + undPathText(t) + "</td>" +
+        // 颜色单独一列：同一对设备的多条隧道、一条链上的几条隧道，运营只看这一列
+        // 判断「这几条是并用的还是备胎」。
+        "<td><b>" + (t.color || 0) + "</b></td>" +
         "<td>" + undMTUCell(t, doc) + "</td>" +
         "<td>" + undStateTag(doc.state_note) +
-        '<div class="muted" style="font-size:12px">' + esc(t.id) + " · " + esc(clock(t.created_at_unix)) + "</div></td>" +
+        '<div class="muted" style="font-size:12px">' + esc(t.id) + " · " + esc(clock(t.created_at_unix)) +
+        // 同一批的隧道共用一个批次号：批量建了 7 条之后，这一列是唯一能看出
+        // "这 7 条是同一个动作" 的地方。
+        (t.batch_id ? '<div class="muted" style="font-size:12px">批次 ' + esc(t.batch_id) + "</div>" : "") +
+        "</div></td>" +
         '<td class="row-actions">' +
         '<button class="small" data-act="und-tun-edit" data-id="' + esc(t.id) + '">编辑</button>' +
         '<button class="small danger" data-act="und-tun-del" data-id="' + esc(t.id) + '">删除</button>' +
@@ -3631,21 +3831,34 @@
     var u = S.und;
     if (!u || !u.doc) return;
     var f = new FormData(form);
-    var a = Number(f.get("a")), b = Number(f.get("b"));
-    if (!a || !b || a === b) { toast("选两台不同的设备"); return; }
+    var a = Number(f.get("a")) || 0;
+    var peers = (f.getAll("b") || []).map(function (v) { return Number(v) || 0; })
+      .filter(function (n) { return n > 0 && n !== a; });
+    if (!a) { toast("选择本端设备"); return; }
+    if (!peers.length) { toast("至少选一台对端设备"); return; }
     var body = {
-      a: { node_id: a, iface: String(f.get("a_iface") || "").trim(), addr: String(f.get("a_addr") || "").trim() },
-      b: { node_id: b, iface: String(f.get("b_iface") || "").trim(), addr: String(f.get("b_addr") || "").trim() }
+      a: { node_id: a, iface: String(f.get("a_iface") || "").trim(), addr: String(f.get("a_addr") || "").trim() }
     };
+    var color = parseInt(String(f.get("color")), 10);
+    body.color = isNaN(color) ? 0 : color;
+    // 一台对端走单条创建（能指定它的出口端口和地址），两台以上走批量：批量
+    // 那套只有 node_id，端口与地址各用设备自己的观测，这是控制器的契约。
+    if (peers.length === 1) {
+      body.b = {
+        node_id: peers[0],
+        iface: String(f.get("b_iface") || "").trim(),
+        addr: String(f.get("b_addr") || "").trim()
+      };
+    } else {
+      body.peers = peers;
+    }
     var mode = u.mPath || "direct";
     if (mode === "inline") {
-      var relay = Number(f.get("relay") || 0);
-      if (!relay) { toast("选择中转设备"); return; }
-      body.path = {
-        node_id: relay,
-        addr: String(f.get("relay_addr") || "").trim(),
-        save_as: String(f.get("save_as") || "").trim()
-      };
+      var hs = undHopsBody(u, "mHops");
+      if (hs.err) { toast(hs.err); return; }
+      body.path = { hops: hs.hops };
+      var saveAs = String(f.get("save_as") || "").trim();
+      if (saveAs) body.path.save_as = saveAs;
     } else if (mode === "template") {
       var tpl = String(f.get("template") || "");
       if (!tpl) { toast("选择路径模板"); return; }
@@ -3653,12 +3866,25 @@
     }
     api("POST", "/api/underlay/tunnels", body).then(function (res) {
       u.mPath = "direct";
-      u.note = { kind: "", text: "隧道 " + res.tunnel.id + " 已创建（" +
-        (res.tunnel.path ? "经 " + (res.tunnel.path.serial || ("node-" + res.tunnel.path.node_id)) + " 中转" : "直连") +
-        "）；隧道段随心跳下发：开着 -tunnels 的设备下一轮心跳会拉走，结果回报在本页「设备与中转端口」表的「隧道下发」列。" };
+      u.mHops = [];
+      var chain = "直连";
+      if (res.tunnel && res.tunnel.path) {
+        chain = "经 " + (res.tunnel.path.hops || []).length + " 跳中转（" +
+          undHopChain(res.tunnel.path.hops) + "）";
+      }
+      if (res.tunnel) {
+        u.batch = null;
+        u.note = { kind: "", text: "隧道 " + res.tunnel.id + " 已创建（" + chain +
+          "）；隧道段随心跳下发：开着 -tunnels 的设备下一轮心跳会拉走，结果回报在本页「设备与中转端口」表的「隧道下发」列。" };
+      } else {
+        u.batch = { applied: true, batch_id: res.batch_id,
+          created: (res.tunnels || []).length, skipped: res.skipped || [],
+          text: "路径：" + chain + "。新增的隧道段随心跳下发，被跳过的对端一条也没动。" };
+        u.note = null;
+      }
       releaseForm(form);
       undSetDoc(res.underlay);
-      toast("隧道已创建");
+      toast(res.tunnel ? "隧道已创建" : "批量创建完成");
     }).catch(function (err) {
       u.note = undErrNote(err);
       render();
@@ -3669,7 +3895,6 @@
     var t = undTunnelOf(doc, u.editTun);
     if (!t) { u.editTun = null; return ""; }
     var mode = u.editPathMode || undTunnelPathMode(t);
-    var relay = t.path && !t.path.template_id ? t.path.node_id : 0;
     var tpl = t.path && t.path.template_id ? t.path.template_id : "";
     var h = '<section class="panel"><header><h2>编辑隧道 ' + esc(t.id) + "</h2>" +
       '<span class="muted" style="font-size:12.5px">' + esc(t.a.serial || ("node-" + t.a.node_id)) + " ↔ " +
@@ -3686,14 +3911,12 @@
       '<div class="field"><label for="und-edit-b-addr">对端外层地址（留空用观测）</label>' +
       '<input id="und-edit-b-addr" name="b_addr" value="' + esc(t.b.addr) + '" placeholder="ip 或 ip:port"></div>' +
       '<div class="field"><label for="und-edit-pathmode">路径</label>' +
-      '<select id="und-edit-pathmode">' + undPathModeOptions(mode) + "</select></div>";
+      '<select id="und-edit-pathmode">' + undPathModeOptions(mode) + "</select></div>" +
+      '<div class="field"><label for="und-edit-color">颜色</label>' +
+      '<select id="und-edit-color" name="color">' + undColorOptions(doc, t.color || 0) + "</select></div>";
     if (mode === "inline") {
-      h += '<div class="field"><label for="und-edit-relay">中转设备</label>' +
-        dpHtml("und-edit-relay", "relay", dpNodeItems(doc.nodes), relay,
-          { empty: "选择中转设备…" }) + "</div>" +
-        '<div class="field"><label for="und-edit-relay-addr">中转地址（可选）</label>' +
-        '<input id="und-edit-relay-addr" name="relay_addr" value="' +
-        esc(t.path && !t.path.template_id ? t.path.addr : "") + '" placeholder="ip 或 ip:port"></div>';
+      h += undHopsEditor(doc, "editHops", { exclude: [t.a.node_id, t.b.node_id] }) +
+        '<div class="hint" style="margin-top:8px">改成另一条链是整条替换：新的顺序会一起下发，旧链不会留下一跳。</div>';
     } else if (mode === "template") {
       h += '<div class="field"><label for="und-edit-template">路径模板</label>' +
         '<select id="und-edit-template" name="template">' + undTemplateOptions(doc, tpl) + "</select></div>";
@@ -3701,7 +3924,11 @@
     h += "</div>" +
       '<div class="hint" style="margin:10px 0 0">端口和 overlay /32 不在这里改：端口由池分配，overlay 地址跟着隧道走。' +
       "改成「直连」会丢掉中转；地址留空表示改回使用观测地址。" +
-      "物理端口只在改动时提交：选「默认」表示交回设备上报的出口。</div>" +
+      "物理端口只在改动时提交：选「默认」表示交回设备上报的出口。" +
+      // 实测出来的行为，不是猜测：VPP 原地替换路径时不重算 preference，
+      // 所以改颜色必须删了重加（docs/overlay-design-draft.md §2.2）。
+      "改颜色会把这条隧道上的路由删掉重加，正在走的流量有一个收敛窗口的中断。" +
+      "</div>" +
       '<div style="margin-top:10px"><button class="primary" type="submit">保存修改</button> ' +
       '<button class="small" type="button" data-act="und-tun-cancel">取消</button></div>' +
       "</form></section>";
@@ -3719,6 +3946,10 @@
       a: { node_id: t.a.node_id, addr: String(f.get("a_addr") || "").trim() },
       b: { node_id: t.b.node_id, addr: String(f.get("b_addr") || "").trim() }
     };
+    // 颜色总是提交：表单把它回填成了当前值，所以"没动它"和"改回 0"在这份
+    // 请求里是不同的数字，后端那个 *uint8 就是为这个准备的。
+    var color = parseInt(String(f.get("color")), 10);
+    body.color = isNaN(color) ? (t.color || 0) : color;
     // "默认" resolves to the device's own egress port: the API treats an empty
     // iface as "keep", so clearing back to the default has to name it.
     var ndA = undNodeOf(u.doc, t.a.node_id), ndB = undNodeOf(u.doc, t.b.node_id);
@@ -3730,9 +3961,9 @@
     if (mode === "direct") {
       body.clear_path = true;
     } else if (mode === "inline") {
-      var relay = Number(f.get("relay") || 0);
-      if (!relay) { toast("选择中转设备"); return; }
-      body.path = { node_id: relay, addr: String(f.get("relay_addr") || "").trim() };
+      var hs = undHopsBody(u, "editHops");
+      if (hs.err) { toast(hs.err); return; }
+      body.path = { hops: hs.hops };
     } else {
       var tpl = String(f.get("template") || "");
       if (!tpl) { toast("选择路径模板"); return; }
@@ -3741,6 +3972,7 @@
     api("PUT", "/api/underlay/tunnels", body).then(function (res) {
       u.editTun = null;
       u.editPathMode = null;
+      u.editHops = null;
       u.note = { kind: "", text: "隧道 " + t.id + " 已更新。" };
       undSetDoc(res.underlay);
       toast("隧道已更新");
@@ -3769,14 +4001,14 @@
   function undPathPanel(doc, u) {
     var h = '<section class="panel"><header><h2>路径模板</h2>' +
       '<span class="muted" style="font-size:12.5px">' + doc.paths.length + " 个</span></header>" +
-      '<div class="hint">模板是共享的中转跳：编辑模板会同时移动所有引用它的隧道，删除前必须先解除引用。</div>';
+      '<div class="hint">模板是共享的中转链：编辑模板会同时移动所有引用它的隧道，删除前必须先解除引用。链的顺序就是包被弹的顺序。</div>';
     if (doc.paths.length) {
-      h += "<table><thead><tr><th>名称</th><th>中转设备</th><th>地址</th><th>引用</th><th>创建</th><th></th></tr></thead><tbody>";
+      h += "<table><thead><tr><th>名称</th><th>中转链</th><th>引用</th><th>创建</th><th></th></tr></thead><tbody>";
       doc.paths.forEach(function (p) {
         h += "<tr>" +
           "<td><b>" + esc(p.name) + '</b><div class="muted" style="font-size:12px">' + esc(p.id) + "</div></td>" +
-          "<td>" + esc(p.serial || ("node-" + p.node_id)) + "</td>" +
-          '<td class="mono muted">' + esc(p.addr || "用观测地址") + "</td>" +
+          "<td>" + esc(undHopChain(p.hops, true)) +
+          '<div class="muted" style="font-size:12px">' + (p.hops || []).length + " 跳</div></td>" +
           "<td>" + (p.users.length ? p.users.length + " 条" : "—") + "</td>" +
           '<td class="muted">' + esc(clock(p.created_at_unix)) + "</td>" +
           '<td class="row-actions">' +
@@ -3794,15 +4026,12 @@
   }
 
   function undPathCreateForm(doc) {
-    return '<form id="und-path-form" class="addrow">' +
+    return '<form id="und-path-form" class="addrow" style="display:block">' +
+      '<div class="fields" style="margin-top:10px">' +
       '<div class="field"><label for="und-path-name">模板名称</label>' +
       '<input id="und-path-name" name="name" placeholder="如 经上海中转" maxlength="60"></div>' +
-      '<div class="field"><label for="und-path-node">中转设备</label>' +
-      dpHtml("und-path-node", "node", dpNodeItems(doc.nodes), 0,
-        { empty: "选择中转设备…" }) + "</div>" +
-      '<div class="field"><label for="und-path-addr">中转地址（可选）</label>' +
-      '<input id="und-path-addr" name="addr" placeholder="ip 或 ip:port"></div>' +
-      '<button class="small" type="submit">新建模板</button></form>';
+      "</div>" + undHopsEditor(doc, "pHops", {}) +
+      '<div style="margin-top:10px"><button class="small" type="submit">新建模板</button></div></form>';
   }
 
   function undPathEditForm(doc, u) {
@@ -3815,11 +4044,9 @@
       '<form id="und-path-edit-form"><div class="fields">' +
       '<div class="field"><label for="und-path-edit-name">名称</label>' +
       '<input id="und-path-edit-name" name="name" value="' + esc(p.name) + '" maxlength="60"></div>' +
-      '<div class="field"><label for="und-path-edit-node">中转设备</label>' +
-      dpHtml("und-path-edit-node", "node", dpNodeItems(doc.nodes), p.node_id) + "</div>" +
-      '<div class="field"><label for="und-path-edit-addr">中转地址（可选）</label>' +
-      '<input id="und-path-edit-addr" name="addr" value="' + esc(p.addr) + '" placeholder="ip 或 ip:port"></div>' +
-      "</div>" +
+      "</div>" + undHopsEditor(doc, "pEditHops", {}) +
+      '<div class="hint" style="margin-top:8px">保存是整条链替换：引用这个模板的 ' + p.users.length +
+      " 条隧道会立刻改用新的中转链，包括顺序。</div>" +
       '<div style="margin-top:10px"><button class="primary" type="submit">保存模板</button> ' +
       '<button class="small" type="button" data-act="und-path-cancel">取消</button></div>' +
       "</form></div>";
@@ -3830,16 +4057,18 @@
     if (!u || !u.doc) return;
     var f = new FormData(form);
     var name = String(f.get("name") || "").trim();
-    var node = Number(f.get("node") || 0);
     if (!name) { toast("给模板起个名字"); return; }
-    if (!node) { toast("选择中转设备"); return; }
-    var body = { name: name, node_id: node, addr: String(f.get("addr") || "").trim() };
+    var hs = undHopsBody(u, id ? "pEditHops" : "pHops");
+    if (hs.err) { toast(hs.err); return; }
+    var body = { name: name, hops: hs.hops };
     if (id) body.id = id;
     api(id ? "PUT" : "POST", "/api/underlay/paths", body).then(function (res) {
       u.editPath = null;
+      u.pEditHops = [];
+      if (!id) u.pHops = [];
       u.note = { kind: "", text: id
         ? "模板「" + name + "」已更新" + (res.users && res.users.length ? "，引用它的 " + res.users.length + " 条隧道会跟着变" : "") + "。"
-        : "模板「" + name + "」已创建。" };
+        : "模板「" + name + "」已创建（" + hs.hops.length + " 跳）。" };
       releaseForm(form);
       undSetDoc(res.underlay);
       toast(id ? "模板已更新" : "模板已创建");
@@ -4051,15 +4280,23 @@
           items.push({ t: t, key: i, label: t.id + " · " + (t.a.port || "—") + "→" + (t.b.port || "—") });
         });
       } else {
-        var relayNames = {}, anyRelay = false;
+        var relayNames = {}, anyRelay = false, firstRelayed = null;
         b.tunnels.forEach(function (t) {
-          if (t.path) { anyRelay = true; relayNames[t.path.serial || ("node-" + t.path.node_id)] = true; }
+          if (t.path) {
+            anyRelay = true;
+            // 低倍率下几条隧道合成一条线。取第一条真的带中转的隧道来画形状，
+            // 否则「标签写着经 X 中转、线却画成直线」——线要说得出跳的顺序。
+            if (!firstRelayed) firstRelayed = t;
+            (t.path.hops || []).forEach(function (h) {
+              relayNames[h.serial || ("node-" + h.node_id)] = true;
+            });
+          }
           if (t.path_error) anyRelay = true;
         });
         var lb = b.count + " 条";
         var ks = Object.keys(relayNames);
-        if (ks.length) lb += (lb ? " · " : "") + "经 " + ks.join("、");
-        items.push({ t: b.tunnels[0], key: 0, relay: anyRelay, label: lv >= 1 ? lb : "" });
+        if (ks.length) lb += (lb ? " · " : "") + "经 " + ks.join("、") + " 中转";
+        items.push({ t: firstRelayed || b.tunnels[0], key: 0, relay: anyRelay, label: lv >= 1 ? lb : "" });
       }
       var m = items.length, span = 11 * inv;
       items.forEach(function (it, idx) {
@@ -4087,18 +4324,57 @@
   }
 
   // The line for one tunnel, offset sideways by idx*span so a split bundle reads
-  // as parallel wires rather than one thick stroke, and bowed through the relay
-  // box when the tunnel is source-routed.
+  // as parallel wires rather than one thick stroke. A relayed tunnel is drawn as
+  // the chain it actually is -- 本端 → 每一跳 → 对端 -- because a bowed line that
+  // merely "hints at a relay" cannot show which device is second and which third,
+  // and that order is the whole configuration.
   function undMapPath(t, pos, pa, pb, off, inv) {
+    var hops = [];
+    ((t && t.path && t.path.hops) || []).forEach(function (h) {
+      var p = pos[h.node_id];
+      if (p) hops.push(p);
+    });
     var dx = pb[0] - pa[0], dy = pb[1] - pa[1];
     var len = Math.sqrt(dx * dx + dy * dy);
-    if (!len) return null;
-    var nx = -dy / len, ny = dx / len;
+    // 同一站点上的两台盒子投影到同一个点，两端之间的直线长度是 0。这时候不能因为
+    // "两端重合"就把整条边丢掉：一条经过北京→上海→北京的中转隧道，路径是真实存在
+    // 的，图上必须看得见。只有既没有距离、又没有中转跳（那就真的是一段零长度）时
+    // 才不画。方向也照这个逻辑取：两端有距离用两端的垂线，两端重合就用第一跳的方向，
+    // 这样同一站点的几条隧道才不会完全叠在一起。
+    var nx = 0, ny = 0;
+    if (len) { nx = -dy / len; ny = dx / len; }
+    else if (hops.length) {
+      var hx = hops[0][0] - pa[0], hy = hops[0][1] - pa[1];
+      var hl = Math.sqrt(hx * hx + hy * hy);
+      if (!hl) return null;
+      nx = -hy / hl; ny = hx / hl;
+    } else return null;
     var a = [pa[0] + nx * off, pa[1] + ny * off], b = [pb[0] + nx * off, pb[1] + ny * off];
-    var hop = t && t.path ? pos[t.path.node_id] : null;
-    if (hop) {
-      return { d: "M" + r1(a[0]) + "," + r1(a[1]) + "Q" + r1(hop[0]) + "," + r1(hop[1]) + " " + r1(b[0]) + "," + r1(b[1]),
-        mx: (a[0] + 2 * hop[0] + b[0]) / 4, my: (a[1] + 2 * hop[1] + b[1]) / 4 };
+    var chain = [a];
+    hops.forEach(function (p) { chain.push(p); });
+    chain.push(b);
+    if (chain.length > 2) {
+      var total = 0, segs = [];
+      for (var i = 1; i < chain.length; i++) {
+        var sl = Math.sqrt(Math.pow(chain[i][0] - chain[i - 1][0], 2) +
+          Math.pow(chain[i][1] - chain[i - 1][1], 2));
+        total += sl;
+        segs.push(sl);
+      }
+      var want = total / 2, d2 = 0, mid = chain[chain.length - 1];
+      for (var k = 0; k < segs.length; k++) {
+        if (!segs[k]) { continue; }
+        if (d2 + segs[k] >= want) {
+          var r = (want - d2) / segs[k];
+          mid = [chain[k][0] + (chain[k + 1][0] - chain[k][0]) * r,
+            chain[k][1] + (chain[k + 1][1] - chain[k][1]) * r];
+          break;
+        }
+        d2 += segs[k];
+      }
+      return { d: chain.map(function (p, idx) {
+          return (idx ? "L" : "M") + r1(p[0]) + "," + r1(p[1]);
+        }).join(""), mx: mid[0], my: mid[1] };
     }
     return { d: "M" + r1(a[0]) + "," + r1(a[1]) + "L" + r1(b[0]) + "," + r1(b[1]),
       mx: (a[0] + b[0]) / 2, my: (a[1] + b[1]) / 2 };
@@ -4724,10 +5000,45 @@
       el.addEventListener("change", function () {
         var u = S.und;
         if (!u) return;
-        if (el.getAttribute("data-und-dev") === "a") u.mA = Number(el.value) || 0;
-        else u.mB = Number(el.value) || 0;
+        if (el.getAttribute("data-und-dev") === "a") {
+          u.mA = Number(el.value) || 0;
+          // 本端换了，上一批的结果就不再是"眼前这个动作"的结果；而新本端如果
+          // 正好在旧对端里，那台必须出去，否则提交时会被控制器判成"同一台设备"。
+          u.mPeers = (u.mPeers || []).filter(function (id) { return id !== u.mA; });
+        } else {
+          u.mPeers = Array.prototype.slice.call(el.selectedOptions)
+            .map(function (op) { return Number(op.value) || 0; })
+            .filter(function (v) { return v > 0 && v !== u.mA; });
+        }
+        u.batch = null;
         blurContent();
         render();
+      });
+    });
+    // 中转链的某一跳换了设备：换完必须重画，因为其它几跳的候选列表要跟着去掉
+    // 这台（一条链不能绕回同一台设备）。
+    document.querySelectorAll("#content select[data-hop-key]").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var u = S.und;
+        if (!u) return;
+        var key = el.getAttribute("data-hop-key");
+        var i = Number(el.getAttribute("data-hop-i")) || 0;
+        if (!u[key] || !u[key][i]) return;
+        u[key][i].node = Number(el.value) || 0;
+        blurContent();
+        render();
+      });
+    });
+    // 地址是手打的：只写进状态，不重画，否则一边打字一边丢光标。
+    document.querySelectorAll("#content input[data-hop-addr]").forEach(function (el) {
+      el.addEventListener("input", function () {
+        var u = S.und;
+        if (!u) return;
+        var p = (el.getAttribute("data-hop-addr") || "").split(":");
+        var arr = u[p[0]];
+        if (!arr) return;
+        var hop = arr[Number(p[1])];
+        if (hop) hop.addr = el.value;
       });
     });
     var ump = $("und-tun-pathmode");
@@ -4987,6 +5298,10 @@
         }
         else if (act === "und-avoid-add") undAddAvoid();
         else if (act === "und-avoid-del") undDelAvoid(Number(el.getAttribute("data-i")));
+        else if (act === "hop-add") undHopAdd(el.getAttribute("data-key"));
+        else if (act === "hop-del") undHopDel(el.getAttribute("data-key"), Number(el.getAttribute("data-i")));
+        else if (act === "hop-up") undHopMove(el.getAttribute("data-key"), Number(el.getAttribute("data-i")), -1);
+        else if (act === "hop-down") undHopMove(el.getAttribute("data-key"), Number(el.getAttribute("data-i")), 1);
         else if (act === "und-auto-apply") undAutoApply();
         else if (act === "und-tun-edit") {
           if (!S.und || !S.und.doc) return;
@@ -4994,6 +5309,11 @@
           if (!et) return;
           S.und.editTun = et.id;
           S.und.editPathMode = undTunnelPathMode(et);
+          // 编辑器里那条链从隧道当前的路径抄一份出来：直接编辑视图里的数组会把
+          // 落库数据和草稿混在一起，取消时就没法还原了。
+          S.und.editHops = (et.path && et.path.hops ? et.path.hops : []).map(function (x) {
+            return { node: x.node_id, addr: x.addr || "" };
+          });
           blurContent();
           render();
         }
@@ -5001,18 +5321,25 @@
           if (!S.und) return;
           S.und.editTun = null;
           S.und.editPathMode = null;
+          S.und.editHops = null;
           render();
         }
         else if (act === "und-tun-del") undDeleteTunnel(el.getAttribute("data-id"));
         else if (act === "und-path-edit") {
           if (!S.und) return;
           S.und.editPath = el.getAttribute("data-id");
+          var ep = null;
+          (S.und.doc.paths || []).forEach(function (x) { if (x.id === S.und.editPath) ep = x; });
+          S.und.pEditHops = (ep && ep.hops ? ep.hops : []).map(function (x) {
+            return { node: x.node_id, addr: x.addr || "" };
+          });
           blurContent();
           render();
         }
         else if (act === "und-path-cancel") {
           if (!S.und) return;
           S.und.editPath = null;
+          S.und.pEditHops = [];
           render();
         }
         else if (act === "und-path-del") undDeletePath(el.getAttribute("data-id"));

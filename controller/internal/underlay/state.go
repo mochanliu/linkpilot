@@ -1,11 +1,15 @@
 package underlay
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
+
+	"sdwan/controller/internal/wire"
 )
 
 var (
@@ -35,16 +39,68 @@ type Endpoint struct {
 	Overlay string `json:"overlay"`
 }
 
-// TunnelPath names the relay hop of a tunnel. Empty (nil on the tunnel) means
+// MaxTunnelColor is the highest color a tunnel may carry. See Tunnel.Color: the
+// eight segments 颜色*1000+10000..+255 are the ones that were checked against the
+// table numbers already in use.
+const MaxTunnelColor uint8 = 7
+
+// MaxRelayHops is the deepest relay chain a path may carry.
+//
+// The dataplane can carry more: a VPP path message holds wire.MaxSRSegments (8)
+// segments and one of them must be the tunnel destination, so 7 relays is the
+// physical ceiling. 3 is the number we accept because it is the depth that has
+// actually been made to work on a real box; a longer chain would be an untested
+// claim about the data plane, and a path that is wrong only under load is the
+// worst kind of wrong. Asserted against the dataplane limit in TestRelayDepthFitsSegments.
+const MaxRelayHops = 3
+
+// PathHop is one relay device on a path. Hops are ordered the way a person reads
+// a route -- hops[0] is the FIRST box the packet touches -- because that is the
+// order the console shows and the order the operator means. The dataplane wants
+// the reverse (segment 0 is the destination); the agent flips it, see
+// internal/agent/dataplane.go's segment construction.
+//
+// Addr is an explicit outer address for this hop. Empty means "use what the
+// reflector observed", exactly like Endpoint.Addr.
+type PathHop struct {
+	NodeID uint16 `json:"node_id"`
+	Addr   string `json:"addr,omitempty"`
+}
+
+// TunnelPath names the relay chain of a tunnel. Empty (nil on the tunnel) means
 // the tunnel is direct, which is the zero-hop SR path.
 //
 // Two forms: TemplateID points at a reusable PathTemplate (editing the template
-// changes every tunnel that uses it), or NodeID/Addr is set inline. Exactly one
-// form is allowed; see resolve.
+// changes every tunnel that uses it), or Hops is set inline. Exactly one form is
+// allowed; see resolve.
 type TunnelPath struct {
-	TemplateID string `json:"template_id,omitempty"`
-	NodeID     uint16 `json:"node_id,omitempty"`
-	Addr       string `json:"addr,omitempty"`
+	TemplateID string    `json:"template_id,omitempty"`
+	Hops       []PathHop `json:"hops,omitempty"`
+}
+
+// UnmarshalJSON accepts the one-hop record shape (top-level node_id/addr) that
+// every state file written before multi-hop carries, and normalizes it into a
+// one-element Hops list. Nothing writes that shape any more; a record that
+// carries both is refused rather than guessed at, because "which hop did the
+// operator mean" has no safe answer.
+func (p *TunnelPath) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		TemplateID string    `json:"template_id,omitempty"`
+		Hops       []PathHop `json:"hops,omitempty"`
+		NodeID     uint16    `json:"node_id,omitempty"`
+		Addr       string    `json:"addr,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	p.TemplateID, p.Hops = raw.TemplateID, raw.Hops
+	if raw.NodeID != 0 {
+		if len(p.Hops) > 0 {
+			return fmt.Errorf("路径同时写了 hops 和单跳字段，无法判断以哪个为准")
+		}
+		p.Hops = []PathHop{{NodeID: raw.NodeID, Addr: raw.Addr}}
+	}
+	return nil
 }
 
 // Roles are display labels only. A hub is a hub for the batch that created this
@@ -69,6 +125,17 @@ type Tunnel struct {
 	B    Endpoint    `json:"b"`
 	Path *TunnelPath `json:"path,omitempty"`
 
+	// Color is the tunnel's SD-WAN color. It is the only thing the data plane
+	// learns from this field: VPP's preference for the FIB paths that go through
+	// this tunnel is PrefBase+Color, so color 0 wins while it is alive and the
+	// next-lowest live color takes over on its own (docs/overlay-design-draft.md §4).
+	//
+	// 0..7, never more: the color is also the high digit of the VRF table number
+	// (颜色*1000+10000+主表号), and only those eight segments were checked against
+	// the tables in use. The u8 arithmetic itself tolerates 25, which is not a
+	// reason to hand out colors whose tables nobody has verified.
+	Color uint8 `json:"color,omitempty"`
+
 	// MTU is derived, never configured by the user: the smaller of the underlay
 	// MTUs the devices reported (interface inventory), minus the overhead of the
 	// dataplane's WORST-CASE segment list -- not of this path's hop count, because
@@ -84,14 +151,38 @@ type Tunnel struct {
 	UpdatedAt int64  `json:"updated_at_unix"`
 }
 
-// PathTemplate is a reusable relay hop: several tunnels can share one template,
-// which is the point -- editing the template once moves all of them.
+// PathTemplate is a reusable relay chain: several tunnels can share one template,
+// which is the point -- editing the template once moves all of them. The hops are
+// ordered exactly like TunnelPath's.
 type PathTemplate struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	NodeID    uint16 `json:"node_id"`
-	Addr      string `json:"addr,omitempty"`
-	CreatedAt int64  `json:"created_at_unix"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Hops      []PathHop `json:"hops"`
+	CreatedAt int64     `json:"created_at_unix"`
+}
+
+// UnmarshalJSON is the same migration as TunnelPath's: an old template stored one
+// device at the top level.
+func (t *PathTemplate) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID        string    `json:"id"`
+		Name      string    `json:"name"`
+		Hops      []PathHop `json:"hops"`
+		NodeID    uint16    `json:"node_id"`
+		Addr      string    `json:"addr,omitempty"`
+		CreatedAt int64     `json:"created_at_unix"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	t.ID, t.Name, t.Hops, t.CreatedAt = raw.ID, raw.Name, raw.Hops, raw.CreatedAt
+	if raw.NodeID != 0 {
+		if len(t.Hops) > 0 {
+			return fmt.Errorf("路径模板 %s 同时写了 hops 和单跳字段，无法判断以哪个为准", raw.ID)
+		}
+		t.Hops = []PathHop{{NodeID: raw.NodeID, Addr: raw.Addr}}
+	}
+	return nil
 }
 
 // State is one tenant's whole underlay configuration. It is persisted as part
@@ -168,12 +259,14 @@ func (s *State) Clone() *State {
 	}
 	for k, v := range s.Paths {
 		p := *v
+		p.Hops = cloneHops(v.Hops)
 		c.Paths[k] = &p
 	}
 	for k, v := range s.Tunnels {
 		t := *v
 		if v.Path != nil {
 			p := *v.Path
+			p.Hops = cloneHops(v.Path.Hops)
 			t.Path = &p
 		}
 		c.Tunnels[k] = &t
@@ -484,10 +577,10 @@ func (s *State) SetSettings(next Settings) error {
 
 // ------------------------------------------------------------------ paths
 
-// CreatePath adds a reusable relay hop.
-func (s *State) CreatePath(name string, node uint16, addr string, now int64) (PathTemplate, error) {
+// CreatePath adds a reusable relay chain.
+func (s *State) CreatePath(name string, hops []PathHop, now int64) (PathTemplate, error) {
 	c := s.Clone()
-	p, err := c.createPath(name, node, addr, now)
+	p, err := c.createPath(name, hops, now)
 	if err != nil {
 		return PathTemplate{}, err
 	}
@@ -496,38 +589,52 @@ func (s *State) CreatePath(name string, node uint16, addr string, now int64) (Pa
 	return p, nil
 }
 
-func (s *State) createPath(name string, node uint16, addr string, now int64) (PathTemplate, error) {
-	if node == 0 {
-		return PathTemplate{}, fmt.Errorf("路径需要指定一个中转设备")
+func (s *State) createPath(name string, hops []PathHop, now int64) (PathTemplate, error) {
+	if err := validateHops(hops); err != nil {
+		return PathTemplate{}, err
 	}
 	name = trimName(name)
 	if name == "" {
-		name = fmt.Sprintf("经设备 %d 中转", node)
+		name = defaultPathName(hops)
 	}
-	p := PathTemplate{ID: s.nextID("p"), Name: name, NodeID: node, Addr: addr, CreatedAt: now}
+	p := PathTemplate{ID: s.nextID("p"), Name: name, Hops: cloneHops(hops), CreatedAt: now}
 	s.Paths[p.ID] = &p
 	return p, nil
+}
+
+// defaultPathName names a template the operator did not bother to name. The hops
+// are listed in traversal order so the name reads like the route.
+func defaultPathName(hops []PathHop) string {
+	names := make([]string, 0, len(hops))
+	for _, h := range hops {
+		names = append(names, strconv.FormatUint(uint64(h.NodeID), 10))
+	}
+	return "经设备 " + strings.Join(names, "→") + " 中转"
 }
 
 // UpdatePath moves every tunnel that references the template at once -- that is
 // what sharing a template means. The caller is expected to show the fan-out
 // (PathUsers) before confirming.
-func (s *State) UpdatePath(id, name string, node uint16, addr string) error {
+func (s *State) UpdatePath(id, name string, hops []PathHop) error {
 	c := s.Clone()
 	p, ok := c.Paths[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if node == 0 {
-		return fmt.Errorf("路径需要指定一个中转设备")
+	if err := validateHops(hops); err != nil {
+		return err
 	}
 	for _, t := range c.Tunnels {
-		if t.Path != nil && t.Path.TemplateID == id && (node == t.A.NodeID || node == t.B.NodeID) {
-			return fmt.Errorf("隧道 %s 的一端就是设备 %d，不能把它同时当作中转", t.ID, node)
+		if t.Path == nil || t.Path.TemplateID != id {
+			continue
+		}
+		for _, h := range hops {
+			if h.NodeID == t.A.NodeID || h.NodeID == t.B.NodeID {
+				return fmt.Errorf("隧道 %s 的一端就是设备 %d，不能把它同时当作中转", t.ID, h.NodeID)
+			}
 		}
 	}
-	p.NodeID = node
-	p.Addr = addr
+	p.Hops = cloneHops(hops)
 	if n := trimName(name); n != "" {
 		p.Name = n
 	}
@@ -562,27 +669,68 @@ func (s *State) PathUsers(id string) []string {
 	return out
 }
 
-// resolve turns a tunnel's path into (relay node, relay address). The port is
-// not stored here: it belongs to the device and is looked up at delivery time,
-// so a device that had to rebind does not leave stale ports on every tunnel.
-func (s *State) resolve(p *TunnelPath) (node uint16, addr string, err error) {
+// resolve turns a tunnel's path into the ordered relay chain it must traverse.
+// The ports are not returned: they belong to the devices and are looked up at
+// delivery time, so a device that had to rebind does not leave stale ports on
+// every tunnel.
+//
+// Every caller gets the whole list or an error -- a resolve that returned only
+// the first hop would silently shorten a 3-hop path on every tunnel that uses it.
+func (s *State) resolve(p *TunnelPath) ([]PathHop, error) {
 	if p == nil {
-		return 0, "", nil
+		return nil, nil
 	}
 	if p.TemplateID != "" {
-		if p.NodeID != 0 || p.Addr != "" {
-			return 0, "", fmt.Errorf("路径只能二选一：模板或内联中转设备")
+		if len(p.Hops) > 0 {
+			return nil, fmt.Errorf("路径只能二选一：模板或内联中转设备")
 		}
 		tpl, ok := s.Paths[p.TemplateID]
 		if !ok {
-			return 0, "", fmt.Errorf("路径模板 %s 不存在", p.TemplateID)
+			return nil, fmt.Errorf("路径模板 %s 不存在", p.TemplateID)
 		}
-		return tpl.NodeID, tpl.Addr, nil
+		if err := validateHops(tpl.Hops); err != nil {
+			return nil, fmt.Errorf("路径模板 %s: %w", p.TemplateID, err)
+		}
+		return cloneHops(tpl.Hops), nil
 	}
-	if p.NodeID == 0 {
-		return 0, "", fmt.Errorf("路径需要指定一个中转设备")
+	if err := validateHops(p.Hops); err != nil {
+		return nil, err
 	}
-	return p.NodeID, p.Addr, nil
+	return cloneHops(p.Hops), nil
+}
+
+// validateHops checks a hop list on its own terms: non-empty, within the depth
+// the data plane has been made to carry, no device twice, no placeholder. Whether
+// each hop exists, is online and is not one of the tunnel's own ends is a question
+// about the devices, and lives in checkHops.
+func validateHops(hops []PathHop) error {
+	if len(hops) == 0 {
+		return fmt.Errorf("路径需要至少一个中转设备")
+	}
+	if len(hops) > MaxRelayHops {
+		return fmt.Errorf("中转最多 %d 跳，这条路径有 %d 跳：一段路径最多 %d 个段，其中一段必须留给隧道终点",
+			MaxRelayHops, len(hops), wire.MaxSRSegments)
+	}
+	seen := make(map[uint16]bool, len(hops))
+	for i, h := range hops {
+		if h.NodeID == 0 {
+			return fmt.Errorf("路径第 %d 跳没有指定中转设备", i+1)
+		}
+		if seen[h.NodeID] {
+			return fmt.Errorf("设备 %d 在路径里出现了两次：中转链不能绕回同一台设备", h.NodeID)
+		}
+		seen[h.NodeID] = true
+	}
+	return nil
+}
+
+func cloneHops(hops []PathHop) []PathHop {
+	if len(hops) == 0 {
+		return nil
+	}
+	out := make([]PathHop, len(hops))
+	copy(out, hops)
+	return out
 }
 
 func trimName(s string) string { return strings.Join(strings.Fields(s), " ") }

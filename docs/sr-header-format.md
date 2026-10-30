@@ -44,7 +44,7 @@ SR（Source Routing）路径头插入在 UDP Header 和 WireGuard 加密数据�
 | 16 | 4B | ipv4_addr | 段节点 IPv4 地址（网络序） |
 | 20 | 2B | udp_port | 段节点 UDP 端口（网络序） |
 
-每段 6 字节，共 seg_count 段。
+每段 6 字节，共 seg_count 段。`seg_count` 在线格式上是 1 字节，但收发两侧都把段数卡在 `wire.MaxSRSegments` = 8：`segments[0]` 必须留给隧道终点，所以物理上限是 7 跳中转。控制台的策略上限更低——3 跳（`underlay.MaxRelayHops`，取"实测到的深度"那一档，理由见 `underlay-design.md` §2）。
 
 ### hmac 字段（8 字节）
 

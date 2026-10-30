@@ -161,50 +161,70 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	}
 
 	if t.Path != nil {
-		relayEp, relayNode, err := relayEndpoint(st, t, views)
+		relays, err := relayHops(st, t, views)
 		if err != nil {
 			return wire.TunnelSpec{}, err
 		}
-		spec.RelayEndpoint, spec.RelayNodeID = relayEp, relayNode
+		spec.Relays = relays
 	}
 	return spec, nil
 }
 
-// relayEndpoint names the relay hop as the box must dial it: the hop's outer
-// address plus its transit port. A relay that cannot be named is an error -- the
-// alternative, quietly building a direct tunnel, would move the traffic onto a
-// path nobody selected.
-func relayEndpoint(st *underlay.State, t *underlay.Tunnel, views map[uint16]underlay.NodeView) (string, uint16, error) {
+// relayHops names the relay chain as the box must dial it: every hop's outer
+// address plus its transit port, in traversal order. A hop that cannot be named
+// is an error -- the alternative, dropping it or quietly building a direct tunnel,
+// would move the traffic onto a path nobody selected.
+//
+// Per hop, not per tunnel: an address fallback (explicit value vs the reflector's
+// observation) and a transit-port lookup are each a hop's own facts, and one hop
+// without them must not borrow another hop's.
+func relayHops(st *underlay.State, t *underlay.Tunnel, views map[uint16]underlay.NodeView) ([]wire.RelayHop, error) {
 	rp, has, err := st.PathFor(t.Path)
 	if err != nil {
-		return "", 0, fmt.Errorf("中转路径无法解析：%v", err)
+		return nil, fmt.Errorf("中转路径无法解析：%v", err)
 	}
-	if !has || rp.NodeID == 0 {
-		return "", 0, fmt.Errorf("中转路径没有指定设备")
+	if !has {
+		return nil, fmt.Errorf("隧道 %s 有路径却没有可解析的中转跳", t.ID)
 	}
-	addr := strings.TrimSpace(rp.Addr)
+	out := make([]wire.RelayHop, 0, len(rp.Hops))
+	for i, h := range rp.Hops {
+		ep, err := relayHopEndpoint(st, views, i, h.NodeID, h.Addr)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, wire.RelayHop{NodeID: h.NodeID, Endpoint: ep})
+	}
+	return out, nil
+}
+
+func relayHopEndpoint(st *underlay.State, views map[uint16]underlay.NodeView, idx int, node uint16, explicit string) (string, error) {
+	where := fmt.Sprintf("第 %d 跳", idx+1)
+	if node == 0 {
+		return "", fmt.Errorf("%s的中转设备没有指定", where)
+	}
+	addr := strings.TrimSpace(explicit)
 	if addr == "" {
-		v := views[rp.NodeID]
+		v := views[node]
 		switch {
 		case v.Observed == "":
-			return "", 0, fmt.Errorf("中转设备 %d 还没有外层地址（没有观测到，也没有手填）", rp.NodeID)
+			return "", fmt.Errorf("%s的中转设备 %d 还没有外层地址（没有观测到，也没有手填）", where, node)
 		case v.ObservedStale:
-			return "", 0, fmt.Errorf("中转设备 %d 的观测地址 %s 已过期", rp.NodeID, v.Observed)
+			return "", fmt.Errorf("%s的中转设备 %d 的观测地址 %s 已过期", where, node, v.Observed)
 		}
 		addr = v.Observed
 	}
-	port := st.TransitPorts[rp.NodeID]
+	port := st.TransitPorts[node]
 	if port == 0 {
-		return "", 0, fmt.Errorf("中转设备 %d 还没有分配中转端口", rp.NodeID)
+		return "", fmt.Errorf("%s的中转设备 %d 还没有分配中转端口", where, node)
 	}
 	if _, err := netip.ParseAddrPort(addr); err == nil {
-		return addr, rp.NodeID, nil
+		return addr, nil
 	}
 	a, err := netip.ParseAddr(addr)
 	if err != nil {
-		return "", 0, fmt.Errorf("中转设备 %d 的地址 %q 不合法", rp.NodeID, addr)
+		return "", fmt.Errorf("%s的中转设备 %d 的地址 %q 不合法", where, node, addr)
 	}
-	return net.JoinHostPort(a.String(), strconv.Itoa(int(port))), rp.NodeID, nil
+	return net.JoinHostPort(a.String(), strconv.Itoa(int(port))), nil
 }
 
 // dialEndpoint turns a stored endpoint address into "ip:port".

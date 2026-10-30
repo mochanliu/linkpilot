@@ -44,7 +44,7 @@ func TestIPRouteAddDelEncoding(t *testing.T) {
 	defer cancel()
 	prefix := netip.MustParsePrefix("10.20.0.1/32")
 	nh := netip.MustParseAddr("192.168.99.2")
-	if err := c.IPRouteAddDel(ctx, 100, prefix, []FIBPath{{SWIfIndex: 2, NextHop: nh, Labels: []uint32{777}}}, true); err != nil {
+	if err := c.IPRouteAddDel(ctx, 100, prefix, []FIBPath{{SWIfIndex: 2, NextHop: nh, Labels: []uint32{777}, Weight: 3, Preference: 235}}, true); err != nil {
 		t.Fatal(err)
 	}
 	r := f.lastRequest(t)
@@ -80,8 +80,11 @@ func TestIPRouteAddDelEncoding(t *testing.T) {
 	if got := binary.BigEndian.Uint32(p[4:8]); got != 0 {
 		t.Errorf("path table_id = %d，期望 0", got)
 	}
-	if p[12] != 1 || p[13] != 0 {
-		t.Errorf("weight/preference = %d/%d，期望 1/0", p[12], p[13])
+	if p[12] != 3 {
+		t.Errorf("weight = %d，期望 3", p[12])
+	}
+	if p[13] != 235 {
+		t.Errorf("preference = %d，期望 235", p[13])
 	}
 	// type/flags/proto 都是普通枚举、各 4 字节（与 af 不同）
 	if got := binary.BigEndian.Uint32(p[14:18]); got != 0 {
@@ -189,8 +192,14 @@ func encodeIPRouteRaw(table uint32, addr [4]byte, plen byte, paths [][]byte) []b
 }
 
 func encodeFIBPathRaw(swIf uint32, nh [4]byte, labels ...uint32) []byte {
+	return encodeFIBPathRawWP(swIf, 1, 0, nh, labels...)
+}
+
+func encodeFIBPathRawWP(swIf uint32, weight, pref uint8, nh [4]byte, labels ...uint32) []byte {
 	b := make([]byte, fibPathLen)
 	binary.BigEndian.PutUint32(b[0:4], swIf)
+	b[12] = weight
+	b[13] = pref
 	copy(b[26:30], nh[:])
 	b[54] = byte(len(labels))
 	for i, l := range labels {
@@ -229,6 +238,34 @@ func TestFIBRoutesParsing(t *testing.T) {
 	}
 }
 
+func TestFIBRoutesWeightPref(t *testing.T) {
+	f := newFake(t)
+	f.ipRouteRaw = [][]byte{
+		encodeIPRouteRaw(10, [4]byte{10, 0, 0, 0}, 24,
+			[][]byte{
+				encodeFIBPathRawWP(5, 1, 230, [4]byte{192, 168, 1, 1}, 1000),
+				encodeFIBPathRawWP(6, 1, 237, [4]byte{192, 168, 2, 1}, 1000),
+			}),
+	}
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	routes, err := c.FIBRoutes(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || len(routes[0].Paths) != 2 {
+		t.Fatalf("got %d routes with %d paths", len(routes), len(routes[0].Paths))
+	}
+	p0, p1 := routes[0].Paths[0], routes[0].Paths[1]
+	if p0.Weight != 1 || p0.Preference != 230 {
+		t.Errorf("path[0] weight/pref = %d/%d, want 1/230", p0.Weight, p0.Preference)
+	}
+	if p1.Weight != 1 || p1.Preference != 237 {
+		t.Errorf("path[1] weight/pref = %d/%d, want 1/237", p1.Weight, p1.Preference)
+	}
+}
+
 func TestMPLSRoutesParsing(t *testing.T) {
 	f := newFake(t)
 	path := encodeFIBPathRaw(^uint32(0), [4]byte{})
@@ -256,6 +293,26 @@ func TestMPLSRoutesParsing(t *testing.T) {
 	}
 	if len(got.Paths) != 1 || got.Paths[0].SWIfIndex != ^uint32(0) || got.Paths[0].TableID != 100 {
 		t.Errorf("lookup 路径读错: %+v", got.Paths)
+	}
+}
+
+func TestDefaultWeightPreservesOne(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	ctx, cancel := shortCtx()
+	defer cancel()
+	nh := netip.MustParseAddr("10.0.0.1")
+	if err := c.IPRouteAddDel(ctx, 0, netip.MustParsePrefix("10.99.0.0/24"),
+		[]FIBPath{{SWIfIndex: 3, NextHop: nh}}, true); err != nil {
+		t.Fatal(err)
+	}
+	r := f.lastRequest(t)
+	p := r.body[ipRouteFixedLen:]
+	if p[12] != 1 {
+		t.Errorf("weight = %d, want 1 (zero-value fallback)", p[12])
+	}
+	if p[13] != 0 {
+		t.Errorf("preference = %d, want 0", p[13])
 	}
 }
 

@@ -69,7 +69,9 @@ type CreateRequest struct {
 	Path    *TunnelPath // nil = direct
 	BatchID string
 	Roles   Roles
-	Now     int64
+	// Color is the tunnel's SD-WAN color; see Tunnel.Color.
+	Color uint8
+	Now   int64
 }
 
 // Create validates, allocates and stores one tunnel. It runs on a clone, so a
@@ -91,6 +93,9 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	}
 	if req.A.NodeID == req.B.NodeID {
 		return Tunnel{}, fmt.Errorf("隧道两端不能是同一台设备")
+	}
+	if err := checkColor(req.Color); err != nil {
+		return Tunnel{}, err
 	}
 	if id, ok := s.pairTunnel(req.A.NodeID, req.B.NodeID); ok {
 		return Tunnel{}, fmt.Errorf("%w %s：设备 %d 和 %d 之间只能有一条隧道——每台设备只有一把 WireGuard 静态密钥，VPP 的 peer 表按公钥跨接口去重，第二条会被数据面以 -116 拒掉；先删掉现有隧道再建",
@@ -124,24 +129,12 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 		return Tunnel{}, err
 	}
 
-	relayNode, _, err := s.resolve(req.Path)
+	hops, err := s.resolve(req.Path)
 	if err != nil {
 		return Tunnel{}, err
 	}
-	if req.Path != nil {
-		if relayNode == req.A.NodeID || relayNode == req.B.NodeID {
-			return Tunnel{}, fmt.Errorf("中转设备 %d 同时是隧道的一端", relayNode)
-		}
-		rv, err := viewOf(views, "中转设备", relayNode)
-		if err != nil {
-			return Tunnel{}, err
-		}
-		if rv.Stale {
-			return Tunnel{}, fmt.Errorf("中转设备 %d 当前离线", relayNode)
-		}
-		if _, err := s.ensureTransitPort(relayNode); err != nil {
-			return Tunnel{}, err
-		}
+	if err := s.checkHops(hops, req.A.NodeID, req.B.NodeID, views); err != nil {
+		return Tunnel{}, err
 	}
 
 	// Transit first: allocPort must know it so the two never collide.
@@ -175,6 +168,7 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 		A:         Endpoint{NodeID: req.A.NodeID, Iface: ifaceA, Addr: addrA, Port: portA, Overlay: ovA},
 		B:         Endpoint{NodeID: req.B.NodeID, Iface: ifaceB, Addr: addrB, Port: portB, Overlay: ovB},
 		Path:      clonePath(req.Path),
+		Color:     req.Color,
 		MTU:       mtu,
 		Roles:     req.Roles,
 		BatchID:   req.BatchID,
@@ -195,7 +189,10 @@ type UpdateRequest struct {
 	PortA, PortB   uint16
 	Path           *TunnelPath
 	ClearPath      bool
-	Now            int64
+	// Color is a pointer because 0 is a real color: "keep the current color" and
+	// "recolor this tunnel to 0" cannot both be written as a zero value.
+	Color *uint8
+	Now   int64
 }
 
 func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) (Tunnel, error) {
@@ -215,6 +212,12 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 	// nothing has to be put back.
 	delete(c.Tunnels, id)
 
+	if req.Color != nil {
+		if err := checkColor(*req.Color); err != nil {
+			return Tunnel{}, err
+		}
+		t.Color = *req.Color
+	}
 	if req.IfaceA != "" {
 		iface, err := endpointIface("本端", views[t.A.NodeID], req.IfaceA)
 		if err != nil {
@@ -263,17 +266,12 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 	} else if req.Path != nil {
 		t.Path = clonePath(req.Path)
 	}
-	relay, _, err := c.resolve(t.Path)
+	hops, err := c.resolve(t.Path)
 	if err != nil {
 		return Tunnel{}, err
 	}
-	if t.Path != nil {
-		if relay == t.A.NodeID || relay == t.B.NodeID {
-			return Tunnel{}, fmt.Errorf("中转设备 %d 同时是隧道的一端", relay)
-		}
-		if _, err := c.ensureTransitPort(relay); err != nil {
-			return Tunnel{}, err
-		}
+	if err := c.checkHops(hops, t.A.NodeID, t.B.NodeID, views); err != nil {
+		return Tunnel{}, err
 	}
 	mtu, err := tunnelMTU(views[t.A.NodeID], views[t.B.NodeID], t.A.Iface, t.B.Iface)
 	if err != nil {
@@ -417,10 +415,49 @@ func tunnelMTU(a, b NodeView, ifaceA, ifaceB string) (uint16, error) {
 	return budget, nil
 }
 
+// checkHops validates a resolved relay chain against the tunnel it belongs to and
+// against the devices as they are right now. A hop may not be one of the two ends
+// (the box would be asked to relay to itself); each hop must be enrolled and
+// online; and each hop must already hold a transit port, which is why the port
+// allocation happens here and not as a surprise at delivery time.
+//
+// It is the same rule for create and update: a tunnel edited onto an offline
+// relay is no more installable than one created onto it, and saving it would only
+// move the failure to the device.
+//
+// It mutates the receiver (ensureTransitPort), so callers must pass a clone.
+func (s *State) checkHops(hops []PathHop, a, b uint16, views map[uint16]NodeView) error {
+	for i, h := range hops {
+		if h.NodeID == a || h.NodeID == b {
+			return fmt.Errorf("路径第 %d 跳的中转设备 %d 同时是隧道的一端", i+1, h.NodeID)
+		}
+		v, ok := views[h.NodeID]
+		if !ok {
+			return fmt.Errorf("路径第 %d 跳的中转设备 %d 不存在或未入网", i+1, h.NodeID)
+		}
+		if v.Stale {
+			return fmt.Errorf("路径第 %d 跳的中转设备 %d 当前离线", i+1, h.NodeID)
+		}
+		if _, err := s.ensureTransitPort(h.NodeID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func clonePath(p *TunnelPath) *TunnelPath {
 	if p == nil {
 		return nil
 	}
-	c := *p
-	return &c
+	return &TunnelPath{TemplateID: p.TemplateID, Hops: cloneHops(p.Hops)}
+}
+
+// checkColor refuses a color whose VPP preference would either wrap (PrefBase is
+// 230 and preference is a u8 with no saturation) or land on a table-number segment
+// nobody verified. 0..7 is the range the design committed to.
+func checkColor(c uint8) error {
+	if c > MaxTunnelColor {
+		return fmt.Errorf("颜色 %d 超出 0..%d", c, MaxTunnelColor)
+	}
+	return nil
 }
