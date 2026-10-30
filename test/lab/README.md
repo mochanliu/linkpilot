@@ -99,6 +99,12 @@ lab-custN 10.99.0.2N        BGP router-id
    1250，但全是 `dpo-drop`——它只用于再分发，不参与转发。
 7. 客户侧终端只需要 `default via 10.68.N.2`（客户路由器）。
 
+`sr-route` 还有一道运行时入口 `PUT /local-prefixes`（上面第 3 步就是它），O5 又补了两道：
+`PUT /tunnels` 与 `PUT /vrfs` —— 整表替换，改的是**内存里**那两张表，本机立刻按新表重算，
+不重启进程也不问 RR。**本 lab 不用这两道**（这里的隧道与 VPN 表由 `bringup.sh` 一次性配好），
+判据在 srwg-node1/2 上跑 `test/scripts/test-refresh.sh`（51 条断言，五个进程一次都没重启）。
+要知道哪条前缀被本机扣下了，读同一份 `/status` 里的 `pending` 与 `local_skips`。
+
 防环：
 
 - 我们自己导出的 table 1250 路由回到 BGP 时 tag 是 0，sr-frr 只收 tag 1001，

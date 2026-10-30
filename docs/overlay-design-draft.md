@@ -663,8 +663,8 @@ FRR 那份撤销时 API 那份自动顶上（§2.7）。设备要**记一条 war
 与回归基线 `test-fib.sh` 36/36 |
 | O4 | 逃生开关 | 打开：颜色 0 全 down 后 `show ip fib` 主表切到最小存活颜色、恢复后自动回 0；关闭：颜色 0 全 down 后主表该前缀**不存在**（丢包，不回落到昂贵颜色）。两条都要计时并写进文档，作为 §8 口径的证据。**2026-10-30 落地：`test-escape.sh` 32/32**（VRF 60，两端各两条多跳 BFD + 两个 tap 终端打 0.1s 流）。两条判据都成立且**都拿到数**：开关关 342–1165 ms 后主表没这条前缀、故障期间 120 发只有 10 收（黑洞，无回落）；开关开前缀一次没消失、724–1783 ms 收成最小存活颜色、终端断 900 ms，恢复后 891–2188 ms 回到两条并用 `show interface` 的 `mpls` 计数证明流量真回了颜色 0。全部数与读法在 §5.3，§8 用的是同一套口径。附带量到的：§11 拍板 #2 那个"改色窗口"实测 **0 ms**（120 发 120 收） |
 | O5-a | `route` 包：adj-RIBs-in + 推导视图 + `SetTunnels` + `SetVRFs`（**不动协议字段，版本仍 3**，Route Refresh 已拍不做） | 单测（2026-10-30 已落，`go vet` + `-race` 全绿）：后补隧道 ⇒ 此前 `no_path` 的前缀装进表、去掉隧道 ⇒ 前缀离开表但仍在 `pending`；改 import RT ⇒ held 路由双向搬；**负向：VRF 被删 ⇒ 它上面的本地前缀必须显式撤回**（RR 那边要看到 withdraw，`LocalSkips()` 报 `vrf_unconfigured`）；被拒的变更不动表；会话断开期间的表变更要在重连时补发；空隧道表必须走 `[]` 而不是 `null`。**顺手修掉一个既有 bug**：`&nil` 序列化成 `"tunnels":null`，RR 会以"tunnels message without a table"关掉会话 ⇒ 任何"没配隧道"的设备原本一上线就掉会话 |
-| O5-b | `sr-route` 开 `PUT /tunnels` + `PUT /vrfs`（照既有 `PUT /local-prefixes` 那道缝），`/status` 加待决清单（`Pending()` + `LocalSkips()`，带上总数） | curl 能改隧道表并读回；待决清单在 `/status` 可见且有条数上限 |
-| O5-c | `test/scripts/test-refresh.sh`：全程**不重启任何进程** | srwg-node1/2：无隧道 ⇒ `pending/no_path`；`PUT /tunnels` ⇒ 下一次 sr-fib 轮询装表 ⇒ tap 终端 ping 通；撤隧道 ⇒ 离表且 FIB 撤；`PUT /vrfs` 改 import ⇒ 此前 RT 不匹配的前缀回来 |
+| O5-b | `sr-route` 开 `PUT /tunnels` + `PUT /vrfs`（照既有 `PUT /local-prefixes` 那道缝），`/status` 加待决清单（`Pending()` + `LocalSkips()`，带上总数） | curl 能改隧道表并读回；待决清单在 `/status` 可见且有条数上限。**2026-10-30 落地**：`cmd/sr-route/main_test.go` 6 个用例跑**真 `route.Client` + httptest**（不打桩 RR，因为要看的是本机表被改之后发生了什么），覆盖读回、三类非法 PUT 拒了不动表、删 VPN ⇒ local 变 `local_skips/vrf_unconfigured` ⇒ 加回又宣告、清单能原样 PUT 回去、超 200 条时 `*_total` + `*_truncated` 如实标 |
+| O5-c | `test/scripts/test-refresh.sh`：全程**不重启任何进程** | 判据原文写的是"无隧道 ⇒ `pending/no_path`"，实测发现**这条在 lab 里断不出稳定态**：RR 只按双向邻接反射，本机没隧道时 RR 一条都不发，`no_path` 只在"隧道刚被撤走、RR 的撤回还没到"那一瞬存在（稳定形态由单测 `TestClient...NoPath` 那组钉住）。脚本因此把 A 段判据换成"空隧道表能开会话"（顺手做 O5-a 那个 `null` 的实测回归），B 段改判 `rt_mismatch` —— 它由本机 VPN 表决定，所以是稳定的。其余判据不变：`PUT /vrfs` 改 import ⇒ 此前 RT 不匹配的前缀回来；下一次 sr-fib 轮询装表 ⇒ tap 终端 ping 通；撤隧道 ⇒ 离表且 FIB 撤。**2026-10-30 落地：51/51 全绿**（VPN 50/51/53，表 50、标签 1050/1051/1053、颜色表 10050）。七段：A 空隧道表能开会话（就是 O5-a 那个 `null` 的实测回归）、B 加隧道 ⇒ 收到但留在 `pending/rt_mismatch`、C 一次 `PUT /vrfs` 让**同一条**前缀进表而 `received/imported/dropped_rt_mismatch` 一个数没动、D 两端 sr-fib 装表 + 两个 tap 跨 VPN ping 通、E 撤隧道 ⇒ 离表/FIB 撤/ping 断再加回来、F 负向删 VPN ⇒ 本地前缀**显式撤回**（对端 `withdrawn` +1，不是等老化）且本机 `local_skips` 看得见、G 五个进程的 pid + `/proc/<pid>/stat` 启动时刻与开机时逐个相同。**两处实测把设计里的空话变成了判据**：① 撤隧道时 node1 的 `withdrawn` **不该**涨（本机先把它从表搬进待决，RR 的撤回到达时它已不在表里），要涨的那个数在对端 —— 脚本按这个方向断言，顺手钉住"事件计数器只记帧做了什么"；② `targets` 是 `[]uint8`，`encoding/json` 当 `[]byte` 处理 ⇒ `/status` 把表 50 印成 base64 `"Mg=="`。单测全绿也看不见这件事，是这支脚本读真端点读出来的，已修成 `route.TableList`（渲染成数字，空表是 `[]` 不是 `null`）并加 `TestRibEntryTargetsMarshalAsNumbers` |
 | O5-d | 开机自启：`usr/local/lib/sr-box/start.sh` 一份清单（vpp → sr-apply boot → frr → sr-agent → sr-route → sr-fib，按身份门控），systemd 单元作薄壳并注明"未在 lab 实测"；容器 `--restart unless-stopped` 只在 srwg-node1/2 验 | 重启盒子后不手敲任何命令，overlay 与路由面自己在；agent 只在首次入网时 `systemctl start sr-route sr-fib`，之后配置变更**永不**重启进程 |
 | O6 | 控制台「配置 > overlay」三块（全局 / 导通 / leak），导通规则可编辑 | 真浏览器：新增规则后 RT 自动写入两行、编辑减设备后残留 RT 被摘掉、被丢路由三态可见；改完 `console.html` 必须 `node --check` |
 | O7 | SD-WAN policy（下一节，按 SLA 引流到颜色表） | 本文不展开，只要求 O1..O4 已经把颜色表建好 |
@@ -730,8 +730,18 @@ O1..O4 是"数据面+本地选路"，O5 是"不重启进程也能收敛"，O6 �
    计数器改成**事件形状**（记"这一帧做了什么"，本机表变动不许改写历史）。**协议没动**：
    Route Refresh 用户拍"先不做"，所以 `ProtocolVersion` 仍是 3，`reflector.go` 一行未改。
    判据、负向单测与顺手修掉的 `null` 隧道表 bug 见 §9 的 O5-a 行。
-8. **下一步 O5-b**（`sr-route` 的 `PUT /tunnels` + `PUT /vrfs` 与 `/status` 待决清单），
-   然后 O5-c 才是"不重启进程补隧道就学到前缀"的 lab 判据，O5-d 收开机自启。
+8. **O5-b 已落地（2026-10-30）**：`cmd/sr-route/main.go` 把状态口换成 `statusMux()`，除既有
+   `PUT /local-prefixes` 外开了 `PUT /tunnels` 与 `PUT /vrfs`（整表替换、校验不过 400 且**不动表**），
+   `/status` 加了 `pending` / `local_skips` 两条清单与各自的 `*_total` / `*_truncated`（上限 200 条）。
+   单测在 `cmd/sr-route/main_test.go`：跑真 `route.Client` + httptest，不打桩 RR。
+9. **O5-c 已落地（2026-10-30）**：`test/scripts/test-refresh.sh` 51/51，全程不重启任何进程，
+   阶段 G 用 pid + `/proc/<pid>/stat` 启动时刻自证。判据细节与它量出来的两件事（`no_path` 在 lab
+   里断不出稳定态、`targets` 被 `encoding/json` 当 `[]byte` 印成 base64）都在 §9 的 O5-c 行。
+10. **下一步 O5-d**：开机自启那份清单（§9 的 O5-d 行）。同时有一件事**要先请用户拍**：
+    `PUT /tunnels` / `PUT /vrfs` 改的是**内存里**那张表，磁盘上的 `node*.json` 不跟着变，
+    所以重启进程就回到文件那份（脚本头注已经写明）。要让它持久，得走控制器发布 →
+    `sr-agent -apply` 那条既有链路，把隧道表/VPN 表也纳入配置包 —— 那不属于 O5 的判据，
+    但属于 O5 落地后立刻会出现的下一个问题。
 
 ---
 

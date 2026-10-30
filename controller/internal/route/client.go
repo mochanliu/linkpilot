@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -111,8 +112,31 @@ type ClientStats struct {
 // 装表那边（internal/fib）拿 map 的键当目标表、拿 Route.VRFID 算标签。
 type RIBEntry struct {
 	Route
-	Targets  []uint8  `json:"targets"`
-	NextHops []string `json:"next_hops"`
+	Targets  TableList `json:"targets"`
+	NextHops []string  `json:"next_hops"`
+}
+
+// TableList is the set of local VRF ids a route was imported into.
+//
+// It needs its own marshaller for one reason only: to encoding/json a []uint8
+// IS a []byte, so table 50 would be published in /status as the base64 string
+// "Mg==". Nothing in Go notices -- the unit tests compared the decoded value --
+// until test-refresh.sh read the real endpoint and found a table number nobody
+// can read. Empty marshals as [] rather than null, same reason as the tunnel
+// table: a list that is absent and a list that is empty must not be the same
+// token in a document people debug by eye.
+type TableList []uint8
+
+func (t TableList) MarshalJSON() ([]byte, error) {
+	buf := make([]byte, 0, len(t)*4+2)
+	buf = append(buf, '[')
+	for i, id := range t {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = strconv.AppendUint(buf, uint64(id), 10)
+	}
+	return append(buf, ']'), nil
 }
 
 // Why a received route is held back instead of installed. These are the two
@@ -1104,8 +1128,8 @@ func (c *Client) applyAnnounce(idx int, routes []Route) error {
 // importTargets 返回本机 import 了这些 RT 的 VRF，升序。
 // 升序不是整理癖：Targets 会进 /status 的 JSON，也是 sr-fib 每轮重算的输入，
 // 顺序不稳定就等于每轮都"看起来变了"。
-func (c *Client) importTargets(rts []string) []uint8 {
-	var out []uint8
+func (c *Client) importTargets(rts []string) TableList {
+	var out TableList
 	for _, id := range c.vrfIDs {
 		lv := c.vrfs[id]
 		for _, rtTag := range rts {

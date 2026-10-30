@@ -3,6 +3,7 @@ package route
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -323,6 +324,36 @@ func TestClientImportsOnlyMatchingRTs(t *testing.T) {
 	// A withdraw removes it from the "bgp" table.
 	peer.send(Envelope{Type: MsgWithdraw, Keys: []RouteKey{good.Key()}})
 	waitFor(t, "route withdrawn", func() bool { return len(c.RIB(5)) == 1 })
+}
+
+// TableList exists for one reason, and it is this test: encoding/json treats a
+// []uint8 as a []byte, so a plain []uint8 target list leaves the process in
+// /status as the base64 string "Mg==" instead of 50. Every Go-side assertion in
+// this file passed while that was happening -- test-refresh.sh read the real
+// endpoint and caught it, so the wire shape is pinned here too.
+func TestRibEntryTargetsMarshalAsNumbers(t *testing.T) {
+	raw, err := json.Marshal(RIBEntry{
+		Route:    Route{DeviceID: 20, VRFID: 9, Prefix: "10.40.0.0/16", RTs: []string{"65000:6"}},
+		Targets:  TableList{5, 50},
+		NextHops: []string{"192.168.99.2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"targets":[5,50]`) {
+		t.Fatalf("targets must be a list of numbers, got %s", raw)
+	}
+	// And an empty list is still a list: a console must not have to decode null
+	// as "empty" the way the tunnel table learned it must not.
+	empty, err := json.Marshal(struct {
+		Targets TableList `json:"targets"`
+	}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(empty) != `{"targets":[]}` {
+		t.Fatalf("empty targets = %s", empty)
+	}
 }
 
 func TestClientResolvesEveryTunnelToOrigin(t *testing.T) {
