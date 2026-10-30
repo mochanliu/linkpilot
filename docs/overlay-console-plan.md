@@ -61,11 +61,37 @@ leak 那块（第三块面板）落的是 sr-frr 的 `import` 段 + FRR 侧的 `
 这一块的字段今天**完全没有对应实现**（sr-frr 只按 tag 全量反向导入，
 `cmd/sr-frr/main.go:54-56`），所以它是 O6 里最贵的一块，建议单独一步、不要和前两块混。
 
-### 1.2 渲染：bundle 第 4 段
+### 1.2 渲染：bundle 第 4 段（O6-a 落地后重写的一节）
 
-`Artifacts` 加一个 `Route string`（内容就是 `sr-route` 那份 `fileConfig` 的 JSON，
-字段名逐字照 `cmd/sr-route/main.go:40-50`）。为什么是 JSON 而不是像 vpp/frr 那样塞文本：
-sr-route 只吃 JSON + HTTP，`boot.sh` 那种 vppctl 行喂不了它。
+原话是"`Route string` 内容就是 `sr-route` 那份 `fileConfig` 的 JSON"。**这条按字面做不到**，
+O6-a 之后我把两边都读了一遍：
+
+`sr-route` 只吃一个完整文件，且 `loadConfig` 用了 `DisallowUnknownFields`，
+其中四个键**控制器根本不知道**（[cmd/sr-route/main.go:38-50,70-100](../controller/cmd/sr-route/main.go)）：
+
+| 键 | 谁能知道 | lab 现值（`lab-cpe1:/etc/sdwan/route.json`） |
+| --- | --- | --- |
+| `identity_dir` | 只有盒子（agent 的身份目录，清单里是 `SR_BOX_AGENT_ID`） | `/etc/sdwan/identity` |
+| `status_addr` | 只有盒子（本机监听口） | `0.0.0.0:19001` |
+| `hold_sec` / `tls_server_name` | 运维选，不是租户选 | `12` / `10.99.0.100` |
+| `rrs` | **控制器今天完全没有这个概念**：`wire.RRAddress` 全仓库只有两处引用（类型定义 + `sr-route` 的那个字段），`sr-ctrl` 零命中 —— sr-route 配置里那句注释"the controller pushes these at enrollment"是**没实现的话** | `[{rr-a,10.99.0.100:18446}]`（我手写的） |
+| `tenant` / `device_id` / `serial` | 控制器知道（入网记录） | `tenant-a` / `1` / `lab-cpe1` |
+| `tunnels` / `vrfs` | 控制器知道，且这正是 O6 要接管的两份 | 手写 |
+| `local_prefixes` | 不在文件里也行 —— `sr-frr` 运行时 `POST /local-prefixes` 送 | 缺 |
+
+所以第 4 段的形状定成**控制器只发它拥有的那两个键**：
+
+```json
+{ "tunnels": [{"peer_device_id": 2, "next_hop": "192.168.99.2"}],
+  "vrfs":    [{"id": 0, "export_rts": ["65000:1000"], "import_rts": ["65000:1000"]}] }
+```
+
+键名与 `sr-route` 的 `tunnelsDoc` / `vrfsDoc` 逐字相同（[cmd/sr-route/main.go:407-458](../controller/cmd/sr-route/main.go)），
+所以同一份内容既能合进磁盘文件、又能直接当 `PUT` 的 body 用，不用两套编码。
+`vrfs` 来自 O6-a 的 `overlayVRFsLocked`，`tunnels` 来自控制器已有的 underlay 隧道表
+（`Endpoint.NodeID` + `Endpoint.Overlay`）。
+
+出厂时那份完整的 `route.json` 从哪来，是一个独立的问题（§3 D6），不要把 O6-b 憋成它的答案。
 
 `Checks` 里加闸门（发布前拦，不指望设备侧报错）：
 ① 组成员的 vpnID 在该设备的基础配置里不存在 ⇒ **error**；② 两台成员之间没有隧道 ⇒
@@ -78,34 +104,44 @@ sr-route 只吃 JSON + HTTP，`boot.sh` 那种 vppctl 行喂不了它。
 
 ### 1.3 设备侧：谁写盘、谁推活表
 
-**`sr-apply` 写盘**（它已经是 bundle 的安装者，`Install` + `replay` 都在它手里），
-把 `route.json` 落到 `/etc/sdwan/sr-route.json`（就是 sr-route 今天读的那个路径）。
-**`sr-agent` 推活表**：装完之后 `PUT /vrfs` + `PUT /tunnels` 到本机 sr-route 的状态口 ——
-O5-b 开这两道缝就是为了这一刻。
+**`sr-apply` 写盘 + `sr-apply` 推活表**（原计划让 `sr-agent` 推，落地前改了）。理由：
+`sr-apply` 本来就是"把这份配置变活"的那个组件——它已经写 `/etc/frr/frr.conf` 并且重启 FRR，
+`sr-apply apply --file bundle.json` 是一条完整的手工路径。推口放到 `sr-agent` 里，
+手工路径就少了半边，两个入口的代价也更大。放在 `Apply` 而不是 `replay`，所以
+**开机重放（`Boot`）不推** —— 那时 sr-route 还没起来，它读盘上那份就是新表。
 
-这样分工的代价是"两个入口"，但各自解决一个真问题：
-- 只有 agent 推、盘上没有 ⇒ sr-route 一重启就回到旧那份（**这正是今天 `PUT` 不持久那个缺陷**）；
-- 只有盘、不推 ⇒ 配置变更要重启 sr-route 才生效 ⇒ **违反"配置变更永不重启别的进程"这条判据**。
+写盘是**叠加**：把第 4 段的两个键盖到 `/etc/sdwan/route.json` 上，其余键（`identity_dir`、
+`status_addr`、`rrs`…）一概不动；盘上没有这个文件时**直接报错，不猜**（猜出来的 `rrs` 比没有更坏）。
+所以"盘上那份就是答案"这句话仍然成立，只是答案有两个来源，排障时要知道 `rrs` 是盒子自己的。
 
-sr-fib 那份（`vrfs` + `tunnels` + `escape_all_colors`）同样由 `sr-apply` 写盘，
-但它**没有热更入口**（sr-fib 一轮轮询自己读 RIB，配置文件只在启动时读一次）⇒
-逃生开关/VPN 集合改了要等 sr-fib 自然重启才生效。**这条要拍**（见 §3 D3）。
+顺序：`replay` → `installFRR`/`reloadFRR` → 写 route.json → 推 PUT。前面的 VPP/内核没成，
+就不留半张已推的路由表。
+
+推的时候 sr-route 没在跑（或口被别人占）⇒ **记 warning 不判 apply 失败**：盘上那份已经是对的，
+下次 sr-route 一起来就是新表；把一次瞬时的连不上变成"这台盒子的配置下发卡在错误里"是更大的假。
+日志与 `status.json` 里必须明写"已落盘、未热更"，不写成完成。
+
+
+sr-fib 那份（`vrfs` + `tunnels` + `escape_all_colors`）同样由 `sr-apply` 写盘，但它**没有热更入口**
+（sr-fib 一轮轮询自己读 RIB，配置文件只在启动时读一次）⇒ 逃生开关/VPN 集合改了要等 sr-fib
+自然重启才生效。D3 已拍"照 O5-b 给 sr-fib 也开一道 `PUT`"，**那是 O6-b 之后单独一步**：
+写盘那半属于 O6-b（同一次 `Apply` 里多一个文件），开 `PUT` 那半属于 D3 那一步。
 
 ### 1.4 开机路径
 
-清单不用改顺序：`apply`（重放磁盘那版，含新写的 `sr-route.json`）本来就排在
+清单不用改顺序：`apply`（重放磁盘那版，含新盖的 `route.json`）本来就排在
 `agent → route → fib` 之前（[start.sh](../controller/deploy/sr-box/start.sh) 的顺序
 `vpp → apply → frr → agent → route → fib → bridge → tunnels_check`）。
 所以"重启盒子后不手敲任何命令"这一句，在 overlay 这块**由磁盘那份 bundle 保证**，
 不需要控制器可达。隧道那一层仍然是"控制器可达才有"（离线开机建不出 wg 口，
-因为期望值不在盘上 —— 要不要也落盘见 §3 D2）。
+因为期望值不在盘上 —— D2 已拍可以落盘，改动小，另列为 O5-e）。
 
 ## 2. 开工顺序（每步一个增量、绿了再走）
 
 | 步 | 内容 | 判据 |
 | --- | --- | --- |
 | O6-a ✅ | 控制器 overlay 模型 + `OverlayGroup` 的 CRUD API + RT 分配与渲染（不动 UI） | 单测：建组→渲染出的每台 `export/import_rts` 逐字对；编辑组减设备⇒残留 RT 消失；两条闸门各一条负向 |
-| O6-b | bundle 第 4 段 + `sr-apply` 落盘 + `sr-agent` 推 `PUT /vrfs` `/tunnels` | lab：控制台改一次导通，**不重启任何进程**，两台 sr-route 的 `/status` 里 vrfs 变了；`docker restart` 盒子后不手敲命令，`/status` 里 vrfs 还是那份（磁盘回来的） |
+| O6-b | bundle 第 4 段（只发 `tunnels`+`vrfs`）+ `sr-apply` 叠加写盘 + `sr-apply` 推 `PUT /vrfs` `/tunnels` | lab：控制台改一次导通，**不重启任何进程**，两台 sr-route 的 `/status` 里 vrfs 变了；`docker restart` 盒子后不手敲命令，`/status` 里 vrfs 还是那份（磁盘回来的） |
 | O6-c | 控制台「Overlay 配置」页：全局 + 导通两块（leak 先不放） | 真浏览器：新增规则后两行 RT 自动写入、编辑减设备后残留被摘、被丢路由三态有数 |
 | O6-d | 被丢路由三态上控制台（`pending` / `local_skips` / `rt_mismatch`，走心跳摘要字段） | 控制台显示的数与设备 `/status` 的数逐字相同；设备没上报时明写"未上报" |
 | O6-e | leak（第三块）：sr-frr 的 prefix 过滤 + FRR redistribute 字段 | 单独出方案，本文不展开 |
@@ -133,7 +169,22 @@ O6-a/O6-b 是后端，O6-c 才见效。**最快能让他看到东西的一步是
 - **D3｜sr-fib 热更**：按我建议 —— 给 `sr-fib` 开一道 `PUT`（照 O5-b 的形状）。**排在 O6-b 之后单独一步。**
 - **D4｜"没有不跑 FRR 的盒子"** ⇒ 不加代码闸，`sr-apply` 无条件重启 FRR 保持不动；lab 那两个
   不跑 FRR 的测试盒子是**形态不一致**，修法是把 FRR 装进 dev 镜像（待做，不改判据脚本）。
+  顺带把他反问的那句记在这里，因为它说明"盒子"这个词在我们之间是有歧义的：**盒子 ≠ 虚拟机**，
+  指的是一台设备上那套**软件形态**（VPP + sr-apply + FRR + sr-agent + sr-route + sr-fib + sr-frr
+  这一组进程）。lab 里同时存在两种形态：`srwg-node1/2`（`srwg-dev` 镜像，**没有 FRR**）和
+  `lab-cpe1/2/3`（含 FRR 10.7.1 的镜像）。交付形态只有一种，就是带 FRR 的那种。
 - **D5｜开工**：已按 §2 顺序开工，O6-a 落地。
+- **D6｜出厂那台盒子第一次开机时，`route.json` 从哪来（O6-b 落地前新出的，需拍）**：
+  §1.2 的实测结果是控制器今天不知道 `rrs` / `identity_dir` / `status_addr`，所以 O6-b 用的是
+  "控制器发 `tunnels`+`vrfs`、`sr-apply` 把这两个键盖到盘上那份文件"的形状（**S1**）。
+  它够用，但新盒子必须**先有一份手写的 `route.json`** 才谈得上被覆盖 —— lab 里这样没问题，
+  出厂形态不行。两条路：
+  - **S1（我建议先按这个走）**：O6-b 只做叠加，`rrs` 那一半留作独立一步
+    「RR 地址进控制器 + `route.json` 出厂形状」（它要动 `State`、要动控制台、还得定"RR 是租户级
+    还是运营方级"，是另一件事，混进 O6-b 会让这一步不绿）。
+  - **S2**：先把 RR 搬进控制器，`route.json` 由控制器一次渲染完整、`sr-apply` 直接覆盖写，
+    不要叠加。形状更干净（一个文件一个来源），代价是 O6-b 变大、O6-c 跟着往后压，
+    而且"RR 归属"这条没拍之前渲染函数写不了。
 
 ## 4. 明确不做
 
