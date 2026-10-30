@@ -666,7 +666,7 @@ FRR 那份撤销时 API 那份自动顶上（§2.7）。设备要**记一条 war
 | O5-b | `sr-route` 开 `PUT /tunnels` + `PUT /vrfs`（照既有 `PUT /local-prefixes` 那道缝），`/status` 加待决清单（`Pending()` + `LocalSkips()`，带上总数） | curl 能改隧道表并读回；待决清单在 `/status` 可见且有条数上限。**2026-10-30 落地**：`cmd/sr-route/main_test.go` 6 个用例跑**真 `route.Client` + httptest**（不打桩 RR，因为要看的是本机表被改之后发生了什么），覆盖读回、三类非法 PUT 拒了不动表、删 VPN ⇒ local 变 `local_skips/vrf_unconfigured` ⇒ 加回又宣告、清单能原样 PUT 回去、超 200 条时 `*_total` + `*_truncated` 如实标 |
 | O5-c | `test/scripts/test-refresh.sh`：全程**不重启任何进程** | 判据原文写的是"无隧道 ⇒ `pending/no_path`"，实测发现**这条在 lab 里断不出稳定态**：RR 只按双向邻接反射，本机没隧道时 RR 一条都不发，`no_path` 只在"隧道刚被撤走、RR 的撤回还没到"那一瞬存在（稳定形态由单测 `TestClient...NoPath` 那组钉住）。脚本因此把 A 段判据换成"空隧道表能开会话"（顺手做 O5-a 那个 `null` 的实测回归），B 段改判 `rt_mismatch` —— 它由本机 VPN 表决定，所以是稳定的。其余判据不变：`PUT /vrfs` 改 import ⇒ 此前 RT 不匹配的前缀回来；下一次 sr-fib 轮询装表 ⇒ tap 终端 ping 通；撤隧道 ⇒ 离表且 FIB 撤。**2026-10-30 落地：51/51 全绿**（VPN 50/51/53，表 50、标签 1050/1051/1053、颜色表 10050）。七段：A 空隧道表能开会话（就是 O5-a 那个 `null` 的实测回归）、B 加隧道 ⇒ 收到但留在 `pending/rt_mismatch`、C 一次 `PUT /vrfs` 让**同一条**前缀进表而 `received/imported/dropped_rt_mismatch` 一个数没动、D 两端 sr-fib 装表 + 两个 tap 跨 VPN ping 通、E 撤隧道 ⇒ 离表/FIB 撤/ping 断再加回来、F 负向删 VPN ⇒ 本地前缀**显式撤回**（对端 `withdrawn` +1，不是等老化）且本机 `local_skips` 看得见、G 五个进程的 pid + `/proc/<pid>/stat` 启动时刻与开机时逐个相同。**两处实测把设计里的空话变成了判据**：① 撤隧道时 node1 的 `withdrawn` **不该**涨（本机先把它从表搬进待决，RR 的撤回到达时它已不在表里），要涨的那个数在对端 —— 脚本按这个方向断言，顺手钉住"事件计数器只记帧做了什么"；② `targets` 是 `[]uint8`，`encoding/json` 当 `[]byte` 处理 ⇒ `/status` 把表 50 印成 base64 `"Mg=="`。单测全绿也看不见这件事，是这支脚本读真端点读出来的，已修成 `route.TableList`（渲染成数字，空表是 `[]` 不是 `null`）并加 `TestRibEntryTargetsMarshalAsNumbers` |
 | O5-d | 开机自启：`usr/local/lib/sr-box/start.sh` 一份清单（vpp → sr-apply boot → frr → sr-agent → sr-route → sr-fib → sr-frr 桥 → 隧道核验），按门控跳过；systemd 那两面（`sr-box.service` + `sr-box-watch.timer`）只是薄壳 | **2026-10-30 落地：`test/scripts/test-boot.sh` 90/90 全绿**（VPN 56/57，表 56/57，标签 1056/1057，颜色表 10056，bundle 记号 = VPP 里的 `MPLS-VRF:1956/1957` + 内核 table 56/57 里一条 blackhole）。四段各答一半（脚本里的 (1)/(B1)/(B2)/(C)，下面把 (B2) 拆成两块证据）：**1b** `check` 只读（跑完一个进程都没多，且把"该跑而没跑"逐行说出来）；**2** 热 VPP 下一遍 `up` 把路由面带起来、终端 ping 通，然后**只杀 sr-route** 再 `up` —— sr-route 换新 pid（`pid//starttime` 都记了），sr-fib/sr-agent/VPP 一个没动，第三遍 `up` 连 sr-route 都不换 ⇒ **这份清单不是重启进程的手段**；**B2** `docker restart` 两个容器（先确认 MPLS 表 1956、内核那条 blackhole、wg0 三者**都没了**），每台盒子只敲一条 `start.sh up`，于是 VPP 由清单自己拉起（伪终端那条路径，插件 1 份 sr_wg 在）、磁盘上那版重放回来（1956 与内核路由都回来了，一个字节没问控制器）、RR 还没起来 ⇒ 状态口照样回话而会话明写着 `connection refused` + `last_error`；**B2b/bc** RR 起来后 sr-route 自己重连（`reconnects=1`）学回前缀，手工恢复 wg0（扮演控制器 + `sr-agent -tunnels`）之后**已经在跑的** sr-fib 下一轮轮询自己把表装上、终端又通，四个 pid 一个没变；**C** 第三个入口 `stop` 的判据是同一件事的反面 —— 三行带 pid 的 `SIGTERM`、三个 pidfile 清干净、三个 `sr-*` 进程真不在，而 **VPP 的 pid 没变（77）**、`wg0` 还在、overlay 照样 0% 丢包、连 `vpp.pid` 那份「VPP 是谁起的」记录都没被抹（容器形态下 VPP 确实是这份清单拉起的，它仍然不杀：停数据面 = 现网断流，不该是"停一份清单"的副作用）；stop 之后的 `check` 如实报「配置在，进程没跑」而不是"上次 up 成功了"；再 `up` 一遍只补那三步（sr-route 119→729、sr-fib 746、sr-agent 716），新进程自己连回 RR 同步完、自己装回表 56，两端终端又通，而 VPP 仍是 77。**三条诚实的边界（都是实测，不是注释）**：① 隧道这一层清单恢复不了，`up` 的结论里明写"tunnels 0 条：wg 口是 sr-agent 从**控制器**取期望值建的，磁盘上没有那份表"；② `--restart unless-stopped` 只解决"容器自己没了 / Docker Desktop 重启后容器还在"，**不会**替盒子跑清单 —— lab 容器的 CMD 是 `/bin/bash`，所以实测形状是"容器起来后人敲一条 up"（同镜像一次性容器实测：进程自杀 exit 0 会被拉回，12 秒内 `RestartCount` 涨到 3；`docker kill` 算人为停止，**不**自动重启）；③ 两个 systemd 单元**未在 lab 实测**（容器里没有 systemd）。**这一支脚本顺带钉掉 start.sh 里三个真缺陷**（都是"单看代码看不出来"的那类）：陈 pidfile + 被回收的 pid 会让清单以为那一步已经好了而什么都不起（`/run` 在容器里是写层，跨 `docker restart` 还在）⇒ `alive`/`pid_of`/`stop` 一律核对 `/proc/<pid>/comm` 是不是这一步该跑的二进制；`tunnels` 计数用 `grep '^wg[0-9]'` 数出恒 0，因为 VPP 打印的是 `[0] wg0 src:…` ⇒ 改成锚定 `\[[0-9]+\] wg…`；`status_addr` 写 `0.0.0.0:18706` 时状态口 URL 被拼成 `http://127.0.0.1127.0.0.1:18706/status` ⇒ 只有监听在通配地址/纯端口时才换回环，运维写了具体地址一概不动 |
-| O6 | 控制台「配置 > overlay」三块（全局 / 导通 / leak），导通规则可编辑 | 真浏览器：新增规则后 RT 自动写入两行、编辑减设备后残留 RT 被摘掉、被丢路由三态可见；改完 `console.html` 必须 `node --check` |
+| O6 | 控制台「配置 > overlay」三块（全局 / 导通 / leak），导通规则可编辑 —— **方案已出：`docs/overlay-console-plan.md`（2026-10-31），等 D1..D5** | 真浏览器：新增规则后 RT 自动写入两行、编辑减设备后残留 RT 被摘掉、被丢路由三态可见；改完 `console.html` 必须 `node --check` |
 | O7 | SD-WAN policy（下一节，按 SLA 引流到颜色表） | 本文不展开，只要求 O1..O4 已经把颜色表建好 |
 | O8 | 站点 HA：同站点双设备的隧道彩色规则（§13.2）+ LAN 侧 VRRP（§3.1.1）+ 控制台按站点看冗余 | lab 判据（**要先有第二台盒，见 §13.5**）：① 两台设备同颜色 0 隧道 → 主表该前缀 `buckets:2`；② 打下一台设备的 wg 口 → `buckets:1` 且流量不断；③ VRRP 主备切换后客户侧 ping 无中断（连续打流计数），且**我们这一份路由不受影响**（`show ip fib` 只是 LAN 侧首跳变了）；④ 同站点两台同时宣告同一前缀 ⇒ **不黑洞**（§13.3） |
 
@@ -744,18 +744,23 @@ O1..O4 是"数据面+本地选路"，O5 是"不重启进程也能收敛"，O6 �
     同一支脚本还量到一条 iproute2 的形状：`ip route replace blackhole <pfx>/32 table <n>`
     里类型关键字必须在最前（写成 `<pfx> table <n> blackhole` 是 exit 255），而且
     `ip route show` 回显时**丢掉 /32** —— bundle 里的记号路由因此按无前缀掩码去 grep。
-11. **O5-d 之后仍要先请用户拍的那件事**：`PUT /tunnels` / `PUT /vrfs` 改的是**内存里**
-    那张表，磁盘上的 `node*.json` 不跟着变，所以重启进程就回到文件那份（脚本头注已经写明）。
-    要让它持久，得走控制器发布 →
-    `sr-agent -apply` 那条既有链路，把隧道表/VPN 表也纳入配置包 —— 那不属于 O5 的判据，
-    但属于 O5 落地后立刻会出现的下一个问题。**O5-d 又把这条问题的另一半量化了**：开机时
-    控制器不可达 ⇒ 隧道 0 条，而磁盘上确实没有那份表（清单明说，不假装完成）。
-    所以"隧道表进配置包"不是锦上添花，是把"重启盒子后不手敲任何命令"这半句补全的那一步。
-12. **O5-d 量到的一条与 sr-apply 有关的边界**：`sr-apply apply` 结尾总会调一次
-    `reloadFRR()`（`internal/apply/apply.go` 自动探测 `/usr/lib/frr/frrinit.sh`，没有就
-    `systemctl restart frr`）⇒ **不跑 FRR 的盒子**（srwg 容器两种都没有）那条命令必然失败，
-    整次 apply 返回非 0，即使 VPP 侧的命令全成。判据脚本用 `--frr-reload true` 绕过，
-    **代码未动**。要不要给它加"探测不到 FRR 就跳过"的门控，请用户拍。
+11. **这条已经拍完（2026-10-31 用户）：进配置包，而且要保证设备重启后能工作。** 落法与代价
+    全部写在 **`docs/overlay-console-plan.md`**（O6 方案）。两条事实先记在这里，因为它们
+    改变了这条拍板的含义：
+    ① **隧道今天其实已经在控制器上，而且可达时重启自带** —— 心跳带 `tunnel_version`，
+    `sr-agent -tunnels` 取整份表用 vppapi 建口（`cmd/sr-agent/main.go:186-197,246-251`），
+    开机清单也已经能带 `SR_BOX_AGENT_VPP_API` / `SR_BOX_AGENT_TUNNELS` 两个开关
+    （`start.sh:311-314`）。O5-d 判据量到的"重启后 0 条"是脚本**故意**把控制器指向
+    127.0.0.1:18799（没人监听）造成的，量的是"离线开机"那一格，不是常态。
+    ② 所以"进配置包"真正要补的是**另一批数据**：每台每 VPN 的 `export/import_rts`、
+    overlay 侧的 `local_prefixes`、`escape_all_colors`、sr-fib 的 `vrfs`+`tunnels`、
+    sr-frr 的 `vrfs`+`import` —— 这些今天只存在于设备上、由 `test/lab/bringup.sh` 手写，
+    控制器代码里 grep 不到（`internal/apply` 里 `Tunnel` 零命中，bundle 只有
+    `Artifacts{FRR,VPP,Boot}` 三段文本）。
+12. **这条也拍完（2026-10-31 用户）：不存在不跑 FRR 的盒子，盒子软件是统一的** ⇒
+    **不给 `sr-apply` 加"探测不到 FRR 就跳过"的门控**，`reloadFRR()` 那条无条件调用保持原样。
+    留下的只有一处 lab 与交付形态的不一致（srwg-node1/2 这两个测试容器里没有 FRR，
+    判据脚本用 `--frr-reload false` 绕过、代码未动），已作为 O6 方案的 D4 请用户定。
 
 ---
 
