@@ -12,16 +12,16 @@ func TestResetRemovesManagedState(t *testing.T) {
 	if _, err := a.Apply(context.Background(), plan1()); err != nil {
 		t.Fatal(err)
 	}
-	if len(dp.routes) != 1 || len(dp.labels) != 1 || len(dp.tables) != 1 {
-		t.Fatal("前置状态没装上")
+	if len(dp.routes) != 2 || len(dp.labels) != 1 || len(dp.tables) != 2 {
+		t.Fatal("前置状态没装上（主表 + 颜色 0 的表）")
 	}
 
 	res, err := Reset(context.Background(), dp, []uint8{100})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RoutesRemoved != 1 || res.LabelsRemoved != 1 || res.TablesRemoved != 1 {
-		t.Errorf("res = %+v, want 各撤 1", res)
+	if res.RoutesRemoved != 2 || res.LabelsRemoved != 1 || res.TablesRemoved != 2 {
+		t.Errorf("res = %+v, want 路由 2 / 标签 1 / 表 2（颜色表也要撤干净）", res)
 	}
 	if len(dp.routes) != 0 || len(dp.labels) != 0 || len(dp.tables) != 0 {
 		t.Errorf("仍有残留: routes=%v labels=%v tables=%v", dp.routes, dp.labels, dp.tables)

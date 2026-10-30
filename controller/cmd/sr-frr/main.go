@@ -143,12 +143,14 @@ func (c *fileConfig) tables() ([]frr.Table, error) {
 }
 
 // statusDoc 是 sr-route /status 里本进程用到的部分。
+//
+// rib 的**键是目标主表**（本机 import 命中了的 VPN）—— 要往客户内网通告的就是这一份，
+// 条目里的 vrf_id 是来源 VPN（只决定标签，与本进程无关，所以不声明）。
 type statusDoc struct {
 	RIB map[string][]ribRoute `json:"rib"`
 }
 
 type ribRoute struct {
-	VRFID    uint8    `json:"vrf_id"`
 	Prefix   string   `json:"prefix"`
 	NextHops []string `json:"next_hops"`
 }
@@ -171,9 +173,13 @@ func fetchRIB(ctx context.Context, hc *http.Client, url string) ([]frr.RIBRoute,
 		return nil, fmt.Errorf("解析 %s: %w", url, err)
 	}
 	var out []frr.RIBRoute
-	for _, rs := range doc.RIB {
+	for key, rs := range doc.RIB {
+		table, err := strconv.Atoi(key)
+		if err != nil || uint64(table) > 255 {
+			return nil, fmt.Errorf("%s 的 RIB 键 %q 不是主表号（0..255）", url, key)
+		}
 		for _, r := range rs {
-			out = append(out, frr.RIBRoute{VRF: r.VRFID, Prefix: r.Prefix, NextHops: r.NextHops})
+			out = append(out, frr.RIBRoute{VRF: uint8(table), Prefix: r.Prefix, NextHops: r.NextHops})
 		}
 	}
 	return out, nil

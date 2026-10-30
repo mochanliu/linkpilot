@@ -361,6 +361,17 @@ func readFIBPath(b []byte) FIBPath {
 }
 
 // FIBRoutes 读回一张 VRF 表里的 IPv4 路由（按需用于核对下发结果）。
+//
+// 三件实测（决定调用方能不能拿"空"当判据）：
+//   - dump 是**按表**的：表 100 里有路由、表 0 里有一堆 overlay 路由时，
+//     dump 100 回的全是 table=100，一条外来表项都没有。
+//   - 表**不存在**：零帧，retval 0，不报错。
+//   - 表存在但没人装路由：不是空的 —— VPP 自动带 5 条 special
+//     （0.0.0.0/0、0.0.0.0/32、224.0.0.0/4、240.0.0.0/4、255.255.255.255/32），
+//     下一跳读回来是 invalid、preference=0，不是本加载器写的。
+//
+// 所以 len()==0 只表示"这张表不存在"，而"这张表里有没有我们的路由"必须看
+// preference 或前缀，不能拿条目数当数。
 func (c *Client) FIBRoutes(ctx context.Context, tableID uint32) ([]IPRoute, error) {
 	body := make([]byte, 0, 69)
 	body = appendU32(body, tableID)

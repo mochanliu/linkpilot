@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -92,12 +94,16 @@ func loadConfig(path string) (*fileConfig, error) {
 // statusDoc 是 sr-route /status 里本进程用到的部分。刻意只声明需要的字段：
 // 那个 JSON 还有会话统计、local 前缀等，与本进程无关 —— local 前缀由盒内
 // FRR 经 linux-nl 直接装进 VPP，不经过 sr-fib。
+//
+// rib 的**键是目标主表**（本机 import 命中了的 VPN），条目的 vrf_id 是**来源** VPN：
+// 导通时两者不同，标签取来源 VPN、装表取键（草案 §2.4/§4.3）。
 type statusDoc struct {
 	RIB map[string][]ribRoute `json:"rib"`
 }
 
 type ribRoute struct {
-	VRFID    uint8    `json:"vrf_id"`
+	DeviceID uint16   `json:"device_id"`
+	VRFID    uint8    `json:"vrf_id"` // 来源 VPN
 	Prefix   string   `json:"prefix"`
 	NextHops []string `json:"next_hops"`
 }
@@ -120,11 +126,31 @@ func fetchStatus(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRou
 		return nil, fmt.Errorf("解析 %s: %w", url, err)
 	}
 	var out []fib.RIBRoute
-	for _, rs := range doc.RIB {
+	for key, rs := range doc.RIB {
+		table, err := strconv.Atoi(key)
+		if err != nil || uint64(table) > 255 {
+			return nil, fmt.Errorf("%s 的 RIB 键 %q 不是主表号（0..255）", url, key)
+		}
 		for _, r := range rs {
-			out = append(out, fib.RIBRoute{VRF: r.VRFID, Prefix: r.Prefix, NextHops: r.NextHops})
+			out = append(out, fib.RIBRoute{
+				Table:     uint8(table),
+				SourceVRF: r.VRFID,
+				Origin:    r.DeviceID,
+				Prefix:    r.Prefix,
+				NextHops:  r.NextHops,
+			})
 		}
 	}
+	// map 迭代顺序是随机的，排一下：本进程的日志与每轮计划比较都靠稳定输入。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Table != out[j].Table {
+			return out[i].Table < out[j].Table
+		}
+		if out[i].Origin != out[j].Origin {
+			return out[i].Origin < out[j].Origin
+		}
+		return out[i].Prefix < out[j].Prefix
+	})
 	return out, nil
 }
 

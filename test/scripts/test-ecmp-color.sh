@@ -1,7 +1,7 @@
 #!/bin/bash
-# test-ecmp-color.sh - 同一对 CPE 的两条同色隧道，在 VPP 里真的落成两个 bucket（O2 判据）
+# test-ecmp-color.sh - 同对端两条同色隧道落成两个 bucket，改色则搬进颜色表（O2 + O3 判据）
 #
-# 这条脚本只回答四件事，每件都有一个"看起来对但其实错"的反例：
+# 这条脚本回答五件事，每件都有一个"看起来对但其实错"的反例：
 #
 #   (1) 本机隧道表里对同一个对端有**两条**隧道时，控制面反射过来的前缀会不会
 #       只剩一条路径？协议 v3 的下一跳由本机隧道表解析（前缀本身不带下一跳），
@@ -15,9 +15,16 @@
 #       原生算的，不是我们的控制面循环干的 —— O4 的逃生开关靠的就是这个机制。
 #   (4) 恢复那条口，bucket 自己回到 2。
 #
-# 外加一次**观测**（只打数，不作通过/失败）：改色之后重启 sr-fib，VPP 里存的
-# preference 变不变。新进程的"上一份计划"是空的，所以走的是原地 add 而不是
-# §2.2 的先删后加；量到的数字就是"重启改色到底生不生效"的答案，留给用户拍。
+# 第 (5) 件事是 O3-b 的判据，也是"逃生开关关着"（定案）那条规则的实证：
+#       把 wg1 改成颜色 3 再重启 sr-fib，**不是**"主表里那条路径的 preference
+#       变了"，而是**搬表** —— 主表 $VRF 只留颜色 0 的那条（buckets 回 1），
+#       改色的那条只存在于 ColorTable(3,$VRF)=3*1000+10000+$VRF（§4.2 公式）。
+#       同时颜色 0 那条在主表和 ColorTable(0,$VRF) 里各有一份（双写是定案）。
+#       反例长这样：两条路径都留在主表、只差 preference —— 那是逃生开关**打开**
+#       时的形态，归 O4，不是现在这份代码该产出的。
+#
+# 为什么用"重启 sr-fib"来改色：新进程的上一份计划是空的，所以走原地 add（整条
+# 替换）而不是 §2.2 的先删后加；这一步同时回答"重启改色生不生效"。
 #
 # 前置：**必须先跑过 test-e2e.sh --keep 与 test-multitunnel.sh --keep**
 # （node1↔node2 之间 wg0@192.168.99.x 与 wg1@192.168.100.x 两条隧道都在、都通）。
@@ -114,14 +121,38 @@ have_buckets() {   # <want> <container> <prefix>
     [ "$(buckets_of "$2" "$3")" = "$1" ]
 }
 
+dump_table() {   # <table> <prefix> —— 读回任意表里这条前缀（没有该前缀时输出为空）
+    dx "$N1" "$WORK/bin/fib-dump -table $1 -prefix $2" 2>/dev/null
+}
 dump_of() {   # 读回 preference —— show ip fib 打不出来，只能走 ip_route_details
-    dx "$N1" "$WORK/bin/fib-dump -table $VRF -prefix $REMOTE_PFX" 2>/dev/null
+    dump_table "$VRF" "$REMOTE_PFX"
 }
 path_pref() {   # <next_hop> <preference>
     dump_of | grep -F "via $1 " | grep -q "preference=$2"
 }
 path_count() {
     [ "$(dump_of | grep -c '  via ')" = "$1" ]
+}
+
+# §4.2 的表号公式在脚本侧独立算一遍：这一步要断言的正是"sr-fib 落的是不是
+# 这张表"，复用它的输出就成了自己给自己判卷。
+color_table() { echo $(( $1 * 1000 + 10000 + $2 )); }   # <color> <main>
+table_has() {   # <table> <prefix>
+    [ -n "$(dump_table "$1" "$2")" ]
+}
+table_path() {   # <table> <next_hop> <preference> —— 固定看 $REMOTE_PFX
+    dump_table "$1" "$REMOTE_PFX" | grep -F "via $2 " | grep -q "preference=$3"
+}
+table_buckets() {   # <table> <prefix>
+    vpp "$N1" "show ip fib table $1" | awk -v p="$2" '$1==p {f=1; next}
+        f && /dpo-load-balance/ {
+            if (match($0, /buckets:[0-9]+/)) print substr($0, RSTART+8, RLENGTH-8);
+            exit}'
+}
+table_block() {   # <table> <prefix> —— 该表里这条前缀的整块
+    vpp "$N1" "show ip fib table $1" | awk -v p="$2" '$1==p {f=1; print; next}
+        f && /^[^[:space:]]/ {exit}
+        f {print}'
 }
 
 wait_fn() {   # <label> <timeout_s> <fn> [args...]
@@ -448,9 +479,12 @@ vpp "$N1" "set interface state $WG2_IF up" >/dev/null || die "up $WG2_IF 失败"
 wait_fn "$REMOTE_PFX 又是 2 个 bucket" 15 have_buckets 2 "$N1" "$REMOTE_PFX"
 wait_ping "$N1" "${TAP_N2_HOST%/*}" "恢复后 ping 仍通" 20
 
-# ---------------------------------------------------------------- 7 改色观测
+# ---------------------------------------------------------------- 7 改色搬表
 
-info "7. 观测（不算通过/失败）：改色后重启 sr-fib，VPP 里存的 preference 变不变"
+info "7. (5) 改色 $WG2_IF → 颜色 $COLOR2：主表只留颜色 0，改色的那条搬进颜色表"
+CT0=$(color_table 0 "$VRF")
+CT2=$(color_table "$COLOR2" "$VRF")
+info "     表号按 §4.2 公式：颜色 0 → $CT0，颜色 $COLOR2 → $CT2"
 # 只改 $WG2_IF 那一行：两条隧道的颜色都是 0，按内容匹配会把两条一起换掉。
 dx "$N1" "sed -i '/$WG2_IF/s/\"color\": 0}/\"color\": $COLOR2}/' $WORK/fib.json" >/dev/null
 info "     fib.json 的隧道段：$(tunnels_line)"
@@ -458,23 +492,58 @@ kill_one "$N1" fib
 dx "$N1" "$WORK/bin/sr-fib -config $WORK/fib.json -once > $WORK/recolor.log 2>&1" ||
     bad "改色后的 sr-fib -once 退出非 0（见 recolor.log）"
 info "     收敛计数：$(fib_tail recolor.log)"
-info "     读回："
+
+info "     主表 $VRF 读回："
 dump_of | sed 's/^/       /'
-info "     show ip fib 该前缀整块（看 bucket 数有没有随颜色变化）："
-entry_block "$N1" "$REMOTE_PFX" | sed 's/^/       /'
-if path_pref "$OVERLAY2_N2" $((230 + COLOR2)); then
-    info "     → 读回 preference=$((230 + COLOR2))：新进程的原地 add 也把颜色写进去了"
-elif path_pref "$OVERLAY2_N2" 230; then
-    info "     → 读回 preference 仍是 230：原地 add 没换掉 VPP 存的颜色（§2.2 的陷阱，重启改色不生效）"
+wait_fn "主表 $VRF 只剩 1 个 bucket" 15 have_buckets 1 "$N1" "$REMOTE_PFX"
+path_pref "$OVERLAY_N2" 230 &&
+    ok "主表里活下来的是 $WG_IF 那条，preference 仍是 230（颜色 0 不动）" ||
+    bad "主表里那条 230 不在了"
+if dump_table "$VRF" "$REMOTE_PFX" | grep -qF "via $OVERLAY2_N2 "; then
+    bad "改色的 $OVERLAY2_N2 还在主表 $VRF：逃生开关关着时主表只收颜色 0"
 else
-    info "     → 读不到 $OVERLAY2_N2 这条路径，见上面的 dump"
+    ok "改色的 $OVERLAY2_N2 已不在主表 $VRF（负向：改色是搬表，不是留在主表换 pref）"
 fi
-wait_ping "$N1" "${TAP_N2_HOST%/*}" "改色重启期间前缀仍然可转发" 20
+
+info "     颜色表 $CT2 读回："
+dump_table "$CT2" "$REMOTE_PFX" | sed 's/^/       /'
+wait_fn "颜色表 $CT2 里有 $REMOTE_PFX" 15 table_has "$CT2" "$REMOTE_PFX"
+table_path "$CT2" "$OVERLAY2_N2" $((230 + COLOR2)) &&
+    ok "该表里这条路径 preference=$((230 + COLOR2))（= 230 + 颜色，$WG2_IF 那条）" ||
+    bad "颜色表 $CT2 里这条路径的 preference 不是 $((230 + COLOR2))"
+table_block "$CT2" "$REMOTE_PFX" | grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" &&
+    table_block "$CT2" "$REMOTE_PFX" | grep -qF "mpls via $OVERLAY2_N2 $WG2_IF" &&
+    ok "颜色表里同样压标签 $LABEL 走 $WG2_IF（表号跟着颜色走，标签跟着来源 VPN 走）" ||
+    bad "颜色表 $CT2 里这条路径不是带标签 $LABEL 走 $WG2_IF"
+if dump_table "$CT2" "$REMOTE_PFX" | grep -qF "via $OVERLAY_N2 "; then
+    bad "颜色表 $CT2 里混进了 $WG_IF（颜色 0）：一张颜色表只收自己那个颜色"
+else
+    ok "颜色表 $CT2 里只有颜色 $COLOR2 那条（颜色 0 没串进来）"
+fi
+table_path "$CT0" "$OVERLAY_N2" 230 &&
+    ok "颜色 0 是双写：主表 $VRF 与颜色表 $CT0 各有一份同一条路径" ||
+    bad "颜色表 $CT0 里没有颜色 0 那条（§4.3 第 5 步要求颜色 0 也建自己的表）"
+wait_ping "$N1" "${TAP_N2_HOST%/*}" "改色搬表之后仍然可转发（主表还剩一条颜色 0）" 20
+
+info "8. (5) 反向：颜色改回 0 再重启，主表自己回到 2 个 bucket"
+dx "$N1" "sed -i '/$WG2_IF/s/\"color\": $COLOR2}/\"color\": 0}/' $WORK/fib.json" >/dev/null
+kill_one "$N1" fib
+dx "$N1" "$WORK/bin/sr-fib -config $WORK/fib.json -once > $WORK/recolor2.log 2>&1" ||
+    bad "改回颜色 0 的 sr-fib -once 退出非 0（见 recolor2.log）"
+wait_fn "主表 $VRF 又回到 2 个 bucket" 15 have_buckets 2 "$N1" "$REMOTE_PFX"
+path_pref "$OVERLAY2_N2" 230 &&
+    ok "$WG2_IF 那条回到 230：新进程的原地 add（整条替换）把颜色写回了 VPP" ||
+    bad "$WG2_IF 那条没回到 230（原地 add 没换掉 VPP 存的 preference）"
+# 颜色表 13xxx 里的旧条目**不会**被这次重启删掉：新进程的上一份计划是空的，
+# Apply 的删除轮只能删它自己装过的东西。这不是缺陷，是 -reset 的职责边界，
+# 打个数留给读日志的人（真要清干净由收尾的 sr-fib -reset 扫颜色表）。
+info "     （已知行为）颜色表 $CT2 里改色那轮的旧路径仍在：$(dump_table "$CT2" "$REMOTE_PFX" | grep -c '  via ') 条；新进程删不到没装过的表"
+wait_ping "$N1" "${TAP_N2_HOST%/*}" "改回颜色 0 之后仍然可转发" 20
 
 echo
 echo "== 结果：$PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then
-    for f in fib node1 node2 rr recolor; do
+    for f in fib node1 node2 rr recolor recolor2; do
         echo "---- $f.log" >&2
         dx "$N1" "tail -20 $WORK/$f.log" >&2 2>/dev/null || true
     done

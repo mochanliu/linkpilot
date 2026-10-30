@@ -6,10 +6,11 @@
 //
 // 三个决定，都是数据面实测之后定下来的：
 //
-//   - **标签按 VRF 派生**：label = LabelBase + VRFID。标签只在收端本地有意义，
+//   - **标签按来源 VPN 派生**：label = LabelBase + 来源 VPN。标签只在收端本地有意义，
 //     远端压的值必须等于收端登记的本地标签；两个 CPE 对同一个 VPN 用同一个号，
 //     收发就自动对齐，不需要在路由协议里再多一个字段（Cisco 的 VPN-ID 当标签
 //     也是这个形状：VPN 标识由控制面分配、在路由里携带、每跳只在本机有意义）。
+//     导通时它是**来源** VPN，与这条路由装进本机哪张表无关（草案 §2.4/§4.3）。
 //   - **下一跳 → 出口**来自控制面给的隧道表，不从 VPP 猜。RIB 里一条路由的每个
 //     next_hop 对应一条本地隧道；映射关系（对端 overlay → 本端 wg 接口）
 //     是 vBOND 分配隧道时就定下来的，猜它等于把控制面的职责挪进数据面。
@@ -17,8 +18,9 @@
 //     已经撤掉的路径，而 VPP 不会告诉你它还在。
 //
 // 表布局：VPN 表号 = VPN ID（0, 1, ...），250 留给 overlay（wg 接口与对外下一跳
-// 空间），underlay 在 table 0 —— 所以 VPN 0 与 underlay 共用 table 0。MPLS 标签
-// 不分表：VPP 收包后的标签查表恒为全局 MPLS 表（实测与接口所在 IP 表无关）。
+// 空间），underlay 在 table 0 —— 所以 VPN 0 与 underlay 共用 table 0；颜色表用
+// ColorTable() 那个公式（10000..17255），与上面几段实测不撞。MPLS 标签不分表：
+// VPP 收包后的标签查表恒为全局 MPLS 表（实测与接口所在 IP 表无关）。
 //
 // 本包只装 overlay 学到的前缀。客户侧/本机前缀归盒内 FRR：FRR 把路由装进内核
 // FIB，VPP 的 linux-nl 插件再按 netlink 同步进同一张 VPP 表。两个写者不碰同一
@@ -58,13 +60,48 @@ const MaxColor uint8 = 255 - PrefBase
 
 // LabelFor 是"这个 VRF 的 VPN 标签"的唯一算法。收端登记本地标签、发端压标签
 // 都用它 —— 两边各算一次还长得一样，是这套方案不需要信令的原因。
+//
+// 导通时参数是**来源** VPN（§2.4：标签是远端语义，对端弹栈后查的是它自己那张表），
+// 收端登记时参数是本机配置的 VPN。两边用同一个函数，不需要在协议里多带字段。
 func LabelFor(vrf uint8) uint32 { return LabelBase + uint32(vrf) }
 
-// RIBRoute 是喂给本包的最小路由形状（由 cmd/sr-fib 从 route.Route 转换）。
+// 颜色表的表号公式（草案 §4.2）：
+//
+//	表号 = 颜色*ColorTableStride + ColorTableBase + 主表号      主表号 ∈ 0..255
+//
+// 色段之间留 1000 的空隙（> 主表号上限 255）⇒ 8 个颜色互不重叠；数值落在
+// 10000..17255，实测与 lab 现用的 0/10/99/250/1250 都不撞。标签空间 1000+vpn
+// 是**另一个命名空间**（MPLS 20 位标签），形似但无交叉。
+const (
+	ColorTableBase   uint32 = 10000
+	ColorTableStride uint32 = 1000
+)
+
+// ColorTable 把（颜色, 主表）折成一个 VPP 表号。policy 阶段用策略路由把流引到
+// 指定颜色的表；O3 只负责把这些表建出来并装好路径。
+func ColorTable(color uint8, main uint32) (uint32, error) {
+	if color > MaxColor {
+		return 0, fmt.Errorf("fib: 颜色 %d 超出上限（PrefBase %d + 颜色 ≤ 255 ⇒ 最大 %d）", color, PrefBase, MaxColor)
+	}
+	if main > uint32(MaxVRFID) {
+		return 0, fmt.Errorf("fib: 主表号 %d 超出 0..%d，会和下一个颜色的表段重叠", main, MaxVRFID)
+	}
+	return uint32(color)*ColorTableStride + ColorTableBase + main, nil
+}
+
+// RIBRoute 是喂给本包的最小路由形状（由 cmd/sr-fib 从 sr-route /status 转换）。
+//
+// 三个字段是三件事，混成一个就是 §2.4 那个坑：
+//   - Table：目标主表，本机 import 命中了这条路由 RT 的那些 VRF 之一（=装进哪张表）。
+//   - SourceVRF：来源 VPN，只决定**标签**。导通时它和 Table 必然不同 ——
+//     A 的 VPN 10 落进 B 的 VPN 20，B 出方向压 1010，A 弹栈查自己的表 10。
+//   - Origin：来源设备。§6.4 的确定性 tie-break 比 RD = <device_id, vpn_id>。
 type RIBRoute struct {
-	VRF      uint8
-	Prefix   string
-	NextHops []string
+	Table     uint8
+	SourceVRF uint8
+	Origin    uint16
+	Prefix    string
+	NextHops  []string
 }
 
 // Tunnel 是控制面分配的隧道：对端 overlay 地址 → 本端 wg 接口名。
@@ -101,11 +138,65 @@ type Label struct {
 
 // Plan 是一份完整的期望状态。
 type Plan struct {
+	// Tables 是这一轮要保证存在的 VPP 表：本机每个 VPN 的主表 + **真被装进路由的**
+	// 颜色表（§4.2：不是 8×256 张全开）。它不能从 Labels 推出来 —— 颜色表不登记标签
+	// （标签弹栈后进的永远是 VPN 自己的表），它是 policy 阶段引流要落的那张表。
+	Tables []uint32
 	Labels []Label
 	Routes []Route
-	// Warnings 记录"RIB 里有、但这台 CPE 装不了"的路径（下一跳不在隧道表里）。
+	// Warnings 记录"RIB 里有、但这台 CPE 装不了"的路径：下一跳不在隧道表里、
+	// BFD 不是 Up、以及同前缀多来源标签被择一丢掉的那些。
 	// 它们不阻断整份计划：一条隧道没配好，不该让同一个 VRF 的其它前缀也停摆。
 	Warnings []string
+}
+
+// cand 是择一之前的一条候选路径：能下发的形状 + 它的 RD。
+//
+// RD 不进 Path：Path 是交给 vppapi 的下发形状，RD 只是选路时的比较键（§7）。
+type cand struct {
+	Path
+	rd uint32 // rdOf(来源设备, 来源 VPN)
+}
+
+// rdOf 把 RD = <device_id, vpn_id>（§7）压成一个可直接比大小的数：vpn 是 8 位，
+// 所以 device 左移 8 位就是"先比 device、再比 vpn"，与 BGP 的 lowest router-id
+// 同一条确定性 tie-break。
+func rdOf(origin uint16, sourceVRF uint8) uint32 {
+	return uint32(origin)<<8 | uint32(sourceVRF)
+}
+
+func rdString(rd uint32) string { return fmt.Sprintf("%d/%d", rd>>8, rd&0xff) }
+
+// pickWinner 走 §6.4 的决策链，返回胜者标签对应的那些路径，以及被淘汰的 RD 集合。
+//
+// 链上只有最后一步有属性可比：local-pref / AS_PATH / origin / MED / eBGP 优于 iBGP
+// 本系统都没有（显式跳过，以后 policy 加属性是**插进一步**而不是改算法）；
+// IGP cost 的类比项 = 颜色，已经由 preference=230+颜色 表达，不在这里重复。
+//
+// 为什么必须淘汰：同一个桶里塞两个标签 = 一半流量被投进**另一个 VPN** 的表
+// （§2.4 的静默投递）。被淘汰的那条不丢，它还留在 sr-route 的 adj-RIBs-in 里，
+// 只是这一轮不下发。
+func pickWinner(list []cand) (win []cand, losers []uint32) {
+	best := list[0].rd
+	for _, c := range list[1:] {
+		if c.rd < best {
+			best = c.rd
+		}
+	}
+	winLabel := LabelFor(uint8(best & 0xff))
+	seen := map[uint32]bool{}
+	for _, c := range list {
+		if c.Label == winLabel {
+			win = append(win, c)
+			continue
+		}
+		if !seen[c.rd] {
+			seen[c.rd] = true
+			losers = append(losers, c.rd)
+		}
+	}
+	sort.Slice(losers, func(i, j int) bool { return losers[i] < losers[j] })
+	return win, losers
 }
 
 // PlanFrom 把 RIB 快照翻译成期望状态。纯函数，不碰 VPP。
@@ -116,6 +207,10 @@ type Plan struct {
 // down 是"明确不可达"的下一跳集合（来自 UnreachablePeers）；nil 表示没有
 // 可达性信息，所有路径保留。显式不可达的路径与"下一跳不在隧道表里"同样处理：
 // 跳过它、留一条 warning，而不是把整条前缀撤掉 —— 同前缀可能还有别的隧道。
+//
+// 装表算法是草案 §4.3 的六步，逐字对应：RT 命中哪些本机 VRF（=routes 里的 Table，
+// sr-route 已经算好）→ 标签取来源 VPN → 候选路径按颜色分进主表/颜色表 →
+// 同前缀多来源标签先择一 → 整条交给 Applier 替换。
 func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool) (Plan, error) {
 	var p Plan
 	if len(vrfs) == 0 {
@@ -133,6 +228,11 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 		p.Labels = append(p.Labels, Label{Label: LabelFor(v), Table: uint32(v)})
 	}
 	sort.Slice(p.Labels, func(i, j int) bool { return p.Labels[i].Label < p.Labels[j].Label })
+
+	tables := map[uint32]bool{}
+	for _, v := range vrfs {
+		tables[uint32(v)] = true
+	}
 
 	tunnelOf := map[string]Tunnel{}
 	for _, t := range tunnels {
@@ -152,15 +252,25 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 		tunnelOf[addr.String()] = t
 	}
 
+	// 桶键 =（VPP 表号, 前缀）。同一个 RouteKey 在导通时可以落进几张主表，
+	// 每张表各自是一个桶，各自择一。
 	type key struct {
 		table  uint32
 		prefix netip.Prefix
 	}
-	grouped := map[key][]Path{}
+	grouped := map[key][]cand{}
 	warned := map[string]bool{}
+	warn := func(format string, args ...any) {
+		w := fmt.Sprintf(format, args...)
+		if !warned[w] {
+			warned[w] = true
+			p.Warnings = append(p.Warnings, w)
+		}
+	}
+
 	for _, r := range routes {
-		if !seenVRF[r.VRF] {
-			return p, fmt.Errorf("fib: RIB 里有 VRF %d 的路由（%s），但本机没配这个 VRF", r.VRF, r.Prefix)
+		if !seenVRF[r.Table] {
+			return p, fmt.Errorf("fib: RIB 里有要装进表 %d 的路由（%s），但本机没配这个 VPN", r.Table, r.Prefix)
 		}
 		prefix, err := netip.ParsePrefix(r.Prefix)
 		if err != nil || !prefix.Addr().Is4() {
@@ -170,6 +280,9 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 		if len(r.NextHops) == 0 {
 			return p, fmt.Errorf("fib: %s 没有任何下一跳", prefix)
 		}
+		// §4.3 第 3 步：标签恒为 LabelFor(**来源** VPN)，与装进哪张表无关。
+		label := LabelFor(r.SourceVRF)
+		rd := rdOf(r.Origin, r.SourceVRF)
 		for _, raw := range r.NextHops {
 			nh, err := netip.ParseAddr(raw)
 			if err != nil || !nh.Is4() {
@@ -179,29 +292,48 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 			if !ok {
 				// 这台 CPE 上没有到该下一跳的隧道：这条路径不可用。留一条 warning，
 				// 不去猜别的隧道 —— 猜错比不通更难查。
-				w := fmt.Sprintf("%s: 下一跳 %s 不在隧道表里，该路径跳过", prefix, nh)
-				if !warned[w] {
-					warned[w] = true
-					p.Warnings = append(p.Warnings, w)
-				}
+				warn("%s: 下一跳 %s 不在隧道表里，该路径跳过", prefix, nh)
 				continue
 			}
 			if down[nh] {
 				// BFD 明确说这条隧道不通。跳过而不是整条撤掉：同前缀的多路径里
 				// 可能还有活着的。
-				w := fmt.Sprintf("%s: 下一跳 %s 的 BFD 会话不是 Up，该路径跳过", prefix, nh)
-				if !warned[w] {
-					warned[w] = true
-					p.Warnings = append(p.Warnings, w)
-				}
+				warn("%s: 下一跳 %s 的 BFD 会话不是 Up，该路径跳过", prefix, nh)
 				continue
 			}
-			k := key{table: uint32(r.VRF), prefix: prefix}
-			grouped[k] = append(grouped[k], Path{NextHop: nh, Interface: t.Interface, Label: LabelFor(r.VRF), Preference: PrefBase + t.Color})
+			c := cand{Path: Path{NextHop: nh, Interface: t.Interface, Label: label, Preference: PrefBase + t.Color}, rd: rd}
+			// §4.3 第 5 步，逃生开关**关**（默认）：主表只收颜色 0 的路径 ——
+			// 颜色 0 全 down 时这个前缀在主表里就不存在了（宁丢不占昂贵颜色）。
+			// 打开时主表要收全部颜色、靠 preference 排序，那是 O4，这里不预留开关。
+			if t.Color == 0 {
+				k := key{table: uint32(r.Table), prefix: prefix}
+				grouped[k] = append(grouped[k], c)
+			}
+			// 颜色表 t_c 只收颜色 c（policy 阶段的引流落点）。
+			ct, err := ColorTable(t.Color, uint32(r.Table))
+			if err != nil {
+				return p, err
+			}
+			ck := key{table: ct, prefix: prefix}
+			grouped[ck] = append(grouped[ck], c)
 		}
 	}
 
-	for k, paths := range grouped {
+	for k, list := range grouped {
+		win, lose := pickWinner(list)
+		if len(lose) > 0 {
+			names := make([]string, 0, len(lose))
+			for _, rd := range lose {
+				names = append(names, rdString(rd))
+			}
+			warn("表 %d %s: 来源 %v 送同一前缀但来源 VPN 不同（标签不同不能同桶），按 RD 择一保留 %s，其余本轮不下发",
+				k.table, k.prefix, names, rdString(win[0].rd))
+		}
+		tables[k.table] = true
+		paths := make([]Path, 0, len(win))
+		for _, c := range win {
+			paths = append(paths, c.Path)
+		}
 		// 去重 + 稳定排序：同一条路径被两个 RR 各反射一次是常态（双 RR 主备），
 		// 路径集合相同就不该产生一次下发。
 		sort.Slice(paths, func(i, j int) bool {
@@ -225,6 +357,10 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 		}
 		return p.Routes[i].Prefix.String() < p.Routes[j].Prefix.String()
 	})
+	for t := range tables {
+		p.Tables = append(p.Tables, t)
+	}
+	sort.Slice(p.Tables, func(i, j int) bool { return p.Tables[i] < p.Tables[j] })
 	sort.Strings(p.Warnings)
 	return p, nil
 }
@@ -295,16 +431,17 @@ func (a *Applier) Apply(ctx context.Context, next Plan) (Result, error) {
 	// 1. 表：新增的表先建。table 0 是 global 表（underlay 也在里面），本来就
 	//    存在，建不得也删不得。不删已经不在计划里的表 —— 表里可能还有本包没管
 	//    的路由（例如操作员手敲的）；删表会把它们一起带走。
+	//    表来自 next.Tables 而不是 Labels：颜色表不登记标签，但必须存在。
 	prevTables := map[uint32]bool{}
-	for _, l := range a.prev.Labels {
-		prevTables[l.Table] = true
+	for _, t := range a.prev.Tables {
+		prevTables[t] = true
 	}
-	for _, l := range next.Labels {
-		if l.Table == 0 || prevTables[l.Table] {
+	for _, t := range next.Tables {
+		if t == 0 || prevTables[t] {
 			continue
 		}
-		if err := a.dp.IPTableAddDel(ctx, l.Table, true); err != nil {
-			return res, fmt.Errorf("fib: 建 VRF 表 %d: %w", l.Table, err)
+		if err := a.dp.IPTableAddDel(ctx, t, true); err != nil {
+			return res, fmt.Errorf("fib: 建表 %d: %w", t, err)
 		}
 		res.TablesAdded++
 	}

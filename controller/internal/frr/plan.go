@@ -46,6 +46,8 @@ func ValidateTables(tables []Table) error {
 }
 
 // RIBRoute 是 sr-route /status 里喂给本包的最小形状。
+// VRF 是**目标主表**（/status 的 rib 键）：导通时要往客户内网通告的就是落进本机
+// 这张表的那条前缀，来源 VPN 只决定标签，与本包无关。
 type RIBRoute struct {
 	VRF      uint8
 	Prefix   string
@@ -83,7 +85,7 @@ func PlanFrom(tables []Table, routes []RIBRoute, distance uint8, metric uint32) 
 	for _, r := range routes {
 		tableID, ok := tableOf[r.VRF]
 		if !ok {
-			return Plan{}, fmt.Errorf("frr: RIB 里有 VRF %d 的路由（%s），但本机没配这个 VRF", r.VRF, r.Prefix)
+			return Plan{}, fmt.Errorf("frr: RIB 里有要落进 VRF %d 的路由（%s），但本机没配这个 VPN", r.VRF, r.Prefix)
 		}
 		if len(r.NextHops) == 0 {
 			continue
