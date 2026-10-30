@@ -115,9 +115,15 @@ func (f *fakeDP) CLI(_ context.Context, cmd string) (string, error) {
 	return "", nil
 }
 
-// planFrom 是"没有可达性信息"的 PlanFrom：这些用例只关心 RIB 的翻译。
+// planFrom 是"没有可达性信息、逃生开关关着"的 PlanFrom：这些用例只关心 RIB 的翻译。
 func planFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
-	return PlanFrom(vrfs, routes, tunnels, nil)
+	return PlanFrom(vrfs, routes, tunnels, nil, false)
+}
+
+// planEscape 只把逃生开关翻成"开"（§5）。开关影响的是**主表收哪些颜色**，
+// 颜色表两种情况下都照写，所以它必须和关着的那份逐条对比才有意义。
+func planEscape(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
+	return PlanFrom(vrfs, routes, tunnels, nil, true)
 }
 
 // ribOne 是单 VPN 的常见形状：来源 VPN 就是目标表。Origin 固定成一个正常设备号，
@@ -488,7 +494,7 @@ func TestPlanFromSkipsBFDDownPaths(t *testing.T) {
 			ribOne(100, "10.1.0.0/24", "10.255.0.2", "10.255.0.3"),
 			ribOne(100, "10.2.0.0/24", "10.255.0.3"),
 		},
-		tun, down,
+		tun, down, false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -522,7 +528,7 @@ func TestApplyBFDDownRemovesPath(t *testing.T) {
 	routes := []RIBRoute{
 		ribOne(100, "10.1.0.0/24", "10.255.0.2", "10.255.0.3"),
 	}
-	up, err := PlanFrom([]uint8{100}, routes, tun, nil)
+	up, err := PlanFrom([]uint8{100}, routes, tun, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +540,7 @@ func TestApplyBFDDownRemovesPath(t *testing.T) {
 	}
 
 	down, err := PlanFrom([]uint8{100}, routes, tun,
-		map[netip.Addr]bool{netip.MustParseAddr("10.255.0.3"): true})
+		map[netip.Addr]bool{netip.MustParseAddr("10.255.0.3"): true}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +577,7 @@ func TestApplyVPN0UsesGlobalTable(t *testing.T) {
 	plan, err := PlanFrom([]uint8{0},
 		[]RIBRoute{ribOne(0, "10.68.2.0/24", "192.168.99.2")},
 		[]Tunnel{{NextHop: "192.168.99.2", Interface: "wg0"}},
-		nil)
+		nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +599,6 @@ func TestApplyVPN0UsesGlobalTable(t *testing.T) {
 }
 
 // 逃生关（默认）的口径：主表只收颜色 0，非 0 颜色只活在它自己的颜色表里。
-// 打开开关（主表收全部颜色、靠 preference 排序）是 O4，不在这里测。
 func TestPlanFromColorPreference(t *testing.T) {
 	plan, err := PlanFrom(
 		[]uint8{100},
@@ -601,7 +606,7 @@ func TestPlanFromColorPreference(t *testing.T) {
 		[]Tunnel{
 			{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
 			{NextHop: "10.255.0.3", Interface: "wg1", Color: 7},
-		}, nil)
+		}, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,11 +627,196 @@ func TestPlanFromColorPreference(t *testing.T) {
 	}
 }
 
+// 逃生开关打开（§5）：主表收全部颜色，谁先用交给 VPP 按 preference 排（§2.1）。
+// 颜色表**两种情况下都照写** —— 它是 policy 阶段引流的落点，不是开关的替代品，
+// 所以这里断言的是"开关只多出一份主表路径，颜色表一条不多一条不少"。
+func TestPlanFromEscapePutsAllColorsInMainTable(t *testing.T) {
+	vrfs := []uint8{100}
+	routes := []RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2", "10.255.0.3")}
+	tunnels := []Tunnel{
+		{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
+		{NextHop: "10.255.0.3", Interface: "wg1", Color: 7},
+	}
+	off, err := PlanFrom(vrfs, routes, tunnels, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	on, err := planEscape(vrfs, routes, tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	main := mustRoute(t, on, 100, "10.1.0.0/24")
+	if len(main.Paths) != 2 {
+		t.Fatalf("逃生开：主表 paths = %+v, want 两条都在主表里", main.Paths)
+	}
+	for _, want := range []struct {
+		iface string
+		pref  uint8
+	}{{"wg0", PrefBase}, {"wg1", PrefBase + 7}} {
+		found := false
+		for _, p := range main.Paths {
+			if p.Interface == want.iface && p.Preference == want.pref {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("主表缺 %s（pref %d）: %+v", want.iface, want.pref, main.Paths)
+		}
+	}
+	// 颜色表与开关无关：把关掉时那两张表原样比一遍。
+	for _, ct := range []uint32{colorTable(t, 0, 100), colorTable(t, 7, 100)} {
+		offR, onR := mustRoute(t, off, ct, "10.1.0.0/24"), mustRoute(t, on, ct, "10.1.0.0/24")
+		if len(offR.Paths) != len(onR.Paths) || offR.Paths[0] != onR.Paths[0] {
+			t.Errorf("颜色表 %d 被开关改动了: 关 %+v 开 %+v", ct, offR.Paths, onR.Paths)
+		}
+	}
+	// 开关不新增路由对象、也不多建一张表：主表 100 本来就在（Tables 由 vrfs 打底），
+	// 两个颜色同前缀又落进同一个桶。所以差异只体现在**桶里的路径数**。
+	if len(on.Routes) != len(off.Routes) || len(on.Tables) != len(off.Tables) {
+		t.Errorf("开/关的 routes=%d tables=%d，关 routes=%d tables=%d，want 数量都不变",
+			len(on.Routes), len(on.Tables), len(off.Routes), len(off.Tables))
+	}
+	if offMain := mustRoute(t, off, 100, "10.1.0.0/24"); len(offMain.Paths) != 1 ||
+		offMain.Paths[0].Interface != "wg0" {
+		t.Errorf("逃生关：主表 paths = %+v, want 只有颜色 0 的 wg0", offMain.Paths)
+	}
+}
+
+// 开关最尖锐的差别在"只剩昂贵颜色"时（§5 口径）：关 ⇒ 这条前缀在主表里**不存在**，
+// 打流直接丢，不回落给昂贵颜色买单；开 ⇒ 主表用那条颜色 7 兜住，pref 仍是 230+色。
+// 两种情况下颜色表 17100 都照写 —— 它是 policy 阶段的落点，不是开关的替身。
+func TestPlanFromEscapeDecidesWhetherExpensiveColorSurvives(t *testing.T) {
+	vrfs := []uint8{100}
+	routes := []RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.3")}
+	tunnels := []Tunnel{{NextHop: "10.255.0.3", Interface: "wg1", Color: 7}}
+
+	off, err := planFrom(vrfs, routes, tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := routeAt(t, off, 100, "10.1.0.0/24"); ok {
+		t.Errorf("逃生关：主表 100 里有 %s（paths %+v），want 这条前缀不存在", r.Prefix, r.Paths)
+	}
+	offColor := mustRoute(t, off, colorTable(t, 7, 100), "10.1.0.0/24")
+	if len(offColor.Paths) != 1 || offColor.Paths[0].Preference != PrefBase+7 {
+		t.Errorf("逃生关：颜色表 paths = %+v, want wg1 pref %d", offColor.Paths, PrefBase+7)
+	}
+
+	on, err := planEscape(vrfs, routes, tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onMain := mustRoute(t, on, 100, "10.1.0.0/24")
+	if len(onMain.Paths) != 1 || onMain.Paths[0].Interface != "wg1" ||
+		onMain.Paths[0].Preference != PrefBase+7 {
+		t.Errorf("逃生开：主表 paths = %+v, want wg1 pref %d", onMain.Paths, PrefBase+7)
+	}
+	onColor := mustRoute(t, on, colorTable(t, 7, 100), "10.1.0.0/24")
+	if len(onColor.Paths) != len(offColor.Paths) || onColor.Paths[0] != offColor.Paths[0] {
+		t.Errorf("逃生开改动颜色表: 关 %+v 开 %+v", offColor.Paths, onColor.Paths)
+	}
+	// 主表本来就是 vrfs 打底的表，开关不该多建表 —— 只多出一条路由对象。
+	if len(on.Tables) != len(off.Tables) {
+		t.Errorf("建表数 = %+v / %+v, want 相同", on.Tables, off.Tables)
+	}
+	if len(on.Routes) != len(off.Routes)+1 {
+		t.Errorf("routes 数 = %d / %d, want 开的时候多主表那一条", len(on.Routes), len(off.Routes))
+	}
+}
+
+// 负向：逃生开关**不放松**"同标签才同桶"。开关影响的是主表收哪些颜色（同一来源
+// VPN 的不同隧道），不是收哪些来源（不同标签）。两个来源送同一前缀时，主表仍只留
+// RD 胜者那个标签 —— 否则 §2.4 的静默投递会换个理由从逃生开关里回来。
+func TestPlanFromEscapeDoesNotRelaxLabelBucket(t *testing.T) {
+	plan, err := planEscape(
+		[]uint8{40},
+		[]RIBRoute{
+			ribCross(40, 41, 2, "10.44.0.0/24", "10.255.0.2"),
+			ribCross(40, 42, 2, "10.44.0.0/24", "10.255.0.2"),
+		},
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 3}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []uint32{40, colorTable(t, 3, 40)} {
+		main := mustRoute(t, plan, table, "10.44.0.0/24")
+		if len(main.Paths) != 1 || main.Paths[0].Label != LabelFor(41) {
+			t.Errorf("表 %d paths = %+v, want 只有 1041 那个标签的一条", table, main.Paths)
+		}
+	}
+	joined := strings.Join(plan.Warnings, "; ")
+	if !strings.Contains(joined, "择一") {
+		t.Errorf("warnings = %v, want 有择一警告", plan.Warnings)
+	}
+}
+
+// 逃生开关存在的理由就是这一格：颜色 0 被 BFD 判死之后主表还剩什么。开 ⇒ 主表
+// 留下昂贵颜色的路径（pref=230+色 保证 VPP 先挑颜色 3 再挑颜色 7，§2.1 实测
+// down 顶上/up 回落是原生行为）；关 ⇒ 主表这条前缀直接消失，打流宁丢不买单。
+// 这是 O4 lab 判据的单元镜像，两边对的是同一件事。
+func TestPlanFromColorZeroDownWithEscape(t *testing.T) {
+	vrfs := []uint8{100}
+	routes := []RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2", "10.255.0.3", "10.255.0.4")}
+	tunnels := []Tunnel{
+		{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
+		{NextHop: "10.255.0.3", Interface: "wg1", Color: 7},
+		{NextHop: "10.255.0.4", Interface: "wg2", Color: 3},
+	}
+	down := map[netip.Addr]bool{netip.MustParseAddr("10.255.0.2"): true}
+
+	on, err := PlanFrom(vrfs, routes, tunnels, down, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := mustRoute(t, on, 100, "10.1.0.0/24")
+	if len(main.Paths) != 2 {
+		t.Fatalf("逃生开、颜色 0 down：主表 paths = %+v, want wg1+wg2 两条", main.Paths)
+	}
+	// 计划不按 pref 排序（顺序交给 VPP 判定），钉的是每条路径的 pref 等于 230+色。
+	wantPref := map[string]uint8{"wg1": PrefBase + 7, "wg2": PrefBase + 3}
+	for _, p := range main.Paths {
+		if p.Interface == "wg0" {
+			t.Errorf("逃生开：主表里还有 down 掉的 wg0（%+v）", main.Paths)
+			continue
+		}
+		if p.Preference != wantPref[p.Interface] {
+			t.Errorf("%s 的 pref = %d, want %d（230+颜色）", p.Interface, p.Preference, wantPref[p.Interface])
+		}
+		delete(wantPref, p.Interface)
+	}
+	if len(wantPref) != 0 {
+		t.Errorf("主表缺路径 %v（现有 %+v）", wantPref, main.Paths)
+	}
+	// 颜色 0 表也一起空掉：那条路径已经跳过，桶里没东西就不会建这张表的路由。
+	if _, ok := routeAt(t, on, colorTable(t, 0, 100), "10.1.0.0/24"); ok {
+		t.Errorf("逃生开：颜色 0 表里仍有路径，want 没有（唯一的下一跳已 down）")
+	}
+
+	off, err := PlanFrom(vrfs, routes, tunnels, down, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := routeAt(t, off, 100, "10.1.0.0/24"); ok {
+		t.Errorf("逃生关、颜色 0 down：主表 100 里还有这条前缀，want 不存在（§5 不回落）")
+	}
+	// 颜色表两侧都照写：policy 引流不靠开关，别把它当逃生开关的替代品删了。
+	for _, c := range []uint8{3, 7} {
+		ct, err := ColorTable(c, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustRoute(t, off, ct, "10.1.0.0/24")
+		mustRoute(t, on, ct, "10.1.0.0/24")
+	}
+}
+
 func TestPlanFromRejectsBadColor(t *testing.T) {
 	_, err := PlanFrom(
 		[]uint8{100},
 		[]RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2")},
-		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 230}}, nil)
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 230}}, nil, false)
 	if err == nil {
 		t.Fatal("Color 230 (230+230 > 255) must fail")
 	}

@@ -30,11 +30,15 @@ import (
 )
 
 type fileConfig struct {
-	StatusURL string         `json:"status_url"`
-	VPPSocket string         `json:"vpp_socket"`
-	PollSec   int            `json:"poll_sec"`
-	VRFs      []uint8        `json:"vrfs"`
-	Tunnels   []tunnelConfig `json:"tunnels"`
+	StatusURL string `json:"status_url"`
+	VPPSocket string `json:"vpp_socket"`
+	PollSec   int    `json:"poll_sec"`
+	// Escape 是草案 §3.1 的 escape_all_colors（§5.2 逃生开关），租户级。
+	// 键名与草案逐字一致：读配置用了 DisallowUnknownFields，将来控制器
+	// 打包（O6）时两边名字对不上会当场报错，而不是静默按默认关跑。
+	Escape  bool           `json:"escape_all_colors"`
+	VRFs    []uint8        `json:"vrfs"`
+	Tunnels []tunnelConfig `json:"tunnels"`
 }
 
 // tunnelConfig 是控制面分配的隧道映射。下一跳必须与 RIB 里 next_hops 的某个元素逐字相同。
@@ -205,7 +209,7 @@ func main() {
 		if err != nil {
 			return fmt.Errorf("读 BFD 会话: %w", err)
 		}
-		plan, err := fib.PlanFrom(cfg.VRFs, routes, tunnels, fib.UnreachablePeers(sessions))
+		plan, err := fib.PlanFrom(cfg.VRFs, routes, tunnels, fib.UnreachablePeers(sessions), cfg.Escape)
 		if err != nil {
 			return err
 		}
@@ -236,8 +240,8 @@ func main() {
 	}
 
 	interval := time.Duration(cfg.PollSec) * time.Second
-	log.Printf("sr-fib: %d 个 VRF、%d 条隧道，每 %s 从 %s 收敛一次",
-		len(cfg.VRFs), len(tunnels), interval, cfg.StatusURL)
+	log.Printf("sr-fib: %d 个 VRF、%d 条隧道，每 %s 从 %s 收敛一次（逃生开关=%v）",
+		len(cfg.VRFs), len(tunnels), interval, cfg.StatusURL, cfg.Escape)
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {

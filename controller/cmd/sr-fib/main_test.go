@@ -56,3 +56,31 @@ func TestLoadConfigRejectsUnknownTunnelField(t *testing.T) {
 		t.Fatalf("未知字段应被拒并点名，实际 %v", err)
 	}
 }
+
+// 逃生开关的键名就是草案 §3.1 的 escape_all_colors，这条测试钉的是"键名即契约"：
+// O6 控制器打包时用的必须是同一个名字。缺省必须是关（§5.2：默认 false，昂贵颜色
+// 不被默认流量占用），写 true 才开。开关读丢了不会报错 —— 路由照样装得上，只是
+// 颜色 0 全 down 后主表直接没这条前缀，于是这个静默要由测试来堵。
+func TestLoadConfigEscapeSwitch(t *testing.T) {
+	off, err := loadConfig(writeCfg(t, `{
+  "status_url": "http://127.0.0.1:19001/status",
+  "vrfs": [10]
+}`))
+	if err != nil {
+		t.Fatalf("不带开关的配置读不了: %v", err)
+	}
+	if off.Escape {
+		t.Errorf("缺省 Escape = %v, want false（§5.2 默认关）", off.Escape)
+	}
+	on, err := loadConfig(writeCfg(t, `{
+  "status_url": "http://127.0.0.1:19001/status",
+  "vrfs": [10],
+  "escape_all_colors": true
+}`))
+	if err != nil {
+		t.Fatalf("开关打开的配置读不了: %v", err)
+	}
+	if !on.Escape {
+		t.Errorf("escape_all_colors=true 没读进 Escape（%v）", on.Escape)
+	}
+}

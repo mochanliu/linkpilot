@@ -208,10 +208,16 @@ func pickWinner(list []cand) (win []cand, losers []uint32) {
 // 可达性信息，所有路径保留。显式不可达的路径与"下一跳不在隧道表里"同样处理：
 // 跳过它、留一条 warning，而不是把整条前缀撤掉 —— 同前缀可能还有别的隧道。
 //
+// escape 是 §5 的逃生开关：关掉（默认）时主表只收颜色 0 的路径，颜色 0 全 down
+// 就等于这个前缀在主表里不存在（宁丢不占昂贵颜色）；打开时主表收全部颜色，
+// 谁先用由 preference=230+颜色 交给 VPP 原生排序（§2.1 实测 down 顶上、up 回落
+// 都不需要我们再下发）。**颜色表两种情况下都照写**——它是 policy 阶段引流的落点，
+// 不是逃生开关的替代品。
+//
 // 装表算法是草案 §4.3 的六步，逐字对应：RT 命中哪些本机 VRF（=routes 里的 Table，
 // sr-route 已经算好）→ 标签取来源 VPN → 候选路径按颜色分进主表/颜色表 →
 // 同前缀多来源标签先择一 → 整条交给 Applier 替换。
-func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool) (Plan, error) {
+func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool, escape bool) (Plan, error) {
 	var p Plan
 	if len(vrfs) == 0 {
 		return p, fmt.Errorf("fib: 没有配置任何 VRF，无事可做")
@@ -302,10 +308,11 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 				continue
 			}
 			c := cand{Path: Path{NextHop: nh, Interface: t.Interface, Label: label, Preference: PrefBase + t.Color}, rd: rd}
-			// §4.3 第 5 步，逃生开关**关**（默认）：主表只收颜色 0 的路径 ——
-			// 颜色 0 全 down 时这个前缀在主表里就不存在了（宁丢不占昂贵颜色）。
-			// 打开时主表要收全部颜色、靠 preference 排序，那是 O4，这里不预留开关。
-			if t.Color == 0 {
+			// §4.3 第 5 步：主表收哪些颜色由逃生开关决定。关（默认）⇒ 只收颜色 0，
+			// 于是"颜色 0 全 down"时这个前缀在主表里就不存在了（宁丢不占昂贵颜色）；
+			// 开 ⇒ 全部颜色都进主表，靠 preference=230+颜色 让 VPP 自己排（§2.1 实测
+			// down 顶上、up 回落都是原生行为，我们只负责把集合与 pref 写对）。
+			if t.Color == 0 || escape {
 				k := key{table: uint32(r.Table), prefix: prefix}
 				grouped[k] = append(grouped[k], c)
 			}
