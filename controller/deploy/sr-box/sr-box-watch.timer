@@ -1,0 +1,19 @@
+# 触发 sr-box-watch.service：开机 60 秒后第一次（给 systemd 自己的 vpp/frr 留时间），
+# 之后每 60 秒一次。
+#
+# Persistent=true：盒子关机期间错过的轮次，开机后补一次 —— 这正是"开机自动启动"
+# 在 timer 形态下的意思（清单本身不关心自己是开机第一次跑还是第 300 次跑）。
+#
+# **未在 lab 实测**（lab 容器里没有 systemd）。
+
+[Unit]
+Description=Re-run the sr-box boot checklist every minute
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Persistent=true
+Unit=sr-box-watch.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+# 每 60 秒把同一份开机清单再跑一遍 —— 这就是这台盒子的进程看护。
+#
+# 只有在清单幂等的前提下才安全：已经在跑的进程不会被重启（start.sh 的每一步先问
+# "在不在"，在就报一句 running 就过去），所以这条 timer 唯一能做的事是补上真死了
+# 的那一步。O5 之后改配置不再需要重启进程，这条也就不会在任何正常操作里动到谁。
+#
+# 装在 /etc/systemd/system/，与 sr-box.service 一起 enable：
+#   systemctl enable --now sr-box-watch.timer
+#
+# **未在 lab 实测**（lab 容器里没有 systemd）。
+
+[Unit]
+Description=sr-box checklist watchdog (idempotent re-run)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/sr-box/start.sh up
+# 上一次没跑完就跳过这一轮，别让等待中的步骤叠成堆。
+# 日志只追加在 start.sh 里，这里不重复落盘。
+Nice=10

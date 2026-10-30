@@ -1,0 +1,54 @@
+# systemd 薄壳：开机把 sr-box 那份清单跑一遍。
+#
+# 装法（真盒子）：
+#   install -m 0755 start.sh /usr/local/lib/sr-box/start.sh
+#   install -m 0644 sr-box.service sr-box-watch.service sr-box-watch.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable sr-box.service sr-box-watch.timer
+#
+# 这个 unit 里没有任何"怎么起"的知识 —— 顺序、门控、就绪判据全在 start.sh，
+# 因为同一个盒子在没有 systemd 的形态（容器 / 最小镜像）里必须走同一份清单。
+# 两处各写一遍必然走样。
+#
+# 为什么 Type=oneshot 而不是六个 service：清单跑到最后一步就结束，进程是它 nohup
+# 起来的孤儿。换成 per-process unit 会把那份顺序复制六遍，而 O5 之后进程本来就不
+# 该被重启（改配置走 PUT / 发布），"每个进程一个常驻 unit"这条动机已经不成立了。
+#
+# PartOf=vpp.service：VPP 停掉时这份清单也该停；VPP 重启时 sr-box 重新跑一遍
+# start.sh up —— 清单幂等，活着的进程一个都不会被重启，只有真死了的那些会被补上。
+# 反过来 sr-box 停了不影响 VPP（VPP 是数据面，不归这份清单管）。
+#
+# 崩溃恢复由 sr-box-watch.timer 负责：它每分钟把同一份 up 再跑一遍，缺哪步补哪步。
+# 这一条只在"清单幂等"成立时才安全，也正因此才值得用，而不是给每个进程配
+# Restart=on-failure 再去复制那份顺序。
+#
+# **未在 lab 实测**：lab 的容器里没有 systemd（VPP 用 script(1) 起，FRR 用
+# frrinit.sh）。实测的部分是这份清单本身（test/scripts/test-boot.sh：冷启动容器后
+# 一条命令把 VPP + 磁盘上那版配置 + 路由面拉回来）；这两个 unit 只是它的调用点。
+#
+# 一条已知的边界（写在 start.sh 里，这里只是提醒）：开机时如果控制器不可达，
+# sr-agent -tunnels 拿不到隧道期望值，盒子会带着"路由面在、隧道 0 条"起来。
+# 磁盘上现在没有那份隧道表。
+#
+# 与 sr-apply.service（controller/deploy/sr-apply.service）的关系：那个 unit 是 #99 为
+# "VPP 单独重启"配的，两个都启用时清单里的 apply 那一步会把同一份配置**再重放一遍**。
+# sr-apply boot 没有"已经装过就跳过"这回事（internal/apply/apply.go:446 直接 replay），
+# 它逐条重跑 bundle 里的 vppctl 行与 boot.sh —— 是否无害取决于那些命令本身幂不幂等
+# （`set interface ip address`、`ip route replace`、`mpls table add` 都幂等）。
+# 只想留一个调用点的话禁掉 sr-apply.service 即可：清单覆盖得到同样的顺序。
+
+[Unit]
+Description=sr-box boot checklist (VPP -> config replay -> route plane)
+After=vpp.service sr-apply.service frr.service
+Wants=vpp.service sr-apply.service
+PartOf=vpp.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/sr-box/start.sh up
+ExecStop=/usr/local/lib/sr-box/start.sh stop
+# 清单里每一步都有自己的等待上限，这里给整个一次开机留 5 分钟。
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

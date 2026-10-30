@@ -342,6 +342,32 @@ frr-start`，三个单元最后都是 active。
 lab 的三台 `lab-cpeN` 仍然按 [bringup.sh](bringup.sh) 手写的数据面计划运行——
 推送通道搬的是客户侧基础配置，不碰隧道、端口和 VRF。
 
+## 盒子开机清单（O5-d，2026-10-30）
+
+一台盒子从上电到"路由面自己在"的那几步，现在只写在一处：
+[controller/deploy/sr-box/start.sh](../../controller/deploy/sr-box/start.sh)
+（装到盒子上是 `/usr/local/lib/sr-box/start.sh`）。三个入口：
+
+```bash
+docker exec srwg-node1 /usr/local/lib/sr-box/start.sh check   # 只读：每步门控 + 现状
+docker exec srwg-node1 /usr/local/lib/sr-box/start.sh up      # 幂等地补上没在跑的那几步
+docker exec srwg-node1 /usr/local/lib/sr-box/start.sh stop    # 只停清单自己起的 sr-* 进程
+```
+
+顺序 `vpp → apply → frr → agent → route → fib → bridge → 隧道核验`，全部路径可以在
+`/etc/sr-box/sr-box.conf` 里逐项覆盖。**lab 是这份清单的"没有 systemd"形态**：容器里
+PID 1 是 bash，所以 `vpp` 那一步是真启动（走 `start-node.sh` 那条伪终端路径），
+而"谁跑第一遍 up"是人 —— 判据脚本
+[test/scripts/test-boot.sh](../scripts/test-boot.sh)（69 条断言，需先
+`test-e2e.sh --keep`）就是照这个形状写的：热 VPP 一遍 up、只杀 sr-route 再 up、
+`docker restart` 两个容器后每台盒子只敲一条 up。跑完会自己收尾（`--keep` 可留着看）。
+
+三条实测到的边界，别再当成 bug 查：隧道那一层清单恢复不了（wg 口的期望值在控制器上，
+磁盘上没有那份表，`up` 的结论会明写 `tunnels 0 条`）；`--restart unless-stopped`
+（已加进 [docker-compose.yml](../docker/docker-compose.yml)，node1/2 也用
+`docker update` 就地生效）只保证容器自己没了会被拉回来，**不会**替盒子跑清单；
+两个 systemd 薄壳单元**未在 lab 实测**（这里没有 systemd）。
+
 ## 配置发布与设备拉取（推送通道，2026-10-28）
 
 方向是设计本身：控制器**从不主动拨盒子**（CPE 在 NAT 后面，拨不到）。租户在

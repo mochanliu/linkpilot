@@ -7,6 +7,14 @@ services:
     image: srwg-dev:latest
     container_name: srwg-node1
     hostname: node1
+    # O5-d 的容器形态：这些盒子的 CMD 是 /bin/bash（PID 1 不是清单），所以这一条
+    # 只解决"容器自己没了 / Docker Desktop 重启之后容器还在不在"，它**不会**替盒子
+    # 跑 deploy/sr-box/start.sh —— 那一步在真盒子形态由 sr-box.service 跑，在 lab 里
+    # 由人（或判据脚本）跑一遍。实测（2026-10-30，同镜像的一次性容器）：进程自己退出
+    # （exit 0）会被拉回来，12 秒内 RestartCount 涨到 3；`docker kill` 算人为停止，
+    # **不**会自动重启。srwg-node1/2 已用 `docker update --restart=unless-stopped`
+    # 就地生效，这一行是为了下次重建容器时还在。transit 与终端保持 no（它们不是盒子）。
+    restart: unless-stopped
     privileged: true
     tty: true
     stdin_open: true
