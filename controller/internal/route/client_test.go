@@ -53,7 +53,15 @@ func startClient(t *testing.T, cfg ClientConfig) *Client {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	waitForWithin(t, 5*time.Second, what, cond)
+}
+
+// waitForWithin is waitFor with a chosen budget, for the cases where the thing
+// being waited for is a reconnect: the backoff caps at 5 s, so "RR is back and
+// carrying the new table" can legitimately take longer than the default.
+func waitForWithin(t *testing.T, within time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -616,5 +624,362 @@ func TestAllRIBAndEmptyWhenStopped(t *testing.T) {
 	waitFor(t, "table cleared when no RR is usable", func() bool {
 		st := c.Stats()
 		return st.ActiveRR == -1 && len(c.AllRIB()) == 0
+	})
+}
+
+// scriptedRR is a controllable RR: it handshakes, records everything the client
+// writes, and lets the test push frames at an exact moment. The real Reflector
+// cannot produce the states SetTunnels has to survive -- it never reflects a
+// route over an adjacency it does not have, and "we hold a route whose tunnel the
+// operator has not configured yet" is precisely the state O5 exists for.
+type scriptedRR struct {
+	mu     sync.Mutex
+	frames []Envelope
+	push   chan Envelope
+}
+
+func newScriptedRR() *scriptedRR {
+	return &scriptedRR{push: make(chan Envelope, 32)}
+}
+
+func (s *scriptedRR) dial(ctx context.Context, addr string) (net.Conn, error) {
+	srv, cli := net.Pipe()
+	go func() {
+		defer srv.Close()
+		br := bufio.NewReader(srv)
+		if _, err := ReadEnvelope(br); err != nil { // hello
+			return
+		}
+		if err := WriteEnvelope(srv, Envelope{Type: MsgHelloOK, Version: ProtocolVersion, RRID: "script", HoldSec: 30}); err != nil {
+			return
+		}
+		go func() {
+			for {
+				env, err := ReadEnvelope(br)
+				if err != nil {
+					return
+				}
+				s.mu.Lock()
+				s.frames = append(s.frames, env)
+				s.mu.Unlock()
+			}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case env := <-s.push:
+				if err := WriteEnvelope(srv, env); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return cli, nil
+}
+
+func (s *scriptedRR) send(env Envelope) {
+	s.push <- env
+}
+
+// announce hands the client a snapshot: routes then EOR. The client serves from
+// one RR only after its EOR, so a script that just sends routes would leave the
+// table invisible.
+func (s *scriptedRR) announce(routes ...Route) {
+	s.send(Envelope{Type: MsgAnnounce, Routes: routes})
+	s.send(Envelope{Type: MsgEOR})
+}
+
+// tables returns the tunnel tables the client wrote, oldest first. The first one
+// is the session's snapshot; more entries mean a live replacement.
+func (s *scriptedRR) tables() [][]Tunnel {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out [][]Tunnel
+	for _, env := range s.frames {
+		if env.Type == MsgTunnels && env.Tunnels != nil {
+			out = append(out, *env.Tunnels)
+		}
+	}
+	return out
+}
+
+func TestSetTunnelsInstallsRoutesHeldForWantOfAPath(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(22, 5, "10.22.0.0/16", "65000:6")
+	rr.announce(rt)
+	waitFor(t, "route held as pending", func() bool {
+		p := c.Pending()
+		return len(p) == 1 && p[0].Reason == PendingNoPath && p[0].Prefix == "10.22.0.0/16"
+	})
+	if n := len(c.RIB(5)); n != 0 {
+		t.Fatalf("installed a route with no path: %v", ribPrefixes(c.RIB(5)))
+	}
+	before := c.Stats()
+	if before.DroppedNoPath != 1 || before.ActivePending != 1 {
+		t.Fatalf("counters = %+v", before)
+	}
+
+	// Add the tunnel. No second announce is needed: the route is already here.
+	if err := c.SetTunnels([]Tunnel{
+		{Peer: 20, NextHop: "192.168.99.2"},
+		{Peer: 22, NextHop: "192.168.100.2"},
+	}); err != nil {
+		t.Fatalf("SetTunnels: %v", err)
+	}
+	got := c.RIB(5)
+	if len(got) != 1 || got[0].Prefix != "10.22.0.0/16" || len(got[0].NextHops) != 1 ||
+		got[0].NextHops[0] != "192.168.100.2" {
+		t.Fatalf("rib = %v", ribPrefixes(got))
+	}
+	if n := len(c.Pending()); n != 0 {
+		t.Fatalf("pending = %d, want 0", n)
+	}
+	// Event counters: the recompute must not count the route as newly imported.
+	after := c.Stats()
+	if after.Imported != before.Imported || after.DroppedNoPath != before.DroppedNoPath {
+		t.Fatalf("recompute rewrote the counters: %+v -> %+v", before, after)
+	}
+	// The RR has to be told: it decides what to reflect to us at all.
+	waitFor(t, "the RR to be told the new table", func() bool {
+		tb := rr.tables()
+		return len(tb) == 2 && len(tb[1]) == 2
+	})
+}
+
+func TestSetTunnelsRemovesPathAndRouteLeavesTheTable(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
+	rr.announce(rt)
+	waitFor(t, "route imported", func() bool { return len(c.RIB(5)) == 1 })
+	before := c.Stats()
+	if before.Imported != 1 {
+		t.Fatalf("counters = %+v", before)
+	}
+
+	if err := c.SetTunnels(nil); err != nil {
+		t.Fatalf("SetTunnels(nil): %v", err)
+	}
+	if n := len(c.RIB(5)); n != 0 {
+		t.Fatalf("route survived its last tunnel: %v", ribPrefixes(c.RIB(5)))
+	}
+	// It is not gone: it is held, and the console has to be able to say that.
+	p := c.Pending()
+	if len(p) != 1 || p[0].Reason != PendingNoPath {
+		t.Fatalf("pending = %+v", p)
+	}
+	after := c.Stats()
+	if after.Imported != before.Imported || after.Withdrawn != before.Withdrawn {
+		t.Fatalf("recompute rewrote the counters: %+v -> %+v", before, after)
+	}
+	waitFor(t, "the RR to be told the table is empty", func() bool {
+		tb := rr.tables()
+		return len(tb) == 2 && len(tb[1]) == 0
+	})
+}
+
+func TestClientWithNoTunnelsAnnouncesAnEmptyTable(t *testing.T) {
+	// A device that has not been given a tunnel yet must still hold a session:
+	// its table travels as [], not as a missing field, and the RR waits for it
+	// rather than rejecting the frame.
+	rr := newTestReflector(t, ReflectorConfig{})
+	srv := newTestRRSrv(t, rr, 10)
+	cfg := testClientConfig()
+	cfg.Tunnels = nil
+	cfg.Dial = srv.dial
+	c := startClient(t, cfg)
+	waitFor(t, "the RR to record an empty tunnel table", func() bool {
+		sn := rr.Sessions()
+		return len(sn) == 1 && sn[0].Tunnels == 0
+	})
+	waitFor(t, "client synced", func() bool { return c.Stats().ActiveRR == 0 })
+
+	// And clearing the last tunnel of a running session reaches the RR the same
+	// way instead of dropping the session.
+	if err := c.SetTunnels([]Tunnel{{Peer: 20, NextHop: "192.168.99.2"}}); err != nil {
+		t.Fatalf("SetTunnels: %v", err)
+	}
+	waitFor(t, "the RR to see one tunnel", func() bool {
+		sn := rr.Sessions()
+		return len(sn) == 1 && sn[0].Tunnels == 1
+	})
+	if err := c.SetTunnels(nil); err != nil {
+		t.Fatalf("SetTunnels(nil): %v", err)
+	}
+	waitFor(t, "the RR to see the table emptied again", func() bool {
+		st := c.Stats()
+		sn := rr.Sessions()
+		return len(sn) == 1 && sn[0].Tunnels == 0 && st.Sessions[0].Connected && st.ActiveRR == 0
+	})
+}
+
+func TestSetVRFsImportChangeMovesHeldRoutesBothWays(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(20, 5, "10.20.0.0/16", "65000:7") // vrf 5 imports 65000:6 only
+	rr.announce(rt)
+	waitFor(t, "route held for RT", func() bool {
+		p := c.Pending()
+		return len(p) == 1 && p[0].Reason == PendingRTMismatch
+	})
+	before := c.Stats()
+	if before.DroppedRTMismatch != 1 || before.Imported != 0 {
+		t.Fatalf("counters = %+v", before)
+	}
+
+	// A VPN added later picks up the prefixes that are already in adj-RIBs-in.
+	if err := c.SetVRFs([]VRFConfig{
+		{ID: 5, ExportRTs: []string{"65000:5"}, ImportRTs: []string{"65000:6"}},
+		{ID: 6, ExportRTs: []string{"65000:6"}, ImportRTs: []string{"65000:7"}},
+	}); err != nil {
+		t.Fatalf("SetVRFs: %v", err)
+	}
+	got := c.RIB(6)
+	if len(got) != 1 || got[0].Prefix != "10.20.0.0/16" {
+		t.Fatalf("vrf 6 = %v", ribPrefixes(got))
+	}
+	if n := len(c.RIB(5)); n != 0 {
+		t.Fatalf("vrf 5 = %v, must not import 65000:7", ribPrefixes(c.RIB(5)))
+	}
+	after := c.Stats()
+	if after.Imported != before.Imported || after.DroppedRTMismatch != before.DroppedRTMismatch {
+		t.Fatalf("recompute rewrote the counters: %+v -> %+v", before, after)
+	}
+
+	// And removing the import again takes it out of the table, without a withdraw.
+	if err := c.SetVRFs([]VRFConfig{
+		{ID: 5, ExportRTs: []string{"65000:5"}, ImportRTs: []string{"65000:6"}},
+	}); err != nil {
+		t.Fatalf("SetVRFs back: %v", err)
+	}
+	if n := len(c.AllRIB()[6]); n != 0 {
+		t.Fatalf("vrf 6 still has %d routes after its import RTs were removed", n)
+	}
+	if p := c.Pending(); len(p) != 1 || p[0].Reason != PendingRTMismatch {
+		t.Fatalf("pending = %+v", p)
+	}
+	if got := c.AllRIB(); len(got) != 0 {
+		t.Fatalf("rib = %v", got)
+	}
+}
+
+func TestSetVRFsRestampsAndWithdrawsLocalRoutes(t *testing.T) {
+	rr := newTestReflector(t, ReflectorConfig{})
+	srv := newTestRRSrv(t, rr, 10)
+	cfg := testClientConfig()
+	cfg.VRFs = []VRFConfig{
+		{ID: 5, ExportRTs: []string{"65000:5"}, ImportRTs: []string{"65000:6"}},
+		{ID: 6, ExportRTs: []string{"65000:6"}, ImportRTs: []string{"65000:9"}},
+	}
+	cfg.LocalPrefixes = []LocalPrefix{
+		{VRFID: 5, Prefix: "10.10.0.0/16"},
+		{VRFID: 6, Prefix: "10.20.0.0/16"},
+	}
+	cfg.Dial = srv.dial
+	c := startClient(t, cfg)
+	waitFor(t, "the RR holds both prefixes", func() bool { return len(rr.RoutesOf(10)) == 2 })
+
+	// Drop vrf 6 and change vrf 5's export RT in one step. The prefix on the
+	// removed VRF must leave the RR -- a route announced with the RTs of a VRF
+	// nobody configured would be imported by a policy that no longer exists.
+	if err := c.SetVRFs([]VRFConfig{
+		{ID: 5, ExportRTs: []string{"65000:51"}, ImportRTs: []string{"65000:6"}},
+	}); err != nil {
+		t.Fatalf("SetVRFs: %v", err)
+	}
+	waitFor(t, "the RR to hold one re-stamped prefix", func() bool {
+		rs := rr.RoutesOf(10)
+		return len(rs) == 1 && rs[0].Prefix == "10.10.0.0/16" &&
+			len(rs[0].RTs) == 1 && rs[0].RTs[0] == "65000:51"
+	})
+	if lp := c.LocalSkips(); len(lp) != 1 || lp[0].VRFID != 6 ||
+		lp[0].Prefix != "10.20.0.0/16" || lp[0].Reason != SkipVRFUnconfigured {
+		t.Fatalf("local skips = %+v", lp)
+	}
+
+	// Put the VRF back: the prefix was kept as an input, so it comes back on its
+	// own -- no restart, no re-push of the local config.
+	if err := c.SetVRFs([]VRFConfig{
+		{ID: 5, ExportRTs: []string{"65000:51"}, ImportRTs: []string{"65000:6"}},
+		{ID: 6, ExportRTs: []string{"65000:6"}, ImportRTs: []string{"65000:9"}},
+	}); err != nil {
+		t.Fatalf("SetVRFs again: %v", err)
+	}
+	waitFor(t, "the RR holds both prefixes again", func() bool { return len(rr.RoutesOf(10)) == 2 })
+	if n := len(c.LocalSkips()); n != 0 {
+		t.Fatalf("local skips = %+v", c.LocalSkips())
+	}
+}
+
+func TestRejectedChangeLeavesTheTablesAlone(t *testing.T) {
+	cfg := testClientConfig()
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"tunnel to this device", c.SetTunnels([]Tunnel{{Peer: 10, NextHop: "192.168.99.9"}}), "this device"},
+		{"bad next hop", c.SetTunnels([]Tunnel{{Peer: 20, NextHop: "192.168.099.2"}}), "bad next_hop"},
+		{"duplicate tunnel", c.SetTunnels([]Tunnel{{Peer: 20, NextHop: "192.168.99.2"}, {Peer: 20, NextHop: "192.168.99.2"}}), "ascending"},
+		{"bad RT", c.SetVRFs([]VRFConfig{{ID: 5, ExportRTs: []string{"65000:5"}, ImportRTs: []string{"1:"}}}), "bad RT"},
+		{"duplicate vrf", c.SetVRFs([]VRFConfig{{ID: 5, ExportRTs: []string{"65000:5"}}, {ID: 5, ExportRTs: []string{"65000:6"}}}), "twice"},
+	}
+	for _, tc := range cases {
+		if tc.err == nil || !strings.Contains(tc.err.Error(), tc.want) {
+			t.Fatalf("%s: error = %v, want containing %q", tc.name, tc.err, tc.want)
+		}
+	}
+	if got := c.Tunnels(); len(got) != 1 || got[0] != (Tunnel{Peer: 20, NextHop: "192.168.99.2"}) {
+		t.Fatalf("tunnels after rejected sets = %+v", got)
+	}
+	if n := len(c.LocalRoutes()); n != 1 {
+		t.Fatalf("local routes after rejected sets = %d", n)
+	}
+	if n := len(c.Pending()); n != 0 {
+		t.Fatalf("pending = %d", n)
+	}
+}
+
+func TestTableChangeWhileNoSessionIsAnnouncedOnReconnect(t *testing.T) {
+	rr := newTestReflector(t, ReflectorConfig{})
+	srv := newTestRRSrv(t, rr, 10)
+	cfg := testClientConfig()
+	cfg.Dial = srv.dial
+	c := startClient(t, cfg)
+	waitFor(t, "session synced", func() bool { return c.Stats().ActiveRR == 0 })
+
+	srv.kill()
+	waitFor(t, "session down", func() bool { return !c.Stats().Sessions[0].Connected })
+
+	// Both changes land while nothing is connected. They still have to reach the
+	// RR once it comes back -- the session's own snapshot is the only copy.
+	if err := c.SetTunnels([]Tunnel{
+		{Peer: 20, NextHop: "192.168.99.2"},
+		{Peer: 21, NextHop: "192.168.99.3"},
+	}); err != nil {
+		t.Fatalf("SetTunnels: %v", err)
+	}
+	if err := c.SetLocalPrefixes([]LocalPrefix{{VRFID: 5, Prefix: "10.50.0.0/16"}}); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
+	}
+	srv.revive()
+	waitForWithin(t, 20*time.Second, "the new session to carry both changes", func() bool {
+		sn := rr.Sessions()
+		return len(sn) == 1 && sn[0].Tunnels == 2 && len(rr.RoutesOf(10)) == 2
 	})
 }

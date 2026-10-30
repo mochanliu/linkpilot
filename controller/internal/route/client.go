@@ -71,17 +71,21 @@ type SessionStats struct {
 	RRID       string `json:"rr_id,omitempty"` // as reported by hello_ok
 	Connected  bool   `json:"connected"`
 	Synced     bool   `json:"synced"`
-	Routes     int    `json:"routes"` // imported and held from this RR
+	Routes     int    `json:"routes"`  // installed in the table from this RR
+	Pending    int    `json:"pending"` // held from this RR, not installed
 	Reconnects uint64 `json:"reconnects"`
 	LastError  string `json:"last_error,omitempty"`
 }
 
-// ClientStats is the whole instance's state. Counters are cumulative since
-// NewClient except Routes, which is live.
+// ClientStats is the whole instance's state. The drop/import counters are
+// cumulative and event-shaped: they count what each received message did, so a
+// route that the local tunnel or VRF table later moves between installed and
+// held back does not change the numbers after the fact. Routes is live.
 type ClientStats struct {
 	DeviceID          uint16         `json:"device_id"`
 	ActiveRR          int            `json:"active_rr"` // index into RRs, -1 = none
 	ActiveRIBRoutes   int            `json:"active_rib_routes"`
+	ActivePending     int            `json:"active_pending"` // known from the active RR, not installed
 	Sessions          []SessionStats `json:"sessions"`
 	Received          uint64         `json:"received"`
 	Imported          uint64         `json:"imported"`
@@ -111,9 +115,47 @@ type RIBEntry struct {
 	NextHops []string `json:"next_hops"`
 }
 
+// Why a received route is held back instead of installed. These are the two
+// gates in §8; a route that fails neither is in the RIB. Both are reversible:
+// changing a local table can move a route across either one, in either
+// direction. Malformed and self-originated routes are not here -- they are
+// rejected at intake and never reach adj-RIBs-in, so nothing can resurrect them.
+const (
+	// PendingRTMismatch: no local VRF imports any of its RTs (§4.3 step 1).
+	PendingRTMismatch = "rt_mismatch"
+	// PendingNoPath: this device has no tunnel to the origin right now. The RR
+	// only reflects over mutual adjacency, so this is either a route whose
+	// tunnel SetTunnels just removed, or one the RR sent before our new table
+	// reached it. Either way it is transient: the next table change decides.
+	PendingNoPath = "no_path"
+)
+
+// Why a configured local prefix is not being announced.
+const (
+	SkipVRFUnconfigured = "vrf_unconfigured"
+	SkipNoExportRTs     = "no_export_rts"
+)
+
+// PendingRoute is one route held in this session's adj-RIBs-in that is not
+// installed, with the gate that stopped it. It is visible so the console can
+// say "this prefix is known and not deployed, because ...", which is the whole
+// point of keeping the route instead of dropping it.
+type PendingRoute struct {
+	Route
+	Reason string `json:"reason"`
+}
+
+// LocalSkip is one local prefix the device knows about but cannot announce
+// under the current VRF table.
+type LocalSkip struct {
+	VRFID  uint8  `json:"vrf_id"`
+	Prefix string `json:"prefix"`
+	Reason string `json:"reason"`
+}
+
 // Client is the CPE route instance.
 //
-// Two design rules matter more than the code:
+// Three design rules matter more than the code:
 //
 //   - The visible RIB belongs to exactly ONE RR (the lowest synced index).
 //     Views are never merged: a route present only on the standby must not
@@ -123,15 +165,21 @@ type RIBEntry struct {
 //   - An RR that is up but has not sent EOR contributes nothing. Serving a
 //     snapshot that is still arriving would install a partial table and then
 //     silently "lose" routes at EOR; empty is honest, partial is not.
+//
+//   - What an RR sent is kept even when it cannot be installed. Each session
+//     holds the routes exactly as received (adj-RIBs-in) and derives the table
+//     from the local tunnel and VRF tables, so a tunnel or a VPN added later
+//     deploys the routes that are already known -- without asking the RR again.
 type Client struct {
 	cfg      ClientConfig
 	hold     time.Duration
 	vrfs     map[uint8]*localVRF
 	vrfIDs   []uint8            // vrfs 的升序：Targets 要有稳定顺序（map 迭代是随机的）
 	exports  map[uint8][]string // vrf -> canonical export RTs, stamped on local routes
-	base     map[RouteKey]Route // static local_prefixes from config
-	dynamic  map[RouteKey]Route // replaced wholesale by SetLocalPrefixes
-	local    []Route            // effective (base + dynamic), sorted
+	base     map[localKey]LocalPrefix
+	dynamic  map[localKey]LocalPrefix
+	local    []Route     // effective set, rebuilt from base ∪ dynamic + the VRF table
+	skipped  []LocalSkip // the same inputs that could not become routes
 	tunnels  []Tunnel
 	nextHops map[uint16][]string // peer -> ascending next hops of its tunnels
 
@@ -146,6 +194,18 @@ type Client struct {
 type localVRF struct {
 	imports map[string]bool
 }
+
+// localKey identifies one announced prefix. It is not a RouteKey: the device id
+// is always ours, and the RTs are derived from the VRF, so the pair (vrf,
+// prefix) is the whole identity of an input. Keeping the inputs instead of the
+// built routes is what lets a VRF change re-stamp every local route and withdraw
+// the ones whose VRF is gone.
+type localKey struct {
+	vrfID  uint8
+	prefix string
+}
+
+func (lp LocalPrefix) key() localKey { return localKey{vrfID: lp.VRFID, prefix: lp.Prefix} }
 
 type counters struct {
 	received   uint64
@@ -163,16 +223,25 @@ type clientSession struct {
 	conn       net.Conn
 	up         bool
 	synced     bool
-	rib        map[RouteKey]RIBEntry
 	reconnects uint64
 	lastErr    string
 
+	// adjIn is what this RR told us, one copy per route key, exactly as
+	// received. rib and pending are derived from it plus the local tunnel and
+	// VRF tables and are never written anywhere else -- so SetTunnels/SetVRFs can
+	// rebuild them and nothing needs to be re-requested.
+	adjIn   map[RouteKey]Route
+	rib     map[RouteKey]RIBEntry
+	pending map[RouteKey]PendingRoute
+
 	// sc is the serialized writer owned by serveSession. ready is set once the
-	// session's snapshot has been written; only then may local-prefix updates
-	// be streamed to it. announced is what this session has been told.
-	sc        *sessionConn
-	ready     bool
-	announced map[RouteKey]Route
+	// session's snapshot has been written; only then may local-prefix and tunnel
+	// updates be streamed to it. announced/announcedTunnels are what this session
+	// has been told, so a change that lands mid-snapshot is still reconciled.
+	sc               *sessionConn
+	ready            bool
+	announced        map[RouteKey]Route
+	announcedTunnels []Tunnel
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -201,75 +270,112 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	c := &Client{
 		cfg:      cfg,
 		hold:     hold,
-		vrfs:     make(map[uint8]*localVRF, len(cfg.VRFs)),
-		exports:  make(map[uint8][]string, len(cfg.VRFs)),
-		base:     map[RouteKey]Route{},
-		dynamic:  map[RouteKey]Route{},
+		base:     map[localKey]LocalPrefix{},
+		dynamic:  map[localKey]LocalPrefix{},
 		sessions: make([]clientSession, len(cfg.RRs)),
 		active:   -1,
 	}
-	exports := make(map[uint8][]string, len(cfg.VRFs))
-	for _, v := range cfg.VRFs {
-		if _, dup := c.vrfs[v.ID]; dup {
-			return nil, fmt.Errorf("route client: vrf %d configured twice", v.ID)
+	vrfs, ids, exports, err := buildVRFs(cfg.VRFs)
+	if err != nil {
+		return nil, err
+	}
+	c.vrfs, c.vrfIDs, c.exports = vrfs, ids, exports
+
+	tunnels, nextHops, err := normalizeTunnels(cfg.DeviceID, cfg.Tunnels)
+	if err != nil {
+		return nil, err
+	}
+	c.tunnels, c.nextHops = tunnels, nextHops
+
+	for _, lp := range cfg.LocalPrefixes {
+		if _, err := c.localRoute(lp); err != nil {
+			return nil, err
+		}
+		c.base[lp.key()] = lp
+	}
+	c.rebuildLocalLocked()
+
+	for i := range c.sessions {
+		c.sessions[i] = clientSession{
+			addr:    cfg.RRs[i].Addr,
+			adjIn:   map[RouteKey]Route{},
+			rib:     map[RouteKey]RIBEntry{},
+			pending: map[RouteKey]PendingRoute{},
+		}
+	}
+	return c, nil
+}
+
+// buildVRFs validates a VRF table and returns the three views the client needs:
+// the import sets, the ascending ids, and the canonical export RTs. It builds
+// new maps instead of touching a running client, so a table the operator typed
+// wrong is rejected without half-applying.
+func buildVRFs(vs []VRFConfig) (map[uint8]*localVRF, []uint8, map[uint8][]string, error) {
+	vrfs := make(map[uint8]*localVRF, len(vs))
+	exports := make(map[uint8][]string, len(vs))
+	ids := make([]uint8, 0, len(vs))
+	for _, v := range vs {
+		if _, dup := vrfs[v.ID]; dup {
+			return nil, nil, nil, fmt.Errorf("route client: vrf %d configured twice", v.ID)
 		}
 		lv := &localVRF{imports: map[string]bool{}}
 		exp := map[string]bool{}
 		for _, rt := range v.ExportRTs {
 			canon, err := CanonicalRT(rt)
 			if err != nil {
-				return nil, fmt.Errorf("route client: vrf %d: %w", v.ID, err)
+				return nil, nil, nil, fmt.Errorf("route client: vrf %d: %w", v.ID, err)
 			}
 			exp[canon] = true
 		}
 		for _, rt := range v.ImportRTs {
 			canon, err := CanonicalRT(rt)
 			if err != nil {
-				return nil, fmt.Errorf("route client: vrf %d: %w", v.ID, err)
+				return nil, nil, nil, fmt.Errorf("route client: vrf %d: %w", v.ID, err)
 			}
 			lv.imports[canon] = true
 		}
-		c.vrfs[v.ID] = lv
+		vrfs[v.ID] = lv
 		exports[v.ID] = sortedKeys(exp)
-		c.exports[v.ID] = exports[v.ID]
-		c.vrfIDs = append(c.vrfIDs, v.ID)
+		ids = append(ids, v.ID)
 	}
-	sort.Slice(c.vrfIDs, func(i, j int) bool { return c.vrfIDs[i] < c.vrfIDs[j] })
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return vrfs, ids, exports, nil
+}
 
-	tunnels := append([]Tunnel(nil), cfg.Tunnels...)
-	for _, t := range tunnels {
-		if t.Peer == cfg.DeviceID {
-			return nil, fmt.Errorf("route client: tunnel peer %d is this device", cfg.DeviceID)
+// normalizeTunnels canonicalizes a tunnel table and builds the peer -> next hops
+// index that resolves a received route's origin into local paths.
+func normalizeTunnels(deviceID uint16, in []Tunnel) ([]Tunnel, map[uint16][]string, error) {
+	for _, t := range in {
+		if t.Peer == deviceID {
+			return nil, nil, fmt.Errorf("route client: tunnel peer %d is this device", deviceID)
 		}
 	}
-	tunnels = SortedTunnels(tunnels)
+	tunnels := SortedTunnels(in)
 	if err := ValidateTunnels(tunnels); err != nil {
-		return nil, fmt.Errorf("route client: tunnels: %w", err)
+		return nil, nil, fmt.Errorf("route client: tunnels: %w", err)
 	}
-	c.tunnels = tunnels
-	c.nextHops = make(map[uint16][]string, len(tunnels))
+	tunnels = copyTunnels(tunnels)
+	nextHops := make(map[uint16][]string, len(tunnels))
 	for _, t := range tunnels {
-		c.nextHops[t.Peer] = append(c.nextHops[t.Peer], t.NextHop)
+		nextHops[t.Peer] = append(nextHops[t.Peer], t.NextHop)
 	}
+	return tunnels, nextHops, nil
+}
 
-	for _, lp := range cfg.LocalPrefixes {
-		rt, err := c.localRoute(lp)
-		if err != nil {
-			return nil, err
-		}
-		c.base[rt.Key()] = rt
-	}
-	c.local = c.mergedLocalLocked()
-
-	for i := range c.sessions {
-		c.sessions[i] = clientSession{addr: cfg.RRs[i].Addr, rib: map[RouteKey]RIBEntry{}}
-	}
-	return c, nil
+// copyTunnels returns a non-nil copy of a tunnel table. The non-nil part is
+// load-bearing: &nil is a pointer, so json.Marshal writes "tunnels":null for it,
+// and the RR rejects a tunnels frame that carries no table at all. "This device
+// has no tunnels" has to travel as [], or clearing the last tunnel would drop
+// the session instead of withdrawing the routes.
+func copyTunnels(in []Tunnel) []Tunnel {
+	out := make([]Tunnel, 0, len(in))
+	return append(out, in...)
 }
 
 // LocalRoutes returns the routes this CPE announces (one per VRF × prefix, no
 // next hops): the static configuration plus whatever SetLocalPrefixes last
-// installed.
+// installed, stamped with the export RTs of the VRF table as it stands. A prefix
+// whose VRF is gone is not here -- see LocalSkips for why.
 func (c *Client) LocalRoutes() []Route {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -279,14 +385,32 @@ func (c *Client) LocalRoutes() []Route {
 // localRoute builds a local route from a (vrf, prefix) pair. Export RTs come
 // from the VRF config, so a local prefix can never be announced without the
 // policy that makes it importable somewhere.
+//
+// It reads the VRF table, so callers other than NewClient must hold c.mu.
 func (c *Client) localRoute(lp LocalPrefix) (Route, error) {
-	if c.vrfs[lp.VRFID] == nil {
+	rt, reason := c.newLocalRoute(lp)
+	switch reason {
+	case "":
+		return rt, nil
+	case SkipVRFUnconfigured:
 		return Route{}, fmt.Errorf("route client: local prefix %s references unconfigured vrf %d", lp.Prefix, lp.VRFID)
+	case SkipNoExportRTs:
+		return Route{}, fmt.Errorf("route client: vrf %d has local prefix %s but no export RTs (nothing could import it)",
+			lp.VRFID, lp.Prefix)
+	}
+	return Route{}, fmt.Errorf("route client: local prefix %s: %s", lp.Prefix, reason)
+}
+
+// newLocalRoute is localRoute with the answer in gate names instead of errors:
+// after a VRF change a prefix that cannot be announced is a fact to report, not
+// a request to fail.
+func (c *Client) newLocalRoute(lp LocalPrefix) (Route, string) {
+	if c.vrfs[lp.VRFID] == nil {
+		return Route{}, SkipVRFUnconfigured
 	}
 	rts := c.exports[lp.VRFID]
 	if len(rts) == 0 {
-		return Route{}, fmt.Errorf("route client: vrf %d has local prefix %s but no export RTs (nothing could import it)",
-			lp.VRFID, lp.Prefix)
+		return Route{}, SkipNoExportRTs
 	}
 	rt := Route{
 		DeviceID: c.cfg.DeviceID,
@@ -295,27 +419,48 @@ func (c *Client) localRoute(lp LocalPrefix) (Route, error) {
 		RTs:      rts,
 	}
 	if err := rt.Validate(); err != nil {
-		return Route{}, fmt.Errorf("route client: local prefix: %w", err)
+		return Route{}, err.Error()
 	}
-	return rt, nil
+	return rt, ""
 }
 
-// mergedLocalLocked is base ∪ dynamic. A dynamic prefix identical to a static
-// one collapses to one route: the same (device, vrf, prefix) key must be
-// announced once, or a withdraw of one copy would take the other with it.
-func (c *Client) mergedLocalLocked() []Route {
-	m := make(map[RouteKey]Route, len(c.base)+len(c.dynamic))
-	for k, r := range c.base {
-		m[k] = r
+// rebuildLocalLocked recomputes the announced set from the prefix inputs and the
+// VRF table as it stands. SetVRFs calls it because the RTs are stamped from the
+// VRF: change them and every route of that VRF has to be re-announced, delete
+// the VRF and its prefixes have to be withdrawn. A prefix that no longer becomes
+// a route is kept in skipped -- the console says why it stopped being advertised
+// instead of the table just getting shorter.
+//
+// Must be called with c.mu held.
+func (c *Client) rebuildLocalLocked() {
+	m := make(map[localKey]LocalPrefix, len(c.base)+len(c.dynamic))
+	for k, lp := range c.base {
+		m[k] = lp
 	}
-	for k, r := range c.dynamic {
-		m[k] = r
+	// A dynamic prefix identical to a static one collapses to one route: the
+	// same (device, vrf, prefix) must be announced once, or a withdraw of one
+	// copy would take the other with it.
+	for k, lp := range c.dynamic {
+		m[k] = lp
 	}
-	out := make([]Route, 0, len(m))
-	for _, r := range m {
-		out = append(out, r)
+	routes := make([]Route, 0, len(m))
+	var skipped []LocalSkip
+	for _, lp := range m {
+		rt, reason := c.newLocalRoute(lp)
+		if reason != "" {
+			skipped = append(skipped, LocalSkip{VRFID: lp.VRFID, Prefix: lp.Prefix, Reason: reason})
+			continue
+		}
+		routes = append(routes, rt)
 	}
-	return SortedRoutes(out)
+	c.local = SortedRoutes(routes)
+	sort.Slice(skipped, func(i, j int) bool {
+		if skipped[i].VRFID != skipped[j].VRFID {
+			return skipped[i].VRFID < skipped[j].VRFID
+		}
+		return skipped[i].Prefix < skipped[j].Prefix
+	})
+	c.skipped = skipped
 }
 
 // SetLocalPrefixes replaces the dynamic local set (customer prefixes learned
@@ -324,23 +469,72 @@ func (c *Client) mergedLocalLocked() []Route {
 // still streaming its snapshot reconciles against its own announced set once
 // the snapshot is done.
 func (c *Client) SetLocalPrefixes(lps []LocalPrefix) error {
-	next := make(map[RouteKey]Route, len(lps))
-	for _, lp := range lps {
-		rt, err := c.localRoute(lp)
-		if err != nil {
-			return err
-		}
-		next[rt.Key()] = rt
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if equalRouteMaps(c.dynamic, next) {
+	next := make(map[localKey]LocalPrefix, len(lps))
+	for _, lp := range lps {
+		if _, err := c.localRoute(lp); err != nil {
+			return err
+		}
+		next[lp.key()] = lp
+	}
+	if equalLocalSets(c.dynamic, next) {
 		return nil
 	}
 	c.dynamic = next
-	c.local = c.mergedLocalLocked()
+	c.rebuildLocalLocked()
 	c.pushLocalLocked()
+	return nil
+}
+
+// SetVRFs replaces the local VRF table at runtime -- the "新 VPN 后补" half of
+// O5. It is all-or-nothing: a table that fails validation changes nothing,
+// because a half-applied import policy would decide which prefixes get installed
+// and the operator would have no way to see which version was in force.
+//
+// Two derived things follow from it. Received routes are re-run through the new
+// import sets, so a VRF added now picks up the prefixes already in adj-RIBs-in
+// without asking the RR again. Local prefixes are re-stamped, and withdrawn if
+// their VRF is gone: a route left announced with the RTs of a VRF that no longer
+// exists would be imported by a policy nobody configured.
+func (c *Client) SetVRFs(vs []VRFConfig) error {
+	vrfs, ids, exports, err := buildVRFs(vs)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.vrfs, c.vrfIDs, c.exports = vrfs, ids, exports
+	c.rebuildLocalLocked()
+	c.pushLocalLocked()
+	for i := range c.sessions {
+		c.deriveSessionLocked(&c.sessions[i])
+	}
+	return nil
+}
+
+// SetTunnels replaces this device's tunnel table at runtime. The table is what
+// turns "this route came from device N" into local paths, so a prefix that was
+// held back for want of a path is installed by this call alone -- and a prefix
+// whose path was removed leaves the table again. Each live session is told the
+// new table (MsgTunnels is a full replacement), which makes the RR reflect or
+// withdraw on its side too.
+func (c *Client) SetTunnels(ts []Tunnel) error {
+	tunnels, nextHops, err := normalizeTunnels(c.cfg.DeviceID, ts)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if equalTunnels(c.tunnels, tunnels) {
+		return nil
+	}
+	c.tunnels, c.nextHops = tunnels, nextHops
+	for i := range c.sessions {
+		s := &c.sessions[i]
+		c.deriveSessionLocked(s)
+		c.pushTunnelsLocked(s)
+	}
 	return nil
 }
 
@@ -397,13 +591,12 @@ func (c *Client) syncSessionLocalLocked(s *clientSession, desired map[RouteKey]R
 	s.announced = cloneRoutes(desired)
 }
 
-func equalRouteMaps(a, b map[RouteKey]Route) bool {
+func equalLocalSets(a, b map[localKey]LocalPrefix) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for k, ra := range a {
-		rb, ok := b[k]
-		if !ok || !ra.Equal(rb) {
+	for k, la := range a {
+		if lb, ok := b[k]; !ok || la != lb {
 			return false
 		}
 	}
@@ -418,9 +611,125 @@ func cloneRoutes(in map[RouteKey]Route) map[RouteKey]Route {
 	return out
 }
 
-// Tunnels returns the table this device announces, in canonical order.
+func equalTunnels(a, b []Tunnel) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Tunnels returns the table this device announces, in canonical order. The copy
+// is never nil: see copyTunnels.
 func (c *Client) Tunnels() []Tunnel {
-	return append([]Tunnel(nil), c.tunnels...)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return copyTunnels(c.tunnels)
+}
+
+// Pending returns the routes the active RR sent that are not installed, plus the
+// gate each one is behind. This is the other half of "keep what you were told":
+// a held-back prefix has to be reportable, or a table that is missing routes is
+// indistinguishable from one that never received them.
+func (c *Client) Pending() []PendingRoute {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pendingOf(c.active)
+}
+
+func (c *Client) pendingOf(idx int) []PendingRoute {
+	if idx < 0 {
+		return nil
+	}
+	out := make([]PendingRoute, 0, len(c.sessions[idx].pending))
+	for _, p := range c.sessions[idx].pending {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DeviceID != out[j].DeviceID {
+			return out[i].DeviceID < out[j].DeviceID
+		}
+		if out[i].VRFID != out[j].VRFID {
+			return out[i].VRFID < out[j].VRFID
+		}
+		return out[i].Prefix < out[j].Prefix
+	})
+	return out
+}
+
+// LocalSkips returns the local prefixes that the current VRF table cannot turn
+// into an announcement, sorted.
+func (c *Client) LocalSkips() []LocalSkip {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]LocalSkip(nil), c.skipped...)
+}
+
+// classifyLocked decides where one received route belongs: the table entry it
+// installs as, or the gate that keeps it in adj-RIBs-in only.
+//
+// Must be called with c.mu held.
+func (c *Client) classifyLocked(rt Route) (RIBEntry, string) {
+	// RT 匹配决定的是**这条路由装进本机哪几张表**，与来源 VPN 无关
+	// （§4.3 第 1 步）。来源 VPN 只决定标签：对端弹栈后查的是它自己那张表
+	// （§2.4）。所以这里不能看 rt.VRFID 在本机存不存在 —— 导通要解决的正是
+	// "本机没有的那个 VPN 的路由落进本机有的 VPN 表"，旧代码那道
+	// `c.vrfs[rt.VRFID] == nil` 的闸会把所有跨 VPN 的导通在 RT 匹配之前就丢掉。
+	targets := c.importTargets(rt.RTs)
+	if len(targets) == 0 {
+		return RIBEntry{}, PendingRTMismatch
+	}
+	// The route is only installed if this device has a tunnel to its origin.
+	// Without one there is no path to point the FIB at -- but the route itself
+	// stays, because the tunnel may arrive before the next RR message does.
+	nh := c.nextHops[rt.DeviceID]
+	if len(nh) == 0 {
+		return RIBEntry{}, PendingNoPath
+	}
+	return RIBEntry{Route: rt, Targets: targets, NextHops: append([]string(nil), nh...)}, ""
+}
+
+// deriveSessionLocked rebuilds one session's table from its adj-RIBs-in and the
+// current tunnel and VRF tables. It never touches the counters: those record
+// what each received message did, and a route that moves between installed and
+// held back because the local config changed must not rewrite that history.
+//
+// Must be called with c.mu held.
+func (c *Client) deriveSessionLocked(s *clientSession) {
+	rib := make(map[RouteKey]RIBEntry, len(s.adjIn))
+	pending := make(map[RouteKey]PendingRoute)
+	for k, rt := range s.adjIn {
+		entry, reason := c.classifyLocked(rt)
+		if reason != "" {
+			pending[k] = PendingRoute{Route: rt, Reason: reason}
+			continue
+		}
+		rib[k] = entry
+	}
+	s.rib, s.pending = rib, pending
+}
+
+// pushTunnelsLocked re-sends the whole table to one session that already has an
+// established snapshot. MsgTunnels is a replacement, not a delta, so there is
+// nothing to diff on the wire; the comparison is only so a republished table
+// does not make every RR rebuild its adjacency for no reason. A write failure
+// closes the session: reconnect re-announces everything.
+//
+// Must be called with c.mu held.
+func (c *Client) pushTunnelsLocked(s *clientSession) {
+	if !s.ready || s.sc == nil || equalTunnels(s.announcedTunnels, c.tunnels) {
+		return
+	}
+	table := copyTunnels(c.tunnels)
+	if err := s.sc.write(Envelope{Type: MsgTunnels, Tunnels: &table}); err != nil {
+		s.sc.close()
+		return
+	}
+	s.announcedTunnels = table
 }
 
 // Run keeps both RR sessions alive until ctx is cancelled. It returns nil.
@@ -564,9 +873,10 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 		return true, fmt.Errorf("send eor: %w", err)
 	}
 
-	// From here on the session is part of the live local-prefix fanout. The
-	// snapshot may already be stale: reconcile against the current set before
-	// releasing the lock, so no update can slip between snapshot and fanout.
+	// From here on the session is part of the live local-prefix and tunnel
+	// fanout. The snapshot may already be stale: reconcile against the current
+	// sets before releasing the lock, so no update can slip between snapshot and
+	// fanout.
 	c.mu.Lock()
 	s := &c.sessions[idx]
 	if !s.up {
@@ -583,6 +893,8 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 		desired[rt.Key()] = rt
 	}
 	c.syncSessionLocalLocked(s, desired)
+	s.announcedTunnels = tunnels
+	c.pushTunnelsLocked(s)
 	c.mu.Unlock()
 
 	go c.keepaliveLoop(sc, hold/3, sessionDone)
@@ -639,13 +951,19 @@ func (c *Client) markUp(idx int, conn net.Conn, rrID string, hold time.Duration)
 	s.conn = conn
 	s.up = true
 	s.synced = false
+	// A reconnect is a fresh snapshot: everything held from the previous session
+	// is gone, and the RR will send it again. Keeping the old copy would make a
+	// withdrawn route survive a flap.
+	s.adjIn = map[RouteKey]Route{}
 	s.rib = map[RouteKey]RIBEntry{}
+	s.pending = map[RouteKey]PendingRoute{}
 	s.rrID = rrID
 	s.reconnects++
 	s.lastErr = ""
 	s.sc = nil
 	s.ready = false
 	s.announced = nil
+	s.announcedTunnels = nil
 }
 
 func (c *Client) markDown(idx int) {
@@ -654,11 +972,14 @@ func (c *Client) markDown(idx int) {
 	s := &c.sessions[idx]
 	s.up = false
 	s.synced = false
+	s.adjIn = map[RouteKey]Route{}
 	s.rib = map[RouteKey]RIBEntry{}
+	s.pending = map[RouteKey]PendingRoute{}
 	s.conn = nil
 	s.sc = nil
 	s.ready = false
 	s.announced = nil
+	s.announcedTunnels = nil
 	c.pickActiveLocked()
 }
 
@@ -733,27 +1054,25 @@ func (c *Client) applyAnnounce(idx int, routes []Route) error {
 	c.counters.received += uint64(len(order))
 	for _, k := range order {
 		rt := last[k]
-		delete(s.rib, k) // RT change can revoke the import
-		// RT 匹配决定的是**这条路由装进本机哪几张表**，与来源 VPN 无关
-		// （§4.3 第 1 步）。来源 VPN 只决定标签：对端弹栈后查的是它自己那张表
-		// （§2.4）。所以这里不能再看 rt.VRFID 在本机存不存在 —— 导通要解决的正是
-		// "本机没有的那个 VPN 的路由落进本机有的 VPN 表"，旧代码那道
-		// `c.vrfs[rt.VRFID] == nil` 的闸会把所有跨 VPN 的导通在 RT 匹配之前就丢掉。
-		targets := c.importTargets(rt.RTs)
-		if len(targets) == 0 {
-			c.counters.rtMismatch++
+		s.adjIn[k] = rt
+		// Counters are event-shaped: they say what processing this frame did, not
+		// what the table looks like now. A prefix that moves between installed and
+		// held back every time a tunnel changes would otherwise rewrite the history
+		// the console reports.
+		delete(s.rib, k)
+		delete(s.pending, k)
+		entry, reason := c.classifyLocked(rt)
+		if reason != "" {
+			s.pending[k] = PendingRoute{Route: rt, Reason: reason}
+			switch reason {
+			case PendingRTMismatch:
+				c.counters.rtMismatch++
+			case PendingNoPath:
+				c.counters.noPath++
+			}
 			continue
 		}
-		// The route is only installed if this device actually has a tunnel to
-		// its origin. The RR should never send one without adjacency; if it does,
-		// the table is inconsistent and a route with no path would only make the
-		// FIB warn every poll.
-		nh := c.nextHops[rt.DeviceID]
-		if len(nh) == 0 {
-			c.counters.noPath++
-			continue
-		}
-		s.rib[k] = RIBEntry{Route: rt, Targets: targets, NextHops: append([]string(nil), nh...)}
+		s.rib[k] = entry
 		c.counters.imported++
 	}
 	return nil
@@ -784,10 +1103,17 @@ func (c *Client) applyWithdraw(idx int, keys []RouteKey) error {
 		return fmt.Errorf("withdraw on a session that is not up")
 	}
 	for _, k := range keys {
-		if _, ok := s.rib[k]; ok {
-			delete(s.rib, k)
+		if _, ok := s.adjIn[k]; !ok {
+			continue
+		}
+		delete(s.adjIn, k)
+		// withdrawn counts routes that actually left the table. Withdrawing one
+		// that was only ever held back changes nothing a console could act on.
+		if _, installed := s.rib[k]; installed {
 			c.counters.withdrawn++
 		}
+		delete(s.rib, k)
+		delete(s.pending, k)
 	}
 	return nil
 }
@@ -866,6 +1192,7 @@ func (c *Client) Stats() ClientStats {
 	}
 	if c.active >= 0 {
 		st.ActiveRIBRoutes = len(c.sessions[c.active].rib)
+		st.ActivePending = len(c.sessions[c.active].pending)
 	}
 	for i := range c.sessions {
 		s := &c.sessions[i]
@@ -875,6 +1202,7 @@ func (c *Client) Stats() ClientStats {
 			Connected:  s.up,
 			Synced:     s.synced,
 			Routes:     len(s.rib),
+			Pending:    len(s.pending),
 			Reconnects: s.reconnects,
 			LastError:  s.lastErr,
 		})
