@@ -524,8 +524,8 @@ source priority（§2.7 实测：230 vs 240 仍然是 FRR 转发）。
 
 | BGP 机制 | 我们解决的问题 | 现状 |
 |---|---|---|
-| adj-RIBs-in（每会话一份原始库） | 隧道后补 / 新 VPN 后补时不必重新问 RR；修 §2.5 那条"必须重启" | 无：丢掉的路线不留存 |
-| **Route Refresh (RFC 2918)** | `SetTunnels` 之后就地重算，不重建会话、不断表 | 无：`Tunnels()` 只有读侧 |
+| adj-RIBs-in（每会话一份原始库） | 隧道后补 / 新 VPN 后补时不必重新问 RR；修 §2.5 那条"必须重启" | **O5-a 已落（2026-10-30）**：每会话一份 `adjIn` 存原样收到的路由，`rib` 与 `pending` 都从它 + 本机隧道表/VPN 表推导；`SetTunnels`/`SetVRFs` 只重算，不再问 RR |
+| **Route Refresh (RFC 2918)** | `SetTunnels` 之后就地重算，不重建会话、不断表 | **不做（2026-10-30 用户拍）**：它要解决的问题已经在**收端**解决了——原始库留着，本机表一变就重算，不需要向 RR 再要一遍。⇒ O5 不动线上字段，`ProtocolVersion` 仍是 3 |
 | **Graceful Restart (RFC 4724)** | RR 重启/主备切换时转发面不动 | 无：新会话顶替即清表 |
 | **Add-Path (RFC 7911)** | 同一前缀的多来源路径都送下来，颜色才有得选 | 无：按 `{device,vrf,prefix}` 一条 |
 | per-peer 最优路径计算 | 把装表决策收在设备侧（§4.3 步骤 2/4） | 无：RIB 直出 |
@@ -540,7 +540,11 @@ source priority（§2.7 实测：230 vs 240 仍然是 FRR 转发）。
 - mTLS 身份绑定：`device_id` 必须等于证书身份（`proto.go:116-123` 的既有约束），
   任何"来源字段与会话身份不符"的路由照旧丢弃。
 
-### 6.3 协议字段增项（v4）
+### 6.3 协议字段增项（v4，**未启用**）
+
+O5-a 没有走到这里：adj-RIBs-in 的重算发生在收端本机，`SetTunnels`/`SetVRFs` 复用已有的
+`MsgTunnels`/`MsgAnnounce`，一个字段都没加 ⇒ **`ProtocolVersion` 仍是 3**。下面这些是
+Add-Path / GR / NOTIFY 结构化那一轮才需要的，先留档：
 
 ```
 Route  { rd, device_id, prefix, rts[], origin_tag }   // rd = device_id:vpn_id（§7）
@@ -585,8 +589,11 @@ preference（§2.1）。**两件事分开：BGP 决定"哪个属性组赢"，VPP
 （§2.2 表第三行，O2 第 7 步实测：`buckets:2 → 1`、preference 读回 230/233）。
 所以"实测这个窗口"这件事变成：**如果按 O1 已落的删加规则走才有窗口**。
 2026-10-30 用户拍：**规则留着，改色丢包属于正常应该接受的**（§11 拍板 #2）。
-⇒ 窗口本身不再是要不要存在的问题，但**时长还没量过**；控制台文案要等这个数，
-建议并进 O4 逃生开关那次打流实测（那时本来就要打流看颜色切换）。
+⇒ 窗口本身不再是要不要存在的问题。**时长已在 O4 量到（§5.3 第 10 步）：走"新进程 plain add
+（整条替换）"这一路 = 120 发 120 收、断流 0 ms**；而 Applier 的先删后加分支要求"同一进程内
+身份相同、只有 pref 变"，颜色只在进程启动时读一次 ⇒ 今天的配置流线走不到它，只有单测钉住。
+⇒ 控制台文案可以用"改色不保证零丢包"这个口径，但**不必**承诺一个具体的丢失秒数；
+下一次动这块代码时的依据是这组数，不是"改色一定留窗口"这个未被实测支持的前提。
 
 `origin_tag` 就是 §3.3 的盒内防环标记，由设备在 leak 上行时打，"sdwan→内侧"下行时拒收。
 
@@ -655,12 +662,15 @@ FRR 那份撤销时 API 那份自动顶上（§2.7）。设备要**记一条 war
 `TestColorTableFormula`、`TestPlanFromCrossVPNInstall`、`TestPlanFromDifferentLabelsTieBreakByRD`
 与回归基线 `test-fib.sh` 36/36 |
 | O4 | 逃生开关 | 打开：颜色 0 全 down 后 `show ip fib` 主表切到最小存活颜色、恢复后自动回 0；关闭：颜色 0 全 down 后主表该前缀**不存在**（丢包，不回落到昂贵颜色）。两条都要计时并写进文档，作为 §8 口径的证据。**2026-10-30 落地：`test-escape.sh` 32/32**（VRF 60，两端各两条多跳 BFD + 两个 tap 终端打 0.1s 流）。两条判据都成立且**都拿到数**：开关关 342–1165 ms 后主表没这条前缀、故障期间 120 发只有 10 收（黑洞，无回落）；开关开前缀一次没消失、724–1783 ms 收成最小存活颜色、终端断 900 ms，恢复后 891–2188 ms 回到两条并用 `show interface` 的 `mpls` 计数证明流量真回了颜色 0。全部数与读法在 §5.3，§8 用的是同一套口径。附带量到的：§11 拍板 #2 那个"改色窗口"实测 **0 ms**（120 发 120 收） |
-| O5 | 协议 v4 机制件：adj-RIBs-in + `SetTunnels` + Route Refresh | 在**不重启进程**的前提下：后补一条 A-B 隧道 → A 立刻学到此前被 `noPath` 丢掉的 B 前缀；`watchRIB` 打出的 `active/rib` 变化可核对；双 RR 主备切换不掉表（standby 未 synced 时不得顶上） |
+| O5-a | `route` 包：adj-RIBs-in + 推导视图 + `SetTunnels` + `SetVRFs`（**不动协议字段，版本仍 3**，Route Refresh 已拍不做） | 单测（2026-10-30 已落，`go vet` + `-race` 全绿）：后补隧道 ⇒ 此前 `no_path` 的前缀装进表、去掉隧道 ⇒ 前缀离开表但仍在 `pending`；改 import RT ⇒ held 路由双向搬；**负向：VRF 被删 ⇒ 它上面的本地前缀必须显式撤回**（RR 那边要看到 withdraw，`LocalSkips()` 报 `vrf_unconfigured`）；被拒的变更不动表；会话断开期间的表变更要在重连时补发；空隧道表必须走 `[]` 而不是 `null`。**顺手修掉一个既有 bug**：`&nil` 序列化成 `"tunnels":null`，RR 会以"tunnels message without a table"关掉会话 ⇒ 任何"没配隧道"的设备原本一上线就掉会话 |
+| O5-b | `sr-route` 开 `PUT /tunnels` + `PUT /vrfs`（照既有 `PUT /local-prefixes` 那道缝），`/status` 加待决清单（`Pending()` + `LocalSkips()`，带上总数） | curl 能改隧道表并读回；待决清单在 `/status` 可见且有条数上限 |
+| O5-c | `test/scripts/test-refresh.sh`：全程**不重启任何进程** | srwg-node1/2：无隧道 ⇒ `pending/no_path`；`PUT /tunnels` ⇒ 下一次 sr-fib 轮询装表 ⇒ tap 终端 ping 通；撤隧道 ⇒ 离表且 FIB 撤；`PUT /vrfs` 改 import ⇒ 此前 RT 不匹配的前缀回来 |
+| O5-d | 开机自启：`usr/local/lib/sr-box/start.sh` 一份清单（vpp → sr-apply boot → frr → sr-agent → sr-route → sr-fib，按身份门控），systemd 单元作薄壳并注明"未在 lab 实测"；容器 `--restart unless-stopped` 只在 srwg-node1/2 验 | 重启盒子后不手敲任何命令，overlay 与路由面自己在；agent 只在首次入网时 `systemctl start sr-route sr-fib`，之后配置变更**永不**重启进程 |
 | O6 | 控制台「配置 > overlay」三块（全局 / 导通 / leak），导通规则可编辑 | 真浏览器：新增规则后 RT 自动写入两行、编辑减设备后残留 RT 被摘掉、被丢路由三态可见；改完 `console.html` 必须 `node --check` |
 | O7 | SD-WAN policy（下一节，按 SLA 引流到颜色表） | 本文不展开，只要求 O1..O4 已经把颜色表建好 |
 | O8 | 站点 HA：同站点双设备的隧道彩色规则（§13.2）+ LAN 侧 VRRP（§3.1.1）+ 控制台按站点看冗余 | lab 判据（**要先有第二台盒，见 §13.5**）：① 两台设备同颜色 0 隧道 → 主表该前缀 `buckets:2`；② 打下一台设备的 wg 口 → `buckets:1` 且流量不断；③ VRRP 主备切换后客户侧 ping 无中断（连续打流计数），且**我们这一份路由不受影响**（`show ip fib` 只是 LAN 侧首跳变了）；④ 同站点两台同时宣告同一前缀 ⇒ **不黑洞**（§13.3） |
 
-O1..O4 是"数据面+本地选路"，O5 是"协议"，O6 是"控制台"，**O8 需要 lab 第二台 CPE 盒，排在 O6 之后**。
+O1..O4 是"数据面+本地选路"，O5 是"不重启进程也能收敛"，O6 是"控制台"，**O8 需要 lab 第二台 CPE 盒，排在 O6 之后**。
 **O3 之前不动协议**，所以 O1..O4 可以完全在设备侧落地并单独验证。
 
 ---
@@ -715,8 +725,13 @@ O1..O4 是"数据面+本地选路"，O5 是"协议"，O6 是"控制台"，**O8 �
    与 `sr-fib` 配置文件（键名与 §3.1 逐字一致，读侧 `DisallowUnknownFields` 保证控制器打包时对不上
    会当场报错），判据与**四个计时数 + 三段打流**在 §5.3，控制台口径在 §8（#150）。
    §12 原先挂在这里的"顺手量改色窗口时长"也一起量完了，结果是 0 ms（§11 拍板 #2 末段）。
-7. **下一步 O5**（协议 v4 机制件：adj-RIBs-in + `SetTunnels` + Route Refresh）—— 这是 O1..O4 之后
-   第一件要动协议的事，判据是"不重启进程补一条隧道就能学到此前被 `noPath` 丢掉的前缀"。
+7. **O5-a 已落地（2026-10-30）**：`internal/route/client.go` 加每会话 adj-RIBs-in（`adjIn`）+
+   两张推导视图（`rib`/`pending`）+ `SetTunnels` / `SetVRFs` + `Pending()` / `LocalSkips()`，
+   计数器改成**事件形状**（记"这一帧做了什么"，本机表变动不许改写历史）。**协议没动**：
+   Route Refresh 用户拍"先不做"，所以 `ProtocolVersion` 仍是 3，`reflector.go` 一行未改。
+   判据、负向单测与顺手修掉的 `null` 隧道表 bug 见 §9 的 O5-a 行。
+8. **下一步 O5-b**（`sr-route` 的 `PUT /tunnels` + `PUT /vrfs` 与 `/status` 待决清单），
+   然后 O5-c 才是"不重启进程补隧道就学到前缀"的 lab 判据，O5-d 收开机自启。
 
 ---
 
@@ -774,8 +789,9 @@ O1..O4 是"数据面+本地选路"，O5 是"协议"，O6 是"控制台"，**O8 �
 - **配置漂移**没人对齐：两台各拉各的发布包。⇒ 控制台要一个"按站点比对两份配置"的差异视图（O8 判据）。
 - **一次抖动 = 多设备重推**：A 的隧道 down 时，对端主表少一个 bucket。走的是现有 diff 增量
   （`reflector.go:435-486` 实测只推 gained/lost 的那几台），不是全网重推。
-- **一台重启 = 该来源路由与隧道表清空重放**（`reflector.go:197-208`，Graceful Restart 还没做，在 O5）。
-  HA 的另一台天然兜住这段窗口 ⇒ **在 O5 之前，"同站点双设备"就是我们最实用的 GR 替代品**，
+- **一台重启 = 该来源路由与隧道表清空重放**（`reflector.go:197-208`）。Graceful Restart 还没做，
+  也**不在 O5**：O5-a 的 adj-RIBs-in 是**收端**保留原样消息，RR 那侧重启仍然清表重放。
+  HA 的另一台天然兜住这段窗口 ⇒ **在 GR 之前，"同站点双设备"就是我们最实用的 GR 替代品**，
   这句话值得如实写进控制台的排障说明。
 
 ### 13.5 lab 前置（要用户点头才动）
