@@ -327,10 +327,13 @@ func (a *Applier) Apply(ctx context.Context, next Plan) (Result, error) {
 	}
 
 	// 3. 路由：按 (表, 前缀) 整条替换。
-	//    身份集合没变、只有 preference 变了时先删后加。注意这条规则的**前提已经站不住**：
-	//    docs/overlay-design-draft.md §2.2（2026-10-30 重测）表明我们发的
-	//    is_multipath=0 整条替换自己会重算选路，删加反而是改色瞬间窗口的唯一来源；
-	//    留不留等用户重拍，拍之前先保证这条分支有单测覆盖（O1 已落的那条负向单测）。
+	//    身份集合没变、只有 preference 变了时先删后加。
+	//    这条规则**不是必需的**：docs/overlay-design-draft.md §2.2（2026-10-30 重测）表明
+	//    我们发的 is_multipath=0 整条替换自己会重算选路，删加只是让改色瞬间多一个路由整条
+	//    消失再回来的窗口。用户 2026-10-30 拍了：改颜色丢包属于正常、应该接受，规则保留。
+	//    所以这里保证的是"改色一定重算"，代价是窗口；窗口时长由 lab 判据记录，不做优化。
+	//    覆盖它的单测：TestApplyDeleteThenAddOnPrefChange（改色 ⇒ RoutesRemoved=1 + RoutesSet=1）
+	//    与 TestApplyAddRemovePathNoExtraDelete（路径集合本身变化 ⇒ 不触发删加）。
 	prevRoutes := map[string]Route{}
 	for _, r := range a.prev.Routes {
 		prevRoutes[routeKey(r)] = r
