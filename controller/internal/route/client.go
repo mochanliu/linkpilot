@@ -631,10 +631,33 @@ func (c *Client) Tunnels() []Tunnel {
 	return copyTunnels(c.tunnels)
 }
 
+// VRFs returns the local VRF table in force, sorted by id. RTs come back
+// canonicalised and sorted, so a reader sees the same strings the routes carry
+// rather than the order they were configured in -- and an empty list is empty,
+// never nil, because a console has to be able to tell "no import RTs" apart
+// from "not reported".
+func (c *Client) VRFs() []VRFConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]VRFConfig, 0, len(c.vrfIDs))
+	for _, id := range c.vrfIDs {
+		out = append(out, VRFConfig{
+			ID:        id,
+			ExportRTs: append([]string(nil), c.exports[id]...),
+			ImportRTs: sortedKeys(c.vrfs[id].imports),
+		})
+	}
+	return out
+}
+
 // Pending returns the routes the active RR sent that are not installed, plus the
 // gate each one is behind. This is the other half of "keep what you were told":
 // a held-back prefix has to be reportable, or a table that is missing routes is
 // indistinguishable from one that never received them.
+//
+// The slice is never nil, same reason as copyTunnels: these lists reach the
+// console as JSON, and "[]" says "nothing held back" while "null" would only say
+// "this build does not report it".
 func (c *Client) Pending() []PendingRoute {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -642,10 +665,10 @@ func (c *Client) Pending() []PendingRoute {
 }
 
 func (c *Client) pendingOf(idx int) []PendingRoute {
+	out := make([]PendingRoute, 0)
 	if idx < 0 {
-		return nil
+		return out
 	}
-	out := make([]PendingRoute, 0, len(c.sessions[idx].pending))
 	for _, p := range c.sessions[idx].pending {
 		out = append(out, p)
 	}
@@ -662,11 +685,11 @@ func (c *Client) pendingOf(idx int) []PendingRoute {
 }
 
 // LocalSkips returns the local prefixes that the current VRF table cannot turn
-// into an announcement, sorted.
+// into an announcement, sorted. Never nil: see Pending.
 func (c *Client) LocalSkips() []LocalSkip {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]LocalSkip(nil), c.skipped...)
+	return append([]LocalSkip{}, c.skipped...)
 }
 
 // classifyLocked decides where one received route belongs: the table entry it

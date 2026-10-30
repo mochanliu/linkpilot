@@ -233,7 +233,8 @@ func summary(c *route.Client) string {
 	if len(parts) == 0 {
 		parts = append(parts, "empty")
 	}
-	return fmt.Sprintf("active=%d sessions[%v] rib{%s}", st.ActiveRR, synced, strings.Join(parts, " "))
+	return fmt.Sprintf("active=%d sessions[%v] rib{%s} held=%d",
+		st.ActiveRR, synced, strings.Join(parts, " "), st.ActivePending)
 }
 
 // localPrefixJSON is both the /status "local" shape and the /local-prefixes
@@ -256,26 +257,120 @@ func localPrefixes(c *route.Client) []localPrefixJSON {
 	return out
 }
 
-func serveStatus(addr string, c *route.Client) {
+// statusDoc is the /status body. ClientStats is embedded, so its fields stay at
+// the top level the way sr-fib and the console read them.
+//
+// The two held-back lists are bounded (maxStatusList) and always come with a
+// total. A device can have as many pending prefixes as the RR knows about, and
+// this endpoint is polled, not streamed -- but a truncated list with no total
+// would let a console say "these are all the routes being held back", which is
+// the kind of number nobody can act on and nobody can disprove.
+type statusDoc struct {
+	route.ClientStats
+	RIB                 map[string][]route.RIBEntry `json:"rib"`
+	Local               []localPrefixJSON           `json:"local"`
+	Tunnels             []tunnelConfig              `json:"tunnels"`
+	VRFs                []vrfConfig                 `json:"vrfs"`
+	Pending             []route.PendingRoute        `json:"pending"`
+	PendingTotal        int                         `json:"pending_total"`
+	PendingTruncated    bool                        `json:"pending_truncated"`
+	LocalSkips          []route.LocalSkip           `json:"local_skips"`
+	LocalSkipsTotal     int                         `json:"local_skips_total"`
+	LocalSkipsTruncated bool                        `json:"local_skips_truncated"`
+}
+
+// Enough to show a console a real page of held routes without letting one VPN
+// worth of them dominate the body.
+const maxStatusList = 200
+
+func statusFor(c *route.Client) statusDoc {
+	all := c.AllRIB()
+	doc := statusDoc{
+		ClientStats: c.Stats(),
+		RIB:         make(map[string][]route.RIBEntry, len(all)),
+		Local:       localPrefixes(c),
+		Tunnels:     tunnelsOf(c),
+		VRFs:        vrfsOf(c),
+	}
+	for vrf, routes := range all {
+		doc.RIB[strconv.Itoa(int(vrf))] = routes
+	}
+	doc.Pending = c.Pending()
+	doc.PendingTotal = len(doc.Pending)
+	if doc.PendingTotal > maxStatusList {
+		doc.Pending = doc.Pending[:maxStatusList]
+		doc.PendingTruncated = true
+	}
+	doc.LocalSkips = c.LocalSkips()
+	doc.LocalSkipsTotal = len(doc.LocalSkips)
+	if doc.LocalSkipsTotal > maxStatusList {
+		doc.LocalSkips = doc.LocalSkips[:maxStatusList]
+		doc.LocalSkipsTruncated = true
+	}
+	return doc
+}
+
+func tunnelsOf(c *route.Client) []tunnelConfig {
+	ts := c.Tunnels()
+	out := make([]tunnelConfig, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, tunnelConfig{Peer: t.Peer, NextHop: t.NextHop})
+	}
+	return out
+}
+
+func vrfsOf(c *route.Client) []vrfConfig {
+	vs := c.VRFs()
+	out := make([]vrfConfig, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, vrfConfig{ID: v.ID, ExportRTs: v.ExportRTs, ImportRTs: v.ImportRTs})
+	}
+	return out
+}
+
+type tunnelsDoc struct {
+	Tunnels []tunnelConfig `json:"tunnels"`
+}
+
+type vrfsDoc struct {
+	VRFs []vrfConfig `json:"vrfs"`
+}
+
+// writeJSON is the response half of the seams below. Encoding errors are not
+// reportable to the caller at that point, so log them: a silently short body
+// would look like a device that has no routes.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		log.Printf("sr-route: encode status: %v", err)
+	}
+}
+
+// decodeJSON reads a PUT body with the same strictness as the config file. That
+// matters more here than it does for a file nobody can start the process
+// without: a misspelled field would otherwise decode as "this table is empty",
+// and these PUTs are whole replacements.
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(target); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+// statusMux is split out of serveStatus so the seams can be driven by httptest.
+func statusMux(c *route.Client) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "GET only", http.StatusMethodNotAllowed)
 			return
 		}
-		all := c.AllRIB()
-		rib := make(map[string][]route.RIBEntry, len(all))
-		for vrf, routes := range all {
-			rib[strconv.Itoa(int(vrf))] = routes
-		}
-		w.Header().Set("Content-Type", "application/json")
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		enc.Encode(struct {
-			route.ClientStats
-			RIB   map[string][]route.RIBEntry `json:"rib"`
-			Local []localPrefixJSON           `json:"local"`
-		}{c.Stats(), rib, localPrefixes(c)})
+		writeJSON(w, statusFor(c))
 	})
 	// PUT replaces the dynamic local set (static local_prefixes are kept).
 	// This is the reverse-import entry point: sr-frr watches the in-box FRR
@@ -283,14 +378,10 @@ func serveStatus(addr string, c *route.Client) {
 	mux.HandleFunc("/local-prefixes", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(localPrefixesDoc{Prefixes: localPrefixes(c)})
+			writeJSON(w, localPrefixesDoc{Prefixes: localPrefixes(c)})
 		case http.MethodPut:
 			var doc localPrefixesDoc
-			dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&doc); err != nil {
-				http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			if !decodeJSON(w, r, &doc) {
 				return
 			}
 			lps := make([]route.LocalPrefix, 0, len(doc.Prefixes))
@@ -302,14 +393,75 @@ func serveStatus(addr string, c *route.Client) {
 				return
 			}
 			log.Printf("sr-route: 动态 local prefixes = %d 条", len(lps))
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(localPrefixesDoc{Prefixes: localPrefixes(c)})
+			writeJSON(w, localPrefixesDoc{Prefixes: localPrefixes(c)})
 		default:
 			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 		}
 	})
-	log.Printf("sr-route: status on http://%s/status（反向上报入口 PUT /local-prefixes）", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	// PUT replaces the whole tunnel table -- the same message the RR is sent, so
+	// a table posted here both re-resolves the routes already held in adj-RIBs-in
+	// and tells the RR what it may reflect to us. Routes that were held back for
+	// want of a path are installed by this call alone; no process restarts and no
+	// prefix has to be announced twice. Omitting the key means an empty table,
+	// which is a withdraw of every tunnel, so callers must send the array.
+	mux.HandleFunc("/tunnels", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, tunnelsDoc{Tunnels: tunnelsOf(c)})
+		case http.MethodPut:
+			var doc tunnelsDoc
+			if !decodeJSON(w, r, &doc) {
+				return
+			}
+			ts := make([]route.Tunnel, 0, len(doc.Tunnels))
+			for _, t := range doc.Tunnels {
+				ts = append(ts, route.Tunnel{Peer: t.Peer, NextHop: t.NextHop})
+			}
+			if err := c.SetTunnels(ts); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			log.Printf("sr-route: 隧道表 = %d 条（待决 %d 条）", len(c.Tunnels()), len(c.Pending()))
+			writeJSON(w, tunnelsDoc{Tunnels: tunnelsOf(c)})
+		default:
+			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
+		}
+	})
+	// PUT replaces the VRF table, which is half of every route decision: the
+	// import RTs decide which received prefixes leave the pending list, and the
+	// export RTs are stamped onto what we announce. A VRF dropped here therefore
+	// withdraws its local prefixes rather than leaving them announced under an RT
+	// policy nobody configured any more.
+	mux.HandleFunc("/vrfs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, vrfsDoc{VRFs: vrfsOf(c)})
+		case http.MethodPut:
+			var doc vrfsDoc
+			if !decodeJSON(w, r, &doc) {
+				return
+			}
+			vs := make([]route.VRFConfig, 0, len(doc.VRFs))
+			for _, v := range doc.VRFs {
+				vs = append(vs, route.VRFConfig{ID: v.ID, ExportRTs: v.ExportRTs, ImportRTs: v.ImportRTs})
+			}
+			if err := c.SetVRFs(vs); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			log.Printf("sr-route: VPN 表 = %d 张（本地前缀 %d 条，未能宣告 %d 条）",
+				len(c.VRFs()), len(c.LocalRoutes()), len(c.LocalSkips()))
+			writeJSON(w, vrfsDoc{VRFs: vrfsOf(c)})
+		default:
+			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
+		}
+	})
+	return mux
+}
+
+func serveStatus(addr string, c *route.Client) {
+	log.Printf("sr-route: status on http://%s/status（运行时改表入口 PUT /tunnels、PUT /vrfs、PUT /local-prefixes）", addr)
+	if err := http.ListenAndServe(addr, statusMux(c)); err != nil {
 		log.Printf("sr-route: status server: %v", err)
 	}
 }
