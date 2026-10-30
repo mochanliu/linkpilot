@@ -245,9 +245,26 @@ show interface features <wg>     # mpls-input 弧下面是 "none configured" 才
 引用计数字性照抄进 `fakeVPP.mplsCount`（跨 `DeleteInterface` 存活、只在 0↔1 翻弧），所以这四条是真回归。
 **变异测试**：把 `teardownTunnel` 里那句 disable 改成 enable，三条立刻变红，报错正是那句诊断。
 
-**lab 里留下的坏号**（这些实验的代价，别当成新 bug）：lab-cpe2 的 `sw_if_index` 7（上表 A 段）、
-lab-cpe1 的 10/11/12（临时 loopback 试验）。它们谁接上都是"开不了 MPLS"，只有重启该盒 VPP 才清得掉；
-真撞上了会看见 agent 报"隧道接口 N 开不了 MPLS" —— 那是检测在工作，不是又一个新坑。
+**lab 里留下的坏号**（这些实验的代价，别当成新 bug）：**按"当前占着这个号的接口"读，别按号记** ——
+残计数跟着 `sw_if_index` 走，号一释放再被占，坏的就是那张新接口。本轮（2026-10-30 晚）用新判据
+`show interface features <idx>` 对三台 CPE 复测：
+
+| 盒子 | 干净的隧道口 | 弧上还挂着 `mpls-not-enabled` 的 |
+| --- | --- | --- |
+| lab-cpe1 | wg0(4)、wg1(5)、wg1003(7) | **wg1001(6)**（就是上面那张现场照片） |
+| lab-cpe2 | wg0(4)、wg1(5) | **wg1001(6)** |
+| lab-cpe3 | wg0(4)、wg1(5) | 无（这台没跑 agent，隧道是 10-26 手工配的） |
+
+实验用的临时号（lab-cpe2 的 7、lab-cpe1 的 10/11/12）此刻都已释放，`show interface features` 会回
+`unknown interface index` —— 这**不等于**号被洗干净了，只是暂时没人占。上面两个 6 号只有重启该盒 VPP
+才清得掉；真撞上了会看见 agent 报"隧道接口 N 开不了 MPLS" —— 那是检测在工作，不是又一个新坑。
+
+（顺带记一条**与本坑无关**的 lab 现状：`test/lab/verify.sh` 今天 289 通过 / 15 失败，15 条全是
+site3 相关的流。复测到的根因是 lab-cpe3 那台盒子过期：清掉计数后从 term2 打 4 个包到 term3，cpe3 收端
+`show sr-wg stats` 是 `Decap ok=0 / hmac_fail=6`；反向 cpe1 能解封装（`Decap ok=5`）、但内层包止于
+`null-node blackholed`。两边 `show sr-wg keys` 都只有 `hmac_id=1 active=1`，而 cpe3 那份是 10-26
+手工配的、之后 cpe1/cpe2 由 agent 重新下发过 ⇒ **最可能是同一个 id 已不再是同一份密钥**（密钥本身
+读不出来，这句是推断，不是实测）。属于 lab 供给状态问题，另开一条处理，不是 #145 的代价。）
 
 ---
 
