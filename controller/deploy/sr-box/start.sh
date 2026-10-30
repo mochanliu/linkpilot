@@ -454,6 +454,9 @@ run_check() {
 
 run_stop() {
     local s pid name
+    # 容器形态下 $RUN/vpp.pid 也是这份清单写的（vpp 那一步真的把 VPP 拉起来了），
+    # 但这里仍然不碰它：停 VPP = 现网断流，那不该是"停一份清单"的副作用。
+    # 要停数据面请明着停（vpp.service / 那个启动器自己的办法）。
     for s in bridge fib route agent; do
         [ -f "$RUN/$s.pid" ] || continue
         name=$(name_of "$s")

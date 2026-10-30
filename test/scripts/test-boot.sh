@@ -6,7 +6,7 @@
 #
 #   重启盒子后不手敲任何命令，overlay 与路由面自己在；配置变更与进程恢复**永不**重启别的进程。
 #
-# 三段，各答一半：
+# 四段，各答一半：
 #
 #   (1) 装盒子：清单、配置、身份、磁盘上那版客户配置都落到**真路径**
 #       （/usr/local/lib/sr-box/start.sh、/etc/sr-box/sr-box.conf、/etc/sdwan/*.json、
@@ -27,6 +27,13 @@
 #           那份表），而不是用一句"全部完成"盖掉；
 #         * 手工把 wg0 恢复（扮演 sr-agent -tunnels 重新够到控制器）之后，**已经在跑的**
 #           sr-route/sr-fib 自己把 FIB 装上、终端又通 —— 还是一个进程都不用重启。
+#   (C)  stop 这一半：清单有三个入口，前面只判了 up 与 check。stop 的判据是同一件事的
+#       反面 —— **停的是清单起的进程，不是数据面**：三行带 pid 的 SIGTERM、三个 pidfile
+#       清干净、三个进程真没了；而 VPP 的 pid 没变、wg0 还在、overlay 照样 ping 得通、
+#       `vpp.pid` 那份"是谁起的"记录也没被抹（容器形态下 VPP 确实是清单拉起来的，
+#       它仍然不杀 —— 停数据面 = 现网断流，不该是"停一份清单"的副作用）。stop 之后的
+#       check 报的是「配置在，进程没跑」而不是"上次成功了"；再 up 一遍把三步补回来，
+#       新进程各自连回 RR、装回表、终端又通，VPP 仍是同一个 pid。
 #
 # 前置：**必须先跑过 test/scripts/test-e2e.sh --keep**（node1↔node2 的 wg0 在、overlay 通）。
 # 本脚本会重启这两个容器的 VPP，收尾时把隧道手工恢复回 e2e 那个形状。
@@ -700,6 +707,67 @@ has_re "$BOX_OUT" "^tunnels.*1 条" &&
     bad "node1 的 check 没报 tunnels 1 条"
 term_setup
 term_ping "冷启 + 隧道姗姗来迟之后"
+
+# ---------------------------------------------------------------- C stop 这一半
+
+# 清单有三个入口，前两段只判了 up 与 check。stop 也得有一条判据，而且它的判据和
+# 前两条是同一件事的两面：**停的是清单起的进程，不是数据面**。所以这段同时问三句：
+# 该没的都没了（三行 SIGTERM、三个 pidfile、三个进程），不该动的一个没动（VPP 的
+# pid、wg0、overlay 的连通），并且 stop 之后 check 与 up 说的是实话、也做得实事。
+# 注意这段**不**再 term_setup：VPP 没被碰，tap 与前两段建的终端路由都还在。
+info "C. stop：只停清单自己起的进程，VPP 一个字节都不该被碰"
+c_route=$(box_pid "$N1" route)
+c_fib=$(box_pid "$N1" fib)
+c_agent=$(box_pid "$N1" agent)
+c_vpp=$(dx "$N1" "pgrep -x vpp_main | head -1")
+[ -n "$c_vpp" ] || die "C 段开始时 node1 上没有 vpp_main"
+run_box "$N1" stop && ok "node1 stop 退出码 0" || bad "node1 stop 退出码 $BOX_RC"
+has_line "$BOX_OUT" "VPP 与 FRR 没动" &&
+    ok "stop 明说自己没碰 VPP/FRR（容器形态下 vpp.pid 也是清单写的，它还是不杀）" ||
+    bad "stop 没说明它不动数据面：$(printf '%s' "$BOX_OUT" | grep stop || echo 无 stop 行)"
+for s in route fib agent; do
+    has_line "$BOX_OUT" "SIGTERM $s (pid" &&
+        ok "stop 报了 SIGTERM $s 那一行（带 pid，不是含糊的「已停止」）" ||
+        bad "stop 的输出里没有 SIGTERM $s：$(printf '%s' "$BOX_OUT" | grep stop || echo 无 stop 行)"
+done
+no_box_procs() {
+    [ -z "$(dx "$1" "pgrep -x sr-route; pgrep -x sr-fib; pgrep -x sr-agent")" ]
+}
+wait_fn "三个 sr-* 进程都不在了（SIGTERM 落地）" 10 no_box_procs "$N1"
+gone=$(dx "$N1" "for s in route fib agent; do [ -e $BOX_RUN/\$s.pid ] && echo \$s; done")
+[ -z "$gone" ] && ok "pidfile 也清干净了（route/fib/agent 三个都没留）" ||
+    bad "stop 之后还留着这些 pidfile：$gone"
+vpp_pidfile=$(dx "$N1" "[ -e $BOX_RUN/vpp.pid ] && echo yes || echo no")
+[ "$vpp_pidfile" = yes ] &&
+    ok "vpp.pid 还在 —— stop 连「VPP 是谁起的」这份记录都没抹" || bad "stop 把 vpp.pid 也删了"
+[ "$(dx "$N1" "pgrep -x vpp_main | head -1")" = "$c_vpp" ] &&
+    ok "VPP 的 pid 没变（$c_vpp）：停清单不等于停数据面" || bad "VPP 被 stop 弄重启了"
+has_iface "$N1" "$WG_IF" && ok "wg0 还在（VPP 没重启，隧道这层自然也没被牵连）" ||
+    bad "stop 之后 wg0 没了 —— 数据面被动过"
+vpp "$N1" "ping $OVERLAY_N2 repeat 3 interval 0.2" | grep -q '0% packet loss' &&
+    ok "overlay 照样通：这条 ping 走的就是那个没被碰的 VPP" || bad "stop 之后 overlay 不通"
+run_box "$N1" check || bad "stop 之后的 check 返回非 0（check 是只读的，不该失败）"
+has_re "$BOX_OUT" "^route[[:space:]]+有.*配置在，进程没跑" &&
+    ok "check 现在如实报「配置在，进程没跑」—— 它报的是现状，不是「上次 up 成功了」" ||
+    bad "stop 之后的 check 没说 route 没在跑：$(printf '%s' "$BOX_OUT" | grep route || echo 无 route 行)"
+
+info "C2. 再 up 一遍：缺的那三步补回来，VPP 依旧没被碰"
+run_box "$N1" up && ok "stop 之后 up 退出码 0" || bad "stop 之后 up 退出码 $BOX_RC"
+n_route=$(box_pid "$N1" route); n_fib=$(box_pid "$N1" fib); n_agent=$(box_pid "$N1" agent)
+[ "$n_route" != "$c_route" ] && [ "$n_route" != none ] &&
+    ok "sr-route 换成了新的进程（$c_route → $n_route）" || bad "sr-route 没被补起来（$n_route）"
+[ "$n_fib" != "$c_fib" ] && [ "$n_fib" != none ] && ok "sr-fib 补上了（$n_fib）" ||
+    bad "sr-fib 没被补起来（$n_fib）"
+[ "$n_agent" != "$c_agent" ] && [ "$n_agent" != none ] && ok "sr-agent 补上了（$n_agent）" ||
+    bad "sr-agent 没被补起来（$n_agent）"
+[ "$(dx "$N1" "pgrep -x vpp_main | head -1")" = "$c_vpp" ] &&
+    ok "这一遍 up 之后 VPP 的 pid 仍是 $c_vpp —— 补进程与动数据面是两件事" ||
+    bad "第二遍 up 重启了 VPP"
+wait_json "$N1" "$S1" "any(s['connected'] and s['synced'] for s in d['sessions']) and d['active_rib_routes'] == 1" \
+    "新的 sr-route 自己连回 RR 并同步完（没人替它做任何事）" 40
+wait_fn "老的 sr-fib 不在场这一阵子缺的表，新起的 sr-fib 自己装回来了" 30 \
+    labeled_via "$N1" "$VRF_1" "$PFX_2" "$LBL_2" "$OVERLAY_N2"
+term_ping "stop 再 up 之后"
 
 echo
 echo "== 结果：$PASS passed, $FAIL failed"

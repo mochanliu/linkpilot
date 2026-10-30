@@ -358,9 +358,10 @@ docker exec srwg-node1 /usr/local/lib/sr-box/start.sh stop    # 只停清单自�
 `/etc/sr-box/sr-box.conf` 里逐项覆盖。**lab 是这份清单的"没有 systemd"形态**：容器里
 PID 1 是 bash，所以 `vpp` 那一步是真启动（走 `start-node.sh` 那条伪终端路径），
 而"谁跑第一遍 up"是人 —— 判据脚本
-[test/scripts/test-boot.sh](../scripts/test-boot.sh)（69 条断言，需先
+[test/scripts/test-boot.sh](../scripts/test-boot.sh)（90 条断言，需先
 `test-e2e.sh --keep`）就是照这个形状写的：热 VPP 一遍 up、只杀 sr-route 再 up、
-`docker restart` 两个容器后每台盒子只敲一条 up。跑完会自己收尾（`--keep` 可留着看）。
+`docker restart` 两个容器后每台盒子只敲一条 up，最后一遍把三个入口里的 `stop` 也判掉
+（`stop` 只清 `sr-*`，VPP 的 pid 一个字节不动，紧接着 `up` 只补那三步）。跑完会自己收尾（`--keep` 可留着看）。
 
 三条实测到的边界，别再当成 bug 查：隧道那一层清单恢复不了（wg 口的期望值在控制器上，
 磁盘上没有那份表，`up` 的结论会明写 `tunnels 0 条`）；`--restart unless-stopped`
