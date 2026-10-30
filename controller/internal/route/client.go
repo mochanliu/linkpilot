@@ -86,19 +86,28 @@ type ClientStats struct {
 	Received          uint64         `json:"received"`
 	Imported          uint64         `json:"imported"`
 	Withdrawn         uint64         `json:"withdrawn"`
-	DroppedNoVRF      uint64         `json:"dropped_no_vrf"`
 	DroppedRTMismatch uint64         `json:"dropped_rt_mismatch"`
 	DroppedInvalid    uint64         `json:"dropped_invalid"`
 	DroppedOwnRoute   uint64         `json:"dropped_own_route"`
 	DroppedNoPath     uint64         `json:"dropped_no_path"`
 }
 
-// RIBEntry is one imported route plus the local next hops that reach its origin.
+// RIBEntry is one imported route plus the local next hops that reach its origin
+// and the local VRFs it was imported into.
+//
 // The wire never carries next hops: they are resolved here from this device's
 // own tunnel table, so one prefix is a single object at the RR and one entry per
 // receiver only where it is actually installed.
+//
+// Targets is the answer to "本机哪些 VRF import 了这条路由的 RT"，它和 Route.VRFID
+// （**来源** VPN）是两件事：导通组里 A 的 VPN 10 可以落进 B 的 VPN 20。一条路由在
+// 每个目标表都可见 ⇒ 它只存一份、Targets 是一个集合，而不是每个目标一条记录：撤
+// 路由是按 (来源设备, 来源 VPN, 前缀) 这个键来的（见 RouteKey），拆成多行就要在
+// withdraw 那边记住"这条路由我装进了哪几张表"，那是同一份状态的第二个主人。
+// 装表那边（internal/fib）拿 map 的键当目标表、拿 Route.VRFID 算标签。
 type RIBEntry struct {
 	Route
+	Targets  []uint8  `json:"targets"`
 	NextHops []string `json:"next_hops"`
 }
 
@@ -118,6 +127,7 @@ type Client struct {
 	cfg      ClientConfig
 	hold     time.Duration
 	vrfs     map[uint8]*localVRF
+	vrfIDs   []uint8            // vrfs 的升序：Targets 要有稳定顺序（map 迭代是随机的）
 	exports  map[uint8][]string // vrf -> canonical export RTs, stamped on local routes
 	base     map[RouteKey]Route // static local_prefixes from config
 	dynamic  map[RouteKey]Route // replaced wholesale by SetLocalPrefixes
@@ -141,7 +151,6 @@ type counters struct {
 	received   uint64
 	imported   uint64
 	withdrawn  uint64
-	noVRF      uint64
 	rtMismatch uint64
 	invalid    uint64
 	ownRoute   uint64
@@ -223,7 +232,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		c.vrfs[v.ID] = lv
 		exports[v.ID] = sortedKeys(exp)
 		c.exports[v.ID] = exports[v.ID]
+		c.vrfIDs = append(c.vrfIDs, v.ID)
 	}
+	sort.Slice(c.vrfIDs, func(i, j int) bool { return c.vrfIDs[i] < c.vrfIDs[j] })
 
 	tunnels := append([]Tunnel(nil), cfg.Tunnels...)
 	for _, t := range tunnels {
@@ -723,19 +734,13 @@ func (c *Client) applyAnnounce(idx int, routes []Route) error {
 	for _, k := range order {
 		rt := last[k]
 		delete(s.rib, k) // RT change can revoke the import
-		lv := c.vrfs[rt.VRFID]
-		if lv == nil {
-			c.counters.noVRF++
-			continue
-		}
-		matched := false
-		for _, rtTag := range rt.RTs {
-			if lv.imports[rtTag] {
-				matched = true
-				break
-			}
-		}
-		if !matched {
+		// RT 匹配决定的是**这条路由装进本机哪几张表**，与来源 VPN 无关
+		// （§4.3 第 1 步）。来源 VPN 只决定标签：对端弹栈后查的是它自己那张表
+		// （§2.4）。所以这里不能再看 rt.VRFID 在本机存不存在 —— 导通要解决的正是
+		// "本机没有的那个 VPN 的路由落进本机有的 VPN 表"，旧代码那道
+		// `c.vrfs[rt.VRFID] == nil` 的闸会把所有跨 VPN 的导通在 RT 匹配之前就丢掉。
+		targets := c.importTargets(rt.RTs)
+		if len(targets) == 0 {
 			c.counters.rtMismatch++
 			continue
 		}
@@ -748,10 +753,27 @@ func (c *Client) applyAnnounce(idx int, routes []Route) error {
 			c.counters.noPath++
 			continue
 		}
-		s.rib[k] = RIBEntry{Route: rt, NextHops: append([]string(nil), nh...)}
+		s.rib[k] = RIBEntry{Route: rt, Targets: targets, NextHops: append([]string(nil), nh...)}
 		c.counters.imported++
 	}
 	return nil
+}
+
+// importTargets 返回本机 import 了这些 RT 的 VRF，升序。
+// 升序不是整理癖：Targets 会进 /status 的 JSON，也是 sr-fib 每轮重算的输入，
+// 顺序不稳定就等于每轮都"看起来变了"。
+func (c *Client) importTargets(rts []string) []uint8 {
+	var out []uint8
+	for _, id := range c.vrfIDs {
+		lv := c.vrfs[id]
+		for _, rtTag := range rts {
+			if lv.imports[rtTag] {
+				out = append(out, id)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (c *Client) applyWithdraw(idx int, keys []RouteKey) error {
@@ -770,7 +792,9 @@ func (c *Client) applyWithdraw(idx int, keys []RouteKey) error {
 	return nil
 }
 
-// RIB returns the imported routes for one VRF from the active RR, sorted.
+// RIB returns the routes imported into one local VRF from the active RR, sorted.
+// 这里的 vrf 是**目标**表：一条来源 VPN 不在这台盒子上的路由，只要 RT 命中了这个
+// VRF 的 import，就会出现在这里（§4.3 第 1 步）。
 func (c *Client) RIB(vrf uint8) []RIBEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -779,14 +803,18 @@ func (c *Client) RIB(vrf uint8) []RIBEntry {
 	}
 	var out []RIBEntry
 	for _, rt := range c.sessions[c.active].rib {
-		if rt.VRFID == vrf {
-			out = append(out, rt)
+		for _, t := range rt.Targets {
+			if t == vrf {
+				out = append(out, rt)
+				break
+			}
 		}
 	}
 	return sortedEntries(out)
 }
 
-// AllRIB returns every imported route on the active RR, grouped by VRF.
+// AllRIB returns every imported route on the active RR, grouped by **target** VRF
+// —— 也就是 sr-fib 要往哪张表装。同一个 RouteKey 可以出现在几张表下面。
 func (c *Client) AllRIB() map[uint8][]RIBEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -795,7 +823,9 @@ func (c *Client) AllRIB() map[uint8][]RIBEntry {
 		return out
 	}
 	for _, rt := range c.sessions[c.active].rib {
-		out[rt.VRFID] = append(out[rt.VRFID], rt)
+		for _, t := range rt.Targets {
+			out[t] = append(out[t], rt)
+		}
 	}
 	for vrf := range out {
 		out[vrf] = sortedEntries(out[vrf])
@@ -829,7 +859,6 @@ func (c *Client) Stats() ClientStats {
 		Received:          c.counters.received,
 		Imported:          c.counters.imported,
 		Withdrawn:         c.counters.withdrawn,
-		DroppedNoVRF:      c.counters.noVRF,
 		DroppedRTMismatch: c.counters.rtMismatch,
 		DroppedInvalid:    c.counters.invalid,
 		DroppedOwnRoute:   c.counters.ownRoute,

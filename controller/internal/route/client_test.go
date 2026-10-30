@@ -289,21 +289,32 @@ func TestClientImportsOnlyMatchingRTs(t *testing.T) {
 	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
 	good := testRoute(20, 5, "10.20.0.0/16", "65000:6")
 	badRT := testRoute(20, 5, "10.30.0.0/16", "65000:7")
-	badVRF := testRoute(20, 9, "10.40.0.0/16", "65000:6")
-	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{good, badRT, badVRF}})
+	// 来源 VPN 9 本机没有，但 RT 命中 VRF 5 的 import —— 这正是跨站点导通的形状：
+	// 准入只看 RT，来源 VPN 决定的是发端压哪个标签（Route.VRFID 原样留着给 fib）。
+	foreign := testRoute(20, 9, "10.40.0.0/16", "65000:6")
+	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{good, badRT, foreign}})
 
-	waitFor(t, "matching route imported", func() bool { return len(c.RIB(5)) == 1 })
-	if got := ribPrefixes(c.RIB(5)); len(got) != 1 || got[0] != "10.20.0.0/16@192.168.99.2" {
+	waitFor(t, "both matching routes imported", func() bool { return len(c.RIB(5)) == 2 })
+	if got := ribPrefixes(c.RIB(5)); len(got) != 2 ||
+		got[0] != "10.20.0.0/16@192.168.99.2" || got[1] != "10.40.0.0/16@192.168.99.2" {
 		t.Fatalf("rib = %v", got)
 	}
+	for _, e := range c.RIB(5) {
+		if e.Prefix == "10.40.0.0/16" && e.VRFID != 9 {
+			t.Fatalf("foreign route lost its source VPN: %+v", e)
+		}
+		if len(e.Targets) != 1 || e.Targets[0] != 5 {
+			t.Fatalf("targets = %v, want [5]", e.Targets)
+		}
+	}
 	st := c.Stats()
-	if st.DroppedRTMismatch != 1 || st.DroppedNoVRF != 1 || st.DroppedInvalid != 0 {
+	if st.DroppedRTMismatch != 1 || st.DroppedInvalid != 0 {
 		t.Fatalf("drop counters = %+v", st)
 	}
 
 	// A withdraw removes it from the "bgp" table.
 	peer.send(Envelope{Type: MsgWithdraw, Keys: []RouteKey{good.Key()}})
-	waitFor(t, "route withdrawn", func() bool { return len(c.RIB(5)) == 0 })
+	waitFor(t, "route withdrawn", func() bool { return len(c.RIB(5)) == 1 })
 }
 
 func TestClientResolvesEveryTunnelToOrigin(t *testing.T) {
@@ -580,14 +591,25 @@ func TestAllRIBAndEmptyWhenStopped(t *testing.T) {
 	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 		testRoute(20, 6, "10.30.0.0/16", "65000:8"),
-		testRoute(20, 6, "10.31.0.0/16", "65000:6"), // RT does not match VRF 6
+		// 来源 VRF 6、RT 65000:6 —— 命中的是 VRF 5 的 import：跨 VPN 导通。
+		// 它不再因为"本机有 6"或"本机没有 5"而被丢掉，准入只看 RT。
+		testRoute(20, 6, "10.31.0.0/16", "65000:6"),
 	}})
 	waitFor(t, "both VRFs populated", func() bool {
 		all := c.AllRIB()
-		return len(all[5]) == 1 && len(all[6]) == 1
+		return len(all[5]) == 2 && len(all[6]) == 1
 	})
 	if got := ribPrefixes(c.AllRIB()[6]); got[0] != "10.30.0.0/16@192.168.99.2" {
 		t.Fatalf("vrf 6 = %v", got)
+	}
+	if got := ribPrefixes(c.AllRIB()[5]); len(got) != 2 ||
+		got[0] != "10.20.0.0/16@192.168.99.2" || got[1] != "10.31.0.0/16@192.168.99.2" {
+		t.Fatalf("vrf 5 = %v", got)
+	}
+	for _, e := range c.AllRIB()[5] {
+		if e.Prefix == "10.31.0.0/16" && e.VRFID != 6 {
+			t.Fatalf("cross-VPN route lost its source VPN (the label depends on it): %+v", e)
+		}
 	}
 
 	srv.kill()
