@@ -66,6 +66,12 @@ const (
 	// spokes is the scale this split exists for, so the cap is per device, not per
 	// route; the frame limit still applies on top of it.
 	MaxTunnelsPerDevice = 4096
+	// MaxVRFID is the largest VRF this protocol can name: the field is uint8 in
+	// Route.VRFID, RouteKey.VRFID and VRFConfig.ID. A VPN id above it cannot be
+	// expressed at all, so a controller that configures 导通 must refuse it rather
+	// than render a route.json the device rejects. internal/fib carries the same
+	// bound for its table-number formula.
+	MaxVRFID uint8 = 255
 )
 
 // MsgType is the envelope discriminator. Unknown types are protocol errors,

@@ -352,6 +352,12 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/underlay/sites", s.handleAdminUnderlaySites)
 	mux.HandleFunc("/api/underlay/sites/delete", s.handleAdminUnderlaySiteDelete)
 	mux.HandleFunc("/api/underlay/node-site", s.handleAdminUnderlayNodeSite)
+	// Overlay is the route layer: 导通组 and the escape switch. Tenant-only for the
+	// same reason underlay is -- it says which of a customer's VPNs can see each
+	// other, which the operator has no business naming.
+	mux.HandleFunc("/api/overlay", s.handleAdminOverlay)
+	mux.HandleFunc("/api/overlay/settings", s.handleAdminOverlaySettings)
+	mux.HandleFunc("/api/overlay/group", s.handleAdminOverlayGroup)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/code", s.handleAdminClaimCode)

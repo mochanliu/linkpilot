@@ -285,6 +285,13 @@ type State struct {
 	// and it references two devices that must both exist.
 	Underlays map[string]*UnderlayConfig `json:"underlays"`
 
+	// Overlays is each tenant's route layer, keyed by tenant id: the 导通组 whose
+	// members the controller assigned RTs to, and the tenant-level escape switch.
+	// Separate from Underlays because a group is not a point-to-point thing -- it
+	// names a set of (device, VPN) pairs and one RT shared by all of them, and
+	// nothing in it references a tunnel or a port.
+	Overlays map[string]*OverlayConfig `json:"overlays"`
+
 	// Sites is each tenant's location table, keyed by site id. Console-only:
 	// nothing here is pushed to a device, because a coordinate means nothing to
 	// the dataplane. It exists so several boxes in one building share one position
@@ -397,6 +404,7 @@ func seedState() *State {
 		Accounts:   map[string]*Account{},
 		Configs:    map[string]*DeviceConfig{},
 		Underlays:  map[string]*UnderlayConfig{},
+		Overlays:   map[string]*OverlayConfig{},
 		Sites:      map[string]*Site{},
 		PreAuths:   map[string]*PreAuth{},
 
@@ -446,6 +454,16 @@ func normalizeState(s *State) bool {
 	}
 	if s.Underlays == nil {
 		s.Underlays = map[string]*UnderlayConfig{}
+	}
+	if s.Overlays == nil {
+		s.Overlays = map[string]*OverlayConfig{}
+	}
+	// A record from before the counters existed would allocate 65000:0 (an RT two
+	// groups could share), so each one is put back on the allocator's floor.
+	for _, oc := range s.Overlays {
+		if oc != nil {
+			oc.ensure()
+		}
 	}
 	// A tenant account whose tenant no longer exists authorizes nothing; drop it
 	// rather than leave a login that can only ever see an empty world.
