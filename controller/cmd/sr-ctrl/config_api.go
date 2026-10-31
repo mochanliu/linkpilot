@@ -33,6 +33,11 @@ type configView struct {
 	PublishedAt      int64             `json:"published_at_unix,omitempty"`
 	PublishedBy      string            `json:"published_by,omitempty"`
 	Device           *wire.ConfigState `json:"device_state,omitempty"`
+
+	// OverlayPending is "导通组改过、这一版还没发布". The draft version does not
+	// move when a 导通组 is edited, so without this the page would show 已同步 while
+	// the device was still running the old route targets.
+	OverlayPending bool `json:"overlay_pending,omitempty"`
 }
 
 // configViewOf renders one draft for the page. Everything a device would install
@@ -60,8 +65,16 @@ func configViewOf(nodeID uint16, serial string, dc *DeviceConfig, device *wire.C
 	return v
 }
 
-func buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
-	return configViewOf(n.NodeID, n.Serial, dc, n.Config)
+func (s *server) buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
+	v := configViewOf(n.NodeID, n.Serial, dc, n.Config)
+	// The overlay half is per-device and per-tenant, so it can only be added where
+	// the server's state is in reach: the page must show what a publish WOULD send.
+	v.Artifacts.Route = s.overlayRouteArtifactLocked(n.TenantID, n.NodeID)
+	// A 导通组 edit does not touch the draft version, so without this the page
+	// would keep saying "已同步" after the tenant changed the overlay and before
+	// anyone published it.
+	v.OverlayPending = dc != nil && dc.Published != nil && dc.Published.Artifacts.Route != v.Artifacts.Route
+	return v
 }
 
 func buildPreAuthConfigView(p *PreAuth, dc *DeviceConfig) configView {
@@ -144,7 +157,7 @@ func (s *server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	ck := configKey(id.TenantID, nodeID)
 	if r.Method == http.MethodGet {
-		writeJSON(w, buildConfigView(n, s.state.Configs[ck]))
+		writeJSON(w, s.buildConfigView(n, s.state.Configs[ck]))
 		return
 	}
 
@@ -160,7 +173,7 @@ func (s *server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	dc.UpdatedAt = time.Now().Unix()
 	dc.UpdatedBy = id.Username
 	s.save()
-	writeJSON(w, buildConfigView(n, dc))
+	writeJSON(w, s.buildConfigView(n, dc))
 }
 
 // handleAdminConfigBundle hands a tenant the exact artifacts the box should
@@ -193,7 +206,7 @@ func (s *server) handleAdminConfigBundle(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "node not found", http.StatusNotFound)
 		return
 	}
-	view := buildConfigView(node, s.state.Configs[configKey(id.TenantID, uint16(n))])
+	view := s.buildConfigView(node, s.state.Configs[configKey(id.TenantID, uint16(n))])
 	if view.Version == 0 {
 		http.Error(w, "no saved draft for this node", http.StatusConflict)
 		return

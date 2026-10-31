@@ -29,18 +29,32 @@ type publishRequest struct {
 }
 
 // publishConfigLocked freezes the current draft as what the device should run.
-// It reports whether anything changed: re-publishing the same version is not a
+// It reports whether anything changed: re-publishing an identical bundle is not a
 // new instruction and must not bump any timestamp the page shows.
-func publishConfigLocked(dc *DeviceConfig, checks []ConfigCheck, by string, now int64) bool {
-	if dc.Published != nil && dc.Published.Version == dc.Version {
-		return false
+//
+// The overlay is part of what is published, so an edit to a 导通组 counts as a
+// change even when the draft text did not move -- and it has to produce a NEW
+// version number. The box's store treats the version as identity (same number
+// with different content is refused as "already installed with different
+// content"), so reusing the old number would mean the change never reaches the
+// device. Bumping it keeps one numbering scheme for the page's "有没有未发布的改动".
+func (s *server) publishConfigLocked(tenantID string, nodeID uint16, dc *DeviceConfig,
+	checks []ConfigCheck, by string, now int64) bool {
+	route := s.overlayRouteArtifactLocked(tenantID, nodeID)
+	if dc.Published != nil {
+		if dc.Published.Version == dc.Version && dc.Published.Artifacts.Route == route {
+			return false
+		}
+		if dc.Published.Version == dc.Version {
+			dc.Version++
+		}
 	}
 	dc.Published = &PublishedBundle{
 		Version:     dc.Version,
 		PublishedAt: now,
 		PublishedBy: by,
 		Checks:      checks,
-		Artifacts:   renderArtifacts(&dc.Draft),
+		Artifacts:   s.artifactsLocked(tenantID, nodeID, &dc.Draft),
 	}
 	return true
 }
@@ -95,6 +109,11 @@ func (s *server) handleAdminConfigPublish(w http.ResponseWriter, r *http.Request
 		return
 	}
 	checks := validateBasicConfig(&dc.Draft)
+	// The overlay groups that name this device are checked here too: a VPN that
+	// has since been removed from the base config would otherwise reach the box as
+	// a VRF it cannot create, and the error would surface in a device log instead
+	// of on the page that caused it.
+	checks = append(checks, s.overlayNodeChecksLocked(id.TenantID, req.NodeID)...)
 	for _, c := range checks {
 		if c.Severity == "error" {
 			http.Error(w, fmt.Sprintf("草稿 v%d 还有一个校验错误：%s先在页面上改掉——强制下发只在设备侧 CLI（sr-apply --force）",
@@ -102,11 +121,11 @@ func (s *server) handleAdminConfigPublish(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	if publishConfigLocked(dc, checks, id.Username, time.Now().Unix()) {
+	if s.publishConfigLocked(id.TenantID, req.NodeID, dc, checks, id.Username, time.Now().Unix()) {
 		s.save()
 		s.admin.publish("config.published", dc.TenantID, n)
 	}
-	writeJSON(w, buildConfigView(n, dc))
+	writeJSON(w, s.buildConfigView(n, dc))
 }
 
 // handleConfigBundle is the device-facing half. Identity comes from the client
@@ -165,9 +184,10 @@ func bundleFor(p *PublishedBundle, nodeID uint16) apply.Bundle {
 		GeneratedAt: p.PublishedAt,
 		Checks:      checks,
 		Artifacts: apply.Artifacts{
-			FRR:  p.Artifacts.FRR,
-			VPP:  p.Artifacts.VPP,
-			Boot: p.Artifacts.Boot,
+			FRR:   p.Artifacts.FRR,
+			VPP:   p.Artifacts.VPP,
+			Boot:  p.Artifacts.Boot,
+			Route: p.Artifacts.Route,
 		},
 	}
 }

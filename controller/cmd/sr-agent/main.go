@@ -63,6 +63,8 @@ func main() {
 		vppctl    = flag.String("vppctl", "vppctl", "vppctl binary")
 		frrConf   = flag.String("frr-conf", "/etc/frr/frr.conf", "FRR config path")
 		frrReload = flag.String("frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
+		routeConf = flag.String("route-conf", "/etc/sdwan/route.json",
+			"sr-route config file; the bundle's overlay segment is merged into it (never created here)")
 
 		// The interface inventory is read-only and off by default: a box whose
 		// VPP is managed by hand may not have this socket, and an agent that
@@ -206,6 +208,7 @@ func main() {
 		applier.VPPCtl = *vppctl
 		applier.FRRConf = *frrConf
 		applier.FRRReload = *frrReload
+		applier.RouteConf = *routeConf
 		applier.Logf = log.Printf
 		cfg = newConfigSync(id.NodeID(), store, client.ConfigBundle,
 			func(ctx context.Context, b apply.Bundle) error { return applier.Apply(ctx, b, false) },

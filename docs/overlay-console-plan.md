@@ -122,10 +122,33 @@ O6-a 之后我把两边都读了一遍：
 日志与 `status.json` 里必须明写"已落盘、未热更"，不写成完成。
 
 
-sr-fib 那份（`vrfs` + `tunnels` + `escape_all_colors`）同样由 `sr-apply` 写盘，但它**没有热更入口**
+sr-fib 那份（`vrfs` + `tunnels` + `escape_all_colors`）同样要由 `sr-apply` 写盘，但它**没有热更入口**
 （sr-fib 一轮轮询自己读 RIB，配置文件只在启动时读一次）⇒ 逃生开关/VPN 集合改了要等 sr-fib
-自然重启才生效。D3 已拍"照 O5-b 给 sr-fib 也开一道 `PUT`"，**那是 O6-b 之后单独一步**：
-写盘那半属于 O6-b（同一次 `Apply` 里多一个文件），开 `PUT` 那半属于 D3 那一步。
+自然重启才生效。D3 已拍"照 O5-b 给 sr-fib 也开一道 `PUT`"。
+**原计划把写盘那半放进 O6-b，落地时挪到 D3 那一步了**，理由不是省事：`fib.json` 的
+`tunnels[].interface` 是**盒子侧才知道的键**（wg 口的名字由 `sr-agent -tunnels` 现场落地时定，
+控制器今天不知道），所以那半份不能照 `route.json` 那样"控制器渲染 + 设备叠加"，得先想清楚
+是控制器发还是按 next_hop 合并。同一个叠加逻辑写两遍、第二遍还建在没定的问题上，不如一步做完。
+O6-b 因此只动 `route.json` 一个文件。
+
+#### O6-b 落地后实测到的三件事（不是 bug，排障时要知道）
+
+1. **盘上没有 `route.json` 的盒子，整次 apply 会以错误收场**，而且错误发生在其它三段
+   **已经生效之后**（顺序就是 §1.3 那条：VPP → 内核 → FRR → 叠加）。lab 里 `lab-transit`
+   正是这种形状（只做中转、连 `/etc/sdwan/` 都没有），而它已经在 gui-check 的导通组里
+   ⇒ 一发配置它就 `ok:false` 并且按退避重试。**这是 §3 D6 的另一半**：中转-only 盒子要么由
+   控制器不发第 4 段（要先有"这台盒子有没有路由面"这个字段，#68 那条），要么设备侧把它
+   当"这台盒子没有路由面"跳过并明写。今天按 §1.3 的定案仍是硬报错，**待拍**。
+2. **这台宿主的内核没有 `CONFIG_NET_VRF`**（linuxkit 7.0.14，`ip link add … type vrf` 直接
+   `Error: Unknown device type.`）⇒ 基础配置里只要有非 0 VPN，boot 片段就失败，apply 走不到
+   叠加那步。lab 判据因此用 **VPN 0 建组**（两台都在 VPN 0），推口与磁盘那两半逐字一样；
+   多 VPN 的表内容另有两处证据：`overlay_route_test.go` 按 VPN 0/100 渲染，#98 在
+   Ubuntu 6.8 上实测过多 VPN 的 VRF 与数据面隔离。**别再当 bug 查内核。**
+3. **agent 的退避是"整台盒子"的，不是"这一版"的**：一次 apply 失败会设 `nextTry`，退避窗口内
+   （5s→10s→20s→40s→…封顶 1m20s，见 `configsync.go:146`）**换一个已经修好的新版本也不会打断它**
+   ⇒ 现场改完发布，若上一版还卡着失败，最长要等一分多钟才看得到新版落地。实测就是这样：
+   00:22 发布 v2，盒子 00:23:15 才动手。**这条要不要改（新版本应当重置退避）是待拍**，
+   不在 O6-b 里顺手改；但它必须先写进排障手册，否则"发布没生效"会被误查成下发链路坏了。
 
 ### 1.4 开机路径
 
@@ -141,7 +164,7 @@ sr-fib 那份（`vrfs` + `tunnels` + `escape_all_colors`）同样由 `sr-apply` 
 | 步 | 内容 | 判据 |
 | --- | --- | --- |
 | O6-a ✅ | 控制器 overlay 模型 + `OverlayGroup` 的 CRUD API + RT 分配与渲染（不动 UI） | 单测：建组→渲染出的每台 `export/import_rts` 逐字对；编辑组减设备⇒残留 RT 消失；两条闸门各一条负向 |
-| O6-b | bundle 第 4 段（只发 `tunnels`+`vrfs`）+ `sr-apply` 叠加写盘 + `sr-apply` 推 `PUT /vrfs` `/tunnels` | lab：控制台改一次导通，**不重启任何进程**，两台 sr-route 的 `/status` 里 vrfs 变了；`docker restart` 盒子后不手敲命令，`/status` 里 vrfs 还是那份（磁盘回来的） |
+| O6-b ✅ | bundle 第 4 段（只发 `tunnels`+`vrfs`）+ `sr-apply` 叠加写盘 + `sr-apply` 推 `PUT /vrfs` `/tunnels` | lab 实测（2026-10-31，`lab-o6b1`/`lab-o6b2` 两台新盒子 + 控制器 `o6b-lab` 租户，见 [test/lab/README.md](../test/lab/README.md)）：控制台建组 65000:1000 一发布，两台 `route.json` 的第 4 段盖掉运维那份旧表（`peer 99`/`65000:999` → `peer 2`/`65000:1000`），`/status` 活表同一次心跳后跟着变，**`sr-route` 的 pid 从头到尾没换**（137 / 2421）；删组再发布 ⇒ 活表回到 `vrfs: []`，残留 RT 当场摘掉；把盒子改成"控制器不可达"再 `docker restart`，只敲一条 `start.sh up` ⇒ `apply 重放磁盘上那版 → v2 boot ok`、`/status` 里还是导通那张表（磁盘回来的，全程没有控制器）。设备独有键 `tenant/device_id/serial/hold_sec/rrs/local_prefixes/status_addr` 逐字没动；盘上没有 `route.json` 的手工负向按 §1.3 报错并 `rc=1`。单测/编译/harness：`go test -count=1 -race ./...` 全绿、`test-vbond.sh` 196 条全绿 |
 | O6-c | 控制台「Overlay 配置」页：全局 + 导通两块（leak 先不放） | 真浏览器：新增规则后两行 RT 自动写入、编辑减设备后残留被摘、被丢路由三态有数 |
 | O6-d | 被丢路由三态上控制台（`pending` / `local_skips` / `rt_mismatch`，走心跳摘要字段） | 控制台显示的数与设备 `/status` 的数逐字相同；设备没上报时明写"未上报" |
 | O6-e | leak（第三块）：sr-frr 的 prefix 过滤 + FRR redistribute 字段 | 单独出方案，本文不展开 |

@@ -444,6 +444,99 @@ test/lab/bringup.sh --stage terms        # 终端默认路由
 可选：`--bfd` 在隧道内建**多跳** BFD（绑接口的会话会把 overlay 路由打成
 dpo-drop）；`--keep` 不先拆现有容器（只用于调试，状态可能是脏的）。
 
+## 导通组落到盒子（O6-b 判据专用的一对容器，2026-10-31）
+
+O6-b 的判据就一句话：**控制台改一次导通，不重启任何进程，在跑的 sr-route 里那张表
+就变了；`docker restart` 之后不手敲命令，表还是那份（从磁盘回来的）**。为了这句话
+可核对，我造了独立的一对容器，和 `lab-cpeN` 完全隔开——`sr-apply` 会覆盖那边手写的
+FRR 配置并重启 FRR，而那里住着另一个会话；`srwg-nodeN` 在另一个 docker 网络上，
+连不到 `lab-ctrl:8444`。
+
+| | 容器 | IP（lab_mgmt） | 序列号 | sr-route 状态口 | agent 状态口 |
+| --- | --- | --- | --- | --- | --- |
+| 节点 1 | `lab-o6b1` | 10.99.0.2 | `O6B-1` | 127.0.0.1:18706 | 127.0.0.1:18709 |
+| 节点 2 | `lab-o6b2` | 10.99.0.4 | `O6B-2` | 127.0.0.1:18707 | 127.0.0.1:18709 |
+
+建容器（镜像 `srwg-lab:latest`，VPP 要 `--privileged`；PID 1 是 bash，所以
+[start.sh](../../controller/deploy/sr-box/start.sh) 走"没有 systemd"那一支）：
+
+```bash
+R=/Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan
+docker run -itd --name lab-o6b1 --hostname lab-o6b1 --privileged \
+    --network sdwan-lab_lab_mgmt \
+    -v $R/controller:/workspace/controller -v $R/test:/workspace/test \
+    -v $R/vpp-plugin:/workspace/vpp-plugin srwg-lab:latest /bin/bash
+# lab-o6b2 同理换个名字（它拿到 10.99.0.4）
+```
+
+装盒子（每台一条，`-itd` 起的容器里 go 缓存是新的，第一遍编译要点时间）：
+
+```bash
+docker exec -i lab-o6b1 bash -c 'cd /workspace/controller &&
+  for b in sr-route sr-fib sr-apply sr-agent; do go build -o /usr/local/bin/$b ./cmd/$b; done &&
+  mkdir -p /usr/local/lib/sr-box /etc/sr-box /etc/sdwan /var/lib/sr-cpe /var/log/sr-box &&
+  cp deploy/sr-box/start.sh /usr/local/lib/sr-box/start.sh'
+```
+
+`/etc/sr-box/sr-box.conf` 两台**逐字相同**（差别只在下面那份 route.json 里）：
+
+```
+SR_BOX_BIN=/usr/local/bin
+SR_BOX_VPP_START=auto
+SR_BOX_VPP_LAUNCHER=/workspace/test/docker/start-node.sh
+SR_BOX_AGENT_CTRL=lab-ctrl:8444
+SR_BOX_AGENT_ID=/etc/sdwan/identity
+SR_BOX_AGENT_STATUS=http://127.0.0.1:18709/status
+SR_BOX_AGENT_APPLY=yes
+SR_BOX_STATUS_WAIT=40
+```
+
+入网走控制台：`http://127.0.0.1:8088/` 用运营方角色建租户 `o6b-lab`、下发授权、
+生成激活码，然后 `-once`（需要就入网、发一次心跳、打印状态、退出）：
+
+```bash
+docker exec -i -e CODE=<激活码> lab-o6b1 bash -c \
+  '/usr/local/bin/sr-agent -ctrl lab-ctrl:8444 -id /etc/sdwan/identity -serial O6B-1 -claim "$CODE" -once'
+```
+
+`/etc/sdwan/route.json` **先由运维手工写一份**，控制器那一段只覆盖 `tunnels`+`vrfs`
+（D6=S1 先叠加，从不创建这个文件）：`identity_dir`/`status_addr`/`rrs`/`tenant`/
+`device_id`/`serial`/`hold_sec`/`local_prefixes` 都是盒子自己的键。`rrs` 故意指向
+`10.99.0.250:18446`（没人听，id 就叫 `rr-none`）——**这对容器没有 RR**，所以运行中
+那张表唯一可能的来源就是 `sr-apply` 推的 `PUT /vrfs`，"没重启进程而表变了"才说明问题。
+
+控制台侧手工配的就三样，值全在页面上：Underlay 全局（`overlay_cidr` 用
+`10.108.0.0/16`，隧道下一跳 `10.108.0.1/2` 是从这里分出来的）、一条 1↔2 隧道、
+一个导通组（`og2`「O6B 判据导通」，两台都在 VPN 0，RT 由控制器分配 = `65000:1001`）。
+起盒子用 `/usr/local/lib/sr-box/start.sh up`。
+
+跑完（发布到 v4）该看到的样子：
+
+```bash
+docker exec lab-o6b1 curl -s 127.0.0.1:18706/status | python3 -m json.tool  # vrfs 里 65000:1001
+docker exec lab-o6b1 ps -eo pid,comm | grep -E 'sr-(route|agent)'           # 改遍导通组 pid 也不动
+docker exec lab-o6b1 grep -c 已热更 /var/log/sr-box/agent.log               # 6：每次发布推 tunnels+vrfs
+docker exec lab-o6b1 cat /var/lib/sr-cpe/status.json                        # v4 / ok:true / source:apply
+```
+
+第二条判据是这么证的：把 `SR_BOX_AGENT_CTRL` 那行注释掉（**模拟控制器故障**）、
+`docker restart lab-o6b1`、只敲一条 `start.sh up`，然后不看控制器、只看
+`127.0.0.1:18706/status`——表还是那份，`apply.log` 里那句是
+`overlay: 已落盘 /etc/sdwan/route.json（开机重放不热更，sr-route 起来就是这张表）`。
+
+三条环境事实，别再当 bug 查（详见
+[docs/overlay-console-plan.md](../../docs/overlay-console-plan.md) 的 O6-b 一节）：
+
+- 这个内核（`7.0.14-linuxkit`）**没有 `CONFIG_NET_VRF`**：boot 段里
+  `ip link add … type vrf` 必失败（`Error: Unknown device type.`），而 boot 段排在叠加段
+  前面，所以整包会卡在那里。判据只用 **VPN 0**（default VRF，不建 vrf 设备）。多 VPN
+  在 Ubuntu 6.8 内核上实测通过，那是 #98，不是这里能复现的。
+- **盘上没有 `route.json` = 整包失败**，而且是在另外三段都跑完之后才报错。
+  `lab-transit` 正是那个形状（中继-only 盒子不跑路由面）。要不要让这种盒子跳过这一段，
+  是**待拍**。
+- agent 的失败退避**按盒子**走（5s→10s→20s…）：这期间**新发布的版本也不试**。实测
+  00:22 发布 v2，盒子 00:23:15 才动手。"新版本该不该重置退避"也是**待拍**。
+
 ## 登进去测
 
 所有容器都是 `lab-*` 前缀，互不干扰已有的 `srwg-*` 实验环境。

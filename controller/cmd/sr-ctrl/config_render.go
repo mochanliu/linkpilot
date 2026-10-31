@@ -248,8 +248,23 @@ type configArtifacts struct {
 	FRR  string `json:"frr"`
 	VPP  string `json:"vpp"`
 	Boot string `json:"boot"`
+	// Route is bundle 第 4 段: the two keys of sr-route's route.json the
+	// controller owns (tunnels, vrfs). It is an overlay, not a whole file --
+	// identity_dir / status_addr / rrs are the box's, and the controller does not
+	// know them (docs/overlay-console-plan.md §1.2). omitempty because bundles
+	// published before O6-b have no such key and sr-apply must keep reading them.
+	Route string `json:"route,omitempty"`
 }
 
 func renderArtifacts(c *BasicConfig) configArtifacts {
 	return configArtifacts{FRR: renderFRR(c), VPP: renderVPP(c), Boot: renderBoot(c)}
+}
+
+// artifactsLocked adds the per-device overlay artifact to the three text
+// fragments. Route depends on the tenant's groups *and* this device's tunnels,
+// so it cannot be rendered from the draft alone.
+func (s *server) artifactsLocked(tenantID string, nodeID uint16, c *BasicConfig) configArtifacts {
+	a := renderArtifacts(c)
+	a.Route = s.overlayRouteArtifactLocked(tenantID, nodeID)
+	return a
 }

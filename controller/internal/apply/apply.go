@@ -13,6 +13,8 @@
 //  2. wait for the TAPs to exist in the kernel
 //  3. kernel fragment: VRF devices, enslave TAPs, sysctls
 //  4. FRR config: persisted to /etc/frr/frr.conf; FRR loads it at start
+//  5. overlay segment: merged into /etc/sdwan/route.json, then PUT to the running
+//     sr-route (see route.go)
 //
 // Addresses are deliberately absent: FRR owns them, and lcp-sync mirrors them
 // into VPP. Setting them here would fight the mirror (measured on lab-cpe1).
@@ -30,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,11 +52,14 @@ type Check struct {
 	Text     string `json:"text"`
 }
 
-// Artifacts is the three-way split the controller renders.
+// Artifacts is the four-way split the controller renders. Route is the overlay
+// segment (the tunnels/vrfs keys of the box's route.json) and is empty in a
+// bundle published before O6-b -- sr-apply must keep reading those.
 type Artifacts struct {
-	FRR  string `json:"frr"`
-	VPP  string `json:"vpp"`
-	Boot string `json:"boot"`
+	FRR   string `json:"frr"`
+	VPP   string `json:"vpp"`
+	Boot  string `json:"boot"`
+	Route string `json:"route,omitempty"`
 }
 
 // Bundle is what the controller hands out and what the box persists.
@@ -110,17 +116,25 @@ type Installed struct {
 	FRR      string
 	VPP      string
 	Boot     string
+	Route    string
 }
 
 const (
-	frrFile  = "frr.conf"
-	vppFile  = "vpp.conf"
-	bootFile = "boot.sh"
+	frrFile   = "frr.conf"
+	vppFile   = "vpp.conf"
+	bootFile  = "boot.sh"
+	routeFile = "route.json"
 )
+
+// artifactFile is one file inside a version directory.
+type artifactFile struct {
+	name    string
+	content string
+}
 
 // Store is the on-box versioned store. Layout:
 //
-//	<root>/versions/<n>/{manifest.json,frr.conf,vpp.conf,boot.sh}
+//	<root>/versions/<n>/{manifest.json,frr.conf,vpp.conf,boot.sh[,route.json]}
 //	<root>/current -> versions/<n>
 //	<root>/status.json
 //
@@ -156,7 +170,8 @@ func (s Store) Install(b Bundle) (Installed, error) {
 		if err != nil {
 			return Installed{}, fmt.Errorf("version %d exists but cannot be read: %w", b.Version, err)
 		}
-		if cur.FRR != b.Artifacts.FRR || cur.VPP != b.Artifacts.VPP || cur.Boot != b.Artifacts.Boot {
+		if cur.FRR != b.Artifacts.FRR || cur.VPP != b.Artifacts.VPP ||
+			cur.Boot != b.Artifacts.Boot || cur.Route != b.Artifacts.Route {
 			return Installed{}, fmt.Errorf("version %d is already installed with different content", b.Version)
 		}
 		return cur, nil
@@ -168,12 +183,13 @@ func (s Store) Install(b Bundle) (Installed, error) {
 	}
 	defer os.RemoveAll(tmp)
 
-	files := []struct {
-		name, content string
-	}{
-		{frrFile, b.Artifacts.FRR},
-		{vppFile, b.Artifacts.VPP},
-		{bootFile, b.Artifacts.Boot},
+	files := []artifactFile{
+		{name: frrFile, content: b.Artifacts.FRR},
+		{name: vppFile, content: b.Artifacts.VPP},
+		{name: bootFile, content: b.Artifacts.Boot},
+	}
+	if b.Artifacts.Route != "" {
+		files = append(files, artifactFile{name: routeFile, content: b.Artifacts.Route})
 	}
 	hashes := make(map[string]string, len(files))
 	for _, f := range files {
@@ -242,10 +258,21 @@ func (s Store) read(version int) (Installed, error) {
 	}
 	inst := Installed{Dir: dir, Manifest: man}
 	for _, f := range []struct {
-		name string
-		dst  *string
-	}{{frrFile, &inst.FRR}, {vppFile, &inst.VPP}, {bootFile, &inst.Boot}} {
+		name     string
+		dst      *string
+		optional bool
+	}{
+		{frrFile, &inst.FRR, false},
+		{vppFile, &inst.VPP, false},
+		{bootFile, &inst.Boot, false},
+		{routeFile, &inst.Route, true},
+	} {
 		data, err := os.ReadFile(filepath.Join(dir, f.name))
+		if os.IsNotExist(err) && f.optional {
+			// A version installed before O6-b has no route.json. Empty means "this
+			// bundle had no 4th segment", which is what the box was told.
+			continue
+		}
 		if err != nil {
 			return Installed{}, err
 		}
@@ -277,11 +304,12 @@ func writeFileSync(path string, data []byte, mode os.FileMode) error {
 
 // Status is the result of the last apply/boot, kept next to the versions.
 type Status struct {
-	Version   int    `json:"version"`
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
-	AppliedAt int64  `json:"applied_at_unix"`
-	Source    string `json:"source"` // apply | boot
+	Version   int      `json:"version"`
+	OK        bool     `json:"ok"`
+	Error     string   `json:"error,omitempty"`
+	Notes     []string `json:"notes,omitempty"` // e.g. 已落盘、未热更 -- not a failure, never shown as done
+	AppliedAt int64    `json:"applied_at_unix"`
+	Source    string   `json:"source"` // apply | boot
 }
 
 func (s Store) RecordStatus(st Status) error {
@@ -344,13 +372,20 @@ type Applier struct {
 	VPPCtl    string
 	FRRConf   string
 	FRRReload string // shell command; empty means autodetect
-	Wait      time.Duration
-	DryRun    bool
-	Exec      Executor
-	Sleep     func(time.Duration)
-	TAPExists func(string) bool
-	Logf      func(format string, args ...any)
-	Now       func() time.Time
+	// RouteConf is the box's own sr-route file. The overlay segment of a bundle is
+	// merged into it; it is never created from scratch here.
+	RouteConf string
+	// NoRoutePush suppresses the hot PUT to sr-route, so a change waits for the
+	// next sr-route start. A lab judgement knob, not a normal way to run.
+	NoRoutePush bool
+	Wait        time.Duration
+	DryRun      bool
+	Exec        Executor
+	Sleep       func(time.Duration)
+	TAPExists   func(string) bool
+	Logf        func(format string, args ...any)
+	Now         func() time.Time
+	HTTP        *http.Client
 }
 
 // New fills the defaults used on a box.
@@ -359,12 +394,14 @@ func New(store Store) *Applier {
 		Store:     store,
 		VPPCtl:    "vppctl",
 		FRRConf:   "/etc/frr/frr.conf",
+		RouteConf: "/etc/sdwan/route.json",
 		Wait:      10 * time.Second,
 		Exec:      execRunner{},
 		Sleep:     time.Sleep,
 		TAPExists: func(name string) bool { _, err := os.Stat("/sys/class/net/" + name); return err == nil },
 		Logf:      func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
 		Now:       time.Now,
+		HTTP:      &http.Client{Timeout: routePushTimeout},
 	}
 }
 
@@ -375,6 +412,12 @@ func (a *Applier) setDefaults() {
 	}
 	if a.FRRConf == "" {
 		a.FRRConf = def.FRRConf
+	}
+	if a.RouteConf == "" {
+		a.RouteConf = def.RouteConf
+	}
+	if a.HTTP == nil {
+		a.HTTP = def.HTTP
 	}
 	if a.Wait == 0 {
 		a.Wait = def.Wait
@@ -405,18 +448,23 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		return fmt.Errorf("refusing to apply version %d: %d blocking error(s), first: %s", b.Version, len(errs), errs[0])
 	}
 	if a.DryRun {
-		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B)", b.Version, len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot))
+		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B)", b.Version,
+			len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot), len(b.Artifacts.Route))
 		inst := Installed{
 			Dir:      "<dry-run>",
 			Manifest: Manifest{Version: b.Version},
 			FRR:      b.Artifacts.FRR,
 			VPP:      b.Artifacts.VPP,
 			Boot:     b.Artifacts.Boot,
+			Route:    b.Artifacts.Route,
 		}
 		if err := a.replay(ctx, inst); err != nil {
 			return err
 		}
 		a.Logf("would write %s from version %d", a.FRRConf, b.Version)
+		if _, err := a.applyRoute(ctx, inst, !a.NoRoutePush); err != nil {
+			return err
+		}
 		return nil
 	}
 	inst, err := a.Store.Install(b)
@@ -428,6 +476,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 	}
 	a.Logf("installed version %d at %s", inst.Manifest.Version, inst.Dir)
 
+	var notes []string
 	err = a.replay(ctx, inst)
 	if err == nil {
 		if ferr := a.installFRR(inst); ferr != nil {
@@ -436,7 +485,18 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 			err = a.reloadFRR(ctx)
 		}
 	}
-	a.record(inst.Manifest.Version, "apply", err)
+	// Overlay last: replay/installFRR/reloadFRR are what make the VPP tables and
+	// the FRR config exist, and a box that failed those must not be left holding a
+	// route.json that claims VRFs nothing created.
+	if err == nil {
+		note, rerr := a.applyRoute(ctx, inst, !a.NoRoutePush)
+		if rerr != nil {
+			err = rerr
+		} else if note != "" {
+			notes = append(notes, note)
+		}
+	}
+	a.record(inst.Manifest.Version, "apply", err, notes)
 	return err
 }
 
@@ -450,6 +510,7 @@ func (a *Applier) Boot(ctx context.Context, reloadFRR bool) error {
 		return err
 	}
 	a.Logf("replaying version %d from %s", inst.Manifest.Version, inst.Dir)
+	var notes []string
 	err = a.replay(ctx, inst)
 	if err == nil {
 		err = a.installFRR(inst)
@@ -457,12 +518,22 @@ func (a *Applier) Boot(ctx context.Context, reloadFRR bool) error {
 	if err == nil && reloadFRR {
 		err = a.reloadFRR(ctx)
 	}
-	a.record(inst.Manifest.Version, "boot", err)
+	// No hot PUT here: at boot the checklist has not started sr-route yet (apply
+	// runs before route in start.sh), so the file this writes IS the update.
+	if err == nil {
+		note, rerr := a.applyRoute(ctx, inst, false)
+		if rerr != nil {
+			err = rerr
+		} else if note != "" {
+			notes = append(notes, note)
+		}
+	}
+	a.record(inst.Manifest.Version, "boot", err, notes)
 	return err
 }
 
-func (a *Applier) record(version int, source string, err error) {
-	st := Status{Version: version, OK: err == nil, AppliedAt: a.Now().Unix(), Source: source}
+func (a *Applier) record(version int, source string, err error, notes []string) {
+	st := Status{Version: version, OK: err == nil, Notes: notes, AppliedAt: a.Now().Unix(), Source: source}
 	if err != nil {
 		st.Error = err.Error()
 	}

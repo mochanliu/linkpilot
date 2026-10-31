@@ -60,30 +60,53 @@ func usage() {
   sr-apply status [--root DIR]
 
 apply validates the bundle, persists it under <root>/versions/<n>, then applies
-VPP -> kernel -> FRR in that order. boot replays the current version after VPP
-starts; the FRR config is already installed, so no controller is contacted.
+VPP -> kernel -> FRR -> overlay route tables in that order. boot replays the
+current version after VPP starts; the FRR config is already installed, so no
+controller is contacted. boot does not push to sr-route: at that point in the
+boot checklist sr-route is not running yet, and the route.json this writes is
+the update.
 
 common: --root DIR (default /var/lib/sr-cpe), --vppctl PATH, --frr-conf PATH,
-        --frr-reload CMD, --wait DURATION`)
+        --frr-reload CMD, --route-conf PATH (default /etc/sdwan/route.json),
+        --no-route-push, --wait DURATION`)
 }
 
-func commonFlags(fs *flag.FlagSet) (root, vppctl, frrConf, frrReload *string, wait *time.Duration, dry *bool) {
-	root = fs.String("root", "/var/lib/sr-cpe", "state directory on the box")
-	vppctl = fs.String("vppctl", "vppctl", "vppctl binary")
-	frrConf = fs.String("frr-conf", "/etc/frr/frr.conf", "FRR config path")
-	frrReload = fs.String("frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
-	wait = fs.Duration("wait", 10*time.Second, "how long to wait for lcp TAPs")
-	dry = fs.Bool("dry-run", false, "print the planned commands without changing anything")
-	return
+// commonOpts are the paths and knobs every subcommand needs. They are struct
+// fields rather than a tuple of return values because the box's own file layout
+// (vppctl, FRR, sr-route, sr-fib) keeps growing a new one.
+type commonOpts struct {
+	root        string
+	vppctl      string
+	frrConf     string
+	frrReload   string
+	routeConf   string
+	noRoutePush bool
+	wait        time.Duration
+	dry         bool
 }
 
-func applier(root, vppctl, frrConf, frrReload string, wait time.Duration, dry bool) *apply.Applier {
-	a := apply.New(apply.Store{Root: root})
-	a.VPPCtl = vppctl
-	a.FRRConf = frrConf
-	a.FRRReload = frrReload
-	a.Wait = wait
-	a.DryRun = dry
+func (o *commonOpts) register(fs *flag.FlagSet) {
+	fs.StringVar(&o.root, "root", "/var/lib/sr-cpe", "state directory on the box")
+	fs.StringVar(&o.vppctl, "vppctl", "vppctl", "vppctl binary")
+	fs.StringVar(&o.frrConf, "frr-conf", "/etc/frr/frr.conf", "FRR config path")
+	fs.StringVar(&o.frrReload, "frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
+	fs.StringVar(&o.routeConf, "route-conf", "/etc/sdwan/route.json",
+		"sr-route config file; the bundle's 4th segment is merged into it (it is never created here)")
+	fs.BoolVar(&o.noRoutePush, "no-route-push", false,
+		"只改盘上那份，不推给运行中的 sr-route（下次 sr-route 启动才生效）")
+	fs.DurationVar(&o.wait, "wait", 10*time.Second, "how long to wait for lcp TAPs")
+	fs.BoolVar(&o.dry, "dry-run", false, "print the planned commands without changing anything")
+}
+
+func (o *commonOpts) applier() *apply.Applier {
+	a := apply.New(apply.Store{Root: o.root})
+	a.VPPCtl = o.vppctl
+	a.FRRConf = o.frrConf
+	a.FRRReload = o.frrReload
+	a.RouteConf = o.routeConf
+	a.NoRoutePush = o.noRoutePush
+	a.Wait = o.wait
+	a.DryRun = o.dry
 	return a
 }
 
@@ -91,7 +114,8 @@ func runApply(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("apply", flag.ExitOnError)
 	bundlePath := fs.String("bundle", "", "bundle JSON file, or - for stdin")
 	force := fs.Bool("force", false, "apply even when the bundle has blocking errors")
-	root, vppctl, frrConf, frrReload, wait, dry := commonFlags(fs)
+	var o commonOpts
+	o.register(fs)
 	_ = fs.Parse(args)
 	if *bundlePath == "" {
 		return fmt.Errorf("--bundle is required")
@@ -115,8 +139,7 @@ func runApply(ctx context.Context, args []string) error {
 	if errs := b.BlockingErrors(); len(errs) > 0 {
 		fmt.Printf("校验有 %d 个错误（%s）；%s\n", len(errs), errs[0], forceLine(*force))
 	}
-	a := applier(*root, *vppctl, *frrConf, *frrReload, *wait, *dry)
-	if err := a.Apply(ctx, b, *force); err != nil {
+	if err := o.applier().Apply(ctx, b, *force); err != nil {
 		return err
 	}
 	fmt.Printf("applied version %d\n", b.Version)
@@ -133,14 +156,14 @@ func forceLine(force bool) string {
 func runBoot(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("boot", flag.ExitOnError)
 	reloadFRR := fs.Bool("reload-frr", false, "restart FRR after replay (apply already did)")
-	root, vppctl, frrConf, frrReload, wait, dry := commonFlags(fs)
+	var o commonOpts
+	o.register(fs)
 	_ = fs.Parse(args)
-	a := applier(*root, *vppctl, *frrConf, *frrReload, *wait, *dry)
-	inst, err := apply.Store{Root: *root}.Current()
+	inst, err := apply.Store{Root: o.root}.Current()
 	if err != nil {
 		return err
 	}
-	if err := a.Boot(ctx, *reloadFRR); err != nil {
+	if err := o.applier().Boot(ctx, *reloadFRR); err != nil {
 		return err
 	}
 	fmt.Printf("replayed version %d\n", inst.Manifest.Version)

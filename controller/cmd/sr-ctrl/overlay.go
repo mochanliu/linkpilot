@@ -1,9 +1,9 @@
 package main
 
 // The overlay layer: 导通组 (route-target groups) plus the tenant-level escape
-// switch. This file is the model and the arithmetic only -- the HTTP surface is
-// overlay_api.go, and nothing here renders a bundle: turning these groups into
-// the route.json a device installs is O6-b.
+// switch. This file is the model and the arithmetic; the HTTP surface is
+// overlay_api.go, and the bundle's 4th artifact (route.json's tunnels+vrfs) is
+// rendered here by overlayRouteArtifactLocked.
 //
 // The model is deliberately NOT "a VPN carries a list of RTs". A group is the
 // unit the tenant edits (docs/overlay-design-draft.md §2.2): pick devices, give
@@ -19,12 +19,14 @@ package main
 // 定案 6 in the draft: route targets are internal to this system.
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"sdwan/controller/internal/route"
+	"sdwan/controller/internal/underlay"
 )
 
 const (
@@ -551,4 +553,102 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 		view.Nodes = []overlayNodeRow{}
 	}
 	return view
+}
+
+// overlayRouteTunnel is one row of the tunnel table sr-route installs and
+// announces: the peer device and that peer's /32 on the tunnel. The field names
+// are sr-route's own (cmd/sr-route/main.go:54-57), which is also the shape of
+// PUT /tunnels -- so one render serves the installed file and the hot update, and
+// neither side needs a second encoding.
+type overlayRouteTunnel struct {
+	Peer    uint16 `json:"peer_device_id"`
+	NextHop string `json:"next_hop"`
+}
+
+// overlayRouteDoc is bundle 第 4 段. **Which keys are present is the
+// instruction**: sr-apply overlays exactly the keys that appear in it and leaves
+// every other key of the box's route.json alone. `vrfs` is therefore always
+// there (no 导通组 means no RTs, and that is the truth), while `tunnels` is
+// omitted when the tenant has never published a global underlay config -- an
+// empty list from a controller that knows nothing about this box's tunnels would
+// withdraw all of them.
+type overlayRouteDoc struct {
+	Tunnels []overlayRouteTunnel `json:"tunnels,omitempty"`
+	VRFs    []OverlayVRF         `json:"vrfs"`
+}
+
+// overlayRouteArtifactLocked renders one device's 第 4 段. Empty arrays are
+// rendered as arrays, never as null: sr-route treats an absent tunnels key as a
+// withdraw, and a device reading "null" cannot tell that apart from a bug.
+func (s *server) overlayRouteArtifactLocked(tenantID string, nodeID uint16) string {
+	vrfs := s.overlayVRFsLocked(tenantID, nodeID)
+	if vrfs == nil {
+		vrfs = []OverlayVRF{}
+	}
+	doc := overlayRouteDoc{VRFs: vrfs}
+	if uc := s.underlayConfigLocked(tenantID, false); uc != nil && uc.State != nil && uc.State.Configured() {
+		tunnels := []overlayRouteTunnel{}
+		for _, t := range uc.State.SortedTunnels() {
+			peer, ok := overlayPeerOf(t, nodeID)
+			if !ok {
+				continue
+			}
+			tunnels = append(tunnels, overlayRouteTunnel{Peer: peer.NodeID, NextHop: peer.Overlay})
+		}
+		doc.Tunnels = tunnels
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		// Unreachable: both fields are plain JSON types. Returning "" rather than
+		// panicking keeps a render failure a *missing* artifact, which sr-apply
+		// reports as "第 4 段为空" instead of installing half a file.
+		return ""
+	}
+	return string(out) + "\n"
+}
+
+// overlayPeerOf returns the far end of a tunnel as seen from nodeID.
+func overlayPeerOf(t *underlay.Tunnel, nodeID uint16) (underlay.Endpoint, bool) {
+	if t == nil {
+		return underlay.Endpoint{}, false
+	}
+	switch nodeID {
+	case t.A.NodeID:
+		return t.B, true
+	case t.B.NodeID:
+		return t.A, true
+	}
+	return underlay.Endpoint{}, false
+}
+
+// overlayNodeChecksLocked is the publish-time half of gate ①. Saving a group is
+// checked against the whole tenant, but a device is published one at a time and
+// the base config can change afterwards -- deleting a VPN from this box while a
+// group still points at it must stop the publish, because sr-route would be
+// handed a VRF it cannot create and the failure would surface on the box.
+func (s *server) overlayNodeChecksLocked(tenantID string, nodeID uint16) []ConfigCheck {
+	dc := s.state.Configs[configKey(tenantID, nodeID)]
+	var out []ConfigCheck
+	for _, v := range s.overlayVRFsLocked(tenantID, nodeID) {
+		if configHasVPN(dc, uint32(v.ID)) {
+			continue
+		}
+		var names []string
+		if oc := s.overlayConfigLocked(tenantID, false); oc != nil {
+			for _, g := range oc.Groups {
+				for _, m := range g.Members {
+					if m.NodeID == nodeID && m.VPNID == uint32(v.ID) {
+						names = append(names, g.ID)
+					}
+				}
+			}
+		}
+		out = append(out, ConfigCheck{
+			Severity: "error",
+			Text: fmt.Sprintf("这台设备的 VPN %d 要带 RT %s，但它的基础配置里没有 VPN %d："+
+				"先在「配置 › 基础配置」加这个 VPN，或者把它从导通组 %s 里摘掉。",
+				v.ID, strings.Join(v.ExportRTs, "/"), v.ID, strings.Join(names, "、")),
+		})
+	}
+	return out
 }

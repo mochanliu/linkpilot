@@ -272,7 +272,7 @@ do_apply() {
         return
     fi
     say apply "重放磁盘上那版（sr-apply boot）"
-    if "$SR_BIN/sr-apply" boot --root "$APPLY_ROOT" >>"$LOG/apply.log" 2>&1; then
+    if "$SR_BIN/sr-apply" boot --root "$APPLY_ROOT" --route-conf "$ROUTE_CONF" >>"$LOG/apply.log" 2>&1; then
         say apply "重放完成：$(json_field "$APPLY_ROOT/status.json" "'v%s %s %s' % (d.get('version'), d.get('source'), 'ok' if d.get('ok') else 'FAIL')")"
     else
         fail apply "sr-apply boot 返回非 0（看 $LOG/apply.log）"
@@ -309,7 +309,7 @@ do_agent() {
     fi
     if alive agent; then say agent "已在跑（pid $(pid_of agent)）"; return; fi
     local args=(-ctrl "$AGENT_CTRL" -id "$AGENT_ID" -status "$(agent_listen)")
-    [ -n "$AGENT_APPLY" ] && args+=(-apply -store "$AGENT_STORE")
+    [ -n "$AGENT_APPLY" ] && args+=(-apply -store "$AGENT_STORE" -route-conf "$ROUTE_CONF")
     [ -n "$AGENT_VPP_API" ] && args+=(-vpp-api "$AGENT_VPP_API")
     [ -n "$AGENT_TUNNELS" ] && args+=(-tunnels)
     launch agent sr-agent "$SR_BIN/sr-agent" "${args[@]}" || return
