@@ -147,39 +147,106 @@ func TestOverlayRRReplacesTheBoxListAndKeepsTheRest(t *testing.T) {
 	}
 }
 
-// C-c 之前 sr-route 没有收新 RR 列表的入口：热推那一步一次都不碰 /rrs。
-// 但这一半必须写进 status，不能默默当成"都生效了"——否则运维以为换了 RR 就
-// 已经换了，而设备上还在连老反射器。
-func TestOverlayRRIsNotHotPushedButIsReported(t *testing.T) {
+// rrServer is a C-c sr-route: tunnels and vrfs answer 200, and PUT /rrs answers
+// 202 with whatever the caller wants the box to read back. `wait` is the exact
+// `rr_wait` object, injected as a string because there are three different ones
+// worth pinning and a fake that could only say "finished" would hide the half
+// this increment is about.
+func rrServer(calls *[]pushCall, wait string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		*calls = append(*calls, pushCall{r.URL.Path, string(body)})
+		switch r.URL.Path {
+		case "/rrs":
+			w.WriteHeader(http.StatusAccepted)
+			if wait == "" {
+				fmt.Fprint(w, `{"rrs":[{"id":"rr1","addr":"192.0.2.10:20200"}]}`)
+				return
+			}
+			fmt.Fprintf(w, `{"rrs":[],"rr_wait":%s}`, wait)
+		default:
+			fmt.Fprint(w, "{}")
+		}
+	}))
+}
+
+const rrWaitPending = `{"pending_addrs":["192.0.2.10:20200"],"retiring_addrs":["203.0.113.9:8081"]}`
+
+// oldRouteServer is an sr-route from before C-c: the two tables are there, the
+// reflector seam is not.
+func oldRouteServer(calls *[]pushCall) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		*calls = append(*calls, pushCall{r.URL.Path, string(body)})
+		if r.URL.Path == "/rrs" {
+			http.Error(w, "404 page not found", http.StatusNotFound)
+			return
+		}
+		fmt.Fprint(w, "{}")
+	}))
+}
+
+// C-c 把 rrs 也变成可热更的一张表，顺序必须排在 tunnels/vrfs 之后：新反射器的
+// 会话快照里要带隧道表和本地前缀，先推它就等于让新 RR 学到旧策略。
+// 换完了（响应没有 rr_wait）不该有任何 note —— 这是三条里唯一一条"都生效了"。
+func TestOverlayRRIsHotPushedLastAndSilentWhenDone(t *testing.T) {
 	var calls []pushCall
-	srv := recordingServer(&calls)
+	srv := rrServer(&calls, "")
 	defer srv.Close()
 	path := boxRouteWith(t, strings.TrimPrefix(srv.URL, "http://"))
 	a, logs := newRouteApplier(t, path)
 
 	note, err := a.applyRoute(context.Background(), Installed{Route: overlayRRSegment}, true)
-	if err != nil {
-		t.Fatalf("带 rrs 的一版不该失败: %v", err)
+	if err != nil || note != "" {
+		t.Fatalf("换完的一版 = %q, %v", note, err)
 	}
-	if len(calls) != 2 || calls[0].path != "/tunnels" || calls[1].path != "/vrfs" {
-		t.Fatalf("热推 = %v，想要只推 /tunnels 和 /vrfs", calls)
+	if len(calls) != 3 || calls[0].path != "/tunnels" || calls[1].path != "/vrfs" || calls[2].path != "/rrs" {
+		t.Fatalf("热推 = %v，想要 /tunnels、/vrfs、/rrs 依次", calls)
 	}
-	if !strings.Contains(note, "rrs") || !strings.Contains(note, "下次启动") {
-		t.Fatalf("note = %q，想要明写 rrs 要等 sr-route 重启", note)
+	// 整个 rrs 数组原样发过去，id 也在：设备侧 /status 靠它认出这一条是谁。
+	if !strings.Contains(calls[2].body, "192.0.2.11:20200") || !strings.Contains(calls[2].body, `"id"`) {
+		t.Errorf("/rrs 请求体 = %s", calls[2].body)
 	}
-	if joined := strings.Join(*logs, "\n"); !strings.Contains(joined, "rrs 已落盘") {
-		t.Errorf("日志里没说清 rrs 这一半: %s", joined)
+	if joined := strings.Join(*logs, "\n"); !strings.Contains(joined, "/rrs（旧会话已摘）") {
+		t.Errorf("日志没写清旧会话已摘: %s", joined)
 	}
 	if got := string(readRouteKeys(t, path)["rrs"]); !strings.Contains(got, "192.0.2.11:20200") {
 		t.Errorf("rrs 没落盘: %s", got)
 	}
 }
 
-// 只有 rrs 的一版（租户只选了 RR、这一版没发隧道表）热推次数是 0，
-// 但仍然要给出那条 note，而不是"什么都没发生"。
-func TestOverlayRRAlonePushesNothingButStillNotes(t *testing.T) {
+// make-before-break 的那一半：sr-route 立刻返回，但新 RR 还没成立、旧反射器还在
+// 顶着。此时绝不能记成"已热更"，也不能记成"未热更"——盘上和活表都已经是新的，
+// 差的只是那条会话。运维要能在 status.json 里读到「还在换」和去哪看进度。
+func TestOverlaySwitchNotFinishedIsANoteNotALie(t *testing.T) {
 	var calls []pushCall
-	srv := recordingServer(&calls)
+	srv := rrServer(&calls, rrWaitPending)
+	defer srv.Close()
+	path := boxRouteWith(t, strings.TrimPrefix(srv.URL, "http://"))
+	a, logs := newRouteApplier(t, path)
+
+	note, err := a.applyRoute(context.Background(), Installed{Route: overlayRRSegment}, true)
+	if err != nil {
+		t.Fatalf("换 RR 进行中不是 apply 失败: %v", err)
+	}
+	for _, want := range []string{"已开始热更", "192.0.2.10:20200", "203.0.113.9:8081", "/status"} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("note = %q，想要带上 %s", note, want)
+		}
+	}
+	if strings.Contains(note, "未热更") {
+		t.Errorf("这一版已经推上去了，note 不该说未热更: %q", note)
+	}
+	if joined := strings.Join(*logs, "\n"); !strings.Contains(joined, "换 RR 已开始") {
+		t.Errorf("日志里没说清这一半: %s", joined)
+	}
+}
+
+// 只有 rrs 的一版（租户只换了 RR，没发隧道表）也要走 /rrs —— presence 就是指令，
+// 三条里出现的那条就是要动的那条。开机重放那一半不拨号、不给 note。
+func TestOverlayRRAlonePushesOnlyRrs(t *testing.T) {
+	var calls []pushCall
+	srv := rrServer(&calls, rrWaitPending)
 	defer srv.Close()
 	path := boxRouteWith(t, strings.TrimPrefix(srv.URL, "http://"))
 	a, _ := newRouteApplier(t, path)
@@ -188,8 +255,8 @@ func TestOverlayRRAlonePushesNothingButStillNotes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("只有 rrs 的一版不该失败: %v", err)
 	}
-	if len(calls) != 0 {
-		t.Fatalf("没有可热的表却推了 %v", calls)
+	if len(calls) != 1 || calls[0].path != "/rrs" {
+		t.Fatalf("热推 = %v，想要只推 /rrs", calls)
 	}
 	if !strings.Contains(note, "rrs") {
 		t.Fatalf("note = %q，想要带上 rrs", note)
@@ -197,6 +264,58 @@ func TestOverlayRRAlonePushesNothingButStillNotes(t *testing.T) {
 	// 开机重放那一半不需要这条 note：那时 sr-route 还没起来，盘上就是新列表。
 	if bootNote, err := a.applyRoute(context.Background(), Installed{Route: overlayRROnly}, false); err != nil || bootNote != "" {
 		t.Fatalf("开机重放 = %q, %v", bootNote, err)
+	}
+}
+
+// 真机上 192.168.1.100 那台 sr-route 还是 C-c 之前的版本，PUT /rrs 是 404。
+// 这是一次版本偏差，不是一次错误配置：其余两张表照常热更，rrs 只落盘，
+// 并把"要它下次启动才生效"写进 status —— 否则运维以为 RR 已经换了。
+func TestOverlayOldSRRouteWithoutRrsEntry(t *testing.T) {
+	var calls []pushCall
+	srv := oldRouteServer(&calls)
+	defer srv.Close()
+	path := boxRouteWith(t, strings.TrimPrefix(srv.URL, "http://"))
+	a, logs := newRouteApplier(t, path)
+
+	note, err := a.applyRoute(context.Background(), Installed{Route: overlayRRSegment}, true)
+	if err != nil {
+		t.Fatalf("旧版本 sr-route 没有 /rrs 不该失败: %v", err)
+	}
+	if len(calls) != 3 || calls[2].path != "/rrs" {
+		t.Fatalf("热推 = %v，想要前两张表照常推", calls)
+	}
+	if !strings.Contains(note, "没有换 RR 的入口") || !strings.Contains(note, "下次启动") {
+		t.Fatalf("note = %q，想要明写这台还没升上来", note)
+	}
+	if strings.Contains(note, "未热更") {
+		t.Errorf("tunnels/vrfs 已经生效，不该混进未热更那张列表: %q", note)
+	}
+	if joined := strings.Join(*logs, "\n"); !strings.Contains(joined, "rrs 已落盘") {
+		t.Errorf("日志里没说清 rrs 这一半: %s", joined)
+	}
+}
+
+// 404 之外的拒绝是真的拒绝了：RR 地址不成对、id 重复之类，设备会把话说清楚。
+// 这必须报错并带上 sr-route 的原话——"没换但下次启动就换"和"配置有问题"
+// 是两件事，混在一起会让运维去查一个不存在的问题。
+func TestOverlayRRRejectedIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rrs" {
+			http.Error(w, "rr[1] 与 rr[0] 地址相同，备反射器不是同一条会话", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(w, "{}")
+	}))
+	defer srv.Close()
+	path := boxRouteWith(t, strings.TrimPrefix(srv.URL, "http://"))
+	a, _ := newRouteApplier(t, path)
+
+	note, err := a.applyRoute(context.Background(), Installed{Route: overlayRRSegment}, true)
+	if err == nil || !strings.Contains(err.Error(), "地址相同") || !strings.Contains(err.Error(), "已落盘") {
+		t.Fatalf("被拒绝 = %q / %v，想要报错并带上 sr-route 的原话", note, err)
+	}
+	if note != "" {
+		t.Errorf("这次是失败，不该同时记成 note: %q", note)
 	}
 }
 

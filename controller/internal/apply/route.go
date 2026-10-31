@@ -1,4 +1,4 @@
-// The overlay half of a bundle: the two keys of the box's route.json that the
+// The overlay half of a bundle: the three keys of the box's route.json that the
 // controller owns.
 //
 // Why an overlay and not a whole file (docs/overlay-console-plan.md §1.2):
@@ -40,9 +40,10 @@ import (
 // one table not being taken over -- and the log says which key was ignored.
 //
 // `rrs` is on this list from O6-c: the tenant now picks its reflectors in the
-// console, so the controller does know that key. It is a disk-only one until C-c
-// gives sr-route a `PUT /rrs` -- the route client builds its session list at
-// startup and has no way to take a new one, so the file is the honest half.
+// console, so the controller does know that key. From C-c it is hot-updated too,
+// via sr-route's `PUT /rrs` -- but that one is only half of a success: a new
+// reflector has to establish before the old one is dropped, so the response may
+// say "已落盘、已开始、还没换完", and sr-apply says exactly that.
 var overlayRouteKeys = map[string]bool{"tunnels": true, "vrfs": true, "rrs": true}
 
 // routePushTimeout bounds one hot-update request. sr-route answers these in
@@ -188,14 +189,18 @@ func splitStatusAddr(a string) (host, port string, wildcard bool) {
 	return host, port, false
 }
 
-// pushOverlay PUTs the hot-updatable tables to the running sr-route. `rrs` is not
-// one of them yet -- it is written to disk and reported as waiting for the next
-// start, which is the only honest answer until C-c gives the route client a seam.
+// pushOverlay PUTs the hot-updatable tables to the running sr-route. `rrs` joins
+// them in C-c, but it is a different kind of answer: the switch is
+// make-before-break, so sr-route returns as soon as the new session has been
+// started and the reflector it replaces may still be standing. The note says
+// which half of that the box is in, because "已热更" would be a lie while the new
+// RR is unreachable.
 func (a *Applier) pushOverlay(ctx context.Context, base string, doc map[string]json.RawMessage) (string, error) {
 	// tunnels first: a VRF whose import RT already matches a held-back route is
 	// installed by the tunnel table arriving, and doing it the other way round
 	// would log one pointless "still pending" between the two calls.
 	var missed []string
+	var rrNote string
 	for _, key := range []string{"tunnels", "vrfs"} {
 		val, ok := doc[key]
 		if !ok {
@@ -206,7 +211,7 @@ func (a *Applier) pushOverlay(ctx context.Context, base string, doc map[string]j
 			return "", err
 		}
 		url := strings.TrimRight(base, "/") + "/" + key
-		if err := a.putRouteTable(ctx, url, body); err != nil {
+		if _, err := a.putRouteTable(ctx, url, body); err != nil {
 			var rej *routeRejected
 			if errors.As(err, &rej) {
 				// sr-route said "no" about this table: that is a real complaint, and
@@ -224,7 +229,22 @@ func (a *Applier) pushOverlay(ctx context.Context, base string, doc map[string]j
 			a.Logf("overlay: 已热更 %s", url)
 		}
 	}
-	if len(missed) == 0 && doc["rrs"] == nil {
+	// rrs last: the new session is built from the tunnel table and the local
+	// prefixes the VRF table makes speakable, so pushing it before those two would
+	// hand the new reflector a snapshot of the old policy.
+	if raw, ok := doc["rrs"]; ok {
+		miss, note, err := a.pushRRs(ctx, base, raw)
+		if err != nil {
+			return "", err
+		}
+		if miss {
+			missed = append(missed, "rrs")
+		}
+		if note != "" {
+			rrNote = note
+		}
+	}
+	if len(missed) == 0 && rrNote == "" {
 		return "", nil
 	}
 	var notes []string
@@ -232,39 +252,106 @@ func (a *Applier) pushOverlay(ctx context.Context, base string, doc map[string]j
 		notes = append(notes, fmt.Sprintf("已落盘 %s、未热更：%s（sr-route 连不上，下次它启动就是这张表）",
 			a.RouteConf, strings.Join(missed, "/")))
 	}
-	// rrs is on the disk and cannot be pushed in this version: the route client
-	// builds its session list once, at startup, and has no seam to take another
-	// one (that is O6-c C-c). Two of the three pushable tables going live while the
-	// reflector list sits there waiting is exactly the kind of half-truth that has
-	// to be written into the status rather than into the log only.
-	if doc["rrs"] != nil {
-		a.Logf("overlay: rrs 已落盘，这一版不能热更（sr-route 只在启动时读 RR 列表）")
-		notes = append(notes, "rrs 已落盘，要 sr-route 下次启动才生效（这一版没有热更换 RR 的入口）")
+	if rrNote != "" {
+		notes = append(notes, rrNote)
 	}
 	return strings.Join(notes, "；"), nil
 }
 
+// pushRRs PUTs the reflector set and turns sr-route's answer into what this box
+// has to report. `miss` means the usual "not pushed, disk is right, unreachable"
+// case; `note` is the sentence for status.json when the switch is real but not
+// finished (or when this sr-route has no seam at all).
+func (a *Applier) pushRRs(ctx context.Context, base string, raw json.RawMessage) (miss bool, note string, err error) {
+	url := strings.TrimRight(base, "/") + "/rrs"
+	body, err := json.Marshal(map[string]json.RawMessage{"rrs": raw})
+	if err != nil {
+		return false, "", err
+	}
+	resp, err := a.putRouteTable(ctx, url, body)
+	if err == nil {
+		wait := rrWaitOf(resp)
+		if wait == nil {
+			a.Logf("overlay: 已热更 %s（旧会话已摘）", url)
+			return false, "", nil
+		}
+		a.Logf("overlay: 换 RR 已开始，新 RR %v 还没成立，%v 先保留着", wait.PendingAddrs, wait.RetiringAddrs)
+		return false, fmt.Sprintf("rrs 已开始热更：新 RR %s 还没成立，旧反射器 %s 先保留着（进度看设备 /status）",
+			strings.Join(wait.PendingAddrs, "/"), strings.Join(wait.RetiringAddrs, "/")), nil
+	}
+	var rej *routeRejected
+	if errors.As(err, &rej) {
+		if rej.status == http.StatusNotFound || rej.status == http.StatusMethodNotAllowed {
+			// An sr-route from before C-c: the file on disk is still the honest
+			// half, and one box not upgraded yet must not fail the whole delivery.
+			a.Logf("overlay: rrs 已落盘，这台 sr-route 没有换 RR 的入口（%s 返回 %d），要它下次启动才生效", url, rej.status)
+			return false, "rrs 已落盘，这台 sr-route 没有换 RR 的入口，要它下次启动才生效", nil
+		}
+		return false, "", fmt.Errorf("sr-route 拒绝 rrs（已落盘 %s，所以磁盘那份是对的、活表没跟上）: %s", a.RouteConf, rej.body)
+	}
+	a.Logf("overlay: 已落盘 %s、未热更（%s 连不上：%v）", a.RouteConf, url, err)
+	return true, "", nil
+}
+
+// rrWait is the shape sr-route reports for a switch that has not finished. It is
+// re-declared here rather than imported from internal/route because what binds
+// these two is this HTTP body, not a Go type.
+type rrWait struct {
+	PendingAddrs  []string `json:"pending_addrs"`
+	RetiringAddrs []string `json:"retiring_addrs"`
+}
+
+type rrsResponse struct {
+	RRWait *rrWait `json:"rr_wait"`
+}
+
+// rrWaitOf reads the one field of a PUT /rrs response that changes what this
+// apply has to say: sr-route answered, but answered "还差一点". nil means the
+// switch is finished (or this build says nothing about it), which is a clean
+// 已热更.
+func rrWaitOf(body []byte) *rrWait {
+	var doc rrsResponse
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil
+	}
+	if doc.RRWait == nil || (len(doc.RRWait.PendingAddrs) == 0 && len(doc.RRWait.RetiringAddrs) == 0) {
+		return nil
+	}
+	return doc.RRWait
+}
+
 // routeRejected is sr-route saying "no" -- a non-2xx, which is a real complaint
-// about the table, not a box whose sr-route has not started yet.
-type routeRejected struct{ body string }
+// about the table, not a box whose sr-route has not started yet. The status code
+// is kept because one of them is not a complaint about the content: 404/405 means
+// this build has no seam for the key at all.
+type routeRejected struct {
+	status int
+	body   string
+}
 
 func (e *routeRejected) Error() string { return "sr-route 拒绝这份表: " + e.body }
 
-func (a *Applier) putRouteTable(ctx context.Context, url string, body []byte) error {
+// putRouteTable returns the response body: PUT /rrs answers with the state of a
+// switch that is still in progress, and "2xx" alone is not enough to report it.
+func (a *Applier) putRouteTable(ctx context.Context, url string, body []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("content-type", "application/json")
 	resp, err := a.HTTP.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(io.LimitReader(resp.Body, 512))
-		return &routeRejected{body: strings.TrimSpace(buf.String())}
+		return nil, &routeRejected{status: resp.StatusCode, body: strings.TrimSpace(buf.String())}
 	}
-	return nil
+	out, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }

@@ -345,3 +345,182 @@ func TestHeldListIsBoundedAndSaysSo(t *testing.T) {
 		t.Fatalf("pending = %+v total=%d", doc.Pending, doc.PendingTotal)
 	}
 }
+
+// PUT /rrs is the seam C-c exists for: 逐台换反射器 must never mean restarting
+// sr-route, and must never mean the box briefly has no reflector at all. The
+// switch is make-before-break, so the handler cannot wait for the new RR inside the
+// request -- sr-apply budgets 10 s per hot update (internal/apply/route.go,
+// routePushTimeout) -- and answers 202 with the unfinished half in rr_wait.
+func TestPutRRsStartsTheSwitchAndSaysItIsUnfinished(t *testing.T) {
+	c := testClient(t, route.ClientConfig{
+		RRs: []route.RRConfig{{ID: "rr1", Addr: "192.0.2.10:20200"}},
+	})
+	srv := newServer(t, c)
+
+	// GET first: the ids come back, because 主 and 备 are only distinguishable by
+	// the label the tenant picked in the console.
+	code, raw := call(t, srv, http.MethodGet, "/rrs", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /rrs = %d: %s", code, raw)
+	}
+	var before rrsDoc
+	if err := json.Unmarshal([]byte(raw), &before); err != nil {
+		t.Fatalf("decode GET /rrs: %v\n%s", err, raw)
+	}
+	if len(before.RRs) != 1 || before.RRs[0].ID != "rr1" || before.RRs[0].Addr != "192.0.2.10:20200" {
+		t.Fatalf("GET /rrs = %+v", before.RRs)
+	}
+	if before.RRWait != nil {
+		t.Fatalf("nothing was in flight but rr_wait is set: %+v", before.RRWait)
+	}
+
+	// Nothing can establish in this test -- Dial always fails -- so this switch
+	// stays unfinished by construction, which is exactly the state that must be
+	// reportable rather than look like a done deal.
+	code, raw = call(t, srv, http.MethodPut, "/rrs",
+		`{"rrs":[{"id":"rr1","addr":"192.0.2.11:20200"}]}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("PUT /rrs = %d, want 202: %s", code, raw)
+	}
+	var after rrsDoc
+	if err := json.Unmarshal([]byte(raw), &after); err != nil {
+		t.Fatalf("decode PUT /rrs: %v\n%s", err, raw)
+	}
+	if len(after.RRs) != 1 || after.RRs[0].Addr != "192.0.2.11:20200" {
+		t.Fatalf("wanted set = %+v", after.RRs)
+	}
+	if after.RRWait == nil {
+		t.Fatalf("换 RR 没完成，PUT 体里却没有 rr_wait: %s", raw)
+	}
+	if len(after.RRWait.PendingAddrs) != 1 || after.RRWait.PendingAddrs[0] != "192.0.2.11:20200" {
+		t.Fatalf("pending = %v", after.RRWait.PendingAddrs)
+	}
+	if len(after.RRWait.RetiringAddrs) != 1 || after.RRWait.RetiringAddrs[0] != "192.0.2.10:20200" {
+		t.Fatalf("retiring = %v", after.RRWait.RetiringAddrs)
+	}
+
+	// /status carries the same field: that is the page sr-apply's note points an
+	// operator at, and the two must not disagree about what is in flight.
+	doc := getStatus(t, srv)
+	if doc.RRWait == nil || doc.RRWait.RetiringAddrs[0] != "192.0.2.10:20200" {
+		t.Fatalf("/status rr_wait = %+v", doc.RRWait)
+	}
+	// Both sessions are listed: the replacement is being tried, and the old one is
+	// still standing until it succeeds.
+	if len(doc.Sessions) != 2 {
+		t.Fatalf("sessions = %+v, want the new one plus the retiring old one", doc.Sessions)
+	}
+	if doc.Sessions[0].Addr != "192.0.2.11:20200" || !doc.Sessions[1].Retiring {
+		t.Fatalf("session order/flags = %+v", doc.Sessions)
+	}
+
+	// Cancelling the switch mid-flight is a PUT of the old set. The session that was
+	// on its way out is wanted again and stops retiring -- but the .11 session this
+	// box started dialling a moment ago is now the one on its way out, and in this
+	// test nothing can ever establish (Dial always fails), so it lingers. That is
+	// make-before-break, not a leak: see internal/route SetRRs, where the same
+	// rollback against a live session clears the wait at once.
+	code, raw = call(t, srv, http.MethodPut, "/rrs",
+		`{"rrs":[{"id":"rr1","addr":"192.0.2.10:20200"}]}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("PUT the old set back = %d: %s", code, raw)
+	}
+	if err := json.Unmarshal([]byte(raw), &after); err != nil {
+		t.Fatalf("decode: %v\n%s", err, raw)
+	}
+	if len(after.RRs) != 1 || after.RRs[0].Addr != "192.0.2.10:20200" {
+		t.Fatalf("rrs after rollback = %+v", after.RRs)
+	}
+	if after.RRWait == nil ||
+		len(after.RRWait.RetiringAddrs) != 1 ||
+		after.RRWait.RetiringAddrs[0] != "192.0.2.11:20200" {
+		t.Fatalf("rr_wait after rollback = %+v", after.RRWait)
+	}
+	if sn := getStatus(t, srv).Sessions; len(sn) != 2 || sn[0].Addr != "192.0.2.10:20200" ||
+		sn[0].Retiring || !sn[1].Retiring {
+		t.Fatalf("sessions after rollback = %+v", sn)
+	}
+}
+
+// The body read out of GET /rrs is a body that can be PUT back -- the same rule the
+// other two tables follow, so an operator (or a console) can copy one device's
+// reflector set onto another without hand-writing JSON.
+func TestRRsRoundTripThroughPut(t *testing.T) {
+	c := testClient(t, route.ClientConfig{
+		RRs: []route.RRConfig{
+			{ID: "rr1", Addr: "192.0.2.10:20200"},
+			{ID: "rr2", Addr: "192.0.2.11:20200"},
+		},
+	})
+	srv := newServer(t, c)
+	code, raw := call(t, srv, http.MethodGet, "/rrs", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /rrs = %d: %s", code, raw)
+	}
+
+	code, raw = call(t, srv, http.MethodPut, "/rrs", raw)
+	if code != http.StatusAccepted {
+		t.Fatalf("PUT the read-back set = %d: %s", code, raw)
+	}
+	var after rrsDoc
+	if err := json.Unmarshal([]byte(raw), &after); err != nil {
+		t.Fatalf("decode: %v\n%s", err, raw)
+	}
+	if len(after.RRs) != 2 || after.RRs[0].ID != "rr1" || after.RRs[1].Addr != "192.0.2.11:20200" {
+		t.Fatalf("set after round trip = %+v", after.RRs)
+	}
+	// Re-setting the same addresses reuses both sessions, so nothing is retiring
+	// and an idling device must not look like it is mid-switch.
+	if after.RRWait != nil {
+		t.Fatalf("a no-op switch reported as in flight: %+v", after.RRWait)
+	}
+}
+
+// An empty reflector set is the one shape this endpoint must never accept: sr-route
+// refuses to START without an RR (the same file would be unreadable at next boot),
+// so a PUT that emptied it would look fine right up until the box rebooted.
+func TestPutRRsRejectsASetThatWouldStrandTheBox(t *testing.T) {
+	c := testClient(t, route.ClientConfig{
+		RRs: []route.RRConfig{{ID: "rr1", Addr: "192.0.2.10:20200"}},
+	})
+	srv := newServer(t, c)
+
+	cases := []struct{ name, body, want string }{
+		{"empty set", `{"rrs":[]}`, "at least one RR"},
+		{"absent key", `{}`, "at least one RR"},
+		{"same address twice",
+			`{"rrs":[{"id":"a","addr":"192.0.2.11:20200"},{"id":"b","addr":"192.0.2.11:20200"}]}`,
+			"configured twice"},
+		{"no address", `{"rrs":[{"id":"a"}]}`, "no address"},
+		{"misspelled field", `{"rrs":[{"id":"a","address":"192.0.2.11:20200"}]}`, "unknown field"},
+	}
+	for _, tc := range cases {
+		code, raw := call(t, srv, http.MethodPut, "/rrs", tc.body)
+		if code != http.StatusBadRequest || !strings.Contains(raw, tc.want) {
+			t.Fatalf("%s = %d: %s, want 400 containing %q", tc.name, code, raw, tc.want)
+		}
+	}
+
+	// A rejected PUT has to leave the working set exactly where it was. Half an
+	// apply here would strand the box on a reflector nobody chose.
+	code, raw := call(t, srv, http.MethodGet, "/rrs", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /rrs = %d: %s", code, raw)
+	}
+	var doc rrsDoc
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("decode: %v\n%s", err, raw)
+	}
+	if len(doc.RRs) != 1 || doc.RRs[0].ID != "rr1" || doc.RRs[0].Addr != "192.0.2.10:20200" {
+		t.Fatalf("set after rejected PUTs = %+v", doc.RRs)
+	}
+	if doc.RRWait != nil {
+		t.Fatalf("a rejected PUT started a switch: %+v", doc.RRWait)
+	}
+
+	// GET and PUT only: a DELETE would be the one operation this seam cannot do
+	// honestly, because there is no set the box could fall back to.
+	if code, _ := call(t, srv, http.MethodDelete, "/rrs", ""); code != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE /rrs = %d, want 405", code)
+	}
+}

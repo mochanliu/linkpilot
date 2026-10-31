@@ -38,6 +38,12 @@ type LocalPrefix struct {
 // RRConfig is one reflector this CPE peers with. Two are expected (active +
 // standby); the protocol works with any number, and the active is the lowest
 // index among the synced ones.
+//
+// ID is a label: it comes from the controller's RR library and travels into
+// /status so an operator can point at the row they chose. Sessions are matched
+// by Addr, not by ID -- a hand-written route.json (every box today) has
+// addresses with no ids, and "运营方把 rr2 的地址改了" arrives here as exactly
+// "old address gone, new address appeared".
 type RRConfig struct {
 	ID   string
 	Addr string
@@ -69,13 +75,25 @@ type ClientConfig struct {
 // SessionStats is the diagnostics view of one RR session.
 type SessionStats struct {
 	Addr       string `json:"addr"`
-	RRID       string `json:"rr_id,omitempty"` // as reported by hello_ok
+	ConfigID   string `json:"config_id,omitempty"` // RR-library id, when the config named one
+	RRID       string `json:"rr_id,omitempty"`     // as reported by hello_ok
 	Connected  bool   `json:"connected"`
 	Synced     bool   `json:"synced"`
-	Routes     int    `json:"routes"`  // installed in the table from this RR
-	Pending    int    `json:"pending"` // held from this RR, not installed
+	Retiring   bool   `json:"retiring,omitempty"` // replaced, kept only until a wanted RR takes over
+	Routes     int    `json:"routes"`             // installed in the table from this RR
+	Pending    int    `json:"pending"`            // held from this RR, not installed
 	Reconnects uint64 `json:"reconnects"`
 	LastError  string `json:"last_error,omitempty"`
+}
+
+// RRWait is one half of a rolling RR replacement that has not finished: the RR
+// addresses this device wants but cannot establish yet, and the retired session
+// kept alive because of them. It is reported as data, not as a sentence, because
+// sr-apply's push has to be able to tell "换完了" from "还在换" without parsing
+// Chinese. Nil whenever no replacement is in flight.
+type RRWait struct {
+	PendingAddrs  []string `json:"pending_addrs"`
+	RetiringAddrs []string `json:"retiring_addrs"`
 }
 
 // ClientStats is the whole instance's state. The drop/import counters are
@@ -84,10 +102,12 @@ type SessionStats struct {
 // held back does not change the numbers after the fact. Routes is live.
 type ClientStats struct {
 	DeviceID          uint16         `json:"device_id"`
-	ActiveRR          int            `json:"active_rr"` // index into RRs, -1 = none
+	ActiveRR          int            `json:"active_rr"` // index into Sessions, -1 = none
+	ActiveRRID        string         `json:"active_rr_id,omitempty"`
 	ActiveRIBRoutes   int            `json:"active_rib_routes"`
 	ActivePending     int            `json:"active_pending"` // known from the active RR, not installed
 	Sessions          []SessionStats `json:"sessions"`
+	RRWait            *RRWait        `json:"rr_wait,omitempty"`
 	Received          uint64         `json:"received"`
 	Imported          uint64         `json:"imported"`
 	Withdrawn         uint64         `json:"withdrawn"`
@@ -194,6 +214,10 @@ type LocalSkip struct {
 //     holds the routes exactly as received (adj-RIBs-in) and derives the table
 //     from the local tunnel and VRF tables, so a tunnel or a VPN added later
 //     deploys the routes that are already known -- without asking the RR again.
+//
+// The set of RRs is not static (C-c): SetRRs adds and retires sessions while the
+// process runs, which is why a session is a pointer and the slice is reorderable.
+// The rules that make a rolling RR replacement safe are in SetRRs.
 type Client struct {
 	cfg      ClientConfig
 	hold     time.Duration
@@ -208,9 +232,14 @@ type Client struct {
 	nextHops map[uint16][]string // peer -> ascending next hops of its tunnels
 
 	mu       sync.Mutex
-	sessions []clientSession
+	sessions []*clientSession // wanted ones first, in configured order, then the retired ones
 	active   int
 	counters counters
+
+	// runCtx is set by Run and is the parent of every session goroutine's ctx, so
+	// SetRRs can start a session after boot and still have it stop on shutdown.
+	runCtx context.Context
+	wg     sync.WaitGroup
 
 	runOnce sync.Once
 }
@@ -242,13 +271,26 @@ type counters struct {
 }
 
 type clientSession struct {
-	rrID       string
+	cfgID      string // RR-library id, a label only -- see RRConfig
 	addr       string
 	conn       net.Conn
 	up         bool
 	synced     bool
+	rrID       string // as reported by hello_ok, not the config label above
 	reconnects uint64
 	lastErr    string
+
+	// retire is set by SetRRs when the current RR set no longer names this
+	// address. A retired session is not dropped immediately: the replacement has
+	// to establish first (see SetRRs). Once it leaves the session list its
+	// goroutine is still finishing, so every shared-state update re-checks
+	// membership instead of trusting this flag.
+	retire bool
+
+	// cancel ends this session's reconnect loop. It belongs to the goroutine that
+	// dials addr, so dropping a retired session also stops the redial that would
+	// otherwise bring the RR back a second later.
+	cancel context.CancelFunc
 
 	// adjIn is what this RR told us, one copy per route key, exactly as
 	// received. rib and pending are derived from it plus the local tunnel and
@@ -278,13 +320,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Dial == nil {
 		return nil, errors.New("route client: Dial is required")
 	}
-	if len(cfg.RRs) == 0 {
-		return nil, errors.New("route client: at least one RR is required")
-	}
-	for i, rr := range cfg.RRs {
-		if rr.Addr == "" {
-			return nil, fmt.Errorf("route client: rr[%d] has no address", i)
-		}
+	if err := validateRRs(cfg.RRs); err != nil {
+		return nil, err
 	}
 	hold, err := HoldDuration(cfg.HoldSec)
 	if err != nil {
@@ -292,12 +329,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 
 	c := &Client{
-		cfg:      cfg,
-		hold:     hold,
-		base:     map[localKey]LocalPrefix{},
-		dynamic:  map[localKey]LocalPrefix{},
-		sessions: make([]clientSession, len(cfg.RRs)),
-		active:   -1,
+		cfg:     cfg,
+		hold:    hold,
+		base:    map[localKey]LocalPrefix{},
+		dynamic: map[localKey]LocalPrefix{},
+		active:  -1,
 	}
 	vrfs, ids, exports, err := buildVRFs(cfg.VRFs)
 	if err != nil {
@@ -319,15 +355,44 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	c.rebuildLocalLocked()
 
-	for i := range c.sessions {
-		c.sessions[i] = clientSession{
-			addr:    cfg.RRs[i].Addr,
-			adjIn:   map[RouteKey]Route{},
-			rib:     map[RouteKey]RIBEntry{},
-			pending: map[RouteKey]PendingRoute{},
-		}
+	for _, rr := range cfg.RRs {
+		c.sessions = append(c.sessions, newSession(rr))
 	}
 	return c, nil
+}
+
+// validateRRs is the one gate both entry points share: a client that starts with
+// a broken RR list and one that is handed a new one at runtime must refuse for
+// exactly the same reason. An empty list is refused because sr-route itself
+// refuses to start without a reflector -- accepting it here would let a PUT
+// take the device off the network and a restart would then fail outright.
+func validateRRs(rrs []RRConfig) error {
+	if len(rrs) == 0 {
+		return errors.New("route client: at least one RR is required")
+	}
+	seen := make(map[string]bool, len(rrs))
+	for i, rr := range rrs {
+		if rr.Addr == "" {
+			return fmt.Errorf("route client: rr[%d] has no address", i)
+		}
+		if seen[rr.Addr] {
+			return fmt.Errorf("route client: rr %s is configured twice (a second session to the same reflector is not a standby)", rr.Addr)
+		}
+		seen[rr.Addr] = true
+	}
+	return nil
+}
+
+// newSession builds a session that has never connected: adj-RIBs-in and the
+// derived views start empty so a reader sees "nothing yet", not "nothing ever".
+func newSession(rr RRConfig) *clientSession {
+	return &clientSession{
+		cfgID:   rr.ID,
+		addr:    rr.Addr,
+		adjIn:   map[RouteKey]Route{},
+		rib:     map[RouteKey]RIBEntry{},
+		pending: map[RouteKey]PendingRoute{},
+	}
 }
 
 // buildVRFs validates a VRF table and returns the three views the client needs:
@@ -531,8 +596,8 @@ func (c *Client) SetVRFs(vs []VRFConfig) error {
 	c.vrfs, c.vrfIDs, c.exports = vrfs, ids, exports
 	c.rebuildLocalLocked()
 	c.pushLocalLocked()
-	for i := range c.sessions {
-		c.deriveSessionLocked(&c.sessions[i])
+	for _, s := range c.sessions {
+		c.deriveSessionLocked(s)
 	}
 	return nil
 }
@@ -554,12 +619,157 @@ func (c *Client) SetTunnels(ts []Tunnel) error {
 		return nil
 	}
 	c.tunnels, c.nextHops = tunnels, nextHops
-	for i := range c.sessions {
-		s := &c.sessions[i]
+	for _, s := range c.sessions {
 		c.deriveSessionLocked(s)
 		c.pushTunnelsLocked(s)
 	}
 	return nil
+}
+
+// SetRRs replaces the reflector set while the process runs -- the seam C-c exists
+// for, so 逐台换 RR never means restarting sr-route.
+//
+// make-before-break, in three rules:
+//
+//   - Nothing is dropped first. An address the new set no longer names is marked
+//     retire and keeps its session: the goroutine is still dialling, its
+//     adj-RIBs-in is still the table, and the reflector on the other end still
+//     holds our prefixes.
+//   - A retired session goes only once a session this device *wants* has taken
+//     over (establishedLocked). Anything weaker leaves the visible table empty
+//     for a moment, which makes every peer withdraw our prefixes -- the exact
+//     outage the switch is supposed to avoid, and the reason a plain restart
+//     could not be used here.
+//   - If the new RR never comes up, the old session is kept indefinitely and the
+//     state says so (Stats.RRWait). "换 RR 失败" is something to report, not a
+//     licence to black-hole the tenant.
+//
+// Sessions are matched by address and the list is rebuilt with the wanted ones
+// first, in the configured order, so a wanted session always outranks a retiring
+// one as the visible RIB.
+func (c *Client) SetRRs(next []RRConfig) error {
+	if err := validateRRs(next); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	byAddr := make(map[string]*clientSession, len(c.sessions))
+	for _, s := range c.sessions {
+		byAddr[s.addr] = s
+	}
+	wantedAddrs := make(map[string]bool, len(next))
+	wanted := make([]*clientSession, 0, len(next))
+	for _, rr := range next {
+		wantedAddrs[rr.Addr] = true
+		s := byAddr[rr.Addr]
+		if s == nil {
+			s = newSession(rr)
+		} else {
+			// Reused: the label may have changed even when the address did not,
+			// and a session that is wanted again stops being on its way out.
+			s.cfgID, s.retire = rr.ID, false
+		}
+		wanted = append(wanted, s)
+	}
+	var retiring []*clientSession
+	for _, s := range c.sessions {
+		if wantedAddrs[s.addr] {
+			continue
+		}
+		// Marked, not dropped: make-before-break means this session keeps
+		// serving the table until a wanted one has taken over, so it stays in
+		// c.sessions (appended after the wanted ones, so pickActiveLocked
+		// prefers the replacement) and leaves only in reapRetiringLocked.
+		s.retire = true
+		retiring = append(retiring, s)
+	}
+	c.sessions = append(wanted, retiring...)
+	for _, s := range c.sessions {
+		c.startLocked(s)
+	}
+	c.pickActiveLocked()
+	c.reapRetiringLocked()
+	return nil
+}
+
+// RRs returns the reflector set this device is working towards, in the order it
+// was configured. A retiring session is connected but on its way out, so it shows
+// up in Stats().Sessions and not here.
+func (c *Client) RRs() []RRConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]RRConfig, 0, len(c.sessions))
+	for _, s := range c.sessions {
+		if s.retire {
+			continue
+		}
+		out = append(out, RRConfig{ID: s.cfgID, Addr: s.addr})
+	}
+	return out
+}
+
+// establishedLocked is the takeover criterion: connected, EOR'd, and done writing
+// our own snapshot to the RR. Synced without ready would mean the RR finished its
+// snapshot while ours was still in flight, so it does not know all of our prefixes
+// yet -- dropping the old session then would break the return path.
+//
+// Must be called with c.mu held.
+func (c *Client) establishedLocked(s *clientSession) bool {
+	return s != nil && !s.retire && s.up && s.synced && s.ready
+}
+
+// reapRetiringLocked drops the sessions the wanted set no longer names, but only
+// after one of the wanted sessions has taken over. Called from SetRRs (the wanted
+// session may already be established, e.g. when only the standby slot changed) and
+// from markSynced (the instant one becomes established).
+//
+// Must be called with c.mu held.
+func (c *Client) reapRetiringLocked() {
+	var dropped []*clientSession
+	kept := make([]*clientSession, 0, len(c.sessions))
+	for _, s := range c.sessions {
+		if s.retire {
+			dropped = append(dropped, s)
+			continue
+		}
+		kept = append(kept, s)
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	if !c.anyEstablishedLocked() {
+		// 新 RR 还没成立：旧的留着，宁可看起来"配置未完全生效"，也不要把这台盒子
+		// 从反射器上摘下来。
+		return
+	}
+	c.sessions = kept
+	// Re-pick before closing anything: the retired sessions were still eligible
+	// to serve the table, and the list they were indexed in just changed.
+	c.pickActiveLocked()
+	for _, s := range dropped {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.sc != nil {
+			s.sc.close()
+		} else if s.conn != nil {
+			s.conn.Close()
+		}
+		c.logf("route: 新 RR 已成立，摘掉被替换的会话 %s（device %d）", s.addr, c.cfg.DeviceID)
+	}
+}
+
+// anyEstablishedLocked reports whether a session this device wants has taken over.
+//
+// Must be called with c.mu held.
+func (c *Client) anyEstablishedLocked() bool {
+	for _, s := range c.sessions {
+		if c.establishedLocked(s) {
+			return true
+		}
+	}
+	return false
 }
 
 // pushLocalLocked streams local-set changes to every session that has finished
@@ -569,8 +779,7 @@ func (c *Client) pushLocalLocked() {
 	for _, r := range c.local {
 		desired[r.Key()] = r
 	}
-	for i := range c.sessions {
-		s := &c.sessions[i]
+	for _, s := range c.sessions {
 		if !s.ready || s.sc == nil {
 			continue
 		}
@@ -779,50 +988,80 @@ func (c *Client) pushTunnelsLocked(s *clientSession) {
 	s.announcedTunnels = table
 }
 
-// Run keeps both RR sessions alive until ctx is cancelled. It returns nil.
+// Run keeps the RR sessions alive until ctx is cancelled. It returns nil.
+//
+// The reconnect loop belongs to a session, not to a slot in the configured list:
+// SetRRs can hand this client a new reflector after boot, and that session has to
+// be dialled by the same loop and stop on the same ctx.
 func (c *Client) Run(ctx context.Context) error {
 	var started bool
 	c.runOnce.Do(func() { started = true })
 	if !started {
 		return errors.New("route client: Run may only be called once")
 	}
-	var wg sync.WaitGroup
-	for i := range c.cfg.RRs {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			c.runRR(ctx, idx)
-		}(i)
+	c.mu.Lock()
+	c.runCtx = ctx
+	for _, s := range c.sessions {
+		c.startLocked(s)
 	}
+	c.mu.Unlock()
+
 	<-ctx.Done()
 	c.mu.Lock()
-	for i := range c.sessions {
-		if c.sessions[i].conn != nil {
-			c.sessions[i].conn.Close()
+	for _, s := range c.sessions {
+		if s.conn != nil {
+			s.conn.Close()
 		}
 	}
 	c.mu.Unlock()
-	wg.Wait()
+	c.wg.Wait()
 	return nil
 }
 
-func (c *Client) runRR(ctx context.Context, idx int) {
+// startLocked gives one session its reconnect loop. Sessions created before Run
+// are started by Run; ones created after it start here, so a PUT /rrs does not
+// have to wait for a restart. Never call it twice for the same session -- the
+// second goroutine would dial the same address while the first still owns s.conn.
+func (c *Client) startLocked(s *clientSession) {
+	if s.cancel != nil || c.runCtx == nil {
+		return
+	}
+	sctx, cancel := context.WithCancel(c.runCtx)
+	s.cancel = cancel
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.runRR(sctx, s)
+	}()
+}
+
+// logf is the client's only output channel, and the reason a note about a
+// half-finished RR switch can live in a log line without dragging a logger in.
+func (c *Client) logf(format string, args ...any) {
+	if c.cfg.Logf != nil {
+		c.cfg.Logf(format, args...)
+	}
+}
+
+func (c *Client) runRR(ctx context.Context, s *clientSession) {
 	backoff := initialBackoff
 	for ctx.Err() == nil {
-		conn, err := c.cfg.Dial(ctx, c.cfg.RRs[idx].Addr)
+		conn, err := c.cfg.Dial(ctx, s.addr)
 		if err != nil {
-			c.noteError(idx, err)
+			if ctx.Err() == nil {
+				c.noteError(s, err)
+			}
 			if !sleepCtx(ctx, backoff) {
 				return
 			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		handshook, err := c.serveSession(idx, conn)
+		handshook, err := c.serveSession(s, conn)
 		if ctx.Err() != nil {
 			return
 		}
-		c.noteError(idx, err)
+		c.noteError(s, err)
 		if handshook {
 			backoff = initialBackoff
 		} else {
@@ -856,13 +1095,13 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // serveSession runs one connection: hello, snapshot, keepalive, read loop.
 // handshook reports whether hello_ok arrived, which decides whether the
 // reconnect backoff starts over.
-func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error) {
+func (c *Client) serveSession(s *clientSession, conn net.Conn) (handshook bool, err error) {
 	sc := &sessionConn{conn: conn, writeTimeout: c.hold}
 	sessionDone := make(chan struct{})
 	defer func() {
 		close(sessionDone)
 		sc.close()
-		c.markDown(idx)
+		c.markDown(s)
 	}()
 
 	conn.SetDeadline(time.Now().Add(c.hold))
@@ -891,10 +1130,16 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 	sc.writeTimeout = hold
 	handshook = true
 
-	c.markUp(idx, conn, env.RRID, hold)
+	c.markUp(s, conn, env.RRID, hold)
 	c.mu.Lock()
-	c.sessions[idx].sc = sc
+	s.sc = sc
+	reaped := c.indexOfLocked(s) < 0
 	c.mu.Unlock()
+	if reaped {
+		// 换 RR 在这条会话拨号的这段时间里已经完成了：新 RR 成立了，这条是来晚的
+		// 旧地址。接回去会让一个不该存在的反射器重新进入本机路由面。
+		return true, errors.New("session was dropped while it was connecting")
+	}
 
 	// The tunnel table goes first: the RR withholds its snapshot until it knows
 	// which peers this device can reach, and it must not see that as "no
@@ -925,8 +1170,7 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 	// sets before releasing the lock, so no update can slip between snapshot and
 	// fanout.
 	c.mu.Lock()
-	s := &c.sessions[idx]
-	if !s.up {
+	if !s.up || c.indexOfLocked(s) < 0 {
 		c.mu.Unlock()
 		return true, fmt.Errorf("session went down while sending snapshot")
 	}
@@ -958,13 +1202,13 @@ func (c *Client) serveSession(idx int, conn net.Conn) (handshook bool, err error
 		switch env.Type {
 		case MsgKeepalive:
 		case MsgEOR:
-			c.markSynced(idx)
+			c.markSynced(s)
 		case MsgAnnounce:
-			if err := c.applyAnnounce(idx, env.Routes); err != nil {
+			if err := c.applyAnnounce(s, env.Routes); err != nil {
 				return true, err
 			}
 		case MsgWithdraw:
-			if err := c.applyWithdraw(idx, env.Keys); err != nil {
+			if err := c.applyWithdraw(s, env.Keys); err != nil {
 				return true, err
 			}
 		case MsgError:
@@ -991,10 +1235,9 @@ func (c *Client) keepaliveLoop(sc *sessionConn, every time.Duration, done <-chan
 	}
 }
 
-func (c *Client) markUp(idx int, conn net.Conn, rrID string, hold time.Duration) {
+func (c *Client) markUp(s *clientSession, conn net.Conn, rrID string, hold time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := &c.sessions[idx]
 	s.conn = conn
 	s.up = true
 	s.synced = false
@@ -1013,10 +1256,9 @@ func (c *Client) markUp(idx int, conn net.Conn, rrID string, hold time.Duration)
 	s.announcedTunnels = nil
 }
 
-func (c *Client) markDown(idx int) {
+func (c *Client) markDown(s *clientSession) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := &c.sessions[idx]
 	s.up = false
 	s.synced = false
 	s.adjIn = map[RouteKey]Route{}
@@ -1027,35 +1269,65 @@ func (c *Client) markDown(idx int) {
 	s.ready = false
 	s.announced = nil
 	s.announcedTunnels = nil
+	if c.indexOfLocked(s) < 0 {
+		// 这条会话已经因为换 RR 被摘掉了，不在这张表里，也就不必重选 active。
+		return
+	}
 	c.pickActiveLocked()
 }
 
-func (c *Client) markSynced(idx int) {
+func (c *Client) markSynced(s *clientSession) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := &c.sessions[idx]
+	if c.indexOfLocked(s) < 0 {
+		return
+	}
 	if !s.up {
 		return
 	}
 	s.synced = true
 	c.pickActiveLocked()
+	// This is the moment a replacement RR takes over: EOR means its copy of the
+	// table is complete, so the session it replaced can finally be dropped.
+	c.reapRetiringLocked()
 }
 
-func (c *Client) noteError(idx int, err error) {
+func (c *Client) noteError(s *clientSession, err error) {
 	if err == nil {
 		return
 	}
 	c.mu.Lock()
-	c.sessions[idx].lastErr = err.Error()
+	s.lastErr = err.Error()
+	managed := c.indexOfLocked(s) >= 0
 	c.mu.Unlock()
-	if c.cfg.Logf != nil {
-		c.cfg.Logf("route: rr %s (device %d): %v", c.cfg.RRs[idx].Addr, c.cfg.DeviceID, err)
+	if !managed {
+		// 换 RR 摘掉旧会话时是我们自己关的连接，这条"错误"不是运维要看的故障。
+		return
 	}
+	c.logf("route: rr %s (device %d): %v", s.addr, c.cfg.DeviceID, err)
+}
+
+// indexOfLocked finds a session in the live list, or -1 once a rolling RR
+// replacement has dropped it. The goroutine outlives the drop -- it can be
+// mid-dial, mid-snapshot, or blocked in a read -- so every update that touches
+// shared state asks this first instead of assuming it is still listed.
+//
+// Must be called with c.mu held.
+func (c *Client) indexOfLocked(s *clientSession) int {
+	for i, cur := range c.sessions {
+		if cur == s {
+			return i
+		}
+	}
+	return -1
 }
 
 // pickActiveLocked switches the visible RIB to the lowest synced session. Only
 // a session with EOR may serve: a standby in the middle of its snapshot is not
 // a valid fallback, so if only it is up the table is empty.
+//
+// SetRRs keeps the wanted sessions ahead of the retired ones, so a session that
+// is on its way out only becomes active when nothing wanted is serving.
 func (c *Client) pickActiveLocked() {
 	best := -1
 	for i := range c.sessions {
@@ -1067,7 +1339,7 @@ func (c *Client) pickActiveLocked() {
 	c.active = best
 }
 
-func (c *Client) applyAnnounce(idx int, routes []Route) error {
+func (c *Client) applyAnnounce(s *clientSession, routes []Route) error {
 	last := make(map[RouteKey]Route, len(routes))
 	order := make([]RouteKey, 0, len(routes))
 	for _, rt := range routes {
@@ -1094,8 +1366,7 @@ func (c *Client) applyAnnounce(idx int, routes []Route) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := &c.sessions[idx]
-	if !s.up {
+	if !s.up || c.indexOfLocked(s) < 0 {
 		return fmt.Errorf("announce on a session that is not up")
 	}
 	c.counters.received += uint64(len(order))
@@ -1142,11 +1413,10 @@ func (c *Client) importTargets(rts []string) TableList {
 	return out
 }
 
-func (c *Client) applyWithdraw(idx int, keys []RouteKey) error {
+func (c *Client) applyWithdraw(s *clientSession, keys []RouteKey) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := &c.sessions[idx]
-	if !s.up {
+	if !s.up || c.indexOfLocked(s) < 0 {
 		return fmt.Errorf("withdraw on a session that is not up")
 	}
 	for _, k := range keys {
@@ -1238,16 +1508,20 @@ func (c *Client) Stats() ClientStats {
 		DroppedNoPath:     c.counters.noPath,
 	}
 	if c.active >= 0 {
-		st.ActiveRIBRoutes = len(c.sessions[c.active].rib)
-		st.ActivePending = len(c.sessions[c.active].pending)
+		a := c.sessions[c.active]
+		st.ActiveRIBRoutes = len(a.rib)
+		st.ActivePending = len(a.pending)
+		st.ActiveRRID = a.cfgID
 	}
-	for i := range c.sessions {
-		s := &c.sessions[i]
+	st.RRWait = c.rrWaitLocked()
+	for _, s := range c.sessions {
 		st.Sessions = append(st.Sessions, SessionStats{
 			Addr:       s.addr,
+			ConfigID:   s.cfgID,
 			RRID:       s.rrID,
 			Connected:  s.up,
 			Synced:     s.synced,
+			Retiring:   s.retire,
 			Routes:     len(s.rib),
 			Pending:    len(s.pending),
 			Reconnects: s.reconnects,
@@ -1255,6 +1529,30 @@ func (c *Client) Stats() ClientStats {
 		})
 	}
 	return st
+}
+
+// rrWaitLocked reports a rolling RR replacement that has not finished: the RR
+// addresses this device wants but cannot establish yet, and the retired sessions
+// kept alive because of them. nil when nothing is in flight -- a switch that is
+// done is not a state, and a switch nobody asked for is not a warning.
+//
+// Must be called with c.mu held.
+func (c *Client) rrWaitLocked() *RRWait {
+	pending := make([]string, 0, len(c.sessions))
+	retiring := make([]string, 0, len(c.sessions))
+	for _, s := range c.sessions {
+		if s.retire {
+			retiring = append(retiring, s.addr)
+			continue
+		}
+		if !c.establishedLocked(s) {
+			pending = append(pending, s.addr)
+		}
+	}
+	if len(retiring) == 0 {
+		return nil
+	}
+	return &RRWait{PendingAddrs: pending, RetiringAddrs: retiring}
 }
 
 func sortedKeys(m map[string]bool) []string {

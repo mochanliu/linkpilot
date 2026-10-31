@@ -105,6 +105,14 @@ lab-custN 10.99.0.2N        BGP router-id
 判据在 srwg-node1/2 上跑 `test/scripts/test-refresh.sh`（51 条断言，五个进程一次都没重启）。
 要知道哪条前缀被本机扣下了，读同一份 `/status` 里的 `pending` 与 `local_skips`。
 
+O6-c 补了第四道 `PUT /rrs`：换反射器集合，也是整表替换、也只改内存（磁盘那份要下次启动才回来）。
+它跟前三道不一样，**旧会话在新会话成立之前不会摘**（make-before-break），所以 `/status` 可能返回
+`rr_wait{pending_addrs, retiring_addrs}` —— 那是"新 RR 还没成立、旧的先留着"，不是失败。
+判据不在本 lab 的盒子上，它另起三台 sr-rr 与两台 sr-route（自己的端口、自己的配置，不碰 lab 在跑的进程）：
+宿主机上跑 `test/scripts/test-rr-switch.sh`（56 条，约 150 秒，需要 `lab-o6b1`/`lab-o6b2`/`lab-rr`）。
+换 RR 的正确走法只有三步，中间那步必须运营方亲眼看：**先把新 RR 加进选择并发布 → 看新 RR 的
+`/routes` 收齐全租户 → 再把旧 RR 撤掉发布**；跳过第二步会在新 RR 上留一段内容空窗（lab 量到 2.5 秒）。
+
 防环：
 
 - 我们自己导出的 table 1250 路由回到 BGP 时 tag 是 0，sr-frr 只收 tag 1001，

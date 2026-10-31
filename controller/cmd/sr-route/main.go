@@ -233,8 +233,15 @@ func summary(c *route.Client) string {
 	if len(parts) == 0 {
 		parts = append(parts, "empty")
 	}
-	return fmt.Sprintf("active=%d sessions[%v] rib{%s} held=%d",
+	base := fmt.Sprintf("active=%d sessions[%v] rib{%s} held=%d",
 		st.ActiveRR, synced, strings.Join(parts, " "), st.ActivePending)
+	if st.RRWait == nil {
+		return base
+	}
+	// 换 RR 没走完必须看得见：盘上的 rrs 已经是新的，活着的反射器还是旧的，
+	// 这正是"配置未完全生效"，不该只在日志里一闪而过。
+	return base + fmt.Sprintf(" 换 RR 未完成：新 RR %v 未成立，旧会话 %v 保留",
+		st.RRWait.PendingAddrs, st.RRWait.RetiringAddrs)
 }
 
 // localPrefixJSON is both the /status "local" shape and the /local-prefixes
@@ -336,11 +343,35 @@ type vrfsDoc struct {
 	VRFs []vrfConfig `json:"vrfs"`
 }
 
+// rrsDoc is the GET/PUT /rrs body: the reflector set this device is working
+// towards, plus the one thing a caller cannot infer from it -- whether the
+// switch has actually finished. rr_wait is absent when nothing is in flight.
+type rrsDoc struct {
+	RRs    []wire.RRAddress `json:"rrs"`
+	RRWait *route.RRWait    `json:"rr_wait,omitempty"`
+}
+
+func rrsOf(c *route.Client) rrsDoc {
+	rrs := c.RRs()
+	out := make([]wire.RRAddress, 0, len(rrs))
+	for _, rr := range rrs {
+		out = append(out, wire.RRAddress{ID: rr.ID, Addr: rr.Addr})
+	}
+	return rrsDoc{RRs: out, RRWait: c.Stats().RRWait}
+}
+
 // writeJSON is the response half of the seams below. Encoding errors are not
 // reportable to the caller at that point, so log them: a silently short body
 // would look like a device that has no routes.
 func writeJSON(w http.ResponseWriter, v any) {
+	writeJSONStatus(w, http.StatusOK, v)
+}
+
+// writeJSONStatus exists because PUT /rrs answers 202, and a Content-Type set
+// after WriteHeader is silently dropped.
+func writeJSONStatus(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
@@ -456,11 +487,49 @@ func statusMux(c *route.Client) *http.ServeMux {
 			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 		}
 	})
+	// PUT replaces the reflector set while this process runs -- the seam C-c exists
+	// for, so 逐台换 RR never means restarting sr-route (and never means the RR
+	// withdrawing our prefixes on the way, which is what a restart does).
+	//
+	// It answers 202, not 200: the switch is make-before-break, so a new session
+	// has to be dialled, handshaken and EOR'd before the one it replaces may be
+	// dropped, and sr-apply gives one hot update a 10-second budget
+	// (internal/apply/route.go, routePushTimeout). Whether it finished is read
+	// from rr_wait -- here and on every later GET -- not waited for in this call.
+	mux.HandleFunc("/rrs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, rrsOf(c))
+		case http.MethodPut:
+			var doc rrsDoc
+			if !decodeJSON(w, r, &doc) {
+				return
+			}
+			rrs := make([]route.RRConfig, 0, len(doc.RRs))
+			for _, rr := range doc.RRs {
+				rrs = append(rrs, route.RRConfig{ID: rr.ID, Addr: rr.Addr})
+			}
+			if err := c.SetRRs(rrs); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			after := rrsOf(c)
+			if after.RRWait != nil {
+				log.Printf("sr-route: 换 RR 已开始，新 RR %v 还没成立，旧会话 %v 先保留（配置未完全生效）",
+					after.RRWait.PendingAddrs, after.RRWait.RetiringAddrs)
+			} else {
+				log.Printf("sr-route: RR 表 = %d 条（旧会话已全部摘掉）", len(after.RRs))
+			}
+			writeJSONStatus(w, http.StatusAccepted, after)
+		default:
+			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
+		}
+	})
 	return mux
 }
 
 func serveStatus(addr string, c *route.Client) {
-	log.Printf("sr-route: status on http://%s/status（运行时改表入口 PUT /tunnels、PUT /vrfs、PUT /local-prefixes）", addr)
+	log.Printf("sr-route: status on http://%s/status（运行时改表入口 PUT /tunnels、PUT /vrfs、PUT /local-prefixes、PUT /rrs）", addr)
 	if err := http.ListenAndServe(addr, statusMux(c)); err != nil {
 		log.Printf("sr-route: status server: %v", err)
 	}
