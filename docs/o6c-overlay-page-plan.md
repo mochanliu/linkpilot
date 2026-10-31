@@ -279,3 +279,18 @@ adj-RIBs-in，`deriveSessionLocked`（`internal/route/client.go:743`）单会话
   我倾向先走甲（它已经满足 E1 那句"逐台更换不断业务"，乙修的是另一件事：全租户同时改的那几秒），
   但这条是您来定。
 
+
+### 7.5 2026-10-31 补：控制台那句话跟着 C-c 改了口径
+
+C-a 时代 `GET /api/overlay` 的 `rr_note` 末尾写的是"选好了还要发布配置、并且设备上的路由进程换过这一版
+才生效"——那时 `rrs` 确实只落盘。C-c 之后这句成了假话，改成：**发布后设备就地换，先建新会话、它确实接管了
+本机前缀才摘被顶替的那条，路由进程不重启；进度看设备的路由状态**；并把 §6 第 5 条那个诚实例外一起写进去
+（只填一条 RR 时换地址必然有窗口，那是这一格本身的形态，不是故障）。
+位置：[overlay.go](../controller/cmd/sr-ctrl/overlay.go) 的 `RRNote`。
+
+同一个改动没动的两处文案，因为它们本来就是对的：`sr-apply` 的"要它下次启动才生效"只在
+**这台 sr-route 没有 `/rrs` 入口**（404/405，旧二进制）时才出现（[route.go:287-288](../controller/internal/apply/route.go)），
+`RTNote` 里"设备重启后靠本地那一份配置工作"说的仍是磁盘那版。
+判据：`gofmt/vet/test -race` 全绿，lab-ctrl 里重建 sr-ctrl 后真浏览器登录 o6b-admin，
+「Overlay 配置 › 全局配置」渲染出的就是新句子（截图没拿到——in-app 浏览器面板不在前台，
+`take_screenshot` 报 `visibilityState=hidden`；读回的是渲染后的 `main.innerText`）。
