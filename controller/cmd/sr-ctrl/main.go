@@ -292,6 +292,14 @@ type State struct {
 	// nothing in it references a tunnel or a port.
 	Overlays map[string]*OverlayConfig `json:"overlays"`
 
+	// RRs is the operator's route-reflector library: one table for the whole
+	// installation, because an RR is infrastructure the operator deploys rather
+	// than something each customer invents. A tenant's overlay config names two
+	// rows of it by id, and the controller renders those two into a device's
+	// route.json. Kept out of Overlays so a shared row cannot be duplicated per
+	// tenant and drift.
+	RRs *RRLibrary `json:"rrs,omitempty"`
+
 	// Sites is each tenant's location table, keyed by site id. Console-only:
 	// nothing here is pushed to a device, because a coordinate means nothing to
 	// the dataplane. It exists so several boxes in one building share one position
@@ -605,6 +613,9 @@ func normalizeState(s *State) bool {
 		migrated = true
 	}
 	if normalizePreAuths(s) {
+		migrated = true
+	}
+	if normalizeRRs(s) {
 		migrated = true
 	}
 	return migrated

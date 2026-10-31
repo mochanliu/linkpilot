@@ -170,13 +170,18 @@ O6-b 因此只动 `route.json` 一个文件。
 `tunnels`+`vrfs` 两个变三个。设备侧改动很小（`overlayRouteKeys` 加一个键），
 **但 `route.json` 缺文件仍是硬错误不变**（已拍：统一行为）。
 
-这三条没有把 O6-c 说完，还剩四件要请他拍的（每条我先给一个默认，等他改）：
-**① RR 库是全局一份还是按租户隔离**
-（默认：全局一份、所有租户都能选——运营商的 RR 本来就是共享基础设施）；
-**② "位置"字段怎么存**（默认：复用既有的站点 site，不新建一套坐标）；
-**③ 库里的 RR 要不要探活**（默认：不探，页面上如实写"控制机没连过它，未知"，
-和隧道那一格的口径保持一致，别造一个假的绿灯）；
-**④ 主/备怎么进设备**（默认：`rrs` 数组顺序即优先级，主在前；备空着就只发一条）。
+这三条没有把 O6-c 说完。**O6-c 的完整方案已单独成文：
+[o6c-overlay-page-plan.md](o6c-overlay-page-plan.md)**，里面那条"待拍"（原来是 E1-E5，加起来又补了 E0，共六条）**已于 2026-10-31 全部拍完**。
+其中一条要在这里就更正：我原本给的默认"位置字段复用既有站点 `Site`"**不成立** ——
+`Site` 是租户私有的（`cmd/sr-ctrl/site.go:26-34` 带 `TenantID`），运营方没有租户身份，
+借它会新开通往跨租户读站点的路。改成库里存一个自由文本 `location`（他原话就是"手填即可"）。
+另外新查出来一条更硬的约束，它才是 O6-c 真正要拍的：**`rrs` 不能热更** ——
+sr-route 只在启动时读它（会话数组按配置长度构造，`internal/route/client.go:299`），
+`sr-apply` 的热更只覆盖 `tunnels`/`vrfs`，而清单 `start.sh` 只有 `up|check|stop`，
+且 `run_stop` 的循环里**包含 agent**（sr-apply 是 sr-agent 的子进程，谁调谁把他爹杀了）。
+详见那份方案的 §1.4 与 E1。
+**这条约束今天仍在**：C-a（后端，2026-10-31 已落地）把 `rrs` 加进了落盘白名单并在 status 里明写
+"要 sr-route 下次启动才生效"，热更换 RR 是 C-c 的 `PUT /rrs` + make-before-break，还没做。
 
 ### 1.4 开机路径
 
@@ -193,7 +198,7 @@ O6-b 因此只动 `route.json` 一个文件。
 | --- | --- | --- |
 | O6-a ✅ | 控制器 overlay 模型 + `OverlayGroup` 的 CRUD API + RT 分配与渲染（不动 UI） | 单测：建组→渲染出的每台 `export/import_rts` 逐字对；编辑组减设备⇒残留 RT 消失；两条闸门各一条负向 |
 | O6-b ✅ | bundle 第 4 段（只发 `tunnels`+`vrfs`）+ `sr-apply` 叠加写盘 + `sr-apply` 推 `PUT /vrfs` `/tunnels` | lab 实测（2026-10-31，`lab-o6b1`/`lab-o6b2` 两台新盒子 + 控制器 `o6b-lab` 租户，见 [test/lab/README.md](../test/lab/README.md)）：控制台建组 65000:1000 一发布，两台 `route.json` 的第 4 段盖掉运维那份旧表（`peer 99`/`65000:999` → `peer 2`/`65000:1000`），`/status` 活表同一次心跳后跟着变，**`sr-route` 的 pid 从头到尾没换**（137 / 2421）；删组再发布 ⇒ 活表回到 `vrfs: []`，残留 RT 当场摘掉；把盒子改成"控制器不可达"再 `docker restart`，只敲一条 `start.sh up` ⇒ `apply 重放磁盘上那版 → v2 boot ok`、`/status` 里还是导通那张表（磁盘回来的，全程没有控制器）。设备独有键 `tenant/device_id/serial/hold_sec/rrs/local_prefixes/status_addr` 逐字没动；盘上没有 `route.json` 的手工负向按 §1.3 报错并 `rc=1`。单测/编译/harness：`go test -count=1 -race ./...` 全绿、`test-vbond.sh` 196 条全绿 |
-| O6-c | 控制台「Overlay 配置」页：全局 + 导通两块（leak 先不放） | 真浏览器：新增规则后两行 RT 自动写入、编辑减设备后残留被摘、被丢路由三态有数 |
+| O6-c | 控制台「Overlay 配置」页：全局 + 导通两块（leak 先不放）＋运营方的 RR 库。**方案与拍板都在 [o6c-overlay-page-plan.md](o6c-overlay-page-plan.md)；分三步：C-a 后端 ✅（2026-10-31）/ C-b 控制台 / C-c `PUT /rrs` make-before-break** | 真浏览器：新增规则后两行 RT 自动写入、编辑减设备后残留被摘、被丢路由三态有数 |
 | O6-d | 被丢路由三态上控制台（`pending` / `local_skips` / `rt_mismatch`，走心跳摘要字段） | 控制台显示的数与设备 `/status` 的数逐字相同；设备没上报时明写"未上报" |
 | O6-e | leak（第三块）：sr-frr 的 prefix 过滤 + FRR redistribute 字段 | 单独出方案，本文不展开 |
 

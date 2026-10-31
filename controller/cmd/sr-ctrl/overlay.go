@@ -1,9 +1,10 @@
 package main
 
-// The overlay layer: 导通组 (route-target groups) plus the tenant-level escape
-// switch. This file is the model and the arithmetic; the HTTP surface is
-// overlay_api.go, and the bundle's 4th artifact (route.json's tunnels+vrfs) is
-// rendered here by overlayRouteArtifactLocked.
+// The overlay layer: 导通组 (route-target groups), the tenant's two reflector
+// slots and the tenant-level escape switch. This file is the model and the
+// arithmetic; the HTTP surface is overlay_api.go, and the bundle's 4th artifact
+// (route.json's tunnels+vrfs, plus rrs once the tenant has picked) is rendered
+// here by overlayRouteArtifactLocked.
 //
 // The model is deliberately NOT "a VPN carries a list of RTs". A group is the
 // unit the tenant edits (docs/overlay-design-draft.md §2.2): pick devices, give
@@ -27,6 +28,7 @@ import (
 
 	"sdwan/controller/internal/route"
 	"sdwan/controller/internal/underlay"
+	"sdwan/controller/internal/wire"
 )
 
 const (
@@ -74,6 +76,17 @@ type OverlayConfig struct {
 	// It reaches sr-fib's own `escape_all_colors` field; O6-b renders it.
 	EscapeAllColors bool           `json:"escape_all_colors"`
 	Groups          []OverlayGroup `json:"groups"`
+
+	// RRPrimary and RRBackup are the tenant's two 反射器 slots. They hold ids of
+	// rows in the operator's library (State.RRs), never addresses: the operator
+	// owns what a reflector's address is, the tenant only picks. Empty means "the
+	// controller says nothing about rrs", which is what every box enrolled before
+	// this page relied on -- it keeps the list the operator hand-wrote into
+	// route.json. The two names carry no priority: the route client keeps a
+	// session up to every entry it is handed, so two rows are two equal active
+	// reflectors (docs/o6c-overlay-page-plan.md 拍板 E0).
+	RRPrimary string `json:"rr_primary,omitempty"`
+	RRBackup  string `json:"rr_backup,omitempty"`
 
 	// NextRT is the counter behind the allocated value; NextGroup mints ids.
 	// Neither ever rewinds, so an RT is burned for good when its group is deleted
@@ -127,6 +140,8 @@ func (o *OverlayConfig) ensure() {
 	if o.NextGroup < 0 {
 		o.NextGroup = 0
 	}
+	o.RRPrimary = strings.TrimSpace(o.RRPrimary)
+	o.RRBackup = strings.TrimSpace(o.RRBackup)
 	for i := range o.Groups {
 		o.Groups[i].Name = strings.TrimSpace(o.Groups[i].Name)
 		if o.Groups[i].Members == nil {
@@ -468,6 +483,17 @@ type overlayView struct {
 	// RTNote states who owns the RT values, because the page must not make them
 	// editable and a reader is going to ask why not.
 	RTNote string `json:"rt_note"`
+
+	// The two reflector slots and the rows this tenant may pick from them. The
+	// library is filtered here, not in the page: a tenant must never be able to
+	// name (or even learn the existence of) another tenant's exclusive RR.
+	RRPrimary string      `json:"rr_primary"`
+	RRBackup  string      `json:"rr_backup"`
+	RRLibrary []rrPickRow `json:"rr_library"`
+	// RRNote says what "主" and "备" do and do not do on the device, because the
+	// words promise a failover order this plane does not implement: the route
+	// client keeps a session up to every entry it is handed.
+	RRNote string `json:"rr_note"`
 }
 
 func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
@@ -482,6 +508,12 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 		MaxRTsPerVPN:    route.MaxRTsPerRoute,
 		RTNote: fmt.Sprintf("RT 由控制器分配并在租户内唯一（%d:1000 起），"+
 			"页面上不可编辑；设备重启后靠本地那一份配置工作，不依赖控制器在线。", overlayRTASN),
+		RRPrimary: oc.RRPrimary,
+		RRBackup:  oc.RRBackup,
+		RRLibrary: s.rrPickRowsLocked(tenantID),
+		RRNote: "「主」「备」只是这一页上的两个格子，设备不排序：路由客户端对拿到的每一条 RR 都保持会话，" +
+			"两条就是两条等价活动反射器。控制器不会去连库里这些地址，所以这里没有绿灯可给——" +
+			"能不能连上，只有设备自己的路由状态知道。选好了要等设备上的路由进程重启才生效（见发布记录）。",
 	}
 	if view.Groups == nil {
 		view.Groups = []OverlayGroup{}
@@ -495,6 +527,7 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 	// Every stored group is re-checked on read: state can be edited outside the
 	// page (an older file, a device that has since been removed), and a problem
 	// that exists is reported whether or not anyone is about to save.
+	view.Checks = append(view.Checks, s.overlayRRChecksLocked(tenantID)...)
 	for _, g := range oc.Groups {
 		view.Checks = append(view.Checks, s.overlayGroupChecksLocked(tenantID, g, g.ID)...)
 		view.Checks = append(view.Checks, s.overlayTunnelChecksLocked(tenantID, g)...)
@@ -572,9 +605,17 @@ type overlayRouteTunnel struct {
 // omitted when the tenant has never published a global underlay config -- an
 // empty list from a controller that knows nothing about this box's tunnels would
 // withdraw all of them.
+//
+// `rrs` follows the tunnels rule, not the vrfs one, and for the same reason:
+// sr-route refuses to *start* on an empty rrs list (cmd/sr-route/main.go:91), so
+// a tenant that has not picked a reflector must send no key at all and leave the
+// list the operator hand-wrote in place. omitempty is what makes "not selected"
+// and "selected, empty" different on the wire -- and only the second one would
+// be a lie.
 type overlayRouteDoc struct {
 	Tunnels []overlayRouteTunnel `json:"tunnels,omitempty"`
 	VRFs    []OverlayVRF         `json:"vrfs"`
+	RRs     []wire.RRAddress     `json:"rrs,omitempty"`
 }
 
 // overlayRouteArtifactLocked renders one device's 第 4 段. Empty arrays are
@@ -596,6 +637,12 @@ func (s *server) overlayRouteArtifactLocked(tenantID string, nodeID uint16) stri
 			tunnels = append(tunnels, overlayRouteTunnel{Peer: peer.NodeID, NextHop: peer.Overlay})
 		}
 		doc.Tunnels = tunnels
+	}
+	// A tenant that has not picked, or one whose pick no longer resolves, renders
+	// no key at all -- overlayRRChecksLocked says why out loud, and the device
+	// keeps the rrs the operator wrote by hand until something real arrives.
+	if rrs := s.rrForTenantLocked(tenantID); len(rrs) > 0 {
+		doc.RRs = rrs
 	}
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

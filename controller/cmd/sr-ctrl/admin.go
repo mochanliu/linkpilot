@@ -358,6 +358,12 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/overlay", s.handleAdminOverlay)
 	mux.HandleFunc("/api/overlay/settings", s.handleAdminOverlaySettings)
 	mux.HandleFunc("/api/overlay/group", s.handleAdminOverlayGroup)
+	// The RR library is the operator's: it names the boxes that reflect routes,
+	// which is infrastructure the operator deploys rather than something a
+	// customer invents. A tenant never reads this endpoint -- the rows it may pick
+	// arrive inside /api/overlay, already filtered by 归属.
+	mux.HandleFunc("/api/rrs", s.handleAdminRRs)
+	mux.HandleFunc("/api/rrs/delete", s.handleAdminRRDelete)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/code", s.handleAdminClaimCode)

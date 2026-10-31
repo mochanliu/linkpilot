@@ -2,13 +2,13 @@
 // controller owns.
 //
 // Why an overlay and not a whole file (docs/overlay-console-plan.md §1.2):
-// sr-route reads ONE file and calls DisallowUnknownFields, and five of its keys
-// are things the controller does not know -- identity_dir, status_addr, hold_sec,
-// tls_server_name and rrs. There is no RR registry in the controller at all, so a
-// full render would mean inventing an address for a reflector it has never heard
-// of. The controller therefore sends `tunnels` and `vrfs`, and which of the two
-// keys appear is the instruction: sr-apply copies exactly those into the file on
-// disk and touches nothing else.
+// sr-route reads ONE file and calls DisallowUnknownFields, and its remaining keys
+// are things the controller does not know -- identity_dir, status_addr, hold_sec
+// and tls_server_name. Those name a certificate directory and a listen address on
+// this box, which the controller has no business inventing. The controller sends
+// `tunnels`, `vrfs` and (from O6-c) `rrs`, and which keys appear is the
+// instruction: sr-apply copies exactly those into the file on disk and touches
+// nothing else.
 //
 // Two entry points, both needed:
 //
@@ -38,7 +38,12 @@ import (
 // A future controller key would be dropped rather than copied: writing a key
 // sr-route does not know would make it refuse to START, which is far worse than
 // one table not being taken over -- and the log says which key was ignored.
-var overlayRouteKeys = map[string]bool{"tunnels": true, "vrfs": true}
+//
+// `rrs` is on this list from O6-c: the tenant now picks its reflectors in the
+// console, so the controller does know that key. It is a disk-only one until C-c
+// gives sr-route a `PUT /rrs` -- the route client builds its session list at
+// startup and has no way to take a new one, so the file is the honest half.
+var overlayRouteKeys = map[string]bool{"tunnels": true, "vrfs": true, "rrs": true}
 
 // routePushTimeout bounds one hot-update request. sr-route answers these in
 // milliseconds; a box whose sr-route is wedged must not hang the whole apply.
@@ -107,11 +112,12 @@ func overlayRouteFile(path, route string) (out []byte, ignored []string, err err
 	raw, rerr := os.ReadFile(path)
 	if rerr != nil {
 		if os.IsNotExist(rerr) {
-			// Refuse rather than guess: an invented rrs/identity_dir is worse than
-			// no update at all -- it would name a reflector the controller has never
-			// seen and a certificate directory this box may not use.
-			return nil, nil, fmt.Errorf("盘上没有 %s：控制器只发 tunnels/vrfs，"+
-				"identity_dir/status_addr/rrs 是盒子自己的键，得先由运维写一份", path)
+			// Refuse rather than guess: an invented identity_dir is worse than no
+			// update at all -- it would name a certificate directory this box may not
+			// use, and a first RR list could only come from a controller that knows
+			// which reflectors this tenant picked.
+			return nil, nil, fmt.Errorf("盘上没有 %s：控制器只叠加 tunnels/vrfs/rrs，"+
+				"identity_dir/status_addr 是盒子自己的键，得先由运维写一份", path)
 		}
 		return nil, nil, fmt.Errorf("读 %s: %w", path, rerr)
 	}
@@ -182,7 +188,9 @@ func splitStatusAddr(a string) (host, port string, wildcard bool) {
 	return host, port, false
 }
 
-// pushOverlay PUTs the two tables to the running sr-route.
+// pushOverlay PUTs the hot-updatable tables to the running sr-route. `rrs` is not
+// one of them yet -- it is written to disk and reported as waiting for the next
+// start, which is the only honest answer until C-c gives the route client a seam.
 func (a *Applier) pushOverlay(ctx context.Context, base string, doc map[string]json.RawMessage) (string, error) {
 	// tunnels first: a VRF whose import RT already matches a held-back route is
 	// installed by the tunnel table arriving, and doing it the other way round
@@ -216,11 +224,24 @@ func (a *Applier) pushOverlay(ctx context.Context, base string, doc map[string]j
 			a.Logf("overlay: 已热更 %s", url)
 		}
 	}
-	if len(missed) == 0 {
+	if len(missed) == 0 && doc["rrs"] == nil {
 		return "", nil
 	}
-	return fmt.Sprintf("已落盘 %s、未热更：%s（sr-route 连不上，下次它启动就是这张表）",
-		a.RouteConf, strings.Join(missed, "/")), nil
+	var notes []string
+	if len(missed) > 0 {
+		notes = append(notes, fmt.Sprintf("已落盘 %s、未热更：%s（sr-route 连不上，下次它启动就是这张表）",
+			a.RouteConf, strings.Join(missed, "/")))
+	}
+	// rrs is on the disk and cannot be pushed in this version: the route client
+	// builds its session list once, at startup, and has no seam to take another
+	// one (that is O6-c C-c). Two of the three pushable tables going live while the
+	// reflector list sits there waiting is exactly the kind of half-truth that has
+	// to be written into the status rather than into the log only.
+	if doc["rrs"] != nil {
+		a.Logf("overlay: rrs 已落盘，这一版不能热更（sr-route 只在启动时读 RR 列表）")
+		notes = append(notes, "rrs 已落盘，要 sr-route 下次启动才生效（这一版没有热更换 RR 的入口）")
+	}
+	return strings.Join(notes, "；"), nil
 }
 
 // routeRejected is sr-route saying "no" -- a non-2xx, which is a real complaint

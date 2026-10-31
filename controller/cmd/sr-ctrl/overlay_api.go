@@ -5,14 +5,16 @@ package main
 // Same gate and same discipline as the underlay layer: requireTenant before
 // anything is read or written, one mutation under s.mu, then a whole-state save.
 //
-// There is no publish step here, on purpose. A 导通组 is an input to the device
-// config's rendered artifacts, and publishing the device config is the single act
-// that changes what a box runs (O6-b puts route.json into that bundle). Saving a
-// group therefore changes what the NEXT publish renders and leaves the currently
-// installed bundle alone -- which is exactly the draft/publish split the basic
-// config already uses, and why "删除一个组" cannot silently cut anyone's routes.
+// There is no publish step here, on purpose. A 导通组 and the two reflector
+// slots are inputs to the device config's rendered artifacts, and publishing the
+// device config is the single act that changes what a box runs (O6-b puts
+// route.json into that bundle). Saving either therefore changes what the NEXT
+// publish renders and leaves the currently installed bundle alone -- which is
+// exactly the draft/publish split the basic config already uses, and why
+// "删除一个组" cannot silently cut anyone's routes.
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -43,9 +45,15 @@ func (s *server) handleAdminOverlay(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, v)
 }
 
-// handleAdminOverlaySettings saves the escape switch. It is one boolean, so it
-// gets its own endpoint instead of a settings document that would imply the page
-// owns the group list too.
+// handleAdminOverlaySettings saves the global block of the overlay page: the
+// escape switch and the two reflector slots. It is one small document rather than
+// one endpoint per field so the page can save what it shows in one write, and it
+// stays a settings document rather than a group editor: 导通组 have their own
+// endpoint because they carry their own checks.
+//
+// A field that is absent is left alone -- that is what lets the escape toggle
+// keep working while the RR pickers are still being built, and what makes
+// "清掉备 RR" (an explicit empty string) different from "我没碰这个格子" (absent).
 func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireTenant(w, r)
 	if !ok {
@@ -56,28 +64,60 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req struct {
-		EscapeAllColors *bool `json:"escape_all_colors"`
+		EscapeAllColors *bool   `json:"escape_all_colors"`
+		RRPrimary       *string `json:"rr_primary"`
+		RRBackup        *string `json:"rr_backup"`
 	}
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if req.EscapeAllColors == nil {
-		http.Error(w, "escape_all_colors required", http.StatusBadRequest)
+	if req.EscapeAllColors == nil && req.RRPrimary == nil && req.RRBackup == nil {
+		http.Error(w, "escape_all_colors / rr_primary / rr_backup 至少要给一个", http.StatusBadRequest)
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	oc := s.overlayConfigLocked(id.TenantID, true)
-	oc.EscapeAllColors = *req.EscapeAllColors
+
+	// Both halves of the selection are checked before anything is written, and
+	// against the *next* pair rather than each alone: "主 = 备" is not visible from
+	// either field by itself.
+	nextPrimary, nextBackup := oc.RRPrimary, oc.RRBackup
+	if req.RRPrimary != nil {
+		nextPrimary = strings.TrimSpace(*req.RRPrimary)
+	}
+	if req.RRBackup != nil {
+		nextBackup = strings.TrimSpace(*req.RRBackup)
+	}
+	for _, slot := range []struct{ label, val string }{{"主", nextPrimary}, {"备", nextBackup}} {
+		if msg := s.rrSelectionErrorLocked(id.TenantID, slot.val); msg != "" {
+			http.Error(w, fmt.Sprintf("%s RR：%s", slot.label, msg), http.StatusBadRequest)
+			return
+		}
+	}
+	if nextPrimary != "" && nextPrimary == nextBackup {
+		http.Error(w, "主 RR 和备 RR 不能选同一条：一条反射器不需要两个格子", http.StatusBadRequest)
+		return
+	}
+
+	if req.EscapeAllColors != nil {
+		oc.EscapeAllColors = *req.EscapeAllColors
+	}
+	oc.RRPrimary, oc.RRBackup = nextPrimary, nextBackup
 	oc.UpdatedAt = time.Now().Unix()
 	oc.UpdatedBy = id.Username
 	s.save()
-	log.Printf("overlay: tenant=%s escape_all_colors=%t by %s", id.TenantID, oc.EscapeAllColors, id.Username)
+	log.Printf("overlay: tenant=%s escape_all_colors=%t rr_primary=%q rr_backup=%q by %s",
+		id.TenantID, oc.EscapeAllColors, oc.RRPrimary, oc.RRBackup, id.Username)
 	writeJSON(w, map[string]any{
-		"ok":       true,
-		"overlay":  s.overlayViewLocked(id.TenantID, time.Now().Unix()),
-		"settings": map[string]any{"escape_all_colors": oc.EscapeAllColors},
+		"ok":      true,
+		"overlay": s.overlayViewLocked(id.TenantID, time.Now().Unix()),
+		"settings": map[string]any{
+			"escape_all_colors": oc.EscapeAllColors,
+			"rr_primary":        oc.RRPrimary,
+			"rr_backup":         oc.RRBackup,
+		},
 	})
 }
 

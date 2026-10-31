@@ -106,6 +106,100 @@ func TestOverlayMergeIgnoresUnknownKey(t *testing.T) {
 	}
 }
 
+// overlayRROnly is a 第 4 段 from a tenant that picked one reflector and has
+// nothing else to say. The box's own route.json carries an rrs written by hand,
+// and a controller-managed list replaces the whole thing -- the same full-
+// replacement rule tunnels follows, because a reflector left over from a hand
+// 抄 that nobody owns any more is a route path no console can account for.
+const overlayRROnly = `{"rrs":[{"id":"rr1","addr":"192.0.2.10:20200"}]}`
+
+// overlayRRSegment has all three keys, which is what a tenant that publishes both
+// layers and picked 主+备 sends.
+const overlayRRSegment = `{"tunnels":[{"peer_device_id":3,"next_hop":"10.68.0.3"}],` +
+	`"vrfs":[{"id":0,"export_rts":["65000:1000"],"import_rts":["65000:1001"]}],` +
+	`"rrs":[{"id":"rr1","addr":"192.0.2.10:20200"},{"id":"rr2","addr":"192.0.2.11:20200"}]}`
+
+func TestOverlayRRReplacesTheBoxListAndKeepsTheRest(t *testing.T) {
+	path := boxRouteWith(t, "0.0.0.0:8084")
+	a, _ := newRouteApplier(t, path)
+
+	if note, err := a.applyRoute(context.Background(), Installed{Route: overlayRROnly}, false); err != nil || note != "" {
+		t.Fatalf("合并带 rrs 的第 4 段 = %q, %v", note, err)
+	}
+	doc := readRouteKeys(t, path)
+	got := string(doc["rrs"])
+	if !strings.Contains(got, "192.0.2.10:20200") || strings.Contains(got, "203.0.113.9") {
+		t.Errorf("rrs 没有整张替换: %s", got)
+	}
+	// id 也要落盘：设备日志、/status 和以后的热更换都靠它认出这一条是谁。
+	if !strings.Contains(got, `"id"`) {
+		t.Errorf("rrs 里的 id 被丢了: %s", got)
+	}
+	for _, k := range []string{"tenant", "device_id", "identity_dir", "serial", "hold_sec",
+		"status_addr", "local_prefixes", "rrs"} {
+		if _, ok := doc[k]; !ok {
+			t.Errorf("键 %s 没了", k)
+		}
+	}
+	// 这一段没带 tunnels/vrfs，所以盒子那两张表原样留着 —— presence 就是指令。
+	if got := string(doc["vrfs"]); !strings.Contains(got, "65000:9999") {
+		t.Errorf("没发 vrfs 却动了盒子那张: %s", got)
+	}
+}
+
+// C-c 之前 sr-route 没有收新 RR 列表的入口：热推那一步一次都不碰 /rrs。
+// 但这一半必须写进 status，不能默默当成"都生效了"——否则运维以为换了 RR 就
+// 已经换了，而设备上还在连老反射器。
+func TestOverlayRRIsNotHotPushedButIsReported(t *testing.T) {
+	var calls []pushCall
+	srv := recordingServer(&calls)
+	defer srv.Close()
+	path := boxRouteWith(t, strings.TrimPrefix(srv.URL, "http://"))
+	a, logs := newRouteApplier(t, path)
+
+	note, err := a.applyRoute(context.Background(), Installed{Route: overlayRRSegment}, true)
+	if err != nil {
+		t.Fatalf("带 rrs 的一版不该失败: %v", err)
+	}
+	if len(calls) != 2 || calls[0].path != "/tunnels" || calls[1].path != "/vrfs" {
+		t.Fatalf("热推 = %v，想要只推 /tunnels 和 /vrfs", calls)
+	}
+	if !strings.Contains(note, "rrs") || !strings.Contains(note, "下次启动") {
+		t.Fatalf("note = %q，想要明写 rrs 要等 sr-route 重启", note)
+	}
+	if joined := strings.Join(*logs, "\n"); !strings.Contains(joined, "rrs 已落盘") {
+		t.Errorf("日志里没说清 rrs 这一半: %s", joined)
+	}
+	if got := string(readRouteKeys(t, path)["rrs"]); !strings.Contains(got, "192.0.2.11:20200") {
+		t.Errorf("rrs 没落盘: %s", got)
+	}
+}
+
+// 只有 rrs 的一版（租户只选了 RR、这一版没发隧道表）热推次数是 0，
+// 但仍然要给出那条 note，而不是"什么都没发生"。
+func TestOverlayRRAlonePushesNothingButStillNotes(t *testing.T) {
+	var calls []pushCall
+	srv := recordingServer(&calls)
+	defer srv.Close()
+	path := boxRouteWith(t, strings.TrimPrefix(srv.URL, "http://"))
+	a, _ := newRouteApplier(t, path)
+
+	note, err := a.applyRoute(context.Background(), Installed{Route: overlayRROnly}, true)
+	if err != nil {
+		t.Fatalf("只有 rrs 的一版不该失败: %v", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("没有可热的表却推了 %v", calls)
+	}
+	if !strings.Contains(note, "rrs") {
+		t.Fatalf("note = %q，想要带上 rrs", note)
+	}
+	// 开机重放那一半不需要这条 note：那时 sr-route 还没起来，盘上就是新列表。
+	if bootNote, err := a.applyRoute(context.Background(), Installed{Route: overlayRROnly}, false); err != nil || bootNote != "" {
+		t.Fatalf("开机重放 = %q, %v", bootNote, err)
+	}
+}
+
 func TestOverlayRefusesWhenFileIsAbsent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "route.json")
 	a, _ := newRouteApplier(t, path)

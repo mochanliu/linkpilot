@@ -248,11 +248,12 @@ type configArtifacts struct {
 	FRR  string `json:"frr"`
 	VPP  string `json:"vpp"`
 	Boot string `json:"boot"`
-	// Route is bundle 第 4 段: the two keys of sr-route's route.json the
-	// controller owns (tunnels, vrfs). It is an overlay, not a whole file --
-	// identity_dir / status_addr / rrs are the box's, and the controller does not
-	// know them (docs/overlay-console-plan.md §1.2). omitempty because bundles
-	// published before O6-b have no such key and sr-apply must keep reading them.
+	// Route is bundle 第 4 段: the keys of sr-route's route.json the controller
+	// owns -- tunnels, vrfs, and rrs once the tenant has picked a reflector. It is
+	// an overlay, not a whole file: tenant/identity_dir/serial/status_addr stay the
+	// box's own (docs/overlay-console-plan.md §1.2, 更正见 docs/o6c-overlay-page-plan.md
+	// §1.2). omitempty because bundles published before O6-b have no such key and
+	// sr-apply must keep reading them.
 	Route string `json:"route,omitempty"`
 }
 
