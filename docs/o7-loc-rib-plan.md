@@ -114,6 +114,14 @@ R3 会话断开/`retire` 按来源摘除；`SetTunnels`/`SetVRFs` 改为翻标�
 R4 判据（单测 6 条 + `test-rr-switch.sh` 零缺口 + 5 个脚本）
 R5 `rr_note` 措辞：并集落地后"两条就是两条等价活动反射器"这句才真的成立
 
+## 状态（2026-10-31，本增量已完成）
+
+R1 `55fa79e`；R2+R3 `aa951ff`（R3 的按来源摘除与标志位翻转与 R2 是同一份改动，分开写
+只会是空提交）；R4 判据 `aa951ff` 里一起落；R5 `1edec6e`。跑绿的账：`gofmt -l` /
+`go vet ./...` / `go test -race -count=1 ./...`；`test-route.sh` 19、`test-refresh.sh` 51、
+`test-boot.sh` 90、`test-rr-switch.sh` 57（(4) 窗口 node2 缺口 **0**、withdrawn 不动）、
+`test-vbond.sh` 196。
+
 ## 明确不在本增量里
 
 **发布扇出口子**（改导通组时各盒子按自己的 2s 轮询装表，落后的盒子最长约 7s 黑洞：
