@@ -35,6 +35,12 @@ type configSync struct {
 	applying bool
 	fails    int
 	nextTry  time.Time
+	// failedOn is the version that set nextTry. The backoff answers "should I
+	// retry THIS bundle again yet?", not "should I touch any bundle at all": an
+	// operator who published a newer version already changed what the box is
+	// being asked to run, and waiting out a timer for a config that no longer
+	// exists is what made a fix look like it had not been received.
+	failedOn int
 }
 
 func newConfigSync(nodeID uint16, store apply.Store, fetch func(context.Context) ([]byte, error),
@@ -134,16 +140,17 @@ func (c *configSync) fetchAndApply(ctx context.Context, desired int) error {
 }
 
 // Kick starts an apply in the background when the desired version is not what
-// is running and the last failure is not still in its backoff window. It never
-// blocks the heartbeat: an apply restarts FRR and can take tens of seconds, and
-// a device that stops heartbeating mid-change looks offline exactly when
-// somebody is watching it.
+// is running and that version is not still sitting in its own backoff window.
+// It never blocks the heartbeat: an apply restarts FRR and can take tens of
+// seconds, and a device that stops heartbeating mid-change looks offline exactly
+// when somebody is watching it.
 func (c *configSync) Kick(ctx context.Context, desired int) {
 	if desired < 1 {
 		return
 	}
 	c.mu.Lock()
-	if c.applying || (c.state.Version == desired && c.state.OK) || c.now().Before(c.nextTry) {
+	blockedByBackoff := desired == c.failedOn && c.now().Before(c.nextTry)
+	if c.applying || (c.state.Version == desired && c.state.OK) || blockedByBackoff {
 		c.mu.Unlock()
 		return
 	}
@@ -164,9 +171,11 @@ func (c *configSync) Kick(ctx context.Context, desired int) {
 			fails = c.fails
 			wait = c.backoff()
 			c.nextTry = c.now().Add(wait)
+			c.failedOn = desired
 		} else {
 			c.fails = 0
 			c.nextTry = time.Time{}
+			c.failedOn = 0
 		}
 		c.mu.Unlock()
 

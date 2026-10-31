@@ -278,6 +278,66 @@ func TestConfigSyncKickRetriesWithBackoff(t *testing.T) {
 	}
 }
 
+// A backoff window holds the bundle that failed, not the box. An operator who
+// publishes a newer version changed what the device is being asked to run, and
+// the box must go get it now -- otherwise the console shows "等待设备回报" for
+// minutes after a fix that was already correct.
+func TestConfigSyncNewerVersionIsNotHeldByBackoff(t *testing.T) {
+	root, _ := syncRoots(t)
+	clock := time.Unix(1700000000, 0)
+	now := func() time.Time { return clock }
+
+	var mu sync.Mutex
+	desired, tried := 2, []int{}
+	fail := func(_ context.Context, b apply.Bundle) error {
+		mu.Lock()
+		tried = append(tried, b.Version)
+		mu.Unlock()
+		return errors.New("boom")
+	}
+	seen := func() []int {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]int(nil), tried...)
+	}
+	cs := newConfigSync(7, apply.Store{Root: root},
+		func(context.Context) ([]byte, error) {
+			mu.Lock()
+			v := desired
+			mu.Unlock()
+			return bundleBytes(t, syncBundle(7, v)), nil
+		},
+		fail, func(string, ...any) {}, now)
+
+	cs.Kick(context.Background(), 2)
+	waitUntil(t, "v2 attempt", func() bool { return len(seen()) == 1 })
+
+	cs.Kick(context.Background(), 2)
+	time.Sleep(50 * time.Millisecond)
+	if len(seen()) != 1 {
+		t.Fatalf("same version retried inside its window: %v", seen())
+	}
+
+	mu.Lock()
+	desired = 3
+	mu.Unlock()
+	cs.Kick(context.Background(), 3)
+	waitUntil(t, "v3 attempt while v2 is still backing off", func() bool { return len(seen()) == 2 })
+	if got := seen(); got[0] != 2 || got[1] != 3 {
+		t.Fatalf("attempts = %v, want [2 3]", got)
+	}
+
+	// v3 now owns the window (it failed too), so kicking v3 again must wait.
+	cs.Kick(context.Background(), 3)
+	time.Sleep(50 * time.Millisecond)
+	if len(seen()) != 2 {
+		t.Fatalf("v3 retried inside its own window: %v", seen())
+	}
+	clock = clock.Add(10 * time.Second)
+	cs.Kick(context.Background(), 3)
+	waitUntil(t, "v3 retry after its window", func() bool { return len(seen()) == 3 })
+}
+
 // A device started without -apply must still answer the heartbeat: silence is
 // indistinguishable from an old agent, and the console would render it as
 // unknown instead of "this agent does not install configs".
