@@ -288,8 +288,9 @@ func main() {
 		}
 		if importEnabled {
 			// 新连接上的回放会重建整份 BGP 视图；旧连接的条目不会再收到
-			// 删除通知，所以先清空，再让回放把它们重新加回来。
-			imp.Reset()
+			// 删除通知。这里不清空，而是开一个乐观窗口：旧集合继续对外可见，
+			// 回放灌完（静默 500ms 或 10s 上限）后再一次性对账。
+			imp.BeginResync()
 			c.SetRouteHandler(imp.Handle)
 			if err := c.SubscribeBGP(ctx); err != nil {
 				c.Close()
@@ -365,6 +366,9 @@ func main() {
 			log.Printf("sr-frr: 收敛 routes+%d/-%d（表 %s）", res.Added, res.Removed, tableList(tables))
 		}
 		if importEnabled {
+			// 窗口到期判定放在每一次收敛里：订阅回放是异步的，只有轮询
+			// 这一侧知道"已经安静多久了"。
+			imp.Tick(time.Now())
 			ps := imp.Prefixes()
 			if sig := importSig(cfg.Import.VRFID, ps); sig != lastImportSig {
 				if err := pushLocalPrefixes(ctx, hc, cfg.Import, ps); err != nil {
