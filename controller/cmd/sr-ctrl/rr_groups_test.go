@@ -3,8 +3,8 @@
 // The properties worth pinning:
 //
 //   - a device named by a group dials that group's pair; a device no group names
-//     dials every row of the tenant's list. There is no third case, and "not in a
-//     group" is not a special branch -- the list itself is the default.
+//     gets no rrs key at all, so ungrouped boxes have no RR neighbours and keep
+//     the list their own route.json already carries.
 //   - a group's slots go through the same ownership gate as the list, so a group
 //     can never name a reflector another tenant owns.
 //   - the list is replaced as a whole, which is why "one device in two groups" is
@@ -48,14 +48,14 @@ func TestRRGroupOverridesReflectorsPerDevice(t *testing.T) {
 		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
 	}
 
-	// node 1 is in the group; node 3 is not, so it dials the whole list.
+	// node 1 is in the group; node 3 is not, so it gets no rrs at all and keeps
+	// whatever list its own route.json already carries.
 	if rrs := decodedRRs(t, decodeRouteDoc(t, routeArtifact(t, s, "t", 1))); len(rrs) != 2 ||
 		rrs[0].ID != c || rrs[1].ID != d {
 		t.Fatalf("组内设备的 rrs = %+v，想要 %s/%s", rrs, c, d)
 	}
-	if rrs := decodedRRs(t, decodeRouteDoc(t, routeArtifact(t, s, "t", 3))); len(rrs) != 4 ||
-		rrs[0].ID != a || rrs[3].ID != d {
-		t.Fatalf("组外设备的 rrs = %+v，想要整张列表 %s..%s", rrs, a, d)
+	if doc := decodeRouteDoc(t, routeArtifact(t, s, "t", 3)); doc["rrs"] != nil {
+		t.Fatalf("组外设备拿到了 rrs = %v，想要不建邻居", doc["rrs"])
 	}
 
 	v := overlayGetView(t, s, ten)

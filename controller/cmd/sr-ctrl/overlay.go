@@ -97,10 +97,10 @@ type OverlayConfig struct {
 	EscapeAllColors bool           `json:"escape_all_colors"`
 	Groups          []OverlayGroup `json:"groups"`
 
-	// RRGroups splits the tenant's devices across reflector sets. A device that
-	// no group names dials every RR of the tenant's list -- one rule, no branch:
-	// RRs belong to the tenant now, so "all of them" is the default and there is
-	// no second place to pick a pair.
+	// RRGroups splits the tenant's devices across reflector sets. Only a device
+	// a group names gets reflectors at all; a device no group names gets no rrs
+	// key and keeps the list its own route.json already carries. Adding a row to
+	// the library therefore never wakes up sessions on boxes nobody placed.
 	RRGroups []RRGroup `json:"rr_groups,omitempty"`
 
 	// NextRT is the counter behind the allocated value; NextGroup mints ids.
@@ -578,12 +578,12 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 		RRLibrary: s.rrRowsLocked(tenantID),
 		MaxRRs:    rrMaxPerTenant,
 		RRGroups:  append([]RRGroup{}, oc.RRGroups...),
-		RRNote: "这里的每一条 RR，本租户没被反射器分组点名的设备都会拨过去：路由客户端对拿到的每一条 RR 都保持会话，" +
-			"两条的宣告并进同一张路由表（同一条前缀在两台上是同一份路由的两份拷贝），所以多条就是多个等价活动反射器，" +
-			"掉一条表不缩。控制器不会去连这些地址，所以这里没有绿灯可给——" +
-			"能不能连上，只有设备自己的路由状态知道。发布后设备就地换：先把新 RR 的会话建起来，" +
-			"等新 RR 真的收全了本机的前缀，才摘掉被它顶替的那条，路由进程不重启；谁还没接管、谁还替它守着，" +
-			"看设备的路由状态。只剩一条时换地址必然有一段没有反射器的窗口——没有冗余是这一格本身的形态，不是故障。",
+		RRNote: "只有被反射器分组点名的设备才会拿到 rrs：分组给它选的两条 RR 就是它的全部反射器，客户端对拿到的每一条都保持会话，" +
+			"两条的宣告并进同一张路由表（同一条前缀在两台上是同一份路由的两份拷贝），所以两条就是两个等价活动反射器，" +
+			"掉一条表不缩。没被任何分组点名的设备一个 RR 邻居也不建，控制器不给它下发 rrs，它继续用自己盘上那一份。" +
+			"控制器不会去连这些地址，所以这里没有绿灯可给——能不能连上，只有设备自己的路由状态知道。" +
+			"发布后设备就地换：先把新 RR 的会话建起来，等新 RR 真的收全了本机的前缀，才摘掉被它顶替的那条，路由进程不重启；" +
+			"谁还没接管、谁还替它守着，看设备的路由状态。只剩一条时换地址必然有一段没有反射器的窗口——没有冗余是这一格本身的形态，不是故障。",
 	}
 	if view.Groups == nil {
 		view.Groups = []OverlayGroup{}

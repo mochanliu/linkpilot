@@ -11,9 +11,10 @@ package main
 // controller cannot earn is worse than the plain "没探过" the tunnel page already
 // uses.
 //
-// Every device of the tenant dials every row of its own list unless an RR group
-// names it, in which case it dials that group's two. That is why the list is
-// bounded per tenant: the list is also the default per-device fan-out.
+// Only a device an RR group names dials reflectors, and then only that group's
+// two. A device no group names gets no rrs at all: it keeps the list its own
+// route.json already carries, so adding a row here never starts a session on a
+// box nobody placed (2026-11-01 拍板).
 //
 // The rows are kept in one document with the id counter, and an id is never
 // handed back after a delete: a group's selection quotes ids, so re-minting rr3
@@ -170,34 +171,22 @@ func (s *server) rrGroupRefsLocked(tenantID, id string) []rrGroupRef {
 	return out
 }
 
-// rrsForDeviceLocked is the per-device answer the 第 4 段 uses: a device named by
-// an RR group dials that group's two reflectors, every other device dials the
-// whole of its tenant's list. The default used to be the tenant's two hand-picked
-// slots (removed 2026-11-01); the list itself is the tenant's now, so "all of it"
-// is the same default without a second place to pick.
+// rrsForDeviceLocked is the per-device answer the 第 4 段 uses: only a device
+// named by an RR group gets reflectors -- that group's two slots. A device no
+// group names gets nil, i.e. the rrs key is omitted, and the box keeps whatever
+// list its own route.json already carries. This is deliberately not "dial every
+// RR of the tenant": an ungrouped device has no RR neighbours at all, so adding a
+// row to the library never quietly lights up sessions on boxes nobody placed.
 func (s *server) rrsForDeviceLocked(tenantID string, nodeID uint16) []wire.RRAddress {
-	if oc := s.overlayConfigLocked(tenantID, false); oc != nil {
-		if g := oc.rrGroupOf(nodeID); g != nil {
-			return s.rrAddrsLocked(tenantID, g.RRPrimary, g.RRBackup)
-		}
-	}
-	return s.rrAddrsForTenantLocked(tenantID)
-}
-
-// rrAddrsForTenantLocked is the whole list as the device dials it, in id order.
-// A tenant with no rows returns nil: the caller omits the key rather than sending
-// an empty list, because sr-route refuses to start with "rrs is required"
-// (cmd/sr-route/main.go:91).
-func (s *server) rrAddrsForTenantLocked(tenantID string) []wire.RRAddress {
-	rows := s.rrLibraryLocked(false).visibleTo(tenantID)
-	if len(rows) == 0 {
+	oc := s.overlayConfigLocked(tenantID, false)
+	if oc == nil {
 		return nil
 	}
-	out := make([]wire.RRAddress, 0, len(rows))
-	for _, it := range rows {
-		out = append(out, wire.RRAddress{ID: it.ID, Addr: it.Addr})
+	g := oc.rrGroupOf(nodeID)
+	if g == nil {
+		return nil
 	}
-	return out
+	return s.rrAddrsLocked(tenantID, g.RRPrimary, g.RRBackup)
 }
 
 // rrAddrsLocked resolves an RR group's two slots against the library. A slot

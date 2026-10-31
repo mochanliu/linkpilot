@@ -117,16 +117,16 @@ test-route.sh 的 C 段）。线上协议不再有 `tunnels` 帧：`MsgTunnels` 
 
 ## O9-b1 落地状态（2026-10-31，配置面 + 控制台）
 
-一件事：**这台设备连哪两台 RR**，被组点名的用组里的两台，没被点名的用租户那两格——一条规则，
-没有第三种情况。
+一件事：**这台设备连哪两台 RR**，被组点名的用组里的两台，没被任何组点名的**一个 RR 邻居也不建**
+（2026-11-01 拍板；此前"落租户整张列表"的缺省已删，见 `rr.go:rrsForDeviceLocked`）。
 
 - 模型（`cmd/sr-ctrl/overlay.go`）：`RRGroup{id,name,device_ids,rr_primary,rr_backup}`；
   `OverlayConfig.RRGroups` + `NextRRGroup`。`ensure()` 去空白、设备 id 去重排序（存盘与页面
   不把重排当成改动）。
 - 写：`PUT /api/overlay/settings {rr_groups:[…]}` 整张列表替换（删掉一组 = 不再列出它），
   `id` 由服务端发（`rg%d`），**计数随列表一起提交**：被拒的保存不烧号。
-- 读：`rrsForDeviceLocked(tenant, node)` 先查组（`rrGroupOf`，第一个命中）再落租户两格；
-  `overlayRouteArtifactLocked` 因此本来就按节点渲染，第 4 段 `rrs` 不用改形状。
+- 读：`rrsForDeviceLocked(tenant, node)` 只认组（`rrGroupOf`，第一个命中）；不在任何组里就返回
+  nil，第 4 段于是没有 `rrs` 键，设备继续用它盘上自己那一份——加了库行不会让任何设备悄悄建会话。
 - 闸门：`rrGroupsChecksLocked` —— 组名必填、至少一台设备、两格都走 `rrSelectionErrorLocked`
   （租户归属/不存在等）、至少一台 RR、RR 1≠RR 2、设备不重复、设备属于本租户、一台设备只在
   一组；存盘状态每次读 `/api/overlay` 再查一遍（`overlayRRGroupChecksLocked`），只报不修。
@@ -258,6 +258,26 @@ b2b（sr-rr 拨出侧 + 控制器渲染 `neighbours`）与 b2c（控制器签发
 运营方保证，所以这个代价今天是零；哪天出现单通，网格里就是这一对没有会话，两台 RR 的
 `/status` 都会如实空着。要换成 BGP 那套双拨 + 碰撞检测，改的是 cmd 里一行判断，加反射器里
 一条「同键冲突留哪条」的规则，不动协议。
+
+### 加一行只加新会话（拍板 2026-11-01）
+
+> RR 肯定不是一次性添加完的，所以不要出现每添加一个 RR，所有 RR 之间邻居重新建立的情况！
+
+网格是**增量**的，三条约束把它钉死：
+
+1. **id 单调递增**：`nextID` 只在新建时前进、永不回收（`rr.go:103`），所以新加的行一定是当前
+   最大 id。按方向规则「小拨大」，新 RR 拨**所有**已有 RR，已有 RR 一个都不拨它。
+   于是"加一行"在已有节点上的效果是零——它们不新开会话、不关会话、邻居清单里多出一个
+   id 但它本来就不负责拨这个方向。
+2. **sr-rr 按 peer diff，不按整表重建**：`GET /v1/rr/config` 拿到清单后只做两件事——
+   新出现的 peer 起一条拨出协程（仅当 `self.rr_id < peer.id`），消失的 peer 取消它那一条。
+   已经在跑的 peer 协程**原样留着**，不重连、不重建，`since` 时间不变。
+3. **进程不重启**：加行只改控制器的库，`sr-rr` 下次轮询（≤ `poll_sec`，默认 30s）就长出新
+   会话；改 `addr` 也只影响那一对 peer。改 `owner` 等于删行 + 加行：旧租户那边这一个 peer
+   消失（只断那一条），新租户那边把它当新 peer。
+
+会被"重建"的只有这条 RR 自己的会话，而它不算网格重组：`addr` 改了的那一对 peer 会断开重连
+（新地址），被删掉的行收到 `/v1/rr/config` 的 404 后自行退出。两种都不扩散到第三台。
 
 ### b2c：RR 身份签发 + RR 配置端点（先做）
 

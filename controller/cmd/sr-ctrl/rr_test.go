@@ -5,11 +5,12 @@
 //   - the list is the tenant's own, and the same filter decides what the page
 //     shows and what the device is told -- so "the page offered it" and "the
 //     device will dial it" cannot drift apart.
-//   - a tenant with no rows renders NO rrs key at all. An empty list is not a
-//     harmless placeholder: sr-route reads "rrs": [] and refuses to start, which
-//     would take the whole route plane of that box down over an empty table.
-//   - a device no RR group names dials every row; a grouped device dials its
-//     group's two. There is no third case and no second place to pick a pair.
+//   - a device with no rows in its tenant renders NO rrs key at all. An empty
+//     list is not a harmless placeholder: sr-route reads "rrs": [] and refuses
+//     to start, which would take the whole route plane of that box down over an
+//     empty table.
+//   - only a device an RR group names gets reflectors: that group's two. A
+//     device no group names gets no rrs key and keeps its own route.json list.
 //   - deleting a row a group still names is refused, because the alternative
 //     silently drops that group's reflectors.
 //   - a row nothing can manage (no tenant, or a tenant that no longer exists) is
@@ -262,18 +263,26 @@ func TestRRUnmanageableRowIsDropped(t *testing.T) {
 	}
 }
 
-func TestRRRenderIsAllRowsAndNeverEmpty(t *testing.T) {
+func TestRRRenderIsGroupOnlyAndNeverEmpty(t *testing.T) {
 	s, ten, _, _ := rrFixture(t)
 	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))["rrs"]; ok {
-		t.Fatal("租户还没有 RR，第 4 段里就有 rrs 了")
+		t.Fatal("一台设备也没进分组，第 4 段里就有 rrs 了")
 	}
 
 	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
 	b := rrCreate(t, s, ten, "RR-B", "192.0.2.11:20200")
 
+	// Adding rows alone reaches nobody: an ungrouped device keeps its own list.
+	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))["rrs"]; ok {
+		t.Fatal("库里加了 RR，没进分组的设备也拿到了 rrs")
+	}
+
+	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "本组", []uint16{1}, a, b)); rec.Code != http.StatusOK {
+		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
+	}
 	doc := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))
 	if _, ok := doc["rrs"]; !ok {
-		t.Fatal("有了 RR，第 4 段却没有 rrs")
+		t.Fatal("进了分组，第 4 段却没有 rrs")
 	}
 	rrs := decodedRRs(t, doc)
 	if len(rrs) != 2 || rrs[0].ID != a || rrs[0].Addr != "192.0.2.10:20200" || rrs[1].ID != b {
@@ -281,11 +290,14 @@ func TestRRRenderIsAllRowsAndNeverEmpty(t *testing.T) {
 	}
 	// The other tenant is unaffected: its devices get no rrs key.
 	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t2", 9))["rrs"]; ok {
-		t.Error("t2 没有 RR，却收到了 rrs")
+		t.Error("t2 没有分组，却收到了 rrs")
 	}
 
 	// Deleting every row goes back to "no key at all", which is what keeps a box's
-	// own reflector list alive.
+	// own reflector list alive. The group has to go first: it is a reference.
+	if rec := rrGroupsSet(t, s, ten); rec.Code != http.StatusOK {
+		t.Fatalf("清空分组 = %d (%s)", rec.Code, rec.Body.String())
+	}
 	for _, id := range []string{a, b} {
 		if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete",
 			fmt.Sprintf(`{"id":%q}`, id), ten); rec.Code != http.StatusOK {
@@ -451,6 +463,11 @@ func TestRREditMarksTheDevicePending(t *testing.T) {
 		t.Fatalf("存草稿 = %+v", v)
 	}
 	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
+	// The row only reaches node 1 through a group; without one the device has no
+	// rrs at all, so an address change would not be part of its bundle.
+	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "本组", []uint16{1}, a, "")); rec.Code != http.StatusOK {
+		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
+	}
 	if rec := publishReq(t, s, ten, http.MethodPost, `{"node_id":1}`); rec.Code != http.StatusOK {
 		t.Fatalf("发布 v1 = %d (%s)", rec.Code, rec.Body.String())
 	}
