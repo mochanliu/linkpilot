@@ -5186,8 +5186,11 @@
       '<div class="und-box"><h3>逃生开关</h3>' +
       '<label class="chk"><input type="checkbox" id="ov-escape"' + (g.escape ? " checked" : "") +
       "> 主表收全部颜色</label>" +
-      '<div class="hint">打开后，设备的主表（VPN 0）会收下所有颜色的路由：导通组配错或还没配时用它兜底。' +
-      "关掉它才是按 RT 导通。</div></div></div>" +
+      '<div class="hint">这里的「主表」是<b>每个 VPN 自己那张表</b>（不是只有 VPN 0）：一条路由按 RT 落进哪张表，' +
+      "开关就作用在哪张表上。打开后每张表除了颜色 0 还收下其它颜色的路径，谁先用由 preference=230+颜色 " +
+      "交给 VPP 原生排序 —— 颜色 0 全 down 时自动抬最小的存活颜色，恢复后自动回落。关掉时每张表只收颜色 0，" +
+      "颜色 0 全 down 这条前缀在那张表里就不存在（宁丢，不长期占用昂贵的颜色）。" +
+      "注意这里管的是「一张表收哪些颜色」，和「路由能不能进这张表」（那是导通设置里 RT 命中）是两件正交的事。</div></div></div>" +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center">' +
       '<button class="small" type="button" data-act="ov-reload">重新载入</button>' +
       '<button class="small" type="submit">保存</button>' +
