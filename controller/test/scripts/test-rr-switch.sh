@@ -506,7 +506,7 @@ since_b1b=$(since_of "$RR_B_ST" 1)
 [ "$since_b1" = "$since_b1b" ] && [ "$since_b1" != "-" ] &&
     ok "RR-B 上 device 1 的会话 since 没变（$since_b1）：接管用的是 (2) 里那条既有会话" ||
     bad "RR-B 上 device 1 的会话被重建：$since_b1 → $since_b1b"
-log_a=$(dx "$RR" "grep -m1 'device 1' $WORK/rr-a.log" 2>/dev/null)
+log_a=$(dx "$RR" "grep -m1 'node/1' $WORK/rr-a.log" 2>/dev/null)
 log_a=${log_a//\"/}; log_a=${log_a//\'/}
 [ -n "$log_a" ] && note "RR-A 的关闭记录：$log_a" || bad "RR-A 日志里没有 device 1 的会话结束行"
 

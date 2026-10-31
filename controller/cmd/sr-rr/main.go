@@ -8,10 +8,11 @@
 // and the table is rebuilt from the sources. That is why there is no database
 // here and why a restart is safe.
 //
-// Identity: CPEs authenticate with the device certificate the controller
-// issued. The tenant and device id used for routing come from that certificate
-// (srou://<tenant>/node/<id>), never from the hello frame -- the hello's
-// device_id is only cross-checked against it.
+// Identity: a session's peer is named by its certificate URI --
+// srou://<tenant>/node/<id> for a CPE, srou://<tenant>/rr/<id> for another
+// reflector. The tenant and the id used for routing come from that certificate,
+// never from the hello frame -- the hello's device_id is only cross-checked
+// against it, and a reflector's hello carries no device id at all.
 //
 // Reflection: an RR reflects. A route received from one client is advertised to
 // every other session, unchanged, and a route is never sent back to the client
@@ -163,15 +164,35 @@ func serveConn(conn *tls.Conn, tenant, rrID string, ref *route.Reflector) {
 		log.Printf("%s: %s presented no client certificate", rrID, conn.RemoteAddr())
 		return
 	}
-	peerTenant, deviceID, err := keybinding.IdentityOf(peers[0])
+	peer, err := keybinding.RefOf(peers[0])
+	if err != nil {
+		log.Printf("%s: %s: %v", rrID, conn.RemoteAddr(), err)
+		return
+	}
+	id, err := sessionIdentity(peer)
 	if err != nil {
 		log.Printf("%s: %s: %v", rrID, conn.RemoteAddr(), err)
 		return
 	}
 	start := time.Now()
-	err = ref.ServeConn(conn, route.PeerIdentity{Tenant: peerTenant, DeviceID: deviceID})
-	log.Printf("%s: device %d (%s) session ended after %s: %v",
-		rrID, deviceID, conn.RemoteAddr(), time.Since(start).Round(time.Millisecond), err)
+	err = ref.ServeConn(conn, id)
+	log.Printf("%s: %s (%s) session ended after %s: %v",
+		rrID, peer, conn.RemoteAddr(), time.Since(start).Round(time.Millisecond), err)
+}
+
+// sessionIdentity maps the identity a certificate asserts onto the session it
+// may open. The two roles are not interchangeable: a node certificate opens a
+// client session and a reflector certificate opens an rr session, and neither
+// can be used to claim the other.
+func sessionIdentity(peer keybinding.Ref) (route.PeerIdentity, error) {
+	switch peer.Role {
+	case keybinding.RoleNode:
+		return route.PeerIdentity{Tenant: peer.Tenant, Role: route.RoleClient, DeviceID: peer.NodeID}, nil
+	case keybinding.RoleRR:
+		return route.PeerIdentity{Tenant: peer.Tenant, Role: route.RoleRR, RRID: peer.RRID}, nil
+	default:
+		return route.PeerIdentity{}, fmt.Errorf("certificate role %q cannot open a route session", peer.Role)
+	}
 }
 
 func serveStatus(addr string, cfg *fileConfig, ref *route.Reflector) {

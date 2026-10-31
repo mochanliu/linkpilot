@@ -33,6 +33,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -297,4 +298,111 @@ func ParseURI(u *url.URL) (tenant string, nodeID uint16, ok bool) {
 		return "", 0, false
 	}
 	return u.Host, uint16(n), true
+}
+
+// Role is what kind of box holds a certificate. The role is a URI path segment,
+// not a separate field: a certificate that asserts no role is not a session
+// identity at all, and one role must never be read as another.
+type Role string
+
+const (
+	// RoleNode is a CPE: srou://<tenant>/node/<id>.
+	RoleNode Role = "node"
+	// RoleRR is a route reflector: srou://<tenant>/rr/<rr_id>.
+	RoleRR Role = "rr"
+
+	// RRIDMaxLen bounds an rr id in a URI. The controller mints "rr<N>"; the cap
+	// only exists so a hand-written certificate cannot smuggle an unbounded
+	// string into logs, session keys and the neighbour list.
+	RRIDMaxLen = 64
+)
+
+// Ref is the whole identity a tenant certificate asserts: tenant, role, and the
+// id inside that role. NodeID and RRID are not one optional field -- which one
+// is set follows from the role, and a Ref with both or neither is a bug the
+// constructors below never produce.
+type Ref struct {
+	Tenant string
+	Role   Role
+	NodeID uint16 // RoleNode only
+	RRID   string // RoleRR only
+}
+
+// String spells the ref back as the URI the certificate carries, so a log line
+// names an identity exactly as the other end would.
+func (r Ref) String() string {
+	if r.Role == RoleRR {
+		return "srou://" + r.Tenant + "/rr/" + r.RRID
+	}
+	return "srou://" + r.Tenant + "/node/" + strconv.Itoa(int(r.NodeID))
+}
+
+// ParseRef reads one certificate URI SAN, both roles. Unlike ParseURI it is
+// strict about the shape: an unknown role segment or trailing path junk is
+// rejected rather than silently read as "some kind of node".
+func ParseRef(u *url.URL) (Ref, bool) {
+	if u == nil || u.Scheme != "srou" || u.Host == "" {
+		return Ref{}, false
+	}
+	switch {
+	case strings.HasPrefix(u.Path, "/node/"):
+		n, ok := parseUint16(strings.TrimPrefix(u.Path, "/node/"))
+		if !ok {
+			return Ref{}, false
+		}
+		return Ref{Tenant: u.Host, Role: RoleNode, NodeID: n}, true
+	case strings.HasPrefix(u.Path, "/rr/"):
+		id := strings.TrimPrefix(u.Path, "/rr/")
+		if !ValidRRID(id) {
+			return Ref{}, false
+		}
+		return Ref{Tenant: u.Host, Role: RoleRR, RRID: id}, true
+	}
+	return Ref{}, false
+}
+
+// RefOf extracts the identity a certificate asserts, whichever role it names.
+// The controller's certificate minting and the RR's peer classification must
+// agree on this spelling, so both go through here.
+func RefOf(cert *x509.Certificate) (Ref, error) {
+	for _, u := range cert.URIs {
+		if ref, ok := ParseRef(u); ok {
+			return ref, nil
+		}
+	}
+	return Ref{}, fmt.Errorf("certificate carries no srou:// identity URI")
+}
+
+// ValidRRID is the one spelling of an rr id: non-empty, at most RRIDMaxLen
+// bytes, and nothing that would need escaping inside a URI path segment or
+// would be ambiguous as a session key.
+func ValidRRID(s string) bool {
+	if s == "" || len(s) > RRIDMaxLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_', c == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func parseUint16(s string) (uint16, bool) {
+	if s == "" || len(s) > 5 {
+		return 0, false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, false
+	}
+	return uint16(n), true
 }

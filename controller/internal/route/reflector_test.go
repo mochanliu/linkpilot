@@ -15,6 +15,7 @@ import (
 // reconnection, so a test can assert exactly what the RR put on the wire.
 type fakeCPE struct {
 	t    *testing.T
+	id   PeerIdentity
 	conn net.Conn
 	br   *bufio.Reader
 }
@@ -34,16 +35,27 @@ func newTestReflector(t *testing.T, cfg ReflectorConfig) *Reflector {
 	return r
 }
 
-// dial starts a server-side session and returns the client end plus the error
-// channel of ServeConn. The TCP/TLS layer is replaced by net.Pipe: the
-// certificate-derived identity is passed explicitly, exactly as the server
-// would after its TLS handshake.
+// dial starts a server-side session for a client device and returns the client
+// end plus the error channel of ServeConn. The TCP/TLS layer is replaced by
+// net.Pipe: the certificate-derived identity is passed explicitly, exactly as
+// the server would after its TLS handshake.
 func dial(t *testing.T, r *Reflector, dev uint16) (*fakeCPE, chan error) {
+	t.Helper()
+	return dialAs(t, r, PeerIdentity{Tenant: r.tenant, Role: RoleClient, DeviceID: dev})
+}
+
+// dialRR starts a session that speaks as another reflector.
+func dialRR(t *testing.T, r *Reflector, rrID string) (*fakeCPE, chan error) {
+	t.Helper()
+	return dialAs(t, r, PeerIdentity{Tenant: r.tenant, Role: RoleRR, RRID: rrID})
+}
+
+func dialAs(t *testing.T, r *Reflector, id PeerIdentity) (*fakeCPE, chan error) {
 	t.Helper()
 	srv, cli := net.Pipe()
 	errCh := make(chan error, 1)
-	go func() { errCh <- r.ServeConn(srv, PeerIdentity{Tenant: r.tenant, DeviceID: dev}) }()
-	c := &fakeCPE{t: t, conn: cli, br: bufio.NewReader(cli)}
+	go func() { errCh <- r.ServeConn(srv, id) }()
+	c := &fakeCPE{t: t, id: id, conn: cli, br: bufio.NewReader(cli)}
 	t.Cleanup(func() { cli.Close() })
 	return c, errCh
 }
@@ -73,10 +85,11 @@ func (c *fakeCPE) recvErr() (Envelope, error) {
 // join completes the handshake and returns the routes of the initial snapshot.
 // The snapshot follows hello_ok immediately (BGP's initial UPDATE burst + EOR),
 // so this is the whole of what a fresh session receives without announcing
-// anything first.
-func (c *fakeCPE) join(dev uint16) []Route {
+// anything first. A client hello claims its device id; a reflector hello claims
+// none, because a reflector is named by its certificate.
+func (c *fakeCPE) join() []Route {
 	c.t.Helper()
-	c.send(Envelope{Type: MsgHello, Version: ProtocolVersion, DeviceID: dev})
+	c.send(Envelope{Type: MsgHello, Version: ProtocolVersion, DeviceID: c.id.DeviceID})
 	ok := c.recv()
 	if ok.Type != MsgHelloOK {
 		c.t.Fatalf("handshake: got %s, want hello_ok (%+v)", ok.Type, ok)
@@ -156,7 +169,7 @@ func TestSnapshotOnConnectAndFanout(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 
 	c2, _ := dial(t, r, 2)
-	if snap := c2.join(2); len(snap) != 0 {
+	if snap := c2.join(); len(snap) != 0 {
 		t.Fatalf("first session's snapshot = %+v, want empty", snap)
 	}
 	rt2 := testRoute(2, 1, "10.2.0.0/16", "65000:200")
@@ -165,7 +178,7 @@ func TestSnapshotOnConnectAndFanout(t *testing.T) {
 
 	// A late joiner must receive the existing route in its snapshot, before EOR.
 	c1, _ := dial(t, r, 1)
-	snap := c1.join(1)
+	snap := c1.join()
 	if len(snap) != 1 || !snap[0].Equal(rt2) {
 		t.Fatalf("snapshot = %+v, want [%+v]", snap, rt2)
 	}
@@ -181,7 +194,7 @@ func TestSnapshotOnConnectAndFanout(t *testing.T) {
 	// No adjacency gate: a new session gets every route in the RR, except its
 	// own. Whether it can use one is its own tunnel table's decision.
 	c3, _ := dial(t, r, 3)
-	snap3 := c3.join(3)
+	snap3 := c3.join()
 	if len(snap3) != 2 || !snap3[0].Equal(rt1) || !snap3[1].Equal(rt2) {
 		t.Fatalf("device 3 snapshot = %+v, want device 1's and device 2's routes", snap3)
 	}
@@ -199,11 +212,11 @@ func TestSnapshotOnConnectAndFanout(t *testing.T) {
 func TestWithdrawFanoutAndIdempotence(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 	c2, _ := dial(t, r, 2)
-	c2.join(2)
+	c2.join()
 	c3, _ := dial(t, r, 3)
-	c3.join(3)
+	c3.join()
 
 	rt := testRoute(1, 1, "10.1.0.0/16")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -232,9 +245,9 @@ func TestWithdrawFanoutAndIdempotence(t *testing.T) {
 func TestDuplicateAnnounceIsNoOpUnlessChanged(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 	c2, _ := dial(t, r, 2)
-	c2.join(2)
+	c2.join()
 
 	rt := testRoute(1, 1, "10.1.0.0/16", "65000:100")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -257,9 +270,9 @@ func TestDuplicateAnnounceIsNoOpUnlessChanged(t *testing.T) {
 func TestReconnectReplacesSessionAndWithdraws(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 	c2, _ := dial(t, r, 2)
-	c2.join(2)
+	c2.join()
 
 	rt := testRoute(1, 1, "10.1.0.0/16")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -268,7 +281,7 @@ func TestReconnectReplacesSessionAndWithdraws(t *testing.T) {
 	}
 
 	c1b, _ := dial(t, r, 1)
-	c1b.join(1) // duplicate session: new wins
+	c1b.join() // duplicate session: new wins
 
 	got := c2.recv()
 	if got.Type != MsgWithdraw || len(got.Keys) != 1 || got.Keys[0] != rt.Key() {
@@ -286,9 +299,9 @@ func TestReconnectReplacesSessionAndWithdraws(t *testing.T) {
 func TestDisconnectWithdrawsRoutes(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, errCh1 := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 	c2, _ := dial(t, r, 2)
-	c2.join(2)
+	c2.join()
 
 	rt := testRoute(1, 1, "10.1.0.0/16")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -311,7 +324,7 @@ func TestDisconnectWithdrawsRoutes(t *testing.T) {
 func TestSnapshotFollowsHelloOK(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c2, _ := dial(t, r, 2)
-	c2.join(2)
+	c2.join()
 	rt2 := testRoute(2, 1, "10.2.0.0/16")
 	c2.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt2}})
 	c2.send(Envelope{Type: MsgEOR})
@@ -320,7 +333,7 @@ func TestSnapshotFollowsHelloOK(t *testing.T) {
 	// moment the session is up, which is where a BGP speaker sends its initial
 	// UPDATE burst.
 	c1, _ := dial(t, r, 1)
-	if snap := c1.join(1); len(snap) != 1 || !snap[0].Equal(rt2) {
+	if snap := c1.join(); len(snap) != 1 || !snap[0].Equal(rt2) {
 		t.Fatalf("device 1 snapshot = %+v, want [%+v]", snap, rt2)
 	}
 
@@ -328,7 +341,7 @@ func TestSnapshotFollowsHelloOK(t *testing.T) {
 	// whole table and not a prefix of it.
 	r2 := newTestReflector(t, ReflectorConfig{})
 	c7, _ := dial(t, r2, 7)
-	if snap := c7.join(7); len(snap) != 0 {
+	if snap := c7.join(); len(snap) != 0 {
 		t.Fatalf("snapshot from an empty RR = %+v, want none", snap)
 	}
 }
@@ -339,7 +352,7 @@ func TestTunnelsFrameIsRejected(t *testing.T) {
 	// ignoring the frame is how the two sides disagree about the table forever.
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, errCh := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 	c1.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := c1.conn.Write([]byte(`{"type":"tunnels","tunnels":[]}` + "\n")); err != nil {
 		t.Fatalf("write: %v", err)
@@ -352,7 +365,7 @@ func TestTunnelsFrameIsRejected(t *testing.T) {
 func TestAnnounceForAnotherDeviceIsFatal(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, errCh := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{testRoute(2, 1, "10.2.0.0/16")}})
 	err := waitServe(t, errCh)
@@ -367,7 +380,7 @@ func TestAnnounceForAnotherDeviceIsFatal(t *testing.T) {
 func TestMalformedRouteIsFatal(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, errCh := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{testRoute(1, 1, "10.1.2.3/16")}})
 	if err := waitServe(t, errCh); err == nil {
@@ -382,7 +395,7 @@ func TestHandshakeRejections(t *testing.T) {
 		srv, cli := net.Pipe()
 		defer cli.Close()
 		errCh := make(chan error, 1)
-		go func() { errCh <- r.ServeConn(srv, PeerIdentity{Tenant: "other", DeviceID: 1}) }()
+		go func() { errCh <- r.ServeConn(srv, PeerIdentity{Tenant: "other", Role: RoleClient, DeviceID: 1}) }()
 		c := &fakeCPE{t: t, conn: cli, br: bufio.NewReader(cli)}
 		if env := c.recv(); env.Type != MsgError || !strings.Contains(env.Message, "tenant") {
 			t.Fatalf("got %+v", env)
@@ -429,7 +442,7 @@ func TestHandshakeRejections(t *testing.T) {
 func TestKeepaliveIsSent(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{HoldSec: 3})
 	c1, _ := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 	c1.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	env, err := ReadEnvelope(c1.br)
 	if err != nil {
@@ -443,7 +456,7 @@ func TestKeepaliveIsSent(t *testing.T) {
 func TestSessionInfoTracksSyncAndRoutes(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1)
+	c1.join()
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{testRoute(1, 1, "10.1.0.0/16")}})
 	c1.send(Envelope{Type: MsgEOR})
 	c1.send(Envelope{Type: MsgKeepalive}) // round-trip: server applied everything before this
@@ -467,13 +480,13 @@ func TestSessionInfoTracksSyncAndRoutes(t *testing.T) {
 func TestConcurrentAnnounces(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c2, _ := dial(t, r, 2)
-	c2.join(2)
+	c2.join()
 
 	var wg sync.WaitGroup
 	clients := map[uint16]*fakeCPE{}
 	for _, dev := range []uint16{1, 3, 4} {
 		c, _ := dial(t, r, dev)
-		c.join(dev)
+		c.join()
 		clients[dev] = c
 	}
 
@@ -516,4 +529,151 @@ func TestConcurrentAnnounces(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out draining device 2")
 	}
+}
+
+// TestReflectorRelaysRoutesFromAReflector covers the second half of the
+// fan-out rule: what an rr told us goes to clients only. A reflector is not a
+// place a route is re-reflected through -- that is how a mesh becomes a loop.
+func TestReflectorRelaysRoutesFromAReflector(t *testing.T) {
+	r := newTestReflector(t, ReflectorConfig{})
+	c1, _ := dial(t, r, 1)
+	c1.join()
+	rrB, _ := dialRR(t, r, "rr-b")
+	rrB.join()
+
+	// Device 9 has no session here; rr-b is relaying its route, which is
+	// exactly what a reflector session is for.
+	rt := testRoute(9, 1, "10.9.0.0/16")
+	rrB.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
+	if got := c1.recv(); got.Type != MsgAnnounce || len(got.Routes) != 1 || !got.Routes[0].Equal(rt) {
+		t.Fatalf("client got %+v, want the reflected route", got)
+	}
+
+	rrC, _ := dialRR(t, r, "rr-c")
+	if snap := rrC.join(); len(snap) != 0 {
+		t.Fatalf("second reflector's snapshot = %+v, want none (a reflector hears only clients)", snap)
+	}
+
+	sn := r.Sessions()
+	if len(sn) != 3 || sn[0].Key != "node/1" || sn[0].Role != RoleClient ||
+		sn[1].Key != "rr/rr-b" || sn[1].Role != RoleRR || sn[1].DeviceID != 0 {
+		t.Fatalf("sessions = %+v", sn)
+	}
+	if n := len(r.RoutesOf(9)); n != 1 {
+		t.Fatalf("RoutesOf(9) = %d routes, want 1", n)
+	}
+}
+
+// TestSnapshotForAReflectorCarriesOnlyClientRoutes: what a newly attached
+// reflector receives is the client-sourced part of the table, not everything.
+func TestSnapshotForAReflectorCarriesOnlyClientRoutes(t *testing.T) {
+	r := newTestReflector(t, ReflectorConfig{})
+	c1, _ := dial(t, r, 1)
+	c1.join()
+	rt1 := testRoute(1, 1, "10.1.0.0/16")
+	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt1}})
+	c1.send(Envelope{Type: MsgEOR})
+
+	rrB, _ := dialRR(t, r, "rr-b")
+	if snap := rrB.join(); len(snap) != 1 || !snap[0].Equal(rt1) {
+		t.Fatalf("reflector snapshot = %+v, want [%+v]", snap, rt1)
+	}
+
+	// rr-b relays device 8's route; a third reflector must not see it.
+	rt8 := testRoute(8, 1, "10.8.0.0/16")
+	rrB.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt8}})
+	if got := c1.recv(); got.Type != MsgAnnounce || got.Routes[0].DeviceID != 8 {
+		t.Fatalf("client got %+v, want device 8's announce", got)
+	}
+	rrC, _ := dialRR(t, r, "rr-c")
+	snap := rrC.join()
+	if len(snap) != 1 || snap[0].DeviceID != 1 {
+		t.Fatalf("third reflector snapshot = %+v, want only device 1's route", snap)
+	}
+}
+
+// TestWithdrawKeepsARouteAnotherSessionStillHolds: one session letting go must
+// not erase a route another session still vouches for.
+func TestWithdrawKeepsARouteAnotherSessionStillHolds(t *testing.T) {
+	r := newTestReflector(t, ReflectorConfig{})
+	c1, _ := dial(t, r, 1) // the origin
+	c1.join()
+	c2, _ := dial(t, r, 2) // a plain receiver
+	c2.join()
+	rrB, _ := dialRR(t, r, "rr-b")
+	rrB.join()
+
+	rt := testRoute(1, 1, "10.1.0.0/16")
+	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
+	for _, c := range []*fakeCPE{c2, rrB} {
+		if got := c.recv(); got.Type != MsgAnnounce {
+			t.Fatalf("want announce, got %s", got.Type)
+		}
+	}
+	// rr-b says the same key back: two tables now hold it.
+	rrB.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
+	if got := c2.recv(); got.Type != MsgAnnounce {
+		t.Fatalf("want the duplicate announce, got %s", got.Type)
+	}
+	if got := c1.recv(); got.Type != MsgAnnounce || got.Routes[0].DeviceID != 1 {
+		// A client hears its own prefix back through a reflector; dropping it is
+		// the device's own job (Client.applyAnnounce counts own_route).
+		t.Fatalf("origin got %+v, want its own route echoed by the reflector", got)
+	}
+
+	// The origin withdraws. c2 keeps the route: rr-b still holds it. rr-b does
+	// hear a withdraw for its own copy -- per-peer, no other session vouches.
+	c1.send(Envelope{Type: MsgWithdraw, Keys: []RouteKey{rt.Key()}})
+	c2.expectNone(150 * time.Millisecond)
+	if got := rrB.recv(); got.Type != MsgWithdraw || len(got.Keys) != 1 || got.Keys[0] != rt.Key() {
+		t.Fatalf("rr-b got %+v, want the withdraw of its own copy", got)
+	}
+
+	// Now the last holder lets go, and c2 is told.
+	rrB.send(Envelope{Type: MsgWithdraw, Keys: []RouteKey{rt.Key()}})
+	if got := c2.recv(); got.Type != MsgWithdraw || len(got.Keys) != 1 || got.Keys[0] != rt.Key() {
+		t.Fatalf("want withdraw of %+v, got %+v", rt.Key(), got)
+	}
+}
+
+// TestReflectorSessionRules pins the handshake rules that keep a reflector
+// session from being read as a device session and vice versa.
+func TestReflectorSessionRules(t *testing.T) {
+	t.Run("rr hello may not claim a device", func(t *testing.T) {
+		r := newTestReflector(t, ReflectorConfig{})
+		c, errCh := dialRR(t, r, "rr-b")
+		c.send(Envelope{Type: MsgHello, Version: ProtocolVersion, DeviceID: 4})
+		if env := c.recv(); env.Type != MsgError || !strings.Contains(env.Message, "speaks for no device") {
+			t.Fatalf("got %+v", env)
+		}
+		if err := waitServe(t, errCh); err == nil {
+			t.Fatal("an rr session claiming a device was accepted")
+		}
+	})
+
+	t.Run("a reflector does not peer with itself", func(t *testing.T) {
+		r := newTestReflector(t, ReflectorConfig{})
+		c, errCh := dialRR(t, r, "rr-a")
+		if env := c.recv(); env.Type != MsgError || !strings.Contains(env.Message, "itself") {
+			t.Fatalf("got %+v", env)
+		}
+		if err := waitServe(t, errCh); err == nil {
+			t.Fatal("self-peering accepted")
+		}
+	})
+
+	t.Run("an identity with no role is refused", func(t *testing.T) {
+		r := newTestReflector(t, ReflectorConfig{})
+		srv, cli := net.Pipe()
+		defer cli.Close()
+		errCh := make(chan error, 1)
+		go func() { errCh <- r.ServeConn(srv, PeerIdentity{Tenant: r.tenant, DeviceID: 1}) }()
+		c := &fakeCPE{t: t, conn: cli, br: bufio.NewReader(cli)}
+		if env := c.recv(); env.Type != MsgError || !strings.Contains(env.Message, "role") {
+			t.Fatalf("got %+v", env)
+		}
+		if err := waitServe(t, errCh); err == nil {
+			t.Fatal("a session with no role was accepted")
+		}
+	})
 }

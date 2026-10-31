@@ -307,6 +307,79 @@ func TestParseURI(t *testing.T) {
 	}
 }
 
+func TestParseRef(t *testing.T) {
+	ok := []struct {
+		uri  string
+		want Ref
+	}{
+		{"srou://tenant-a/node/42", Ref{Tenant: "tenant-a", Role: RoleNode, NodeID: 42}},
+		{"srou://tenant-a/rr/rr1", Ref{Tenant: "tenant-a", Role: RoleRR, RRID: "rr1"}},
+		{"srou://tenant-a/rr/RR-A_2.5", Ref{Tenant: "tenant-a", Role: RoleRR, RRID: "RR-A_2.5"}},
+	}
+	for _, tc := range ok {
+		u, err := url.Parse(tc.uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, valid := ParseRef(u)
+		if !valid || got != tc.want {
+			t.Fatalf("ParseRef(%q) = (%+v,%v), want (%+v,true)", tc.uri, got, valid, tc.want)
+		}
+		if got.String() != tc.uri {
+			t.Fatalf("Ref.String() = %q, want %q", got.String(), tc.uri)
+		}
+	}
+
+	bad := []string{
+		"https://tenant-a/node/42",
+		"",
+		"srou://tenant-a/nope",
+		"srou://tenant-a/node/70000",
+		"srou://tenant-a/node/",
+		"srou://tenant-a/node/4x",
+		"srou://tenant-a/node/42/extra",
+		"srou://tenant-a/rr/",
+		"srou://tenant-a/rr/a/b",
+		"srou://tenant-a/rr/has space",
+		"srou:///rr/rr1",
+	}
+	for _, s := range bad {
+		u, err := url.Parse(s)
+		if err != nil {
+			continue
+		}
+		if ref, valid := ParseRef(u); valid {
+			t.Fatalf("ParseRef accepted %q as %+v", s, ref)
+		}
+	}
+}
+
+func TestRefOfDistinguishesRoles(t *testing.T) {
+	ca, caKey := newCA(t)
+	pemStr, _ := newDeviceCert(t, ca, caKey, "tenant-a", 7)
+	cert := mustCert(t, pemStr)
+	ref, err := RefOf(cert)
+	if err != nil || ref != (Ref{Tenant: "tenant-a", Role: RoleNode, NodeID: 7}) {
+		t.Fatalf("RefOf(device) = (%+v,%v)", ref, err)
+	}
+
+	rrURI, err := url.Parse("srou://tenant-a/rr/rr2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert.URIs = []*url.URL{rrURI}
+	ref, err = RefOf(cert)
+	if err != nil || ref != (Ref{Tenant: "tenant-a", Role: RoleRR, RRID: "rr2"}) {
+		t.Fatalf("RefOf(rr) = (%+v,%v)", ref, err)
+	}
+
+	// A certificate with no srou URI is nobody: RefOf must not guess a role.
+	cert.URIs = nil
+	if _, err := RefOf(cert); err == nil {
+		t.Fatal("RefOf accepted a certificate with no identity URI")
+	}
+}
+
 // ------------------------------------------------------------------ helpers
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
@@ -317,6 +390,19 @@ func uriFor(tenant string, node uint16) string {
 
 func pemCert(der []byte) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+func mustCert(t *testing.T, pemStr string) *x509.Certificate {
+	t.Helper()
+	blk, _ := pem.Decode([]byte(pemStr))
+	if blk == nil {
+		t.Fatal("no CERTIFICATE block in PEM")
+	}
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert
 }
 
 func newCA(t *testing.T) (*x509.Certificate, ed25519.PrivateKey) {

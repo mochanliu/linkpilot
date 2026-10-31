@@ -144,4 +144,86 @@ test-route.sh 的 C 段）。线上协议不再有 `tunnels` 帧：`MsgTunnels` 
   `GET /api/config?node=` 的 `artifacts.route`：组内 node 2/3 带 `rrs:[rr4]`，组外 node 4 没有
   `rrs` 键。
 
-身份乙（证书 URI 角色段）与 RR↔RR 网格（sr-rr 拨出侧 + 双向证书 + 邻居清单）是 O9-b2，未开始。
+身份乙（证书 URI 角色段）在 O9-b2a 落地；RR↔RR 网格（sr-rr 拨出侧 + 双向证书 + 邻居清单）
+与 RR 身份签发是 O9-b2 的 b2b/b2c，未开始。
+
+## O9-b2 方案（身份乙 + RR↔RR 网格，未开工）
+
+三件事，按这个顺序做，每件独立可验收：
+
+**b2a 会话模型（internal/route + sr-rr 接入侧）**
+
+- `keybinding`：新增 `RefOf(cert)` 解析两种身份——`srou://<tenant>/node/<n>`（客户端）与
+  `srou://<tenant>/rr/<id>`（反射器）。`IdentityOf` 保持"只认 node"，设备侧/控制器侧调用点
+  一行不改，也顺带保证 RR 证书当不了设备证书。
+- `route.PeerIdentity` 加角色：客户端 `{Tenant, Role: client, DeviceID}`，RR
+  `{Tenant, Role: rr, RRID}`；`Key()` 给出会话键 `node/<id>` / `rr/<id>`——**反射器里所有按
+  设备号索引的表都换成这个键**（`sessions`、`adjIn`），因为一个 RR 会话可以替任意来源转发。
+- 反射规则就是一条：**一条路由可发给某会话，当且仅当它的来源不是该会话，且（来源是客户端 或
+  接收方是客户端）**。快照与扇出都走这一条（快照对客户端 = 除自己外的全部，对 RR = 只含
+  客户端来源的那部分）。这就是 GoBGP filterpath 的两条规则，不需要第三条。
+- 宣告校验：客户端会话仍然"路由的 device_id 必须等于自己的 id"；RR 会话不校验来源设备号
+  （同一租户由证书保证），但来源仍是路由自己的属性。
+- 撤销要按"并集"判：同一个 (来源, VRF, 前缀) 可能同时存在于两个会话（设备直连本 RR，而这个
+  前缀又被另一台 RR 反射进来）。一条会话撤走时，只有**没有任何会话还持有它**才把撤销发出去，
+  否则会把另一条会话还举着的路由从收端抹掉。
+- 状态口：`/status` 的 sessions 增加 `role` 与 `key`；`routes` 仍按来源设备号聚合（对外口径不变）。
+
+**b2b 网格（sr-rr 拨出侧 + 控制器渲染邻居清单）**
+
+- sr-rr 配置加 `neighbours: ["10.99.0.101:18446", …]`，进程用**自己的**证书（同一份
+  cert/key 作客户端证书）拨出并保持会话；拨出侧与接入侧用同一套 hello/快照/增量代码（走
+  `route.Client` 的 RR 变体，或把会话状态机抽成一份两端共用）。
+- 邻居清单由控制器渲染：本租户库里出现过的所有 RR 地址，去重、去掉自己；与设备第 4 段同源、
+  不同文件（`rr.json` 的 `neighbours` 字段）。控制器不参与连通性判断，空清单就是"没有网格"。
+
+**b2c RR 身份签发（controller）**
+
+- 今天 RR 的公钥/证书是手搓的（lab 里 `/etc/sr/rr.crt` 只有 IP SAN，没有任何 srou URI）。
+  身份乙要求证书带 `srou://<tenant>/rr/<id>`，所以控制器要能给一条 RR 库行签发身份：运营方
+  在 RR 库里点"签发身份" → 控制器用租户 CA 签一张带 URI SAN 的证书（外加这台 RR 的地址作为
+  IP SAN，供 TLS 主机名校验）→ 一次性下载 cert+key（key 只在这一次返回，不落控制器）。
+- 这一步之前，lab 里的 RR 只能继续用手搓证书，b2a/b2b 的联调用 harness 现生成两张 RR 证书。
+
+**判据（b2a）**：单测 —— 客户端路由扇出到所有会话、RR 来源只扇出给客户端、RR 加入时的快照
+只含客户端来源、两会话持有同一 (来源,前缀) 时撤一条不扇出、RR 会话宣告他人前缀被接受而客户端
+会话宣告他人前缀仍被拒。全部 `go test -race ./internal/route/ ./internal/keybinding/` 绿；
+`test-route.sh` / `test-rr-switch.sh` / `test-boot.sh` 原口径不变。
+
+## O9-b2a 落地状态（2026-10-31，会话模型）
+
+按上面的 b2a 落地，实现中补了三处方案里没写死的细节：
+
+- `keybinding`：`Role`（`node`/`rr`）、`Ref{Tenant,Role,NodeID,RRID}`、`ParseRef`、`RefOf`、
+  `ValidRRID`（1..64 字节 `[A-Za-z0-9._-]`，避免 URI 转义与会话键歧义）。`ParseRef` 比老的
+  `ParseURI` 严：角色段之外多一个路径段、`node/` 后带非数字、`srou` 但无 host 都拒绝。
+  `ParseURI`/`IdentityOf` 原样保留（设备侧与控制器侧调用点一行未改，RR 证书也因此当不了设备证书）。
+- `route`：`PeerRole`（`client`/`rr`）+ `PeerIdentity{Role,DeviceID,RRID}`，`Key()` 给
+  `node/<n>` / `rr/<id>`；`ServeConn` 先 `Validate`（没有角色的身份直接拒，**不默认成 client**）。
+  `sessions` 与 `adjIn` 都按会话键索引；`adjIn` 的每一项带 `role`——规则问的是"这条路由从哪
+  个会话进来"，不是路由里的 `device_id`。
+- 会话规则：客户端 hello 的 `device_id` 必须等于证书；**RR 会话的 hello 不许带 `device_id`**
+  （一个设备号只能属于一个节点）；RR 拨向自己（证书 `rr/<自己的 rr_id>`）在建会话前就拒——
+  否则自己的表会以第二份拷贝回到客户端。
+- 快照/扇出一条规则：`来源 ≠ 接收方 && (来源是 client || 接收方是 client)`。RR 加入时快照
+  只含客户端来源；RR 收到的反射路由不再转给别的 RR。
+- 撤销按并集：删掉一条会话的 key 之后，只有**没有任何别的会话还持有它**（且那个会话对接收方
+  可见）才发 withdraw。同一个 key 可以同时来自"设备直连"和"另一台 RR 反射"，撤一份不能抹掉
+  另一份。
+- `/status`：sessions 每项加 `role`/`key`（按 key 排序），`device_id` 对 RR 会话是 0；
+  `/routes` 仍按来源设备聚合，同一个 key 有多份时确定性取一份（先 client 来源，再按会话键），
+  两次轮询不会给出不同的 RT 列表。
+- `cmd/sr-rr`：用 `RefOf` 分类证书 → `sessionIdentity` 映射成 `PeerIdentity`；日志里会话名
+  改成身份（`srou://…` 与 `node/1` 这种会话键），`test-rr-switch.sh` 那条"RR-A 有没有关闭
+  记录"的断言从 grep `device 1` 改成 grep `node/1`（判据含义不变，只是名字跟着代码走）。
+
+判据（全绿）：`gofmt`/`go vet`/`go build ./...`；`go test ./internal/keybinding/`、
+`go test -race ./internal/route/`（新增 4 组：RR 来源只到客户端、RR 快照只含客户端来源、
+并集撤销、会话规则/自身拨号/无角色拒绝）；`test-route.sh` 21/0；`test-rr-switch.sh` 57/0
+（真二进制 + 真 mTLS，租户 o6b-lab 的设备证书走新的 `RefOf` 分类）。
+`test-boot.sh` 这一步没跑：它会 `docker restart` srwg-node1/2，而那两个容器刚被别的会话重启
+在用；b2a 不碰开机清单与 agent，`test-rr-switch.sh` 已经用真证书覆盖了 sr-rr 的接入侧。
+
+b2b（sr-rr 拨出侧 + 控制器渲染 `neighbours`）与 b2c（控制器签发带 `srou://<tenant>/rr/<id>`
+的 RR 身份）未开始。b2b 之前，两台 RR 之间还不能建网格：今天的 sr-rr 只有接入侧，所以
+"RR 来源只扇出给客户端""并集撤销"这些规则只有单测覆盖，端到端要等 b2b。

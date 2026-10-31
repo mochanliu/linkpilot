@@ -6,16 +6,68 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
+// PeerRole tells the two kinds of session an RR serves apart. Both authenticate
+// with a tenant certificate; the role is what that certificate's URI says, not
+// something the session may claim in the hello.
+type PeerRole string
+
+const (
+	// RoleClient is a CPE: srou://<tenant>/node/<n>.
+	RoleClient PeerRole = "client"
+	// RoleRR is another reflector: srou://<tenant>/rr/<id>.
+	RoleRR PeerRole = "rr"
+)
+
 // PeerIdentity is who a session speaks for. It is read from the peer's mTLS
-// certificate by the caller (keybinding.IdentityOf), never from the hello: the
+// certificate by the caller (keybinding.RefOf), never from the hello: the
 // hello's device_id is only a claim, and the check is that it agrees with this.
 type PeerIdentity struct {
 	Tenant   string
-	DeviceID uint16
+	Role     PeerRole
+	DeviceID uint16 // RoleClient: the node the certificate names
+	RRID     string // RoleRR: the reflector the certificate names
+}
+
+// Key is the reflector's session key: "node/<n>" for a CPE, "rr/<id>" for a
+// reflector. Every table in the reflector is keyed by it, because a reflector
+// session can carry routes for any origin device -- the session is the peer,
+// the device id inside a route is only what that route says about itself.
+func (p PeerIdentity) Key() string {
+	if p.Role == RoleRR {
+		return "rr/" + p.RRID
+	}
+	return "node/" + strconv.Itoa(int(p.DeviceID))
+}
+
+// Validate refuses an identity that cannot name a session. A missing role gets
+// its own message: defaulting it to "client" would let a certificate that says
+// nothing about what it is be treated as a device.
+func (p PeerIdentity) Validate() error {
+	switch p.Role {
+	case RoleClient:
+		if p.DeviceID == 0 {
+			return errors.New("client identity has device id 0 (reserved)")
+		}
+	case RoleRR:
+		if p.RRID == "" {
+			return errors.New("rr identity has an empty rr id")
+		}
+		if strings.ContainsRune(p.RRID, '/') {
+			return fmt.Errorf("rr id %q contains a path separator", p.RRID)
+		}
+	default:
+		return fmt.Errorf("unknown session role %q", p.Role)
+	}
+	if p.Tenant == "" {
+		return errors.New("identity has no tenant")
+	}
+	return nil
 }
 
 // ReflectorConfig is the RR's static input.
@@ -32,26 +84,42 @@ type ReflectorConfig struct {
 
 // Reflector is one RR instance serving one tenant.
 //
-// It keeps one table: the adj-rib-in of routes keyed by origin. A route is
-// advertised to every session except the one it came from (GoBGP's
-// filterPathFromSourcePeer), unchanged -- no next hop is added or rewritten, no
-// RT is applied, no best path is chosen. That is the whole of an RR (RFC 4456).
+// It keeps one table per session: that session's Adj-RIB-In, keyed by session
+// key, plus the role it spoke in. A route is advertised under one rule, copied
+// from RFC 4456 / GoBGP's filterPathFromSourcePeer:
+//
+//	a route may go to a session iff it did not come from that session, and
+//	( it came from a client, or the receiver is a client ).
+//
+// No route is rewritten on the way out: no next hop, no RT, no best path. That
+// is the whole of a reflector.
 type Reflector struct {
 	rrID   string
 	tenant string
 	hold   time.Duration
 
 	mu       sync.Mutex
-	sessions map[uint16]*serverSession
-	adjIn    map[uint16]map[RouteKey]Route
+	sessions map[string]*serverSession
+	adjIn    map[string]*adjRibIn
+}
+
+// adjRibIn is one session's Adj-RIB-In. The role is stored next to the routes
+// because the fan-out rule depends on where a route ENTERED, and the session
+// that entry belongs to can disappear while its routes are still being
+// withdrawn (clearRoutesLocked has to know what it is withdrawing from).
+type adjRibIn struct {
+	role   PeerRole
+	routes map[RouteKey]Route
 }
 
 // SessionInfo is the admin/tests view of one live session.
 type SessionInfo struct {
-	DeviceID uint16    `json:"device_id"`
+	DeviceID uint16    `json:"device_id"` // clients only; 0 for an rr session
+	Role     PeerRole  `json:"role"`
+	Key      string    `json:"key"`
 	Since    time.Time `json:"since"`
 	Synced   bool      `json:"synced"` // peer sent EOR after its first snapshot
-	Routes   int       `json:"routes"` // adj-rib-in size for this origin
+	Routes   int       `json:"routes"` // this session's adj-rib-in size
 }
 
 func NewReflector(cfg ReflectorConfig) (*Reflector, error) {
@@ -69,31 +137,38 @@ func NewReflector(cfg ReflectorConfig) (*Reflector, error) {
 		rrID:     cfg.RRID,
 		tenant:   cfg.Tenant,
 		hold:     hold,
-		sessions: make(map[uint16]*serverSession),
-		adjIn:    make(map[uint16]map[RouteKey]Route),
+		sessions: make(map[string]*serverSession),
+		adjIn:    make(map[string]*adjRibIn),
 	}, nil
 }
 
-// ServeConn runs one CPE session until it dies. The caller has already
+// ServeConn runs one peer session until it dies. The caller has already
 // completed the TLS handshake and must derive id from the verified client
 // certificate.
 //
 // Blocking; run one goroutine per accepted connection. Returning an error is
 // normal on disconnect -- the caller decides whether to log it.
 func (r *Reflector) ServeConn(conn net.Conn, id PeerIdentity) error {
+	if err := id.Validate(); err != nil {
+		return reject(conn, err.Error())
+	}
 	if id.Tenant != r.tenant {
 		return reject(conn, fmt.Sprintf("tenant %q is not served by this reflector", id.Tenant))
 	}
-	if id.DeviceID == 0 {
-		return reject(conn, "device id 0 is reserved")
+	if id.Role == RoleRR && id.RRID == r.rrID {
+		// A reflector dialling itself would hand its own table back as a second
+		// copy of every client route. That is a configuration error, not a
+		// session to nurse along.
+		return reject(conn, "a reflector does not peer with itself")
 	}
 
+	key := id.Key()
 	conn.SetDeadline(time.Now().Add(r.hold))
 	br := bufio.NewReaderSize(conn, 64<<10)
 	env, err := ReadEnvelope(br)
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("reflector: device %d: read hello: %w", id.DeviceID, err)
+		return fmt.Errorf("reflector: %s: read hello: %w", key, err)
 	}
 	if env.Type != MsgHello {
 		return reject(conn, fmt.Sprintf("expected hello, got %q", env.Type))
@@ -101,13 +176,24 @@ func (r *Reflector) ServeConn(conn net.Conn, id PeerIdentity) error {
 	if env.Version != ProtocolVersion {
 		return reject(conn, fmt.Sprintf("protocol version %d unsupported (want %d)", env.Version, ProtocolVersion))
 	}
-	if env.DeviceID != id.DeviceID {
-		return reject(conn, fmt.Sprintf("hello claims device %d but the certificate is for %d", env.DeviceID, id.DeviceID))
+	switch id.Role {
+	case RoleClient:
+		if env.DeviceID != id.DeviceID {
+			return reject(conn, fmt.Sprintf("hello claims device %d but the certificate is for %d", env.DeviceID, id.DeviceID))
+		}
+	case RoleRR:
+		// A reflector is named by the certificate, not by a device id. The hello
+		// may not claim one: a device id belongs to a node, and one node's routes
+		// must never enter through a reflector's session.
+		if env.DeviceID != 0 {
+			return reject(conn, fmt.Sprintf("hello claims device %d, but an rr session speaks for no device", env.DeviceID))
+		}
 	}
 	conn.SetDeadline(time.Time{})
 
 	s := &serverSession{
-		dev:   id.DeviceID,
+		id:    id,
+		key:   key,
 		conn:  conn,
 		out:   make(chan Envelope, 1024),
 		done:  make(chan struct{}),
@@ -135,32 +221,32 @@ func (r *Reflector) attach(s *serverSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if old := r.sessions[s.dev]; old != nil {
+	if old := r.sessions[s.key]; old != nil {
 		// Newest session wins (a CPE reconnecting after its network came back
 		// must not keep talking to a half-dead socket). Its routes go with it:
 		// the new session sends a fresh full snapshot, and keeping the old paths
 		// in the meantime would advertise reachability that nobody re-asserted.
-		r.clearRoutesLocked(old.dev)
-		delete(r.sessions, old.dev)
+		r.clearRoutesLocked(old.key)
+		delete(r.sessions, old.key)
 		old.shutdown()
 	}
-	r.sessions[s.dev] = s
+	r.sessions[s.key] = s
 
 	hello := Envelope{Type: MsgHelloOK, Version: ProtocolVersion, RRID: r.rrID, HoldSec: int(r.hold / time.Second)}
 	if !s.trySend(hello) {
-		delete(r.sessions, s.dev)
+		delete(r.sessions, s.key)
 		s.shutdown()
-		return fmt.Errorf("reflector: device %d: cannot accept hello_ok", s.dev)
+		return fmt.Errorf("reflector: %s: cannot accept hello_ok", s.key)
 	}
 	// Initial UPDATE burst + END-OF-RIB, exactly as a BGP speaker does right
-	// after the session is established. The device's own routes are left out
-	// (we never send a route back to its origin), and an empty table is still an
-	// EOR so the peer knows it has the whole RIB.
-	for _, env := range announceEnvelopes(r.snapshotForLocked(s.dev)) {
+	// after the session is established. The peer's own routes are left out (we
+	// never send a route back to its origin), and an empty table is still an EOR
+	// so the peer knows it has the whole RIB.
+	for _, env := range announceEnvelopes(r.snapshotForLocked(s.id)) {
 		if !s.trySend(env) {
-			delete(r.sessions, s.dev)
+			delete(r.sessions, s.key)
 			s.shutdown()
-			return fmt.Errorf("reflector: device %d: session too slow to accept initial snapshot", s.dev)
+			return fmt.Errorf("reflector: %s: session too slow to accept initial snapshot", s.key)
 		}
 	}
 	return nil
@@ -181,16 +267,20 @@ func announceEnvelopes(routes []Route) []Envelope {
 	return append(envs, Envelope{Type: MsgEOR})
 }
 
-// snapshotForLocked is the initial UPDATE burst for dev: every route in the
-// adj-rib-in, minus the device's own. BGP does not send a peer its own routes
-// back (GoBGP filterPathFromSourcePeer); doing so would only invite loops.
-func (r *Reflector) snapshotForLocked(dev uint16) []Route {
+// snapshotForLocked is the initial UPDATE burst for dst: every route the
+// fan-out rule lets us send it. For a client that is every other session's
+// table; for a reflector it is only what clients told us, because a reflector
+// is not a place a route is re-reflected through.
+func (r *Reflector) snapshotForLocked(dst PeerIdentity) []Route {
 	var out []Route
-	for origin, m := range r.adjIn {
-		if origin == dev {
+	for key, in := range r.adjIn {
+		if key == dst.Key() {
 			continue
 		}
-		for _, rt := range m {
+		if dst.Role != RoleClient && in.role != RoleClient {
+			continue
+		}
+		for _, rt := range in.routes {
 			out = append(out, rt)
 		}
 	}
@@ -203,16 +293,16 @@ func (r *Reflector) readLoop(s *serverSession, br *bufio.Reader) error {
 		env, err := ReadEnvelope(br)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				return fmt.Errorf("reflector: device %d: hold timer expired", s.dev)
+				return fmt.Errorf("reflector: %s: hold timer expired", s.key)
 			}
-			return fmt.Errorf("reflector: device %d: %w", s.dev, err)
+			return fmt.Errorf("reflector: %s: %w", s.key, err)
 		}
 		switch env.Type {
 		case MsgKeepalive:
 			// Nothing to do: the deadline was just pushed out by the read.
 		case MsgEOR:
 			r.mu.Lock()
-			if cur := r.sessions[s.dev]; cur == s {
+			if cur := r.sessions[s.key]; cur == s {
 				s.synced = true
 			}
 			r.mu.Unlock()
@@ -225,21 +315,24 @@ func (r *Reflector) readLoop(s *serverSession, br *bufio.Reader) error {
 				return err
 			}
 		case MsgError:
-			return fmt.Errorf("reflector: device %d: peer error: %s", s.dev, env.Message)
+			return fmt.Errorf("reflector: %s: peer error: %s", s.key, env.Message)
 		default:
-			return fmt.Errorf("reflector: device %d: unexpected %q after handshake", s.dev, env.Type)
+			return fmt.Errorf("reflector: %s: unexpected %q after handshake", s.key, env.Type)
 		}
 	}
 }
 
 func (r *Reflector) applyAnnounce(s *serverSession, routes []Route) error {
 	for _, rt := range routes {
-		if rt.DeviceID != s.dev {
-			return fmt.Errorf("reflector: device %d: announced route for device %d (a node may only speak for itself)",
-				s.dev, rt.DeviceID)
+		// A client may only speak for itself. A reflector speaks for whatever
+		// it learned -- that is what it is for -- and the tenant check on its
+		// certificate is what bounds "whatever".
+		if s.id.Role == RoleClient && rt.DeviceID != s.id.DeviceID {
+			return fmt.Errorf("reflector: %s: announced route for device %d (a node may only speak for itself)",
+				s.key, rt.DeviceID)
 		}
 		if err := rt.Validate(); err != nil {
-			return fmt.Errorf("reflector: device %d: %w", s.dev, err)
+			return fmt.Errorf("reflector: %s: %w", s.key, err)
 		}
 	}
 	if len(routes) == 0 {
@@ -260,34 +353,35 @@ func (r *Reflector) applyAnnounce(s *serverSession, routes []Route) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.sessions[s.dev] != s {
-		return fmt.Errorf("reflector: device %d: session was replaced", s.dev)
+	if r.sessions[s.key] != s {
+		return fmt.Errorf("reflector: %s: session was replaced", s.key)
 	}
-	m := r.adjIn[s.dev]
-	if m == nil {
-		m = make(map[RouteKey]Route)
-		r.adjIn[s.dev] = m
+	in := r.adjIn[s.key]
+	if in == nil {
+		in = &adjRibIn{role: s.id.Role, routes: make(map[RouteKey]Route)}
+		r.adjIn[s.key] = in
 	}
 	changed := make([]Route, 0, len(order))
 	for _, k := range order {
 		rt := last[k]
-		if old, ok := m[k]; ok && old.Equal(rt) {
+		if old, ok := in.routes[k]; ok && old.Equal(rt) {
 			continue // identical re-announcement: not an update
 		}
-		m[k] = rt
+		in.routes[k] = rt
 		changed = append(changed, rt)
 	}
-	r.fanoutRoutesLocked(s.dev, changed)
+	r.fanoutRoutesLocked(s, changed)
 	return nil
 }
 
 func (r *Reflector) applyWithdraw(s *serverSession, keys []RouteKey) error {
 	for _, k := range keys {
-		if k.DeviceID != s.dev {
-			return fmt.Errorf("reflector: device %d: withdrawal for device %d", s.dev, k.DeviceID)
+		if s.id.Role == RoleClient && k.DeviceID != s.id.DeviceID {
+			return fmt.Errorf("reflector: %s: withdrawal for device %d (a node may only speak for itself)",
+				s.key, k.DeviceID)
 		}
 		if err := k.Validate(); err != nil {
-			return fmt.Errorf("reflector: device %d: %w", s.dev, err)
+			return fmt.Errorf("reflector: %s: %w", s.key, err)
 		}
 	}
 	if len(keys) == 0 {
@@ -296,111 +390,127 @@ func (r *Reflector) applyWithdraw(s *serverSession, keys []RouteKey) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.sessions[s.dev] != s {
-		return fmt.Errorf("reflector: device %d: session was replaced", s.dev)
+	if r.sessions[s.key] != s {
+		return fmt.Errorf("reflector: %s: session was replaced", s.key)
 	}
-	m := r.adjIn[s.dev]
+	in := r.adjIn[s.key]
 	var removed []RouteKey
 	for _, k := range keys {
-		if _, ok := m[k]; !ok {
+		if in == nil {
+			break
+		}
+		if _, ok := in.routes[k]; !ok {
 			continue // already gone (e.g. cleared by reconnect): idempotent
 		}
-		delete(m, k)
+		delete(in.routes, k)
 		removed = append(removed, k)
 	}
-	r.fanoutKeysLocked(s.dev, SortedKeys(removed))
+	r.fanoutKeysLocked(s.key, s.id.Role, SortedKeys(removed))
 	return nil
 }
 
-// clearRoutesLocked drops one origin's adj-rib-in and tells the other sessions.
-func (r *Reflector) clearRoutesLocked(dev uint16) {
-	if len(r.adjIn[dev]) == 0 {
-		delete(r.adjIn, dev)
+// clearRoutesLocked drops one session's adj-rib-in and tells the sessions the
+// fan-out rule allows -- minus the keys some other session still holds.
+func (r *Reflector) clearRoutesLocked(key string) {
+	in := r.adjIn[key]
+	if in == nil {
 		return
 	}
-	keys := r.keysOfLocked(dev)
-	delete(r.adjIn, dev)
-	r.fanoutKeysLocked(dev, keys)
-}
-
-func (r *Reflector) routesOfLocked(dev uint16) []Route {
-	m := r.adjIn[dev]
-	if len(m) == 0 {
-		return nil
+	delete(r.adjIn, key)
+	if len(in.routes) == 0 {
+		return
 	}
-	out := make([]Route, 0, len(m))
-	for _, rt := range m {
-		out = append(out, rt)
-	}
-	return SortedRoutes(out)
-}
-
-func (r *Reflector) keysOfLocked(dev uint16) []RouteKey {
-	m := r.adjIn[dev]
-	keys := make([]RouteKey, 0, len(m))
-	for k := range m {
+	keys := make([]RouteKey, 0, len(in.routes))
+	for k := range in.routes {
 		keys = append(keys, k)
 	}
-	return SortedKeys(keys)
+	r.fanoutKeysLocked(key, in.role, SortedKeys(keys))
 }
 
-// fanoutRoutesLocked advertises routes learned from origin to every other
-// session. BGP's filterPathFromSourcePeer: the origin is the one peer that must
-// not get them back.
-func (r *Reflector) fanoutRoutesLocked(origin uint16, routes []Route) {
-	for dev := range r.sessions {
-		if dev == origin {
-			continue
-		}
-		r.sendRoutesLocked(dev, routes)
-	}
-}
-
-func (r *Reflector) fanoutKeysLocked(origin uint16, keys []RouteKey) {
-	for dev := range r.sessions {
-		if dev == origin {
-			continue
-		}
-		r.withdrawKeysLocked(dev, keys)
-	}
-}
-
-func (r *Reflector) sendRoutesLocked(to uint16, routes []Route) {
+// fanoutRoutesLocked advertises routes learned on src to every session the
+// fan-out rule allows (see Reflector).
+func (r *Reflector) fanoutRoutesLocked(src *serverSession, routes []Route) {
 	if len(routes) == 0 {
 		return
 	}
-	s := r.sessions[to]
-	if s == nil {
+	for key, dst := range r.sessions {
+		if key == src.key {
+			continue
+		}
+		if src.id.Role != RoleClient && dst.id.Role != RoleClient {
+			continue
+		}
+		r.sendRoutesLocked(dst, routes)
+	}
+}
+
+// fanoutKeysLocked withdraws keys that left one session's table from every
+// session the rule allows -- but only where no other session still holds the
+// key. The same (origin, VRF, prefix) can sit in two tables at once (a device
+// announces it to this RR directly while another RR reflects it here); taking
+// it out of the receiver because one of the two let go would erase a route the
+// other one still vouches for.
+func (r *Reflector) fanoutKeysLocked(srcKey string, srcRole PeerRole, keys []RouteKey) {
+	if len(keys) == 0 {
 		return
 	}
+	for key, dst := range r.sessions {
+		if key == srcKey {
+			continue
+		}
+		if srcRole != RoleClient && dst.id.Role != RoleClient {
+			continue
+		}
+		gone := make([]RouteKey, 0, len(keys))
+		for _, k := range keys {
+			if r.stillHeldLocked(dst, k) {
+				continue
+			}
+			gone = append(gone, k)
+		}
+		r.withdrawKeysLocked(dst, SortedKeys(gone))
+	}
+}
+
+// stillHeldLocked reports whether some peer other than dst still holds k, in a
+// direction dst is allowed to receive from.
+func (r *Reflector) stillHeldLocked(dst *serverSession, k RouteKey) bool {
+	for key, in := range r.adjIn {
+		if key == dst.key {
+			continue // a session's own table is never reflected back to it
+		}
+		if dst.id.Role != RoleClient && in.role != RoleClient {
+			continue
+		}
+		if _, ok := in.routes[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Reflector) sendRoutesLocked(to *serverSession, routes []Route) {
 	for len(routes) > 0 {
 		n := len(routes)
 		if n > MaxRoutesPerMessage {
 			n = MaxRoutesPerMessage
 		}
-		if !s.trySend(Envelope{Type: MsgAnnounce, Routes: routes[:n]}) {
-			s.shutdown()
+		if !to.trySend(Envelope{Type: MsgAnnounce, Routes: routes[:n]}) {
+			to.shutdown()
 			return
 		}
 		routes = routes[n:]
 	}
 }
 
-func (r *Reflector) withdrawKeysLocked(from uint16, keys []RouteKey) {
-	if len(keys) == 0 {
-		return
-	}
-	s := r.sessions[from]
-	if s == nil {
-		return
-	}
+func (r *Reflector) withdrawKeysLocked(to *serverSession, keys []RouteKey) {
 	for len(keys) > 0 {
 		n := len(keys)
 		if n > MaxRoutesPerMessage {
 			n = MaxRoutesPerMessage
 		}
-		if !s.trySend(Envelope{Type: MsgWithdraw, Keys: keys[:n]}) {
-			s.shutdown()
+		if !to.trySend(Envelope{Type: MsgWithdraw, Keys: keys[:n]}) {
+			to.shutdown()
 			return
 		}
 		keys = keys[n:]
@@ -410,9 +520,9 @@ func (r *Reflector) withdrawKeysLocked(from uint16, keys []RouteKey) {
 func (r *Reflector) detach(s *serverSession) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.sessions[s.dev] == s {
-		delete(r.sessions, s.dev)
-		r.clearRoutesLocked(s.dev)
+	if r.sessions[s.key] == s {
+		delete(r.sessions, s.key)
+		r.clearRoutesLocked(s.key)
 	}
 	s.shutdown()
 }
@@ -448,52 +558,85 @@ func (r *Reflector) keepaliveLoop(s *serverSession, every time.Duration) {
 	}
 }
 
-// Routes returns a copy of the whole adj-rib-in, sorted, keyed by origin.
+// Routes returns the whole adj-rib-in aggregated by origin device, sorted.
+//
+// Two sessions can carry the same route (one direct, one reflected); the view
+// reports it once, because it answers "what does this RR know", not "which
+// peer told it". The copy kept is chosen deterministically -- a client's own
+// word beats a reflected one, then the lower session key -- so two polls of an
+// unchanged router cannot disagree about which RT list they show.
 func (r *Reflector) Routes() map[uint16][]Route {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make(map[uint16][]Route, len(r.adjIn))
-	for dev, m := range r.adjIn {
-		list := make([]Route, 0, len(m))
-		for _, rt := range m {
-			list = append(list, rt)
+	return routesByOriginLocked(r.adjIn)
+}
+
+// RoutesOf returns the routes one origin device is known to advertise, from
+// every session that carries them, deduped the same way Routes does.
+func (r *Reflector) RoutesOf(dev uint16) []Route {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return routesByOriginLocked(r.adjIn)[dev]
+}
+
+func routesByOriginLocked(adjIn map[string]*adjRibIn) map[uint16][]Route {
+	chosen := make(map[RouteKey]Route)
+	from := make(map[RouteKey]string)
+	for key, in := range adjIn {
+		for k, rt := range in.routes {
+			prev, ok := from[k]
+			if ok && !preferredSource(key, in.role, prev, adjIn[prev].role) {
+				continue
+			}
+			chosen[k] = rt
+			from[k] = key
 		}
-		out[dev] = SortedRoutes(list)
+	}
+	out := make(map[uint16][]Route)
+	for _, rt := range chosen {
+		out[rt.DeviceID] = append(out[rt.DeviceID], rt)
+	}
+	for dev := range out {
+		out[dev] = SortedRoutes(out[dev])
 	}
 	return out
 }
 
-// RoutesOf returns one origin's adj-rib-in, sorted.
-func (r *Reflector) RoutesOf(dev uint16) []Route {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	m := r.adjIn[dev]
-	list := make([]Route, 0, len(m))
-	for _, rt := range m {
-		list = append(list, rt)
+// preferredSource says which of two copies of the same key is reported: the
+// first-hand one, then the lower session key.
+func preferredSource(aKey string, aRole PeerRole, bKey string, bRole PeerRole) bool {
+	if (aRole == RoleClient) != (bRole == RoleClient) {
+		return aRole == RoleClient
 	}
-	return SortedRoutes(list)
+	return aKey < bKey
 }
 
-// Sessions returns the live sessions, sorted by device id.
+// Sessions returns the live sessions, sorted by key.
 func (r *Reflector) Sessions() []SessionInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]SessionInfo, 0, len(r.sessions))
-	for dev, s := range r.sessions {
+	for key, s := range r.sessions {
+		var n int
+		if in := r.adjIn[key]; in != nil {
+			n = len(in.routes)
+		}
 		out = append(out, SessionInfo{
-			DeviceID: dev,
+			DeviceID: s.id.DeviceID,
+			Role:     s.id.Role,
+			Key:      key,
 			Since:    s.since,
 			Synced:   s.synced,
-			Routes:   len(r.adjIn[dev]),
+			Routes:   n,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].DeviceID < out[j].DeviceID })
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }
 
 type serverSession struct {
-	dev   uint16
+	id    PeerIdentity
+	key   string
 	conn  net.Conn
 	out   chan Envelope
 	done  chan struct{}

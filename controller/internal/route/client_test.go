@@ -217,7 +217,7 @@ func newTestRRSrv(t *testing.T, r *Reflector, node uint16) *testRRSrv {
 	go func() {
 		for srv := range s.incoming {
 			go func(conn net.Conn) {
-				_ = s.r.ServeConn(conn, PeerIdentity{Tenant: s.r.tenant, DeviceID: s.node})
+				_ = s.r.ServeConn(conn, PeerIdentity{Tenant: s.r.tenant, Role: RoleClient, DeviceID: s.node})
 			}(srv)
 		}
 	}()
@@ -292,7 +292,7 @@ func TestClientImportsOnlyMatchingRTs(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20)
+	peer.join()
 	good := testRoute(20, 5, "10.20.0.0/16", "65000:6")
 	badRT := testRoute(20, 5, "10.30.0.0/16", "65000:7")
 	// 来源 VPN 9 本机没有，但 RT 命中 VRF 5 的 import —— 这正是跨站点导通的形状：
@@ -368,7 +368,7 @@ func TestClientResolvesEveryTunnelToOrigin(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20)
+	peer.join()
 	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
 	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
 
@@ -391,7 +391,7 @@ func TestClientReimportsOnRTChange(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20)
+	peer.join()
 	rt := testRoute(20, 5, "10.20.0.0/16", "65000:7") // not imported
 	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
 	waitFor(t, "mismatch counted", func() bool { return c.Stats().DroppedRTMismatch == 1 })
@@ -419,12 +419,12 @@ func TestTwoSyncedRRSMergeAndLoseOnlyTheirOwnCopies(t *testing.T) {
 	// Each RR has a different origin, so which copies are in the table is
 	// visible in the table itself.
 	peerA, _ := dial(t, rrA, 20)
-	peerA.join(20)
+	peerA.join()
 	peerA.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 	}})
 	peerB, _ := dial(t, rrB, 21)
-	peerB.join(21)
+	peerB.join()
 	peerB.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(21, 5, "10.21.0.0/16", "65000:6"),
 	}})
@@ -488,7 +488,7 @@ func TestOneSessionLeavingDoesNotShrinkTheTable(t *testing.T) {
 	// one CPE's route to another.
 	for _, r := range []*Reflector{rrA, rrB} {
 		peer, _ := dial(t, r, 20)
-		peer.join(20)
+		peer.join()
 		peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 			testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 		}})
@@ -541,7 +541,7 @@ func TestNoSyncedRRMeansEmptyRIB(t *testing.T) {
 	rrA := newTestReflector(t, ReflectorConfig{RRID: "rr-a"})
 	srvA := newTestRRSrv(t, rrA, 10)
 	peerA, _ := dial(t, rrA, 20)
-	peerA.join(20)
+	peerA.join()
 	peerA.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 	}})
@@ -691,7 +691,7 @@ func TestAllRIBAndEmptyWhenStopped(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20)
+	peer.join()
 	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 		testRoute(20, 6, "10.30.0.0/16", "65000:8"),
