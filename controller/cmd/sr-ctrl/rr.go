@@ -1,14 +1,9 @@
 package main
 
-// The route-reflector library: one operator-owned list of the boxes that reflect
-// routes, plus the two slots in each tenant's overlay config that pick from it.
-//
-// Why the operator owns the list (定案, docs/o6c-overlay-page-plan.md §4 E2/E3/E4):
-// an RR is shared infrastructure the operator deploys, the same way it hands out
-// tenant seats. A tenant may not invent an address -- it would then push that
-// address into every one of its devices' route.json, and a reflector that does
-// not exist means every session on that box fails its hello with no explanation.
-// So the tenant only ever *selects*.
+// The route-reflector library: every tenant's own list of the boxes that reflect
+// its routes. A row is added, edited and deleted from that tenant's overlay page
+// (2026-11-01 定案: an RR belongs to exactly one tenant, so the tenant manages it;
+// the operator view no longer carries this page).
 //
 // What an address means here: "host:port", resolved and dialled by the device,
 // never by the controller. The controller has no route to the RR and does not
@@ -16,11 +11,13 @@ package main
 // controller cannot earn is worse than the plain "没探过" the tunnel page already
 // uses.
 //
-// The selection is stored as library *ids*, not addresses. Deleting or renaming
-// an RR's address must not silently re-point a tenant at a different box, and a
-// tenant pointing at an id that no longer exists is a contradiction the page can
-// show and the renderer can refuse -- whereas a stale address looks perfectly
-// plausible right up to the moment the device cannot dial it.
+// Every device of the tenant dials every row of its own list unless an RR group
+// names it, in which case it dials that group's two. That is why the list is
+// bounded per tenant: the list is also the default per-device fan-out.
+//
+// The rows are kept in one document with the id counter, and an id is never
+// handed back after a delete: a group's selection quotes ids, so re-minting rr3
+// would silently re-point a device at a different box.
 
 import (
 	"errors"
@@ -37,21 +34,24 @@ const (
 	rrNameMaxRunes     = 80
 	rrLocationMaxRunes = 120
 	rrAddrMaxRunes     = 253
-	rrMaxItems         = 256
+	// rrMaxPerTenant bounds one tenant's list. It is not an arbitrary table
+	// limit: every device that no RR group names dials the whole list, so the
+	// list length *is* the default session count per device. Eight is far above
+	// the two a tenant needs for redundancy and low enough that one typo cannot
+	// turn every box into a dial loop.
+	rrMaxPerTenant = 8
 )
 
 // RRItem is one reflector in the library.
 //
 // TenantID is the row's one and only 归属: a reflector belongs to the tenant
-// whose devices dial it. There is no shared tier (2026-10-31 定案) -- a row the
-// operator adds is always added *for* somebody. A reflector every tenant may
-// pick from is one nobody owns: its capacity, its address and its retirement
-// become everybody's problem and no one's decision.
+// whose devices dial it. There is no shared tier (2026-10-31 定案), and since
+// 2026-11-01 the owning tenant is also the row's only editor -- which is why an
+// empty 归属 is not "nobody's" but a row nobody can manage.
 //
-// The JSON key stays "owner" even though the field is now a required tenant id.
+// The JSON key stays "owner" even though the field is a required tenant id.
 // Renaming it would drop every binding already on disk and turn those rows into
-// orphans nobody can pick -- a silent change to a customer's setting is exactly
-// what this file refuses to do.
+// orphans nobody can pick.
 type RRItem struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
@@ -63,11 +63,9 @@ type RRItem struct {
 	UpdatedAt int64 `json:"updated_at_unix,omitempty"`
 }
 
-// RRLibrary is the operator's whole RR table. One document, not a map keyed by
-// id, because the order the operator maintains it in is the order the tenant's
-// picker should show (a list of "RR-A 上海" / "RR-B 法兰克福" typed by hand reads
-// better in the order it was typed), and because the id counter lives next to
-// the rows it mints.
+// RRLibrary is the whole RR table. One document, not a per-tenant map, because
+// the order the rows were typed in is the order the tenant's page should show,
+// and because the id counter lives next to the rows it mints.
 type RRLibrary struct {
 	Items     []RRItem `json:"items"`
 	NextID    int      `json:"next_id"`
@@ -146,83 +144,66 @@ func (s *server) rrLibraryLocked(create bool) *RRLibrary {
 	return s.state.RRs
 }
 
-// rrOwnerLabelLocked names a row's 归属 for the operator's table. A row whose
-// tenant has been deleted -- or a row restored from before the binding rule --
-// stays in the library and says so: dropping it would delete the operator's row
-// as a side effect of deleting a customer, and there is no longer anywhere to
-// "fall back" to, so the label has to be the thing that gets it fixed.
-func (s *server) rrOwnerLabelLocked(it RRItem) string {
-	if it.TenantID == "" {
-		return "未绑定租户（谁都选不到这一条）"
-	}
-	if t := s.state.Tenants[it.TenantID]; t != nil {
-		return t.Name
-	}
-	return it.TenantID + "（该租户已不存在，谁都选不到这一条）"
+// rrGroupRef is one RR group that names a row, as much of it as the delete guard
+// and the page's explanation need.
+type rrGroupRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
-// rrReferencesLocked lists the tenants whose 主/备 slots -- or whose RR groups --
-// name this row. The delete guard is the whole reason this exists: a tenant that
-// keeps selecting a deleted RR would render a route.json with no rrs at all, and
-// the device's existing hand-written list would look like it still matched.
-func (s *server) rrReferencesLocked(id string) []string {
-	if id == "" {
+// rrGroupRefsLocked lists the RR groups of one tenant that name this row. It is
+// the delete guard's only input now that the tenant-level pair is gone: a group
+// still pointing at a deleted row would render that group's devices a route.json
+// with no rrs at all, and the device's existing hand-written list would look like
+// it still matched.
+func (s *server) rrGroupRefsLocked(tenantID, id string) []rrGroupRef {
+	oc := s.overlayConfigLocked(tenantID, false)
+	if oc == nil || id == "" {
 		return nil
 	}
-	var out []string
-	for tenantID, oc := range s.state.Overlays {
-		if oc == nil || s.state.Tenants[tenantID] == nil {
-			continue
-		}
-		if oc.RRPrimary == id || oc.RRBackup == id {
-			out = append(out, tenantID)
-			continue
-		}
-		for _, g := range oc.RRGroups {
-			if g.RRPrimary == id || g.RRBackup == id {
-				out = append(out, tenantID)
-				break
-			}
+	out := []rrGroupRef{}
+	for _, g := range oc.RRGroups {
+		if g.RRPrimary == id || g.RRBackup == id {
+			out = append(out, rrGroupRef{ID: g.ID, Name: g.Name})
 		}
 	}
-	sort.Strings(out)
 	return out
 }
 
-// rrForTenantLocked resolves one tenant's two slots into the addresses the
-// device dials. Anything that does not resolve is skipped, and the caller must
-// treat an empty result as "omit the key" -- never as an empty list, because
-// sr-route refuses to start with "rrs is required" (cmd/sr-route/main.go:91).
-// Order is 主 then 备, and that order carries no meaning on the device: the
-// client keeps every session it is given up, so two rows are two equal active
-// reflectors (docs/o6c-overlay-page-plan.md §4, 拍板 E0).
-func (s *server) rrForTenantLocked(tenantID string) []wire.RRAddress {
-	oc := s.overlayConfigLocked(tenantID, false)
-	if oc == nil {
-		return nil
-	}
-	return s.rrAddrsLocked(tenantID, oc.RRPrimary, oc.RRBackup)
-}
-
 // rrsForDeviceLocked is the per-device answer the 第 4 段 uses: a device named by
-// an RR group dials that group's reflectors, every other device dials the
-// tenant's two slots. Both come back through the same resolver, so "the group
-// picked a row another tenant owns" fails exactly like the tenant-level pick.
+// an RR group dials that group's two reflectors, every other device dials the
+// whole of its tenant's list. The default used to be the tenant's two hand-picked
+// slots (removed 2026-11-01); the list itself is the tenant's now, so "all of it"
+// is the same default without a second place to pick.
 func (s *server) rrsForDeviceLocked(tenantID string, nodeID uint16) []wire.RRAddress {
-	oc := s.overlayConfigLocked(tenantID, false)
-	if oc == nil {
-		return nil
+	if oc := s.overlayConfigLocked(tenantID, false); oc != nil {
+		if g := oc.rrGroupOf(nodeID); g != nil {
+			return s.rrAddrsLocked(tenantID, g.RRPrimary, g.RRBackup)
+		}
 	}
-	if g := oc.rrGroupOf(nodeID); g != nil {
-		return s.rrAddrsLocked(tenantID, g.RRPrimary, g.RRBackup)
-	}
-	return s.rrAddrsLocked(tenantID, oc.RRPrimary, oc.RRBackup)
+	return s.rrAddrsForTenantLocked(tenantID)
 }
 
-// rrAddrsLocked resolves two slot ids against the library. A slot that no longer
-// resolves is skipped (the read-time checks say why), and an empty result means
-// "omit the key" -- never "send an empty list", because sr-route refuses to start
-// with no rrs at all (cmd/sr-route/main.go:91).
+// rrAddrsForTenantLocked is the whole list as the device dials it, in id order.
+// A tenant with no rows returns nil: the caller omits the key rather than sending
+// an empty list, because sr-route refuses to start with "rrs is required"
+// (cmd/sr-route/main.go:91).
+func (s *server) rrAddrsForTenantLocked(tenantID string) []wire.RRAddress {
+	rows := s.rrLibraryLocked(false).visibleTo(tenantID)
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]wire.RRAddress, 0, len(rows))
+	for _, it := range rows {
+		out = append(out, wire.RRAddress{ID: it.ID, Addr: it.Addr})
+	}
+	return out
+}
+
+// rrAddrsLocked resolves an RR group's two slots against the library. A slot
+// that no longer resolves is skipped (the read-time checks say why), and an empty
+// result means "omit the key" -- never "send an empty list", because sr-route
+// refuses to start with no rrs at all (cmd/sr-route/main.go:91).
 func (s *server) rrAddrsLocked(tenantID, primary, backup string) []wire.RRAddress {
 	lib := s.rrLibraryLocked(false)
 	out := []wire.RRAddress{}
@@ -239,44 +220,31 @@ func (s *server) rrAddrsLocked(tenantID, primary, backup string) []wire.RRAddres
 	return out
 }
 
-// overlayRRChecksLocked is the read-time check of the two slots. A dangling or
-// foreign reference cannot be produced through the API (create/edit reject it
-// and delete is guarded), so reaching this line means the state file was edited
-// or restored -- exactly the case that must be named rather than papered over.
-func (s *server) overlayRRChecksLocked(tenantID string) []ConfigCheck {
-	oc := s.overlayConfigLocked(tenantID, false)
-	if oc == nil {
-		return nil
+// overlayRRListChecksLocked is the read-time check of the tenant's RR list. The
+// list is the page's own input now, so the checks are about the list as a whole:
+//
+//   - no rows is an info, not an error: the controller then sends no rrs key at
+//     all, and every box enrolled before this page keeps the list the operator
+//     hand-wrote into route.json;
+//   - two rows with the same host:port is an error: the device would dial one
+//     reflector twice and hear every prefix twice. The API refuses it on save, so
+//     reaching this line means the state file was edited or restored.
+func (s *server) overlayRRListChecksLocked(tenantID string) []ConfigCheck {
+	rows := s.rrLibraryLocked(false).visibleTo(tenantID)
+	if len(rows) == 0 {
+		return []ConfigCheck{{Severity: "info",
+			Text: "还没有 RR：控制器不会下发 rrs 这个键，设备继续用它盘上自己那一份；要控制器接管，就在这里添加。"}}
 	}
-	lib := s.rrLibraryLocked(false)
+	seen := map[string]string{}
 	var out []ConfigCheck
-	add := func(sev, format string, args ...any) {
-		out = append(out, ConfigCheck{Severity: sev, Text: fmt.Sprintf(format, args...)})
-	}
-	// 拍板 E0：两格在设备上等价，所以检查里也叫 RR 1 / RR 2，不叫主/备。
-	// （存储与接口的字段名仍是 rr_primary / rr_backup：那是已经落盘的名字，
-	// 为了一个措辞改动 state 形状不值。）
-	for _, slot := range []struct{ name, id string }{{"RR 1", oc.RRPrimary}, {"RR 2", oc.RRBackup}} {
-		if slot.id == "" {
+	for _, it := range rows {
+		if first, ok := seen[it.Addr]; ok {
+			out = append(out, ConfigCheck{Severity: "error", Text: fmt.Sprintf(
+				"%s 和 %s 的地址都是 %s：两条行会让设备把同一个反射器拨两遍，删掉一条。",
+				first, it.ID, it.Addr)})
 			continue
 		}
-		it := lib.get(slot.id)
-		switch {
-		case it == nil:
-			add("error", "%s 选了库里已经不存在的条目 %q：这一台设备这一版拿不到 RR，去「Overlay 配置 › 全局」重选。",
-				slot.name, slot.id)
-		case it.TenantID == "":
-			add("error", "%s 选的 %q（%s）还没绑定租户，谁都选不到：让运营方在「资产 › RR 库」把它绑到一个租户。",
-				slot.name, slot.id, it.Name)
-		case it.TenantID != tenantID:
-			add("error", "%s 选的 %q（%s）归属别的租户，本租户用不了：这一版不会把它下发。",
-				slot.name, slot.id, it.Name)
-		}
-	}
-	if oc.RRPrimary == "" && oc.RRBackup == "" {
-		// Not an error: the device keeps whatever rrs the operator hand-wrote into
-		// route.json, which is how every box enrolled before this page works.
-		add("info", "还没选 RR：控制器不会下发 rrs 这个键，设备继续用它盘上自己那一份。")
+		seen[it.Addr] = it.ID
 	}
 	return out
 }
@@ -346,61 +314,38 @@ func (s *server) overlayRRGroupChecksLocked(tenantID string) []ConfigCheck {
 	return s.rrGroupsChecksLocked(tenantID, oc.RRGroups)
 }
 
-// rrPickRow is one library entry as the tenant's picker shows it. No 归属 and no
-// reference count: the tenant has already been filtered to what it may pick, and
-// how many other customers share a reflector is not this tenant's business.
-type rrPickRow struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Addr     string `json:"addr"`
-	Location string `json:"location"`
+// rrRow is one row of a tenant's RR list as GET /api/overlay returns it: what the
+// page edits, plus the RR groups that name it -- so the delete button can explain
+// itself before anyone clicks it. No 归属 field (the list is already this
+// tenant's) and no reference count from other tenants, which is not this
+// tenant's business.
+type rrRow struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	Addr      string       `json:"addr"`
+	Location  string       `json:"location"`
+	Groups    []rrGroupRef `json:"groups"`
+	CreatedAt int64        `json:"created_at_unix"`
+	UpdatedAt int64        `json:"updated_at_unix,omitempty"`
 }
 
-// rrLibraryRow is the same entry from the operator's side.
-type rrLibraryRow struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Addr     string `json:"addr"`
-	Location string `json:"location"`
-	TenantID string `json:"owner,omitempty"`
-	// OwnerLabel is the 归属 as a sentence, because a bare tenant id is unreadable
-	// and the two rows that need explaining -- no binding, or a tenant that no
-	// longer exists -- look identical as an empty or stale id.
-	OwnerLabel string   `json:"owner_label"`
-	UsedBy     []string `json:"used_by"`
-	UsedNames  []string `json:"used_names"`
-	CreatedAt  int64    `json:"created_at_unix"`
-	UpdatedAt  int64    `json:"updated_at_unix,omitempty"`
-}
-
-func (s *server) rrPickRowsLocked(tenantID string) []rrPickRow {
-	lib := s.rrLibraryLocked(false)
-	out := []rrPickRow{}
-	for _, it := range lib.visibleTo(tenantID) {
-		out = append(out, rrPickRow{ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location})
+func (s *server) rrRowsLocked(tenantID string) []rrRow {
+	out := []rrRow{}
+	for _, it := range s.rrLibraryLocked(false).visibleTo(tenantID) {
+		out = append(out, s.rrRowOfLocked(it))
 	}
 	return out
 }
 
-func (s *server) rrLibraryRowsLocked() []rrLibraryRow {
-	lib := s.rrLibraryLocked(false)
-	out := []rrLibraryRow{}
-	for _, it := range lib.Items {
-		refs := s.rrReferencesLocked(it.ID)
-		names := make([]string, 0, len(refs))
-		for _, t := range refs {
-			if tn := s.state.Tenants[t]; tn != nil {
-				names = append(names, tn.Name)
-			}
-		}
-		out = append(out, rrLibraryRow{
-			ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location,
-			TenantID: it.TenantID, OwnerLabel: s.rrOwnerLabelLocked(it),
-			UsedBy: refs, UsedNames: names,
-			CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
-		})
+func (s *server) rrRowOfLocked(it RRItem) rrRow {
+	groups := s.rrGroupRefsLocked(it.TenantID, it.ID)
+	if groups == nil {
+		groups = []rrGroupRef{}
 	}
-	return out
+	return rrRow{
+		ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location,
+		Groups: groups, CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
+	}
 }
 
 // validRRAddr accepts what the device can dial: a hostname or an IP literal with
@@ -482,21 +427,15 @@ func validRRName(name string) error {
 }
 
 // rrSelectionErrorLocked is the save-time half of the visibility rule. It says
-// only who may not pick a row: whether the id exists, and whether it is bound to
-// somebody else. Naming that tenant would tell a curious customer who else buys
-// service here, so the message stops at "不属于本租户".
+// only that the id is not in this tenant's list: whether it exists, and whose it
+// is when it does, would tell a curious customer who else buys service here.
 func (s *server) rrSelectionErrorLocked(tenantID, id string) string {
 	if id == "" {
 		return ""
 	}
 	it := s.rrLibraryLocked(false).get(id)
-	switch {
-	case it == nil:
-		return fmt.Sprintf("%q 不在 RR 库里；库里只有运营方在「资产 › RR 库」添加的那些条目", id)
-	case it.TenantID == "":
-		return fmt.Sprintf("%q（%s）还没绑定租户，谁都选不了：让运营方在「资产 › RR 库」把它绑到一个租户", id, it.Name)
-	case it.TenantID != tenantID:
-		return fmt.Sprintf("%q（%s）不属于本租户：每条 RR 只归一个租户所有", id, it.Name)
+	if it == nil || it.TenantID != tenantID {
+		return fmt.Sprintf("%q 不在本租户的 RR 列表里：选一条已经加在本租户的 RR", id)
 	}
 	return ""
 }
@@ -514,12 +453,18 @@ func validRRLocation(loc string) error {
 	return nil
 }
 
-// normalizeRRs repairs the library itself. It deliberately does NOT clear a
-// tenant's selection when the id it names is missing: that would make a
-// hand-edited or restored state file lose the customer's setting without anyone
-// being told, and overlayRRChecksLocked reports the contradiction instead. The
-// same rule covers rows with no tenant: they stay, visible to nobody, and the
-// operator's table says so.
+// normalizeRRs repairs the library itself. Two kinds of row are dropped:
+//
+//   - no id or no addr: one cannot be selected, the other cannot be dialled, and
+//     there is nothing to invent -- a half-empty RR would be advertised to a whole
+//     tenant;
+//   - no 归属, or a 归属 that names a tenant which no longer exists: since
+//     2026-11-01 the owning tenant is the row's only editor, so such a row is
+//     unreachable from every page and could never be deleted through the console.
+//
+// Nothing else is repaired behind the tenant's back: a duplicate address stays and
+// overlayRRListChecksLocked names it, because dropping one of two indistinguishable
+// rows is still picking a row for the customer.
 func normalizeRRs(st *State) bool {
 	changed := false
 	// Creating the container is not a repair worth a rewrite: a state file from
@@ -539,10 +484,11 @@ func normalizeRRs(st *State) bool {
 	kept := make([]RRItem, 0, len(lib.Items))
 	seen := map[string]bool{}
 	for _, it := range lib.Items {
-		// A row with no id cannot be selected, and a row with no addr cannot be
-		// dialled. Both are dropped rather than repaired -- there is nothing to
-		// invent, and a half-empty RR would be advertised to every tenant.
 		if it.ID == "" || it.Addr == "" || seen[it.ID] {
+			changed = true
+			continue
+		}
+		if it.TenantID == "" || st.Tenants[it.TenantID] == nil {
 			changed = true
 			continue
 		}
@@ -553,22 +499,12 @@ func normalizeRRs(st *State) bool {
 		lib.Items = kept
 	}
 	lib.ensure()
-	// The counter has to stay above every id in the table, or the next add
+	// The counter has to stay above every id left in the table, or the next add
 	// re-mints an id somebody may still be pointing at.
 	for _, it := range lib.Items {
 		var n int
 		if _, err := fmt.Sscanf(it.ID, "rr%d", &n); err == nil && n > lib.NextID {
 			lib.NextID = n
-			changed = true
-		}
-	}
-	for _, oc := range st.Overlays {
-		if oc == nil {
-			continue
-		}
-		p, b := strings.TrimSpace(oc.RRPrimary), strings.TrimSpace(oc.RRBackup)
-		if p != oc.RRPrimary || b != oc.RRBackup {
-			oc.RRPrimary, oc.RRBackup = p, b
 			changed = true
 		}
 	}

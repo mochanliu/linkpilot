@@ -292,12 +292,11 @@ type State struct {
 	// nothing in it references a tunnel or a port.
 	Overlays map[string]*OverlayConfig `json:"overlays"`
 
-	// RRs is the operator's route-reflector library: one table for the whole
-	// installation, because an RR is infrastructure the operator deploys rather
-	// than something each customer invents. A tenant's overlay config names two
-	// rows of it by id, and the controller renders those two into a device's
-	// route.json. Kept out of Overlays so a shared row cannot be duplicated per
-	// tenant and drift.
+	// RRs is the route-reflector table. One document rather than a per-tenant map,
+	// because the id counter has to be minted in one place and never rewound; but
+	// every row is bound to exactly one tenant (2026-11-01 定案), that tenant is the
+	// row's only editor, and the controller renders its own rows into that tenant's
+	// devices' route.json.
 	RRs *RRLibrary `json:"rrs,omitempty"`
 
 	// Sites is each tenant's location table, keyed by site id. Console-only:

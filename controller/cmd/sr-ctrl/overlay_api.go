@@ -58,14 +58,14 @@ func (s *server) handleAdminOverlay(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAdminOverlaySettings saves the global block of the overlay page: the
-// escape switch and the two reflector slots. It is one small document rather than
-// one endpoint per field so the page can save what it shows in one write, and it
-// stays a settings document rather than a group editor: 导通组 have their own
-// endpoint because they carry their own checks.
+// escape switch and the RR groups. It is one small document rather than one
+// endpoint per field so the page can save what it shows in one write, and it
+// stays a settings document rather than a group editor: 导通策略 have their own
+// endpoint because they carry their own checks. The RR list itself is edited
+// through /api/rrs.
 //
 // A field that is absent is left alone -- that is what lets the escape toggle
-// keep working while the RR pickers are still being built, and what makes
-// "清掉 RR 2" (an explicit empty string) different from "我没碰这个格子" (absent).
+// keep working from a page that only sent the switch.
 func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireTenant(w, r)
 	if !ok {
@@ -77,42 +77,19 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 	}
 	var req struct {
 		EscapeAllColors *bool             `json:"escape_all_colors"`
-		RRPrimary       *string           `json:"rr_primary"`
-		RRBackup        *string           `json:"rr_backup"`
 		RRGroups        *[]rrGroupRequest `json:"rr_groups"`
 	}
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if req.EscapeAllColors == nil && req.RRPrimary == nil && req.RRBackup == nil && req.RRGroups == nil {
-		http.Error(w, "escape_all_colors / rr_primary / rr_backup / rr_groups 至少要给一个", http.StatusBadRequest)
+	if req.EscapeAllColors == nil && req.RRGroups == nil {
+		http.Error(w, "escape_all_colors / rr_groups 至少要给一个", http.StatusBadRequest)
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	oc := s.overlayConfigLocked(id.TenantID, true)
-
-	// Both halves of the selection are checked before anything is written, and
-	// against the *next* pair rather than each alone: "主 = 备" is not visible from
-	// either field by itself.
-	nextPrimary, nextBackup := oc.RRPrimary, oc.RRBackup
-	if req.RRPrimary != nil {
-		nextPrimary = strings.TrimSpace(*req.RRPrimary)
-	}
-	if req.RRBackup != nil {
-		nextBackup = strings.TrimSpace(*req.RRBackup)
-	}
-	for _, slot := range []struct{ label, val string }{{"RR 1", nextPrimary}, {"RR 2", nextBackup}} {
-		if msg := s.rrSelectionErrorLocked(id.TenantID, slot.val); msg != "" {
-			http.Error(w, fmt.Sprintf("%s：%s", slot.label, msg), http.StatusBadRequest)
-			return
-		}
-	}
-	if nextPrimary != "" && nextPrimary == nextBackup {
-		http.Error(w, "RR 1 和 RR 2 不能选同一条：一条反射器不需要两个格子", http.StatusBadRequest)
-		return
-	}
 
 	// RR groups arrive as the whole list, so the checks run on the candidate
 	// document rather than on stored rows: "this device is in two groups" is a
@@ -155,7 +132,6 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 	if req.EscapeAllColors != nil {
 		oc.EscapeAllColors = *req.EscapeAllColors
 	}
-	oc.RRPrimary, oc.RRBackup = nextPrimary, nextBackup
 	if req.RRGroups != nil {
 		oc.RRGroups = nextGroups
 		oc.NextRRGroup = nextCounter
@@ -163,15 +139,13 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 	oc.UpdatedAt = time.Now().Unix()
 	oc.UpdatedBy = id.Username
 	s.save()
-	log.Printf("overlay: tenant=%s escape_all_colors=%t rr_primary=%q rr_backup=%q rr_groups=%d by %s",
-		id.TenantID, oc.EscapeAllColors, oc.RRPrimary, oc.RRBackup, len(oc.RRGroups), id.Username)
+	log.Printf("overlay: tenant=%s escape_all_colors=%t rr_groups=%d by %s",
+		id.TenantID, oc.EscapeAllColors, len(oc.RRGroups), id.Username)
 	writeJSON(w, map[string]any{
 		"ok":      true,
 		"overlay": s.overlayViewLocked(id.TenantID, time.Now().Unix()),
 		"settings": map[string]any{
 			"escape_all_colors": oc.EscapeAllColors,
-			"rr_primary":        oc.RRPrimary,
-			"rr_backup":         oc.RRBackup,
 			"rr_groups":         append([]RRGroup{}, oc.RRGroups...),
 		},
 	})
@@ -209,7 +183,7 @@ func (s *server) createOverlayGroup(w http.ResponseWriter, r *http.Request, id c
 	defer s.mu.Unlock()
 	oc := s.overlayConfigLocked(id.TenantID, true)
 	if len(oc.Groups) >= overlayMaxGroups {
-		http.Error(w, "导通组数量已达上限", http.StatusConflict)
+		http.Error(w, "导通策略数量已达上限", http.StatusConflict)
 		return
 	}
 	g := OverlayGroup{
@@ -268,12 +242,12 @@ func (s *server) updateOverlayGroup(w http.ResponseWriter, r *http.Request, id c
 	defer s.mu.Unlock()
 	oc := s.overlayConfigLocked(id.TenantID, false)
 	if oc == nil {
-		http.Error(w, "导通组不存在", http.StatusNotFound)
+		http.Error(w, "导通策略不存在", http.StatusNotFound)
 		return
 	}
 	existing := oc.group(groupID)
 	if existing == nil {
-		http.Error(w, "导通组不存在", http.StatusNotFound)
+		http.Error(w, "导通策略不存在", http.StatusNotFound)
 		return
 	}
 	g := OverlayGroup{ID: existing.ID, Name: req.Name, RT: existing.RT, Members: req.Members}
@@ -310,7 +284,7 @@ func (s *server) deleteOverlayGroup(w http.ResponseWriter, r *http.Request, id c
 	defer s.mu.Unlock()
 	oc := s.overlayConfigLocked(id.TenantID, false)
 	if oc == nil {
-		http.Error(w, "导通组不存在", http.StatusNotFound)
+		http.Error(w, "导通策略不存在", http.StatusNotFound)
 		return
 	}
 	idx := -1
@@ -321,7 +295,7 @@ func (s *server) deleteOverlayGroup(w http.ResponseWriter, r *http.Request, id c
 		}
 	}
 	if idx < 0 {
-		http.Error(w, "导通组不存在", http.StatusNotFound)
+		http.Error(w, "导通策略不存在", http.StatusNotFound)
 		return
 	}
 	removed := oc.Groups[idx]

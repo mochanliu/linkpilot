@@ -3,14 +3,14 @@
 // The properties worth pinning:
 //
 //   - a device named by a group dials that group's pair; a device no group names
-//     keeps dialling the tenant's two slots. There is no third case, and "not in
-//     a group" is not a special branch -- it is what the default pair means.
-//   - the group's slots go through the same ownership gate as the tenant's, so a
-//     group can never name a reflector another tenant owns.
+//     dials every row of the tenant's list. There is no third case, and "not in a
+//     group" is not a special branch -- the list itself is the default.
+//   - a group's slots go through the same ownership gate as the list, so a group
+//     can never name a reflector another tenant owns.
 //   - the list is replaced as a whole, which is why "one device in two groups" is
 //     refused here: the renderer answers membership with a single lookup.
-//   - a group is a reference: deleting an RR it names is refused, exactly like
-//     deleting one the tenant-level pair names.
+//   - a group is a reference: deleting an RR it names is refused until the group
+//     is changed.
 package main
 
 import (
@@ -37,28 +37,25 @@ func rrGroupWrite(id, name string, devices []uint16, primary, backup string) rrG
 }
 
 func TestRRGroupOverridesReflectorsPerDevice(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
-	b := rrCreate(t, s, ops, "RR-B", "192.0.2.11:20200", "t")
-	c := rrCreate(t, s, ops, "RR-C", "192.0.2.12:20200", "t")
-	d := rrCreate(t, s, ops, "RR-D", "192.0.2.13:20200", "t")
-	if rec := rrSet(t, s, ten, rrStr(a), rrStr(b)); rec.Code != http.StatusOK {
-		t.Fatalf("选默认两格 = %d (%s)", rec.Code, rec.Body.String())
-	}
+	s, ten, _, _ := rrFixture(t)
+	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
+	b := rrCreate(t, s, ten, "RR-B", "192.0.2.11:20200")
+	c := rrCreate(t, s, ten, "RR-C", "192.0.2.12:20200")
+	d := rrCreate(t, s, ten, "RR-D", "192.0.2.13:20200")
 
 	rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "华东站点", []uint16{1}, c, d))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
 	}
 
-	// node 1 is in the group; node 3 is not. Same tenant, different addresses.
+	// node 1 is in the group; node 3 is not, so it dials the whole list.
 	if rrs := decodedRRs(t, decodeRouteDoc(t, routeArtifact(t, s, "t", 1))); len(rrs) != 2 ||
 		rrs[0].ID != c || rrs[1].ID != d {
 		t.Fatalf("组内设备的 rrs = %+v，想要 %s/%s", rrs, c, d)
 	}
-	if rrs := decodedRRs(t, decodeRouteDoc(t, routeArtifact(t, s, "t", 3))); len(rrs) != 2 ||
-		rrs[0].ID != a || rrs[1].ID != b {
-		t.Fatalf("组外设备的 rrs = %+v，想要默认的 %s/%s", rrs, a, b)
+	if rrs := decodedRRs(t, decodeRouteDoc(t, routeArtifact(t, s, "t", 3))); len(rrs) != 4 ||
+		rrs[0].ID != a || rrs[3].ID != d {
+		t.Fatalf("组外设备的 rrs = %+v，想要整张列表 %s..%s", rrs, a, d)
 	}
 
 	v := overlayGetView(t, s, ten)
@@ -87,16 +84,16 @@ func TestRRGroupOverridesReflectorsPerDevice(t *testing.T) {
 }
 
 func TestRRGroupRejectsUnpickableOrConflictingLists(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
-	mine := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
-	foreign := rrCreate(t, s, ops, "别人的 RR", "192.0.2.20:20200", "t2")
+	s, ten, two, _ := rrFixture(t)
+	mine := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
+	foreign := rrCreate(t, s, two, "别人的 RR", "192.0.2.20:20200")
 
 	cases := []struct {
 		name string
 		body []rrGroupRequest
 		want string
 	}{
-		{"别的租户的 RR", []rrGroupRequest{rrGroupWrite("", "甲", []uint16{1}, foreign, "")}, "不属于本租户"},
+		{"别的租户的 RR", []rrGroupRequest{rrGroupWrite("", "甲", []uint16{1}, foreign, "")}, "不在本租户"},
 		{"一台 RR 也没选", []rrGroupRequest{rrGroupWrite("", "乙", []uint16{1}, "", "")}, "至少选一台 RR"},
 		{"两格同一条", []rrGroupRequest{rrGroupWrite("", "丙", []uint16{1}, mine, mine)}, "不能选同一条"},
 		{"设备不存在", []rrGroupRequest{rrGroupWrite("", "丁", []uint16{77}, mine, "")}, "不属于这个租户"},
@@ -130,13 +127,13 @@ func TestRRGroupRejectsUnpickableOrConflictingLists(t *testing.T) {
 }
 
 func TestRRGroupIsAReferenceForTheDeleteGuard(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
-	mine := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
-	other := rrCreate(t, s, ops, "RR-B", "192.0.2.11:20200", "t")
+	s, ten, _, _ := rrFixture(t)
+	mine := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
+	other := rrCreate(t, s, ten, "RR-B", "192.0.2.11:20200")
 	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "华东", []uint16{1}, mine, other)); rec.Code != http.StatusOK {
 		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
 	}
-	rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", `{"id":"`+mine+`"}`, ops)
+	rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", `{"id":"`+mine+`"}`, ten)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("删被分组选着的 RR = %d，想要 409 (%s)", rec.Code, rec.Body.String())
 	}
@@ -144,14 +141,14 @@ func TestRRGroupIsAReferenceForTheDeleteGuard(t *testing.T) {
 	if rec := rrGroupsSet(t, s, ten); rec.Code != http.StatusOK {
 		t.Fatalf("清空分组 = %d (%s)", rec.Code, rec.Body.String())
 	}
-	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", `{"id":"`+mine+`"}`, ops); rec.Code != http.StatusOK {
+	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", `{"id":"`+mine+`"}`, ten); rec.Code != http.StatusOK {
 		t.Fatalf("分组删掉后还删不了 RR = %d (%s)", rec.Code, rec.Body.String())
 	}
 }
 
 func TestRRGroupStaleStateIsNamedNotHealed(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
+	s, ten, _, _ := rrFixture(t)
+	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
 
 	s.mu.Lock()
 	oc := s.overlayConfigLocked("t", true)
@@ -186,8 +183,8 @@ func fmtChecks(checks []ConfigCheck) string {
 }
 
 func TestRRGroupNormalizeAndReload(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
+	s, ten, _, _ := rrFixture(t)
+	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
 	// Unsorted, duplicated device ids are normalized on the way in.
 	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "  华东 ", []uint16{3, 1, 3}, a, "")); rec.Code != http.StatusOK {
 		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())

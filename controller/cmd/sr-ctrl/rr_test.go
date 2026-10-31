@@ -1,17 +1,19 @@
-// Tests for the RR library and the tenant's two reflector slots (O6-c C-a).
+// Tests for the tenant's RR list (O6-c C-a; moved under the tenant 2026-11-01).
 //
 // The properties worth pinning are the ones a page cannot show:
 //
-//   - a tenant can only pick a row it is allowed to see, and the check that
-//     decides that is the same one the renderer uses -- so "the page offered it"
-//     and "the device will be told about it" cannot drift apart.
-//   - an unselected tenant renders NO rrs key at all. An empty list is not a
+//   - the list is the tenant's own, and the same filter decides what the page
+//     shows and what the device is told -- so "the page offered it" and "the
+//     device will dial it" cannot drift apart.
+//   - a tenant with no rows renders NO rrs key at all. An empty list is not a
 //     harmless placeholder: sr-route reads "rrs": [] and refuses to start, which
-//     would take the whole route plane of that box down over a blank dropdown.
-//   - deleting a row somebody still selects is refused, because the alternative
-//     silently drops that tenant's reflectors.
-//   - a reference that no longer resolves (a hand-edited state file) is reported
-//     and omitted, never repaired behind the tenant's back.
+//     would take the whole route plane of that box down over an empty table.
+//   - a device no RR group names dials every row; a grouped device dials its
+//     group's two. There is no third case and no second place to pick a pair.
+//   - deleting a row a group still names is refused, because the alternative
+//     silently drops that group's reflectors.
+//   - a row nothing can manage (no tenant, or a tenant that no longer exists) is
+//     dropped by normalize rather than left in the table forever.
 package main
 
 import (
@@ -27,12 +29,12 @@ import (
 	"sdwan/controller/internal/apply"
 )
 
+// rrFixture returns the tenant sessions for t and t2 plus an operator session.
+// The operator is only here to prove it no longer has any business with this
+// table.
 func rrFixture(t *testing.T) (*server, string, string, string) {
 	t.Helper()
 	s, ten, two := overlayFixture(t)
-	// The overlay fixture makes nodes but no tenant rows; the delete guard counts
-	// references per *existing* tenant, so the library needs the world the console
-	// actually has -- including names, which is what its refusal message quotes.
 	now := int64(1700000000)
 	ensureTenant(s.state, "t", now).Name = "甲方网络"
 	ensureTenant(s.state, "t2", now).Name = "乙方网络"
@@ -40,7 +42,7 @@ func rrFixture(t *testing.T) (*server, string, string, string) {
 	return s, ten, two, ops
 }
 
-// rrReq routes one request to the library's handler.
+// rrReq routes one request to the RR handlers.
 func rrReq(t *testing.T, s *server, method, target, body, sid string) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest(method, target, strings.NewReader(body))
@@ -51,48 +53,31 @@ func rrReq(t *testing.T, s *server, method, target, body, sid string) *httptest.
 	rec := httptest.NewRecorder()
 	switch r.URL.Path {
 	case "/api/rrs":
-		s.handleAdminRRs(rec, r)
+		s.handleTenantRRs(rec, r)
 	case "/api/rrs/delete":
-		s.handleAdminRRDelete(rec, r)
+		s.handleTenantRRDelete(rec, r)
 	default:
 		t.Fatalf("no RR handler for %s", r.URL.Path)
 	}
 	return rec
 }
 
-// rrCreate adds one row as the operator and returns its id.
-func rrCreate(t *testing.T, s *server, sid, name, addr, owner string) string {
+// rrCreate adds one row as the session's tenant and returns its id.
+func rrCreate(t *testing.T, s *server, sid, name, addr string) string {
 	t.Helper()
-	body, _ := json.Marshal(rrWriteRequest{Name: name, Addr: addr, Location: "lab", TenantID: owner})
+	body, _ := json.Marshal(rrWriteRequest{Name: name, Addr: addr, Location: "lab"})
 	rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), sid)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /api/rrs (%s %s) = %d (%s)", name, addr, rec.Code, rec.Body.String())
 	}
 	var out struct {
-		RR rrLibraryRow `json:"rr"`
+		RR rrRow `json:"rr"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode RR response: %v (%s)", err, rec.Body.String())
 	}
 	return out.RR.ID
 }
-
-// rrSet writes the tenant's two slots. A nil pointer means "leave that格子不动",
-// which is the distinction the handler is built around.
-func rrSet(t *testing.T, s *server, sid string, primary, backup *string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := map[string]any{"escape_all_colors": false}
-	if primary != nil {
-		req["rr_primary"] = *primary
-	}
-	if backup != nil {
-		req["rr_backup"] = *backup
-	}
-	body, _ := json.Marshal(req)
-	return overlayDo(t, s, http.MethodPut, "/api/overlay/settings", string(body), sid)
-}
-
-func rrStr(s string) *string { return &s }
 
 // deviceBundle fetches what the box would install right now, the same way
 // sr-agent does, and decodes it with the device's own decoder.
@@ -119,60 +104,59 @@ func decodedRRs(t *testing.T, doc map[string]json.RawMessage) []wireRRRow {
 	return out
 }
 
-// wireRRRow is what the device reads: the pair it dials plus the id it logs.
+// wireRRRow is what the device reads: the address it dials plus the id it logs.
 type wireRRRow struct {
 	ID   string `json:"id"`
 	Addr string `json:"addr"`
 }
 
-func TestRRAddListAndPick(t *testing.T) {
+func TestRRAddListAndSeeInOverlay(t *testing.T) {
 	s, ten, _, ops := rrFixture(t)
 
-	first := rrCreate(t, s, ops, "RR 上海", "rr-sh.example.com:20200", "t")
-	second := rrCreate(t, s, ops, "RR 法兰克福", "192.0.2.9:20200", "t")
+	first := rrCreate(t, s, ten, "RR 上海", "rr-sh.example.com:20200")
+	second := rrCreate(t, s, ten, "RR 法兰克福", "192.0.2.9:20200")
 	if first != "rr1" || second != "rr2" {
 		t.Fatalf("ids = %s, %s，想要 rr1、rr2", first, second)
 	}
 
-	rec := rrReq(t, s, http.MethodGet, "/api/rrs", "", ops)
+	rec := rrReq(t, s, http.MethodGet, "/api/rrs", "", ten)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /api/rrs = %d", rec.Code)
 	}
 	var list struct {
-		RRs []rrLibraryRow `json:"rrs"`
+		RRs    []rrRow `json:"rrs"`
+		MaxRRs int     `json:"max_rrs"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
-	if len(list.RRs) != 2 || list.RRs[0].OwnerLabel != "甲方网络" {
-		t.Fatalf("operator list = %+v", list.RRs)
+	if len(list.RRs) != 2 || list.MaxRRs != rrMaxPerTenant {
+		t.Fatalf("列表 = %+v max=%d", list.RRs, list.MaxRRs)
 	}
 	for _, row := range list.RRs {
-		if len(row.UsedBy) != 0 {
-			t.Errorf("%s 才刚建就有人选？used_by=%v", row.ID, row.UsedBy)
+		if len(row.Groups) != 0 {
+			t.Errorf("%s 才刚建就被分组选着？groups=%v", row.ID, row.Groups)
 		}
 	}
 
-	// The tenant sees both rows, with the address it will be dialled at.
+	// The same two rows arrive inside the overlay view, which is the only read the
+	// page uses -- one filter, not two.
 	v := overlayGetView(t, s, ten)
-	if len(v.RRLibrary) != 2 || v.RRPrimary != "" || v.RRLibrary[0].Addr == "" {
-		t.Fatalf("tenant picker = %+v primary=%q", v.RRLibrary, v.RRPrimary)
+	if len(v.RRLibrary) != 2 || v.RRLibrary[0].ID != first || v.RRLibrary[0].Addr == "" {
+		t.Fatalf("overlay 里的 RR 列表 = %+v", v.RRLibrary)
 	}
-	if v.RRNote == "" {
-		t.Error("页面需要一句关于主备语义的话，API 没给")
+	if v.MaxRRs != rrMaxPerTenant || v.RRNote == "" {
+		t.Fatalf("页面上限/说明没给: max=%d note=%q", v.MaxRRs, v.RRNote)
 	}
-	// Nothing picked yet: the honest line is an info, not an error, because every
-	// box enrolled before this page runs on the rrs its operator wrote by hand.
-	if msg := hasBlockingCheck(v.Checks); msg != "" {
-		t.Errorf("没选 RR 不该是错误: %s", msg)
-	}
-	if !strings.Contains(fmt.Sprint(v.Checks), "还没选 RR") {
-		t.Errorf("没选 RR 时要有一条说明，checks=%+v", v.Checks)
+
+	// The operator has no page and no endpoint here any more.
+	if rec := rrReq(t, s, http.MethodGet, "/api/rrs", "", ops); rec.Code != http.StatusForbidden {
+		t.Errorf("运营方读 /api/rrs = %d，想要 403", rec.Code)
 	}
 }
 
 func TestRRAddressValidation(t *testing.T) {
-	s, _, _, ops := rrFixture(t)
+	s, ten, _, _ := rrFixture(t)
 	cases := []struct {
 		addr string
 		ok   bool
@@ -195,8 +179,8 @@ func TestRRAddressValidation(t *testing.T) {
 		{"", false},
 	}
 	for i, c := range cases {
-		body, _ := json.Marshal(rrWriteRequest{Name: fmt.Sprintf("probe-%d", i), Addr: c.addr, TenantID: "t"})
-		rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), ops)
+		body, _ := json.Marshal(rrWriteRequest{Name: fmt.Sprintf("probe-%d", i), Addr: c.addr})
+		rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), ten)
 		if ok := rec.Code == http.StatusOK; ok != c.ok {
 			t.Errorf("addr %q = %d，想要 ok=%v (%s)", c.addr, rec.Code, c.ok, rec.Body.String())
 		}
@@ -204,200 +188,219 @@ func TestRRAddressValidation(t *testing.T) {
 	// The name is checked too, and a long one is the shape that would otherwise
 	// only be noticed when the page overflows.
 	if rec := rrReq(t, s, http.MethodPost, "/api/rrs",
-		fmt.Sprintf(`{"name":%q,"addr":"192.0.2.40:20200"}`, strings.Repeat("长", 90)), ops); rec.Code != http.StatusBadRequest {
+		fmt.Sprintf(`{"name":%q,"addr":"192.0.2.40:20200"}`, strings.Repeat("长", 90)), ten); rec.Code != http.StatusBadRequest {
 		t.Errorf("超长名字 = %d，想要 400", rec.Code)
 	}
 }
 
-func TestRRIsBoundToOneTenant(t *testing.T) {
-	s, ten, two, ops := rrFixture(t)
-	// The row name is echoed in the refusal, so it must not be a name that hands
-	// the owner away either.
-	mine := rrCreate(t, s, ops, "VIP 专线", "192.0.2.2:20200", "t")
+func TestRRIsOneTenantsOwn(t *testing.T) {
+	s, ten, two, _ := rrFixture(t)
+	mine := rrCreate(t, s, ten, "VIP 专线", "192.0.2.2:20200")
 
 	// t sees its own row; t2 sees nothing -- and cannot even tell that the row
-	// exists, because it is not in its list.
+	// exists, because it is not in its list and every by-id answer is 404.
 	if got := overlayGetView(t, s, ten).RRLibrary; len(got) != 1 || got[0].ID != mine {
-		t.Errorf("t 的可选列表 = %+v，想要只有 %s", got, mine)
+		t.Errorf("t 的列表 = %+v，想要只有 %s", got, mine)
 	}
-	if got2 := overlayGetView(t, s, two).RRLibrary; len(got2) != 0 {
-		t.Errorf("t2 的可选列表 = %+v，想要 0 条", got2)
+	if got := overlayGetView(t, s, two).RRLibrary; len(got) != 0 {
+		t.Errorf("t2 的列表 = %+v，想要 0 条", got)
+	}
+	if rec := rrReq(t, s, http.MethodPut, "/api/rrs",
+		fmt.Sprintf(`{"id":%q,"name":"偷改","addr":"192.0.2.3:20200"}`, mine), two); rec.Code != http.StatusNotFound {
+		t.Errorf("t2 改 t 的 RR = %d，想要 404", rec.Code)
+	}
+	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, mine), two); rec.Code != http.StatusNotFound {
+		t.Errorf("t2 删 t 的 RR = %d，想要 404", rec.Code)
+	}
+	// Reserving an address is a per-tenant rule, not a global one: two tenants may
+	// each run a reflector on the same host without affecting each other.
+	if got := rrCreate(t, s, two, "乙方自己的", "192.0.2.2:20200"); got == mine {
+		t.Fatalf("t2 拿到了一个已存在的 id: %s", got)
 	}
 
-	if rec := rrSet(t, s, two, rrStr(mine), nil); rec.Code != http.StatusBadRequest {
-		t.Fatalf("t2 选别人的 RR = %d，想要 400 (%s)", rec.Code, rec.Body.String())
-	} else if body := rec.Body.String(); strings.Contains(body, "甲方网络") {
-		t.Errorf("拒绝消息里说出了归属租户是谁: %s", body)
-	} else if !strings.Contains(body, "不属于本租户") {
-		t.Errorf("拒绝的话没说明原因: %s", body)
+	// A group of t2 that names t's row is refused by the same visibility gate the
+	// rest of the page uses, and the message must not hand the owner away.
+	rec := rrGroupsSet(t, s, two, rrGroupWrite("", "乙组", []uint16{9}, mine, ""))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("t2 的分组选了 t 的 RR = %d，想要 400 (%s)", rec.Code, rec.Body.String())
 	}
-	if rec := rrSet(t, s, ten, rrStr(mine), nil); rec.Code != http.StatusOK {
-		t.Fatalf("t 选自己的 RR = %d (%s)", rec.Code, rec.Body.String())
+	if body := rec.Body.String(); strings.Contains(body, "甲方网络") || strings.Contains(body, "VIP 专线") {
+		t.Errorf("拒绝消息里说出了另一租户的名字: %s", body)
 	}
-	// An id that is not in the library at all is refused the same way.
-	if rec := rrSet(t, s, ten, rrStr("rr999"), nil); rec.Code != http.StatusBadRequest {
-		t.Fatalf("选了不存在的 id = %d，想要 400", rec.Code)
-	}
-	// 主 = 备 is not visible from either field alone, so it needs the pair.
-	if rec := rrSet(t, s, ten, rrStr(mine), rrStr(mine)); rec.Code != http.StatusBadRequest {
-		t.Fatalf("主备同一条 = %d，想要 400 (%s)", rec.Code, rec.Body.String())
-	}
-	// Every row is added for somebody: no 归属 is a missing decision, not "shared".
-	if rec := rrReq(t, s, http.MethodPost, "/api/rrs",
-		`{"name":"没有归属","addr":"192.0.2.3:20200"}`, ops); rec.Code != http.StatusBadRequest {
-		t.Errorf("不填归属 = %d，想要 400 (%s)", rec.Code, rec.Body.String())
-	}
-	// An 归属 that names nobody is a typo, and a typo means a row no tenant can pick.
-	if rec := rrReq(t, s, http.MethodPost, "/api/rrs",
-		`{"name":"幽灵","addr":"192.0.2.3:20200","owner":"nope"}`, ops); rec.Code != http.StatusBadRequest {
-		t.Errorf("归属填了不存在的租户 = %d，想要 400", rec.Code)
+	if !strings.Contains(rec.Body.String(), "不在本租户") {
+		t.Errorf("拒绝的话没说明原因: %s", rec.Body.String())
 	}
 }
 
-// A row restored from before the binding rule -- its "owner" was empty, which
-// used to mean "shared" -- must not be adopted by every tenant now. It stays in
-// the library, is visible to nobody, and is named in the checks.
-func TestRRUnboundRowIsVisibleToNobody(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
+// A row restored from before the binding rule -- its "owner" was empty, which used
+// to mean "shared" -- must not be adopted by every tenant, and nobody can manage
+// it through the console any more, so normalize drops it.
+func TestRRUnmanageableRowIsDropped(t *testing.T) {
+	s, ten, _, _ := rrFixture(t)
 	s.mu.Lock()
 	lib := s.rrLibraryLocked(true)
-	lib.Items = append(lib.Items, RRItem{ID: "rr50", Name: "老数据", Addr: "192.0.2.50:20200"})
-	s.overlayConfigLocked("t", true).RRPrimary = "rr50"
+	lib.Items = append(lib.Items,
+		RRItem{ID: "rr50", Name: "老数据", Addr: "192.0.2.50:20200"},
+		RRItem{ID: "rr51", Name: "幽灵租户", Addr: "192.0.2.51:20200", TenantID: "gone"})
 	s.mu.Unlock()
 
 	if got := overlayGetView(t, s, ten).RRLibrary; len(got) != 0 {
-		t.Errorf("t 看到了没绑租户的行: %+v", got)
-	}
-	msg := hasBlockingCheck(overlayGetView(t, s, ten).Checks)
-	if !strings.Contains(msg, "rr50") || !strings.Contains(msg, "绑定租户") {
-		t.Errorf("读时检查没把「没绑租户」说清楚: %q", msg)
+		t.Errorf("t 看到了不属于任何现存租户的行: %+v", got)
 	}
 	if doc := decodeRouteDoc(t, routeArtifact(t, s, "t", 1)); doc["rrs"] != nil {
-		t.Errorf("没绑租户的行还是下发了: %s", doc["rrs"])
+		t.Errorf("管不了的行还是下发了: %s", doc["rrs"])
 	}
-	// The operator's table has to explain it too, and normalize must keep the row.
-	rec := rrReq(t, s, http.MethodGet, "/api/rrs", "", ops)
-	if !strings.Contains(rec.Body.String(), "未绑定租户") {
-		t.Errorf("运营方表里没说明这一条没绑租户: %s", rec.Body.String())
+	// The empty list is an info, not an error: the device keeps its own rrs.
+	if msg := hasBlockingCheck(overlayGetView(t, s, ten).Checks); msg != "" {
+		t.Errorf("没有 RR 不该是错误: %s", msg)
 	}
-	normalizeRRs(s.state)
-	if len(s.state.RRs.Items) != 1 || s.state.RRs.Items[0].ID != "rr50" {
-		t.Fatalf("normalize 把没绑租户的行删了: %+v", s.state.RRs.Items)
+	if !normalizeRRs(s.state) {
+		t.Fatal("normalize 没报告删掉了管不了的行")
+	}
+	if len(s.state.RRs.Items) != 0 {
+		t.Fatalf("normalize 之后还留着: %+v", s.state.RRs.Items)
 	}
 }
 
-func TestRRRenderIsOptInAndNeverEmpty(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
+func TestRRRenderIsAllRowsAndNeverEmpty(t *testing.T) {
+	s, ten, _, _ := rrFixture(t)
 	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))["rrs"]; ok {
-		t.Fatal("租户还没选，第 4 段里就有 rrs 了")
+		t.Fatal("租户还没有 RR，第 4 段里就有 rrs 了")
 	}
 
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
-	b := rrCreate(t, s, ops, "RR-B", "192.0.2.11:20200", "t")
-	if rec := rrSet(t, s, ten, rrStr(a), rrStr(b)); rec.Code != http.StatusOK {
-		t.Fatalf("选主备 = %d (%s)", rec.Code, rec.Body.String())
-	}
+	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
+	b := rrCreate(t, s, ten, "RR-B", "192.0.2.11:20200")
 
 	doc := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))
 	if _, ok := doc["rrs"]; !ok {
-		t.Fatal("选了 RR，第 4 段却没有 rrs")
+		t.Fatal("有了 RR，第 4 段却没有 rrs")
 	}
 	rrs := decodedRRs(t, doc)
 	if len(rrs) != 2 || rrs[0].ID != a || rrs[0].Addr != "192.0.2.10:20200" || rrs[1].ID != b {
-		t.Fatalf("rrs = %+v，想要主在前、两条都带上 id 和 addr", rrs)
+		t.Fatalf("rrs = %+v，想要两条、按 id 排序、都带上 id 和 addr", rrs)
 	}
 	// The other tenant is unaffected: its devices get no rrs key.
 	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t2", 9))["rrs"]; ok {
-		t.Error("t2 没选 RR，却收到了 rrs")
+		t.Error("t2 没有 RR，却收到了 rrs")
 	}
 
-	// Only 主: one row, not a two-row list with a hole in it.
-	if rec := rrSet(t, s, ten, rrStr(a), rrStr("")); rec.Code != http.StatusOK {
-		t.Fatalf("清掉备 RR = %d (%s)", rec.Code, rec.Body.String())
-	}
-	if rrs := decodedRRs(t, decodeRouteDoc(t, routeArtifact(t, s, "t", 1))); len(rrs) != 1 || rrs[0].ID != a {
-		t.Fatalf("只选主的时候 rrs = %+v", rrs)
-	}
-
-	// Clearing both goes back to "no key at all", which is what keeps a box's
-	// hand-written reflector list alive.
-	if rec := rrSet(t, s, ten, rrStr(""), nil); rec.Code != http.StatusOK {
-		t.Fatalf("清掉主 RR = %d", rec.Code)
+	// Deleting every row goes back to "no key at all", which is what keeps a box's
+	// own reflector list alive.
+	for _, id := range []string{a, b} {
+		if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete",
+			fmt.Sprintf(`{"id":%q}`, id), ten); rec.Code != http.StatusOK {
+			t.Fatalf("删 %s = %d (%s)", id, rec.Code, rec.Body.String())
+		}
 	}
 	out := routeArtifact(t, s, "t", 1)
 	if doc := decodeRouteDoc(t, out); doc["rrs"] != nil {
-		t.Fatalf("两个格子都清空了还在发 rrs: %s", doc["rrs"])
+		t.Fatalf("删空了还在发 rrs: %s", doc["rrs"])
 	}
-	// And a tenant that picks nothing never sees an empty array either.
+	// And a tenant with no rows never sees an empty array either.
 	if strings.Contains(out, `"rrs": []`) {
 		t.Fatal("发了一条空的 rrs：sr-route 读到这个会拒绝启动")
 	}
 }
 
-func TestRRDeleteGuardAndIDNeverReturns(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
-	keep := rrCreate(t, s, ops, "被选中的 RR", "192.0.2.20:20200", "t")
-	free := rrCreate(t, s, ops, "没人选", "192.0.2.21:20200", "t")
+func TestRRDuplicateAddressRejected(t *testing.T) {
+	s, ten, _, _ := rrFixture(t)
+	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
 
-	if rec := rrSet(t, s, ten, rrStr(keep), nil); rec.Code != http.StatusOK {
-		t.Fatalf("选 RR = %d", rec.Code)
+	// Same address under a different name is the same reflector twice.
+	body, _ := json.Marshal(rrWriteRequest{Name: "RR-A 副本", Addr: "192.0.2.10:20200"})
+	rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), ten)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "192.0.2.10:20200") {
+		t.Fatalf("重复地址 = %d (%s)，想要 400 并带上那个地址", rec.Code, rec.Body.String())
 	}
-	rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, keep), ops)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("删被引用的 RR = %d，想要 409 (%s)", rec.Code, rec.Body.String())
+
+	b := rrCreate(t, s, ten, "RR-B", "192.0.2.11:20200")
+	// Editing B onto A's address is refused; saving B unchanged is not.
+	if rec := rrReq(t, s, http.MethodPut, "/api/rrs",
+		fmt.Sprintf(`{"id":%q,"name":"RR-B","addr":"192.0.2.10:20200"}`, b), ten); rec.Code != http.StatusBadRequest {
+		t.Errorf("改成别人的地址 = %d，想要 400 (%s)", rec.Code, rec.Body.String())
 	}
-	// The refusal has to name the customer to go and un-pick it, or the operator
-	// learns only that something is wrong.
-	if !strings.Contains(rec.Body.String(), "甲方网络") {
-		t.Errorf("拒绝消息没带上是哪个租户: %s", rec.Body.String())
+	if rec := rrReq(t, s, http.MethodPut, "/api/rrs",
+		fmt.Sprintf(`{"id":%q,"name":"RR-B","addr":"192.0.2.11:20200"}`, b), ten); rec.Code != http.StatusOK {
+		t.Errorf("不改地址的编辑被自己挡住了 = %d (%s)", rec.Code, rec.Body.String())
 	}
-	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, free), ops); rec.Code != http.StatusOK {
-		t.Fatalf("删没人选的 RR = %d (%s)", rec.Code, rec.Body.String())
-	}
-	// Unselect, and it becomes deletable; the counter does not hand that id back.
-	if rec := rrSet(t, s, ten, rrStr(""), nil); rec.Code != http.StatusOK {
-		t.Fatalf("清掉选择 = %d", rec.Code)
-	}
-	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, keep), ops); rec.Code != http.StatusOK {
-		t.Fatalf("解除引用之后删 = %d (%s)", rec.Code, rec.Body.String())
-	}
-	next := rrCreate(t, s, ops, "RR 新增", "192.0.2.22:20200", "t")
-	if next == keep || next == free {
-		t.Fatalf("新条目复用了已删除的 id %s：租户里那条引用会突然指向一台别的机器", next)
+
+	// The API refuses it, so a duplicate can only come from a hand-edited file;
+	// then the read-time check has to name both rows instead of staying silent.
+	s.mu.Lock()
+	s.state.RRs.Items = append(s.state.RRs.Items,
+		RRItem{ID: "rr90", Name: "手写副本", Addr: "192.0.2.10:20200", TenantID: "t"})
+	s.mu.Unlock()
+	msg := hasBlockingCheck(overlayGetView(t, s, ten).Checks)
+	if !strings.Contains(msg, a) || !strings.Contains(msg, "rr90") {
+		t.Errorf("重复地址没被两个 id 一起点名: %q", msg)
 	}
 }
 
-// A dangling reference is only reachable by editing state.json by hand (the API
-// refuses it and delete is guarded). The answer must be "say it and send nothing",
-// not "quietly forget the customer's setting".
-func TestRRDanglingReferenceIsNamedNotHealed(t *testing.T) {
-	s, ten, _, _ := rrFixture(t)
-	s.mu.Lock()
-	s.overlayConfigLocked("t", true).RRPrimary = "rr77"
-	s.mu.Unlock()
+func TestRRMaxPerTenant(t *testing.T) {
+	s, ten, two, _ := rrFixture(t)
+	for i := 0; i < rrMaxPerTenant; i++ {
+		rrCreate(t, s, ten, fmt.Sprintf("RR-%d", i), fmt.Sprintf("192.0.2.%d:20200", 100+i))
+	}
+	body, _ := json.Marshal(rrWriteRequest{Name: "多出来的", Addr: "192.0.2.200:20200"})
+	rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), ten)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("第 %d 条 = %d，想要 409 (%s)", rrMaxPerTenant+1, rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), fmt.Sprint(rrMaxPerTenant)) {
+		t.Errorf("拒绝消息没带上上限: %s", rec.Body.String())
+	}
+	// The cap is per tenant, not per table.
+	if got := rrCreate(t, s, two, "乙方第一条", "192.0.2.201:20200"); got == "" {
+		t.Fatal("另一个租户被别人的上限挡住了")
+	}
+}
 
-	v := overlayGetView(t, s, ten)
-	msg := hasBlockingCheck(v.Checks)
-	if msg == "" {
-		t.Fatal("引用了一个不存在的 RR，页面却说不出问题")
+func TestRRDeleteGuardAndIDNeverReturns(t *testing.T) {
+	s, ten, _, _ := rrFixture(t)
+	keep := rrCreate(t, s, ten, "被分组的 RR", "192.0.2.20:20200")
+	free := rrCreate(t, s, ten, "没人选", "192.0.2.21:20200")
+
+	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "华东", []uint16{1}, keep, "")); rec.Code != http.StatusOK {
+		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(msg, "rr77") {
-		t.Errorf("拒绝的话没带上那个 id: %s", msg)
+	rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, keep), ten)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("删被分组选着的 RR = %d，想要 409 (%s)", rec.Code, rec.Body.String())
 	}
-	if v.RRPrimary != "rr77" {
-		t.Errorf("读一次就把租户的选择抹掉了: %q", v.RRPrimary)
+	// The refusal has to name the group to go and change, or the tenant learns only
+	// that something is wrong.
+	if !strings.Contains(rec.Body.String(), "华东") {
+		t.Errorf("拒绝消息没带上是哪个分组: %s", rec.Body.String())
 	}
-	if doc := decodeRouteDoc(t, routeArtifact(t, s, "t", 1)); doc["rrs"] != nil {
-		t.Errorf("解析不出来的引用还是下发了: %s", doc["rrs"])
+	// The list shows the reference too, so the row can explain itself before the
+	// delete button is pressed.
+	for _, row := range overlayGetView(t, s, ten).RRLibrary {
+		if row.ID != keep {
+			continue
+		}
+		if len(row.Groups) != 1 || row.Groups[0].Name != "华东" {
+			t.Errorf("%s 的引用 = %+v，想要华东那一条", keep, row.Groups)
+		}
+	}
+	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, free), ten); rec.Code != http.StatusOK {
+		t.Fatalf("删没人选的 RR = %d (%s)", rec.Code, rec.Body.String())
+	}
+	// Dropping the group releases the row; the counter does not hand the id back.
+	if rec := rrGroupsSet(t, s, ten); rec.Code != http.StatusOK {
+		t.Fatalf("清空分组 = %d", rec.Code)
+	}
+	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, keep), ten); rec.Code != http.StatusOK {
+		t.Fatalf("解除引用之后删 = %d (%s)", rec.Code, rec.Body.String())
+	}
+	next := rrCreate(t, s, ten, "RR 新增", "192.0.2.22:20200")
+	if next == keep || next == free {
+		t.Fatalf("新条目复用了已删除的 id %s：分组里那条引用会突然指向一台别的机器", next)
 	}
 }
 
 func TestRRPersistenceAndNormalize(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
-	if rec := rrSet(t, s, ten, rrStr(a), nil); rec.Code != http.StatusOK {
-		t.Fatalf("选 RR = %d", rec.Code)
-	}
+	s, ten, _, _ := rrFixture(t)
+	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
 	path := filepath.Join(t.TempDir(), "state.json")
 	file := &fileStore{path: path}
 	s.store = file
@@ -407,11 +410,10 @@ func TestRRPersistenceAndNormalize(t *testing.T) {
 		t.Fatalf("reload: %v", err)
 	}
 	if st.RRs == nil || len(st.RRs.Items) != 1 || st.RRs.Items[0].ID != a {
-		t.Fatalf("RR 库没存下来: %+v", st.RRs)
+		t.Fatalf("RR 列表没存下来: %+v", st.RRs)
 	}
-	oc := st.Overlays["t"]
-	if oc == nil || oc.RRPrimary != a {
-		t.Fatalf("租户的选择没存下来: %+v", oc)
+	if st.RRs.Items[0].TenantID != "t" {
+		t.Fatalf("归属没存下来: %+v", st.RRs.Items[0])
 	}
 	// A row with no address cannot be dialled: normalize drops it rather than
 	// advertise an RR no device can reach.
@@ -424,39 +426,22 @@ func TestRRPersistenceAndNormalize(t *testing.T) {
 			t.Fatal("normalize 之后那条没有地址的 RR 还在")
 		}
 	}
-	// normalize must NOT clear a selection nobody can resolve -- that is the rule
-	// TestRRDanglingReferenceIsNamedNotHealed pins, restated here because a repair
-	// pass is exactly what would break it.
 	if normalizeRRs(st) {
 		t.Error("一次干净的 normalize 报告说有改动")
-	}
-	if st.Overlays["t"].RRPrimary != a {
-		t.Errorf("normalize 把租户的选择改了: %q", st.Overlays["t"].RRPrimary)
 	}
 	// A hand-edited id higher than the counter must not be re-minted later.
 	st.RRs.Items = append(st.RRs.Items, RRItem{ID: "rr40", Name: "手写", Addr: "192.0.2.40:20200", TenantID: "t"})
 	normalizeRRs(st)
 	if st.RRs.NextID < 40 {
-		t.Errorf("计数器 %d 还低于库里已有的 rr40，下次新建会撞 id", st.RRs.NextID)
+		t.Errorf("计数器 %d 还低于列表里已有的 rr40，下次新建会撞 id", st.RRs.NextID)
 	}
 }
 
-func TestRROperatorOnly(t *testing.T) {
-	s, ten, _, _ := rrFixture(t)
-	if rec := rrReq(t, s, http.MethodGet, "/api/rrs", "", ten); rec.Code != http.StatusForbidden {
-		t.Errorf("租户读 /api/rrs = %d，想要 403", rec.Code)
-	}
-	body, _ := json.Marshal(rrWriteRequest{Name: "x", Addr: "1.2.3.4:20200"})
-	if rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), ten); rec.Code != http.StatusForbidden {
-		t.Errorf("租户写 /api/rrs = %d，想要 403", rec.Code)
-	}
-}
-
-// Changing an RR address is a configuration change like any other: it reaches a
-// box by publishing, and the page has to say so rather than let the operator think
+// Adding or editing a row is a configuration change like any other: it reaches a
+// box by publishing, and the page has to say so rather than let the tenant think
 // an address is live the moment it is typed.
 func TestRREditMarksTheDevicePending(t *testing.T) {
-	s, ten, _, ops := rrFixture(t)
+	s, ten, _, _ := rrFixture(t)
 	// The overlay fixture seeds drafts straight into the map, so node 1 has no
 	// saved version and a publish would be refused. Save one the way the page does.
 	cfg := baseValidConfig()
@@ -465,22 +450,19 @@ func TestRREditMarksTheDevicePending(t *testing.T) {
 	if v := decodeConfigView(t, configRequest(t, s, ten, http.MethodPut, "/api/config", string(draftBody))); v.Version != 1 {
 		t.Fatalf("存草稿 = %+v", v)
 	}
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
-	if rec := rrSet(t, s, ten, rrStr(a), nil); rec.Code != http.StatusOK {
-		t.Fatalf("选 RR = %d", rec.Code)
-	}
+	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
 	if rec := publishReq(t, s, ten, http.MethodPost, `{"node_id":1}`); rec.Code != http.StatusOK {
 		t.Fatalf("发布 v1 = %d (%s)", rec.Code, rec.Body.String())
 	}
 	if v := decodeConfigView(t, configRequest(t, s, ten, http.MethodGet, "/api/config?node=1", "")); v.OverlayPending {
 		t.Fatal("刚发布完就说待发布")
 	}
-	body, _ := json.Marshal(rrWriteRequest{ID: a, Name: "RR-A", Addr: "192.0.2.99:20200", TenantID: "t"})
-	if rec := rrReq(t, s, http.MethodPut, "/api/rrs", string(body), ops); rec.Code != http.StatusOK {
+	body, _ := json.Marshal(rrWriteRequest{ID: a, Name: "RR-A", Addr: "192.0.2.99:20200"})
+	if rec := rrReq(t, s, http.MethodPut, "/api/rrs", string(body), ten); rec.Code != http.StatusOK {
 		t.Fatalf("改地址 = %d (%s)", rec.Code, rec.Body.String())
 	}
 	if v := decodeConfigView(t, configRequest(t, s, ten, http.MethodGet, "/api/config?node=1", "")); !v.OverlayPending {
-		t.Fatal("运营方改了 RR 地址，设备页却没有说这一版还没发布")
+		t.Fatal("改了 RR 地址，设备页却没有说这一版还没发布")
 	}
 	if rrs := decodedRRs(t, decodeRouteDoc(t, routeArtifact(t, s, "t", 1))); len(rrs) != 1 || rrs[0].Addr != "192.0.2.99:20200" {
 		t.Fatalf("改完地址、准备发布的那段还是旧的: %+v", rrs)

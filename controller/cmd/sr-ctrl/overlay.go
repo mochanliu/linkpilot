@@ -69,7 +69,7 @@ type OverlayGroup struct {
 }
 
 // RRGroup is one 反射器分组: the devices in the list dial this group's two
-// reflectors instead of the tenant's default two slots. It exists because one
+// reflectors instead of every row of the tenant's RR list. It exists because one
 // tenant's sites may sit closer to different reflectors; the reflector side does
 // not care (it reflects to every session it has), so the split is purely a
 // per-device address choice.
@@ -81,9 +81,9 @@ type RRGroup struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name"`
 	DeviceIDs []uint16 `json:"device_ids"`
-	// Same two slots, same storage names, as the tenant-level pair: ids of rows
-	// in the operator's library, validated by the same rrSelectionErrorLocked gate
-	// so a group can never name a reflector another tenant owns.
+	// Ids of rows in the same tenant's RR list, validated by the same
+	// rrSelectionErrorLocked gate, so a group can never name a reflector another
+	// tenant owns.
 	RRPrimary string `json:"rr_primary,omitempty"`
 	RRBackup  string `json:"rr_backup,omitempty"`
 }
@@ -97,20 +97,10 @@ type OverlayConfig struct {
 	EscapeAllColors bool           `json:"escape_all_colors"`
 	Groups          []OverlayGroup `json:"groups"`
 
-	// RRPrimary and RRBackup are the tenant's two 反射器 slots. They hold ids of
-	// rows in the operator's library (State.RRs), never addresses: the operator
-	// owns what a reflector's address is, the tenant only picks. Empty means "the
-	// controller says nothing about rrs", which is what every box enrolled before
-	// this page relied on -- it keeps the list the operator hand-wrote into
-	// route.json. The two names carry no priority: the route client keeps a
-	// session up to every entry it is handed, so two rows are two equal active
-	// reflectors (docs/o6c-overlay-page-plan.md 拍板 E0).
-	RRPrimary string `json:"rr_primary,omitempty"`
-	RRBackup  string `json:"rr_backup,omitempty"`
-
 	// RRGroups splits the tenant's devices across reflector sets. A device that
-	// no group names falls back to the two slots above -- one rule, no branch:
-	// "not in a group" is exactly what the default pair is for.
+	// no group names dials every RR of the tenant's list -- one rule, no branch:
+	// RRs belong to the tenant now, so "all of them" is the default and there is
+	// no second place to pick a pair.
 	RRGroups []RRGroup `json:"rr_groups,omitempty"`
 
 	// NextRT is the counter behind the allocated value; NextGroup mints ids.
@@ -166,8 +156,6 @@ func (o *OverlayConfig) ensure() {
 	if o.NextGroup < 0 {
 		o.NextGroup = 0
 	}
-	o.RRPrimary = strings.TrimSpace(o.RRPrimary)
-	o.RRBackup = strings.TrimSpace(o.RRBackup)
 	if o.RRGroups == nil {
 		o.RRGroups = []RRGroup{}
 	}
@@ -266,7 +254,7 @@ func (o *OverlayConfig) allocateRT() (string, error) {
 		}
 		return rt, nil
 	}
-	return "", errors.New("导通组编号已用尽")
+	return "", errors.New("导通策略编号已用尽")
 }
 
 // nextGroupID mints an id nobody holds. Ids are stable strings the page and the
@@ -394,13 +382,13 @@ func (s *server) overlayGroupChecksLocked(tenantID string, g OverlayGroup, exclu
 	}
 
 	if g.Name == "" {
-		add("error", "导通组要有名字：发布记录和设备上的注释都要能指出这是哪一组。")
+		add("error", "导通策略要有名字：发布记录和设备上的注释都要能指出这是哪一条。")
 	}
 	if len(g.Members) < 2 {
-		add("error", "导通组至少要有两台设备（当前 %d）：只有一台成员时没有任何东西被导通。", len(g.Members))
+		add("error", "导通策略至少要有两台设备（当前 %d）：只有一台成员时没有任何东西被导通。", len(g.Members))
 	}
 	if len(g.Members) > overlayMaxMembers {
-		add("error", "导通组最多 %d 行成员，当前 %d。", overlayMaxMembers, len(g.Members))
+		add("error", "导通策略最多 %d 行成员，当前 %d。", overlayMaxMembers, len(g.Members))
 	}
 
 	seen := map[OverlayMember]bool{}
@@ -416,7 +404,7 @@ func (s *server) overlayGroupChecksLocked(tenantID string, g OverlayGroup, exclu
 			continue
 		}
 		if m.VPNID == vpnReservedOverlay {
-			add("error", "VPN %d 是 overlay 保留表（隧道与对外下一跳用的那张），不能进导通组。", m.VPNID)
+			add("error", "VPN %d 是 overlay 保留表（隧道与对外下一跳用的那张），不能进导通策略。", m.VPNID)
 			continue
 		}
 		if s.state.Nodes[key(tenantID, m.NodeID)] == nil {
@@ -431,7 +419,7 @@ func (s *server) overlayGroupChecksLocked(tenantID string, g OverlayGroup, exclu
 		}
 		// One group adds one RT to this VPN's set; the wire caps the set.
 		if n := s.overlayGroupCountLocked(tenantID, m.NodeID, m.VPNID, exclude) + 1; n > route.MaxRTsPerRoute {
-			add("error", "设备 %d 的 VPN %d 会同时在 %d 个导通组里，超过 %d：一条路由最多带 %d 个 RT，"+
+			add("error", "设备 %d 的 VPN %d 会同时在 %d 个导通策略里，超过 %d：一条路由最多带 %d 个 RT，"+
 				"再多 RR 会直接拒收这条 announce。", m.NodeID, m.VPNID, n,
 				route.MaxRTsPerRoute, route.MaxRTsPerRoute)
 		}
@@ -560,20 +548,17 @@ type overlayView struct {
 	// editable and a reader is going to ask why not.
 	RTNote string `json:"rt_note"`
 
-	// The two reflector slots and the rows this tenant may pick from them. The
-	// library is filtered here, not in the page: a tenant must never be able to
-	// name (or even learn the existence of) another tenant's exclusive RR.
-	// The field names are 主/备-shaped because that is what is already on disk;
-	// every string the page shows calls them RR 1 and RR 2 (拍板 E0).
-	RRPrimary string      `json:"rr_primary"`
-	RRBackup  string      `json:"rr_backup"`
-	RRLibrary []rrPickRow `json:"rr_library"`
-	// RRGroups is the stored per-device split; a device no group names uses the
-	// two slots above. The page edits the list as a whole, which is also how the
-	// save endpoint takes it.
+	// The tenant's own reflector list and the per-device split. Both live here
+	// rather than on a second endpoint: the list is filtered by ownership in one
+	// place, and a tenant must never be able to name (or even learn the existence
+	// of) another tenant's RR. Writes go to /api/rrs.
+	RRLibrary []rrRow `json:"rr_library"`
+	MaxRRs    int     `json:"max_rrs"`
+	// RRGroups is the stored per-device split. The page edits the list as a
+	// whole, which is also how the save endpoint takes it.
 	RRGroups []RRGroup `json:"rr_groups"`
-	// RRNote says what the two slots do and do not do on the device, because two
-	// labelled boxes promise a failover order this plane does not implement: the
+	// RRNote says what the device does with the list, because a list of two
+	// addresses reads like a failover order this plane does not implement: the
 	// route client keeps a session up to every entry it is handed.
 	RRNote string `json:"rr_note"`
 }
@@ -590,16 +575,15 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 		MaxRTsPerVPN:    route.MaxRTsPerRoute,
 		RTNote: fmt.Sprintf("RT 由控制器分配并在租户内唯一（%d:1000 起），"+
 			"页面上不可编辑；设备重启后靠本地那一份配置工作，不依赖控制器在线。", overlayRTASN),
-		RRPrimary: oc.RRPrimary,
-		RRBackup:  oc.RRBackup,
-		RRLibrary: s.rrPickRowsLocked(tenantID),
+		RRLibrary: s.rrRowsLocked(tenantID),
+		MaxRRs:    rrMaxPerTenant,
 		RRGroups:  append([]RRGroup{}, oc.RRGroups...),
-		RRNote: "这两格（RR 1、RR 2）只是这一页上的两个格子，设备不排序：路由客户端对拿到的每一条 RR 都保持会话，" +
-			"两条的宣告并进同一张路由表（同一条前缀在两台上是同一份路由的两份拷贝），所以两条就是两条等价活动反射器，" +
-			"掉一条表不缩。控制器不会去连库里这些地址，所以这里没有绿灯可给——" +
+		RRNote: "这里的每一条 RR，本租户没被反射器分组点名的设备都会拨过去：路由客户端对拿到的每一条 RR 都保持会话，" +
+			"两条的宣告并进同一张路由表（同一条前缀在两台上是同一份路由的两份拷贝），所以多条就是多个等价活动反射器，" +
+			"掉一条表不缩。控制器不会去连这些地址，所以这里没有绿灯可给——" +
 			"能不能连上，只有设备自己的路由状态知道。发布后设备就地换：先把新 RR 的会话建起来，" +
 			"等新 RR 真的收全了本机的前缀，才摘掉被它顶替的那条，路由进程不重启；谁还没接管、谁还替它守着，" +
-			"看设备的路由状态。只填一条时换地址必然有一段没有反射器的窗口——没有冗余是这一格本身的形态，不是故障。",
+			"看设备的路由状态。只剩一条时换地址必然有一段没有反射器的窗口——没有冗余是这一格本身的形态，不是故障。",
 	}
 	if view.Groups == nil {
 		view.Groups = []OverlayGroup{}
@@ -613,7 +597,7 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 	// Every stored group is re-checked on read: state can be edited outside the
 	// page (an older file, a device that has since been removed), and a problem
 	// that exists is reported whether or not anyone is about to save.
-	view.Checks = append(view.Checks, s.overlayRRChecksLocked(tenantID)...)
+	view.Checks = append(view.Checks, s.overlayRRListChecksLocked(tenantID)...)
 	view.Checks = append(view.Checks, s.overlayRRGroupChecksLocked(tenantID)...)
 	for _, g := range oc.Groups {
 		view.Checks = append(view.Checks, s.overlayGroupChecksLocked(tenantID, g, g.ID)...)
@@ -695,10 +679,9 @@ type overlayRouteTunnel struct {
 //
 // `rrs` follows the tunnels rule, not the vrfs one, and for the same reason:
 // sr-route refuses to *start* on an empty rrs list (cmd/sr-route/main.go:91), so
-// a tenant that has not picked a reflector must send no key at all and leave the
-// list the operator hand-wrote in place. omitempty is what makes "not selected"
-// and "selected, empty" different on the wire -- and only the second one would
-// be a lie.
+// a tenant with no RR rows must send no key at all and leave the list written on
+// the box in place. omitempty is what makes "no rows" and "rows, empty" different
+// on the wire -- and only the second one would be a lie.
 type overlayRouteDoc struct {
 	Tunnels []overlayRouteTunnel `json:"tunnels,omitempty"`
 	VRFs    []OverlayVRF         `json:"vrfs"`
@@ -725,10 +708,10 @@ func (s *server) overlayRouteArtifactLocked(tenantID string, nodeID uint16) stri
 		}
 		doc.Tunnels = tunnels
 	}
-	// A tenant that has not picked, or one whose pick no longer resolves, renders
-	// no key at all -- overlayRRChecksLocked says why out loud, and the device
-	// keeps the rrs the operator wrote by hand until something real arrives.
-	// Per-device because an RR group overrides the tenant pair for its devices.
+	// A tenant with no RR rows, or a group whose pair no longer resolves, renders no
+	// key at all -- overlayRRListChecksLocked says why out loud, and the device
+	// keeps the rrs written on its own disk until something real arrives.
+	// Per-device because an RR group narrows the tenant's whole list to its pair.
 	if rrs := s.rrsForDeviceLocked(tenantID, nodeID); len(rrs) > 0 {
 		doc.RRs = rrs
 	}
@@ -781,7 +764,7 @@ func (s *server) overlayNodeChecksLocked(tenantID string, nodeID uint16) []Confi
 		out = append(out, ConfigCheck{
 			Severity: "error",
 			Text: fmt.Sprintf("这台设备的 VPN %d 要带 RT %s，但它的基础配置里没有 VPN %d："+
-				"先在「配置 › 基础配置」加这个 VPN，或者把它从导通组 %s 里摘掉。",
+				"先在「配置 › 基础配置」加这个 VPN，或者把它从导通策略 %s 里摘掉。",
 				v.ID, strings.Join(v.ExportRTs, "/"), v.ID, strings.Join(names, "、")),
 		})
 	}
