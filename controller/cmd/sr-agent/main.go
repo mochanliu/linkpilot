@@ -62,7 +62,7 @@ func main() {
 		storeRoot = flag.String("store", "/var/lib/sr-cpe", "sr-apply store root (versions/, current, status.json)")
 		vppctl    = flag.String("vppctl", "vppctl", "vppctl binary")
 		frrConf   = flag.String("frr-conf", "/etc/frr/frr.conf", "FRR config path")
-		frrReload = flag.String("frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
+		frrReload = flag.String("frr-reload", "", "frr-reload.py used to diff FRR config through vtysh (default: /usr/lib/frr/frr-reload.py)")
 		routeConf = flag.String("route-conf", "/etc/sdwan/route.json",
 			"sr-route config file; the bundle's overlay segment is merged into it (never created here)")
 

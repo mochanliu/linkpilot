@@ -48,12 +48,13 @@ func newTestApplier(t *testing.T, root, frrConf string, fx *fakeExec) *Applier {
 type fakeExec struct {
 	calls   []string
 	outputs map[string]string
+	fail    map[string]error
 }
 
 func (f *fakeExec) Run(_ context.Context, name string, args ...string) (string, error) {
 	key := name + " " + strings.Join(args, " ")
 	f.calls = append(f.calls, key)
-	return f.outputs[key], nil
+	return f.outputs[key], f.fail[key]
 }
 
 func (f *fakeExec) index(substr string) int {
@@ -149,7 +150,7 @@ func TestApplyOrderAndIdempotency(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 	}
 
-	// VPP fragment first, then the kernel fragment, then the FRR restart.
+	// VPP fragment first, then the kernel fragment, then the FRR diff.
 	bootAt := fx.index("sh " + filepath.Join(root, "versions", "3", "boot.sh"))
 	if bootAt < 0 {
 		t.Fatalf("boot fragment not executed: %v", fx.calls)
@@ -157,8 +158,11 @@ func TestApplyOrderAndIdempotency(t *testing.T) {
 	if fx.index("ip table add 10") > bootAt {
 		t.Fatalf("VPP fragment must run before boot: %v", fx.calls)
 	}
-	if fx.index("sh -c true") < bootAt {
-		t.Fatalf("FRR reload must run after boot: %v", fx.calls)
+	if fx.index("true --reload") < bootAt {
+		t.Fatalf("FRR diff must run after boot: %v", fx.calls)
+	}
+	if n := fx.count("true --test"); n != 1 {
+		t.Fatalf("FRR diff was not re-checked exactly once (%d): %v", n, fx.calls)
 	}
 	if fx.count("# comment") != 0 {
 		t.Fatalf("comments executed: %v", fx.calls)
@@ -218,6 +222,65 @@ func TestApplyRefusesBlockingChecks(t *testing.T) {
 	}
 }
 
+// The apply is judged by the state after it, not by the reload's exit status:
+// frr-reload.py can exit 0 and still leave commands unapplied.
+func TestApplyFRRRefusesLeftoverDelta(t *testing.T) {
+	root := t.TempDir()
+	frrConf := filepath.Join(t.TempDir(), "frr.conf")
+	dir := filepath.Dir(frrConf)
+	fx := &fakeExec{outputs: map[string]string{
+		"true --reload " + frrConf + " --stdout --confdir " + dir: "INFO: Applied\n",
+		"true --test " + frrConf + " --stdout --confdir " + dir:   "INFO: Loading\n\nLines To Add\n============\nrouter bgp 65101\n",
+	}}
+	a := newTestApplier(t, root, frrConf, fx)
+
+	err := a.Apply(context.Background(), testBundle(), false)
+	if err == nil || !strings.Contains(err.Error(), "仍有差异") {
+		t.Fatalf("apply = %v, want leftover-delta error", err)
+	}
+	if !strings.Contains(err.Error(), "router bgp 65101") {
+		t.Fatalf("error must name the leftover command: %v", err)
+	}
+	if st, _ := (Store{Root: root}).ReadStatus(); st.OK {
+		t.Fatalf("status claims ok after a failed diff: %+v", st)
+	}
+}
+
+// A failed diff fails the apply. There is no restart-fallback: restarting FRR
+// resets customer BGP sessions (AGENTS.md §1).
+func TestApplyFRRFailureDoesNotRestart(t *testing.T) {
+	root := t.TempDir()
+	frrConf := filepath.Join(t.TempDir(), "frr.conf")
+	key := "true --reload " + frrConf + " --stdout --confdir " + filepath.Dir(frrConf)
+	fx := &fakeExec{
+		outputs: map[string]string{key: "ERROR: vtysh returned status 1"},
+		fail:    map[string]error{key: errors.New("exit status 1")},
+	}
+	a := newTestApplier(t, root, frrConf, fx)
+
+	err := a.Apply(context.Background(), testBundle(), false)
+	if err == nil || !strings.Contains(err.Error(), "差量热更失败") {
+		t.Fatalf("apply = %v, want diff failure", err)
+	}
+	for _, c := range fx.calls {
+		if strings.Contains(c, "restart") || strings.Contains(c, "systemctl") || strings.Contains(c, "frrinit") {
+			t.Fatalf("applier fell back to a restart: %v", fx.calls)
+		}
+	}
+}
+
+func TestFRRDeltaParsing(t *testing.T) {
+	clean := "2026-10-31 23:29:21,035  INFO: Loading Config object from vtysh show running\n"
+	if got := frrDelta(clean); got != "" {
+		t.Fatalf("frrDelta(clean) = %q", got)
+	}
+	withDelta := clean + "\nLines To Delete\n===============\nrouter bgp 65101\n no neighbor 10.0.0.2\n\nLines To Add\n============\nhostname edge-2\n"
+	got := frrDelta(withDelta)
+	if !strings.Contains(got, "no neighbor 10.0.0.2") || !strings.Contains(got, "hostname edge-2") {
+		t.Fatalf("frrDelta = %q", got)
+	}
+}
+
 func TestBootReplaysWithoutController(t *testing.T) {
 	root := t.TempDir()
 	frrConf := filepath.Join(t.TempDir(), "frr.conf")
@@ -238,8 +301,8 @@ func TestBootReplaysWithoutController(t *testing.T) {
 	if fx.index("ip table add 10") < 0 || fx.index("sh "+filepath.Join(root, "versions", "3", "boot.sh")) < 0 {
 		t.Fatalf("boot did not replay VPP+kernel: %v", fx.calls)
 	}
-	if fx.count("sh -c true") != 0 {
-		t.Fatalf("boot restarted FRR without --reload-frr: %v", fx.calls)
+	if fx.count("true --reload") != 0 || fx.count("true --test") != 0 {
+		t.Fatalf("boot touched FRR without --frr-diff: %v", fx.calls)
 	}
 	st, err := Store{Root: root}.ReadStatus()
 	if err != nil || !st.OK || st.Source != "boot" {
@@ -247,10 +310,10 @@ func TestBootReplaysWithoutController(t *testing.T) {
 	}
 
 	if err := a.Boot(context.Background(), true); err != nil {
-		t.Fatalf("boot --reload-frr: %v", err)
+		t.Fatalf("boot --frr-diff: %v", err)
 	}
-	if fx.count("sh -c true") != 1 {
-		t.Fatalf("reload-frr did not restart FRR: %v", fx.calls)
+	if fx.count("true --reload") != 1 || fx.count("true --test") != 1 {
+		t.Fatalf("--frr-diff did not run one diff and one check: %v", fx.calls)
 	}
 }
 

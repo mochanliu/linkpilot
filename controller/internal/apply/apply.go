@@ -12,7 +12,8 @@
 //  1. VPP fragment: tables, interface table/MTU/state, lcp TAPs
 //  2. wait for the TAPs to exist in the kernel
 //  3. kernel fragment: VRF devices, enslave TAPs, sysctls
-//  4. FRR config: persisted to /etc/frr/frr.conf; FRR loads it at start
+//  4. FRR config: persisted to /etc/frr/frr.conf, then diffed into the running
+//     daemons through vtysh (no restart -- see AGENTS.md)
 //  5. overlay segment: merged into /etc/sdwan/route.json, then PUT to the running
 //     sr-route (see route.go)
 //
@@ -368,10 +369,13 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) (string,
 
 // Applier applies or replays one installed version.
 type Applier struct {
-	Store     Store
-	VPPCtl    string
-	FRRConf   string
-	FRRReload string // shell command; empty means autodetect
+	Store   Store
+	VPPCtl  string
+	FRRConf string
+	// FRRReload is the frr-reload.py to run (or a stand-in like "true" on a box
+	// without FRR). Empty means autodetect. It is a program, not a shell command:
+	// the only thing this applier does to FRR is a vtysh diff.
+	FRRReload string
 	// RouteConf is the box's own sr-route file. The overlay segment of a bundle is
 	// merged into it; it is never created from scratch here.
 	RouteConf string
@@ -482,10 +486,10 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		if ferr := a.installFRR(inst); ferr != nil {
 			err = ferr
 		} else {
-			err = a.reloadFRR(ctx)
+			err = a.applyFRR(ctx)
 		}
 	}
-	// Overlay last: replay/installFRR/reloadFRR are what make the VPP tables and
+	// Overlay last: replay/installFRR/applyFRR are what make the VPP tables and
 	// the FRR config exist, and a box that failed those must not be left holding a
 	// route.json that claims VRFs nothing created.
 	if err == nil {
@@ -503,7 +507,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 // Boot replays the current version after VPP starts. It never needs the
 // controller: the FRR config is already in /etc/frr/frr.conf, and this only
 // restores what VPP and the kernel forgot.
-func (a *Applier) Boot(ctx context.Context, reloadFRR bool) error {
+func (a *Applier) Boot(ctx context.Context, frrDiff bool) error {
 	a.setDefaults()
 	inst, err := a.Store.Current()
 	if err != nil {
@@ -515,8 +519,8 @@ func (a *Applier) Boot(ctx context.Context, reloadFRR bool) error {
 	if err == nil {
 		err = a.installFRR(inst)
 	}
-	if err == nil && reloadFRR {
-		err = a.reloadFRR(ctx)
+	if err == nil && frrDiff {
+		err = a.applyFRR(ctx)
 	}
 	// No hot PUT here: at boot the checklist has not started sr-route yet (apply
 	// runs before route in start.sh), so the file this writes IS the update.
@@ -760,27 +764,86 @@ func (a *Applier) installFRR(inst Installed) error {
 	return os.Rename(tmp, a.FRRConf)
 }
 
-// reloadFRR restarts FRR so it picks up the installed config. Restart rather
-// than merge: a reload leaves removed neighbors and interfaces behind.
-func (a *Applier) reloadFRR(ctx context.Context) error {
-	cmd := a.FRRReload
-	if cmd == "" {
-		if _, err := os.Stat("/usr/lib/frr/frrinit.sh"); err == nil {
-			cmd = "/usr/lib/frr/frrinit.sh restart"
-		} else {
-			cmd = "systemctl restart frr"
-		}
+// applyFRR makes the running daemons match the installed file by diffing it
+// through vtysh (frr-reload.py), then diffs again to prove nothing is left.
+//
+// It never restarts a daemon, and there is deliberately no restart fallback: a
+// restart resets the customer's BGP sessions and makes sr-frr republish an empty
+// prefix set. Measured on lab-cpe1 (2026-11-01): restart = 37.5% end-to-end loss
+// for ~6s, eBGP Idle ~4s, half the imported prefixes gone ~4.5s; the same edits
+// through frr-reload.py = 0 loss, bgpd pid unchanged, peer uptime not reset.
+// A diff that cannot be applied fails the apply and leaves the previous config
+// on disk, which is the honest outcome. See AGENTS.md.
+//
+// The filename is passed with --confdir pointing at its own directory so
+// frr-reload.py sees it as the target and does not "write memory" a rewritten
+// copy over it: the file on disk stays exactly the artifact the controller
+// rendered, and a later apply can still compare it byte for byte.
+func (a *Applier) applyFRR(ctx context.Context) error {
+	tool, err := a.frrTool()
+	if err != nil {
+		return err
 	}
+	confdirArgs := []string{"--confdir", filepath.Dir(a.FRRConf)}
 	if a.DryRun {
-		a.Logf("frr reload: %s", cmd)
+		a.Logf("frr diff: %s --reload %s %s", tool, a.FRRConf, strings.Join(confdirArgs, " "))
 		return nil
 	}
-	out, err := a.Exec.Run(ctx, "sh", "-c", cmd)
+	out, err := a.Exec.Run(ctx, tool, append([]string{"--reload", a.FRRConf, "--stdout"}, confdirArgs...)...)
 	if err != nil {
-		return fmt.Errorf("frr reload (%s) failed: %v: %s", cmd, err, tail(out, 400))
+		return fmt.Errorf("frr 差量热更失败（%s）：%v：%s", tool, err, tail(out, 400))
 	}
-	a.Logf("frr reloaded (%s)", cmd)
+	// Exit 0 only says the script did not complain. The proof is the second diff:
+	// an apply is done when the running config equals the file, not when a
+	// command returned.
+	again, err := a.Exec.Run(ctx, tool, append([]string{"--test", a.FRRConf, "--stdout"}, confdirArgs...)...)
+	if err != nil {
+		return fmt.Errorf("frr 热更后核对失败（%s）：%v：%s", tool, err, tail(again, 400))
+	}
+	if delta := frrDelta(again); delta != "" {
+		return fmt.Errorf("frr 热更后运行配置仍有差异：%s", delta)
+	}
+	a.Logf("frr: 差量已生效，复检 0 条差异")
 	return nil
+}
+
+// frrTool resolves the diff tool. It refuses to guess a restart: a box without
+// frr-reload.py is a box whose config cannot be changed hot, and that is the
+// operator's problem to fix, not something to paper over.
+func (a *Applier) frrTool() (string, error) {
+	if a.FRRReload != "" {
+		return a.FRRReload, nil
+	}
+	for _, p := range []string{"/usr/lib/frr/frr-reload.py", "/usr/lib/frr/frr-reload"} {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", errors.New("找不到 frr-reload.py（/usr/lib/frr/）：FRR 配置只能差量热更，不允许重启")
+}
+
+// frrDelta returns the commands frr-reload.py --test says are still missing.
+// Its log lines go to the same stream, so the sections are what we read.
+func frrDelta(out string) string {
+	var lines []string
+	inDelta := false
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case t == "Lines To Delete" || t == "Lines To Add":
+			inDelta = true
+		case !inDelta || t == "" || strings.HasPrefix(t, "==="):
+		default:
+			lines = append(lines, t)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	if len(lines) > 8 {
+		lines = append(lines[:8], "…")
+	}
+	return strings.Join(lines, "；")
 }
 
 func tail(s string, n int) string {

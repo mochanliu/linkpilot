@@ -56,7 +56,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage:
   sr-apply apply  --bundle <file|-> [--force] [--dry-run] [common]
-  sr-apply boot   [--reload-frr] [--dry-run] [common]
+  sr-apply boot   [--frr-diff] [--dry-run] [common]
   sr-apply status [--root DIR]
 
 apply validates the bundle, persists it under <root>/versions/<n>, then applies
@@ -67,7 +67,7 @@ boot checklist sr-route is not running yet, and the route.json this writes is
 the update.
 
 common: --root DIR (default /var/lib/sr-cpe), --vppctl PATH, --frr-conf PATH,
-        --frr-reload CMD, --route-conf PATH (default /etc/sdwan/route.json),
+        --frr-reload TOOL, --route-conf PATH (default /etc/sdwan/route.json),
         --no-route-push, --wait DURATION`)
 }
 
@@ -89,7 +89,7 @@ func (o *commonOpts) register(fs *flag.FlagSet) {
 	fs.StringVar(&o.root, "root", "/var/lib/sr-cpe", "state directory on the box")
 	fs.StringVar(&o.vppctl, "vppctl", "vppctl", "vppctl binary")
 	fs.StringVar(&o.frrConf, "frr-conf", "/etc/frr/frr.conf", "FRR config path")
-	fs.StringVar(&o.frrReload, "frr-reload", "", "FRR restart command (default: frrinit.sh or systemctl)")
+	fs.StringVar(&o.frrReload, "frr-reload", "", "frr-reload.py to diff the config through vtysh (default: /usr/lib/frr/frr-reload.py)")
 	fs.StringVar(&o.routeConf, "route-conf", "/etc/sdwan/route.json",
 		"sr-route config file; the bundle's 4th segment is merged into it (it is never created here)")
 	fs.BoolVar(&o.noRoutePush, "no-route-push", false,
@@ -155,7 +155,7 @@ func forceLine(force bool) string {
 
 func runBoot(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("boot", flag.ExitOnError)
-	reloadFRR := fs.Bool("reload-frr", false, "restart FRR after replay (apply already did)")
+	frrDiff := fs.Bool("frr-diff", false, "reconcile the running FRR after replay (apply already did; boot normally lets FRR read its own file)")
 	var o commonOpts
 	o.register(fs)
 	_ = fs.Parse(args)
@@ -163,7 +163,7 @@ func runBoot(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := o.applier().Boot(ctx, *reloadFRR); err != nil {
+	if err := o.applier().Boot(ctx, *frrDiff); err != nil {
 		return err
 	}
 	fmt.Printf("replayed version %d\n", inst.Manifest.Version)
