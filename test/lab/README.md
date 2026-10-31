@@ -527,6 +527,12 @@ docker exec lab-o6b1 cat /var/lib/sr-cpe/status.json                        # v4
 三条环境事实，别再当 bug 查（详见
 [docs/overlay-console-plan.md](../../docs/overlay-console-plan.md) 的 O6-b 一节）：
 
+- 这台机器上**有两个 docker daemon，容器名是重叠的**：Docker Desktop
+  （`~/.docker/run/docker.sock`，内核 `7.0.14-linuxkit`，**lab 全套 fixture 在这里**）和
+  colima（`~/.colima/default/docker.sock`，Ubuntu 24.04 / 内核 `6.8.0-117-generic`，
+  今天**一个容器都没跑**）。`7.0.14-linuxkit` 没有 `CONFIG_NET_VRF`，`6.8.0-117-generic`
+  有——所以 #98 那次多 VPN 是在 colima 上验的。**每条 docker 命令都要显式
+  `export DOCKER_HOST=…`**，否则"同名容器"会打到另一台机器上，量出来的东西南辕北辙。
 - 这个内核（`7.0.14-linuxkit`）**没有 `CONFIG_NET_VRF`**：boot 段里
   `ip link add … type vrf` 必失败（`Error: Unknown device type.`），而 boot 段排在叠加段
   前面，所以整包会卡在那里。判据只用 **VPN 0**（default VRF，不建 vrf 设备）。多 VPN
