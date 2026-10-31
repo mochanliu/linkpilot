@@ -23,3 +23,6 @@ test/.lab-code
 # 世界底图生成器的第三方输入（d3/topojson/world-atlas）。生成物 world-110m.js、
 # world-50m.js 已入库，构建 sr-ctrl 不需要 node，所以输入物不入库。
 controller/tools/world-basemap/vendor/
+# 判据脚本在 lab-ctrl 里 go build 的落点（/workspace/controller 是共享挂载，
+# 每台容器再 cp 进自己的 $WORK/bin）：编译产物，不入库
+controller/bin/
