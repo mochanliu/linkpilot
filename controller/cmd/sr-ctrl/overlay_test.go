@@ -73,6 +73,8 @@ func overlayDo(t *testing.T, s *server, method, target, body, sid string) *httpt
 		s.handleAdminOverlay(rec, r)
 	case "/api/overlay/settings":
 		s.handleAdminOverlaySettings(rec, r)
+	case "/api/overlay/device-rr":
+		s.handleAdminOverlayDeviceRR(rec, r)
 	case "/api/overlay/group":
 		s.handleAdminOverlayGroup(rec, r)
 	default:

@@ -11,13 +11,14 @@ package main
 // controller cannot earn is worse than the plain "没探过" the tunnel page already
 // uses.
 //
-// Only a device an RR group names dials reflectors, and then only that group's
-// two. A device no group names gets no rrs at all: it keeps the list its own
-// route.json already carries, so adding a row here never starts a session on a
-// box nobody placed (2026-11-01 拍板).
+// Only a device that picked reflectors dials reflectors, and then only its two
+// slots (the RR 1 / RR 2 columns of the 导通策略 device table). A device with no
+// selection gets no rrs at all: it keeps the list its own route.json already
+// carries, so adding a row here never starts a session on a box nobody placed
+// (2026-11-01 拍板).
 //
 // The rows are kept in one document with the id counter, and an id is never
-// handed back after a delete: a group's selection quotes ids, so re-minting rr3
+// handed back after a delete: a device's selection quotes ids, so re-minting rr3
 // would silently re-point a device at a different box.
 
 import (
@@ -27,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"sdwan/controller/internal/wire"
 )
@@ -36,10 +38,10 @@ const (
 	rrLocationMaxRunes = 120
 	rrAddrMaxRunes     = 253
 	// rrMaxPerTenant bounds one tenant's list. It is not an arbitrary table
-	// limit: every device that no RR group names dials the whole list, so the
-	// list length *is* the default session count per device. Eight is far above
+	// limit: the list is what the page offers in its RR 1 / RR 2 columns, so a
+	// wall of rows makes every per-device choice unreadable. Eight is far above
 	// the two a tenant needs for redundancy and low enough that one typo cannot
-	// turn every box into a dial loop.
+	// bury the rest.
 	rrMaxPerTenant = 8
 )
 
@@ -145,52 +147,63 @@ func (s *server) rrLibraryLocked(create bool) *RRLibrary {
 	return s.state.RRs
 }
 
-// rrGroupRef is one RR group that names a row, as much of it as the delete guard
-// and the page's explanation need.
-type rrGroupRef struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+// rrBindRef is one device that dials a row, as much of it as the delete guard and
+// the page's explanation need.
+type rrBindRef struct {
+	NodeID uint16 `json:"node_id"`
+	Name   string `json:"name,omitempty"`
 }
 
-// rrGroupRefsLocked lists the RR groups of one tenant that name this row. It is
-// the delete guard's only input now that the tenant-level pair is gone: a group
-// still pointing at a deleted row would render that group's devices a route.json
-// with no rrs at all, and the device's existing hand-written list would look like
-// it still matched.
-func (s *server) rrGroupRefsLocked(tenantID, id string) []rrGroupRef {
+// rrBindRefsLocked lists the devices of one tenant whose RR 1 / RR 2 names this
+// row. It is the delete guard's only input: a device still pointing at a deleted
+// row would render a route.json with that slot missing, and the box's existing
+// hand-written list would look like it still matched.
+func (s *server) rrBindRefsLocked(tenantID, id string) []rrBindRef {
 	oc := s.overlayConfigLocked(tenantID, false)
 	if oc == nil || id == "" {
 		return nil
 	}
-	out := []rrGroupRef{}
-	for _, g := range oc.RRGroups {
-		if g.RRPrimary == id || g.RRBackup == id {
-			out = append(out, rrGroupRef{ID: g.ID, Name: g.Name})
-		}
+	out := []rrBindRef{}
+	names := map[uint16]string{}
+	for k, v := range s.nodeViewsLocked(tenantID, time.Now().Unix()) {
+		names[k] = v.Name
 	}
+	for k, b := range oc.RRBinds {
+		if b.Primary != id && b.Backup != id {
+			continue
+		}
+		n, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		ref := rrBindRef{NodeID: uint16(n)}
+		ref.Name = names[ref.NodeID]
+		out = append(out, ref)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
 }
 
-// rrsForDeviceLocked is the per-device answer the 第 4 段 uses: only a device
-// named by an RR group gets reflectors -- that group's two slots. A device no
-// group names gets nil, i.e. the rrs key is omitted, and the box keeps whatever
-// list its own route.json already carries. This is deliberately not "dial every
-// RR of the tenant": an ungrouped device has no RR neighbours at all, so adding a
-// row to the library never quietly lights up sessions on boxes nobody placed.
+// rrsForDeviceLocked is the per-device answer the 第 4 段 uses: a device with an
+// RR 1 / RR 2 selection gets those slots, and a device with no selection gets
+// nil, i.e. the rrs key is omitted and the box keeps whatever list its own
+// route.json already carries. This is deliberately not "dial every RR of the
+// tenant": adding a row to the library never quietly lights up sessions on boxes
+// nobody placed (2026-11-01 拍板).
 func (s *server) rrsForDeviceLocked(tenantID string, nodeID uint16) []wire.RRAddress {
 	oc := s.overlayConfigLocked(tenantID, false)
 	if oc == nil {
 		return nil
 	}
-	g := oc.rrGroupOf(nodeID)
-	if g == nil {
+	b, ok := oc.rrBindOf(nodeID)
+	if !ok {
 		return nil
 	}
-	return s.rrAddrsLocked(tenantID, g.RRPrimary, g.RRBackup)
+	return s.rrAddrsLocked(tenantID, b.Primary, b.Backup)
 }
 
-// rrAddrsLocked resolves an RR group's two slots against the library. A slot
-// that no longer resolves is skipped (the read-time checks say why), and an empty
+// rrAddrsLocked resolves one device's two slots against the library. A slot that
+// no longer resolves is skipped (the read-time checks say why), and an empty
 // result means "omit the key" -- never "send an empty list", because sr-route
 // refuses to start with no rrs at all (cmd/sr-route/main.go:91).
 func (s *server) rrAddrsLocked(tenantID, primary, backup string) []wire.RRAddress {
@@ -238,84 +251,71 @@ func (s *server) overlayRRListChecksLocked(tenantID string) []ConfigCheck {
 	return out
 }
 
-// rrGroupsChecksLocked validates a whole candidate group list. It is the same
-// question asked once for the document the page saves: the page replaces the
-// list, so "this device is in two groups" only exists as a property of the list.
-//
-// Every message carries the group it is about, because the page shows the flat
-// result and a sentence about "RR 1" would otherwise be indistinguishable from
-// the tenant-level pair above it.
-func (s *server) rrGroupsChecksLocked(tenantID string, groups []RRGroup) []ConfigCheck {
-	var out []ConfigCheck
-	add := func(g RRGroup, format string, args ...any) {
-		out = append(out, ConfigCheck{
-			Severity: "error",
-			Text:     fmt.Sprintf("分组「%s」（%s）：", g.Name, g.ID) + fmt.Sprintf(format, args...),
-		})
+// rrBindErrorLocked is the save-time gate for one device's RR 1 / RR 2. It is
+// one device at a time because that is what the page edits: a column of a row,
+// not a list to replace.
+func (s *server) rrBindErrorLocked(tenantID string, nodeID uint16, b RRBind) string {
+	if s.state.Nodes[key(tenantID, nodeID)] == nil {
+		return fmt.Sprintf("设备 %d 不属于这个租户，或者还没入网。", nodeID)
 	}
-	owner := map[uint16]string{}
-	for _, g := range groups {
-		if g.Name == "" {
-			add(g, "要有名字：页面和设备上的注释都要能指出这是哪一组。")
+	if b.Primary != "" && b.Primary == b.Backup {
+		return "RR 1 和 RR 2 不能选同一条。"
+	}
+	for _, slot := range []struct{ name, id string }{{"RR 1", b.Primary}, {"RR 2", b.Backup}} {
+		if msg := s.rrSelectionErrorLocked(tenantID, slot.id); msg != "" {
+			return slot.name + "：" + msg
 		}
-		if len(g.DeviceIDs) == 0 {
-			add(g, "至少要把一台设备放进这一组；一台也没有的组等于不存在，直接删掉它。")
+	}
+	return ""
+}
+
+// overlayRRBindChecksLocked is the read-time form: stored binds are re-checked on
+// every read, so a selection restored from an older state file (a foreign RR, a
+// device that was removed, two identical slots) is named even when nobody is
+// about to save.
+func (s *server) overlayRRBindChecksLocked(tenantID string) []ConfigCheck {
+	oc := s.overlayConfigLocked(tenantID, false)
+	if oc == nil || len(oc.RRBinds) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(oc.RRBinds))
+	for k := range oc.RRBinds {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, _ := strconv.Atoi(keys[i])
+		b, _ := strconv.Atoi(keys[j])
+		return a < b
+	})
+	var out []ConfigCheck
+	for _, k := range keys {
+		n, err := strconv.Atoi(k)
+		if err != nil || n < 1 || n > 65535 {
+			out = append(out, ConfigCheck{Severity: "error",
+				Text: fmt.Sprintf("RR 选择里有一个键 %q 不是设备号；删掉它。", k)})
+			continue
 		}
-		for _, slot := range []struct{ name, id string }{{"RR 1", g.RRPrimary}, {"RR 2", g.RRBackup}} {
-			if msg := s.rrSelectionErrorLocked(tenantID, slot.id); msg != "" {
-				add(g, "%s：%s", slot.name, msg)
-			}
-		}
-		if g.RRPrimary == "" && g.RRBackup == "" {
-			add(g, "至少选一台 RR：组里的设备靠它反射，留空只会让这些设备拿不到控制器下发的 rrs。")
-		} else if g.RRPrimary != "" && g.RRPrimary == g.RRBackup {
-			add(g, "RR 1 和 RR 2 不能选同一条。")
-		}
-		seen := map[uint16]bool{}
-		for _, nodeID := range g.DeviceIDs {
-			if seen[nodeID] {
-				add(g, "设备 %d 出现了两次。", nodeID)
-				continue
-			}
-			seen[nodeID] = true
-			if s.state.Nodes[key(tenantID, nodeID)] == nil {
-				add(g, "设备 %d 不属于这个租户，或者还没入网。", nodeID)
-				continue
-			}
-			if other, ok := owner[nodeID]; ok {
-				add(g, "设备 %d 已经在分组 %s 里：一台设备只能有一组 RR。", nodeID, other)
-				continue
-			}
-			owner[nodeID] = g.ID
+		if msg := s.rrBindErrorLocked(tenantID, uint16(n), oc.RRBinds[k]); msg != "" {
+			out = append(out, ConfigCheck{Severity: "error",
+				Text: fmt.Sprintf("设备 %d 的 RR 选择：%s", n, msg)})
 		}
 	}
 	return out
 }
 
-// overlayRRGroupChecksLocked is the read-time form: stored groups are re-checked
-// on every read, so a list restored from an older state file (foreign RR, device
-// unenrolled, device in two groups) is named even when nobody is about to save.
-func (s *server) overlayRRGroupChecksLocked(tenantID string) []ConfigCheck {
-	oc := s.overlayConfigLocked(tenantID, false)
-	if oc == nil || len(oc.RRGroups) == 0 {
-		return nil
-	}
-	return s.rrGroupsChecksLocked(tenantID, oc.RRGroups)
-}
-
 // rrRow is one row of a tenant's RR list as GET /api/overlay returns it: what the
-// page edits, plus the RR groups that name it -- so the delete button can explain
-// itself before anyone clicks it. No 归属 field (the list is already this
+// page edits, plus the devices that have it selected -- so the delete button can
+// explain itself before anyone clicks it. No 归属 field (the list is already this
 // tenant's) and no reference count from other tenants, which is not this
 // tenant's business.
 type rrRow struct {
-	ID        string       `json:"id"`
-	Name      string       `json:"name"`
-	Addr      string       `json:"addr"`
-	Location  string       `json:"location"`
-	Groups    []rrGroupRef `json:"groups"`
-	CreatedAt int64        `json:"created_at_unix"`
-	UpdatedAt int64        `json:"updated_at_unix,omitempty"`
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	Addr      string      `json:"addr"`
+	Location  string      `json:"location"`
+	Devices   []rrBindRef `json:"devices"`
+	CreatedAt int64       `json:"created_at_unix"`
+	UpdatedAt int64       `json:"updated_at_unix,omitempty"`
 }
 
 func (s *server) rrRowsLocked(tenantID string) []rrRow {
@@ -327,13 +327,13 @@ func (s *server) rrRowsLocked(tenantID string) []rrRow {
 }
 
 func (s *server) rrRowOfLocked(it RRItem) rrRow {
-	groups := s.rrGroupRefsLocked(it.TenantID, it.ID)
-	if groups == nil {
-		groups = []rrGroupRef{}
+	devices := s.rrBindRefsLocked(it.TenantID, it.ID)
+	if devices == nil {
+		devices = []rrBindRef{}
 	}
 	return rrRow{
 		ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location,
-		Groups: groups, CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
+		Devices: devices, CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
 	}
 }
 

@@ -357,10 +357,11 @@ func (s *server) adminHandler() http.Handler {
 	// other, which the operator has no business naming.
 	mux.HandleFunc("/api/overlay", s.handleAdminOverlay)
 	mux.HandleFunc("/api/overlay/settings", s.handleAdminOverlaySettings)
+	mux.HandleFunc("/api/overlay/device-rr", s.handleAdminOverlayDeviceRR)
 	mux.HandleFunc("/api/overlay/group", s.handleAdminOverlayGroup)
 	// The RR list is the tenant's own (2026-11-01 定案: an RR belongs to one
-	// tenant). Reads come inside /api/overlay with the RR groups they feed; the
-	// writes below are scoped to the session's tenant.
+	// tenant). Reads come inside /api/overlay with the devices that selected them;
+	// the writes below are scoped to the session's tenant.
 	mux.HandleFunc("/api/rrs", s.handleTenantRRs)
 	mux.HandleFunc("/api/rrs/delete", s.handleTenantRRDelete)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)

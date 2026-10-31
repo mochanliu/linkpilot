@@ -14,9 +14,9 @@ package main
 // "删除一个组" cannot silently cut anyone's routes.
 
 import (
-	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,16 +30,13 @@ type overlayGroupRequest struct {
 	Members []OverlayMember `json:"members"`
 }
 
-// rrGroupRequest is one row of the list the settings PUT replaces. An empty id
-// means "new": the controller mints it, the same way 导通组 ids are minted. The
-// page sends the whole list every time, so deleting a group is simply not
-// listing it.
-type rrGroupRequest struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	DeviceIDs []uint16 `json:"device_ids"`
-	RRPrimary string   `json:"rr_primary"`
-	RRBackup  string   `json:"rr_backup"`
+// overlayDeviceRRRequest is one device's row of RR 1 / RR 2, the way the 导通策略
+// table edits it: a column of one device, not a list to replace. An empty id
+// clears the slot, and clearing both means the device goes back to "no rrs key".
+type overlayDeviceRRRequest struct {
+	NodeID  uint16 `json:"node_id"`
+	Primary string `json:"primary"`
+	Backup  string `json:"backup"`
 }
 
 func (s *server) handleAdminOverlay(w http.ResponseWriter, r *http.Request) {
@@ -57,15 +54,13 @@ func (s *server) handleAdminOverlay(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, v)
 }
 
-// handleAdminOverlaySettings saves the global block of the overlay page: the
-// escape switch and the RR groups. It is one small document rather than one
-// endpoint per field so the page can save what it shows in one write, and it
-// stays a settings document rather than a group editor: 导通策略 have their own
-// endpoint because they carry their own checks. The RR list itself is edited
-// through /api/rrs.
+// handleAdminOverlaySettings saves the global block of the overlay page. It is one
+// small document rather than one endpoint per field so the page can save what it
+// shows in one write; 导通策略 and the per-device RR 1 / RR 2 columns have their
+// own endpoints because they carry their own checks, and the RR list itself is
+// edited through /api/rrs.
 //
-// A field that is absent is left alone -- that is what lets the escape toggle
-// keep working from a page that only sent the switch.
+// A field that is absent is left alone.
 func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireTenant(w, r)
 	if !ok {
@@ -76,78 +71,87 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req struct {
-		EscapeAllColors *bool             `json:"escape_all_colors"`
-		RRGroups        *[]rrGroupRequest `json:"rr_groups"`
+		EscapeAllColors *bool `json:"escape_all_colors"`
 	}
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if req.EscapeAllColors == nil && req.RRGroups == nil {
-		http.Error(w, "escape_all_colors / rr_groups 至少要给一个", http.StatusBadRequest)
+	if req.EscapeAllColors == nil {
+		http.Error(w, "escape_all_colors 没给：这次保存没有要改的东西", http.StatusBadRequest)
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	oc := s.overlayConfigLocked(id.TenantID, true)
-
-	// RR groups arrive as the whole list, so the checks run on the candidate
-	// document rather than on stored rows: "this device is in two groups" is a
-	// property of the list being saved, not of any one row. Ids are minted here
-	// and only committed with the list, so a rejected save burns no counter.
-	var nextGroups []RRGroup
-	nextCounter := oc.NextRRGroup
-	if req.RRGroups != nil {
-		nextGroups = make([]RRGroup, 0, len(*req.RRGroups))
-		used := map[string]bool{}
-		for _, in := range *req.RRGroups {
-			g := RRGroup{
-				ID:        strings.TrimSpace(in.ID),
-				Name:      strings.TrimSpace(in.Name),
-				DeviceIDs: normalizeDeviceIDs(in.DeviceIDs),
-				RRPrimary: strings.TrimSpace(in.RRPrimary),
-				RRBackup:  strings.TrimSpace(in.RRBackup),
-			}
-			if g.ID == "" {
-				for {
-					nextCounter++
-					g.ID = fmt.Sprintf("rg%d", nextCounter)
-					if !used[g.ID] && oc.rrGroup(g.ID) == nil {
-						break
-					}
-				}
-			} else if used[g.ID] {
-				http.Error(w, fmt.Sprintf("分组 id %q 出现了两次", g.ID), http.StatusBadRequest)
-				return
-			}
-			used[g.ID] = true
-			nextGroups = append(nextGroups, g)
-		}
-		if checks := s.rrGroupsChecksLocked(id.TenantID, nextGroups); hasBlockingCheck(checks) != "" {
-			writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": hasBlockingCheck(checks), "checks": checks})
-			return
-		}
-	}
-
-	if req.EscapeAllColors != nil {
-		oc.EscapeAllColors = *req.EscapeAllColors
-	}
-	if req.RRGroups != nil {
-		oc.RRGroups = nextGroups
-		oc.NextRRGroup = nextCounter
-	}
+	oc.EscapeAllColors = *req.EscapeAllColors
 	oc.UpdatedAt = time.Now().Unix()
 	oc.UpdatedBy = id.Username
 	s.save()
-	log.Printf("overlay: tenant=%s escape_all_colors=%t rr_groups=%d by %s",
-		id.TenantID, oc.EscapeAllColors, len(oc.RRGroups), id.Username)
+	log.Printf("overlay: tenant=%s escape_all_colors=%t by %s",
+		id.TenantID, oc.EscapeAllColors, id.Username)
 	writeJSON(w, map[string]any{
 		"ok":      true,
 		"overlay": s.overlayViewLocked(id.TenantID, time.Now().Unix()),
 		"settings": map[string]any{
 			"escape_all_colors": oc.EscapeAllColors,
-			"rr_groups":         append([]RRGroup{}, oc.RRGroups...),
 		},
+	})
+}
+
+// handleAdminOverlayDeviceRR writes one device's RR 1 / RR 2. It replaces both
+// slots at once because the page edits them side by side and "which one is RR 1"
+// is part of the answer -- a per-slot PATCH would let a page leave a row where
+// both columns point at the same row.
+//
+// Clearing both slots deletes the entry rather than storing two empty strings:
+// "no entry" is exactly the state that renders no rrs key, and keeping a row of
+// empties would make the map grow one entry per device that ever had a choice.
+func (s *server) handleAdminOverlayDeviceRR(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPut {
+		methodNotAllowed(w, "PUT")
+		return
+	}
+	var req overlayDeviceRRRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.NodeID == 0 {
+		http.Error(w, "node_id required", http.StatusBadRequest)
+		return
+	}
+	b := RRBind{
+		Primary: strings.TrimSpace(req.Primary),
+		Backup:  strings.TrimSpace(req.Backup),
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if msg := s.rrBindErrorLocked(id.TenantID, req.NodeID, b); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+	oc := s.overlayConfigLocked(id.TenantID, true)
+	now := time.Now().Unix()
+	if b.Primary == "" && b.Backup == "" {
+		delete(oc.RRBinds, strconv.Itoa(int(req.NodeID)))
+	} else {
+		oc.RRBinds[strconv.Itoa(int(req.NodeID))] = b
+	}
+	oc.UpdatedAt = now
+	oc.UpdatedBy = id.Username
+	s.save()
+	log.Printf("overlay: tenant=%s device %d rrs=%q/%q by %s",
+		id.TenantID, req.NodeID, b.Primary, b.Backup, id.Username)
+	writeJSON(w, map[string]any{
+		"ok":      true,
+		"node_id": req.NodeID,
+		"bind":    b,
+		"overlay": s.overlayViewLocked(id.TenantID, now),
 	})
 }
 

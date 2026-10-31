@@ -4,9 +4,9 @@ package main
 // tenant, so its tenant is the only one who manages it).
 //
 // Reads do not live here. A tenant sees its list inside GET /api/overlay
-// (overlayView.RRLibrary), together with the RR groups that name those rows --
-// filtered by ownership in one place, so "the page showed it" and "the device will
-// be told about it" cannot drift apart.
+// (overlayView.RRLibrary), together with the devices whose RR 1 / RR 2 name those
+// rows -- filtered by ownership in one place, so "the page showed it" and "the
+// device will be told about it" cannot drift apart.
 //
 // Nothing here publishes anything. A row is an input to the 4th artifact, so an
 // edit changes what the NEXT publish renders for every device of this tenant, and
@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -176,11 +177,11 @@ func (s *server) handleTenantRRs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleTenantRRDelete refuses while one of this tenant's RR groups still names
+// handleTenantRRDelete refuses while one of this tenant's devices still selects
 // the row (拍板 E5). The alternative -- letting the delete through and silently
-// dropping the group's choice -- would leave that group's devices rendering no
-// rrs at all, and "my box has no reflector" is a far worse surprise than a delete
-// button that explains itself.
+// dropping that device's choice -- would leave the box rendering no rrs at all,
+// and "my box has no reflector" is a far worse surprise than a delete button that
+// explains itself.
 func (s *server) handleTenantRRDelete(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireTenant(w, r)
 	if !ok {
@@ -203,12 +204,16 @@ func (s *server) handleTenantRRDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "RR 不存在", http.StatusNotFound)
 		return
 	}
-	if refs := s.rrGroupRefsLocked(id.TenantID, targetID); len(refs) > 0 {
+	if refs := s.rrBindRefsLocked(id.TenantID, targetID); len(refs) > 0 {
 		names := make([]string, 0, len(refs))
-		for _, g := range refs {
-			names = append(names, g.Name)
+		for _, ref := range refs {
+			if ref.Name != "" {
+				names = append(names, fmt.Sprintf("%s（node-%d）", ref.Name, ref.NodeID))
+				continue
+			}
+			names = append(names, "node-"+strconv.Itoa(int(ref.NodeID)))
 		}
-		http.Error(w, fmt.Sprintf("这条 RR 还被 %d 个反射器分组选着（%s）：先把这些分组改成别的 RR，再来删",
+		http.Error(w, fmt.Sprintf("这条 RR 还被 %d 台设备选着（%s）：先在导通策略的 RR 1 / RR 2 列里给这些设备换一条，再来删",
 			len(refs), strings.Join(names, "、")), http.StatusConflict)
 		return
 	}
@@ -219,7 +224,8 @@ func (s *server) handleTenantRRDelete(w http.ResponseWriter, r *http.Request) {
 	removed := lib.Items[idx]
 	// The id is not handed back to the counter: lib.NextID keeps climbing, so a
 	// row that appears later is rr<n+1> and never a resurrected rr<n>. That matters
-	// because an RR group's slot is a plain string that outlives nothing else.
+	// because a device's RR 1 / RR 2 slot is a plain string that outlives nothing
+	// else.
 	lib.Items = append(lib.Items[:idx], lib.Items[idx+1:]...)
 	s.rrTouchLocked(lib, id.Username, time.Now().Unix())
 	s.save()

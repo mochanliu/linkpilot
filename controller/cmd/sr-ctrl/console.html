@@ -135,6 +135,8 @@
   .row-actions button{display:inline-block}
   .row-actions button + button{margin-left:6px}
   .row-actions select{margin-right:6px}
+  /* RR 1 / RR 2 是表格里的一格：库最多 8 条，原生折叠下拉就够，不再套一层过滤框。 */
+  select.rr-slot{width:100%;max-width:260px;padding:4px 6px;font-size:12.5px}
   .banner{display:flex;align-items:center;justify-content:space-between;gap:12px;
     border:1px solid rgba(210,153,34,.4);background:var(--warn-bg);border-radius:8px;padding:10px 14px;
     font-size:13px;margin-top:14px}
@@ -682,12 +684,12 @@
     },
     "overlay-settings": {
       title: "全局配置",
-      sub: "反射器（RR）清单与逃生开关：RR 归本租户所有、在这里增删改；只有被 RR 分组点名的设备才会建 RR 邻居。这一页保存的是下一次发布的输入，改完要在「基础配置」发布，设备才会拿到",
+      sub: "反射器（RR）清单与逃生开关：RR 归本租户所有、在这里增删改；某台设备到底连哪两台，在「导通策略配置」的设备表里选（RR 1 / RR 2 两列），没选的设备不建 RR 邻居。这一页保存的是下一次发布的输入，改完要在「基础配置」发布，设备才会拿到",
       roles: ["tenant"]
     },
     "overlay-groups": {
       title: "导通策略配置",
-      sub: "VPN 互通域：把几台设备的几个 VPN 放进同一条策略，控制器给它分配一个 RT 并写进每个成员的导入与导出。RT 由控制器拥有，页面上只读",
+      sub: "VPN 互通域：把几台设备的几个 VPN 放进同一条策略，控制器给它分配一个 RT 并写进每个成员的导入与导出。成员表的 RR 1 / RR 2 两列选这台设备连哪两台反射器。RT 由控制器拥有，页面上只读",
       roles: ["tenant"]
     },
     account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" }
@@ -4877,7 +4879,7 @@
       releaseForm(form);
       ovRRApply(res, "已加入「" + body.name + "」" +
         (res && res.rr ? "（" + res.rr.id + "）" : "") +
-        "。它只进库，不改变任何设备：要让它真被拨，得在某台设备所在的 RR 分组里选中它，再到「基础配置」发布。", "已加入");
+        "。它只进库，不改变任何设备：要让它真被拨，得在「导通策略」的设备表里把它选进那台设备的 RR 1 或 RR 2，再到「基础配置」发布。", "已加入");
     }).catch(function (err) { ovErr("ov-rr-new-err", err.message); });
   }
 
@@ -4896,7 +4898,7 @@
 
   function ovRRDelete(id, name) {
     if (!confirm("删除 RR「" + name + "」（" + id + "）？\n\n控制器不会去连这个地址，所以删它不碰任何设备。" +
-      "被反射器分组选着的会拒绝删除：要先到「反射器分组」里把那一格改成别的。")) return;
+      "被某台设备的 RR 1 / RR 2 选着的会拒绝删除：要先到「导通策略」里把那一格改成别的。")) return;
     var o = ovStore();
     api("POST", "/api/rrs/delete", { id: id }).then(function (res) {
       ovRRApply(res, "已删除 " + id + "。它的号不会再发给新的条目。", "已删除");
@@ -4921,12 +4923,15 @@
       '" maxlength="120" placeholder="如 上海 · 机房A"></div>';
   }
 
-  // The groups column is the delete guard's answer before the click: a row a 分组
-  // still names cannot be deleted, so the row has to say so itself.
+  // The devices column is the delete guard's answer before the click: a row some
+  // device's RR 1 / RR 2 still names cannot be deleted, so the row has to say so
+  // itself.
   function ovRRUsedCell(row) {
-    var gs = row.groups || [];
-    if (!gs.length) return '<span class="muted">没有分组用</span>';
-    return '<span class="mono">' + esc(gs.map(function (g) { return g.name || g.id; }).join("、")) + "</span>";
+    var ds = row.devices || [];
+    if (!ds.length) return '<span class="muted">没有设备在用</span>';
+    return '<span class="mono">' + esc(ds.map(function (d) {
+      return "node-" + d.node_id + (d.name ? "（" + d.name + "）" : "");
+    }).join("、")) + "</span>";
   }
 
   function ovRRUpdatedCell(row) {
@@ -4943,6 +4948,8 @@
       '<span class="muted" style="font-size:12.5px">' + rows.length + " 条" +
       (max ? " · 上限 " + max : "") + "</span></header>" +
       '<div class="hint">' + esc(doc.rr_note) + "</div>" +
+      '<div class="hint">这里只是库：哪台设备连哪两台，在「Overlay 配置 › 导通策略配置」的成员表里选（RR 1 / RR 2 两列）。' +
+      "没被任何设备选中的条目在库里躺着，不影响任何设备。</div>" +
       '<div class="hint">地址必须带端口：设备上的路由进程要从 host:port 里拆出 TLS 服务名，' +
       "少了端口只能到设备上过一遍才知道写错了。同一条地址不能加两次——一台盒子两个身份会把同一份路由反射两遍。</div>" +
       '<form id="ov-rr-new-form"><div class="fields">' + ovRRFields("ov-rr-new", null) +
@@ -4953,7 +4960,7 @@
       return h + '<div class="empty" style="margin-top:10px">还没有 RR：控制器不下发 <code>rrs</code> 这个键，' +
         "设备继续用它盘上自己那一份。要让控制器接管，就在上面添加。</div></section>";
     }
-    h += "<table><thead><tr><th>名称</th><th>地址</th><th>位置</th><th>用它的分组</th><th>更新</th><th></th></tr></thead><tbody>";
+    h += "<table><thead><tr><th>名称</th><th>地址</th><th>位置</th><th>用它的设备</th><th>更新</th><th></th></tr></thead><tbody>";
     rows.forEach(function (row) {
       var editing = o.rre && o.rre.id === row.id;
       h += "<tr>" +
@@ -4983,10 +4990,10 @@
     return h + "</section>";
   }
 
-  /* ---------------- Overlay：全局（反射器 + 分组 + 逃生开关）与导通策略 ---------------- */
+  /* ---------------- Overlay：全局（反射器 + 逃生开关）与导通策略 ---------------- */
 
   function ovStore() {
-    if (!S.ov) S.ov = { doc: null, at: 0, loading: false, note: null, g: null, edit: null, rg: null, rre: null };
+    if (!S.ov) S.ov = { doc: null, at: 0, loading: false, note: null, g: null, edit: null, rre: null };
     return S.ov;
   }
 
@@ -5028,7 +5035,6 @@
     o.at = nowSec();
     o.loading = false;
     if (!o.g) o.g = { escape: !!doc.escape_all_colors };
-    if (!o.rg) o.rg = ovRGBlank();
     ovPrune(doc);
   }
 
@@ -5038,10 +5044,6 @@
     var o = ovStore();
     var ids = {};
     (doc.nodes || []).forEach(function (n) { ids[n.node_id] = true; });
-    // An RR-group draft is pruned the same way: a device that has since been
-    // unenrolled would make the whole list save fail over a tick box the tenant
-    // cannot see any more.
-    if (o.rg) o.rg.devices = (o.rg.devices || []).filter(function (id) { return ids[Number(id)]; });
     // The same for an RR row that was deleted in another tab: its editor would
     // submit a PUT the controller answers with 404 and no visible cause.
     if (o.rre && !ovRRRow(o.rre.id)) o.rre = null;
@@ -5056,19 +5058,14 @@
     render();
   }
 
-  function ovRRPickOpt() {
-    return { unit: "条", none: "", empty: "不选（这一格留空）",
-      ph: "先打几个字：名称 / 地址 / 位置", aria: "过滤 RR 列表" };
-  }
-
   // The library is already filtered by the controller: a tenant never receives
-  // another tenant's exclusive row. The one case the picker still has to name is
-  // a stored selection that is no longer pickable (row deleted, or re-assigned),
-  // because dropping it from the list would turn the next save into a different
-  // choice the tenant never made.
-  // `cur` is the slot's current id, not the slot's name: the tenant pair and every
-  // RR group have their own current value, and a stale one has to stay visible in
-  // whichever picker it belongs to.
+  // another tenant's exclusive row. The one case a picker still has to name is a
+  // stored selection that is no longer pickable (row deleted), because dropping it
+  // from the list would turn the next save into a different choice the tenant never
+  // made.
+  // `cur` is the slot's current id, not the slot's name: every device row has its
+  // own two slots, and a stale value has to stay visible in whichever row it
+  // belongs to.
   function ovRRItems(doc, cur) {
     var items = (doc.rr_library || []).map(function (it) {
       return { value: it.id,
@@ -5077,18 +5074,9 @@
     });
     var seen = items.some(function (it) { return it.value === cur; });
     if (cur && !seen) {
-      items.unshift({ value: cur, text: cur + "（当前选择，库里已经没有这一条，或它属于别的租户）", tags: "" });
+      items.unshift({ value: cur, text: cur + "（当前选择，库里已经没有这一条）", tags: "" });
     }
     return items;
-  }
-
-  function ovSlotCell(doc, id) {
-    if (!id) return '<span class="tag pending">留空</span>';
-    var row = null;
-    (doc.rr_library || []).forEach(function (x) { if (x.id === id) row = x; });
-    if (!row) return '<span class="mono">' + esc(id) + '</span> <span class="tag stale">库里没有这一条</span>';
-    return '<span class="mono">' + esc(row.addr) + "</span>" +
-      (row.location ? ' <span class="muted">' + esc(row.location) + "</span>" : "");
   }
 
   function ovGlobalForm(o, doc) {
@@ -5132,147 +5120,6 @@
     });
   }
 
-  /* ---------------- RR 分组：一台设备连哪两台 RR ---------------- */
-
-  // 分组只回答一个问题：这台设备的第 4 段里写哪两个 RR 地址。反射器本身没有
-  // 变化——它对每个会话一视同仁地反射，分组是收端地址的选择，不是 RR 侧的策略。
-  function ovRGBlank() {
-    return { id: "", name: "", devices: [], primary: "", backup: "" };
-  }
-
-  function ovRGStart(doc, id) {
-    var o = ovStore();
-    if (id) {
-      var g = null;
-      (doc.rr_groups || []).forEach(function (x) { if (x.id === id) g = x; });
-      if (!g) return;
-      o.rg = { id: g.id, name: g.name || "", devices: (g.device_ids || []).map(String),
-        primary: g.rr_primary || "", backup: g.rr_backup || "" };
-    } else {
-      o.rg = ovRGBlank();
-    }
-    o.note = null;
-  }
-
-  function ovRGTable(doc, o) {
-    var rows = doc.rr_groups || [];
-    var h = '<section class="panel"><header><h2>RR 分组</h2>' +
-      '<span class="muted" style="font-size:12.5px">' + rows.length +
-      " 组 · 没被任何组点名的设备不建 RR 邻居</span></header>";
-    h += '<div class="hint">分组决定「这台设备连哪两台 RR」：被点名的设备，第 4 段里的 ' +
-      "<code>rrs</code> 就是这个组的两台；没被任何组点名的设备一个 RR 邻居也不建，控制器不给它下发 " +
-      "<code>rrs</code>，它继续用自己盘上那一份。想让一台设备用反射器，就把它放进某个组。一台设备只能在一组。" +
-      "反射器那边没有区别——它把收到的路由原样发给除来源外的每个会话，不看隧道也不看分组。</div>";
-    if (!rows.length) {
-      h += '<div class="empty">还没有分组：所有设备都不建 RR 邻居（各自用盘上那一份）。</div>';
-    } else {
-      h += "<table><thead><tr><th>组</th><th>设备</th><th>RR 1</th><th>RR 2</th><th></th></tr></thead><tbody>";
-      rows.forEach(function (g) {
-        var names = (g.device_ids || []).map(function (id) {
-          var n = ovNodeOf(doc, id);
-          return "node-" + id + (n && n.name ? "（" + n.name + "）" : "");
-        }).join("、") || "—";
-        h += "<tr>" +
-          "<td><b>" + esc(g.name) + '</b> <span class="muted mono">' + esc(g.id) + "</span></td>" +
-          '<td class="mono" style="font-size:12px">' + esc(names) + "</td>" +
-          "<td>" + ovSlotCell(doc, g.rr_primary) + "</td>" +
-          "<td>" + ovSlotCell(doc, g.rr_backup) + "</td>" +
-          '<td class="row-actions">' +
-          '<button class="small" data-act="ov-rg-edit" data-id="' + esc(g.id) + '">' +
-          (o.rg && o.rg.id === g.id ? "收起" : "编辑") + "</button>" +
-          '<button class="small danger" data-act="ov-rg-del" data-id="' + esc(g.id) +
-          '" data-name="' + esc(g.name) + '">删除</button>' +
-          "</td></tr>";
-      });
-      h += "</tbody></table>";
-    }
-    h += "</section>";
-    return h;
-  }
-
-  // The four controls in this editor are draft-backed: every keystroke and pick
-  // writes into o.rg, so the draft -- not the DOM -- is what the next render must
-  // show. They carry data-keep because render()'s generic "keep the user's typing"
-  // restore would otherwise refill the blank editor with the just-saved values
-  // (and a multi-select would come back with only its first device).
-  function ovRGEditor(doc, o) {
-    var rg = o.rg || ovRGBlank();
-    var isNew = !rg.id;
-    var pick = ovRRPickOpt();
-    pick.empty = "不选（这一格留空）";
-    pick.attrs = "data-keep";
-    var devItems = ovNodeItems(doc.nodes);
-    return '<section class="panel"><header><h2>' + (isNew ? "新建 RR 分组" : "编辑分组 " + esc(rg.id)) + "</h2>" +
-      '<span class="muted" style="font-size:12.5px">' + (isNew ? "保存后进列表，发布后才到设备" :
-        esc(rg.name)) + "</span></header>" +
-      '<form id="ov-rg-form"><div class="fields">' +
-      '<div class="field"><label for="ov-rg-name">组名</label>' +
-      '<input id="ov-rg-name" value="' + esc(rg.name) + '" maxlength="64" placeholder="如 华东站点" data-keep></div>' +
-      '<div class="field"><label for="ov-rg-dev">设备（可多选）</label>' +
-      dpHtml("ov-rg-dev", "devices", devItems, rg.devices,
-        { multiple: true, size: 6, attrs: 'data-ov-rg="devices" data-keep' }) + "</div>" +
-      "</div>" +
-      '<div class="und-cols" style="margin-top:10px">' +
-      '<div class="und-box"><h3>RR 1</h3>' +
-      dpHtml("ov-rg-rrp", "rg_primary", ovRRItems(doc, rg.primary), rg.primary, pick) + "</div>" +
-      '<div class="und-box"><h3>RR 2</h3>' +
-      dpHtml("ov-rg-rrb", "rg_backup", ovRRItems(doc, rg.backup), rg.backup, pick) + "</div></div>" +
-      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center">' +
-      '<button class="primary" type="submit">' + (isNew ? "添加分组" : "保存修改") + "</button>" +
-      '<button class="small" type="button" data-act="ov-rg-x">取消</button></div>' +
-      '<div class="err" id="ov-rg-err" role="alert"></div>' +
-      '<div class="hint" style="margin:10px 0 0">两台 RR 都是活动反射器，不分主备：设备对两条都保持会话，掉一条表不缩。</div>' +
-      "</form></section>";
-  }
-
-  // 整张列表一起写：删掉一组就是不再列出它。因此「一台设备在两处」这种错只
-  // 存在于这一份候选列表里，由控制器一次判掉——页面不自己算一半。
-  function ovRGSend(list, okText) {
-    var o = ovStore();
-    var body = list.map(function (g) {
-      return { id: g.id || "", name: g.name, device_ids: (g.device_ids || []).map(Number),
-        rr_primary: g.rr_primary || "", rr_backup: g.rr_backup || "" };
-    });
-    api("PUT", "/api/overlay/settings", { rr_groups: body }).then(function (res) {
-      ovSetDoc(res.overlay || o.doc);
-      o.rg = ovRGBlank();
-      o.note = { kind: "", text: okText };
-      blurContent();
-      render();
-      toast("RR 分组已保存");
-    }).catch(function (err) {
-      ovErr("ov-rg-err", undErrNote(err).text);
-    });
-  }
-
-  function ovSaveRRGroup() {
-    var o = ovStore();
-    if (!o.doc) return;
-    var rg = o.rg || ovRGBlank();
-    var nameEl = $("ov-rg-name");
-    var name = String(nameEl ? nameEl.value : rg.name).trim();
-    if (!name) { ovErr("ov-rg-err", "组名必填"); return; }
-    var devs = (rg.devices || []).filter(function (v) { return Number(v) > 0; });
-    if (!devs.length) { ovErr("ov-rg-err", "至少选一台设备"); return; }
-    if (!rg.primary && !rg.backup) { ovErr("ov-rg-err", "至少选一台 RR"); return; }
-    if (rg.primary && rg.primary === rg.backup) { ovErr("ov-rg-err", "RR 1 和 RR 2 不能选同一条"); return; }
-    var list = (o.doc.rr_groups || []).map(function (g) { return g; });
-    var row = { id: rg.id || "", name: name, device_ids: devs, rr_primary: rg.primary || "", rr_backup: rg.backup || "" };
-    var hit = -1;
-    list.forEach(function (g, i) { if (g.id === rg.id && rg.id) hit = i; });
-    if (hit >= 0) list[hit] = row; else list.push(row);
-    ovRGSend(list, "分组「" + name + "」已保存。这一份是下一次发布的输入：到「基础配置」发布以后，" +
-      "这一组设备才会拿到新的 rrs。");
-  }
-
-  function ovDeleteRRGroup(id, name) {
-    var o = ovStore();
-    if (!o.doc) return;
-    if (!confirm("删除分组「" + name + "」？\n\n组里的设备从此不建 RR 邻居，各自回到盘上那一份；已经装在设备上的 rrs 要等下一次发布才变。")) return;
-    var list = (o.doc.rr_groups || []).filter(function (g) { return g.id !== id; }).map(function (g) { return g; });
-    ovRGSend(list, "分组「" + name + "」已删除：组里的设备不再由控制器下发 rrs，各自回到盘上那一份。");
-  }
-
   function viewOverlaySettings() {
     var o = ensureOverlay();
     var doc = o.doc;
@@ -5283,8 +5130,6 @@
     var h = "";
     if (o.note) h += undNote(o.note);
     h += ovRRPanel(doc, o);
-    h += ovRGTable(doc, o);
-    h += ovRGEditor(doc, o);
     h += ovGlobalForm(o, doc);
     h += undChecksPanel(doc);
     h += '<section class="panel"><header><h2>这一页不管的地址池</h2></header>' +
@@ -5354,17 +5199,63 @@
     return { pages: pages, page: Math.min(Math.max(0, edit.page | 0), pages - 1) };
   }
 
+  // 这一格不跟着策略草稿走：策略回答「哪些表互通」，RR 回答「这台设备问谁要路由」，
+  // 两件事分开存（PUT /api/overlay/device-rr，一台设备一次），所以改 RR 不会顺手改
+  // 掉策略里还没保存的东西，反过来也一样。
+  function ovRRSlotSelect(doc, node, slot) {
+    var b = (doc.rr_binds || {})[String(node)] || {};
+    var cur = (slot === "primary" ? b.primary : b.backup) || "";
+    var label = slot === "primary" ? "RR 1" : "RR 2";
+    var h = '<select class="rr-slot" data-keep data-ov-rr-slot="' + slot + '" data-ov-rr-node="' + esc(node) +
+      '" aria-label="node-' + esc(node) + ' 的 ' + label + '">' +
+      '<option value=""' + (cur ? "" : " selected") + ">不用（不建邻居）</option>";
+    ovRRItems(doc, cur).forEach(function (it) {
+      h += '<option value="' + esc(it.value) + '"' + (it.value === cur ? " selected" : "") + ">" +
+        esc(it.text) + "</option>";
+    });
+    return h + "</select>";
+  }
+
+  function ovSetDeviceRR(node, slot, id) {
+    var o = ovStore();
+    if (!o.doc) return;
+    var b = (o.doc.rr_binds || {})[String(node)] || {};
+    var body = { node_id: node, primary: b.primary || "", backup: b.backup || "" };
+    body[slot] = id || "";
+    var label = slot === "primary" ? "RR 1" : "RR 2";
+    api("PUT", "/api/overlay/device-rr", body).then(function (res) {
+      ovSetDoc(res.overlay || o.doc);
+      o.note = { kind: "", text: "node-" + node + " 的 " + label + " 已" +
+        (id ? "改成 " + id : "清空") + "。这一格是下一次发布的输入：到「基础配置」发布以后，" +
+        "设备才会" + (id ? "拨它" : "撤掉那条会话") + "。" };
+      blurContent();
+      render();
+      toast("已保存");
+    }).catch(function (err) {
+      o.note = undErrNote(err);
+      blurContent();
+      render();
+    });
+  }
+
   function ovMemberBody(doc, edit) {
     if (!edit.members.length) {
-      return '<tr><td colspan="4" class="muted">还没有成员：在上面选一台设备和一张 VPN，点「添加成员」。</td></tr>';
+      return '<tr><td colspan="6" class="muted">还没有成员：在上面选一台设备和一张 VPN，点「添加成员」。</td></tr>';
     }
     var rows = ovMemberFiltered(doc, edit);
     if (!rows.length) {
-      return '<tr><td colspan="4" class="muted">没有匹配「' + esc(edit.filter) + '」的成员。</td></tr>';
+      return '<tr><td colspan="6" class="muted">没有匹配「' + esc(edit.filter) + '」的成员。</td></tr>';
     }
     var p = ovMemberPages(rows, edit);
     var h = "";
+    // RR 1 / RR 2 是设备自己的属性，不是（设备, VPN）这一对的：同一台设备带几张
+    // VPN 进来就有几行，那几行说的是同一格，两个下拉指向同一个字段只会让其中一行
+    // 撒谎。所以选取器只画在这台设备在当前这一页第一次出现的那一行，其余写「同上」。
+    var shown = {};
     rows.slice(p.page * ovMembersPerPage, p.page * ovMembersPerPage + ovMembersPerPage).forEach(function (r) {
+      var k = String(r.m.node);
+      var first = !shown[k];
+      shown[k] = 1;
       h += "<tr>" +
         '<td><span class="mono">node-' + esc(r.m.node) + "</span>" +
         (r.node && r.node.name ? '<div class="muted" style="font-size:12px">' + esc(r.node.name) + "</div>" : "") +
@@ -5372,6 +5263,8 @@
         "<td><b>VPN " + esc(r.m.vpn) + "</b>" +
         (r.vname ? ' <span class="muted">' + esc(r.vname) + "</span>" : "") + "</td>" +
         '<td class="muted" style="font-size:12.5px">' + ovVpnRTText(doc, r.m) + "</td>" +
+        "<td>" + (first ? ovRRSlotSelect(doc, r.m.node, "primary") : '<span class="muted">同上</span>') + "</td>" +
+        "<td>" + (first ? ovRRSlotSelect(doc, r.m.node, "backup") : '<span class="muted">同上</span>') + "</td>" +
         '<td class="row-actions"><button class="small danger" type="button" data-act="ov-m-del" data-i="' +
         r.i + '">移出</button></td></tr>';
     });
@@ -5412,8 +5305,13 @@
       '<input id="ov-m-q" name="ov-m-q" value="' + esc(edit.filter || "") +
       '" placeholder="node 号 / 设备名 / VPN"></div></div>' +
       '<table style="margin-top:8px"><thead><tr><th>设备</th><th>VPN</th>' +
-      "<th>这张表当前导通什么</th><th></th></tr></thead>" +
+      "<th>这张表当前导通什么</th><th>RR 1</th><th>RR 2</th><th></th></tr></thead>" +
       '<tbody id="ov-m-tbody">' + ovMemberBody(doc, edit) + "</tbody></table>" +
+      '<div class="hint" style="margin:8px 0 0">RR 1 / RR 2 是<b>设备</b>的反射器，不是这一行 VPN 的：' +
+      "同一台设备在这张表里出现几行，那几行是同一格。两格都空着的设备一个 RR 邻居也不建，控制器不给它下发 " +
+      "<code>rrs</code>，它继续用自己盘上那一份；选了就一直生效，跟这台设备放进哪个策略无关。" +
+      "改了立刻存进控制器，但同样要等「基础配置」发布、设备来拉才换——所以改完先别急着看设备那边变。" +
+      "RR 本身在「Overlay 配置 › 全局配置」里增删。</div>" +
       '<div id="ov-m-pager">' + ovMemberPager(doc, edit) + "</div>";
   }
 
@@ -5975,42 +5873,6 @@
       e.preventDefault();
       ovSaveGroup(ggf);
     });
-    var rgf = $("ov-rg-form");
-    if (rgf) rgf.addEventListener("submit", function (e) {
-      e.preventDefault();
-      ovSaveRRGroup();
-    });
-    var rgn = $("ov-rg-name");
-    if (rgn) rgn.addEventListener("input", function () {
-      var o = ovStore();
-      if (!o.rg) o.rg = ovRGBlank();
-      o.rg.name = rgn.value;
-      var slot = $("ov-rg-err");
-      if (slot) slot.textContent = "";
-    });
-    // 多选列表自己带过滤框，过滤时只换 option 不重建整页，所以这里挂一次就够；
-    // 选中集合每次 change 都写回草稿，否则下一次重画会按旧草稿把勾去掉。
-    var rgd = document.querySelector('#content select[data-dp-list="ov-rg-dev"]');
-    if (rgd) rgd.addEventListener("change", function () {
-      var o = ovStore();
-      if (!o.rg) return;
-      o.rg.devices = Array.prototype.slice.call(rgd.selectedOptions).map(function (op) { return op.value; });
-    });
-    var rrp = $("ov-rg-rrp"), rrb = $("ov-rg-rrb");
-    if (rrp) rrp.addEventListener("change", function () {
-      var o = ovStore();
-      if (!o.rg) return;
-      o.rg.primary = rrp.value;
-      blurContent();
-      render();
-    });
-    if (rrb) rrb.addEventListener("change", function () {
-      var o = ovStore();
-      if (!o.rg) return;
-      o.rg.backup = rrb.value;
-      blurContent();
-      render();
-    });
     // 组名是手打的，必须当场写回草稿：这个表单里「＋ 加一行成员」和换设备都会
     // 重画，而重画时输入框的 value 是按草稿里的旧名字生成的——keep 那一轮只补
     // 空值、不覆盖非空值，所以不写回状态的话，改的名字会在他点下"＋"的那一刻
@@ -6053,6 +5915,14 @@
       o.edit.filter = omq.value;
       o.edit.page = 0;
       ovMemberRefresh();
+    });
+    // RR 1 / RR 2 在成员表里是 <select>，值只在 change 上产生；tbody 会被过滤/翻页
+    // 单独重画，所以挂在表单上（表单只在整页重画时才换），不挂在每一格上。
+    var ggr = $("ov-group-form");
+    if (ggr) ggr.addEventListener("change", function (e) {
+      var el = e.target;
+      if (!el || !el.getAttribute || !el.getAttribute("data-ov-rr-slot")) return;
+      ovSetDeviceRR(Number(el.getAttribute("data-ov-rr-node")), el.getAttribute("data-ov-rr-slot"), el.value);
     });
     // A dropdown's value only exists on "change"; the generic [data-act] click
     // handler below would read it before the user has picked anything.
@@ -6259,31 +6129,12 @@
           var orl = ovStore();
           orl.doc = null;
           orl.g = null;
-          orl.rg = null;
           orl.rre = null;
           orl.edit = null;
           orl.note = null;
           blurContent();
           render();
           loadOverlay();
-        }
-        else if (act === "ov-rg-edit") {
-          var orge = ovStore();
-          if (!orge.doc) return;
-          var orId = el.getAttribute("data-id");
-          if (orge.rg && orge.rg.id === orId) orge.rg = ovRGBlank();
-          else ovRGStart(orge.doc, orId);
-          blurContent();
-          render();
-        }
-        else if (act === "ov-rg-del") {
-          ovDeleteRRGroup(el.getAttribute("data-id"), el.getAttribute("data-name") || "该分组");
-        }
-        else if (act === "ov-rg-x") {
-          var orgx = ovStore();
-          orgx.rg = ovRGBlank();
-          blurContent();
-          render();
         }
         else if (act === "ov-group-new") {
           var onew = ovStore();

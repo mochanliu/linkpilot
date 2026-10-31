@@ -9,10 +9,11 @@
 //     list is not a harmless placeholder: sr-route reads "rrs": [] and refuses
 //     to start, which would take the whole route plane of that box down over an
 //     empty table.
-//   - only a device an RR group names gets reflectors: that group's two. A
-//     device no group names gets no rrs key and keeps its own route.json list.
-//   - deleting a row a group still names is refused, because the alternative
-//     silently drops that group's reflectors.
+//   - only a device that picked an RR 1 / RR 2 pair gets reflectors: that pair.
+//     A device with no selection gets no rrs key and keeps its own route.json
+//     list (2026-11-01: the pair is edited on the 导通策略 device table).
+//   - deleting a row a device still dials is refused, because the alternative
+//     silently drops that device's reflector.
 //   - a row nothing can manage (no tenant, or a tenant that no longer exists) is
 //     dropped by normalize rather than left in the table forever.
 package main
@@ -135,8 +136,8 @@ func TestRRAddListAndSeeInOverlay(t *testing.T) {
 		t.Fatalf("列表 = %+v max=%d", list.RRs, list.MaxRRs)
 	}
 	for _, row := range list.RRs {
-		if len(row.Groups) != 0 {
-			t.Errorf("%s 才刚建就被分组选着？groups=%v", row.ID, row.Groups)
+		if len(row.Devices) != 0 {
+			t.Errorf("%s 才刚建就被设备选着？devices=%v", row.ID, row.Devices)
 		}
 	}
 
@@ -219,11 +220,11 @@ func TestRRIsOneTenantsOwn(t *testing.T) {
 		t.Fatalf("t2 拿到了一个已存在的 id: %s", got)
 	}
 
-	// A group of t2 that names t's row is refused by the same visibility gate the
+	// A t2 device that names t's row is refused by the same visibility gate the
 	// rest of the page uses, and the message must not hand the owner away.
-	rec := rrGroupsSet(t, s, two, rrGroupWrite("", "乙组", []uint16{9}, mine, ""))
+	rec := rrBindSet(t, s, two, 9, mine, "")
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("t2 的分组选了 t 的 RR = %d，想要 400 (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("t2 的设备选了 t 的 RR = %d，想要 400 (%s)", rec.Code, rec.Body.String())
 	}
 	if body := rec.Body.String(); strings.Contains(body, "甲方网络") || strings.Contains(body, "VIP 专线") {
 		t.Errorf("拒绝消息里说出了另一租户的名字: %s", body)
@@ -263,26 +264,26 @@ func TestRRUnmanageableRowIsDropped(t *testing.T) {
 	}
 }
 
-func TestRRRenderIsGroupOnlyAndNeverEmpty(t *testing.T) {
+func TestRRRenderIsSelectionOnlyAndNeverEmpty(t *testing.T) {
 	s, ten, _, _ := rrFixture(t)
 	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))["rrs"]; ok {
-		t.Fatal("一台设备也没进分组，第 4 段里就有 rrs 了")
+		t.Fatal("一台设备也没选，第 4 段里就有 rrs 了")
 	}
 
 	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
 	b := rrCreate(t, s, ten, "RR-B", "192.0.2.11:20200")
 
-	// Adding rows alone reaches nobody: an ungrouped device keeps its own list.
+	// Adding rows alone reaches nobody: an unselected device keeps its own list.
 	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))["rrs"]; ok {
-		t.Fatal("库里加了 RR，没进分组的设备也拿到了 rrs")
+		t.Fatal("库里加了 RR，没选的设备也拿到了 rrs")
 	}
 
-	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "本组", []uint16{1}, a, b)); rec.Code != http.StatusOK {
-		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
+	if rec := rrBindSet(t, s, ten, 1, a, b); rec.Code != http.StatusOK {
+		t.Fatalf("存选择 = %d (%s)", rec.Code, rec.Body.String())
 	}
 	doc := decodeRouteDoc(t, routeArtifact(t, s, "t", 1))
 	if _, ok := doc["rrs"]; !ok {
-		t.Fatal("进了分组，第 4 段却没有 rrs")
+		t.Fatal("选了 RR，第 4 段却没有 rrs")
 	}
 	rrs := decodedRRs(t, doc)
 	if len(rrs) != 2 || rrs[0].ID != a || rrs[0].Addr != "192.0.2.10:20200" || rrs[1].ID != b {
@@ -290,13 +291,13 @@ func TestRRRenderIsGroupOnlyAndNeverEmpty(t *testing.T) {
 	}
 	// The other tenant is unaffected: its devices get no rrs key.
 	if _, ok := decodeRouteDoc(t, routeArtifact(t, s, "t2", 9))["rrs"]; ok {
-		t.Error("t2 没有分组，却收到了 rrs")
+		t.Error("t2 没有选择，却收到了 rrs")
 	}
 
 	// Deleting every row goes back to "no key at all", which is what keeps a box's
-	// own reflector list alive. The group has to go first: it is a reference.
-	if rec := rrGroupsSet(t, s, ten); rec.Code != http.StatusOK {
-		t.Fatalf("清空分组 = %d (%s)", rec.Code, rec.Body.String())
+	// own reflector list alive. The selection has to go first: it is a reference.
+	if rec := rrBindSet(t, s, ten, 1, "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("清空选择 = %d (%s)", rec.Code, rec.Body.String())
 	}
 	for _, id := range []string{a, b} {
 		if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete",
@@ -369,20 +370,20 @@ func TestRRMaxPerTenant(t *testing.T) {
 
 func TestRRDeleteGuardAndIDNeverReturns(t *testing.T) {
 	s, ten, _, _ := rrFixture(t)
-	keep := rrCreate(t, s, ten, "被分组的 RR", "192.0.2.20:20200")
+	keep := rrCreate(t, s, ten, "被选着的 RR", "192.0.2.20:20200")
 	free := rrCreate(t, s, ten, "没人选", "192.0.2.21:20200")
 
-	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "华东", []uint16{1}, keep, "")); rec.Code != http.StatusOK {
-		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
+	if rec := rrBindSet(t, s, ten, 1, keep, ""); rec.Code != http.StatusOK {
+		t.Fatalf("存选择 = %d (%s)", rec.Code, rec.Body.String())
 	}
 	rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, keep), ten)
 	if rec.Code != http.StatusConflict {
-		t.Fatalf("删被分组选着的 RR = %d，想要 409 (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("删被设备选着的 RR = %d，想要 409 (%s)", rec.Code, rec.Body.String())
 	}
-	// The refusal has to name the group to go and change, or the tenant learns only
-	// that something is wrong.
-	if !strings.Contains(rec.Body.String(), "华东") {
-		t.Errorf("拒绝消息没带上是哪个分组: %s", rec.Body.String())
+	// The refusal has to name the device to go and change, or the tenant learns
+	// only that something is wrong.
+	if !strings.Contains(rec.Body.String(), "node-1") {
+		t.Errorf("拒绝消息没带上是哪台设备: %s", rec.Body.String())
 	}
 	// The list shows the reference too, so the row can explain itself before the
 	// delete button is pressed.
@@ -390,23 +391,23 @@ func TestRRDeleteGuardAndIDNeverReturns(t *testing.T) {
 		if row.ID != keep {
 			continue
 		}
-		if len(row.Groups) != 1 || row.Groups[0].Name != "华东" {
-			t.Errorf("%s 的引用 = %+v，想要华东那一条", keep, row.Groups)
+		if len(row.Devices) != 1 || row.Devices[0].NodeID != 1 {
+			t.Errorf("%s 的引用 = %+v，想要 node 1", keep, row.Devices)
 		}
 	}
 	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, free), ten); rec.Code != http.StatusOK {
 		t.Fatalf("删没人选的 RR = %d (%s)", rec.Code, rec.Body.String())
 	}
-	// Dropping the group releases the row; the counter does not hand the id back.
-	if rec := rrGroupsSet(t, s, ten); rec.Code != http.StatusOK {
-		t.Fatalf("清空分组 = %d", rec.Code)
+	// Dropping the selection releases the row; the counter does not hand the id back.
+	if rec := rrBindSet(t, s, ten, 1, "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("清空选择 = %d", rec.Code)
 	}
 	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, keep), ten); rec.Code != http.StatusOK {
 		t.Fatalf("解除引用之后删 = %d (%s)", rec.Code, rec.Body.String())
 	}
 	next := rrCreate(t, s, ten, "RR 新增", "192.0.2.22:20200")
 	if next == keep || next == free {
-		t.Fatalf("新条目复用了已删除的 id %s：分组里那条引用会突然指向一台别的机器", next)
+		t.Fatalf("新条目复用了已删除的 id %s：设备选择里那条引用会突然指向一台别的机器", next)
 	}
 }
 
@@ -463,10 +464,10 @@ func TestRREditMarksTheDevicePending(t *testing.T) {
 		t.Fatalf("存草稿 = %+v", v)
 	}
 	a := rrCreate(t, s, ten, "RR-A", "192.0.2.10:20200")
-	// The row only reaches node 1 through a group; without one the device has no
-	// rrs at all, so an address change would not be part of its bundle.
-	if rec := rrGroupsSet(t, s, ten, rrGroupWrite("", "本组", []uint16{1}, a, "")); rec.Code != http.StatusOK {
-		t.Fatalf("存分组 = %d (%s)", rec.Code, rec.Body.String())
+	// The row only reaches node 1 through a selection; without one the device has
+	// no rrs at all, so an address change would not be part of its bundle.
+	if rec := rrBindSet(t, s, ten, 1, a, ""); rec.Code != http.StatusOK {
+		t.Fatalf("存选择 = %d (%s)", rec.Code, rec.Body.String())
 	}
 	if rec := publishReq(t, s, ten, http.MethodPost, `{"node_id":1}`); rec.Code != http.StatusOK {
 		t.Fatalf("发布 v1 = %d (%s)", rec.Code, rec.Body.String())

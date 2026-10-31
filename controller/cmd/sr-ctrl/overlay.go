@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"sdwan/controller/internal/route"
@@ -68,24 +69,15 @@ type OverlayGroup struct {
 	UpdatedAt int64 `json:"updated_at_unix"`
 }
 
-// RRGroup is one 反射器分组: the devices in the list dial this group's two
-// reflectors instead of every row of the tenant's RR list. It exists because one
-// tenant's sites may sit closer to different reflectors; the reflector side does
-// not care (it reflects to every session it has), so the split is purely a
-// per-device address choice.
-//
-// Membership is a list of devices, not a predicate: "which group is this device
-// in" must be answerable without arithmetic, because the answer decides which
-// addresses go into that device's route.json.
-type RRGroup struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	DeviceIDs []uint16 `json:"device_ids"`
-	// Ids of rows in the same tenant's RR list, validated by the same
-	// rrSelectionErrorLocked gate, so a group can never name a reflector another
-	// tenant owns.
-	RRPrimary string `json:"rr_primary,omitempty"`
-	RRBackup  string `json:"rr_backup,omitempty"`
+// RRBind is the two reflectors one device dials. It is a property of the device,
+// not of a list of devices: the 反射器分组 page it replaced (2026-11-01) only
+// existed to spell out "these devices" around this pair, and a device already
+// appears on the page that lists devices. The values are ids from the same
+// tenant's RR list, validated by rrSelectionErrorLocked, so a bind can never
+// name a reflector another tenant owns.
+type RRBind struct {
+	Primary string `json:"primary,omitempty"`
+	Backup  string `json:"backup,omitempty"`
 }
 
 // OverlayConfig is one tenant's overlay layer. Keyed by tenant id in State.
@@ -97,21 +89,37 @@ type OverlayConfig struct {
 	EscapeAllColors bool           `json:"escape_all_colors"`
 	Groups          []OverlayGroup `json:"groups"`
 
-	// RRGroups splits the tenant's devices across reflector sets. Only a device
-	// a group names gets reflectors at all; a device no group names gets no rrs
-	// key and keeps the list its own route.json already carries. Adding a row to
-	// the library therefore never wakes up sessions on boxes nobody placed.
-	RRGroups []RRGroup `json:"rr_groups,omitempty"`
+	// RRBinds is the per-device reflector choice, keyed by decimal node id. A
+	// device with no entry gets no rrs key and keeps the list its own route.json
+	// carries, so adding a row to the library never wakes up sessions on boxes
+	// nobody placed.
+	RRBinds map[string]RRBind `json:"rr_binds,omitempty"`
+
+	// LegacyRRGroups only carries a state file written before 2026-11-01, when
+	// devices were grouped and each group named a pair. Loading keeps it so
+	// ensure can turn it into RRBinds; every write after that clears it, so a
+	// box does not silently lose its reflectors by upgrading.
+	LegacyRRGroups []legacyRRGroup `json:"rr_groups,omitempty"`
 
 	// NextRT is the counter behind the allocated value; NextGroup mints ids.
 	// Neither ever rewinds, so an RT is burned for good when its group is deleted
 	// -- reusing a value a device may still hold routes under is worse than a gap.
-	NextRT      int `json:"next_rt"`
-	NextGroup   int `json:"next_group"`
-	NextRRGroup int `json:"next_rr_group"`
+	NextRT    int `json:"next_rt"`
+	NextGroup int `json:"next_group"`
 
 	UpdatedAt int64  `json:"updated_at_unix"`
 	UpdatedBy string `json:"updated_by,omitempty"`
+}
+
+// legacyRRGroup is the removed 反射器分组 row, kept only far enough to migrate
+// it. Its pair was already per device in rendering terms -- a group was just a
+// list of devices sharing one pair -- so the migration is a fan-out.
+type legacyRRGroup struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	DeviceIDs []uint16 `json:"device_ids"`
+	RRPrimary string   `json:"rr_primary"`
+	RRBackup  string   `json:"rr_backup"`
 }
 
 // OverlayVRF is the derived, per-device route-target view of one VPN. The JSON
@@ -156,17 +164,48 @@ func (o *OverlayConfig) ensure() {
 	if o.NextGroup < 0 {
 		o.NextGroup = 0
 	}
-	if o.RRGroups == nil {
-		o.RRGroups = []RRGroup{}
+	if o.RRBinds == nil {
+		o.RRBinds = map[string]RRBind{}
 	}
-	if o.NextRRGroup < 0 {
-		o.NextRRGroup = 0
+	// One-way: a group's pair becomes each of its devices' pair, and the old rows
+	// are dropped so the next save writes the new shape only. A bind that is
+	// already stored wins -- it was written later, through the per-device column.
+	// A group whose two ids are equal, or empty, is left alone: it could never
+	// have been saved through the old API either, so it renders nothing anyway and
+	// the read-time check will name it if it still matters.
+	for _, g := range o.LegacyRRGroups {
+		p := strings.TrimSpace(g.RRPrimary)
+		b := strings.TrimSpace(g.RRBackup)
+		if p != "" && p == b {
+			b = ""
+		}
+		for _, id := range g.DeviceIDs {
+			if id == 0 {
+				continue
+			}
+			k := strconv.Itoa(int(id))
+			if _, ok := o.RRBinds[k]; ok {
+				continue
+			}
+			if p == "" && b == "" {
+				continue
+			}
+			o.RRBinds[k] = RRBind{Primary: p, Backup: b}
+		}
 	}
-	for i := range o.RRGroups {
-		o.RRGroups[i].Name = strings.TrimSpace(o.RRGroups[i].Name)
-		o.RRGroups[i].RRPrimary = strings.TrimSpace(o.RRGroups[i].RRPrimary)
-		o.RRGroups[i].RRBackup = strings.TrimSpace(o.RRGroups[i].RRBackup)
-		o.RRGroups[i].DeviceIDs = normalizeDeviceIDs(o.RRGroups[i].DeviceIDs)
+	o.LegacyRRGroups = nil
+	// A node that is gone, or an entry with neither slot filled, is not a
+	// selection: keeping it would make the page show a choice that renders
+	// nothing. Repaired here (not in a migration) so a hand-edited state file
+	// cannot resurrect one either.
+	for k, b := range o.RRBinds {
+		b.Primary = strings.TrimSpace(b.Primary)
+		b.Backup = strings.TrimSpace(b.Backup)
+		if k == "" || (b.Primary == "" && b.Backup == "") {
+			delete(o.RRBinds, k)
+			continue
+		}
+		o.RRBinds[k] = b
 	}
 	for i := range o.Groups {
 		o.Groups[i].Name = strings.TrimSpace(o.Groups[i].Name)
@@ -185,26 +224,21 @@ func (o *OverlayConfig) group(id string) *OverlayGroup {
 	return nil
 }
 
-func (o *OverlayConfig) rrGroup(id string) *RRGroup {
-	for i := range o.RRGroups {
-		if o.RRGroups[i].ID == id {
-			return &o.RRGroups[i]
-		}
-	}
-	return nil
+// rrBindOf answers the only question the renderer asks: which two slots this
+// device was given. A missing entry is "no reflectors from the controller".
+func (o *OverlayConfig) rrBindOf(nodeID uint16) (RRBind, bool) {
+	b, ok := o.RRBinds[strconv.Itoa(int(nodeID))]
+	return b, ok
 }
 
-// rrGroupOf answers the only membership question the renderer asks. The save
-// gate refuses to put one device in two groups, so the first hit is the answer.
-func (o *OverlayConfig) rrGroupOf(nodeID uint16) *RRGroup {
-	for i := range o.RRGroups {
-		for _, id := range o.RRGroups[i].DeviceIDs {
-			if id == nodeID {
-				return &o.RRGroups[i]
-			}
-		}
+// rrBindsCopy is what the view hands the page: a copy, never the map the server
+// mutates under s.mu (the response is built under the lock but encoded after it).
+func rrBindsCopy(in map[string]RRBind) map[string]RRBind {
+	out := make(map[string]RRBind, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
-	return nil
+	return out
 }
 
 // normalizeDeviceIDs makes a saved group stable: the state file and the console
@@ -554,9 +588,9 @@ type overlayView struct {
 	// of) another tenant's RR. Writes go to /api/rrs.
 	RRLibrary []rrRow `json:"rr_library"`
 	MaxRRs    int     `json:"max_rrs"`
-	// RRGroups is the stored per-device split. The page edits the list as a
-	// whole, which is also how the save endpoint takes it.
-	RRGroups []RRGroup `json:"rr_groups"`
+	// RRBinds is the stored per-device choice, keyed by decimal node id. The page
+	// shows it as the RR 1 / RR 2 columns of the device rows it already renders.
+	RRBinds map[string]RRBind `json:"rr_binds"`
 	// RRNote says what the device does with the list, because a list of two
 	// addresses reads like a failover order this plane does not implement: the
 	// route client keeps a session up to every entry it is handed.
@@ -577,10 +611,10 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 			"页面上不可编辑；设备重启后靠本地那一份配置工作，不依赖控制器在线。", overlayRTASN),
 		RRLibrary: s.rrRowsLocked(tenantID),
 		MaxRRs:    rrMaxPerTenant,
-		RRGroups:  append([]RRGroup{}, oc.RRGroups...),
-		RRNote: "只有被反射器分组点名的设备才会拿到 rrs：分组给它选的两条 RR 就是它的全部反射器，客户端对拿到的每一条都保持会话，" +
+		RRBinds:   rrBindsCopy(oc.RRBinds),
+		RRNote: "只有选了 RR 的设备才会拿到 rrs：RR 1 / RR 2 就是它的全部反射器，客户端对拿到的每一条都保持会话，" +
 			"两条的宣告并进同一张路由表（同一条前缀在两台上是同一份路由的两份拷贝），所以两条就是两个等价活动反射器，" +
-			"掉一条表不缩。没被任何分组点名的设备一个 RR 邻居也不建，控制器不给它下发 rrs，它继续用自己盘上那一份。" +
+			"掉一条表不缩。两列都空着的设备一个 RR 邻居也不建，控制器不给它下发 rrs，它继续用自己盘上那一份。" +
 			"控制器不会去连这些地址，所以这里没有绿灯可给——能不能连上，只有设备自己的路由状态知道。" +
 			"发布后设备就地换：先把新 RR 的会话建起来，等新 RR 真的收全了本机的前缀，才摘掉被它顶替的那条，路由进程不重启；" +
 			"谁还没接管、谁还替它守着，看设备的路由状态。只剩一条时换地址必然有一段没有反射器的窗口——没有冗余是这一格本身的形态，不是故障。",
@@ -598,7 +632,7 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 	// page (an older file, a device that has since been removed), and a problem
 	// that exists is reported whether or not anyone is about to save.
 	view.Checks = append(view.Checks, s.overlayRRListChecksLocked(tenantID)...)
-	view.Checks = append(view.Checks, s.overlayRRGroupChecksLocked(tenantID)...)
+	view.Checks = append(view.Checks, s.overlayRRBindChecksLocked(tenantID)...)
 	for _, g := range oc.Groups {
 		view.Checks = append(view.Checks, s.overlayGroupChecksLocked(tenantID, g, g.ID)...)
 		view.Checks = append(view.Checks, s.overlayTunnelChecksLocked(tenantID, g)...)
