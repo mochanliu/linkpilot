@@ -682,7 +682,7 @@
     },
     "overlay-settings": {
       title: "全局配置",
-      sub: "反射器（RR）清单与逃生开关：RR 归本租户所有、在这里增删改，没被 RR 分组点名的设备会拨每一条。这一页保存的是下一次发布的输入，改完要在「基础配置」发布，设备才会拿到",
+      sub: "反射器（RR）清单与逃生开关：RR 归本租户所有、在这里增删改；只有被 RR 分组点名的设备才会建 RR 邻居。这一页保存的是下一次发布的输入，改完要在「基础配置」发布，设备才会拿到",
       roles: ["tenant"]
     },
     "overlay-groups": {
@@ -4877,7 +4877,7 @@
       releaseForm(form);
       ovRRApply(res, "已加入「" + body.name + "」" +
         (res && res.rr ? "（" + res.rr.id + "）" : "") +
-        "。没被反射器分组点名的设备都会拨它；要到「基础配置」发布以后才生效。", "已加入");
+        "。它只进库，不改变任何设备：要让它真被拨，得在某台设备所在的 RR 分组里选中它，再到「基础配置」发布。", "已加入");
     }).catch(function (err) { ovErr("ov-rr-new-err", err.message); });
   }
 
@@ -5106,7 +5106,12 @@
       '<button class="small" type="button" data-act="ov-reload">重新载入</button>' +
       '<button class="small" type="submit">保存</button>' +
       '<button class="small primary" type="button" data-act="goto" data-view="config">去「基础配置」发布</button>' +
-      "</div></form></section>";
+      "</div>" +
+      '<div class="hint" style="margin-top:12px">这三个按钮各做一件事：<b>保存</b>只把这一格写进控制器的草稿，' +
+      "设备那边一个字都不变；<b>重新载入</b>丢掉你还没保存的勾选，重新从控制器读一遍（保存失败或改主意时用）；" +
+      "<b>去「基础配置」发布</b>才把当前这一版发给设备——发布之后设备也要等下一次心跳才拉下来，所以" +
+      "「保存了但没发布」和「发布了但设备还没拉」都不是故障。</div>" +
+      "</form></section>";
     return h;
   }
 
@@ -5153,12 +5158,13 @@
     var rows = doc.rr_groups || [];
     var h = '<section class="panel"><header><h2>RR 分组</h2>' +
       '<span class="muted" style="font-size:12.5px">' + rows.length +
-      " 组 · 没被任何组点名的设备拨本租户每一条 RR</span></header>";
-    h += '<div class="hint">分组只管「这台设备连哪两台 RR」：被点名的设备，第 4 段里的 ' +
-      "<code>rrs</code> 就是这个组的两台；没被点名的设备拨本租户的每一条 RR。一台设备只能在一组。" +
+      " 组 · 没被任何组点名的设备不建 RR 邻居</span></header>";
+    h += '<div class="hint">分组决定「这台设备连哪两台 RR」：被点名的设备，第 4 段里的 ' +
+      "<code>rrs</code> 就是这个组的两台；没被任何组点名的设备一个 RR 邻居也不建，控制器不给它下发 " +
+      "<code>rrs</code>，它继续用自己盘上那一份。想让一台设备用反射器，就把它放进某个组。一台设备只能在一组。" +
       "反射器那边没有区别——它把收到的路由原样发给除来源外的每个会话，不看隧道也不看分组。</div>";
     if (!rows.length) {
-      h += '<div class="empty">还没有分组：所有设备都拨本租户每一条 RR。</div>';
+      h += '<div class="empty">还没有分组：所有设备都不建 RR 邻居（各自用盘上那一份）。</div>';
     } else {
       h += "<table><thead><tr><th>组</th><th>设备</th><th>RR 1</th><th>RR 2</th><th></th></tr></thead><tbody>";
       rows.forEach(function (g) {
@@ -5262,9 +5268,9 @@
   function ovDeleteRRGroup(id, name) {
     var o = ovStore();
     if (!o.doc) return;
-    if (!confirm("删除分组「" + name + "」？\n\n组里的设备会回到拨本租户全部 RR。已经装在设备上的 rrs 要等下一次发布才变。")) return;
+    if (!confirm("删除分组「" + name + "」？\n\n组里的设备从此不建 RR 邻居，各自回到盘上那一份；已经装在设备上的 rrs 要等下一次发布才变。")) return;
     var list = (o.doc.rr_groups || []).filter(function (g) { return g.id !== id; }).map(function (g) { return g; });
-    ovRGSend(list, "分组「" + name + "」已删除：组里的设备回到拨本租户全部 RR。");
+    ovRGSend(list, "分组「" + name + "」已删除：组里的设备不再由控制器下发 rrs，各自回到盘上那一份。");
   }
 
   function viewOverlaySettings() {
@@ -5319,23 +5325,136 @@
     return h;
   }
 
-  function ovMemberRows(doc, edit) {
-    var h = "";
+  // 成员是表格 + 过滤 + 分页：一个策略最多 doc.max_members 行，上千台设备的租户里逐行
+  // 铺开的表单会长到没法用。改动只发生在两处——顶部的「添加成员」与行上的「移出」——
+  // 所以行里不放控件：要改一行就是移出再加。
+  var ovMembersPerPage = 10;
+
+  function ovMemberKey(m) { return m.node + "/" + m.vpn; }
+
+  // 过滤只作用于「画出来的那部分」，草稿里的成员数组一行不动：过滤是看的方式，
+  // 不是保存的内容。
+  function ovMemberFiltered(doc, edit) {
+    var q = String(edit.filter || "").trim().toLowerCase();
+    var out = [];
     edit.members.forEach(function (m, i) {
       var node = ovNodeOf(doc, m.node);
-      h += '<div class="und-box" style="margin-bottom:8px"><div class="fields" style="align-items:end">' +
-        '<div class="field"><label>设备</label>' +
-        dpHtml("ov-m-" + i, "ov-m-" + i, ovNodeItems(doc.nodes), m.node || "",
-          { unit: "台", none: "", empty: "选择设备", ph: "先打几个字：node 号 / 名称 / 状态",
-            aria: "过滤设备列表", attrs: 'data-ov-m="' + i + '"' }) + "</div>" +
-        '<div class="field"><label for="ov-vpn-' + i + '">VPN</label>' +
-        '<select id="ov-vpn-' + i + '" data-ov-v="' + i + '">' + ovVpnOptions(node, m.vpn) + "</select></div>" +
-        '<div class="field"><label>这张表现在导通什么</label>' +
-        '<span class="muted" style="font-size:12.5px">' + ovVpnRTText(doc, m) + "</span></div>" +
-        '<div class="field"><button class="small danger" type="button" data-act="ov-m-del" data-i="' + i +
-        '">移出去</button></div></div></div>';
+      var vname = "";
+      ((node && node.vrfs) || []).forEach(function (v) { if (String(v.id) === String(m.vpn)) vname = v.name || ""; });
+      var label = "node-" + m.node + " " + ((node && node.name) || "") +
+        " vpn " + m.vpn + " " + vname;
+      if (q && label.toLowerCase().indexOf(q) < 0) return;
+      out.push({ m: m, i: i, node: node, vname: vname });
+    });
+    return out;
+  }
+
+  function ovMemberPages(rows, edit) {
+    var pages = Math.max(1, Math.ceil(rows.length / ovMembersPerPage));
+    return { pages: pages, page: Math.min(Math.max(0, edit.page | 0), pages - 1) };
+  }
+
+  function ovMemberBody(doc, edit) {
+    if (!edit.members.length) {
+      return '<tr><td colspan="4" class="muted">还没有成员：在上面选一台设备和一张 VPN，点「添加成员」。</td></tr>';
+    }
+    var rows = ovMemberFiltered(doc, edit);
+    if (!rows.length) {
+      return '<tr><td colspan="4" class="muted">没有匹配「' + esc(edit.filter) + '」的成员。</td></tr>';
+    }
+    var p = ovMemberPages(rows, edit);
+    var h = "";
+    rows.slice(p.page * ovMembersPerPage, p.page * ovMembersPerPage + ovMembersPerPage).forEach(function (r) {
+      h += "<tr>" +
+        '<td><span class="mono">node-' + esc(r.m.node) + "</span>" +
+        (r.node && r.node.name ? '<div class="muted" style="font-size:12px">' + esc(r.node.name) + "</div>" : "") +
+        "</td>" +
+        "<td><b>VPN " + esc(r.m.vpn) + "</b>" +
+        (r.vname ? ' <span class="muted">' + esc(r.vname) + "</span>" : "") + "</td>" +
+        '<td class="muted" style="font-size:12.5px">' + ovVpnRTText(doc, r.m) + "</td>" +
+        '<td class="row-actions"><button class="small danger" type="button" data-act="ov-m-del" data-i="' +
+        r.i + '">移出</button></td></tr>';
     });
     return h;
+  }
+
+  function ovMemberPager(doc, edit) {
+    var rows = ovMemberFiltered(doc, edit);
+    var p = ovMemberPages(rows, edit);
+    return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" class="muted">' +
+      '<span style="font-size:12.5px">共 ' + edit.members.length + " 行" +
+      (rows.length !== edit.members.length ? "，筛出 " + rows.length + " 行" : "") +
+      " · 第 " + (p.page + 1) + "/" + p.pages + " 页</span>" +
+      '<button class="small" type="button" data-act="ov-m-prev"' + (p.page <= 0 ? " disabled" : "") +
+      ">上一页</button>" +
+      '<button class="small" type="button" data-act="ov-m-next"' + (p.page >= p.pages - 1 ? " disabled" : "") +
+      ">下一页</button></div>";
+  }
+
+  function ovMemberEditor(doc, edit) {
+    var add = edit.add || (edit.add = { node: "", vpn: "" });
+    var addNode = ovNodeOf(doc, Number(add.node));
+    var full = edit.members.length >= doc.max_members;
+    return '<div class="und-box" style="margin-top:8px">' +
+      '<div class="fields" style="align-items:end">' +
+      '<div class="field"><label>添加成员 · 设备</label>' +
+      dpHtml("ov-m-new", "ov-m-new", ovNodeItems(doc.nodes), add.node,
+        { unit: "台", none: "", empty: "选择设备", ph: "先打几个字：node 号 / 名称 / 状态",
+          aria: "过滤设备列表", attrs: 'data-ov-mnew="1"' }) + "</div>" +
+      '<div class="field"><label for="ov-new-vpn">VPN</label>' +
+      '<select id="ov-new-vpn" data-ov-mv="1">' + ovVpnOptions(addNode, add.vpn) + "</select></div>" +
+      '<div class="field"><button class="small primary" type="button" data-act="ov-m-add"' +
+      (full ? " disabled" : "") + ">＋ 添加成员</button></div></div>" +
+      (full ? '<div class="hint">已经到上限 ' + doc.max_members + " 行，要再加先移出一行。</div>" : "") +
+      '<div class="err" id="ov-m-err" role="alert"></div></div>' +
+      '<div class="fields" style="align-items:end;margin-top:12px"><div class="field">' +
+      '<label for="ov-m-q">过滤成员</label>' +
+      '<input id="ov-m-q" name="ov-m-q" value="' + esc(edit.filter || "") +
+      '" placeholder="node 号 / 设备名 / VPN"></div></div>' +
+      '<table style="margin-top:8px"><thead><tr><th>设备</th><th>VPN</th>' +
+      "<th>这张表当前导通什么</th><th></th></tr></thead>" +
+      '<tbody id="ov-m-tbody">' + ovMemberBody(doc, edit) + "</tbody></table>" +
+      '<div id="ov-m-pager">' + ovMemberPager(doc, edit) + "</div>";
+  }
+
+  // 过滤与翻页只换 tbody / 分页条，不重画整页：一边打字一边全页重建会把光标弹走，
+  // 也会把策略名那种手填字段的输入打断。
+  function ovMemberRefresh() {
+    var o = ovStore();
+    if (!o.edit || !o.doc) return;
+    var tb = document.getElementById("ov-m-tbody");
+    if (tb) tb.innerHTML = ovMemberBody(o.doc, o.edit);
+    var pg = document.getElementById("ov-m-pager");
+    if (pg) pg.innerHTML = ovMemberPager(o.doc, o.edit);
+  }
+
+  // 添加这一下走整页 render：设备选择器的过滤词与下拉状态都从草稿重建，抽屉里不留
+  // 半截状态。新行排在末尾，所以顺手跳到最后一页并清掉过滤，让他看见刚加的那一行。
+  function ovMemberAdd() {
+    var o = ovStore();
+    if (!o.edit || !o.doc) return;
+    var add = o.edit.add || (o.edit.add = { node: "", vpn: "" });
+    var node = Number(add.node) || 0;
+    if (!node) { ovErr("ov-m-err", "先选一台设备"); return; }
+    if (add.vpn === "" || add.vpn == null) { ovErr("ov-m-err", "再选一张 VPN"); return; }
+    if (o.edit.members.length >= o.doc.max_members) {
+      ovErr("ov-m-err", "一个策略最多 " + o.doc.max_members + " 行，要再加先移出一行"); return;
+    }
+    var key = ovMemberKey({ node: node, vpn: Number(add.vpn) });
+    var dup = false;
+    o.edit.members.forEach(function (m) {
+      if (ovMemberKey({ node: m.node, vpn: Number(m.vpn) }) === key) dup = true;
+    });
+    if (dup) {
+      ovErr("ov-m-err", "node-" + node + " 的 VPN " + add.vpn + " 已经在这个策略里了");
+      return;
+    }
+    o.edit.members.push({ node: node, vpn: Number(add.vpn) });
+    o.edit.add = { node: "", vpn: "" };
+    o.edit.filter = "";
+    o.edit.page = Math.max(0, Math.ceil(o.edit.members.length / ovMembersPerPage) - 1);
+    blurContent();
+    render();
   }
 
   // 成员那一行的 RT 取自控制器已经展开好的那份（doc.nodes[].vrfs）：页面上这几行
@@ -5362,16 +5481,14 @@
     var h = '<section class="panel"><header><h2>' + (isNew ? "新建导通策略" : "编辑策略 " + esc(edit.id)) + "</h2>" +
       '<span class="muted" style="font-size:12.5px">' + (isNew ? "保存时由控制器分配 RT" : "RT " + esc(g ? g.rt : edit.rt)) + "</span></header>" +
       '<div class="hint">一个策略就是一个互通域：策略里每一行的 VPN 都同时导出与导入这个策略的 RT，' +
-      "所以不需要 from/to 一对规则。成员是「设备 + VPN」这一对，同一台设备的两张表可以在不同策略里。" +
-      "上限：一个策略最多 " + doc.max_members + " 行、本租户最多 " + doc.max_groups + " 个策略、" +
-      "一张表最多进 " + doc.max_rts_per_vpn + " 个策略。</div>" +
+      "所以不需要 from/to 一对规则。成员是「设备 + VPN」这一对；同一台设备的不同表可以进不同策略，" +
+      "同一张表也可以同时进多个策略（最多 " + doc.max_rts_per_vpn + " 个），它就同时导入这几个域的路由。" +
+      "上限：一个策略最多 " + doc.max_members + " 行、本租户最多 " + doc.max_groups + " 个策略。</div>" +
       '<form id="ov-group-form">' +
       '<div class="fields"><div class="field"><label for="ov-g-name">策略名</label>' +
       '<input id="ov-g-name" name="ov-g-name" value="' + esc(edit.name) + '" maxlength="64" placeholder="如 生产网互通"></div></div>' +
-      ovMemberRows(doc, edit) +
-      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">' +
-      '<button class="small" type="button" data-act="ov-m-add"' +
-      (edit.members.length >= doc.max_members ? " disabled" : "") + ">＋ 加一行成员</button>" +
+      ovMemberEditor(doc, edit) +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' +
       '<button class="primary" type="submit">' + (isNew ? "新建" : "保存修改") + "</button>" +
       '<button class="small" type="button" data-act="ov-group-x">取消</button></div>' +
       '<div class="hint" style="margin:10px 0 0">' + esc(doc.rt_note) + "</div>" +
@@ -5409,33 +5526,6 @@
       "这一页的保存同样要等一次「基础配置」发布才到设备。</div></section>";
   }
 
-  function ovVpnPanel(doc) {
-    var h = '<section class="panel"><header><h2>每台设备的表</h2>' +
-      '<span class="muted" style="font-size:12.5px">按当前配置展开，不是设备回报</span></header>';
-    if (!doc.nodes.length) return h + '<div class="empty">还没有设备入网。</div></section>';
-    h += "<table><thead><tr><th>设备</th><th>状态</th><th>VPN</th><th>导出 RT</th><th>导入 RT</th><th>所在策略</th></tr></thead><tbody>";
-    doc.nodes.forEach(function (n) {
-      if (!n.vrfs.length) {
-        h += "<tr><td><span class=\"mono\">node-" + esc(n.node_id) + "</span></td><td>" + statusTag(n.status) +
-          '<td colspan="4" class="muted">这台设备没有 VPN 表</td></tr>';
-        return;
-      }
-      n.vrfs.forEach(function (v, vi) {
-        h += "<tr>" + (vi === 0
-          ? '<td rowspan="' + n.vrfs.length + '"><span class="mono">node-' + esc(n.node_id) + "</span>" +
-            (n.name ? '<div class="muted" style="font-size:12px">' + esc(n.name) + "</div>" : "") + "</td>" +
-            '<td rowspan="' + n.vrfs.length + '">' + statusTag(n.status) + "</td>"
-          : "") +
-          "<td><b>VPN " + esc(v.id) + "</b>" + (v.name ? ' <span class="muted">' + esc(v.name) + "</span>" : "") +
-          (v.selectable ? "" : ' <span class="tag stale">' + esc(v.note) + "</span>") + "</td>" +
-          '<td class="mono">' + ((v.export_rts || []).length ? esc(v.export_rts.join("、")) : '<span class="muted">—</span>') + "</td>" +
-          '<td class="mono">' + ((v.import_rts || []).length ? esc(v.import_rts.join("、")) : '<span class="muted">—</span>') + "</td>" +
-          "<td>" + ((v.groups || []).length ? esc(v.groups.join("、")) : '<span class="muted">不在任何策略</span>') + "</td></tr>";
-      });
-    });
-    return h + "</tbody></table></section>";
-  }
-
   function viewOverlayGroups() {
     var o = ensureOverlay();
     var doc = o.doc;
@@ -5453,7 +5543,6 @@
         '<div style="margin-top:10px"><button class="small primary" data-act="ov-group-new">新建</button></div></section>';
     }
     h += ovGroupTable(doc);
-    h += ovVpnPanel(doc);
     h += undChecksPanel(doc);
     return h;
   }
@@ -5464,10 +5553,12 @@
       var g = null;
       doc.groups.forEach(function (x) { if (x.id === id) g = x; });
       if (!g) return;
-      o.edit = { id: g.id, rt: g.rt, name: g.name,
+      o.edit = { id: g.id, rt: g.rt, name: g.name, filter: "", page: 0,
+        add: { node: "", vpn: "" },
         members: (g.members || []).map(function (m) { return { node: m.node_id, vpn: m.vpn_id }; }) };
     } else {
-      o.edit = { id: "", rt: "", name: "", members: [{ node: 0, vpn: "" }] };
+      o.edit = { id: "", rt: "", name: "", filter: "", page: 0,
+        add: { node: "", vpn: "" }, members: [] };
     }
     o.note = null;
   }
@@ -5934,34 +6025,34 @@
     if (oes) oes.addEventListener("change", function () {
       ovStore().g.escape = oes.checked;
     });
-    document.querySelectorAll("#content select[data-ov-m]").forEach(function (el) {
-      el.addEventListener("change", function () {
-        var o = ovStore();
-        if (!o.edit || !o.doc) return;
-        var i = Number(el.getAttribute("data-ov-m")) || 0;
-        var m = o.edit.members[i];
-        if (!m) return;
-        m.node = Number(el.value) || 0;
-        // 换设备等于换一张 VPN 表：原来那个号在新设备上未必存在，留着它只会
-        // 让提交时挨一句"设备 X 没有 VPN Y"。
-        var nd = ovNodeOf(o.doc, m.node);
-        var has = false;
-        ((nd && nd.vrfs) || []).forEach(function (v) { if (String(v.id) === String(m.vpn)) has = true; });
-        if (!has) m.vpn = "";
-        blurContent();
-        render();
-      });
+    // 成员编辑器只在「换了设备」时重画：VPN 下拉的选项由设备决定，换设备后原来那个
+    // 号未必还存在，留着它只会让提交时挨一句"设备 X 没有 VPN Y"。
+    var omn = document.querySelector("#content select[data-ov-mnew]");
+    if (omn) omn.addEventListener("change", function () {
+      var o = ovStore();
+      if (!o.edit) return;
+      var add = o.edit.add || (o.edit.add = { node: "", vpn: "" });
+      add.node = omn.value;
+      add.vpn = "";
+      blurContent();
+      render();
     });
-    document.querySelectorAll("#content select[data-ov-v]").forEach(function (el) {
-      el.addEventListener("change", function () {
-        var o = ovStore();
-        if (!o.edit) return;
-        var i = Number(el.getAttribute("data-ov-v")) || 0;
-        if (!o.edit.members[i]) return;
-        o.edit.members[i].vpn = el.value === "" ? "" : Number(el.value);
-        blurContent();
-        render();
-      });
+    var omv = document.querySelector("#content select[data-ov-mv]");
+    if (omv) omv.addEventListener("change", function () {
+      var o = ovStore();
+      if (!o.edit) return;
+      var add = o.edit.add || (o.edit.add = { node: "", vpn: "" });
+      add.vpn = omv.value === "" ? "" : Number(omv.value);
+    });
+    // 过滤只换表格与分页条：整页重建会把光标从输入框里弹出，还会把策略名那种
+    // 手填字段的中间状态打断。
+    var omq = $("ov-m-q");
+    if (omq) omq.addEventListener("input", function () {
+      var o = ovStore();
+      if (!o.edit) return;
+      o.edit.filter = omq.value;
+      o.edit.page = 0;
+      ovMemberRefresh();
     });
     // A dropdown's value only exists on "change"; the generic [data-act] click
     // handler below would read it before the user has picked anything.
@@ -6216,17 +6307,19 @@
         else if (act === "ov-group-del") {
           ovDeleteGroup(el.getAttribute("data-id"), el.getAttribute("data-name") || "该组");
         }
-        else if (act === "ov-m-add") {
-          var oa = ovStore();
-          if (!oa.edit) return;
-          oa.edit.members.push({ node: 0, vpn: "" });
-          blurContent();
-          render();
+        else if (act === "ov-m-add") ovMemberAdd();
+        else if (act === "ov-m-prev" || act === "ov-m-next") {
+          var op = ovStore();
+          if (!op.edit) return;
+          var pgm = ovMemberPages(ovMemberFiltered(op.doc, op.edit), op.edit);
+          op.edit.page = Math.max(0, Math.min(pgm.pages - 1, pgm.page + (act === "ov-m-next" ? 1 : -1)));
+          ovMemberRefresh();
         }
         else if (act === "ov-m-del") {
           var od = ovStore();
           if (!od.edit) return;
           od.edit.members.splice(Number(el.getAttribute("data-i")) || 0, 1);
+          od.edit.page = ovMemberPages(ovMemberFiltered(od.doc, od.edit), od.edit).page;
           blurContent();
           render();
         }
