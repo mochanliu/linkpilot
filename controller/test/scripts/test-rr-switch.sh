@@ -20,15 +20,16 @@
 #   (3) **运营方该看的那一眼**：RR-B 的 /routes 里现在**两台设备都在** ⇒ 这时才允许撤旧。
 #   (4) **第二步（撤旧）**：node1 先 PUT [B]，隔 1 秒再 node2 PUT [B]。
 #       node1 是"被换的那台"：它的表**一条样本都不该缺**（B 上什么都有）—— 这就是 E1。
-#       node2 此刻还是旧配置 [A, B]，active 是排在第 1 格的 A：A 已经不持有 device 1，
-#       于是它**会缺**，而且缺的时长应当正好等于我故意插进去的那 1 秒。
-#       这条不是 C-c 的失败，而是它划出来的边界：**缺口的长度 = 一次发布扇出到全租户
-#       的时间**（生产上是 sr-agent 的心跳周期，控制器默认 -hb 5 ⇒ 秒级），不是切换机制。
-#       换 RR 的正确走法就是 (2)(3)(4)：先加、等新 RR 收全、再撤。
+#       node2 此刻还是旧配置 [A, B]，两条会话都在往同一张 Loc-RIB 里送：A 撤走它自己
+#       那份 device 1 的拷贝，B 的那份顶上，**前缀不离开表、样本一条都不缺**。
+#       旧模型（从"挑中的那一条"会话读表）下这里会缺满一次扇出间隔；O7 把读路径改成
+#       合并所有会话再选优之后，这道缺口在产品上就不存在了 —— 所以它是硬指标，不是
+#       允许出现的数字（对齐 BGP：撤一条 adj-RIB-in 不等于撤一条路由）。
+#       换 RR 的正确走法仍是 (2)(3)(4)：先加、等新 RR 收全、再撤。
 #   (5) 收尾状态：两台都只挂 B，RR-A 上干净。
 #   (6) **冷 RR 的反例**：node1 PUT [C]，而 C 这个进程还没启动 ⇒ 这是一段**想停多久
-#       停多久**的确定状态：rr_wait 挂着 pending=[C]、retiring=[B]，active 正是那条
-#       retiring 的会话，表还是满的（机制在这里最硬，且不依赖任何采样时刻）。
+#       停多久**的确定状态：rr_wait 挂着 pending=[C]、retiring=[B]，`rib_ready` 正由
+#       那条 retiring 的会话供着，表还是满的（机制在这里最硬，且不依赖任何采样时刻）。
 #       然后才启动 C：node1 不 PUT 第二次，靠自己的重连退避接上 C，B 随即被摘 ——
 #       会话没断，但表里 device 2 那条**真的没了**，因为 C 上从来就没有它。
 #       接着 node2 也 PUT [C]：node1 那条路由**在没有第三次 PUT 的情况下自己回来**。
@@ -56,7 +57,7 @@ set -u
 
 RR=lab-rr
 N1=lab-o6b1                       # device 1：被换的那台
-N2=lab-o6b2                       # device 2：另一台（用它量发布扇出的那道口）
+N2=lab-o6b2                       # device 2：另一台（并集之后再撤旧的那台：它一条样本都不许缺）
 CTRL=lab-ctrl                     # 只用来编译
 MODULE=${MODULE:-/workspace/controller}
 WORK=${WORK:-/tmp/sr-rr-switch}
@@ -76,7 +77,7 @@ N2_ST=18882
 RR_A_ADDR=$RR_IP:$RR_A_PORT
 RR_B_ADDR=$RR_IP:$RR_B_PORT
 RR_C_ADDR=$RR_IP:$RR_C_PORT
-FANOUT_SLEEP=${FANOUT_SLEEP:-1}   # (4) 里两次 PUT 之间的间隔：node2 的缺口应当等于它
+FANOUT_SLEEP=${FANOUT_SLEEP:-1}   # (4) 里两次 PUT 之间的间隔：以前 node2 的缺口等于它，现在是 0
 
 KEEP=0
 for a in "$@"; do
@@ -250,10 +251,11 @@ start_node "$N2" 2 O6B-2 "$N2_ST" "[{\"id\":\"rr-a\",\"addr\":\"$RR_A_ADDR\"}]"
 
 info "(1) 稳态：两台都只挂 A，并且互相看得见"
 wait_json "$N1" "$(n1_url status)" \
-    "d['active_rr'] == 0 and d['active_rr_id'] == 'rr-a' and '$PFX2' in [r['prefix'] for v in d['rib'].values() for r in v]" \
+    "d['rib_ready'] and len(d['sessions']) == 1 and d['sessions'][0]['addr'] == '$RR_A_ADDR' and
+     '$PFX2' in [r['prefix'] for v in d['rib'].values() for r in v]" \
     "device 1 从 A 学到了 device 2 的 $PFX2" 25
 wait_json "$N2" "$(n2_url status)" \
-    "d['active_rr'] == 0 and '$PFX1' in [r['prefix'] for v in d['rib'].values() for r in v]" \
+    "d['rib_ready'] and '$PFX1' in [r['prefix'] for v in d['rib'].values() for r in v]" \
     "device 2 从 A 学到了 device 1 的 $PFX1 —— 业务在跑的就是这两条" 25
 wait_json "$RR" "$(rr_url "$RR_B_ST" routes)" "not d" "RR-B 现在还是空的：谁都没挂它" 10
 
@@ -271,7 +273,7 @@ import json, os, sys, time, urllib.request
 
 csv, stop, pfx1, pfx2 = sys.argv[1:5]
 urls = sys.argv[5].split(",")
-COLS = ["ts_ms", "n1_ok", "n2_ok", "n1_active", "n2_active", "n1_has", "n2_has",
+COLS = ["ts_ms", "n1_ok", "n2_ok", "n1_ready", "n2_ready", "n1_has", "n2_has",
         "n1_wd", "n2_wd", "a_d1", "a_d2", "b_d1", "b_d2", "c_d1", "c_d2", "any_d1", "any_d2"]
 
 
@@ -291,7 +293,7 @@ def row_of(st, rib_pfx):
     rib = (st or {}).get("rib") or {}
     return {
         "ok": 1 if st else 0,
-        "active": (st or {}).get("active_rr", -2),
+        "ready": 1 if (st or {}).get("rib_ready") else 0,
         "has": 1 if rib_pfx in [r.get("prefix") for v in rib.values() for r in v] else 0,
         "wd": (st or {}).get("withdrawn", -1),
     }
@@ -305,7 +307,7 @@ while not os.path.exists(stop):
     x1, x2 = row_of(s1, pfx2), row_of(s2, pfx1)
     a, b, c = [(has((r or {}).get("1"), pfx1), has((r or {}).get("2"), pfx2)) for r in rrs]
     out.write(",".join(str(v) for v in [
-        "%.0f" % (time.time() * 1000), x1["ok"], x2["ok"], x1["active"], x2["active"],
+        "%.0f" % (time.time() * 1000), x1["ok"], x2["ok"], x1["ready"], x2["ready"],
         x1["has"], x2["has"], x1["wd"], x2["wd"],
         a[0], a[1], b[0], b[1], c[0], c[1],
         1 if (a[0] or b[0] or c[0]) else 0,
@@ -356,7 +358,7 @@ print("samples=%d span_ms=%d" % (len(w), float(w[-1]["ts_ms"]) - float(w[0]["ts_
 print("n1_ok=%s n2_ok=%s" % (flat("n1_ok"), flat("n2_ok")))
 print("n1_has=%s n1_gap=%d n1_missing=%d" % (flat("n1_has"), longest("n1_has")[0], longest("n1_has")[1]))
 print("n2_has=%s n2_gap=%d n2_missing=%d" % (flat("n2_has"), longest("n2_has")[0], longest("n2_has")[1]))
-print("n1_active=%s n2_active=%s" % (flat("n1_active"), flat("n2_active")))
+print("n1_ready=%s n2_ready=%s" % (flat("n1_ready"), flat("n2_ready")))
 print("any_d1=%s any_d1_gap=%d any_d2=%s any_d2_gap=%d" % (flat("any_d1"), d1_gap, flat("any_d2"), d2_gap))
 print("both_ab_d1=%d both_bc_d1=%d" % (
     sum(1 for r in w if r["a_d1"] == "1" and r["b_d1"] == "1"),
@@ -448,10 +450,10 @@ code=$(rrs_put "$N1" "$(n1_url rrs)" "$body_ab"); [ "$code" = 202 ] && ok "node1
 code=$(rrs_put "$N2" "$(n2_url rrs)" "$body_ab"); [ "$code" = 202 ] && ok "node2 响应 202" || bad "node2 响应 $code $(resp_body "$N2")"
 wait_json "$N1" "$(n1_url status)" \
     "len(d['sessions']) == 2 and all(not s.get('retiring') for s in d['sessions']) and d.get('rr_wait') is None and
-     all(s['connected'] and s['synced'] for s in d['sessions']) and d['active_rr'] == 0" \
-    "node1 两条会话都是 wanted、都 up+synced、无更换在途，active 仍是排在第 1 格的 A" 20
+     all(s['connected'] and s['synced'] for s in d['sessions']) and d['rib_ready']" \
+    "node1 两条会话都是 wanted、都 up+synced、无更换在途，两条都往同一张 Loc-RIB 里送" 20
 wait_json "$N2" "$(n2_url status)" \
-    "len(d['sessions']) == 2 and d['active_rr'] == 0 and d.get('rr_wait') is None" \
+    "len(d['sessions']) == 2 and d['rib_ready'] and d.get('rr_wait') is None" \
     "node2 同样挂上两台（等价的两条活动 RR，不分主备）" 20
 sleep 1
 window "(2)" "$FROM" "$(now_ms)"
@@ -484,9 +486,9 @@ since_b1=$(since_of "$RR_B_ST" 1)
 code=$(rrs_put "$N1" "$(n1_url rrs)" "{\"rrs\":[{\"id\":\"rr-b\",\"addr\":\"$RR_B_ADDR\"}]}")
 [ "$code" = 202 ] && ok "node1 响应 202" || bad "node1 响应 $code $(resp_body "$N1")"
 wait_json "$N1" "$(n1_url status)" \
-    "d['active_rr'] == 0 and len(d['sessions']) == 1 and d['sessions'][0]['addr'] == '$RR_B_ADDR' and
+    "d['rib_ready'] and len(d['sessions']) == 1 and d['sessions'][0]['addr'] == '$RR_B_ADDR' and
      d.get('rr_wait') is None" \
-    "node1 只剩 B 一条会话且它是 active：A 已经摘掉" 20
+    "node1 只剩 B 一条会话且它已经同步：A 已经摘掉" 20
 wait_json "$RR" "$(rr_url "$RR_A_ST" status)" "not [s for s in d['sessions'] if s['device_id'] == 1]" \
     "RR-A 上 device 1 的会话确实关了（不是留着记账）" 20
 sleep "$FANOUT_SLEEP"
@@ -494,7 +496,7 @@ MID=$(now_ms)
 code=$(rrs_put "$N2" "$(n2_url rrs)" "{\"rrs\":[{\"id\":\"rr-b\",\"addr\":\"$RR_B_ADDR\"}]}")
 [ "$code" = 202 ] && ok "node2 响应 202（这一步隔了 ${FANOUT_SLEEP}s 才发：模拟发布扇出）" || bad "node2 响应 $code $(resp_body "$N2")"
 wait_json "$N2" "$(n2_url status)" \
-    "d['active_rr'] == 0 and len(d['sessions']) == 1 and d['sessions'][0]['addr'] == '$RR_B_ADDR' and
+    "d['rib_ready'] and len(d['sessions']) == 1 and d['sessions'][0]['addr'] == '$RR_B_ADDR' and
      '$PFX1' in [r['prefix'] for v in d['rib'].values() for r in v]" \
     "node2 也只剩 B，且它表里 $PFX1 又回来了" 20
 sleep 0.5
@@ -508,22 +510,16 @@ log_a=$(dx "$RR" "grep -m1 'device 1' $WORK/rr-a.log" 2>/dev/null)
 log_a=${log_a//\"/}; log_a=${log_a//\'/}
 [ -n "$log_a" ] && note "RR-A 的关闭记录：$log_a" || bad "RR-A 日志里没有 device 1 的会话结束行"
 
-# node2 这一段缺了多久？它应当等于我故意插进去的扇出间隔，而不是切换机制。
+# O7 的靶心：node2 是"还没换的那台"，这一步它同样一条样本都不许缺。
+# A 撤走自己那份 device 1 的拷贝之后，B 的同一份必须顶上；under 旧模型这里会缺满整个
+# 扇出间隔（缺口长度恰好等于两次 PUT 之间），现在缺口必须为 0。
 n2_gap=$(win_val n2_gap)
-if [ "${n2_gap:-0}" -gt 0 ]; then
-    lo=$((FANOUT_SLEEP * 1000 - 400)); hi=$((FANOUT_SLEEP * 1000 + 900))
-    if [ "$n2_gap" -ge "$lo" ] && [ "$n2_gap" -le "$hi" ]; then
-        ok "node2 的缺口 = ${n2_gap}ms ≈ 两次 PUT 之间的 ${FANOUT_SLEEP}s：这道口子是**发布扇出**开出来的，不是切换机制"
-        note "     生产上扇出一轮 = sr-agent 心跳周期（控制器默认 -hb 5 ⇒ 秒级），所以换 RR 必须走 (2)(3)(4) 三步"
-    else
-        bad "node2 的缺口 ${n2_gap}ms 对不上扇出间隔 ${FANOUT_SLEEP}s：得单独查是不是机制在拖"
-    fi
-else
-    ok "node2 全程没缺：这台正好在 node1 之前也换完了（本次时序没扇出，缺口为 0）"
-fi
+[ "${n2_gap:-x}" = "0" ] &&
+    ok "(4)：node2 全程没缺（并集覆盖：A 撤了它那份，B 的同一份顶上）" ||
+    bad "(4)：node2 缺了 $(win_val n2_missing) 条样本、最长 $(win_val n2_gap)ms —— 并集没兜住，第二条 RR 等于白挂"
 [ "$(win_val n2_wd)" = "$w2_0" ] &&
-    bad "node2 的 withdrawn 没动（$w2_0）：可它明明少了一条路由 —— 说明可见表换了会话却没记事件，得说明白" ||
-    note "node2 的 withdrawn 从 $w2_0 变成 $(win_val n2_wd)：它确实处理了 A 发来的那条撤回（A 上已经没有 device 1 了）"
+    ok "(4)：node2 的 withdrawn 没动（$w2_0）：少了一份拷贝，前缀没离开表" ||
+    bad "(4)：node2 的 withdrawn 从 $w2_0 变成 $(win_val n2_wd)：A 的撤回不该让这个前缀离开表"
 
 # ---------------------------------------------------------------- 5 收尾状态
 
@@ -538,18 +534,18 @@ code=$(rrs_put "$N1" "$(n1_url rrs)" "{\"rrs\":[{\"id\":\"rr-c\",\"addr\":\"$RR_
 [ "$code" = 202 ] && ok "node1 响应 202（立刻回话，不等换完）" || bad "node1 响应 $code $(resp_body "$N1")"
 wait_json "$N1" "$(n1_url status)" \
     "d['rr_wait'] and d['rr_wait']['pending_addrs'] == ['$RR_C_ADDR'] and d['rr_wait']['retiring_addrs'] == ['$RR_B_ADDR'] and
-     d['active_rr'] == 1 and d['sessions'][1]['retiring'] and
+     d['rib_ready'] and d['sessions'][1]['retiring'] and d['sessions'][1]['synced'] and
      '$PFX2' in [r['prefix'] for v in d['rib'].values() for r in v]" \
-    "新 RR 上不去这一路：rr_wait 挂着 pending=[C]/retiring=[B]，active 正是那条 retiring 的会话，表还是满的" 15
+    "新 RR 上不去这一路：rr_wait 挂着 pending=[C]/retiring=[B]，rib_ready 正是由那条 retiring 的会话供着，表还是满的" 15
 note "这段状态是确定的（不靠抢采样），停 3 秒"
 sleep 3
-wait_json "$N1" "$(n1_url status)" "d['active_rr'] == 1 and d['rr_wait'] and d['sessions'][1]['retiring']" \
+wait_json "$N1" "$(n1_url status)" "d['rib_ready'] and d['rr_wait'] and d['sessions'][1]['retiring']" \
     "3 秒后仍是同一份状态：B 没被摘、表没空过" 10
 
 FROM6=$(now_ms)
 start_rr rr-c "$RR_C_PORT" "$RR_C_ST"
 wait_json "$N1" "$(n1_url status)" \
-    "d['active_rr'] == 0 and len(d['sessions']) == 1 and d['sessions'][0]['addr'] == '$RR_C_ADDR' and
+    "d['rib_ready'] and len(d['sessions']) == 1 and d['sessions'][0]['addr'] == '$RR_C_ADDR' and
      d.get('rr_wait') is None" \
     "C 一监听，node1 靠自己的重连退避就接上了（全程没有第二次 PUT）；B 随即被摘" 30
 
@@ -584,7 +580,7 @@ done
 after=$(rrs_of)
 [ -n "$before" ] && [ "$before" = "$after" ] && ok "五次被拒之后集合还是 $after" || bad "非法 PUT 改了集合：$before → $after"
 wait_json "$N1" "$(n1_url status)" \
-    "d['active_rr'] == 0 and '$PFX2' in [r['prefix'] for v in d['rib'].values() for r in v]" \
+    "d['rib_ready'] and '$PFX2' in [r['prefix'] for v in d['rib'].values() for r in v]" \
     "连着五次被拒之后，node1 仍在 C 上正常服务" 10
 code=$(dx "$N1" "curl -s -o /dev/null -w '%{http_code}' -X DELETE $(n1_url rrs)")
 [ "$code" = 405 ] && ok "DELETE /rrs 是 405：这个入口只有读和整体替换" || bad "DELETE /rrs 应当 405，实际 $code"
@@ -610,7 +606,7 @@ w1_end=$(field "$N1" "$(n1_url status)" "d['withdrawn']")
 w2_end=$(field "$N2" "$(n2_url status)" "d['withdrawn']")
 [ "$w1_end" = "$w1_0" ] && ok "device 1 全程 withdrawn = $w1_0：被换的那台一次撤路由都没处理" ||
     bad "device 1 的 withdrawn 从 $w1_0 变成 $w1_end"
-[ "$w2_end" != "$w2_0" ] && ok "device 2 的 withdrawn 从 $w2_0 涨到 $w2_end：只有该被撤的那条（A 上的 device 1）被记成事件" ||
+[ "$w2_end" != "$w2_0" ] && ok "device 2 的 withdrawn 从 $w2_0 涨到 $w2_end：涨在 (6) —— 那时 B 上 device 1 的拷贝**全没了**，是真撤路由；(4) 里只少一份拷贝，没记事件" ||
     note "device 2 的 withdrawn 没涨（$w2_0）：它换过去时 A 上已经没东西可撤了"
 stamp_n1_end=$(stamp_of "$N1" "$WORK/node1.pid")
 stamp_n2_end=$(stamp_of "$N2" "$WORK/node2.pid")

@@ -35,9 +35,9 @@ type LocalPrefix struct {
 	Prefix string
 }
 
-// RRConfig is one reflector this CPE peers with. Two are expected (active +
-// standby); the protocol works with any number, and the active is the lowest
-// index among the synced ones.
+// RRConfig is one reflector this CPE peers with. Two are expected; the protocol
+// works with any number, and every synced one contributes to the same Loc-RIB
+// (there is no "active" slot -- see Client).
 //
 // ID is a label: it comes from the controller's RR library and travels into
 // /status so an operator can point at the row they chose. Sessions are matched
@@ -80,8 +80,7 @@ type SessionStats struct {
 	Connected  bool   `json:"connected"`
 	Synced     bool   `json:"synced"`
 	Retiring   bool   `json:"retiring,omitempty"` // replaced, kept only until a wanted RR takes over
-	Routes     int    `json:"routes"`             // installed in the table from this RR
-	Pending    int    `json:"pending"`            // held from this RR, not installed
+	Routes     int    `json:"routes"`             // in this RR's adj-RIB-in
 	Reconnects uint64 `json:"reconnects"`
 	LastError  string `json:"last_error,omitempty"`
 }
@@ -99,13 +98,16 @@ type RRWait struct {
 // ClientStats is the whole instance's state. The drop/import counters are
 // cumulative and event-shaped: they count what each received message did, so a
 // route that the local tunnel or VRF table later moves between installed and
-// held back does not change the numbers after the fact. Routes is live.
+// held back does not change the numbers after the fact. RibRoutes is live.
+//
+// There is no "active RR" any more: every session writes into one Loc-RIB, so
+// the table is not "the one that RR sent me". RibReady says whether a session
+// has reached EOR, which is the only moment the table may be trusted as a
+// whole (see Client).
 type ClientStats struct {
 	DeviceID          uint16         `json:"device_id"`
-	ActiveRR          int            `json:"active_rr"` // index into Sessions, -1 = none
-	ActiveRRID        string         `json:"active_rr_id,omitempty"`
-	ActiveRIBRoutes   int            `json:"active_rib_routes"`
-	ActivePending     int            `json:"active_pending"` // known from the active RR, not installed
+	RibReady          bool           `json:"rib_ready"`
+	RibRoutes         int            `json:"rib_routes"` // installed in a local table now
 	Sessions          []SessionStats `json:"sessions"`
 	RRWait            *RRWait        `json:"rr_wait,omitempty"`
 	Received          uint64         `json:"received"`
@@ -201,19 +203,23 @@ type LocalSkip struct {
 //
 // Three design rules matter more than the code:
 //
-//   - The visible RIB belongs to exactly ONE RR (the lowest synced index).
-//     Views are never merged: a route present only on the standby must not
-//     resurrect after the active dies, and a flapping RR must not make the
-//     table alternate between two partially-overlapping truths.
+//   - Every session writes into one Loc-RIB (loc), exactly as BGP does: the
+//     adj-RIBs-in of all peers merge into one table, and each prefix picks one
+//     best path from the copies all sessions sent. Two RRs carrying the same
+//     route are two copies of one path, so losing one session never shrinks the
+//     table -- the other copy takes over.
 //
 //   - An RR that is up but has not sent EOR contributes nothing. Serving a
 //     snapshot that is still arriving would install a partial table and then
 //     silently "lose" routes at EOR; empty is honest, partial is not.
 //
 //   - What an RR sent is kept even when it cannot be installed. Each session
-//     holds the routes exactly as received (adj-RIBs-in) and derives the table
-//     from the local tunnel and VRF tables, so a tunnel or a VPN added later
-//     deploys the routes that are already known -- without asking the RR again.
+//     holds the routes exactly as received (adj-RIBs-in); the tunnel table
+//     decides whether a path's next hop resolves (a flag on the path, GoBGP's
+//     IsNexthopInvalid), and the VRF table decides which local table can see it
+//     (GoBGP's CanImportToVrf). Both are consulted when reading and when the
+//     input changes, so a tunnel or a VPN added later deploys routes that are
+//     already known -- without asking the RR again.
 //
 // The set of RRs is not static (C-c): SetRRs adds and retires sessions while the
 // process runs, which is why a session is a pointer and the slice is reorderable.
@@ -233,7 +239,7 @@ type Client struct {
 
 	mu       sync.Mutex
 	sessions []*clientSession // wanted ones first, in configured order, then the retired ones
-	active   int
+	loc      *locRib
 	counters counters
 
 	// runCtx is set by Run and is the parent of every session goroutine's ctx, so
@@ -293,12 +299,10 @@ type clientSession struct {
 	cancel context.CancelFunc
 
 	// adjIn is what this RR told us, one copy per route key, exactly as
-	// received. rib and pending are derived from it plus the local tunnel and
-	// VRF tables and are never written anywhere else -- so SetTunnels/SetVRFs can
-	// rebuild them and nothing needs to be re-requested.
-	adjIn   map[RouteKey]Route
-	rib     map[RouteKey]RIBEntry
-	pending map[RouteKey]PendingRoute
+	// received -- the adj-RIB-in. The visible table is the shared Loc-RIB (see
+	// Client.loc), never a per-session derivation: that is what keeps one
+	// session's copy from disappearing when another session dies.
+	adjIn map[RouteKey]Route
 
 	// sc is the serialized writer owned by serveSession. ready is set once the
 	// session's snapshot has been written; only then may local-prefix and tunnel
@@ -333,7 +337,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		hold:    hold,
 		base:    map[localKey]LocalPrefix{},
 		dynamic: map[localKey]LocalPrefix{},
-		active:  -1,
+		loc:     newLocRib(),
 	}
 	vrfs, ids, exports, err := buildVRFs(cfg.VRFs)
 	if err != nil {
@@ -383,15 +387,13 @@ func validateRRs(rrs []RRConfig) error {
 	return nil
 }
 
-// newSession builds a session that has never connected: adj-RIBs-in and the
-// derived views start empty so a reader sees "nothing yet", not "nothing ever".
+// newSession builds a session that has never connected: its adj-RIB-in starts
+// empty so a reader sees "nothing yet", not "nothing ever".
 func newSession(rr RRConfig) *clientSession {
 	return &clientSession{
-		cfgID:   rr.ID,
-		addr:    rr.Addr,
-		adjIn:   map[RouteKey]Route{},
-		rib:     map[RouteKey]RIBEntry{},
-		pending: map[RouteKey]PendingRoute{},
+		cfgID: rr.ID,
+		addr:  rr.Addr,
+		adjIn: map[RouteKey]Route{},
 	}
 }
 
@@ -596,9 +598,9 @@ func (c *Client) SetVRFs(vs []VRFConfig) error {
 	c.vrfs, c.vrfIDs, c.exports = vrfs, ids, exports
 	c.rebuildLocalLocked()
 	c.pushLocalLocked()
-	for _, s := range c.sessions {
-		c.deriveSessionLocked(s)
-	}
+	// Nothing to re-derive on the received side: import RTs are consulted when
+	// the table is read (GoBGP's CanImportToVrf + Table.Select), so a VRF added
+	// now sees the paths already in the Loc-RIB without any rewrite.
 	return nil
 }
 
@@ -618,12 +620,51 @@ func (c *Client) SetTunnels(ts []Tunnel) error {
 	if equalTunnels(c.tunnels, tunnels) {
 		return nil
 	}
+	before := c.nextHops
 	c.tunnels, c.nextHops = tunnels, nextHops
 	for _, s := range c.sessions {
-		c.deriveSessionLocked(s)
 		c.pushTunnelsLocked(s)
 	}
+	// Nexthop Tracking, the same shape as GoBGP (zclient applyToPathList ->
+	// updatePath -> globalRib.Update): only the origins whose next hops changed
+	// re-enter the Loc-RIB, each path replaced by a copy with the new flag. No
+	// session is touched and nothing is re-requested from the RR.
+	for id := range changedOrigins(before, nextHops) {
+		for _, p := range c.loc.originPaths(id) {
+			c.loc.process(p.route, p.source, len(nextHops[id]) > 0)
+		}
+	}
 	return nil
+}
+
+// changedOrigins names the origin devices whose next-hop set differs between
+// two tunnel tables. An origin with no tunnels either side has no paths, so
+// leaving it out costs nothing.
+func changedOrigins(before, after map[uint16][]string) map[uint16]struct{} {
+	changed := make(map[uint16]struct{}, len(before)+len(after))
+	for id, nh := range before {
+		if !equalStrings(nh, after[id]) {
+			changed[id] = struct{}{}
+		}
+	}
+	for id, nh := range after {
+		if !equalStrings(nh, before[id]) {
+			changed[id] = struct{}{}
+		}
+	}
+	return changed
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // SetRRs replaces the reflector set while the process runs -- the seam C-c exists
@@ -645,8 +686,9 @@ func (c *Client) SetTunnels(ts []Tunnel) error {
 //     licence to black-hole the tenant.
 //
 // Sessions are matched by address and the list is rebuilt with the wanted ones
-// first, in the configured order, so a wanted session always outranks a retiring
-// one as the visible RIB.
+// first, in the configured order. That order is presentation only now: the
+// visible table is the Loc-RIB, and set position no longer decides which copy of
+// a prefix wins (the session address does, see comparePaths).
 func (c *Client) SetRRs(next []RRConfig) error {
 	if err := validateRRs(next); err != nil {
 		return err
@@ -678,9 +720,9 @@ func (c *Client) SetRRs(next []RRConfig) error {
 			continue
 		}
 		// Marked, not dropped: make-before-break means this session keeps
-		// serving the table until a wanted one has taken over, so it stays in
-		// c.sessions (appended after the wanted ones, so pickActiveLocked
-		// prefers the replacement) and leaves only in reapRetiringLocked.
+		// feeding the Loc-RIB until a wanted one has taken over, so it stays in
+		// c.sessions (after the wanted ones) and leaves only in
+		// reapRetiringLocked.
 		s.retire = true
 		retiring = append(retiring, s)
 	}
@@ -688,7 +730,6 @@ func (c *Client) SetRRs(next []RRConfig) error {
 	for _, s := range c.sessions {
 		c.startLocked(s)
 	}
-	c.pickActiveLocked()
 	c.reapRetiringLocked()
 	return nil
 }
@@ -744,10 +785,11 @@ func (c *Client) reapRetiringLocked() {
 		return
 	}
 	c.sessions = kept
-	// Re-pick before closing anything: the retired sessions were still eligible
-	// to serve the table, and the list they were indexed in just changed.
-	c.pickActiveLocked()
 	for _, s := range dropped {
+		// GoBGP's dropAdjRIBIn: the session's copies leave the Loc-RIB by
+		// source, one route at a time. A prefix another session also carries
+		// simply keeps that copy, so the table never dips on the way out.
+		c.dropSessionLocked(s)
 		if s.cancel != nil {
 			s.cancel()
 		}
@@ -883,10 +925,14 @@ func (c *Client) VRFs() []VRFConfig {
 	return out
 }
 
-// Pending returns the routes the active RR sent that are not installed, plus the
-// gate each one is behind. This is the other half of "keep what you were told":
-// a held-back prefix has to be reportable, or a table that is missing routes is
-// indistinguishable from one that never received them.
+// Pending returns the prefixes the Loc-RIB knows and no local table installs,
+// plus the gate each one is behind. This is the other half of "keep what you
+// were told": a held-back prefix has to be reportable, or a table that is
+// missing routes is indistinguishable from one that never received them.
+//
+// One row per prefix, not per session copy: the gates are properties of the
+// merged table (GoBGP applies CanImportToVrf to the destination's paths and
+// reads the head), so two RRs carrying the same prefix must not list it twice.
 //
 // The slice is never nil, same reason as copyTunnels: these lists reach the
 // console as JSON, and "[]" says "nothing held back" while "null" would only say
@@ -894,17 +940,20 @@ func (c *Client) VRFs() []VRFConfig {
 func (c *Client) Pending() []PendingRoute {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.pendingOf(c.active)
-}
-
-func (c *Client) pendingOf(idx int) []PendingRoute {
 	out := make([]PendingRoute, 0)
-	if idx < 0 {
-		return out
-	}
-	for _, p := range c.sessions[idx].pending {
-		out = append(out, p)
-	}
+	c.loc.eachDest(func(d *destination) {
+		p := c.importablePathLocked(d)
+		if p == nil {
+			// GoBGP CanImportToVrf is false for every copy: no table here cares.
+			if len(d.paths) > 0 {
+				out = append(out, PendingRoute{Route: d.paths[0].route, Reason: PendingRTMismatch})
+			}
+			return
+		}
+		if !p.resolvable {
+			out = append(out, PendingRoute{Route: p.route, Reason: PendingNoPath})
+		}
+	})
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].DeviceID != out[j].DeviceID {
 			return out[i].DeviceID < out[j].DeviceID
@@ -925,48 +974,92 @@ func (c *Client) LocalSkips() []LocalSkip {
 	return append([]LocalSkip{}, c.skipped...)
 }
 
-// classifyLocked decides where one received route belongs: the table entry it
-// installs as, or the gate that keeps it in adj-RIBs-in only.
+// admitLocked applies the two intake gates to one received route: is any local
+// table importing its RTs, and does a tunnel reach its origin. It answers for
+// the counters only -- what the table shows is decided when it is read, because
+// both gates are reversible (add a VRF, add a tunnel) and neither rewrites the
+// received RIB.
+//
+// It is NOT the source of path.resolvable: that flag is the tunnel gate alone
+// (GoBGP's IsNexthopInvalid), while RT import is a read-time question
+// (CanImportToVrf). Folding them together would make a VPN added later unable to
+// pick up routes that are already here.
 //
 // Must be called with c.mu held.
-func (c *Client) classifyLocked(rt Route) (RIBEntry, string) {
+func (c *Client) admitLocked(rt Route) (reachable bool, reason string) {
 	// RT 匹配决定的是**这条路由装进本机哪几张表**，与来源 VPN 无关
 	// （§4.3 第 1 步）。来源 VPN 只决定标签：对端弹栈后查的是它自己那张表
 	// （§2.4）。所以这里不能看 rt.VRFID 在本机存不存在 —— 导通要解决的正是
 	// "本机没有的那个 VPN 的路由落进本机有的 VPN 表"，旧代码那道
 	// `c.vrfs[rt.VRFID] == nil` 的闸会把所有跨 VPN 的导通在 RT 匹配之前就丢掉。
-	targets := c.importTargets(rt.RTs)
-	if len(targets) == 0 {
-		return RIBEntry{}, PendingRTMismatch
+	if len(c.importTargets(rt.RTs)) == 0 {
+		return false, PendingRTMismatch
 	}
-	// The route is only installed if this device has a tunnel to its origin.
-	// Without one there is no path to point the FIB at -- but the route itself
-	// stays, because the tunnel may arrive before the next RR message does.
-	nh := c.nextHops[rt.DeviceID]
-	if len(nh) == 0 {
-		return RIBEntry{}, PendingNoPath
+	// Without a tunnel to the origin there is no path to point the FIB at. The
+	// path stays in the Loc-RIB as unresolvable, so the tunnel may arrive before
+	// the next RR message does.
+	if !c.reachableLocked(rt) {
+		return false, PendingNoPath
 	}
-	return RIBEntry{Route: rt, Targets: targets, NextHops: append([]string(nil), nh...)}, ""
+	return true, ""
 }
 
-// deriveSessionLocked rebuilds one session's table from its adj-RIBs-in and the
-// current tunnel and VRF tables. It never touches the counters: those record
-// what each received message did, and a route that moves between installed and
-// held back because the local config changed must not rewrite that history.
+// reachableLocked is the tunnel gate: does this device have any tunnel to the
+// route's origin right now. This is the only thing path.resolvable is set from.
 //
 // Must be called with c.mu held.
-func (c *Client) deriveSessionLocked(s *clientSession) {
-	rib := make(map[RouteKey]RIBEntry, len(s.adjIn))
-	pending := make(map[RouteKey]PendingRoute)
-	for k, rt := range s.adjIn {
-		entry, reason := c.classifyLocked(rt)
-		if reason != "" {
-			pending[k] = PendingRoute{Route: rt, Reason: reason}
-			continue
-		}
-		rib[k] = entry
+func (c *Client) reachableLocked(rt Route) bool {
+	return len(c.nextHops[rt.DeviceID]) > 0
+}
+
+// importablePathLocked is GoBGP's per-VRF view at the global level: the first
+// copy in best-path order whose RTs any local table imports. nil when no copy
+// can be imported at all.
+//
+// Must be called with c.mu held.
+func (c *Client) importablePathLocked(d *destination) *path {
+	if d == nil {
+		return nil
 	}
-	s.rib, s.pending = rib, pending
+	for _, p := range d.paths {
+		if len(c.importTargets(p.route.RTs)) > 0 {
+			return p
+		}
+	}
+	return nil
+}
+
+// installedLocked reports whether this prefix currently reaches a local table.
+//
+// Must be called with c.mu held.
+func (c *Client) installedLocked(k RouteKey) bool {
+	p := c.importablePathLocked(c.loc.dsts[k])
+	return p != nil && p.resolvable
+}
+
+// entryLocked is the read-time shape of one path: local next hops belong to the
+// origin's tunnel set right now, not to the announce that was received earlier.
+//
+// Must be called with c.mu held.
+func (c *Client) entryLocked(p *path) RIBEntry {
+	return RIBEntry{
+		Route:    p.route,
+		Targets:  c.importTargets(p.route.RTs),
+		NextHops: append([]string(nil), c.nextHops[p.route.DeviceID]...),
+	}
+}
+
+// dropSessionLocked removes one session's copies from the Loc-RIB, by source,
+// without touching any other session's copy of the same prefixes. This is
+// GoBGP's dropAdjRIBIn: a session going away withdraws exactly what that session
+// had told us.
+//
+// Must be called with c.mu held.
+func (c *Client) dropSessionLocked(s *clientSession) {
+	for k := range s.adjIn {
+		c.loc.withdraw(k, s.addr)
+	}
+	s.adjIn = map[RouteKey]Route{}
 }
 
 // pushTunnelsLocked re-sends the whole table to one session that already has an
@@ -1241,12 +1334,11 @@ func (c *Client) markUp(s *clientSession, conn net.Conn, rrID string, hold time.
 	s.conn = conn
 	s.up = true
 	s.synced = false
-	// A reconnect is a fresh snapshot: everything held from the previous session
-	// is gone, and the RR will send it again. Keeping the old copy would make a
-	// withdrawn route survive a flap.
-	s.adjIn = map[RouteKey]Route{}
-	s.rib = map[RouteKey]RIBEntry{}
-	s.pending = map[RouteKey]PendingRoute{}
+	// A reconnect is a fresh snapshot: the paths this session contributed are
+	// dropped from the Loc-RIB (GoBGP dropAdjRIBIn before the new session fills
+	// adjRibIn) and the RR will send them again. Keeping the old copy would make
+	// a withdrawn route survive a flap.
+	c.dropSessionLocked(s)
 	s.rrID = rrID
 	s.reconnects++
 	s.lastErr = ""
@@ -1261,19 +1353,12 @@ func (c *Client) markDown(s *clientSession) {
 	defer c.mu.Unlock()
 	s.up = false
 	s.synced = false
-	s.adjIn = map[RouteKey]Route{}
-	s.rib = map[RouteKey]RIBEntry{}
-	s.pending = map[RouteKey]PendingRoute{}
+	c.dropSessionLocked(s)
 	s.conn = nil
 	s.sc = nil
 	s.ready = false
 	s.announced = nil
 	s.announcedTunnels = nil
-	if c.indexOfLocked(s) < 0 {
-		// 这条会话已经因为换 RR 被摘掉了，不在这张表里，也就不必重选 active。
-		return
-	}
-	c.pickActiveLocked()
 }
 
 func (c *Client) markSynced(s *clientSession) {
@@ -1286,7 +1371,12 @@ func (c *Client) markSynced(s *clientSession) {
 		return
 	}
 	s.synced = true
-	c.pickActiveLocked()
+	// EOR: the snapshot is complete, so this is the one moment its whole
+	// adj-RIB-in may enter the Loc-RIB. Routes received from here on go in as
+	// they arrive (see applyAnnounce).
+	for _, rt := range s.adjIn {
+		c.loc.process(rt, s.addr, c.reachableLocked(rt))
+	}
 	// This is the moment a replacement RR takes over: EOR means its copy of the
 	// table is complete, so the session it replaced can finally be dropped.
 	c.reapRetiringLocked()
@@ -1322,23 +1412,18 @@ func (c *Client) indexOfLocked(s *clientSession) int {
 	return -1
 }
 
-// pickActiveLocked switches the visible RIB to the lowest synced session. Only
-// a session with EOR may serve: a standby in the middle of its snapshot is not
-// a valid fallback, so if only it is up the table is empty.
+// applyAnnounce writes what one RR sent into this session's adj-RIB-in and then
+// feeds each route into the shared Loc-RIB, where it competes with whatever the
+// other sessions said about the same prefix.
 //
-// SetRRs keeps the wanted sessions ahead of the retired ones, so a session that
-// is on its way out only becomes active when nothing wanted is serving.
-func (c *Client) pickActiveLocked() {
-	best := -1
-	for i := range c.sessions {
-		if c.sessions[i].up && c.sessions[i].synced {
-			best = i
-			break
-		}
-	}
-	c.active = best
-}
-
+// Only a session that has reached EOR contributes to the table: until then its
+// snapshot is still arriving, and serving a partial one would install routes and
+// then "lose" them at EOR. The routes are kept either way (adj-RIB-in), so
+// markSynced can hand the whole set to the Loc-RIB in one go.
+//
+// The resolvable flag is decided at intake for the counters only. What the table
+// shows is read through the local tunnel and VRF tables at read time, because
+// both gates are reversible and neither rewrites what we were told.
 func (c *Client) applyAnnounce(s *clientSession, routes []Route) error {
 	last := make(map[RouteKey]Route, len(routes))
 	order := make([]RouteKey, 0, len(routes))
@@ -1372,26 +1457,25 @@ func (c *Client) applyAnnounce(s *clientSession, routes []Route) error {
 	c.counters.received += uint64(len(order))
 	for _, k := range order {
 		rt := last[k]
+		// adj-RIB-in first: it is the record of what this session said, and
+		// dropSessionLocked walks it to know which copies to take back out.
 		s.adjIn[k] = rt
 		// Counters are event-shaped: they say what processing this frame did, not
 		// what the table looks like now. A prefix that moves between installed and
 		// held back every time a tunnel changes would otherwise rewrite the history
 		// the console reports.
-		delete(s.rib, k)
-		delete(s.pending, k)
-		entry, reason := c.classifyLocked(rt)
-		if reason != "" {
-			s.pending[k] = PendingRoute{Route: rt, Reason: reason}
-			switch reason {
-			case PendingRTMismatch:
-				c.counters.rtMismatch++
-			case PendingNoPath:
-				c.counters.noPath++
-			}
-			continue
+		_, reason := c.admitLocked(rt)
+		switch reason {
+		case PendingRTMismatch:
+			c.counters.rtMismatch++
+		case PendingNoPath:
+			c.counters.noPath++
+		default:
+			c.counters.imported++
 		}
-		s.rib[k] = entry
-		c.counters.imported++
+		if s.synced {
+			c.loc.process(rt, s.addr, c.reachableLocked(rt))
+		}
 	}
 	return nil
 }
@@ -1423,57 +1507,69 @@ func (c *Client) applyWithdraw(s *clientSession, keys []RouteKey) error {
 		if _, ok := s.adjIn[k]; !ok {
 			continue
 		}
+		was := c.installedLocked(k)
 		delete(s.adjIn, k)
-		// withdrawn counts routes that actually left the table. Withdrawing one
+		// Only this session's copy leaves. If the other RR still carries the
+		// prefix its copy becomes best and the route stays installed.
+		c.loc.withdraw(k, s.addr)
+		// withdrawn counts routes that actually left a local table. Withdrawing one
 		// that was only ever held back changes nothing a console could act on.
-		if _, installed := s.rib[k]; installed {
+		if was && !c.installedLocked(k) {
 			c.counters.withdrawn++
 		}
-		delete(s.rib, k)
-		delete(s.pending, k)
 	}
 	return nil
 }
 
-// RIB returns the routes imported into one local VRF from the active RR, sorted.
-// 这里的 vrf 是**目标**表：一条来源 VPN 不在这台盒子上的路由，只要 RT 命中了这个
-// VRF 的 import，就会出现在这里（§4.3 第 1 步）。
+// RIB returns the routes installed into one local VRF, sorted. 这里的 vrf 是**目标**
+// 表：一条来源 VPN 不在这台盒子上的路由，只要 RT 命中了这个 VRF 的 import，就会出
+// 现在这里（§4.3 第 1 步）。
+//
+// 读的是 Loc-RIB 里每个前缀的最优路：所有 RR 会话的同一份拷贝已经在表里合成了一
+// 个 destination，所以两条 RR 各送一遍不会让一条前缀出现两次。
 func (c *Client) RIB(vrf uint8) []RIBEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.active < 0 {
-		return nil
-	}
 	var out []RIBEntry
-	for _, rt := range c.sessions[c.active].rib {
-		for _, t := range rt.Targets {
-			if t == vrf {
-				out = append(out, rt)
-				break
-			}
+	c.loc.eachBest(func(_ RouteKey, p *path) {
+		if c.importsIntoLocked(p.route.RTs, vrf) {
+			out = append(out, c.entryLocked(p))
 		}
-	}
+	})
 	return sortedEntries(out)
 }
 
-// AllRIB returns every imported route on the active RR, grouped by **target** VRF
-// —— 也就是 sr-fib 要往哪张表装。同一个 RouteKey 可以出现在几张表下面。
+// AllRIB returns every installed route, grouped by **target** VRF —— 也就是 sr-fib
+// 要往哪张表装。同一个 RouteKey 可以出现在几张表下面。
 func (c *Client) AllRIB() map[uint8][]RIBEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make(map[uint8][]RIBEntry)
-	if c.active < 0 {
-		return out
-	}
-	for _, rt := range c.sessions[c.active].rib {
-		for _, t := range rt.Targets {
-			out[t] = append(out[t], rt)
+	c.loc.eachBest(func(_ RouteKey, p *path) {
+		for _, t := range c.importTargets(p.route.RTs) {
+			out[t] = append(out[t], c.entryLocked(p))
 		}
-	}
+	})
 	for vrf := range out {
 		out[vrf] = sortedEntries(out[vrf])
 	}
 	return out
+}
+
+// importsIntoLocked reports whether one local VRF imports any of these RTs.
+//
+// Must be called with c.mu held.
+func (c *Client) importsIntoLocked(rts []string, vrf uint8) bool {
+	lv := c.vrfs[vrf]
+	if lv == nil {
+		return false
+	}
+	for _, rt := range rts {
+		if lv.imports[rt] {
+			return true
+		}
+	}
+	return false
 }
 
 // sortedEntries orders RIB rows the same way SortedRoutes orders routes, so a
@@ -1498,7 +1594,7 @@ func (c *Client) Stats() ClientStats {
 	defer c.mu.Unlock()
 	st := ClientStats{
 		DeviceID:          c.cfg.DeviceID,
-		ActiveRR:          c.active,
+		RibReady:          c.ribReadyLocked(),
 		Received:          c.counters.received,
 		Imported:          c.counters.imported,
 		Withdrawn:         c.counters.withdrawn,
@@ -1507,12 +1603,11 @@ func (c *Client) Stats() ClientStats {
 		DroppedOwnRoute:   c.counters.ownRoute,
 		DroppedNoPath:     c.counters.noPath,
 	}
-	if c.active >= 0 {
-		a := c.sessions[c.active]
-		st.ActiveRIBRoutes = len(a.rib)
-		st.ActivePending = len(a.pending)
-		st.ActiveRRID = a.cfgID
-	}
+	c.loc.eachDest(func(d *destination) {
+		if c.installedLocked(d.key) {
+			st.RibRoutes++
+		}
+	})
 	st.RRWait = c.rrWaitLocked()
 	for _, s := range c.sessions {
 		st.Sessions = append(st.Sessions, SessionStats{
@@ -1522,13 +1617,25 @@ func (c *Client) Stats() ClientStats {
 			Connected:  s.up,
 			Synced:     s.synced,
 			Retiring:   s.retire,
-			Routes:     len(s.rib),
-			Pending:    len(s.pending),
+			Routes:     len(s.adjIn),
 			Reconnects: s.reconnects,
 			LastError:  s.lastErr,
 		})
 	}
 	return st
+}
+
+// ribReadyLocked reports whether any session has reached EOR, i.e. whether the
+// table can be read as a whole rather than as a snapshot still arriving.
+//
+// Must be called with c.mu held.
+func (c *Client) ribReadyLocked() bool {
+	for _, s := range c.sessions {
+		if s.up && s.synced {
+			return true
+		}
+	}
+	return false
 }
 
 // rrWaitLocked reports a rolling RR replacement that has not finished: the RR

@@ -141,7 +141,7 @@ func TestSetRRsKeepsTheOldSessionUntilTheNewOneEstablishes(t *testing.T) {
 	cfg.RRs = []RRConfig{{ID: "rr1", Addr: "rr-a"}}
 	cfg.Dial = f.dial
 	c := startClient(t, cfg)
-	waitFor(t, "rr-a to be the active RR", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "rr-a to serve", func() bool { return c.Stats().RibReady })
 	if n := len(rrA.RoutesOf(10)); n != 1 {
 		t.Fatalf("rr-a holds %d of our routes before the switch", n)
 	}
@@ -164,8 +164,10 @@ func TestSetRRsKeepsTheOldSessionUntilTheNewOneEstablishes(t *testing.T) {
 	if s, ok := sessionOf(c, "rr-a"); !ok || !s.Retiring || !s.Synced {
 		t.Fatalf("rr-a session = %+v/%v", s, ok)
 	}
-	if st.ActiveRR < 0 || st.Sessions[st.ActiveRR].Addr != "rr-a" {
-		t.Fatalf("active = %d, still want rr-a while rr-b is coming up", st.ActiveRR)
+	// rr-a is still the only session in the Loc-RIB, so the route plane did not
+	// blink while the replacement was dialled.
+	if s, ok := sessionOf(c, "rr-a"); !ok || !s.Synced || !st.RibReady {
+		t.Fatalf("rr-a session = %+v/%v ready=%v, still want it serving while rr-b is coming up", s, ok, st.RibReady)
 	}
 	// RRs() is the set this box works towards, not the set still connected.
 	if got := c.RRs(); len(got) != 1 || got[0].Addr != "rr-b" {
@@ -201,7 +203,7 @@ func TestSetRRsToAnUnreachableRRKeepsTheOldOne(t *testing.T) {
 	cfg.RRs = []RRConfig{{ID: "rr1", Addr: "rr-a"}}
 	cfg.Dial = f.dial
 	c := startClient(t, cfg)
-	waitFor(t, "rr-a to be the active RR", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "rr-a to serve", func() bool { return c.Stats().RibReady })
 
 	if err := c.SetRRs([]RRConfig{{ID: "rr1", Addr: "nowhere"}}); err != nil {
 		t.Fatalf("SetRRs: %v", err)
@@ -213,7 +215,7 @@ func TestSetRRsToAnUnreachableRRKeepsTheOldOne(t *testing.T) {
 	// up as rr-a leaving the list.
 	waitForWithin(t, 3*time.Second, "rr-a to still be serving", func() bool {
 		st := c.Stats()
-		if st.ActiveRR < 0 || !st.Sessions[st.ActiveRR].Synced {
+		if !st.RibReady {
 			return false
 		}
 		return st.RRWait != nil && len(st.RRWait.RetiringAddrs) == 1 &&
@@ -244,7 +246,7 @@ func TestSetRRsStandbyChangesDoNotDisturbTheActiveSession(t *testing.T) {
 	cfg.RRs = []RRConfig{{ID: "rr1", Addr: "rr-a"}}
 	cfg.Dial = f.dial
 	c := startClient(t, cfg)
-	waitFor(t, "rr-a serves", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "rr-a serves", func() bool { return c.Stats().RibReady })
 	dialed := f.dialCount("rr-a")
 
 	if err := c.SetRRs([]RRConfig{{ID: "rr1", Addr: "rr-a"}, {ID: "rr2", Addr: "rr-b"}}); err != nil {
@@ -273,9 +275,10 @@ func TestSetRRsStandbyChangesDoNotDisturbTheActiveSession(t *testing.T) {
 	if err := c.SetRRs([]RRConfig{{ID: "rr1", Addr: "rr-b"}, {ID: "rr2", Addr: "rr-a"}}); err != nil {
 		t.Fatalf("swap: %v", err)
 	}
-	waitFor(t, "rr-b to be preferred", func() bool {
+	waitFor(t, "rr-b to be listed first", func() bool {
 		st := c.Stats()
-		return st.ActiveRR == 0 && st.Sessions[0].Addr == "rr-b" && st.Sessions[0].Synced
+		return st.Sessions[0].Addr == "rr-b" && st.Sessions[0].Synced &&
+			st.Sessions[1].Addr == "rr-a" && st.Sessions[1].Synced
 	})
 	if st := c.Stats(); st.RRWait != nil {
 		t.Fatalf("a reorder retired sessions: %+v", st.RRWait)
@@ -306,7 +309,7 @@ func TestSetRRsRollbackReusesTheRetiringSession(t *testing.T) {
 	cfg.RRs = []RRConfig{{ID: "rr1", Addr: "rr-a"}}
 	cfg.Dial = f.dial
 	c := startClient(t, cfg)
-	waitFor(t, "rr-a serves", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "rr-a serves", func() bool { return c.Stats().RibReady })
 	dialed := f.dialCount("rr-a")
 
 	if err := c.SetRRs([]RRConfig{{ID: "rr1", Addr: "nowhere"}}); err != nil {
@@ -330,8 +333,8 @@ func TestSetRRsRollbackReusesTheRetiringSession(t *testing.T) {
 	if f.dialCount("rr-a") != dialed {
 		t.Fatal("the retiring session was torn down and redialled instead of reused")
 	}
-	if s, ok := sessionOf(c, "rr-a"); !ok || s.Retiring || !s.Connected || st.ActiveRR != 0 {
-		t.Fatalf("rr-a after rollback = %+v/%v active=%d", s, ok, st.ActiveRR)
+	if s, ok := sessionOf(c, "rr-a"); !ok || s.Retiring || !s.Connected || !st.RibReady {
+		t.Fatalf("rr-a after rollback = %+v/%v ready=%v", s, ok, st.RibReady)
 	}
 }
 
@@ -345,7 +348,7 @@ func TestSetRRsReapsWhenTheNewSessionSyncsLater(t *testing.T) {
 	cfg.RRs = []RRConfig{{ID: "rr1", Addr: "rr-a"}}
 	cfg.Dial = f.dial
 	c := startClient(t, cfg)
-	waitFor(t, "rr-a serves", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "rr-a serves", func() bool { return c.Stats().RibReady })
 
 	if err := c.SetRRs([]RRConfig{{ID: "rr1", Addr: "rr-b"}}); err != nil {
 		t.Fatalf("switch: %v", err)
@@ -367,7 +370,7 @@ func TestSetRRsReapsWhenTheNewSessionSyncsLater(t *testing.T) {
 // One case where an empty table is the honest answer: the RR is gone. The sessions
 // list keeps the address, so /status can still say which reflector this box is
 // trying to reach.
-func TestAllSessionsDownLeavesNoActiveRR(t *testing.T) {
+func TestAllSessionsDownLeavesNothingReady(t *testing.T) {
 	f := newFarm()
 	f.add(t, "rr-a", "rr-a")
 
@@ -375,10 +378,10 @@ func TestAllSessionsDownLeavesNoActiveRR(t *testing.T) {
 	cfg.RRs = []RRConfig{{ID: "rr1", Addr: "rr-a"}}
 	cfg.Dial = f.dial
 	c := startClient(t, cfg)
-	waitFor(t, "rr-a serves", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "rr-a serves", func() bool { return c.Stats().RibReady })
 
 	f.kill("rr-a")
-	waitFor(t, "no active RR", func() bool { return c.Stats().ActiveRR == -1 })
+	waitFor(t, "nothing ready", func() bool { return !c.Stats().RibReady })
 	st := c.Stats()
 	if len(st.Sessions) != 1 || st.Sessions[0].Connected {
 		t.Fatalf("sessions = %+v", st.Sessions)

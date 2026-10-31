@@ -187,8 +187,8 @@ func main() {
 	log.Printf("sr-route: stopped")
 }
 
-// watchRIB logs a change of active RR or table shape. Failover that nobody can
-// see is indistinguishable from a table that quietly went empty.
+// watchRIB logs a change in what the sessions hold or in the table's shape. A
+// table that quietly went empty is indistinguishable from one nobody reads.
 func watchRIB(c *route.Client, stop <-chan struct{}) {
 	last := ""
 	t := time.NewTicker(2 * time.Second)
@@ -233,8 +233,8 @@ func summary(c *route.Client) string {
 	if len(parts) == 0 {
 		parts = append(parts, "empty")
 	}
-	base := fmt.Sprintf("active=%d sessions[%v] rib{%s} held=%d",
-		st.ActiveRR, synced, strings.Join(parts, " "), st.ActivePending)
+	base := fmt.Sprintf("ready=%v sessions[%v] rib{%s} held=%d",
+		st.RibReady, synced, strings.Join(parts, " "), len(c.Pending()))
 	if st.RRWait == nil {
 		return base
 	}

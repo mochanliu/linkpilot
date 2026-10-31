@@ -109,7 +109,7 @@ func TestStatusReportsTheTablesInForce(t *testing.T) {
 	// but every list still has to be present as an empty array, or a console
 	// cannot tell "nothing held back" from "this build does not report it".
 	doc := getStatus(t, srv)
-	if doc.ActiveRR != -1 || doc.ActiveRIBRoutes != 0 || doc.ActivePending != 0 {
+	if doc.RibReady || doc.RibRoutes != 0 {
 		t.Fatalf("idle stats = %+v", doc.ClientStats)
 	}
 	if len(doc.Tunnels) != 2 || doc.Tunnels[0].Peer != 20 || doc.Tunnels[1].Peer != 22 {

@@ -282,7 +282,7 @@ func TestClientAnnouncesItsTable(t *testing.T) {
 	})
 	waitFor(t, "session synced", func() bool {
 		st := c.Stats()
-		return st.ActiveRR == 0 && st.Sessions[0].Synced && st.Sessions[0].RRID == "rr-a"
+		return st.RibReady && st.Sessions[0].Synced && st.Sessions[0].RRID == "rr-a"
 	})
 }
 
@@ -292,7 +292,7 @@ func TestClientImportsOnlyMatchingRTs(t *testing.T) {
 	cfg := testClientConfig()
 	cfg.Dial = srv.dial
 	c := startClient(t, cfg)
-	waitFor(t, "client synced", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
 	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
@@ -368,7 +368,7 @@ func TestClientResolvesEveryTunnelToOrigin(t *testing.T) {
 	}
 	cfg.Dial = srv.dial
 	c := startClient(t, cfg)
-	waitFor(t, "client synced", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
 	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
@@ -391,7 +391,7 @@ func TestClientReimportsOnRTChange(t *testing.T) {
 	cfg := testClientConfig()
 	cfg.Dial = srv.dial
 	c := startClient(t, cfg)
-	waitFor(t, "client synced", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
 	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
@@ -413,14 +413,14 @@ func TestClientReimportsOnRTChange(t *testing.T) {
 	waitFor(t, "import revoked by RT change", func() bool { return len(c.RIB(5)) == 0 })
 }
 
-func TestActiveStandbyFailoverWithoutMerge(t *testing.T) {
+func TestTwoSyncedRRSMergeAndLoseOnlyTheirOwnCopies(t *testing.T) {
 	rrA := newTestReflector(t, ReflectorConfig{RRID: "rr-a"})
 	rrB := newTestReflector(t, ReflectorConfig{RRID: "rr-b"})
 	srvA := newTestRRSrv(t, rrA, 10)
 	srvB := newTestRRSrv(t, rrB, 10)
 
-	// Each RR has a different origin, so "which RR am I serving from" is visible
-	// in the table itself.
+	// Each RR has a different origin, so which copies are in the table is
+	// visible in the table itself.
 	peerA, _ := dial(t, rrA, 20)
 	peerA.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
 	peerA.send(Envelope{Type: MsgAnnounce, Routes: []Route{
@@ -448,18 +448,23 @@ func TestActiveStandbyFailoverWithoutMerge(t *testing.T) {
 	}
 	c := startClient(t, cfg)
 
-	waitFor(t, "primary active with route A", func() bool {
+	// Two synced RRs are two peers of one Loc-RIB, not a primary table plus a
+	// standby table: every prefix each of them carries is in the merged table.
+	waitFor(t, "both reflectors' routes merged", func() bool {
 		st := c.Stats()
 		rib := c.RIB(5)
-		return st.ActiveRR == 0 && len(rib) == 1 && rib[0].Prefix == "10.20.0.0/16" &&
-			len(rib[0].NextHops) == 1 && rib[0].NextHops[0] == "192.168.99.2"
+		return st.RibReady && len(rib) == 2 &&
+			rib[0].Prefix == "10.20.0.0/16" && len(rib[0].NextHops) == 1 && rib[0].NextHops[0] == "192.168.99.2" &&
+			rib[1].Prefix == "10.21.0.0/16" && len(rib[1].NextHops) == 1 && rib[1].NextHops[0] == "192.168.99.3"
 	})
 
+	// A session going away takes back exactly its own copies (dropAdjRIBIn).
+	// Prefixes the other RR also carries would keep that copy; here rr-a's
+	// prefix was only rr-a's, so it leaves and rr-b's stays.
 	srvA.kill()
-	waitFor(t, "standby takes over with its own table only", func() bool {
-		st := c.Stats()
+	waitFor(t, "rr-a's copies leave, rr-b's stay", func() bool {
 		rib := c.RIB(5)
-		return st.ActiveRR == 1 && len(rib) == 1 && rib[0].Prefix == "10.21.0.0/16" &&
+		return len(rib) == 1 && rib[0].Prefix == "10.21.0.0/16" &&
 			len(rib[0].NextHops) == 1 && rib[0].NextHops[0] == "192.168.99.3"
 	})
 	if st := c.Stats(); st.Sessions[0].Connected {
@@ -467,10 +472,72 @@ func TestActiveStandbyFailoverWithoutMerge(t *testing.T) {
 	}
 
 	srvA.revive()
-	waitFor(t, "primary comes back and takes over again", func() bool {
-		st := c.Stats()
-		return st.ActiveRR == 0 && len(c.RIB(5)) == 1 && c.RIB(5)[0].Prefix == "10.20.0.0/16"
+	waitFor(t, "rr-a comes back and contributes its copies again", func() bool {
+		return len(c.RIB(5)) == 2 && c.RIB(5)[0].Prefix == "10.20.0.0/16"
 	})
+}
+
+// The bull's-eye of O7: two reflectors carry the same path for the same prefix.
+// One session dying must not shrink the table -- the other copy *is* the same
+// route, and BGP would not withdraw it either, because dropAdjRIBIn takes back
+// only what the dying session said.
+func TestOneSessionLeavingDoesNotShrinkTheTable(t *testing.T) {
+	rrA := newTestReflector(t, ReflectorConfig{RRID: "rr-a"})
+	rrB := newTestReflector(t, ReflectorConfig{RRID: "rr-b"})
+	srvA := newTestRRSrv(t, rrA, 10)
+	srvB := newTestRRSrv(t, rrB, 10)
+
+	// The same announce reaches both reflectors, exactly as an RR pair reflects
+	// one CPE's route to another.
+	for _, r := range []*Reflector{rrA, rrB} {
+		peer, _ := dial(t, r, 20)
+		peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+		peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{
+			testRoute(20, 5, "10.20.0.0/16", "65000:6"),
+		}})
+	}
+
+	cfg := testClientConfig()
+	cfg.Tunnels = []Tunnel{{Peer: 20, NextHop: "192.168.99.2"}}
+	cfg.RRs = []RRConfig{{ID: "rr-a", Addr: "rr-a"}, {ID: "rr-b", Addr: "rr-b"}}
+	var mu sync.Mutex
+	dialFor := map[string]func(context.Context, string) (net.Conn, error){"rr-a": srvA.dial, "rr-b": srvB.dial}
+	cfg.Dial = func(ctx context.Context, addr string) (net.Conn, error) {
+		mu.Lock()
+		d := dialFor[addr]
+		mu.Unlock()
+		return d(ctx, addr)
+	}
+	c := startClient(t, cfg)
+
+	// Two copies of one path are one row: no ADD-PATH here, so a destination
+	// holds one path per session and the reader sees the best of them.
+	waitFor(t, "the shared prefix is in the table once", func() bool {
+		rib := c.RIB(5)
+		return len(rib) == 1 && rib[0].Prefix == "10.20.0.0/16"
+	})
+	before := c.Stats()
+
+	srvA.kill()
+	waitFor(t, "rr-a's session is down", func() bool { return !c.Stats().Sessions[0].Connected })
+	rib := c.RIB(5)
+	if len(rib) != 1 || rib[0].Prefix != "10.20.0.0/16" {
+		t.Fatalf("table shrank with one session gone: %v", ribPrefixes(rib))
+	}
+	if st := c.Stats(); st.Withdrawn != before.Withdrawn || st.RibRoutes != before.RibRoutes {
+		t.Fatalf("losing a copy counted as a withdrawal: %+v -> %+v", before, st)
+	}
+
+	// And coming back is the same story: the copy re-enters, the row does not
+	// become two.
+	srvA.revive()
+	waitFor(t, "rr-a is back and synced", func() bool {
+		st := c.Stats()
+		return st.Sessions[0].Connected && st.Sessions[0].Synced
+	})
+	if rib := c.RIB(5); len(rib) != 1 || rib[0].Prefix != "10.20.0.0/16" {
+		t.Fatalf("the shared prefix became two rows: %v", ribPrefixes(rib))
+	}
 }
 
 func TestNoSyncedRRMeansEmptyRIB(t *testing.T) {
@@ -540,14 +607,14 @@ func TestNoSyncedRRMeansEmptyRIB(t *testing.T) {
 		return dialB(ctx, addr)
 	}
 	c := startClient(t, cfg)
-	waitFor(t, "a synced", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "a synced", func() bool { return c.Stats().RibReady })
 	waitFor(t, "b connected but unsynced", func() bool {
 		st := c.Stats()
 		return st.Sessions[1].Connected && !st.Sessions[1].Synced
 	})
 
 	srvA.kill()
-	waitFor(t, "no active RR after the primary dies", func() bool { return c.Stats().ActiveRR == -1 })
+	waitFor(t, "nothing ready after the only synced RR dies", func() bool { return !c.Stats().RibReady })
 	if n := len(c.RIB(5)); n != 0 {
 		t.Fatalf("served %d routes from an unsynced RR", n)
 	}
@@ -555,7 +622,8 @@ func TestNoSyncedRRMeansEmptyRIB(t *testing.T) {
 	close(eorGate)
 	waitFor(t, "standby becomes usable at EOR", func() bool {
 		st := c.Stats()
-		return st.ActiveRR == 1 && len(c.RIB(5)) == 1 && c.RIB(5)[0].Prefix == "10.21.0.0/16"
+		return st.Sessions[1].Synced && st.RibReady &&
+			len(c.RIB(5)) == 1 && c.RIB(5)[0].Prefix == "10.21.0.0/16"
 	})
 }
 
@@ -623,7 +691,7 @@ func TestAllRIBAndEmptyWhenStopped(t *testing.T) {
 	cfg.VRFs = append(cfg.VRFs, VRFConfig{ID: 6, ExportRTs: []string{"65000:6"}, ImportRTs: []string{"65000:8"}})
 	cfg.Dial = srv.dial
 	c := startClient(t, cfg)
-	waitFor(t, "client synced", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
 	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
@@ -654,7 +722,7 @@ func TestAllRIBAndEmptyWhenStopped(t *testing.T) {
 	srv.kill()
 	waitFor(t, "table cleared when no RR is usable", func() bool {
 		st := c.Stats()
-		return st.ActiveRR == -1 && len(c.AllRIB()) == 0
+		return !st.RibReady && len(c.AllRIB()) == 0
 	})
 }
 
@@ -751,7 +819,7 @@ func TestSetTunnelsInstallsRoutesHeldForWantOfAPath(t *testing.T) {
 		t.Fatalf("installed a route with no path: %v", ribPrefixes(c.RIB(5)))
 	}
 	before := c.Stats()
-	if before.DroppedNoPath != 1 || before.ActivePending != 1 {
+	if before.DroppedNoPath != 1 || before.RibRoutes != 0 {
 		t.Fatalf("counters = %+v", before)
 	}
 
@@ -831,7 +899,7 @@ func TestClientWithNoTunnelsAnnouncesAnEmptyTable(t *testing.T) {
 		sn := rr.Sessions()
 		return len(sn) == 1 && sn[0].Tunnels == 0
 	})
-	waitFor(t, "client synced", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	// And clearing the last tunnel of a running session reaches the RR the same
 	// way instead of dropping the session.
@@ -848,7 +916,7 @@ func TestClientWithNoTunnelsAnnouncesAnEmptyTable(t *testing.T) {
 	waitFor(t, "the RR to see the table emptied again", func() bool {
 		st := c.Stats()
 		sn := rr.Sessions()
-		return len(sn) == 1 && sn[0].Tunnels == 0 && st.Sessions[0].Connected && st.ActiveRR == 0
+		return len(sn) == 1 && sn[0].Tunnels == 0 && st.Sessions[0].Connected && st.RibReady
 	})
 }
 
@@ -992,7 +1060,7 @@ func TestTableChangeWhileNoSessionIsAnnouncedOnReconnect(t *testing.T) {
 	cfg := testClientConfig()
 	cfg.Dial = srv.dial
 	c := startClient(t, cfg)
-	waitFor(t, "session synced", func() bool { return c.Stats().ActiveRR == 0 })
+	waitFor(t, "session synced", func() bool { return c.Stats().RibReady })
 
 	srv.kill()
 	waitFor(t, "session down", func() bool { return !c.Stats().Sessions[0].Connected })

@@ -96,8 +96,8 @@ status_check() {   # <cpe> <port> <want_rib> <want_local>
 import json, sys, urllib.request
 port, vrf, want, wantl = sys.argv[1:5]
 d = json.load(urllib.request.urlopen("http://127.0.0.1:%s/status" % port, timeout=3))
-if d.get("active_rr") != 0:
-    raise SystemExit("active_rr=%r" % d.get("active_rr"))
+if not d.get("rib_ready"):
+    raise SystemExit("rib_ready=%r/会话未同步" % d.get("rib_ready"))
 got = sorted("%s:%s" % (r["prefix"], ",".join(sorted(r["next_hops"])))
              for r in d.get("rib", {}).get(vrf, []))
 if got != sorted(x for x in want.split(",") if x):

@@ -333,7 +333,7 @@ do_route() {
     local u
     u=$(route_status_url)
     if [ -n "$u" ] && wait_url "$u"; then
-        say route "状态口 $u 已回话（RR 同步要几秒，check 里看 active_rr）"
+        say route "状态口 $u 已回话（RR 同步要几秒，check 里看 rib_ready）"
     else
         fail route "进程在但状态口没回话：${u:-route.json 里没有 status_addr}（看 $LOG/route.log）"
     fi

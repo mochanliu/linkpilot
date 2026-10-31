@@ -489,14 +489,14 @@ ok "五个进程的 pid + 启动时刻已记下，阶段 G 回来比"
 
 info "(A) node1 开机零隧道：会话必须活着（这条是 null 隧道表的实测回归）"
 wait_json "$N1_STATUS" \
-    "any(s['connected'] and s['synced'] for s in d['sessions']) and d['active_rr'] >= 0" \
+    "any(s['connected'] and s['synced'] for s in d['sessions']) and d['rib_ready']" \
     "node1 的 RR 会话 connected + synced：空隧道表没有让 RR 关会话" 30
 if dx "$N1" "grep -q 'tunnels message without a table' $WORK/node1.log" 2>/dev/null; then
     bad "node1.log 里有 'tunnels message without a table'（空表又被序列化成 null 了）"
 else
     ok "日志里没有那条错误：空隧道表是以 [] 上线的，不是 null"
 fi
-wait_json "$N1_STATUS" "d['active_rib_routes'] == 0 and d['pending_total'] == 0" \
+wait_json "$N1_STATUS" "d['rib_routes'] == 0 and d['pending_total'] == 0" \
     "本机既没装任何路由，也没有待决的（没人反射给一个零隧道的设备）" 20
 rr_json | python3 -c "
 import json,sys
@@ -519,7 +519,7 @@ wait_json "$N1_STATUS" \
     "d['pending_total'] == 1 and d['pending'][0]['reason'] == 'rt_mismatch' and
      d['pending'][0]['prefix'] == '$PFX_SRC' and d['pending'][0]['device_id'] == 2" \
     "node2 的前缀**收到了但装不进表**，留在 pending 里且原因写着 rt_mismatch（旧代码这里直接丢弃）" 30
-wait_json "$N1_STATUS" "d['active_rib_routes'] == 0" \
+wait_json "$N1_STATUS" "d['rib_routes'] == 0" \
     "它没有偷偷进表（RT 不匹配就是没装上）" 10
 wait_fn "VPP 表 $VRF_DST 里也没有 $PFX_SRC（pending 不该惊动数据面）" 10 \
     no_route_in "$N1" "$VRF_DST" "$PFX_SRC"
@@ -543,7 +543,7 @@ wait_json "$N1_STATUS" \
     "[(r['vrf_id'], r['prefix']) for r in d['rib'].get('$VRF_DST', [])] == [($VRF_SRC, '$PFX_SRC')]" \
     "$PFX_SRC 进了表 $VRF_DST（来源记的是 VPN $VRF_SRC，装的是本机 VPN $VRF_DST）" 20
 wait_json "$N1_STATUS" \
-    "d['pending_total'] == 0 and d['active_rib_routes'] == 1" \
+    "d['pending_total'] == 0 and d['rib_routes'] == 1" \
     "待决清单空了：它不是被重新学一遍，是从待决里搬进表里" 15
 recv_c=$(field "$N1_STATUS" "d['received']")
 imported_c=$(field "$N1_STATUS" "d['imported']")
@@ -595,7 +595,7 @@ withdrawn_e_before=$(field "$N2_STATUS" "d['withdrawn']")
 w_n1_before=$(field "$N1_STATUS" "d['withdrawn']")
 put "$N1_STATUS" "/tunnels" "$(dx "$N1" "cat $WORK/tunnels-none.json")" ||
     die "PUT /tunnels（清空）失败"
-wait_json "$N1_STATUS" "d['active_rib_routes'] == 0" "$PFX_SRC 离开表 $VRF_DST" 20
+wait_json "$N1_STATUS" "d['rib_routes'] == 0" "$PFX_SRC 离开表 $VRF_DST" 20
 wait_json "$N2_STATUS" "d['withdrawn'] > $withdrawn_e_before" \
     "node2 的 withdrawn 从 $withdrawn_e_before 涨上去：对端是收到 RR 的**显式撤回**的，不是等老化" 25
 wait_json "$N1_STATUS" "d['pending_total'] == 0" \

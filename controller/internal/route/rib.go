@@ -273,6 +273,19 @@ func (r *locRib) eachBest(fn func(key RouteKey, p *path)) {
 	}
 }
 
+// eachDest 按 destination 的键序遍历每一个前缀，不分可解析与否。待决清单从这里
+// 出：一条路能不能装表要在读的时候问本机两张表（见 importablePathLocked），
+// 所以它必须看见那些 best 为 nil 的前缀。
+func (r *locRib) eachDest(fn func(d *destination)) {
+	keys := make([]RouteKey, 0, len(r.dsts))
+	for k := range r.dsts {
+		keys = append(keys, k)
+	}
+	for _, k := range SortedKeys(keys) {
+		fn(r.dsts[k])
+	}
+}
+
 // originPaths 给出某个来源设备的所有 path（Nexthop Tracking 翻标志位用）。
 // 返回的是副本切片，调用方可以边拿边 process。
 func (r *locRib) originPaths(deviceID uint16) []*path {

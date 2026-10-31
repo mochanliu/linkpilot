@@ -773,12 +773,12 @@ EOF
             die "$c: sr-route 状态口没起来（cat /var/log/sr-route.log）"
         for i in $(seq 1 40); do
             docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" |
-                grep -Eq "\"active_rr\":[[:space:]]*0" && break
+                grep -Eq "\"rib_ready\":[[:space:]]*true" && break
             sleep 0.5
         done
         docker exec "$c" curl -sf "http://127.0.0.1:${ROUTE_STATUS[$n]}/status" |
-            grep -Eq "\"active_rr\":[[:space:]]*0" ||
-            die "$c: 没有和 rr-a 同步（cat /var/log/sr-route.log）"
+            grep -Eq "\"rib_ready\":[[:space:]]*true" ||
+            die "$c: 没有和 RR 同步（cat /var/log/sr-route.log）"
     done
 
     for n in 1 2 3; do

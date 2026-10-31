@@ -14,8 +14,8 @@
 #       计数增加（"没收到"和"收到了但拒收"必须分得开）。
 #   (C) 反射策略：reflect_to {"2":[3]} 只能在邻接之上做减法 —— CPE2 的路由
 #       送到 CPE3，不再送到 CPE1。策略不能凭空造出可达性。
-#   (D) 双 RR 主备：杀掉首选 RR 后三个 CPE 都切到 rr-b（active_rr=1）且表不
-#       变；首选 RR 回来后切回（active_rr=0）。
+#   (D) 双 RR 冗余：两条会话都往同一张 Loc-RIB 里送；杀掉 rr-a 后它那份拷贝
+#       退场、rr-b 的同一份顶上，表不变；rr-a 回来后两份拷贝重新合并。
 #
 # 不碰 VPP、不碰数据面：这个增量只验证路由协议本身。FIB 的下发是下一步。
 #
@@ -237,11 +237,11 @@ assert_status "http://127.0.0.1:$RR_A_STATUS/tunnels" \
 
 info "(A) 收端本地解析 + RT 匹配：node1 路由进入 node2 的 bgp 表"
 wait_status "$URL_N2" \
-    "d['active_rr']==0 and [ (r['prefix'], r['next_hops']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16',['192.168.99.1'])]" \
+    "d['rib_ready'] and [ (r['prefix'], r['next_hops']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16',['192.168.99.1'])]" \
     "node2 vrf5 = {10.10.0.0/16 via 192.168.99.1（来自 node2 自己的隧道表）}" 25
 
 info "(B) RT import 过滤：node3 的 65000:7 到了 node1 但不进表"
-wait_status "$URL_N1" "d['active_rr']==0 and d['dropped_rt_mismatch']>=1" \
+wait_status "$URL_N1" "d['rib_ready'] and d['dropped_rt_mismatch']>=1" \
     "node1 拒收了一条 RT 不匹配的路由" 25
 assert_status "$URL_N1" "d['rib'].get('5',[])==[]" \
     "node1 vrf5 为空（没有可导入的路由，而不是没收到）"
@@ -250,17 +250,17 @@ assert_status "$URL_N1" "d['received']>=1" \
 
 info "(C) 反射策略：node2 的路由只送到 node3，不送到 node1"
 wait_status "$URL_N3" \
-    "d['active_rr']==0 and sorted((r['prefix'], r['next_hops']) for r in d['rib'].get('5',[])) == [('10.10.0.0/16',['192.168.88.1','192.168.99.1']), ('10.20.0.0/16',['192.168.99.2'])]" \
+    "d['rib_ready'] and sorted((r['prefix'], r['next_hops']) for r in d['rib'].get('5',[])) == [('10.10.0.0/16',['192.168.88.1','192.168.99.1']), ('10.20.0.0/16',['192.168.99.2'])]" \
     "node3 收到 node1（两条并行隧道 ⇒ 两个下一跳）与 node2（策略允许）" 25
 assert_status "$URL_N1" "not [r for r in d['rib'].get('5',[]) if r['prefix']=='10.20.0.0/16']" \
     "node1 没收到 node2 的路由（reflect_to 在邻接之上把它减掉了）"
 
-info "(D) 主备切换：杀掉 rr-a，三个 CPE 切到 rr-b 且表不变"
+info "(D) 双 RR 冗余：杀掉 rr-a，它那份拷贝退场、rr-b 的顶上，表不变"
 kill "$RR_A" 2>/dev/null || true
 for u in "$URL_N1:node1" "$URL_N2:node2" "$URL_N3:node3"; do
     url=${u%:*}; who=${u##*:}
-    wait_status "$url" "d['active_rr']==1 and d['sessions'][0]['connected']==False" \
-        "$who 切到 rr-b" 15
+    wait_status "$url" "d['sessions'][0]['connected']==False and d['rib_ready']" \
+        "$who 只剩 rr-b 在供表（表仍可读）" 15
 done
 assert_status "$URL_N2" \
     "[ (r['prefix'], r['next_hops']) for r in d['rib'].get('5',[]) ] == [('10.10.0.0/16',['192.168.99.1'])]" \
@@ -269,12 +269,12 @@ assert_status "$URL_N3" \
     "sorted(r['prefix'] for r in d['rib'].get('5',[])) == ['10.10.0.0/16','10.20.0.0/16']" \
     "切到 rr-b 后 node3 的表不变"
 
-info "(D) 首选 RR 回来：切回 rr-a"
+info "(D) rr-a 回来：两份拷贝重新合并，表仍然不变"
 start sr-rr "$WORK/rr-a.json" "$WORK/rr-a.log.2"; RR_A=$LAST_PID
 for u in "$URL_N1:node1" "$URL_N2:node2" "$URL_N3:node3"; do
     url=${u%:*}; who=${u##*:}
-    wait_status "$url" "d['active_rr']==0 and d['sessions'][0]['synced']==True" \
-        "$who 切回 rr-a" 20
+    wait_status "$url" "d['rib_ready'] and d['sessions'][0]['synced']==True" \
+        "$who 与 rr-a 重新同步" 20
 done
 
 info "RR 会话数在切换后仍然正确（没有僵尸会话）"

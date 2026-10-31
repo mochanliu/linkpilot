@@ -87,6 +87,25 @@
   最优由另一条会话的同内容拷贝接手时，会照 BGP 的样子出一次 withdraw+advertise（内容
   没变，但"队首换人了"）。表不缩水这条不受影响。
 
+## R2 落地时对齐到的三处细节（2026-10-31）
+
+- **EOR 是进口闸门，不是合并规则**：`adjIn` 从握手起就一直写（"这条会话说过什么"的
+  记录，`dropAdjRIBIn` 要靠它按来源摘），但只有 `markSynced`（收到 EOR）那一刻才把整份
+  `adjIn` 灌进 Loc-RIB，之后逐条进。对齐 GoBGP：没到 Established / 快照中途的 peer 不
+  贡献 path。灌入是 `process(rt, s.addr, reachable)`，来源写成会话地址 —— 之后一条会话
+  断掉，按地址摘的正是自己那几份。
+- **`path.resolvable` 只能等于隧道闸门**（`IsNexthopInvalid`），不能把 RT 命中折进去。
+  实现里先折了一次，`TestSetVRFsImportChangeMovesHeldRoutesBothWays` 立刻红：折进去
+  等于把 `CanImportToVrf` 的结论写死在 path 上，后加的 VPN 就永远捡不回已经在
+  adj-RIB-in 里的路由。所以分成两个函数：`reachableLocked`（本机有没有到 `DeviceID` 的
+  隧道，唯一决定 `resolvable`）与 `admitLocked`（RT + 隧道，只用来记 `rt_mismatch` /
+  `no_path` 两个事件计数）。
+- **摘除只按来源、事件计数看"前缀是否离开表"**：`applyWithdraw` 与
+  `dropSessionLocked` 都走 `withdraw(k, s.addr)`，然后才用 `was && !installed` 决定
+  `withdrawn` 加不加一。另一条会话还拿着这个前缀时它不加 —— 这也是
+  `test-rr-switch.sh` (4) 的判据从"node2 会缺满一个扇出间隔"反转成"node2 缺口 0、
+  withdrawn 不动"的原因：缺的那条是**拷贝**，不是路由。
+
 ## 顺序
 
 R1 `destination` + `updateLocRib` + `comparePaths`（纯数据结构 + 单测，读路径先不接）

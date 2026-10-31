@@ -558,9 +558,9 @@ run_box "$N2" up && ok "node2 up 退出码 0" || bad "node2 up 退出码 $BOX_RC
 
 wait_json "$N1" "$S1" "any(s['connected'] and s['synced'] for s in d['sessions'])" \
     "node1 的 sr-route 连上 RR 并同步完" 40
-wait_json "$N1" "$S1" "d['active_rib_routes'] == 1 and d['rib']['$VRF_1'][0]['prefix'] == '$PFX_2'" \
+wait_json "$N1" "$S1" "d['rib_routes'] == 1 and d['rib']['$VRF_1'][0]['prefix'] == '$PFX_2'" \
     "表 $VRF_1 里学到 $PFX_2（node2 的宣告）" 30
-wait_json "$N2" "$S2" "d['active_rib_routes'] == 1 and d['rib']['$VRF_2'][0]['prefix'] == '$PFX_1'" \
+wait_json "$N2" "$S2" "d['rib_routes'] == 1 and d['rib']['$VRF_2'][0]['prefix'] == '$PFX_1'" \
     "node2 那边学到 $PFX_1：清单跑完的是**两台**盒子" 30
 wait_fn "node1 VPP 表 $VRF_1 里 $PFX_2 压 $LBL_2 经 $WG_IF" 25 \
     labeled_via "$N1" "$VRF_1" "$PFX_2" "$LBL_2" "$OVERLAY_N2"
@@ -604,7 +604,7 @@ p2_fib=$(box_pid "$N1" fib); p2_agent=$(box_pid "$N1" agent)
 [ "$p2_agent" = "$p1_agent" ] && ok "sr-agent 没被重启（$p2_agent）" || bad "sr-agent 被重启了：$p1_agent → $p2_agent"
 [ "$vpp_pid" = "$(dx "$N1" "pgrep -x vpp_main | head -1")" ] && ok "VPP 没被重启" || bad "VPP 被清单重启了"
 
-wait_json "$N1" "$S1" "any(s['connected'] and s['synced'] for s in d['sessions']) and d['active_rib_routes'] == 1" \
+wait_json "$N1" "$S1" "any(s['connected'] and s['synced'] for s in d['sessions']) and d['rib_routes'] == 1" \
     "新 sr-route 自己连回 RR 又学到了（没人替它重启谁）" 40
 wait_fn "VPP 表 $VRF_1 里的 $PFX_2 又回来了（老的 sr-fib 下一轮轮询自己补上）" 25 \
     labeled_via "$N1" "$VRF_1" "$PFX_2" "$LBL_2" "$OVERLAY_N2"
@@ -668,8 +668,8 @@ wait_json "$N2" "$S2" "any(s['connected'] and s['synced'] for s in d['sessions']
 rc1=$(field "$N1" "$S1" "d['sessions'][0]['reconnects']")
 [ "$rc1" -ge 1 ] 2>/dev/null && ok "node1 的 reconnects=$rc1（≥1）：那条连接是它自己重试出来的" ||
     bad "node1 的 reconnects=$rc1：它没重试过？"
-wait_json "$N1" "$S1" "d['active_rib_routes'] == 1" "node1 重新学到 $PFX_2" 30
-wait_json "$N2" "$S2" "d['active_rib_routes'] == 1" "node2 重新学到 $PFX_1" 30
+wait_json "$N1" "$S1" "d['rib_routes'] == 1" "node1 重新学到 $PFX_2" 30
+wait_json "$N2" "$S2" "d['rib_routes'] == 1" "node2 重新学到 $PFX_1" 30
 if no_route_in "$N1" "$VRF_1" "$PFX_2"; then
     ok "但 VPP 表 $VRF_1 里还装不上：没有隧道就没有下一跳，sr-fib 只能等着（它没报错，也没重启）"
 else
@@ -763,7 +763,7 @@ n_route=$(box_pid "$N1" route); n_fib=$(box_pid "$N1" fib); n_agent=$(box_pid "$
 [ "$(dx "$N1" "pgrep -x vpp_main | head -1")" = "$c_vpp" ] &&
     ok "这一遍 up 之后 VPP 的 pid 仍是 $c_vpp —— 补进程与动数据面是两件事" ||
     bad "第二遍 up 重启了 VPP"
-wait_json "$N1" "$S1" "any(s['connected'] and s['synced'] for s in d['sessions']) and d['active_rib_routes'] == 1" \
+wait_json "$N1" "$S1" "any(s['connected'] and s['synced'] for s in d['sessions']) and d['rib_routes'] == 1" \
     "新的 sr-route 自己连回 RR 并同步完（没人替它做任何事）" 40
 wait_fn "老的 sr-fib 不在场这一阵子缺的表，新起的 sr-fib 自己装回来了" 30 \
     labeled_via "$N1" "$VRF_1" "$PFX_2" "$LBL_2" "$OVERLAY_N2"
