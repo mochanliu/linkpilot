@@ -91,3 +91,28 @@ RR 手里那份隧道表（`Reflector.tunnels`）只被**一处**用到：我加
   零缺口硬指标不变；harness 196 条；gofmt / vet / `-race` 全绿。
 - 部署顺序：sr-rr 与盒子**必须同版本**（旧盒子发 `tunnels` 会被新 RR 当未知类型断连），
   lab 里一起换。协议版本号暂不升（4 仍是 3），要升你说一声。
+
+## O9-a 落地状态（2026-10-31）
+
+已按上面"要删的东西"全部落地；`reflect_to` 按建议**一起删**（配置项、`buildPolicy`、测试与
+test-route.sh 的 C 段）。线上协议不再有 `tunnels` 帧：`MsgTunnels` 常量、`Envelope.Tunnels`
+字段、每帧隧道数上限、`case MsgTunnels` 全部移除；`ValidateTunnels`/`MaxTunnelsPerDevice`
+留在本地（`normalizeTunnels` 仍用）。
+
+- `Reflector`：只剩 `sessions` + `adjIn`；`SessionInfo` 不再有 `Tunnels`；`attach` 在回完
+  `hello_ok` 后立即发快照 + EOR（`announceEnvelopes(snapshotForLocked)`），快照与扇出都只做
+  "除了来源之外的所有会话"。
+- `Client`：`SetTunnels` 只重算本机表，不再向 RR 发任何东西；`pushTunnelsLocked`、
+  `clientSession.announcedTunnels`、重连补发隧道表全部删除。
+- `cmd/sr-rr`：`fileConfig` 去掉 `reflect_to`；`/status` 只返回 `{rr_id, tenant, sessions,
+  routes}`；`GET /tunnels` 删除。
+- 新增回归：`TestSnapshotFollowsHelloOK`（不送任何表也能收到快照）、`TestTunnelsFrameIsRejected`
+  （旧帧被当未知类型、会话结束）、`TestSnapshotOnConnectAndFanout` 改成"来源永远收不到自己的
+  路由、晚加入者按 RT 长度拿到全部"。
+- 判据（全绿）：`gofmt`/`go vet`/`go build ./...`；`go test -race ./internal/route/`；`go test
+  ./cmd/...`；`test-route.sh` 21/0（新增 E 段：收端只有到 node3 的隧道 ⇒ node1 的前缀收到但挂
+  `no_path`）；`test-fib.sh` 36/0；`test-refresh.sh` 51/0（A/B/E 段改成"零隧道也收路由、
+  撤隧道不动对端与 RR"）；`test-rr-switch.sh` 57/0；`test-boot.sh` 90/0；`test-vbond.sh` 196/0；
+  `test-e2e.sh --keep` 46/0。
+
+O9-b（分组：配置面 + 身份乙 + 网格）未开始。

@@ -275,11 +275,8 @@ func TestClientAnnouncesItsTable(t *testing.T) {
 	if !got[0].Equal(want[0]) {
 		t.Fatalf("rr stored %+v, want %+v", got[0], want[0])
 	}
-	// The tunnel table travels once, as its own message, not with the prefix.
-	waitFor(t, "rr to see the tunnel table", func() bool {
-		sn := rr.Sessions()
-		return len(sn) == 1 && sn[0].Tunnels == 2
-	})
+	// The prefix is announced on its own: the tunnel table never leaves this
+	// process -- it is what resolves a received route's origin locally.
 	waitFor(t, "session synced", func() bool {
 		st := c.Stats()
 		return st.RibReady && st.Sessions[0].Synced && st.Sessions[0].RRID == "rr-a"
@@ -295,7 +292,7 @@ func TestClientImportsOnlyMatchingRTs(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+	peer.join(20)
 	good := testRoute(20, 5, "10.20.0.0/16", "65000:6")
 	badRT := testRoute(20, 5, "10.30.0.0/16", "65000:7")
 	// 来源 VPN 9 本机没有，但 RT 命中 VRF 5 的 import —— 这正是跨站点导通的形状：
@@ -371,7 +368,7 @@ func TestClientResolvesEveryTunnelToOrigin(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+	peer.join(20)
 	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
 	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
 
@@ -394,7 +391,7 @@ func TestClientReimportsOnRTChange(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+	peer.join(20)
 	rt := testRoute(20, 5, "10.20.0.0/16", "65000:7") // not imported
 	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
 	waitFor(t, "mismatch counted", func() bool { return c.Stats().DroppedRTMismatch == 1 })
@@ -422,12 +419,12 @@ func TestTwoSyncedRRSMergeAndLoseOnlyTheirOwnCopies(t *testing.T) {
 	// Each RR has a different origin, so which copies are in the table is
 	// visible in the table itself.
 	peerA, _ := dial(t, rrA, 20)
-	peerA.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+	peerA.join(20)
 	peerA.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 	}})
 	peerB, _ := dial(t, rrB, 21)
-	peerB.join(21, Tunnel{Peer: 10, NextHop: "192.168.78.10"})
+	peerB.join(21)
 	peerB.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(21, 5, "10.21.0.0/16", "65000:6"),
 	}})
@@ -491,7 +488,7 @@ func TestOneSessionLeavingDoesNotShrinkTheTable(t *testing.T) {
 	// one CPE's route to another.
 	for _, r := range []*Reflector{rrA, rrB} {
 		peer, _ := dial(t, r, 20)
-		peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+		peer.join(20)
 		peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 			testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 		}})
@@ -544,7 +541,7 @@ func TestNoSyncedRRMeansEmptyRIB(t *testing.T) {
 	rrA := newTestReflector(t, ReflectorConfig{RRID: "rr-a"})
 	srvA := newTestRRSrv(t, rrA, 10)
 	peerA, _ := dial(t, rrA, 20)
-	peerA.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+	peerA.join(20)
 	peerA.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 	}})
@@ -694,7 +691,7 @@ func TestAllRIBAndEmptyWhenStopped(t *testing.T) {
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
 	peer, _ := dial(t, rr, 20)
-	peer.join(20, Tunnel{Peer: 10, NextHop: "192.168.77.10"})
+	peer.join(20)
 	peer.send(Envelope{Type: MsgAnnounce, Routes: []Route{
 		testRoute(20, 5, "10.20.0.0/16", "65000:6"),
 		testRoute(20, 6, "10.30.0.0/16", "65000:8"),
@@ -789,18 +786,19 @@ func (s *scriptedRR) announce(routes ...Route) {
 	s.send(Envelope{Type: MsgEOR})
 }
 
-// tables returns the tunnel tables the client wrote, oldest first. The first one
-// is the session's snapshot; more entries mean a live replacement.
-func (s *scriptedRR) tables() [][]Tunnel {
+// sentTunnelFrames counts what the client put on the wire as a tunnel table.
+// The frame type no longer exists, so the only right answer is zero; the literal
+// keeps the regression visible if someone wires it back in.
+func (s *scriptedRR) sentTunnelFrames() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out [][]Tunnel
+	n := 0
 	for _, env := range s.frames {
-		if env.Type == MsgTunnels && env.Tunnels != nil {
-			out = append(out, *env.Tunnels)
+		if env.Type == MsgType("tunnels") {
+			n++
 		}
 	}
-	return out
+	return n
 }
 
 func TestSetTunnelsInstallsRoutesHeldForWantOfAPath(t *testing.T) {
@@ -843,11 +841,11 @@ func TestSetTunnelsInstallsRoutesHeldForWantOfAPath(t *testing.T) {
 	if after.Imported != before.Imported || after.DroppedNoPath != before.DroppedNoPath {
 		t.Fatalf("recompute rewrote the counters: %+v -> %+v", before, after)
 	}
-	// The RR has to be told: it decides what to reflect to us at all.
-	waitFor(t, "the RR to be told the new table", func() bool {
-		tb := rr.tables()
-		return len(tb) == 2 && len(tb[1]) == 2
-	})
+	// Nothing is sent to the RR: it reflects every route to every session, and
+	// the path is resolved here.
+	if n := rr.sentTunnelFrames(); n != 0 {
+		t.Fatalf("client wrote %d tunnel frames to the RR", n)
+	}
 }
 
 func TestSetTunnelsRemovesPathAndRouteLeavesTheTable(t *testing.T) {
@@ -879,45 +877,30 @@ func TestSetTunnelsRemovesPathAndRouteLeavesTheTable(t *testing.T) {
 	if after.Imported != before.Imported || after.Withdrawn != before.Withdrawn {
 		t.Fatalf("recompute rewrote the counters: %+v -> %+v", before, after)
 	}
-	waitFor(t, "the RR to be told the table is empty", func() bool {
-		tb := rr.tables()
-		return len(tb) == 2 && len(tb[1]) == 0
-	})
 }
 
-func TestClientWithNoTunnelsAnnouncesAnEmptyTable(t *testing.T) {
-	// A device that has not been given a tunnel yet must still hold a session:
-	// its table travels as [], not as a missing field, and the RR waits for it
-	// rather than rejecting the frame.
+func TestClientWithNoTunnelsStillHoldsTheSession(t *testing.T) {
+	// A device that has not been given a tunnel yet still has a session and a
+	// whole table: the RR does not care what it can reach, only it does.
 	rr := newTestReflector(t, ReflectorConfig{})
 	srv := newTestRRSrv(t, rr, 10)
 	cfg := testClientConfig()
 	cfg.Tunnels = nil
 	cfg.Dial = srv.dial
 	c := startClient(t, cfg)
-	waitFor(t, "the RR to record an empty tunnel table", func() bool {
-		sn := rr.Sessions()
-		return len(sn) == 1 && sn[0].Tunnels == 0
-	})
 	waitFor(t, "client synced", func() bool { return c.Stats().RibReady })
 
-	// And clearing the last tunnel of a running session reaches the RR the same
-	// way instead of dropping the session.
+	// Giving it a tunnel and taking it away again never touches the session.
 	if err := c.SetTunnels([]Tunnel{{Peer: 20, NextHop: "192.168.99.2"}}); err != nil {
 		t.Fatalf("SetTunnels: %v", err)
 	}
-	waitFor(t, "the RR to see one tunnel", func() bool {
-		sn := rr.Sessions()
-		return len(sn) == 1 && sn[0].Tunnels == 1
-	})
 	if err := c.SetTunnels(nil); err != nil {
 		t.Fatalf("SetTunnels(nil): %v", err)
 	}
-	waitFor(t, "the RR to see the table emptied again", func() bool {
-		st := c.Stats()
-		sn := rr.Sessions()
-		return len(sn) == 1 && sn[0].Tunnels == 0 && st.Sessions[0].Connected && st.RibReady
-	})
+	st := c.Stats()
+	if !st.RibReady || len(st.Sessions) != 1 || !st.Sessions[0].Connected || !st.Sessions[0].Synced {
+		t.Fatalf("session did not survive a table change: %+v", st)
+	}
 }
 
 func TestSetVRFsImportChangeMovesHeldRoutesBothWays(t *testing.T) {
@@ -1065,20 +1048,24 @@ func TestTableChangeWhileNoSessionIsAnnouncedOnReconnect(t *testing.T) {
 	srv.kill()
 	waitFor(t, "session down", func() bool { return !c.Stats().Sessions[0].Connected })
 
-	// Both changes land while nothing is connected. They still have to reach the
-	// RR once it comes back -- the session's own snapshot is the only copy.
+	// The prefix change lands while nothing is connected. It still has to reach
+	// the RR once it comes back -- the session's own snapshot is the only copy.
+	if err := c.SetLocalPrefixes([]LocalPrefix{{VRFID: 5, Prefix: "10.50.0.0/16"}}); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
+	}
+	// A tunnel change in the same window stays in this process; it must not
+	// disturb the table the new session will announce.
 	if err := c.SetTunnels([]Tunnel{
 		{Peer: 20, NextHop: "192.168.99.2"},
 		{Peer: 21, NextHop: "192.168.99.3"},
 	}); err != nil {
 		t.Fatalf("SetTunnels: %v", err)
 	}
-	if err := c.SetLocalPrefixes([]LocalPrefix{{VRFID: 5, Prefix: "10.50.0.0/16"}}); err != nil {
-		t.Fatalf("SetLocalPrefixes: %v", err)
-	}
 	srv.revive()
-	waitForWithin(t, 20*time.Second, "the new session to carry both changes", func() bool {
-		sn := rr.Sessions()
-		return len(sn) == 1 && sn[0].Tunnels == 2 && len(rr.RoutesOf(10)) == 2
+	waitForWithin(t, 20*time.Second, "the new session to carry the prefix", func() bool {
+		return len(rr.Sessions()) == 1 && len(rr.RoutesOf(10)) == 2
 	})
+	if n := len(c.Tunnels()); n != 2 {
+		t.Fatalf("tunnels = %d, want 2", n)
+	}
 }

@@ -1,27 +1,23 @@
 #!/bin/bash
 # test-refresh.sh - 不重启任何进程，让路由跟着本机隧道表与 VPN 表重新算（O5 判据）
+# O9-a 之后它还兼做"RR 只反射"的判据：隧道不上线，收端自己决定路由能不能用。
 #
 # 这条脚本回答的是 O5 的唯一问题：**"后补的配置"到底要不要重启进程**。以前要，
 # 因为装不进表的路由哪儿都没留（§2.5 那条"必须重启"）。现在每个会话留一份
 # adj-RIBs-in，本机表一变就就地重算，于是下面每一段都只是 curl + 轮询：
 #
-#   (A) **空隧道表能开会话**。这是 O5-a 顺手修掉的那个 bug 的实测回归：空表以前
-#       序列化成 `"tunnels":null`，RR 判"tunnels message without a table"直接关
-#       会话 ⇒ 一台没配隧道的设备一上线就掉线。现在必须以 `[]` 上线。
-#   (B) node1 加上到 node2 的隧道 ⇒ RR 开始反射 ⇒ node1 **收到**了 node2 的前缀，
-#       但本机没有 VPN import 它的 RT ⇒ 它不丢，而是留在 pending 里，原因写着
-#       rt_mismatch。反例是旧行为：这一条会被直接丢弃，之后无论配什么都查不到。
-#       为什么这里判的是 rt_mismatch 而不是 no_path：RR **只按双向邻接反射**，本机
-#       没隧道时它一条都不发，所以 no_path 只有在"隧道刚被撤走、RR 的撤回还没到"
-#       那一瞬存在 —— 拿它当判据就是拿竞态的一个侧面当判据。稳定形态由 route 包的
-#       单测钉；本脚本只在阶段 E 断言那个瞬时最终会被撤回收干净（待决清单回空）。
+#   (A) **零隧道的设备照样收路由**。O9-a 之后 RR 只做反射，隧道表根本不上线：
+#       node1 一上来就收到 node2 的前缀，装不进表就停在 pending。
+#   (B) node1 加上到 node2 的隧道 ⇒ 本机表一变就地重算；路由在阶段 A 就到了，
+#       所以 received 一动不动的。它仍装不进表（本机没有 VPN import 它的 RT），
+#       留在 pending 里，原因写着 rt_mismatch。反例是旧行为：这一条会被直接丢弃。
 #   (C) **一次 PUT /vrfs 加 import RT ⇒ 此前已经收到的那条前缀进表**，而且
 #       `received` 与 `imported` 一动不动 —— 这两个数不变就是"没有再问 RR"的证据，
 #       也是"本机重算不许改写事件计数器"这条设计规矩在真进程里的样子。
 #   (D) sr-fib 下一轮轮询把它落到 VPP（表 50、压 **1051=来源 VPN** 的标签），
 #       两端 tap 终端 ping 通 ⇒ 学到的东西真的在转发，不是只在 JSON 里。
-#   (E) 撤掉隧道 ⇒ 前缀离表、VPP 撤路由、终端 ping 断；再加回来 ⇒ 又学到又装上。
-#       来回两次，全程零重启。
+#   (E) 撤掉隧道 ⇒ 本机前缀离表、VPP 撤路由、终端 ping 断，路由停在 no_path；
+#       对端不受影响、RR 也不撤回。再加回来 ⇒ 又装上。来回两次，全程零重启。
 #   (F) 负向：**删掉一个 VPN ⇒ 它上面的本地前缀必须显式撤回**（node2 那边看得见
 #       它消失），而不是留在 RR 里靠一份没人配置过的 RT 继续被导入；同时 node1 的
 #       local_skips 要报 vrf_unconfigured —— 配了但说不出口的前缀必须可见。
@@ -337,7 +333,7 @@ cat > "$WORK/node1.json" <<EOF
 }
 EOF
 
-# node2 有到 node1 的隧道，所以阶段 B 一加就成双向邻接；它 import 50 与 53，
+# node2 有到 node1 的隧道，它上线后就能解析 node1 的两份宣告；它 import 50 与 53，
 # 于是 node1 的两份宣告都会在 node2 的表 51 里出现 —— 阶段 F 看的就是 53 那份消失。
 cat > "$WORK/node2.json" <<EOF
 {
@@ -491,23 +487,26 @@ info "(A) node1 开机零隧道：会话必须活着（这条是 null 隧道表�
 wait_json "$N1_STATUS" \
     "any(s['connected'] and s['synced'] for s in d['sessions']) and d['rib_ready']" \
     "node1 的 RR 会话 connected + synced：空隧道表没有让 RR 关会话" 30
-if dx "$N1" "grep -q 'tunnels message without a table' $WORK/node1.log" 2>/dev/null; then
-    bad "node1.log 里有 'tunnels message without a table'（空表又被序列化成 null 了）"
+if dx "$N1" "grep -qiE 'error|fatal' $WORK/node1.log" 2>/dev/null; then
+    bad "node1.log 里有 error/fatal：零隧道不该让会话出问题"
 else
-    ok "日志里没有那条错误：空隧道表是以 [] 上线的，不是 null"
+    ok "日志里没有会话级错误：隧道表本来就不上线，零隧道与零会话无关"
 fi
-wait_json "$N1_STATUS" "d['rib_routes'] == 0 and d['pending_total'] == 0" \
-    "本机既没装任何路由，也没有待决的（没人反射给一个零隧道的设备）" 20
+# O9-a 之后 RR 只做反射：零隧道的 node1 一样收到 node2 的路由，装不进表就停着。
+wait_json "$N1_STATUS" \
+    "d['rib_routes'] == 0 and d['pending_total'] == 1 and
+     d['pending'][0]['prefix'] == '$PFX_SRC' and d['pending'][0]['reason'] == 'rt_mismatch'" \
+    "零隧道的 node1 也收到了 node2 的路由：不装表，停在 rt_mismatch" 30
 rr_json | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
-sys.exit(0 if d['tunnels'].get('1') == 0 and d['tunnels'].get('2') == 1 else 1)" 2>/dev/null &&
-    ok "RR 侧看到的隧道表条数：device 1 = 0，device 2 = 1（双向邻接不成立，所以此时谁都不反射）" ||
-    bad "RR 侧的隧道表和预期不符：$(rr_json | python3 -c 'import json,sys; print(json.load(sys.stdin)["tunnels"])' 2>/dev/null)"
+sys.exit(0 if 'tunnels' not in d else 1)" 2>/dev/null &&
+    ok "RR 的 /status 里没有隧道表：它不认识隧道，也就没有按隧道做的门槛" ||
+    bad "RR 的 /status 里出现了 tunnels 字段：反射器又看隧道了"
 
 # ---------------------------------------------------------------- B 加隧道
 
-info "(B) PUT /tunnels 加上到 node2 的隧道 —— 不重启，让 RR 开始反射"
+info "(B) PUT /tunnels 加上到 node2 的隧道 —— 不重启，本机表一变就地重算"
 recv_b_before=$(field "$N1_STATUS" "d['received']")
 put "$N1_STATUS" "/tunnels" "$(dx "$N1" "cat $WORK/tunnels-one.json")" ||
     die "PUT /tunnels 失败（阶段 B）"
@@ -526,13 +525,13 @@ wait_fn "VPP 表 $VRF_DST 里也没有 $PFX_SRC（pending 不该惊动数据面�
 wait_json "$N2_STATUS" \
     "[(r['vrf_id'], r['prefix']) for r in d['rib'].get('$VRF_SRC', []) if r['prefix'] == '$PFX_DST'] ==
      [($VRF_DST, '$PFX_DST')]" \
-    "邻接双向成立后 node2 学到了 $PFX_DST（node2 的 VPN $VRF_SRC 本来就 import 65000:50）" 30
+    "node2 学到了 $PFX_DST（它自己的隧道表指向 node1，与 node1 配没配隧道无关）" 30
 recv_b=$(field "$N1_STATUS" "d['received']")
 imported_b=$(field "$N1_STATUS" "d['imported']")
 mismatch_b=$(field "$N1_STATUS" "d['dropped_rt_mismatch']")
-[ "$recv_b" -gt "$recv_b_before" ] &&
-    ok "received 从 $recv_b_before 涨到 $recv_b：这一段确实是从 RR **收**来的" ||
-    bad "received 没涨（$recv_b_before → $recv_b）：RR 没把 node2 的路由送过来"
+[ "$recv_b" = "$recv_b_before" ] &&
+    ok "received 没变（仍是 $recv_b）：加隧道不会换来新帧，那条路由在阶段 A 就收到了" ||
+    bad "received 从 $recv_b_before 变成了 $recv_b：加隧道不该再问 RR 要一遍"
 
 # ---------------------------------------------------------------- C 改 import
 
@@ -586,29 +585,31 @@ wait_ping "$N2" "${TAP_N1_HOST%/*}" "反向也通（表 $VRF_SRC -> 标签 $LBL_
 
 # ---------------------------------------------------------------- E 撤了再加
 
-info "(E) PUT /tunnels 撤掉隧道：前缀离表、FIB 撤、终端断 —— 还是不重启"
-# 撤隧道这段的证据必须分两头看，而且得先说清**为什么不看 node1 的 withdrawn**：
-# 本机 PUT 一生效，这条路由就先从表里搬进待决（没路径了）；等 RR 的撤回到达时它
-# 早已不在表里，而 withdrawn 只记"真的从表里退了"的那次 —— 所以 node1 这边注定是
-# 平的。会涨的计数器在 node2：它那边这条前缀是装进表的，只有收到 RR 的撤回才 +1。
+info "(E) PUT /tunnels 撤掉隧道：本机前缀离表、FIB 撤、终端断 —— 对端的表不动"
+# 撤隧道只改本机的路径判定：路由还留在 adj-RIB-in 里，于是进待决（no_path），
+# 既不会向 RR 撤回，对端也不会因此失去 $PFX_DST —— RR 没有隧道可看，它只反射。
 withdrawn_e_before=$(field "$N2_STATUS" "d['withdrawn']")
 w_n1_before=$(field "$N1_STATUS" "d['withdrawn']")
 put "$N1_STATUS" "/tunnels" "$(dx "$N1" "cat $WORK/tunnels-none.json")" ||
     die "PUT /tunnels（清空）失败"
 wait_json "$N1_STATUS" "d['rib_routes'] == 0" "$PFX_SRC 离开表 $VRF_DST" 20
-wait_json "$N2_STATUS" "d['withdrawn'] > $withdrawn_e_before" \
-    "node2 的 withdrawn 从 $withdrawn_e_before 涨上去：对端是收到 RR 的**显式撤回**的，不是等老化" 25
-wait_json "$N1_STATUS" "d['pending_total'] == 0" \
-    "本机待决清单也清空了：RR 撤了就不再替它记着（adj-RIBs-in 不是永久缓存）" 25
+wait_json "$N1_STATUS" \
+    "d['pending_total'] == 1 and d['pending'][0]['prefix'] == '$PFX_SRC' and
+     d['pending'][0]['reason'] == 'no_path'" \
+    "本机没有路径了：路由停在 no_path，仍在手里（adj-RIBs-in 不是用完就丢）" 25
 w_n1=$(field "$N1_STATUS" "d['withdrawn']")
 [ "$w_n1" = "$w_n1_before" ] &&
     ok "node1 的 withdrawn 没动（$w_n1）：只是被本机扣下的路由，不该算成一次撤回" ||
     bad "node1 的 withdrawn 被本机重算改写了：$w_n1_before → $w_n1"
 wait_fn "VPP 表 $VRF_DST 里这条路由被 sr-fib 撤掉" 20 no_route_in "$N1" "$VRF_DST" "$PFX_SRC"
 wait_no_ping "$N1" "${TAP_N2_HOST%/*}" "node1 终端打不通了（控制面一撤，数据面跟着撤）" 20
+w_n2=$(field "$N2_STATUS" "d['withdrawn']")
+[ "$w_n2" = "$withdrawn_e_before" ] &&
+    ok "node2 的 withdrawn 没动（$w_n2）：RR 不按别人的隧道表重算、不撤路由" ||
+    bad "node2 的 withdrawn 涨了：$withdrawn_e_before → $w_n2（RR 又在替收端做决定）"
 wait_json "$N2_STATUS" \
-    "'$PFX_DST' not in [r['prefix'] for r in d['rib'].get('$VRF_SRC', [])]" \
-    "node2 那边也失去 $PFX_DST：RR 是按隧道表重算的，不是按会话断开" 30
+    "'$PFX_DST' in [r['prefix'] for r in d['rib'].get('$VRF_SRC', [])]" \
+    "node2 仍留着 $PFX_DST：它的隧道还在，这条路由对它仍然可用" 15
 
 put "$N1_STATUS" "/tunnels" "$(dx "$N1" "cat $WORK/tunnels-one.json")" ||
     die "PUT /tunnels（加回）失败"

@@ -218,16 +218,9 @@ func TestEqualAndKey(t *testing.T) {
 func TestCodecRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Grow(64 << 10)
-	parallel := []Tunnel{
-		{Peer: 20, NextHop: "192.168.77.1"},
-		{Peer: 20, NextHop: "192.168.99.2"},
-	}
-	empty := []Tunnel{}
 	want := []Envelope{
 		{Type: MsgHello, Version: ProtocolVersion, DeviceID: 42},
 		{Type: MsgHelloOK, Version: ProtocolVersion, RRID: "rr-a", HoldSec: 30},
-		{Type: MsgTunnels, Tunnels: &parallel},
-		{Type: MsgTunnels, Tunnels: &empty}, // "I have no tunnels" must survive the wire
 		{Type: MsgAnnounce, Routes: []Route{validRoute()}},
 		{Type: MsgWithdraw, Keys: []RouteKey{validRoute().Key()}},
 		{Type: MsgEOR},
@@ -249,12 +242,6 @@ func TestCodecRoundTrip(t *testing.T) {
 		if got.Type != env.Type || got.Version != env.Version || got.DeviceID != env.DeviceID ||
 			got.RRID != env.RRID || got.HoldSec != env.HoldSec || got.Message != env.Message {
 			t.Fatalf("frame #%d round-tripped as %+v, want %+v", i, got, env)
-		}
-		if (got.Tunnels == nil) != (env.Tunnels == nil) {
-			t.Fatalf("frame #%d tunnel presence = %v, want %v", i, got.Tunnels != nil, env.Tunnels != nil)
-		}
-		if env.Tunnels != nil && !reflect.DeepEqual(*got.Tunnels, *env.Tunnels) {
-			t.Fatalf("frame #%d tunnels = %+v, want %+v", i, *got.Tunnels, *env.Tunnels)
 		}
 		if len(got.Routes) != len(env.Routes) {
 			t.Fatalf("frame #%d routes %d, want %d", i, len(got.Routes), len(env.Routes))
@@ -281,8 +268,9 @@ func TestReadRejectsBadFrames(t *testing.T) {
 		"empty line":   "\n",
 		"too many routes": `{"type":"announce","routes":[` +
 			strings.Repeat(`{},`, MaxRoutesPerMessage) + `{}]}` + "\n",
-		"too many tunnels": `{"type":"tunnels","tunnels":[` +
-			strings.Repeat(`{},`, MaxTunnelsPerDevice) + `{}]}` + "\n",
+		// The tunnel-table frame is gone (an RR only reflects); an old box that
+		// still sends it must be refused, not silently ignored.
+		"retired tunnels type": `{"type":"tunnels","tunnels":[]}` + "\n",
 	}
 	for name, in := range cases {
 		if _, err := ReadEnvelope(bufio.NewReader(strings.NewReader(in))); err == nil {

@@ -70,33 +70,17 @@ func (c *fakeCPE) recvErr() (Envelope, error) {
 	return ReadEnvelope(c.br)
 }
 
-// hello completes the handshake and stops after hello_ok. No snapshot starts
-// until the tunnel table arrives, which tests that care about the boundary rely
-// on.
-func (c *fakeCPE) hello(dev uint16) {
+// join completes the handshake and returns the routes of the initial snapshot.
+// The snapshot follows hello_ok immediately (BGP's initial UPDATE burst + EOR),
+// so this is the whole of what a fresh session receives without announcing
+// anything first.
+func (c *fakeCPE) join(dev uint16) []Route {
 	c.t.Helper()
 	c.send(Envelope{Type: MsgHello, Version: ProtocolVersion, DeviceID: dev})
 	ok := c.recv()
 	if ok.Type != MsgHelloOK {
 		c.t.Fatalf("handshake: got %s, want hello_ok (%+v)", ok.Type, ok)
 	}
-}
-
-// sendTunnels announces a whole table. The variadic empty list is an explicitly
-// empty table, not "no table": the RR needs that distinction and rejects a
-// tunnels frame without it.
-func (c *fakeCPE) sendTunnels(ts ...Tunnel) {
-	c.t.Helper()
-	table := append([]Tunnel{}, ts...)
-	c.send(Envelope{Type: MsgTunnels, Tunnels: &table})
-}
-
-// join completes the handshake, announces the tunnel table and returns the
-// routes received in the initial snapshot. EOR is consumed but not returned.
-func (c *fakeCPE) join(dev uint16, ts ...Tunnel) []Route {
-	c.t.Helper()
-	c.hello(dev)
-	c.sendTunnels(ts...)
 	var routes []Route
 	for {
 		env := c.recv()
@@ -157,65 +141,14 @@ func testRoute(dev, vrf uint16, prefix string, rts ...string) Route {
 }
 
 func TestNewReflectorValidation(t *testing.T) {
-	base := func() ReflectorConfig {
-		return ReflectorConfig{RRID: "rr", Tenant: "t"}
-	}
 	if _, err := NewReflector(ReflectorConfig{Tenant: "t"}); err == nil {
 		t.Fatal("missing rr_id accepted")
 	}
 	if _, err := NewReflector(ReflectorConfig{RRID: "rr"}); err == nil {
 		t.Fatal("missing tenant accepted")
 	}
-	badHold := base()
-	badHold.HoldSec = 2
-	if _, err := NewReflector(badHold); err == nil {
+	if _, err := NewReflector(ReflectorConfig{RRID: "rr", Tenant: "t", HoldSec: 2}); err == nil {
 		t.Fatal("hold 2s accepted")
-	}
-	badPolicy := base()
-	badPolicy.ReflectTo = map[uint16][]uint16{1: {1}}
-	if _, err := NewReflector(badPolicy); err == nil {
-		t.Fatal("reflect_to self target accepted")
-	}
-	zeroPolicy := base()
-	zeroPolicy.ReflectTo = map[uint16][]uint16{1: {0}}
-	if _, err := NewReflector(zeroPolicy); err == nil {
-		t.Fatal("reflect_to device 0 accepted")
-	}
-	zeroOrigin := base()
-	zeroOrigin.ReflectTo = map[uint16][]uint16{0: {1}}
-	if _, err := NewReflector(zeroOrigin); err == nil {
-		t.Fatal("reflect_to origin 0 accepted")
-	}
-}
-
-func TestAdjacencyIsMutualAndPolicyOnlyFilters(t *testing.T) {
-	r := newTestReflector(t, ReflectorConfig{
-		ReflectTo: map[uint16][]uint16{1: {2, 9}}, // 9 has no tunnel, so it cannot be added
-	})
-	c1, _ := dial(t, r, 1)
-	c1.join(1,
-		Tunnel{Peer: 2, NextHop: "192.168.99.2"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-		Tunnel{Peer: 4, NextHop: "192.168.99.4"}, // device 4 will not announce the reverse edge
-	)
-	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	c3, _ := dial(t, r, 3)
-	c3.join(3, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	c4, _ := dial(t, r, 4)
-	c4.join(4) // no tunnels at all
-
-	if got := r.TargetsOf(1); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("targets of 1 = %v, want [2] (3 filtered by policy, 4 one-way, 9 has no tunnel)", got)
-	}
-	if got := r.TargetsOf(2); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("targets of 2 = %v, want [1]", got)
-	}
-	if got := r.TargetsOf(4); len(got) != 0 {
-		t.Fatalf("targets of 4 = %v, want none (device 1 never heard it back)", got)
-	}
-	if got := r.TargetsOf(9); len(got) != 0 {
-		t.Fatalf("targets of unconnected device 9 = %v, want none", got)
 	}
 }
 
@@ -223,56 +156,54 @@ func TestSnapshotOnConnectAndFanout(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 
 	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
+	if snap := c2.join(2); len(snap) != 0 {
+		t.Fatalf("first session's snapshot = %+v, want empty", snap)
+	}
 	rt2 := testRoute(2, 1, "10.2.0.0/16", "65000:200")
 	c2.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt2}})
 	c2.send(Envelope{Type: MsgEOR})
 
 	// A late joiner must receive the existing route in its snapshot, before EOR.
 	c1, _ := dial(t, r, 1)
-	snap := c1.join(1,
-		Tunnel{Peer: 2, NextHop: "192.168.99.2"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-	)
+	snap := c1.join(1)
 	if len(snap) != 1 || !snap[0].Equal(rt2) {
 		t.Fatalf("snapshot = %+v, want [%+v]", snap, rt2)
 	}
 
-	// Device 1's own route reaches 2 but not back to 1.
+	// Device 1's own route reaches 2 and never comes back to 1.
 	rt1 := testRoute(1, 1, "10.1.0.0/16")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt1}})
 	if got := c2.recv(); got.Type != MsgAnnounce || len(got.Routes) != 1 || !got.Routes[0].Equal(rt1) {
 		t.Fatalf("device 2 got %+v, want announce of %+v", got, rt1)
 	}
+	c1.expectNone(150 * time.Millisecond)
 
+	// No adjacency gate: a new session gets every route in the RR, except its
+	// own. Whether it can use one is its own tunnel table's decision.
 	c3, _ := dial(t, r, 3)
-	snap3 := c3.join(3, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	// 3 tunnels only to 1, so device 2's route (adjacent to 1, not to 3) must
-	// not be here.
-	if len(snap3) != 1 || !snap3[0].Equal(rt1) {
-		t.Fatalf("device 3 snapshot = %+v, want only device 1's route", snap3)
+	snap3 := c3.join(3)
+	if len(snap3) != 2 || !snap3[0].Equal(rt1) || !snap3[1].Equal(rt2) {
+		t.Fatalf("device 3 snapshot = %+v, want device 1's and device 2's routes", snap3)
 	}
 
-	// A route from 2 reflects only over its mutual edge to 1.
+	// A route from 2 reaches every other session, not just one neighbour.
 	rt2b := testRoute(2, 1, "10.22.0.0/16")
 	c2.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt2b}})
-	if got := c1.recv(); got.Type != MsgAnnounce || got.Routes[0].Prefix != "10.22.0.0/16" {
-		t.Fatalf("device 1 got %+v", got)
+	for _, c := range []*fakeCPE{c1, c3} {
+		if got := c.recv(); got.Type != MsgAnnounce || got.Routes[0].Prefix != "10.22.0.0/16" {
+			t.Fatalf("got %+v, want the 10.22.0.0/16 announce", got)
+		}
 	}
-	c3.expectNone(150 * time.Millisecond) // 3 is not adjacent to 2
 }
 
 func TestWithdrawFanoutAndIdempotence(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1,
-		Tunnel{Peer: 2, NextHop: "192.168.99.2"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-	)
+	c1.join(1)
 	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
+	c2.join(2)
 	c3, _ := dial(t, r, 3)
-	c3.join(3, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
+	c3.join(3)
 
 	rt := testRoute(1, 1, "10.1.0.0/16")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -301,9 +232,9 @@ func TestWithdrawFanoutAndIdempotence(t *testing.T) {
 func TestDuplicateAnnounceIsNoOpUnlessChanged(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1, Tunnel{Peer: 2, NextHop: "192.168.99.2"})
+	c1.join(1)
 	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
+	c2.join(2)
 
 	rt := testRoute(1, 1, "10.1.0.0/16", "65000:100")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -323,40 +254,12 @@ func TestDuplicateAnnounceIsNoOpUnlessChanged(t *testing.T) {
 	}
 }
 
-func TestReflectToFiltersButCannotAdd(t *testing.T) {
-	r := newTestReflector(t, ReflectorConfig{
-		ReflectTo: map[uint16][]uint16{1: {3, 9}},
-	})
-	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	c3, _ := dial(t, r, 3)
-	c3.join(3, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	c1, _ := dial(t, r, 1)
-	c1.join(1,
-		Tunnel{Peer: 2, NextHop: "192.168.99.2"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-	)
-
-	rt := testRoute(1, 1, "10.1.0.0/16")
-	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
-	if got := c3.recv(); got.Type != MsgAnnounce || !got.Routes[0].Equal(rt) {
-		t.Fatalf("policy target 3 got %+v", got)
-	}
-	c2.expectNone(150 * time.Millisecond)
-
-	// The snapshot follows the same policy for a device that joins later.
-	c4, _ := dial(t, r, 2)
-	if snap := c4.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"}); len(snap) != 0 {
-		t.Fatalf("device 2 snapshot = %+v, want none under reflect_to policy", snap)
-	}
-}
-
 func TestReconnectReplacesSessionAndWithdraws(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1, Tunnel{Peer: 2, NextHop: "192.168.99.2"})
+	c1.join(1)
 	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
+	c2.join(2)
 
 	rt := testRoute(1, 1, "10.1.0.0/16")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -365,7 +268,7 @@ func TestReconnectReplacesSessionAndWithdraws(t *testing.T) {
 	}
 
 	c1b, _ := dial(t, r, 1)
-	c1b.join(1, Tunnel{Peer: 2, NextHop: "192.168.99.2"}) // duplicate session: new wins
+	c1b.join(1) // duplicate session: new wins
 
 	got := c2.recv()
 	if got.Type != MsgWithdraw || len(got.Keys) != 1 || got.Keys[0] != rt.Key() {
@@ -383,9 +286,9 @@ func TestReconnectReplacesSessionAndWithdraws(t *testing.T) {
 func TestDisconnectWithdrawsRoutes(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, errCh1 := dial(t, r, 1)
-	c1.join(1, Tunnel{Peer: 2, NextHop: "192.168.99.2"})
+	c1.join(1)
 	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
+	c2.join(2)
 
 	rt := testRoute(1, 1, "10.1.0.0/16")
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
@@ -405,144 +308,44 @@ func TestDisconnectWithdrawsRoutes(t *testing.T) {
 	}
 }
 
-func TestSnapshotWaitsForTunnelTable(t *testing.T) {
+func TestSnapshotFollowsHelloOK(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
+	c2, _ := dial(t, r, 2)
+	c2.join(2)
+	rt2 := testRoute(2, 1, "10.2.0.0/16")
+	c2.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt2}})
+	c2.send(Envelope{Type: MsgEOR})
+
+	// Nothing is announced by the new session first: the RR sends its table the
+	// moment the session is up, which is where a BGP speaker sends its initial
+	// UPDATE burst.
 	c1, _ := dial(t, r, 1)
-	c1.hello(1)
+	if snap := c1.join(1); len(snap) != 1 || !snap[0].Equal(rt2) {
+		t.Fatalf("device 1 snapshot = %+v, want [%+v]", snap, rt2)
+	}
 
-	// Without the table the RR has no idea who this device can reach, so it
-	// must not send an EOR'd (empty) snapshot that it would then have to undo
-	// route by route.
-	c1.expectNone(150 * time.Millisecond)
-
-	c1.sendTunnels() // explicitly empty: "I have no tunnels", not "not yet"
-	if env := c1.recv(); env.Type != MsgEOR {
-		t.Fatalf("after an empty table got %s, want eor", env.Type)
+	// An empty RR still ends the burst with EOR, so the peer knows it has the
+	// whole table and not a prefix of it.
+	r2 := newTestReflector(t, ReflectorConfig{})
+	c7, _ := dial(t, r2, 7)
+	if snap := c7.join(7); len(snap) != 0 {
+		t.Fatalf("snapshot from an empty RR = %+v, want none", snap)
 	}
 }
 
-func TestTunnelsMessageRequiresTable(t *testing.T) {
+func TestTunnelsFrameIsRejected(t *testing.T) {
+	// The tunnel table left the wire when the RR stopped deriving adjacency from
+	// it. A peer still speaking the old protocol must be refused loudly: silently
+	// ignoring the frame is how the two sides disagree about the table forever.
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, errCh := dial(t, r, 1)
-	c1.hello(1)
-	c1.send(Envelope{Type: MsgTunnels}) // pointer omitted: no table at all
-	if err := waitServe(t, errCh); err == nil || !strings.Contains(err.Error(), "without a table") {
-		t.Fatalf("ServeConn error = %v, want a missing-table error", err)
+	c1.join(1)
+	c1.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c1.conn.Write([]byte(`{"type":"tunnels","tunnels":[]}` + "\n")); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-}
-
-func TestOneWayTunnelsReflectNothing(t *testing.T) {
-	r := newTestReflector(t, ReflectorConfig{})
-	c1, _ := dial(t, r, 1)
-	c1.join(1, Tunnel{Peer: 2, NextHop: "192.168.99.2"})
-	c2, _ := dial(t, r, 2)
-	c2.join(2) // announces no tunnels
-
-	rt := testRoute(1, 1, "10.1.0.0/16")
-	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt}})
-	c2.expectNone(150 * time.Millisecond)
-
-	// The reverse edge arrives: the route must be delivered without waiting for
-	// a re-announce, because the RR keeps the origin's adj-rib-in.
-	c2.sendTunnels(Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	got := c2.recv()
-	if got.Type != MsgAnnounce || len(got.Routes) != 1 || !got.Routes[0].Equal(rt) {
-		t.Fatalf("after the reverse edge got %+v, want announce of %+v", got, rt)
-	}
-}
-
-func TestTunnelTableChangeAddsAndWithdraws(t *testing.T) {
-	r := newTestReflector(t, ReflectorConfig{})
-	c1, _ := dial(t, r, 1)
-	c1.join(1,
-		Tunnel{Peer: 2, NextHop: "192.168.99.2"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-	)
-	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	c3, _ := dial(t, r, 3)
-	c3.join(3, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-
-	rt1 := testRoute(1, 1, "10.1.0.0/16")
-	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt1}})
-	for _, c := range []*fakeCPE{c2, c3} {
-		if got := c.recv(); got.Type != MsgAnnounce {
-			t.Fatalf("want announce, got %s", got.Type)
-		}
-	}
-	rt3 := testRoute(3, 1, "10.3.0.0/16")
-	c3.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt3}})
-	if got := c1.recv(); got.Type != MsgAnnounce || !got.Routes[0].Equal(rt3) {
-		t.Fatalf("device 1 got %+v, want device 3's route", got)
-	}
-	c2.expectNone(150 * time.Millisecond) // 2 and 3 are not adjacent
-
-	// Device 1 drops its tunnel to 3: both directions lose the routes, and
-	// device 2 (still adjacent to 1) keeps its copy.
-	c1.sendTunnels(Tunnel{Peer: 2, NextHop: "192.168.99.2"})
-	if got := c3.recv(); got.Type != MsgWithdraw || got.Keys[0] != rt1.Key() {
-		t.Fatalf("device 3 got %+v, want withdraw of its copy of %+v", got, rt1.Key())
-	}
-	if got := c1.recv(); got.Type != MsgWithdraw || got.Keys[0] != rt3.Key() {
-		t.Fatalf("device 1 got %+v, want withdraw of %+v", got, rt3.Key())
-	}
-	c2.expectNone(150 * time.Millisecond)
-
-	// Re-adding the tunnel restores both directions from adj-rib-in.
-	c1.sendTunnels(
-		Tunnel{Peer: 2, NextHop: "192.168.99.2"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-	)
-	if got := c3.recv(); got.Type != MsgAnnounce || !got.Routes[0].Equal(rt1) {
-		t.Fatalf("device 3 got %+v, want device 1's route again", got)
-	}
-	if got := c1.recv(); got.Type != MsgAnnounce || !got.Routes[0].Equal(rt3) {
-		t.Fatalf("device 1 got %+v, want device 3's route again", got)
-	}
-}
-
-func TestTunnelTableDroppedOnDisconnect(t *testing.T) {
-	r := newTestReflector(t, ReflectorConfig{})
-	c1, errCh := dial(t, r, 1)
-	c1.join(1, Tunnel{Peer: 2, NextHop: "192.168.99.2"})
-	c2, _ := dial(t, r, 2)
-	c2.join(2, Tunnel{Peer: 1, NextHop: "192.168.99.1"})
-	if got := r.TargetsOf(1); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("targets of 1 = %v, want [2]", got)
-	}
-
-	c1.conn.Close()
-	if err := waitServe(t, errCh); err == nil {
-		t.Fatal("ServeConn returned nil after the client closed")
-	}
-	if n := len(r.Tunnels()[1]); n != 0 {
-		t.Fatalf("device 1 kept %d tunnels after disconnect", n)
-	}
-	if got := r.TargetsOf(2); len(got) != 0 {
-		t.Fatalf("targets of 2 = %v, want none once 1's table is gone", got)
-	}
-}
-
-func TestInvalidTunnelTableIsFatal(t *testing.T) {
-	cases := map[string][]Tunnel{
-		"self":          {{Peer: 1, NextHop: "192.168.99.1"}},
-		"bad next hop":  {{Peer: 2, NextHop: "192.168.099.2"}},
-		"not ascending": {{Peer: 2, NextHop: "192.168.99.3"}, {Peer: 2, NextHop: "192.168.99.2"}},
-		"peer zero":     {{Peer: 0, NextHop: "192.168.99.2"}},
-	}
-	for name, table := range cases {
-		t.Run(name, func(t *testing.T) {
-			r := newTestReflector(t, ReflectorConfig{})
-			c1, errCh := dial(t, r, 1)
-			c1.hello(1)
-			c1.send(Envelope{Type: MsgTunnels, Tunnels: &table})
-			if err := waitServe(t, errCh); err == nil {
-				t.Fatal("invalid tunnel table accepted and session kept")
-			}
-			if n := len(r.Tunnels()[1]); n != 0 {
-				t.Fatalf("invalid table stored %d entries", n)
-			}
-		})
+	if err := waitServe(t, errCh); err == nil || !strings.Contains(err.Error(), "unknown message type") {
+		t.Fatalf("ServeConn error = %v, want a retired-message-type error", err)
 	}
 }
 
@@ -637,13 +440,10 @@ func TestKeepaliveIsSent(t *testing.T) {
 	}
 }
 
-func TestSessionInfoTracksSyncRoutesAndTunnels(t *testing.T) {
+func TestSessionInfoTracksSyncAndRoutes(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c1, _ := dial(t, r, 1)
-	c1.join(1,
-		Tunnel{Peer: 2, NextHop: "192.168.99.2"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-	)
+	c1.join(1)
 	c1.send(Envelope{Type: MsgAnnounce, Routes: []Route{testRoute(1, 1, "10.1.0.0/16")}})
 	c1.send(Envelope{Type: MsgEOR})
 	c1.send(Envelope{Type: MsgKeepalive}) // round-trip: server applied everything before this
@@ -657,7 +457,7 @@ func TestSessionInfoTracksSyncRoutesAndTunnels(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(sn) != 1 || !sn[0].Synced || sn[0].Routes != 1 || sn[0].Tunnels != 2 {
+	if len(sn) != 1 || !sn[0].Synced || sn[0].Routes != 1 {
 		t.Fatalf("session info = %+v", sn)
 	}
 }
@@ -667,17 +467,13 @@ func TestSessionInfoTracksSyncRoutesAndTunnels(t *testing.T) {
 func TestConcurrentAnnounces(t *testing.T) {
 	r := newTestReflector(t, ReflectorConfig{})
 	c2, _ := dial(t, r, 2)
-	c2.join(2,
-		Tunnel{Peer: 1, NextHop: "192.168.99.1"},
-		Tunnel{Peer: 3, NextHop: "192.168.99.3"},
-		Tunnel{Peer: 4, NextHop: "192.168.99.4"},
-	)
+	c2.join(2)
 
 	var wg sync.WaitGroup
 	clients := map[uint16]*fakeCPE{}
 	for _, dev := range []uint16{1, 3, 4} {
 		c, _ := dial(t, r, dev)
-		c.join(dev, Tunnel{Peer: 2, NextHop: "192.168.99.2"})
+		c.join(dev)
 		clients[dev] = c
 	}
 

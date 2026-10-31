@@ -3,19 +3,22 @@
 #
 # 这条脚本跑的是**真二进制**（cmd/sr-rr、cmd/sr-route）和**真 mTLS**
 # （自签租户 CA，CPE 证书带 srou://tenant-a/node/N 身份），不是进程内假端。
-# 协议 v3：prefix 不带下一跳，每台 CPE 单独宣告自己的隧道表，RR 只把路由送给
-# 与源发端有**双向**隧道的 CPE，收端用自己的隧道表解析下一跳。它回答五件事：
+# 协议 v3：prefix 不带下一跳，RR 不认识隧道和 RT —— 一条路由从哪个会话来，
+# 就原样送给除来源之外的每个会话。能不能用由收端自己的隧道表决定。它回答五件事：
 #
-#   (A) 隧道表 + 反射：三台互相有隧道（1↔2、1↔3、2↔3），RR 收齐三张表；
+#   (A) 纯反射：三台 CPE，RR 收齐三条路由并把每条送到另外两台；
 #       CPE1 的路由到了 CPE2 和 CPE3，下一跳分别由各自的隧道表解析出来。
 #       CPE3 对 CPE1 有两条并行隧道 ⇒ 同一条路由解析出两个等价下一跳。
-#   (B) RT import 过滤：CPE3 的路由到了 CPE1（有隧道），但 export RT 与
+#   (B) RT import 过滤：CPE3 的路由到了 CPE1，但 export RT 与
 #       CPE1 vrf5 的 import RT 没有交集 ⇒ 不进表，且 dropped_rt_mismatch
 #       计数增加（"没收到"和"收到了但拒收"必须分得开）。
-#   (C) 反射策略：reflect_to {"2":[3]} 只能在邻接之上做减法 —— CPE2 的路由
-#       送到 CPE3，不再送到 CPE1。策略不能凭空造出可达性。
+#   (C) RR 不做策略：CPE2 的路由同样送到 CPE1（它的 RT 正好匹配），
+#       RR 侧没有任何"送给谁"的规则。
 #   (D) 双 RR 冗余：两条会话都往同一张 Loc-RIB 里送；杀掉 rr-a 后它那份拷贝
 #       退场、rr-b 的同一份顶上，表不变；rr-a 回来后两份拷贝重新合并。
+#   (E) 闸在收端：把 CPE2 的隧道表换成只有到 CPE3 的那条，CPE1 的路由照样
+#       被收到（received 增长），但因为本机没有到 CPE1 的隧道而停在 no_path，
+#       vrf5 里不出现这条前缀。
 #
 # 不碰 VPP、不碰数据面：这个增量只验证路由协议本身。FIB 的下发是下一步。
 #
@@ -140,7 +143,7 @@ done
 
 # ---------------------------------------------------------------- 配置
 
-info "写配置（全互联隧道 1↔2、1↔3、2↔3，策略 reflect_to {\"2\":[3]}）"
+info "写配置（全互联隧道 1↔2、1↔3、2↔3；RR 侧不配任何转发规则）"
 cat > "$WORK/rr-a.json" <<EOF
 {
   "rr_id": "rr-a",
@@ -148,8 +151,7 @@ cat > "$WORK/rr-a.json" <<EOF
   "hold_sec": 6,
   "listen": "127.0.0.1:$RR_A_PORT",
   "status_addr": "127.0.0.1:$RR_A_STATUS",
-  "tls": {"cert_file": "$WORK/pki/rr.crt", "key_file": "$WORK/pki/rr.key", "ca_file": "$WORK/pki/ca.crt"},
-  "reflect_to": {"2": [3]}
+  "tls": {"cert_file": "$WORK/pki/rr.crt", "key_file": "$WORK/pki/rr.key", "ca_file": "$WORK/pki/ca.crt"}
 }
 EOF
 sed -e 's/"rr-a"/"rr-b"/' \
@@ -157,9 +159,9 @@ sed -e 's/"rr-a"/"rr-b"/' \
     -e "s/127.0.0.1:$RR_A_STATUS/127.0.0.1:$RR_B_STATUS/" \
     "$WORK/rr-a.json" > "$WORK/rr-b.json"
 
-# node1: 枢纽，import 65000:6；node2: export 65000:6（默认应被 1 收，但策略把它
-# 改送到 3）；node3: export 65000:7（能到 1，但 RT 不匹配 ⇒ 必须被拒收）。
-# 每台只宣告自己的隧道表（peer_device_id + 对端 overlay），prefix 里没有下一跳。
+# node1: import 65000:6（能收 node2）；node2: export 65000:6（RT 命中就收，
+# RR 不管谁跟谁有隧道）；node3: export 65000:7（到了 node1，但 RT 不匹配 ⇒
+# 必须被拒收）。每台只在自己进程内配隧道表，线上从不发它。
 write_node() {   # <n> <tunnels-json> <prefix> <export> <import-csv> <status-port>
     local n=$1 tunnels=$2 prefix=$3 export=$4 imports=$5 status=$6
     cat > "$WORK/node$n.json" <<EOF
@@ -221,19 +223,16 @@ URL_N3="http://127.0.0.1:$N3_STATUS/status"
 
 # ---------------------------------------------------------------- 断言
 
-info "(A) RR 收齐三家的宣告：隧道表与 prefix 是分开的两张表"
+info "(A) RR 收齐三家的宣告，每条原样反射"
 wait_status "http://127.0.0.1:$RR_A_STATUS/status" \
     "set(d['routes'])=={'1','2','3'} and all(v==1 for v in d['routes'].values()) and all(s['synced'] for s in d['sessions']) and len(d['sessions'])==3" \
     "rr-a 有 3 个 synced 会话、每家 1 条 adj-rib-in" 20
-assert_status "http://127.0.0.1:$RR_A_STATUS/status" \
-    "sorted((s['device_id'], s['tunnels']) for s in d['sessions']) == [(1,2),(2,2),(3,3)]" \
-    "rr-a：三家的隧道表条目数 2/2/3（node3 对 node1 有两条并行隧道）"
 assert_status "http://127.0.0.1:$RR_A_STATUS/routes" \
     "all(len(v)==1 and 'next_hops' not in v[0] and len(v[0]['rts'])==1 for v in d.values()) and sorted(v[0]['device_id'] for v in d.values())==[1,2,3]" \
     "rr-a：每条 prefix 都不带下一跳（只有 device_id/vrf/prefix/rts）"
-assert_status "http://127.0.0.1:$RR_A_STATUS/tunnels" \
-    "sorted(t['peer_device_id'] for t in d['1'])==[2,3] and sorted(t['peer_device_id'] for t in d['3'])==[1,1,2] and sorted(t['next_hop'] for t in d['3'] if t['peer_device_id']==1)==['192.168.88.1','192.168.99.1']" \
-    "rr-a：隧道表按设备保存，node3 到 node1 的两条隧道都在"
+assert_status "http://127.0.0.1:$RR_A_STATUS/status" \
+    "'tunnels' not in json.dumps(d)" \
+    "rr-a 的状态里没有任何隧道表（它不认识隧道）"
 
 info "(A) 收端本地解析 + RT 匹配：node1 路由进入 node2 的 bgp 表"
 wait_status "$URL_N2" \
@@ -243,17 +242,19 @@ wait_status "$URL_N2" \
 info "(B) RT import 过滤：node3 的 65000:7 到了 node1 但不进表"
 wait_status "$URL_N1" "d['rib_ready'] and d['dropped_rt_mismatch']>=1" \
     "node1 拒收了一条 RT 不匹配的路由" 25
-assert_status "$URL_N1" "d['rib'].get('5',[])==[]" \
-    "node1 vrf5 为空（没有可导入的路由，而不是没收到）"
-assert_status "$URL_N1" "d['received']>=1" \
-    "node1 确实收到了 RR 发来的路由（received>0）"
+assert_status "$URL_N1" \
+    "not [r for r in d['rib'].get('5',[]) if r['prefix']=='10.30.0.0/16']" \
+    "node1 vrf5 里没有 node3 的前缀（收到了但拒收，不是没收到）"
+assert_status "$URL_N1" "d['received']>=2" \
+    "node1 收到了另外两家的路由（received>=2）"
 
-info "(C) 反射策略：node2 的路由只送到 node3，不送到 node1"
-wait_status "$URL_N3" \
+info "(C) RR 不做策略：node2 的路由也送到 node1，能不能用由 node1 自己决定"
+wait_status "$URL_N1" \
+    "d['rib_ready'] and [ (r['prefix'], r['next_hops']) for r in d['rib'].get('5',[]) if r['prefix']=='10.20.0.0/16' ] == [('10.20.0.0/16',['192.168.99.2'])]" \
+    "node1 收下 node2 的前缀，下一跳来自 node1 自己的隧道表" 25
+assert_status "$URL_N3" \
     "d['rib_ready'] and sorted((r['prefix'], r['next_hops']) for r in d['rib'].get('5',[])) == [('10.10.0.0/16',['192.168.88.1','192.168.99.1']), ('10.20.0.0/16',['192.168.99.2'])]" \
-    "node3 收到 node1（两条并行隧道 ⇒ 两个下一跳）与 node2（策略允许）" 25
-assert_status "$URL_N1" "not [r for r in d['rib'].get('5',[]) if r['prefix']=='10.20.0.0/16']" \
-    "node1 没收到 node2 的路由（reflect_to 在邻接之上把它减掉了）"
+    "node3 收到 node1（两条并行隧道 ⇒ 两个下一跳）与 node2"
 
 info "(D) 双 RR 冗余：杀掉 rr-a，它那份拷贝退场、rr-b 的顶上，表不变"
 kill "$RR_A" 2>/dev/null || true
@@ -281,6 +282,21 @@ info "RR 会话数在切换后仍然正确（没有僵尸会话）"
 wait_status "http://127.0.0.1:$RR_A_STATUS/status" \
     "len(d['sessions'])==3 and all(s['synced'] for s in d['sessions'])" \
     "重启后的 rr-a 重新收齐 3 个会话" 20
+
+info "(E) 闸在收端：node2 只剩到 node3 的隧道，node1 的路由被收到但停在 no_path"
+kill "$N2" 2>/dev/null || true
+wait "$N2" 2>/dev/null || true
+write_node 2 '[{"peer_device_id": 3, "next_hop": "192.168.99.3"}]' \
+    10.20.0.0/16 65000:6 '"65000:5"' "$N2_STATUS"
+start sr-route "$WORK/node2.json" "$WORK/node2.log.2"; N2=$LAST_PID
+wait_status "$URL_N2" \
+    "d['rib_ready'] and any(p['prefix']=='10.10.0.0/16' and p['reason']=='no_path' for p in d['pending'])" \
+    "node2 把 node1 的路由停在 no_path（收到了，本机没有到 node1 的隧道）" 25
+assert_status "$URL_N2" \
+    "not [r for r in d['rib'].get('5',[]) if r['prefix']=='10.10.0.0/16']" \
+    "node2 vrf5 里没有 node1 的前缀"
+assert_status "$URL_N2" "d['received']>=1 and d['dropped_no_path']>=1" \
+    "计数器分得清：收到了、因为没路径而没装"
 
 # ---------------------------------------------------------------- 收尾
 

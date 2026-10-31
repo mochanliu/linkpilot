@@ -101,15 +101,15 @@
 
   <rect class="inbox" x="786" y="148" width="398" height="60" rx="7"/>
   <text class="t" x="800" y="171">会话层</text>
-  <text class="s" x="800" y="191">TLS + mTLS · hold 30 s · 双向门槛（对端也要有回程隧道边）</text>
+  <text class="s" x="800" y="191">TLS + mTLS · hold 30 s · 会话建立即发全表 + EOR</text>
 
   <rect class="inbox" x="786" y="218" width="398" height="60" rx="7"/>
   <text class="t" x="800" y="241">adj-rib-in</text>
-  <text class="s" x="800" y="261">前缀 + 隧道表；下一跳不随前缀下发，由各站点本地解析</text>
+  <text class="s" x="800" y="261">每条路由一站一份、保留来源；隧道表不上线，下一跳由各站点本地解析</text>
 
   <rect class="inbox" x="786" y="288" width="398" height="60" rx="7"/>
   <text class="t" x="800" y="311">反射策略</text>
-  <text class="s" x="800" y="331">reflect_to：只在有隧道边的方向反射 · RT 由接收侧 import 过滤</text>
+  <text class="s" x="800" y="331">原样发给除来源外的每个会话 · RT 由接收侧 import 过滤</text>
 
   <text class="b" x="786" y="374">· 无持久化：重启后由各站点重新宣告</text>
   <text class="b" x="786" y="396">· 可多实例（主备）：站点配 RR 列表，按顺序切换</text>
@@ -236,7 +236,7 @@
 
   <circle class="num" cx="640" cy="1034" r="9"/><text class="numt" x="640" y="1037.5">3</text>
   <text class="b" x="658" y="1030">sr-route ↔ sr-rr：路由协议 v3（JSONL over TLS），hold 30 s；</text>
-  <text class="b" x="658" y="1048">前缀与隧道表分离，下一跳在站点本地解析。</text>
+  <text class="b" x="658" y="1048">前缀不带下一跳；隧道表只在本机，下一跳在站点解析。</text>
 
   <circle class="num" cx="640" cy="1078" r="9"/><text class="numt" x="640" y="1081.5">4</text>
   <text class="b" x="658" y="1074">agent 负责身份、心跳、遥测采集与 watch 收敛；</text>

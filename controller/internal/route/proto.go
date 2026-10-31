@@ -82,7 +82,6 @@ type MsgType string
 const (
 	MsgHello     MsgType = "hello"     // CPE -> RR: version + claimed device id
 	MsgHelloOK   MsgType = "hello_ok"  // RR -> CPE: version, rr id, hold time
-	MsgTunnels   MsgType = "tunnels"   // CPE -> RR: this device's whole tunnel table
 	MsgAnnounce  MsgType = "announce"  // either direction: add/replace routes
 	MsgWithdraw  MsgType = "withdraw"  // either direction: remove exact keys
 	MsgEOR       MsgType = "eor"       // end of the sender's initial snapshot
@@ -101,15 +100,6 @@ type Envelope struct {
 	DeviceID uint16 `json:"device_id,omitempty"` // hello: claimed identity
 	RRID     string `json:"rr_id,omitempty"`     // hello_ok
 	HoldSec  int    `json:"hold_sec,omitempty"`  // hello_ok
-
-	// tunnels
-	//
-	// A pointer so an explicitly empty table ({"tunnels":[]}) is distinguishable
-	// from a frame that forgot the field. "I have no tunnels" is a valid answer
-	// and must still arrive: the RR does not send a route snapshot to a peer
-	// before it knows that peer's table, otherwise the peer would get an empty
-	// EOR'd table and then all of it again as updates.
-	Tunnels *[]Tunnel `json:"tunnels,omitempty"`
 
 	// announce / withdraw
 	Routes []Route    `json:"routes,omitempty"`
@@ -361,12 +351,9 @@ func ReadEnvelope(br *bufio.Reader) (Envelope, error) {
 		return Envelope{}, errors.New("route: frame has no type")
 	}
 	switch env.Type {
-	case MsgHello, MsgHelloOK, MsgTunnels, MsgAnnounce, MsgWithdraw, MsgEOR, MsgKeepalive, MsgError:
+	case MsgHello, MsgHelloOK, MsgAnnounce, MsgWithdraw, MsgEOR, MsgKeepalive, MsgError:
 	default:
 		return Envelope{}, fmt.Errorf("route: unknown message type %q", env.Type)
-	}
-	if env.Tunnels != nil && len(*env.Tunnels) > MaxTunnelsPerDevice {
-		return Envelope{}, fmt.Errorf("route: %d tunnels exceeds %d per device", len(*env.Tunnels), MaxTunnelsPerDevice)
 	}
 	if len(env.Routes) > MaxRoutesPerMessage {
 		return Envelope{}, fmt.Errorf("route: %d routes exceeds %d per message", len(env.Routes), MaxRoutesPerMessage)

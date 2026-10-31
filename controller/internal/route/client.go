@@ -305,13 +305,12 @@ type clientSession struct {
 	adjIn map[RouteKey]Route
 
 	// sc is the serialized writer owned by serveSession. ready is set once the
-	// session's snapshot has been written; only then may local-prefix and tunnel
-	// updates be streamed to it. announced/announcedTunnels are what this session
-	// has been told, so a change that lands mid-snapshot is still reconciled.
-	sc               *sessionConn
-	ready            bool
-	announced        map[RouteKey]Route
-	announcedTunnels []Tunnel
+	// session's snapshot has been written; only then may local-prefix updates be
+	// streamed to it. announced is what this session has been told, so a change
+	// that lands mid-snapshot is still reconciled.
+	sc        *sessionConn
+	ready     bool
+	announced map[RouteKey]Route
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -453,11 +452,8 @@ func normalizeTunnels(deviceID uint16, in []Tunnel) ([]Tunnel, map[uint16][]stri
 	return tunnels, nextHops, nil
 }
 
-// copyTunnels returns a non-nil copy of a tunnel table. The non-nil part is
-// load-bearing: &nil is a pointer, so json.Marshal writes "tunnels":null for it,
-// and the RR rejects a tunnels frame that carries no table at all. "This device
-// has no tunnels" has to travel as [], or clearing the last tunnel would drop
-// the session instead of withdrawing the routes.
+// copyTunnels returns a non-nil copy of a tunnel table, so a reader (the status
+// page, a config dump) never aliases the table the route client is using.
 func copyTunnels(in []Tunnel) []Tunnel {
 	out := make([]Tunnel, 0, len(in))
 	return append(out, in...)
@@ -607,9 +603,8 @@ func (c *Client) SetVRFs(vs []VRFConfig) error {
 // SetTunnels replaces this device's tunnel table at runtime. The table is what
 // turns "this route came from device N" into local paths, so a prefix that was
 // held back for want of a path is installed by this call alone -- and a prefix
-// whose path was removed leaves the table again. Each live session is told the
-// new table (MsgTunnels is a full replacement), which makes the RR reflect or
-// withdraw on its side too.
+// whose path was removed leaves the table again. Nothing is sent to the RR: it
+// reflects every route to every session and never looks at tunnels.
 func (c *Client) SetTunnels(ts []Tunnel) error {
 	tunnels, nextHops, err := normalizeTunnels(c.cfg.DeviceID, ts)
 	if err != nil {
@@ -622,9 +617,6 @@ func (c *Client) SetTunnels(ts []Tunnel) error {
 	}
 	before := c.nextHops
 	c.tunnels, c.nextHops = tunnels, nextHops
-	for _, s := range c.sessions {
-		c.pushTunnelsLocked(s)
-	}
 	// Nexthop Tracking, the same shape as GoBGP (zclient applyToPathList ->
 	// updatePath -> globalRib.Update): only the origins whose next hops changed
 	// re-enter the Loc-RIB, each path replaced by a copy with the new flag. No
@@ -1062,25 +1054,6 @@ func (c *Client) dropSessionLocked(s *clientSession) {
 	s.adjIn = map[RouteKey]Route{}
 }
 
-// pushTunnelsLocked re-sends the whole table to one session that already has an
-// established snapshot. MsgTunnels is a replacement, not a delta, so there is
-// nothing to diff on the wire; the comparison is only so a republished table
-// does not make every RR rebuild its adjacency for no reason. A write failure
-// closes the session: reconnect re-announces everything.
-//
-// Must be called with c.mu held.
-func (c *Client) pushTunnelsLocked(s *clientSession) {
-	if !s.ready || s.sc == nil || equalTunnels(s.announcedTunnels, c.tunnels) {
-		return
-	}
-	table := copyTunnels(c.tunnels)
-	if err := s.sc.write(Envelope{Type: MsgTunnels, Tunnels: &table}); err != nil {
-		s.sc.close()
-		return
-	}
-	s.announcedTunnels = table
-}
-
 // Run keeps the RR sessions alive until ctx is cancelled. It returns nil.
 //
 // The reconnect loop belongs to a session, not to a slot in the configured list:
@@ -1234,14 +1207,6 @@ func (c *Client) serveSession(s *clientSession, conn net.Conn) (handshook bool, 
 		return true, errors.New("session was dropped while it was connecting")
 	}
 
-	// The tunnel table goes first: the RR withholds its snapshot until it knows
-	// which peers this device can reach, and it must not see that as "no
-	// tunnels". It is also a full replacement, so every reconnect re-asserts it.
-	tunnels := c.Tunnels()
-	if err := sc.write(Envelope{Type: MsgTunnels, Tunnels: &tunnels}); err != nil {
-		return true, fmt.Errorf("send tunnel table: %w", err)
-	}
-
 	// Announce our whole table before EOR, in bounded chunks.
 	local := c.LocalRoutes()
 	for rest := local; len(rest) > 0; {
@@ -1258,10 +1223,9 @@ func (c *Client) serveSession(s *clientSession, conn net.Conn) (handshook bool, 
 		return true, fmt.Errorf("send eor: %w", err)
 	}
 
-	// From here on the session is part of the live local-prefix and tunnel
-	// fanout. The snapshot may already be stale: reconcile against the current
-	// sets before releasing the lock, so no update can slip between snapshot and
-	// fanout.
+	// From here on the session is part of the live local-prefix fanout. The
+	// snapshot may already be stale: reconcile against the current sets before
+	// releasing the lock, so no update can slip between snapshot and fanout.
 	c.mu.Lock()
 	if !s.up || c.indexOfLocked(s) < 0 {
 		c.mu.Unlock()
@@ -1277,8 +1241,6 @@ func (c *Client) serveSession(s *clientSession, conn net.Conn) (handshook bool, 
 		desired[rt.Key()] = rt
 	}
 	c.syncSessionLocalLocked(s, desired)
-	s.announcedTunnels = tunnels
-	c.pushTunnelsLocked(s)
 	c.mu.Unlock()
 
 	go c.keepaliveLoop(sc, hold/3, sessionDone)
@@ -1345,7 +1307,6 @@ func (c *Client) markUp(s *clientSession, conn net.Conn, rrID string, hold time.
 	s.sc = nil
 	s.ready = false
 	s.announced = nil
-	s.announcedTunnels = nil
 }
 
 func (c *Client) markDown(s *clientSession) {
@@ -1358,7 +1319,6 @@ func (c *Client) markDown(s *clientSession) {
 	s.sc = nil
 	s.ready = false
 	s.announced = nil
-	s.announcedTunnels = nil
 }
 
 func (c *Client) markSynced(s *clientSession) {
