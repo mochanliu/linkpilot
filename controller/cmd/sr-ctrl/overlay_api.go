@@ -53,7 +53,7 @@ func (s *server) handleAdminOverlay(w http.ResponseWriter, r *http.Request) {
 //
 // A field that is absent is left alone -- that is what lets the escape toggle
 // keep working while the RR pickers are still being built, and what makes
-// "清掉备 RR" (an explicit empty string) different from "我没碰这个格子" (absent).
+// "清掉 RR 2" (an explicit empty string) different from "我没碰这个格子" (absent).
 func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireTenant(w, r)
 	if !ok {
@@ -90,14 +90,14 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 	if req.RRBackup != nil {
 		nextBackup = strings.TrimSpace(*req.RRBackup)
 	}
-	for _, slot := range []struct{ label, val string }{{"主", nextPrimary}, {"备", nextBackup}} {
+	for _, slot := range []struct{ label, val string }{{"RR 1", nextPrimary}, {"RR 2", nextBackup}} {
 		if msg := s.rrSelectionErrorLocked(id.TenantID, slot.val); msg != "" {
-			http.Error(w, fmt.Sprintf("%s RR：%s", slot.label, msg), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("%s：%s", slot.label, msg), http.StatusBadRequest)
 			return
 		}
 	}
 	if nextPrimary != "" && nextPrimary == nextBackup {
-		http.Error(w, "主 RR 和备 RR 不能选同一条：一条反射器不需要两个格子", http.StatusBadRequest)
+		http.Error(w, "RR 1 和 RR 2 不能选同一条：一条反射器不需要两个格子", http.StatusBadRequest)
 		return
 	}
 

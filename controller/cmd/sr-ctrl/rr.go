@@ -212,13 +212,10 @@ func (s *server) overlayRRChecksLocked(tenantID string) []ConfigCheck {
 	add := func(sev, format string, args ...any) {
 		out = append(out, ConfigCheck{Severity: sev, Text: fmt.Sprintf(format, args...)})
 	}
-	label := func(slot string) string {
-		if slot == "主" {
-			return "主 RR"
-		}
-		return "备 RR"
-	}
-	for _, slot := range []struct{ name, id string }{{"主", oc.RRPrimary}, {"备", oc.RRBackup}} {
+	// 拍板 E0：两格在设备上等价，所以检查里也叫 RR 1 / RR 2，不叫主/备。
+	// （存储与接口的字段名仍是 rr_primary / rr_backup：那是已经落盘的名字，
+	// 为了一个措辞改动 state 形状不值。）
+	for _, slot := range []struct{ name, id string }{{"RR 1", oc.RRPrimary}, {"RR 2", oc.RRBackup}} {
 		if slot.id == "" {
 			continue
 		}
@@ -226,10 +223,10 @@ func (s *server) overlayRRChecksLocked(tenantID string) []ConfigCheck {
 		switch {
 		case it == nil:
 			add("error", "%s 选了库里已经不存在的条目 %q：这一台设备这一版拿不到 RR，去「Overlay 配置 › 全局」重选。",
-				label(slot.name), slot.id)
+				slot.name, slot.id)
 		case it.Owner != "" && it.Owner != tenantID:
 			add("error", "%s 选的 %q（%s）归属别的租户，本租户用不了：这一版不会把它下发。",
-				label(slot.name), slot.id, it.Name)
+				slot.name, slot.id, it.Name)
 		}
 	}
 	if oc.RRPrimary == "" && oc.RRBackup == "" {

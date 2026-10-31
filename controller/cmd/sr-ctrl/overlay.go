@@ -487,12 +487,14 @@ type overlayView struct {
 	// The two reflector slots and the rows this tenant may pick from them. The
 	// library is filtered here, not in the page: a tenant must never be able to
 	// name (or even learn the existence of) another tenant's exclusive RR.
+	// The field names are 主/备-shaped because that is what is already on disk;
+	// every string the page shows calls them RR 1 and RR 2 (拍板 E0).
 	RRPrimary string      `json:"rr_primary"`
 	RRBackup  string      `json:"rr_backup"`
 	RRLibrary []rrPickRow `json:"rr_library"`
-	// RRNote says what "主" and "备" do and do not do on the device, because the
-	// words promise a failover order this plane does not implement: the route
-	// client keeps a session up to every entry it is handed.
+	// RRNote says what the two slots do and do not do on the device, because two
+	// labelled boxes promise a failover order this plane does not implement: the
+	// route client keeps a session up to every entry it is handed.
 	RRNote string `json:"rr_note"`
 }
 
@@ -511,9 +513,9 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 		RRPrimary: oc.RRPrimary,
 		RRBackup:  oc.RRBackup,
 		RRLibrary: s.rrPickRowsLocked(tenantID),
-		RRNote: "「主」「备」只是这一页上的两个格子，设备不排序：路由客户端对拿到的每一条 RR 都保持会话，" +
+		RRNote: "这两格（RR 1、RR 2）只是这一页上的两个格子，设备不排序：路由客户端对拿到的每一条 RR 都保持会话，" +
 			"两条就是两条等价活动反射器。控制器不会去连库里这些地址，所以这里没有绿灯可给——" +
-			"能不能连上，只有设备自己的路由状态知道。选好了要等设备上的路由进程重启才生效（见发布记录）。",
+			"能不能连上，只有设备自己的路由状态知道。选好了还要发布配置、并且设备上的路由进程换过这一版才生效（见发布记录）。",
 	}
 	if view.Groups == nil {
 		view.Groups = []OverlayGroup{}

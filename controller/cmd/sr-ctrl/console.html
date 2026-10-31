@@ -316,7 +316,9 @@
       <a class="child" href="#underlay-settings" data-view="underlay-settings" data-roles="tenant">全局配置</a>
       <a class="child" href="#underlay-tunnels" data-view="underlay-tunnels" data-roles="tenant">隧道配置</a>
       <div class="sect" data-roles="tenant">Overlay 配置</div>
-      <a class="child dis" data-roles="tenant">路由 · 尚未规划</a>
+      <a class="child" href="#overlay-settings" data-view="overlay-settings" data-roles="tenant">全局配置</a>
+      <a class="child" href="#overlay-groups" data-view="overlay-groups" data-roles="tenant">导通</a>
+      <a class="child dis" data-roles="tenant">路由泄露 · 尚未规划</a>
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a class="child" href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
@@ -324,6 +326,7 @@
       <a class="child" href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
       <a class="child" href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
       <a class="child" href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
+      <a class="child" href="#rrs" data-view="rrs" data-roles="operator">RR 库 <span class="n" id="n-rrs">—</span></a>
       <div class="sect">账号管理</div>
       <a class="child" href="#accounts" data-view="accounts" data-roles="operator">账号 <span class="n" id="n-accounts">0</span></a>
       <a class="child" href="#account" data-view="account" id="nav-account">账号设置</a>
@@ -358,7 +361,8 @@
   var S = { state: null, me: null, accounts: null, loginTab: "account",
     view: "dashboard", lastResult: null, lastSecret: null, codeReveal: null,
     html: "", timer: null, ago: null, es: null,
-    metrics: null, fast: null, cfg: null, und: null, topo: null, sites: null, pa: null };
+    metrics: null, fast: null, cfg: null, und: null, topo: null, sites: null, pa: null,
+    rr: null, ov: null };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -677,6 +681,21 @@
       sub: "设备与隧道连线的只读视图；每条连线的运行状态仍显示「未知」（遥测行还没逐条对上），每台设备建了几条隧道看「Underlay 配置 › 隧道配置」的「设备与中转端口」表",
       roles: ["tenant"]
     },
+    "overlay-settings": {
+      title: "全局配置",
+      sub: "反射器（RR）与逃生开关：RR 从运营方维护的库里选，这一页保存的是下一次发布的输入，改完要在「基础配置」发布，设备才会拿到",
+      roles: ["tenant"]
+    },
+    "overlay-groups": {
+      title: "导通",
+      sub: "VPN 互通域：把几台设备的几个 VPN 放进同一组，控制器给这个组分配一个 RT 并写进每个成员的导入与导出。RT 由控制器拥有，页面上只读",
+      roles: ["tenant"]
+    },
+    rrs: {
+      title: "RR 库",
+      sub: "运营方维护的反射器清单：地址与位置手填，控制器不会去连它，所以这一页没有任何连通性结论。租户在「Overlay 配置 › 全局配置」里从这张表选",
+      roles: ["operator"]
+    },
     account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" }
   };
 
@@ -692,12 +711,17 @@
     $("view-title").textContent = v.title;
     $("view-sub").textContent = (isOp ? v.sub : (v.tenantSub || v.sub));
     syncFast();
+    // The RR count belongs in the sidebar for the operator: /api/state does not
+    // carry it, and 10s staleness is the same cadence the rest of the console
+    // uses. ensureRR only fires when nothing has been read yet or the read is old.
+    if (isOp) ensureRR();
 
     var online = st.nodes.filter(function (n) { return n.status === "online"; }).length;
     $("n-tenants").textContent = st.tenants.length;
     $("n-accounts").textContent = S.accounts ? S.accounts.length : 0;
     $("n-claims").textContent = liveGrants(st).length;
     $("n-devices").textContent = online + "/" + st.nodes.length;
+    $("n-rrs").textContent = S.rr && S.rr.at ? S.rr.rows.length : "—";
     $("ctrl-line").textContent = (st.controller.tls_addrs || []).join(" · ");
 
     // 后台刷新（SSE + 10 秒轮询）不能把操作员正在填的表单冲掉：焦点还在
@@ -719,6 +743,9 @@
     else if (S.view === "underlay-settings") c = viewUnderlaySettings();
     else if (S.view === "underlay-tunnels") c = viewUnderlayTunnels();
     else if (S.view === "underlay-topology") c = viewUnderlayTopology();
+    else if (S.view === "overlay-settings") c = viewOverlaySettings();
+    else if (S.view === "overlay-groups") c = viewOverlayGroups();
+    else if (S.view === "rrs") c = viewRRs();
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "account") c = viewAccount();
     else c = viewPlaceholder();
@@ -1540,6 +1567,14 @@
             " 新：可能有人在设备上手工装过。控制器不会把它改回去，除非你再次发布。";
         }
       }
+    }
+
+    // Overlay 那一层（导通组、选定的 RR）没有自己的发布按钮：它是这次发布的
+    // 输入。所以"改了但还没发布"必须在这一栏说出来，否则租户会以为保存就到设备了。
+    if (v.overlay_pending) {
+      note = (note ? note + " " : "") +
+        "Overlay 配置改过了（导通组或选定的 RR），但这一版还没发布：设备现在跑的仍是上一次发布时冻结的那一份。" +
+        "要生效就点上面的「发布到设备」。";
     }
 
     return '<section class="panel"><header><h2>下发到设备</h2>' + tag + "</header>" +
@@ -3271,6 +3306,8 @@
     var keep = DP[id];
     DP[id] = {
       items: items, multi: !!o.multiple, empty: o.empty || "",
+      unit: o.unit || "台", ph: o.ph || "", aria: o.aria || "过滤设备列表",
+      none: o.none === undefined ? "0" : o.none,
       q: keep ? keep.q : "", st: keep ? keep.st : ""
     };
     return DP[id];
@@ -3299,7 +3336,8 @@
     var d = DP[id];
     var head = "";
     if (d.empty) {
-      head = '<option value="0"' + (String(sel) === "0" || sel === null || sel === undefined ? " selected" : "") +
+      head = '<option value="' + esc(d.none) + '"' +
+        (String(sel) === d.none || sel === null || sel === undefined ? " selected" : "") +
         ">" + esc(d.empty) + "</option>";
     }
     var isSel = d.multi
@@ -3311,21 +3349,21 @@
     hit.forEach(function (it) { shown[it.value] = 1; body += dpOption(it, isSel, false); });
     // 被过滤掉的当前选择必须留在列表里：否则一次轮询重建就会把用户选中的设备
     // 变成"第一项"，保存时写下去的是另一台。
-    if (!d.multi && String(sel) !== "" && String(sel) !== "0" && isSel(String(sel)) && !shown[String(sel)]) {
+    if (!d.multi && String(sel) !== "" && String(sel) !== d.none && isSel(String(sel)) && !shown[String(sel)]) {
       for (var i = 0; i < d.items.length; i++) {
         if (d.items[i].value === String(sel)) { body = dpOption(d.items[i], isSel, true) + body; break; }
       }
     }
     d.hit = hit.length;
-    return head + (body || (d.empty ? "" : '<option value="" disabled>没有符合条件的设备</option>'));
+    return head + (body || (d.empty ? "" : '<option value="" disabled>没有符合条件的' + d.unit + "</option>"));
   }
 
   function dpCountText(id) {
     var d = DP[id];
     if (d.multi) {
-      return "共 " + d.items.length + " 台 · 符合 " + d.hit + " 台 · 按住 Ctrl/⌘ 多选";
+      return "共 " + d.items.length + " " + d.unit + " · 符合 " + d.hit + " " + d.unit + " · 按住 Ctrl/⌘ 多选";
     }
-    return "符合 " + d.hit + " / " + d.items.length + " 台";
+    return "符合 " + d.hit + " / " + d.items.length + " " + d.unit;
   }
 
   // 单选那一行平时就是「共 128 台」这种没人要的字数，所以只在真的过滤了、或者
@@ -3341,11 +3379,12 @@
     o = o || {};
     var d = dpState(id, items, o);
     var attrs = o.attrs ? " " + o.attrs : "";
+    var ph = d.ph || (d.multi ? "过滤：名称 / 序列号 / 站点 / 状态" :
+      "先打几个字：名称 / 序列号 / 站点 / 状态");
     var tools = '<div class="dp-tools">' +
       '<input class="devfilter" id="dpf-' + id + '" data-dp-q="' + id + '" value="' + esc(d.q) +
-      '" placeholder="' + (d.multi ? "过滤：名称 / 序列号 / 站点 / 状态" :
-        "先打几个字：名称 / 序列号 / 站点 / 状态") +
-      '" autocomplete="off" aria-label="过滤设备列表">' +
+      '" placeholder="' + esc(ph) +
+      '" autocomplete="off" aria-label="' + esc(d.aria) + '">' +
       (d.multi ? '<select id="dps-' + id + '" data-dp-st="' + id + '" aria-label="按状态过滤设备">' +
         '<option value="">全部状态</option>' +
         dpStatuses(items).map(function (s) {
@@ -4799,6 +4838,659 @@
     return h;
   }
 
+  /* ---------------- RR 库（运营方）与 Overlay 两页（租户） ---------------- */
+
+  // 三块页面说的是同一件事：反射器。运营方拥有表里的行（地址与位置手填，控制器
+  // 不去连——拍板 E4），租户只拥有"我的设备拨哪两条"这一件事。两边都不发布：一次
+  // RR 改动只改变下一次发布的输入，正在跑的设备保持它已经装上的那一版。
+  //
+  // 页面上不出现「主/备」这种暗示择一的词（拍板 E0）：设备对拿到的每一条 RR 都
+  // 保持会话，两条就是两条等价活动反射器，所以这两格叫 RR 1 / RR 2。
+
+  function rrStore() {
+    if (!S.rr) S.rr = { rows: [], max: 0, at: 0, loading: false, note: null, edit: null };
+    return S.rr;
+  }
+
+  function rrIsOp() { return !!(S.me && S.me.role === "operator"); }
+
+  function rrRow(id) {
+    var r = S.rr;
+    if (!r) return null;
+    for (var i = 0; i < r.rows.length; i++) if (r.rows[i].id === id) return r.rows[i];
+    return null;
+  }
+
+  function ensureRR() {
+    var r = rrStore();
+    if (!rrIsOp()) return r;
+    if (r.loading) return r;
+    if (!r.at || nowSec() - r.at >= 10) loadRR();
+    return r;
+  }
+
+  function loadRR() {
+    var r = rrStore();
+    if (!rrIsOp() || r.loading) return;
+    r.loading = true;
+    api("GET", "/api/rrs").then(function (doc) {
+      r.loading = false;
+      if (!doc) { render(); return; }
+      r.rows = doc.rrs || [];
+      r.max = Number(doc.max_items) || 0;
+      r.at = nowSec();
+      if (r.note && r.note.fromLoad) r.note = null;
+      if (r.edit && !rrRow(r.edit.id)) r.edit = null;
+      render();
+    }).catch(function (err) {
+      r.loading = false;
+      r.note = undErrNote(err);
+      r.note.fromLoad = true;
+      render();
+    });
+  }
+
+  function rrErr(slot, text) {
+    var el = $(slot);
+    if (el) { el.textContent = text; return; }
+    var r = rrStore();
+    r.note = { kind: "bad", text: text };
+    render();
+  }
+
+  // Every write answers with the whole table, so the page takes the whole table:
+  // a renumbered id, a reference count and a refused delete are exactly the
+  // things one operator's edit changes for the *other* rows.
+  function rrApply(res, msg) {
+    var r = rrStore();
+    r.loading = false;
+    if (res && res.rrs) r.rows = res.rrs;
+    r.at = nowSec();
+    r.edit = null;
+    r.note = { kind: "", text: msg };
+    blurContent();
+    render();
+    toast(msg);
+  }
+
+  function rrBody(f, p) {
+    return {
+      name: String(f.get(p + "-name") || "").trim(),
+      addr: String(f.get(p + "-addr") || "").trim(),
+      location: String(f.get(p + "-loc") || "").trim(),
+      owner: String(f.get(p + "-owner") || "")
+    };
+  }
+
+  function rrCreate(form) {
+    var r = rrStore();
+    var body = rrBody(new FormData(form), "rr-n");
+    if (!body.name) { rrErr("rr-new-err", "名称必填"); return; }
+    if (!body.addr) { rrErr("rr-new-err", "地址必填，而且要带端口（ip:port 或 域名:port）"); return; }
+    r.loading = true;
+    r.note = null;
+    api("POST", "/api/rrs", body).then(function (res) {
+      releaseForm(form);
+      rrApply(res, "已加入库：" + (res.rr ? res.rr.id + " · " + res.rr.name : body.name));
+    }).catch(function (err) { r.loading = false; rrErr("rr-new-err", err.message); });
+  }
+
+  function rrSaveEdit(form) {
+    var r = rrStore();
+    if (!r.edit) return;
+    var body = rrBody(new FormData(form), "rr-e");
+    body.id = r.edit.id;
+    if (!body.name) { rrErr("rr-edit-err", "名称必填"); return; }
+    if (!body.addr) { rrErr("rr-edit-err", "地址必填，而且要带端口（ip:port 或 域名:port）"); return; }
+    r.loading = true;
+    r.note = null;
+    api("PUT", "/api/rrs", body).then(function (res) {
+      rrApply(res, "已更新 " + body.id +
+        (res.addr_changed ? "：地址变了，选了它的租户要在配置重新发布（并且盒内路由进程换过这一版）之后才会拨新地址。" : "：地址没变。"));
+    }).catch(function (err) { r.loading = false; rrErr("rr-edit-err", err.message); });
+  }
+
+  function rrDelete(id, name) {
+    var r = rrStore();
+    if (!confirm("删除 RR「" + name + "」（" + id + "）？\n\n控制器不会去连这个地址，所以删它不碰任何设备。" +
+      "被租户选着的会拒绝删除：要先让那个租户在「Overlay 配置 › 全局」里改选别的。")) return;
+    r.loading = true;
+    r.note = null;
+    api("POST", "/api/rrs/delete", { id: id }).then(function (res) {
+      rrApply(res, "已删除 " + id + "。它的号不会再发给新的条目。");
+    }).catch(function (err) {
+      r.loading = false;
+      r.note = undErrNote(err);
+      blurContent();
+      render();
+    });
+  }
+
+  // 归属的候选直接取 /api/state 已经带来的租户表：GET /api/tenants 是 POST-only，
+  // 为这一个下拉再开一条读口不值。
+  function rrOwnerOptions(cur) {
+    var ts = (S.state && S.state.tenants) || [];
+    var h = '<option value="">共享（所有租户都能选）</option>';
+    ts.forEach(function (t) {
+      h += '<option value="' + esc(t.tenant_id) + '"' + (t.tenant_id === cur ? " selected" : "") + ">" +
+        esc(t.name || t.tenant_id) + "</option>";
+    });
+    // 独享条目的租户已经不在了：这个值必须仍然可选，否则运营方连"只修地址不动归属"
+    // 都保存不了（API 允许原样重存），而页面会把它悄悄改成共享。
+    var known = ts.some(function (t) { return t.tenant_id === cur; });
+    if (cur && !known) {
+      h += '<option value="' + esc(cur) + '" selected>' + esc(cur) + "（该租户已不存在，谁都选不到这一条）</option>";
+    }
+    return h;
+  }
+
+  function rrFields(p, v) {
+    v = v || {};
+    return '<div class="field"><label for="' + p + '-name">名称</label>' +
+      '<input id="' + p + '-name" name="' + p + '-name" value="' + esc(v.name) +
+      '" maxlength="80" placeholder="如 上海反射器-1"></div>' +
+      '<div class="field"><label for="' + p + '-addr">地址（必须带端口）</label>' +
+      '<input id="' + p + '-addr" name="' + p + '-addr" value="' + esc(v.addr) +
+      '" spellcheck="false" maxlength="253" placeholder="rr.example.net:18446"></div>' +
+      '<div class="field"><label for="' + p + '-loc">位置（手填，纯文本）</label>' +
+      '<input id="' + p + '-loc" name="' + p + '-loc" value="' + esc(v.location) +
+      '" maxlength="120" placeholder="如 上海 · 机房A"></div>' +
+      '<div class="field"><label for="' + p + '-owner">归属</label>' +
+      '<select id="' + p + '-owner" name="' + p + '-owner">' + rrOwnerOptions(v.owner) + "</select></div>";
+  }
+
+  function rrUsedCell(row) {
+    var by = row.used_by || [];
+    if (!by.length) return '<span class="muted">没人选</span>';
+    var names = row.used_names || [];
+    var h = esc((names.length ? names : by).join("、"));
+    if (names.length < by.length) h += ' <span class="tag stale">含已不存在的租户</span>';
+    return h;
+  }
+
+  function rrUpdatedCell(row) {
+    var t = row.updated_at_unix || row.created_at_unix;
+    if (!t) return '<span class="muted">—</span>';
+    return '<span class="muted" style="font-size:12px">' + esc(clock(t)) +
+      (row.updated_at_unix ? "" : "（建）") + " · " + esc(ago(t)) + "</span>";
+  }
+
+  function viewRRs() {
+    var r = ensureRR();
+    var h = '<section class="panel"><header><h2>RR 库</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + (r.at ? r.rows.length : "…") + " 条" +
+      (r.max ? " · 上限 " + r.max : "") + "</span></header>" +
+      '<div class="hint">反射器是设备上的路由进程拨号过去的那个角色：这一页只管「有哪些、在哪儿、归谁」，' +
+      "谁选哪两条在「Overlay 配置 › 全局配置」。<b>控制器不会去连库里的地址</b>，所以这一页没有任何绿灯可给——" +
+      "能不能连上只有设备自己的路由状态知道。地址必须带端口：设备上的路由进程要从 host:port 里拆出 TLS 服务名，" +
+      "少了端口只能到设备上过一遍才知道写错了。归属：<b>共享</b>对所有租户可见，<b>独享</b>只在那一个租户的下拉里出现，" +
+      "别的租户既选不到、也看不到有这一条。</div>";
+    if (!r.at && r.loading) {
+      return h + '<div class="empty">正在读取 RR 库…</div></section>';
+    }
+    h += '<form id="rr-new-form"><div class="fields">' + rrFields("rr-n", null) +
+      '<button class="primary" type="submit"' + (r.max && r.rows.length >= r.max ? " disabled" : "") +
+      ">加入库里</button></div>" +
+      '<div class="err" id="rr-new-err" role="alert"></div></form>' +
+      (r.note ? undNote(r.note) : "");
+    if (!r.rows.length) {
+      return h + '<div class="empty" style="margin-top:10px">库里还没有 RR：先加两条，租户才有得选；' +
+        "一条也没有时，租户那两格只能留空，设备会继续用它盘上自己那份 <code>rrs</code>。</div></section>";
+    }
+    h += "<table><thead><tr><th>名称</th><th>地址</th><th>位置</th><th>归属</th>" +
+      "<th>被哪些租户选着</th><th>更新</th><th></th></tr></thead><tbody>";
+    r.rows.forEach(function (row) {
+      var editing = r.edit && r.edit.id === row.id;
+      h += "<tr>" +
+        "<td><b>" + esc(row.name) + '</b> <span class="muted mono">' + esc(row.id) + "</span></td>" +
+        '<td class="mono">' + esc(row.addr) + "</td>" +
+        "<td>" + (row.location ? esc(row.location) : '<span class="muted">未填</span>') + "</td>" +
+        "<td>" + esc(row.owner_label) + "</td>" +
+        "<td>" + rrUsedCell(row) + "</td>" +
+        "<td>" + rrUpdatedCell(row) + "</td>" +
+        '<td class="row-actions">' +
+        '<button class="small" data-act="rr-edit" data-id="' + esc(row.id) + '">' +
+        (editing ? "收起" : "编辑") + '</button>' +
+        '<button class="small danger" data-act="rr-del" data-id="' + esc(row.id) +
+        '" data-name="' + esc(row.name) + '">删除</button>' +
+        "</td></tr>";
+      if (editing) {
+        h += '<tr><td colspan="7"><form id="rr-edit-form"><div class="fields">' +
+          rrFields("rr-e", r.edit) +
+          '<button class="primary" type="submit">保存</button> ' +
+          '<button class="small" type="button" data-act="rr-edit-x">取消</button></div>' +
+          '<div class="hint" style="margin:8px 0 0">整行覆盖：这一页改的就是库里这一条。' +
+          "改地址只影响下一次发布；把归属改成「共享」会让所有租户都能选到它。</div>" +
+          '<div class="err" id="rr-edit-err" role="alert"></div></form></td></tr>';
+      }
+    });
+    h += "</tbody></table>" +
+      '<div class="hint" style="margin-top:8px">改动只影响下一次发布：选了这条 RR 的租户，其设备要在配置发布' +
+      "并且盒内路由进程换过这一版之后才会用新地址。号（rr1、rr2…）删了不回收，所以下一次加入的一定是个新号，" +
+      "不会复活刚删掉的那一条。</div>";
+    return h + "</section>";
+  }
+
+  /* ---------------- Overlay：全局（两格 RR + 逃生开关）与导通 ---------------- */
+
+  function ovStore() {
+    if (!S.ov) S.ov = { doc: null, at: 0, loading: false, note: null, g: null, edit: null };
+    return S.ov;
+  }
+
+  function ovRole() { return !!(S.me && S.me.role === "tenant"); }
+
+  function ensureOverlay() {
+    var o = ovStore();
+    if (!ovRole()) return o;
+    if (o.loading) return o;
+    if (!o.doc || nowSec() - o.at >= 10) loadOverlay();
+    return o;
+  }
+
+  function loadOverlay() {
+    var o = ovStore();
+    if (!ovRole() || o.loading) return;
+    o.loading = true;
+    api("GET", "/api/overlay").then(function (doc) {
+      o.loading = false;
+      if (!doc) { render(); return; }
+      ovSetDoc(doc);
+      if (o.note && o.note.fromLoad) o.note = null;
+      render();
+    }).catch(function (err) {
+      o.loading = false;
+      o.note = undErrNote(err);
+      o.note.fromLoad = true;
+      render();
+    });
+  }
+
+  // The two slots are a draft, not a live read: a poll must not silently undo a
+  // selection the tenant has just made but not saved yet.
+  function ovSetDoc(doc) {
+    var o = ovStore();
+    o.doc = doc;
+    o.at = nowSec();
+    o.loading = false;
+    if (!o.g) {
+      o.g = { primary: doc.rr_primary || "", backup: doc.rr_backup || "",
+        escape: !!doc.escape_all_colors };
+    }
+    ovPrune(doc);
+  }
+
+  // A device that has since been unenrolled cannot stay in an open editor: the
+  // controller would refuse the whole save over it, and the row would look fine.
+  function ovPrune(doc) {
+    var o = ovStore();
+    if (!o.edit) return;
+    var ids = {};
+    (doc.nodes || []).forEach(function (n) { ids[n.node_id] = true; });
+    o.edit.members = o.edit.members.filter(function (m) { return !m.node || ids[m.node]; });
+  }
+
+  function ovErr(slot, text) {
+    var el = $(slot);
+    if (el) { el.textContent = text; return; }
+    ovStore().note = { kind: "bad", text: text };
+    render();
+  }
+
+  function ovRRPickOpt() {
+    return { unit: "条", none: "", empty: "不选（这一格留空）",
+      ph: "先打几个字：名称 / 地址 / 位置", aria: "过滤 RR 列表" };
+  }
+
+  // The library is already filtered by the controller: a tenant never receives
+  // another tenant's exclusive row. The one case the picker still has to name is
+  // a stored selection that is no longer pickable (row deleted, or re-assigned),
+  // because dropping it from the list would turn the next save into a different
+  // choice the tenant never made.
+  function ovRRItems(doc, slot) {
+    var items = (doc.rr_library || []).map(function (it) {
+      return { value: it.id,
+        text: it.name + " — " + it.addr + (it.location ? " — " + it.location : ""),
+        tags: "" };
+    });
+    var cur = slot === "primary" ? doc.rr_primary : doc.rr_backup;
+    var seen = items.some(function (it) { return it.value === cur; });
+    if (cur && !seen) {
+      items.unshift({ value: cur, text: cur + "（当前选择，库里已经没有这一条，或它属于别的租户）", tags: "" });
+    }
+    return items;
+  }
+
+  function ovSlotCell(doc, id) {
+    if (!id) return '<span class="tag pending">留空</span>';
+    var row = null;
+    (doc.rr_library || []).forEach(function (x) { if (x.id === id) row = x; });
+    if (!row) return '<span class="mono">' + esc(id) + '</span> <span class="tag stale">库里没有这一条</span>';
+    return '<span class="mono">' + esc(row.addr) + "</span>" +
+      (row.location ? ' <span class="muted">' + esc(row.location) + "</span>" : "");
+  }
+
+  function ovGlobalForm(o, doc) {
+    var g = o.g;
+    var pick = ovRRPickOpt();
+    var h = '<form id="ov-global-form"><div class="und-cols">' +
+      '<div class="und-box"><h3>RR 1</h3>' +
+      dpHtml("ov-rr-p", "ov-rr-p", ovRRItems(doc, "primary"), g.primary, pick) + "</div>" +
+      '<div class="und-box"><h3>RR 2</h3>' +
+      dpHtml("ov-rr-b", "ov-rr-b", ovRRItems(doc, "backup"), g.backup, pick) + "</div></div>" +
+      '<div class="hint" style="margin-top:10px">' + esc(doc.rr_note) + "</div>" +
+      '<div class="und-cols" style="margin-top:12px">' +
+      '<div class="und-box"><h3>这两格现在指的是</h3>' +
+      '<table><tbody><tr><th>RR 1</th><td>' + ovSlotCell(doc, g.primary) + "</td></tr>" +
+      '<tr><th>RR 2</th><td>' + ovSlotCell(doc, g.backup) + "</td></tr></tbody></table></div>" +
+      '<div class="und-box"><h3>逃生开关</h3>' +
+      '<label class="chk"><input type="checkbox" id="ov-escape"' + (g.escape ? " checked" : "") +
+      "> 主表收全部颜色</label>" +
+      '<div class="hint">打开后，设备的主表（VPN 0）会收下所有颜色的路由：导通组配错或还没配时用它兜底。' +
+      "关掉它才是按 RT 导通。</div></div></div>" +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center">' +
+      '<button class="small" type="button" data-act="ov-reload">重新载入</button>' +
+      '<button class="small" type="submit">保存</button>' +
+      '<button class="small primary" type="button" data-act="goto" data-view="config">去「基础配置」发布</button>' +
+      "</div></form>";
+    return h;
+  }
+
+  function ovSaveGlobal() {
+    var o = ovStore();
+    if (!o.doc || !o.g) return;
+    var body = { escape_all_colors: !!o.g.escape,
+      rr_primary: o.g.primary || "", rr_backup: o.g.backup || "" };
+    api("PUT", "/api/overlay/settings", body).then(function (res) {
+      var s = res.settings || {};
+      ovSetDoc(res.overlay || o.doc);
+      o.g = { primary: s.rr_primary || "", backup: s.rr_backup || "", escape: !!s.escape_all_colors };
+      o.note = { kind: "", text: "已保存。这一页保存的是下一次发布的输入：到「基础配置」发布以后，" +
+        "设备才会拿到这两条；而换 RR 要等盒内的路由进程换过这一版（重启或在 C-c 之后热换）。" };
+      blurContent();
+      render();
+      toast("已保存");
+    }).catch(function (err) {
+      o.note = undErrNote(err);
+      blurContent();
+      render();
+    });
+  }
+
+  function viewOverlaySettings() {
+    var o = ensureOverlay();
+    var doc = o.doc;
+    if (!doc) {
+      return '<section class="panel"><div class="empty">' +
+        esc(o.note ? o.note.text : "正在读取 overlay 配置…") + "</div></section>";
+    }
+    var h = "";
+    if (o.note) h += undNote(o.note);
+    h += '<section class="panel"><header><h2>反射器与逃生开关</h2>' +
+      '<span class="muted" style="font-size:12.5px">库里可选 ' + (doc.rr_library || []).length + " 条</span></header>";
+    if (!(doc.rr_library || []).length) {
+      h += '<div class="empty">库里还没有你能选的 RR：两格只能留空。留空时控制器不下发 <code>rrs</code> 这个键，' +
+        "设备继续用它盘上自己那一份。要新增请让运营方在「资产 › RR 库」里加。" +
+        '<button class="small" data-act="ov-reload">重新载入</button></div>';
+    }
+    h += ovGlobalForm(o, doc) + "</section>";
+    h += undChecksPanel(doc);
+    h += '<section class="panel"><header><h2>这一页不管的地址池</h2></header>' +
+      '<div class="hint">overlay 地址池（<code>overlay_cidr</code>）与隧道/中转端口属于 Underlay，' +
+      "在「Underlay 配置 › 全局配置」里改，这一页不复制它的值——两处显示同一个数就会有两处可能说错。" +
+      "导通的 RT 也不在这里编辑：它由控制器分配，见「Overlay 配置 › 导通」。</div></section>";
+    return h;
+  }
+
+  /* ---------------- 导通：组列表 + 组编辑 + 每台设备的展开 ---------------- */
+
+  function ovNodeOf(doc, id) {
+    var out = null;
+    (doc.nodes || []).forEach(function (n) { if (n.node_id === id) out = n; });
+    return out;
+  }
+
+  function ovNodeItems(nodes) {
+    return (nodes || []).map(function (n) {
+      var st = n.status === "online" ? "在线" : n.status === "stale" ? "失联" : "未上线";
+      return { value: String(n.node_id),
+        text: "node-" + n.node_id + (n.name ? " · " + n.name : "") + " · " + st, tags: st };
+    });
+  }
+
+  function ovVpnOptions(node, cur) {
+    if (!node) return '<option value="">先选设备</option>';
+    var list = node.vrfs || [];
+    if (!list.length) return '<option value="">这台设备没有 VPN 表</option>';
+    // 空值必须是列表里真实存在的一格：否则改完设备后模型里是「未选」，画面上却是
+    // 第一项看起来像已经选中，提交时那一行会凭空消失。
+    var h = '<option value="">选择 VPN</option>';
+    list.forEach(function (v) {
+      h += '<option value="' + esc(v.id) + '"' + (cur !== "" && cur !== null && String(v.id) === String(cur) ? " selected" : "") +
+        (v.selectable ? "" : " disabled") + ">VPN " + esc(v.id) +
+        (v.name ? " · " + esc(v.name) : "") + (v.selectable ? "" : "（" + esc(v.note) + "）") + "</option>";
+    });
+    return h;
+  }
+
+  function ovMemberRows(doc, edit) {
+    var h = "";
+    edit.members.forEach(function (m, i) {
+      var node = ovNodeOf(doc, m.node);
+      h += '<div class="und-box" style="margin-bottom:8px"><div class="fields" style="align-items:end">' +
+        '<div class="field"><label>设备</label>' +
+        dpHtml("ov-m-" + i, "ov-m-" + i, ovNodeItems(doc.nodes), m.node || "",
+          { unit: "台", none: "", empty: "选择设备", ph: "先打几个字：node 号 / 名称 / 状态",
+            aria: "过滤设备列表", attrs: 'data-ov-m="' + i + '"' }) + "</div>" +
+        '<div class="field"><label for="ov-vpn-' + i + '">VPN</label>' +
+        '<select id="ov-vpn-' + i + '" data-ov-v="' + i + '">' + ovVpnOptions(node, m.vpn) + "</select></div>" +
+        '<div class="field"><label>这张表现在导通什么</label>' +
+        '<span class="muted" style="font-size:12.5px">' + ovVpnRTText(doc, m) + "</span></div>" +
+        '<div class="field"><button class="small danger" type="button" data-act="ov-m-del" data-i="' + i +
+        '">移出去</button></div></div></div>';
+    });
+    return h;
+  }
+
+  // 成员那一行的 RT 取自控制器已经展开好的那份（doc.nodes[].vrfs）：页面上这几行
+  // 说的必须是"这一版配置会写成什么"，而不是页面自己按组名猜一遍。
+  function ovVpnRTText(doc, m) {
+    var node = ovNodeOf(doc, m.node);
+    if (!node) return "先选设备";
+    if (m.vpn === "" || m.vpn === null || m.vpn === undefined) {
+      return node.vrfs && node.vrfs.length ? "选一张 VPN 表" : "这台设备没有 VPN 表";
+    }
+    var v = null;
+    (node.vrfs || []).forEach(function (x) { if (String(x.id) === String(m.vpn)) v = x; });
+    if (!v) return "这台设备没有这张表";
+    var e = (v.export_rts || []).map(esc).join("、") || "—";
+    var im = (v.import_rts || []).map(esc).join("、") || "—";
+    return "导出 " + e + " · 导入 " + im;
+  }
+
+  function ovGroupEditor(doc, o) {
+    var edit = o.edit;
+    var isNew = !edit.id;
+    var g = null;
+    if (!isNew) doc.groups.forEach(function (x) { if (x.id === edit.id) g = x; });
+    var h = '<section class="panel"><header><h2>' + (isNew ? "新建导通组" : "编辑组 " + esc(edit.id)) + "</h2>" +
+      '<span class="muted" style="font-size:12.5px">' + (isNew ? "保存时由控制器分配 RT" : "RT " + esc(g ? g.rt : edit.rt)) + "</span></header>" +
+      '<div class="hint">一个组就是一个互通域：组里每一行的 VPN 都同时导出与导入这个组的 RT，' +
+      "所以不需要 from/to 一对规则。成员是「设备 + VPN」这一对，同一台设备的两张表可以在不同组里。" +
+      "上限：一组最多 " + doc.max_members + " 行、本租户最多 " + doc.max_groups + " 个组、" +
+      "一张表最多进 " + doc.max_rts_per_vpn + " 个组。</div>" +
+      '<form id="ov-group-form">' +
+      '<div class="fields"><div class="field"><label for="ov-g-name">组名</label>' +
+      '<input id="ov-g-name" name="ov-g-name" value="' + esc(edit.name) + '" maxlength="64" placeholder="如 生产网互通"></div></div>' +
+      ovMemberRows(doc, edit) +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">' +
+      '<button class="small" type="button" data-act="ov-m-add"' +
+      (edit.members.length >= doc.max_members ? " disabled" : "") + ">＋ 加一行成员</button>" +
+      '<button class="primary" type="submit">' + (isNew ? "建这个组" : "保存修改") + "</button>" +
+      '<button class="small" type="button" data-act="ov-group-x">取消</button></div>' +
+      '<div class="hint" style="margin:10px 0 0">' + esc(doc.rt_note) + "</div>" +
+      '<div class="err" id="ov-group-err" role="alert"></div></form></section>';
+    return h;
+  }
+
+  function ovGroupTable(doc) {
+    var h = '<section class="panel"><header><h2>导通组</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + doc.groups.length + " 个 · 上限 " + doc.max_groups + "</span></header>";
+    if (!doc.groups.length) {
+      return h + '<div class="empty">还没有导通组：一个组也没有时，每张表都不导入任何 overlay 路由，' +
+        "跨 VPN 互访要靠逃生开关或设备等下一版配置。</div></section>";
+    }
+    h += "<table><thead><tr><th>组</th><th>RT</th><th>成员</th><th>更新</th><th></th></tr></thead><tbody>";
+    doc.groups.forEach(function (g) {
+      h += "<tr>" +
+        "<td><b>" + esc(g.name) + '</b> <span class="muted mono">' + esc(g.id) + "</span></td>" +
+        '<td class="mono">' + esc(g.rt) + "</td>" +
+        "<td>" + (g.members || []).length + " 行<div class=\"muted\" style=\"font-size:12px\">" +
+        esc((g.members || []).map(function (m) {
+          return "node-" + m.node_id + "/VPN " + m.vpn_id;
+        }).join("、") || "—") + "</div></td>" +
+        '<td class="muted" style="font-size:12px">' + esc(clock(g.updated_at_unix || g.created_at_unix)) + "</td>" +
+        '<td class="row-actions">' +
+        '<button class="small" data-act="ov-group-edit" data-id="' + esc(g.id) + '">' +
+        (S.ov.edit && S.ov.edit.id === g.id ? "收起" : "编辑") + "</button>" +
+        '<button class="small danger" data-act="ov-group-del" data-id="' + esc(g.id) +
+        '" data-name="' + esc(g.name) + '">删除</button>' +
+        "</td></tr>";
+    });
+    return h + "</tbody></table>" +
+      '<div class="hint" style="margin-top:8px">删除一个组只是把这个组的 RT 从成员表上摘下来：' +
+      "已经在那条路由上跑着的流量会等设备下一次装配置才收敛。RT 不会被回收给下一个组。" +
+      "这一页的保存同样要等一次「基础配置」发布才到设备。</div></section>";
+  }
+
+  function ovVpnPanel(doc) {
+    var h = '<section class="panel"><header><h2>每台设备的表</h2>' +
+      '<span class="muted" style="font-size:12.5px">按当前配置展开，不是设备回报</span></header>';
+    if (!doc.nodes.length) return h + '<div class="empty">还没有设备入网。</div></section>';
+    h += "<table><thead><tr><th>设备</th><th>状态</th><th>VPN</th><th>导出 RT</th><th>导入 RT</th><th>所在组</th></tr></thead><tbody>";
+    doc.nodes.forEach(function (n) {
+      if (!n.vrfs.length) {
+        h += "<tr><td><span class=\"mono\">node-" + esc(n.node_id) + "</span></td><td>" + statusTag(n.status) +
+          '<td colspan="4" class="muted">这台设备没有 VPN 表</td></tr>';
+        return;
+      }
+      n.vrfs.forEach(function (v, vi) {
+        h += "<tr>" + (vi === 0
+          ? '<td rowspan="' + n.vrfs.length + '"><span class="mono">node-' + esc(n.node_id) + "</span>" +
+            (n.name ? '<div class="muted" style="font-size:12px">' + esc(n.name) + "</div>" : "") + "</td>" +
+            '<td rowspan="' + n.vrfs.length + '">' + statusTag(n.status) + "</td>"
+          : "") +
+          "<td><b>VPN " + esc(v.id) + "</b>" + (v.name ? ' <span class="muted">' + esc(v.name) + "</span>" : "") +
+          (v.selectable ? "" : ' <span class="tag stale">' + esc(v.note) + "</span>") + "</td>" +
+          '<td class="mono">' + ((v.export_rts || []).length ? esc(v.export_rts.join("、")) : '<span class="muted">—</span>') + "</td>" +
+          '<td class="mono">' + ((v.import_rts || []).length ? esc(v.import_rts.join("、")) : '<span class="muted">—</span>') + "</td>" +
+          "<td>" + ((v.groups || []).length ? esc(v.groups.join("、")) : '<span class="muted">不在任何组</span>') + "</td></tr>";
+      });
+    });
+    return h + "</tbody></table></section>";
+  }
+
+  function viewOverlayGroups() {
+    var o = ensureOverlay();
+    var doc = o.doc;
+    if (!doc) {
+      return '<section class="panel"><div class="empty">' +
+        esc(o.note ? o.note.text : "正在读取 overlay 配置…") + "</div></section>";
+    }
+    var h = "";
+    if (o.note) h += undNote(o.note);
+    if (o.edit) h += ovGroupEditor(doc, o);
+    else {
+      h += '<section class="panel"><header><h2>新建导通组</h2></header>' +
+        '<div class="hint">把要互访的「设备 + VPN」放进同一个组；组与组之间不通，' +
+        "这正是导通唯一要表达的事。</div>" +
+        '<div style="margin-top:10px"><button class="small primary" data-act="ov-group-new">新建一个组</button></div></section>';
+    }
+    h += ovGroupTable(doc);
+    h += ovVpnPanel(doc);
+    h += undChecksPanel(doc);
+    return h;
+  }
+
+  function ovGroupStart(doc, id) {
+    var o = ovStore();
+    if (id) {
+      var g = null;
+      doc.groups.forEach(function (x) { if (x.id === id) g = x; });
+      if (!g) return;
+      o.edit = { id: g.id, rt: g.rt, name: g.name,
+        members: (g.members || []).map(function (m) { return { node: m.node_id, vpn: m.vpn_id }; }) };
+    } else {
+      o.edit = { id: "", rt: "", name: "", members: [{ node: 0, vpn: "" }] };
+    }
+    o.note = null;
+  }
+
+  function ovGroupBody() {
+    var o = ovStore();
+    var edit = o.edit;
+    if (!edit) return null;
+    var name = String((document.getElementById("ov-g-name") || {}).value || "").trim();
+    var members = [];
+    edit.members.forEach(function (m) {
+      if (!(m.node > 0) || m.vpn === "" || m.vpn == null) return;
+      members.push({ node_id: m.node, vpn_id: Number(m.vpn) });
+    });
+    if (!name) { ovErr("ov-group-err", "组名必填"); return null; }
+    if (!members.length) { ovErr("ov-group-err", "至少一行成员：设备和 VPN 都要选"); return null; }
+    var seen = {};
+    var uniq = [];
+    members.forEach(function (m) {
+      var k = m.node_id + "/" + m.vpn_id;
+      if (seen[k]) return;
+      seen[k] = 1;
+      uniq.push(m);
+    });
+    return { id: edit.id || undefined, name: name, members: uniq };
+  }
+
+  function ovSaveGroup(form) {
+    var o = ovStore();
+    var body = ovGroupBody();
+    if (!body) return;
+    var isNew = !body.id;
+    api(isNew ? "POST" : "PUT", "/api/overlay/group", body).then(function (res) {
+      var g = res.group || {};
+      o.edit = null;
+      ovSetDoc(res.overlay || o.doc);
+      o.note = { kind: "", text: "组「" + (g.name || body.name) + "」已" +
+        (isNew ? "创建" : "保存") + "，RT " + (g.rt || "沿用原来的") +
+        "。这一页保存的是下一次发布的输入：到「基础配置」发布后设备才会装上。" };
+      blurContent();
+      render();
+      toast(isNew ? "导通组已创建" : "导通组已保存");
+    }).catch(function (err) {
+      var n = undErrNote(err);
+      if (n.checks) n.text = "这个组没有保存：" + n.text;
+      o.note = n;
+      blurContent();
+      render();
+    });
+  }
+
+  function ovDeleteGroup(id, name) {
+    var o = ovStore();
+    if (!confirm("删除导通组「" + name + "」（" + id + "）？\n\n" +
+      "这个组的 RT 会从它每行成员的导入/导出里摘掉，成员之间不再互导路由。RT 不会被回收给下一个组。")) return;
+    api("DELETE", "/api/overlay/group?id=" + encodeURIComponent(id)).then(function (res) {
+      if (o.edit && o.edit.id === id) o.edit = null;
+      ovSetDoc(res.overlay || o.doc);
+      o.note = { kind: "", text: "已删除组 " + id + "。到「基础配置」发布以后设备才会装上摘掉这个组的那一版。" };
+      blurContent();
+      render();
+      toast("已删除");
+    }).catch(function (err) {
+      o.note = undErrNote(err);
+      blurContent();
+      render();
+    });
+  }
+
   /* ---------------- actions ---------------- */
 
   // The 10s poll skips re-render while a form field has focus, so it cannot
@@ -5117,6 +5809,89 @@
         if (slot) slot.textContent = "";
       });
     });
+
+    /* RR 库 + Overlay 的表单与选择器 */
+    var rnf = $("rr-new-form");
+    if (rnf) rnf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      rrCreate(rnf);
+    });
+    var ref2 = $("rr-edit-form");
+    if (ref2) ref2.addEventListener("submit", function (e) {
+      e.preventDefault();
+      rrSaveEdit(ref2);
+    });
+    [rnf, ref2].forEach(function (f) {
+      if (!f) return;
+      f.addEventListener("input", function () {
+        var slot = $(f.id.replace("-form", "-err"));
+        if (slot) slot.textContent = "";
+      });
+    });
+    var ogf = $("ov-global-form");
+    if (ogf) ogf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      ovSaveGlobal();
+    });
+    var ggf = $("ov-group-form");
+    if (ggf) ggf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      ovSaveGroup(ggf);
+    });
+    // 组名是手打的，必须当场写回草稿：这个表单里「＋ 加一行成员」和换设备都会
+    // 重画，而重画时输入框的 value 是按草稿里的旧名字生成的——keep 那一轮只补
+    // 空值、不覆盖非空值，所以不写回状态的话，改的名字会在他点下"＋"的那一刻
+    // 静默变回去，提交时挨一句"已保存"却存的是老名字。
+    var ogn = $("ov-g-name");
+    if (ogn) ogn.addEventListener("input", function () {
+      var o = ovStore();
+      if (o.edit) o.edit.name = ogn.value;
+    });
+    var oep = $("ov-rr-p"), oeb = $("ov-rr-b"), oes = $("ov-escape");
+    if (oep) oep.addEventListener("change", function () {
+      ovStore().g.primary = oep.value;
+      blurContent();
+      render();
+    });
+    if (oeb) oeb.addEventListener("change", function () {
+      ovStore().g.backup = oeb.value;
+      blurContent();
+      render();
+    });
+    // 复选框只改状态，不重画：这一格旁边没有任何由它决定的内容，重画反而会
+    // 把操作者刚在两个下拉里选好的东西按一遍。
+    if (oes) oes.addEventListener("change", function () {
+      ovStore().g.escape = oes.checked;
+    });
+    document.querySelectorAll("#content select[data-ov-m]").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var o = ovStore();
+        if (!o.edit || !o.doc) return;
+        var i = Number(el.getAttribute("data-ov-m")) || 0;
+        var m = o.edit.members[i];
+        if (!m) return;
+        m.node = Number(el.value) || 0;
+        // 换设备等于换一张 VPN 表：原来那个号在新设备上未必存在，留着它只会
+        // 让提交时挨一句"设备 X 没有 VPN Y"。
+        var nd = ovNodeOf(o.doc, m.node);
+        var has = false;
+        ((nd && nd.vrfs) || []).forEach(function (v) { if (String(v.id) === String(m.vpn)) has = true; });
+        if (!has) m.vpn = "";
+        blurContent();
+        render();
+      });
+    });
+    document.querySelectorAll("#content select[data-ov-v]").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var o = ovStore();
+        if (!o.edit) return;
+        var i = Number(el.getAttribute("data-ov-v")) || 0;
+        if (!o.edit.members[i]) return;
+        o.edit.members[i].vpn = el.value === "" ? "" : Number(el.value);
+        blurContent();
+        render();
+      });
+    });
     // A dropdown's value only exists on "change"; the generic [data-act] click
     // handler below would read it before the user has picked anything.
     document.querySelectorAll('#content select[data-act="node-site"]').forEach(function (el) {
@@ -5248,6 +6023,8 @@
           if (S.und) S.und.note = null;
           if (S.sites) S.sites.note = null;
           if (S.pa) S.pa.note = null;
+          if (S.rr) S.rr.note = null;
+          if (S.ov) S.ov.note = null;
           blurContent();
           render();
         }
@@ -5295,6 +6072,73 @@
         else if (act === "pa-revoke") {
           paRevoke(el.getAttribute("data-id"), el.getAttribute("data-name") || "该设备",
             Number(el.getAttribute("data-node")) || 0);
+        }
+        else if (act === "rr-edit") {
+          var rr = rrStore();
+          var one = rrRow(el.getAttribute("data-id"));
+          if (!one) return;
+          if (rr.edit && rr.edit.id === one.id) { rr.edit = null; }
+          else {
+            rr.edit = { id: one.id, name: one.name, addr: one.addr,
+              location: one.location, owner: one.owner || "" };
+          }
+          rr.note = null;
+          blurContent();
+          render();
+        }
+        else if (act === "rr-edit-x") {
+          if (S.rr) { S.rr.edit = null; S.rr.note = null; }
+          blurContent();
+          render();
+        }
+        else if (act === "rr-del") {
+          rrDelete(el.getAttribute("data-id"), el.getAttribute("data-name") || "该 RR");
+        }
+        else if (act === "ov-reload") {
+          var orl = ovStore();
+          orl.doc = null;
+          orl.g = null;
+          orl.edit = null;
+          orl.note = null;
+          blurContent();
+          render();
+          loadOverlay();
+        }
+        else if (act === "ov-group-new") {
+          var onew = ovStore();
+          if (onew.doc) { ovGroupStart(onew.doc, ""); blurContent(); render(); }
+        }
+        else if (act === "ov-group-edit") {
+          var oe = ovStore();
+          if (!oe.doc) return;
+          var oeId = el.getAttribute("data-id");
+          if (oe.edit && oe.edit.id === oeId) oe.edit = null;
+          else ovGroupStart(oe.doc, oeId);
+          oe.note = null;
+          blurContent();
+          render();
+        }
+        else if (act === "ov-group-x") {
+          if (S.ov) S.ov.edit = null;
+          blurContent();
+          render();
+        }
+        else if (act === "ov-group-del") {
+          ovDeleteGroup(el.getAttribute("data-id"), el.getAttribute("data-name") || "该组");
+        }
+        else if (act === "ov-m-add") {
+          var oa = ovStore();
+          if (!oa.edit) return;
+          oa.edit.members.push({ node: 0, vpn: "" });
+          blurContent();
+          render();
+        }
+        else if (act === "ov-m-del") {
+          var od = ovStore();
+          if (!od.edit) return;
+          od.edit.members.splice(Number(el.getAttribute("data-i")) || 0, 1);
+          blurContent();
+          render();
         }
         else if (act === "und-avoid-add") undAddAvoid();
         else if (act === "und-avoid-del") undDelAvoid(Number(el.getAttribute("data-i")));

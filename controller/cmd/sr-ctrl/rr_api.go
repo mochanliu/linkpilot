@@ -74,8 +74,10 @@ func (s *server) handleAdminRRs(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		// The 归属 picker reads GET /api/tenants, which the operator page already
-		// has: a second shape for the same list is a second thing to keep honest.
+		// The 归属 picker needs the tenant list and already has it: /api/state
+		// carries it on every operator poll, so this answer stays the library alone.
+		// (/api/tenants is the create endpoint -- a second shape for the same list
+		// would be a second thing to keep honest.)
 		writeJSON(w, map[string]any{
 			"rrs":       s.rrLibraryRowsLocked(),
 			"max_items": rrMaxItems,
