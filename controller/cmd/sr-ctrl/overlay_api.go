@@ -30,6 +30,18 @@ type overlayGroupRequest struct {
 	Members []OverlayMember `json:"members"`
 }
 
+// rrGroupRequest is one row of the list the settings PUT replaces. An empty id
+// means "new": the controller mints it, the same way 导通组 ids are minted. The
+// page sends the whole list every time, so deleting a group is simply not
+// listing it.
+type rrGroupRequest struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	DeviceIDs []uint16 `json:"device_ids"`
+	RRPrimary string   `json:"rr_primary"`
+	RRBackup  string   `json:"rr_backup"`
+}
+
 func (s *server) handleAdminOverlay(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireTenant(w, r)
 	if !ok {
@@ -64,15 +76,16 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req struct {
-		EscapeAllColors *bool   `json:"escape_all_colors"`
-		RRPrimary       *string `json:"rr_primary"`
-		RRBackup        *string `json:"rr_backup"`
+		EscapeAllColors *bool             `json:"escape_all_colors"`
+		RRPrimary       *string           `json:"rr_primary"`
+		RRBackup        *string           `json:"rr_backup"`
+		RRGroups        *[]rrGroupRequest `json:"rr_groups"`
 	}
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if req.EscapeAllColors == nil && req.RRPrimary == nil && req.RRBackup == nil {
-		http.Error(w, "escape_all_colors / rr_primary / rr_backup 至少要给一个", http.StatusBadRequest)
+	if req.EscapeAllColors == nil && req.RRPrimary == nil && req.RRBackup == nil && req.RRGroups == nil {
+		http.Error(w, "escape_all_colors / rr_primary / rr_backup / rr_groups 至少要给一个", http.StatusBadRequest)
 		return
 	}
 
@@ -101,15 +114,57 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// RR groups arrive as the whole list, so the checks run on the candidate
+	// document rather than on stored rows: "this device is in two groups" is a
+	// property of the list being saved, not of any one row. Ids are minted here
+	// and only committed with the list, so a rejected save burns no counter.
+	var nextGroups []RRGroup
+	nextCounter := oc.NextRRGroup
+	if req.RRGroups != nil {
+		nextGroups = make([]RRGroup, 0, len(*req.RRGroups))
+		used := map[string]bool{}
+		for _, in := range *req.RRGroups {
+			g := RRGroup{
+				ID:        strings.TrimSpace(in.ID),
+				Name:      strings.TrimSpace(in.Name),
+				DeviceIDs: normalizeDeviceIDs(in.DeviceIDs),
+				RRPrimary: strings.TrimSpace(in.RRPrimary),
+				RRBackup:  strings.TrimSpace(in.RRBackup),
+			}
+			if g.ID == "" {
+				for {
+					nextCounter++
+					g.ID = fmt.Sprintf("rg%d", nextCounter)
+					if !used[g.ID] && oc.rrGroup(g.ID) == nil {
+						break
+					}
+				}
+			} else if used[g.ID] {
+				http.Error(w, fmt.Sprintf("分组 id %q 出现了两次", g.ID), http.StatusBadRequest)
+				return
+			}
+			used[g.ID] = true
+			nextGroups = append(nextGroups, g)
+		}
+		if checks := s.rrGroupsChecksLocked(id.TenantID, nextGroups); hasBlockingCheck(checks) != "" {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": hasBlockingCheck(checks), "checks": checks})
+			return
+		}
+	}
+
 	if req.EscapeAllColors != nil {
 		oc.EscapeAllColors = *req.EscapeAllColors
 	}
 	oc.RRPrimary, oc.RRBackup = nextPrimary, nextBackup
+	if req.RRGroups != nil {
+		oc.RRGroups = nextGroups
+		oc.NextRRGroup = nextCounter
+	}
 	oc.UpdatedAt = time.Now().Unix()
 	oc.UpdatedBy = id.Username
 	s.save()
-	log.Printf("overlay: tenant=%s escape_all_colors=%t rr_primary=%q rr_backup=%q by %s",
-		id.TenantID, oc.EscapeAllColors, oc.RRPrimary, oc.RRBackup, id.Username)
+	log.Printf("overlay: tenant=%s escape_all_colors=%t rr_primary=%q rr_backup=%q rr_groups=%d by %s",
+		id.TenantID, oc.EscapeAllColors, oc.RRPrimary, oc.RRBackup, len(oc.RRGroups), id.Username)
 	writeJSON(w, map[string]any{
 		"ok":      true,
 		"overlay": s.overlayViewLocked(id.TenantID, time.Now().Unix()),
@@ -117,6 +172,7 @@ func (s *server) handleAdminOverlaySettings(w http.ResponseWriter, r *http.Reque
 			"escape_all_colors": oc.EscapeAllColors,
 			"rr_primary":        oc.RRPrimary,
 			"rr_backup":         oc.RRBackup,
+			"rr_groups":         append([]RRGroup{}, oc.RRGroups...),
 		},
 	})
 }

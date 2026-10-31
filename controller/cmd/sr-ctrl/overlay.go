@@ -68,6 +68,26 @@ type OverlayGroup struct {
 	UpdatedAt int64 `json:"updated_at_unix"`
 }
 
+// RRGroup is one 反射器分组: the devices in the list dial this group's two
+// reflectors instead of the tenant's default two slots. It exists because one
+// tenant's sites may sit closer to different reflectors; the reflector side does
+// not care (it reflects to every session it has), so the split is purely a
+// per-device address choice.
+//
+// Membership is a list of devices, not a predicate: "which group is this device
+// in" must be answerable without arithmetic, because the answer decides which
+// addresses go into that device's route.json.
+type RRGroup struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	DeviceIDs []uint16 `json:"device_ids"`
+	// Same two slots, same storage names, as the tenant-level pair: ids of rows
+	// in the operator's library, validated by the same rrSelectionErrorLocked gate
+	// so a group can never name a reflector another tenant owns.
+	RRPrimary string `json:"rr_primary,omitempty"`
+	RRBackup  string `json:"rr_backup,omitempty"`
+}
+
 // OverlayConfig is one tenant's overlay layer. Keyed by tenant id in State.
 type OverlayConfig struct {
 	TenantID string `json:"tenant_id"`
@@ -88,11 +108,17 @@ type OverlayConfig struct {
 	RRPrimary string `json:"rr_primary,omitempty"`
 	RRBackup  string `json:"rr_backup,omitempty"`
 
+	// RRGroups splits the tenant's devices across reflector sets. A device that
+	// no group names falls back to the two slots above -- one rule, no branch:
+	// "not in a group" is exactly what the default pair is for.
+	RRGroups []RRGroup `json:"rr_groups,omitempty"`
+
 	// NextRT is the counter behind the allocated value; NextGroup mints ids.
 	// Neither ever rewinds, so an RT is burned for good when its group is deleted
 	// -- reusing a value a device may still hold routes under is worse than a gap.
-	NextRT    int `json:"next_rt"`
-	NextGroup int `json:"next_group"`
+	NextRT      int `json:"next_rt"`
+	NextGroup   int `json:"next_group"`
+	NextRRGroup int `json:"next_rr_group"`
 
 	UpdatedAt int64  `json:"updated_at_unix"`
 	UpdatedBy string `json:"updated_by,omitempty"`
@@ -142,6 +168,18 @@ func (o *OverlayConfig) ensure() {
 	}
 	o.RRPrimary = strings.TrimSpace(o.RRPrimary)
 	o.RRBackup = strings.TrimSpace(o.RRBackup)
+	if o.RRGroups == nil {
+		o.RRGroups = []RRGroup{}
+	}
+	if o.NextRRGroup < 0 {
+		o.NextRRGroup = 0
+	}
+	for i := range o.RRGroups {
+		o.RRGroups[i].Name = strings.TrimSpace(o.RRGroups[i].Name)
+		o.RRGroups[i].RRPrimary = strings.TrimSpace(o.RRGroups[i].RRPrimary)
+		o.RRGroups[i].RRBackup = strings.TrimSpace(o.RRGroups[i].RRBackup)
+		o.RRGroups[i].DeviceIDs = normalizeDeviceIDs(o.RRGroups[i].DeviceIDs)
+	}
 	for i := range o.Groups {
 		o.Groups[i].Name = strings.TrimSpace(o.Groups[i].Name)
 		if o.Groups[i].Members == nil {
@@ -157,6 +195,44 @@ func (o *OverlayConfig) group(id string) *OverlayGroup {
 		}
 	}
 	return nil
+}
+
+func (o *OverlayConfig) rrGroup(id string) *RRGroup {
+	for i := range o.RRGroups {
+		if o.RRGroups[i].ID == id {
+			return &o.RRGroups[i]
+		}
+	}
+	return nil
+}
+
+// rrGroupOf answers the only membership question the renderer asks. The save
+// gate refuses to put one device in two groups, so the first hit is the answer.
+func (o *OverlayConfig) rrGroupOf(nodeID uint16) *RRGroup {
+	for i := range o.RRGroups {
+		for _, id := range o.RRGroups[i].DeviceIDs {
+			if id == nodeID {
+				return &o.RRGroups[i]
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeDeviceIDs makes a saved group stable: the state file and the console
+// must not show a reordered list as a change.
+func normalizeDeviceIDs(ids []uint16) []uint16 {
+	out := make([]uint16, 0, len(ids))
+	seen := map[uint16]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // usedRTs is what this tenant's groups already hold. The allocator consults it so
@@ -492,6 +568,10 @@ type overlayView struct {
 	RRPrimary string      `json:"rr_primary"`
 	RRBackup  string      `json:"rr_backup"`
 	RRLibrary []rrPickRow `json:"rr_library"`
+	// RRGroups is the stored per-device split; a device no group names uses the
+	// two slots above. The page edits the list as a whole, which is also how the
+	// save endpoint takes it.
+	RRGroups []RRGroup `json:"rr_groups"`
 	// RRNote says what the two slots do and do not do on the device, because two
 	// labelled boxes promise a failover order this plane does not implement: the
 	// route client keeps a session up to every entry it is handed.
@@ -513,6 +593,7 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 		RRPrimary: oc.RRPrimary,
 		RRBackup:  oc.RRBackup,
 		RRLibrary: s.rrPickRowsLocked(tenantID),
+		RRGroups:  append([]RRGroup{}, oc.RRGroups...),
 		RRNote: "这两格（RR 1、RR 2）只是这一页上的两个格子，设备不排序：路由客户端对拿到的每一条 RR 都保持会话，" +
 			"两条的宣告并进同一张路由表（同一条前缀在两台上是同一份路由的两份拷贝），所以两条就是两条等价活动反射器，" +
 			"掉一条表不缩。控制器不会去连库里这些地址，所以这里没有绿灯可给——" +
@@ -533,6 +614,7 @@ func (s *server) overlayViewLocked(tenantID string, now int64) overlayView {
 	// page (an older file, a device that has since been removed), and a problem
 	// that exists is reported whether or not anyone is about to save.
 	view.Checks = append(view.Checks, s.overlayRRChecksLocked(tenantID)...)
+	view.Checks = append(view.Checks, s.overlayRRGroupChecksLocked(tenantID)...)
 	for _, g := range oc.Groups {
 		view.Checks = append(view.Checks, s.overlayGroupChecksLocked(tenantID, g, g.ID)...)
 		view.Checks = append(view.Checks, s.overlayTunnelChecksLocked(tenantID, g)...)
@@ -646,7 +728,8 @@ func (s *server) overlayRouteArtifactLocked(tenantID string, nodeID uint16) stri
 	// A tenant that has not picked, or one whose pick no longer resolves, renders
 	// no key at all -- overlayRRChecksLocked says why out loud, and the device
 	// keeps the rrs the operator wrote by hand until something real arrives.
-	if rrs := s.rrForTenantLocked(tenantID); len(rrs) > 0 {
+	// Per-device because an RR group overrides the tenant pair for its devices.
+	if rrs := s.rrsForDeviceLocked(tenantID, nodeID); len(rrs) > 0 {
 		doc.RRs = rrs
 	}
 	out, err := json.MarshalIndent(doc, "", "  ")

@@ -75,7 +75,7 @@ RR 手里那份隧道表（`Reflector.tunnels`）只被**一处**用到：我加
 - 扇出代价（如实记）：跨组前缀会无差别发给每台客户端，由收端挂 `no_path` 消化。这是删闸
   换来的简单性，代价是每盒路由数 = 全租户前缀数。
 
-## 待确认一件小事
+## 待确认一件小事（已定：一起删）
 
 `reflect_to` 的存废。它今天只能"在邻接之上做减法"（reflector.go:28-30），闸删了就没有基准。
 **我建议一起删**（test-route.sh C 段随之删）；若要保留，改成"绝对白名单"（配置了就只发给这些
@@ -115,4 +115,33 @@ test-route.sh 的 C 段）。线上协议不再有 `tunnels` 帧：`MsgTunnels` 
   撤隧道不动对端与 RR"）；`test-rr-switch.sh` 57/0；`test-boot.sh` 90/0；`test-vbond.sh` 196/0；
   `test-e2e.sh --keep` 46/0。
 
-O9-b（分组：配置面 + 身份乙 + 网格）未开始。
+## O9-b1 落地状态（2026-10-31，配置面 + 控制台）
+
+一件事：**这台设备连哪两台 RR**，被组点名的用组里的两台，没被点名的用租户那两格——一条规则，
+没有第三种情况。
+
+- 模型（`cmd/sr-ctrl/overlay.go`）：`RRGroup{id,name,device_ids,rr_primary,rr_backup}`；
+  `OverlayConfig.RRGroups` + `NextRRGroup`。`ensure()` 去空白、设备 id 去重排序（存盘与页面
+  不把重排当成改动）。
+- 写：`PUT /api/overlay/settings {rr_groups:[…]}` 整张列表替换（删掉一组 = 不再列出它），
+  `id` 由服务端发（`rg%d`），**计数随列表一起提交**：被拒的保存不烧号。
+- 读：`rrsForDeviceLocked(tenant, node)` 先查组（`rrGroupOf`，第一个命中）再落租户两格；
+  `overlayRouteArtifactLocked` 因此本来就按节点渲染，第 4 段 `rrs` 不用改形状。
+- 闸门：`rrGroupsChecksLocked` —— 组名必填、至少一台设备、两格都走 `rrSelectionErrorLocked`
+  （租户归属/不存在等）、至少一台 RR、RR 1≠RR 2、设备不重复、设备属于本租户、一台设备只在
+  一组；存盘状态每次读 `/api/overlay` 再查一遍（`overlayRRGroupChecksLocked`），只报不修。
+- E5 删除拒绝：`rrReferencesLocked` 现在也扫分组，删一条被组点名的 RR 仍是 409。
+- 控制台（Overlay › 全局）：RR 分组表格（组 / 设备 / RR 1 / RR 2 / 编辑·删除）+ 新建/编辑
+  表单（组名、可过滤多选设备、两个 RR 单选下拉）。四个控件都是草稿驱动（每次输入写 `o.rg`），
+  因此带 `data-keep`——否则 `render()` 的"保住用户没提交的输入"会把刚保存完的空表单重新填回
+  旧值（多选还会只剩第一台设备）。
+- 判据：`rr_groups_test.go` 5 条（按设备覆盖 reflector / 五种拒绝且不写状态不烧号 / 组也是删除
+  引用 / 存盘脏状态只报不修 / 规范化与重载）；`gofmt`+`go vet ./...`+`go test ./cmd/...
+  ./internal/...` 全绿。
+- 真实浏览器（租户 `gui-check`，临时给该租户建了一条指向 lab 在跑的 RR 的行，验证后已删）：
+  建组 → 行出现在表格；编辑 → 表单回填两台设备；取消 → 表单清空；重复设备 → 行内报「设备 2
+  已经在分组 rg1 里」且输入不被清掉；删除 → 确认框 + 回到 0 组；再建 → 表单在保存后**清空**。
+  `GET /api/config?node=` 的 `artifacts.route`：组内 node 2/3 带 `rrs:[rr4]`，组外 node 4 没有
+  `rrs` 键。
+
+身份乙（证书 URI 角色段）与 RR↔RR 网格（sr-rr 拨出侧 + 双向证书 + 邻居清单）是 O9-b2，未开始。

@@ -5123,6 +5123,7 @@
       o.g = { primary: doc.rr_primary || "", backup: doc.rr_backup || "",
         escape: !!doc.escape_all_colors };
     }
+    if (!o.rg) o.rg = ovRGBlank();
     ovPrune(doc);
   }
 
@@ -5130,9 +5131,13 @@
   // controller would refuse the whole save over it, and the row would look fine.
   function ovPrune(doc) {
     var o = ovStore();
-    if (!o.edit) return;
     var ids = {};
     (doc.nodes || []).forEach(function (n) { ids[n.node_id] = true; });
+    // An RR-group draft is pruned the same way: a device that has since been
+    // unenrolled would make the whole list save fail over a tick box the tenant
+    // cannot see any more.
+    if (o.rg) o.rg.devices = (o.rg.devices || []).filter(function (id) { return ids[Number(id)]; });
+    if (!o.edit) return;
     o.edit.members = o.edit.members.filter(function (m) { return !m.node || ids[m.node]; });
   }
 
@@ -5153,13 +5158,15 @@
   // a stored selection that is no longer pickable (row deleted, or re-assigned),
   // because dropping it from the list would turn the next save into a different
   // choice the tenant never made.
-  function ovRRItems(doc, slot) {
+  // `cur` is the slot's current id, not the slot's name: the tenant pair and every
+  // RR group have their own current value, and a stale one has to stay visible in
+  // whichever picker it belongs to.
+  function ovRRItems(doc, cur) {
     var items = (doc.rr_library || []).map(function (it) {
       return { value: it.id,
         text: it.name + " — " + it.addr + (it.location ? " — " + it.location : ""),
         tags: "" };
     });
-    var cur = slot === "primary" ? doc.rr_primary : doc.rr_backup;
     var seen = items.some(function (it) { return it.value === cur; });
     if (cur && !seen) {
       items.unshift({ value: cur, text: cur + "（当前选择，库里已经没有这一条，或它属于别的租户）", tags: "" });
@@ -5181,9 +5188,9 @@
     var pick = ovRRPickOpt();
     var h = '<form id="ov-global-form"><div class="und-cols">' +
       '<div class="und-box"><h3>RR 1</h3>' +
-      dpHtml("ov-rr-p", "ov-rr-p", ovRRItems(doc, "primary"), g.primary, pick) + "</div>" +
+      dpHtml("ov-rr-p", "ov-rr-p", ovRRItems(doc, g.primary), g.primary, pick) + "</div>" +
       '<div class="und-box"><h3>RR 2</h3>' +
-      dpHtml("ov-rr-b", "ov-rr-b", ovRRItems(doc, "backup"), g.backup, pick) + "</div></div>" +
+      dpHtml("ov-rr-b", "ov-rr-b", ovRRItems(doc, g.backup), g.backup, pick) + "</div></div>" +
       '<div class="hint" style="margin-top:10px">' + esc(doc.rr_note) + "</div>" +
       '<div class="und-cols" style="margin-top:12px">' +
       '<div class="und-box"><h3>这两格现在指的是</h3>' +
@@ -5226,6 +5233,146 @@
     });
   }
 
+  /* ---------------- RR 分组：一台设备连哪两台 RR ---------------- */
+
+  // 分组只回答一个问题：这台设备的第 4 段里写哪两个 RR 地址。反射器本身没有
+  // 变化——它对每个会话一视同仁地反射，分组是收端地址的选择，不是 RR 侧的策略。
+  function ovRGBlank() {
+    return { id: "", name: "", devices: [], primary: "", backup: "" };
+  }
+
+  function ovRGStart(doc, id) {
+    var o = ovStore();
+    if (id) {
+      var g = null;
+      (doc.rr_groups || []).forEach(function (x) { if (x.id === id) g = x; });
+      if (!g) return;
+      o.rg = { id: g.id, name: g.name || "", devices: (g.device_ids || []).map(String),
+        primary: g.rr_primary || "", backup: g.rr_backup || "" };
+    } else {
+      o.rg = ovRGBlank();
+    }
+    o.note = null;
+  }
+
+  function ovRGTable(doc, o) {
+    var rows = doc.rr_groups || [];
+    var h = '<section class="panel"><header><h2>RR 分组</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + rows.length +
+      " 组 · 没被任何组点名的设备用下面那两格</span></header>";
+    h += '<div class="hint">分组只管「这台设备连哪两台 RR」：被点名的设备，第 4 段里的 ' +
+      "<code>rrs</code> 就是这个组的两台，没被点名的用下面默认的两台。一台设备只能在一组。" +
+      "反射器那边没有区别——它把收到的路由原样发给除来源外的每个会话，不看隧道也不看分组。</div>";
+    if (!rows.length) {
+      h += '<div class="empty">还没有分组：所有设备都用下面那两格。</div>';
+    } else {
+      h += "<table><thead><tr><th>组</th><th>设备</th><th>RR 1</th><th>RR 2</th><th></th></tr></thead><tbody>";
+      rows.forEach(function (g) {
+        var names = (g.device_ids || []).map(function (id) {
+          var n = ovNodeOf(doc, id);
+          return "node-" + id + (n && n.name ? "（" + n.name + "）" : "");
+        }).join("、") || "—";
+        h += "<tr>" +
+          "<td><b>" + esc(g.name) + '</b> <span class="muted mono">' + esc(g.id) + "</span></td>" +
+          '<td class="mono" style="font-size:12px">' + esc(names) + "</td>" +
+          "<td>" + ovSlotCell(doc, g.rr_primary) + "</td>" +
+          "<td>" + ovSlotCell(doc, g.rr_backup) + "</td>" +
+          '<td class="row-actions">' +
+          '<button class="small" data-act="ov-rg-edit" data-id="' + esc(g.id) + '">' +
+          (o.rg && o.rg.id === g.id ? "收起" : "编辑") + "</button>" +
+          '<button class="small danger" data-act="ov-rg-del" data-id="' + esc(g.id) +
+          '" data-name="' + esc(g.name) + '">删除</button>' +
+          "</td></tr>";
+      });
+      h += "</tbody></table>";
+    }
+    h += "</section>";
+    return h;
+  }
+
+  // The four controls in this editor are draft-backed: every keystroke and pick
+  // writes into o.rg, so the draft -- not the DOM -- is what the next render must
+  // show. They carry data-keep because render()'s generic "keep the user's typing"
+  // restore would otherwise refill the blank editor with the just-saved values
+  // (and a multi-select would come back with only its first device).
+  function ovRGEditor(doc, o) {
+    var rg = o.rg || ovRGBlank();
+    var isNew = !rg.id;
+    var pick = ovRRPickOpt();
+    pick.empty = "不选（这一格留空）";
+    pick.attrs = "data-keep";
+    var devItems = ovNodeItems(doc.nodes);
+    return '<section class="panel"><header><h2>' + (isNew ? "新建 RR 分组" : "编辑分组 " + esc(rg.id)) + "</h2>" +
+      '<span class="muted" style="font-size:12.5px">' + (isNew ? "保存后进列表，发布后才到设备" :
+        esc(rg.name)) + "</span></header>" +
+      '<form id="ov-rg-form"><div class="fields">' +
+      '<div class="field"><label for="ov-rg-name">组名</label>' +
+      '<input id="ov-rg-name" value="' + esc(rg.name) + '" maxlength="64" placeholder="如 华东站点" data-keep></div>' +
+      '<div class="field"><label for="ov-rg-dev">设备（可多选）</label>' +
+      dpHtml("ov-rg-dev", "devices", devItems, rg.devices,
+        { multiple: true, size: 6, attrs: 'data-ov-rg="devices" data-keep' }) + "</div>" +
+      "</div>" +
+      '<div class="und-cols" style="margin-top:10px">' +
+      '<div class="und-box"><h3>RR 1</h3>' +
+      dpHtml("ov-rg-rrp", "rg_primary", ovRRItems(doc, rg.primary), rg.primary, pick) + "</div>" +
+      '<div class="und-box"><h3>RR 2</h3>' +
+      dpHtml("ov-rg-rrb", "rg_backup", ovRRItems(doc, rg.backup), rg.backup, pick) + "</div></div>" +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center">' +
+      '<button class="primary" type="submit">' + (isNew ? "加这一组" : "保存修改") + "</button>" +
+      '<button class="small" type="button" data-act="ov-rg-x">取消</button></div>' +
+      '<div class="err" id="ov-rg-err" role="alert"></div>' +
+      '<div class="hint" style="margin:10px 0 0">两台 RR 都是活动反射器，不分主备：设备对两条都保持会话，掉一条表不缩。</div>' +
+      "</form></section>";
+  }
+
+  // 整张列表一起写：删掉一组就是不再列出它。因此「一台设备在两处」这种错只
+  // 存在于这一份候选列表里，由控制器一次判掉——页面不自己算一半。
+  function ovRGSend(list, okText) {
+    var o = ovStore();
+    var body = list.map(function (g) {
+      return { id: g.id || "", name: g.name, device_ids: (g.device_ids || []).map(Number),
+        rr_primary: g.rr_primary || "", rr_backup: g.rr_backup || "" };
+    });
+    api("PUT", "/api/overlay/settings", { rr_groups: body }).then(function (res) {
+      ovSetDoc(res.overlay || o.doc);
+      o.rg = ovRGBlank();
+      o.note = { kind: "", text: okText };
+      blurContent();
+      render();
+      toast("RR 分组已保存");
+    }).catch(function (err) {
+      ovErr("ov-rg-err", undErrNote(err).text);
+    });
+  }
+
+  function ovSaveRRGroup() {
+    var o = ovStore();
+    if (!o.doc) return;
+    var rg = o.rg || ovRGBlank();
+    var nameEl = $("ov-rg-name");
+    var name = String(nameEl ? nameEl.value : rg.name).trim();
+    if (!name) { ovErr("ov-rg-err", "组名必填"); return; }
+    var devs = (rg.devices || []).filter(function (v) { return Number(v) > 0; });
+    if (!devs.length) { ovErr("ov-rg-err", "至少选一台设备"); return; }
+    if (!rg.primary && !rg.backup) { ovErr("ov-rg-err", "至少选一台 RR"); return; }
+    if (rg.primary && rg.primary === rg.backup) { ovErr("ov-rg-err", "RR 1 和 RR 2 不能选同一条"); return; }
+    var list = (o.doc.rr_groups || []).map(function (g) { return g; });
+    var row = { id: rg.id || "", name: name, device_ids: devs, rr_primary: rg.primary || "", rr_backup: rg.backup || "" };
+    var hit = -1;
+    list.forEach(function (g, i) { if (g.id === rg.id && rg.id) hit = i; });
+    if (hit >= 0) list[hit] = row; else list.push(row);
+    ovRGSend(list, "分组「" + name + "」已保存。这一份是下一次发布的输入：到「基础配置」发布以后，" +
+      "这一组设备才会拿到新的 rrs。");
+  }
+
+  function ovDeleteRRGroup(id, name) {
+    var o = ovStore();
+    if (!o.doc) return;
+    if (!confirm("删除分组「" + name + "」？\n\n组里的设备会回到下面默认的两格。已经装在设备上的 rrs 要等下一次发布才变。")) return;
+    var list = (o.doc.rr_groups || []).filter(function (g) { return g.id !== id; }).map(function (g) { return g; });
+    ovRGSend(list, "分组「" + name + "」已删除：组里的设备回到下面默认的两格。");
+  }
+
   function viewOverlaySettings() {
     var o = ensureOverlay();
     var doc = o.doc;
@@ -5235,6 +5382,8 @@
     }
     var h = "";
     if (o.note) h += undNote(o.note);
+    h += ovRGTable(doc, o);
+    h += ovRGEditor(doc, o);
     h += '<section class="panel"><header><h2>反射器与逃生开关</h2>' +
       '<span class="muted" style="font-size:12.5px">库里可选 ' + (doc.rr_library || []).length + " 条</span></header>";
     if (!(doc.rr_library || []).length) {
@@ -5847,6 +5996,42 @@
       e.preventDefault();
       ovSaveGroup(ggf);
     });
+    var rgf = $("ov-rg-form");
+    if (rgf) rgf.addEventListener("submit", function (e) {
+      e.preventDefault();
+      ovSaveRRGroup();
+    });
+    var rgn = $("ov-rg-name");
+    if (rgn) rgn.addEventListener("input", function () {
+      var o = ovStore();
+      if (!o.rg) o.rg = ovRGBlank();
+      o.rg.name = rgn.value;
+      var slot = $("ov-rg-err");
+      if (slot) slot.textContent = "";
+    });
+    // 多选列表自己带过滤框，过滤时只换 option 不重建整页，所以这里挂一次就够；
+    // 选中集合每次 change 都写回草稿，否则下一次重画会按旧草稿把勾去掉。
+    var rgd = document.querySelector('#content select[data-dp-list="ov-rg-dev"]');
+    if (rgd) rgd.addEventListener("change", function () {
+      var o = ovStore();
+      if (!o.rg) return;
+      o.rg.devices = Array.prototype.slice.call(rgd.selectedOptions).map(function (op) { return op.value; });
+    });
+    var rrp = $("ov-rg-rrp"), rrb = $("ov-rg-rrb");
+    if (rrp) rrp.addEventListener("change", function () {
+      var o = ovStore();
+      if (!o.rg) return;
+      o.rg.primary = rrp.value;
+      blurContent();
+      render();
+    });
+    if (rrb) rrb.addEventListener("change", function () {
+      var o = ovStore();
+      if (!o.rg) return;
+      o.rg.backup = rrb.value;
+      blurContent();
+      render();
+    });
     // 组名是手打的，必须当场写回草稿：这个表单里「＋ 加一行成员」和换设备都会
     // 重画，而重画时输入框的 value 是按草稿里的旧名字生成的——keep 那一轮只补
     // 空值、不覆盖非空值，所以不写回状态的话，改的名字会在他点下"＋"的那一刻
@@ -6107,11 +6292,30 @@
           var orl = ovStore();
           orl.doc = null;
           orl.g = null;
+          orl.rg = null;
           orl.edit = null;
           orl.note = null;
           blurContent();
           render();
           loadOverlay();
+        }
+        else if (act === "ov-rg-edit") {
+          var orge = ovStore();
+          if (!orge.doc) return;
+          var orId = el.getAttribute("data-id");
+          if (orge.rg && orge.rg.id === orId) orge.rg = ovRGBlank();
+          else ovRGStart(orge.doc, orId);
+          blurContent();
+          render();
+        }
+        else if (act === "ov-rg-del") {
+          ovDeleteRRGroup(el.getAttribute("data-id"), el.getAttribute("data-name") || "该分组");
+        }
+        else if (act === "ov-rg-x") {
+          var orgx = ovStore();
+          orgx.rg = ovRGBlank();
+          blurContent();
+          render();
         }
         else if (act === "ov-group-new") {
           var onew = ovStore();
