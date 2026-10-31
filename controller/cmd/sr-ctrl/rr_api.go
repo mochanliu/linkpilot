@@ -30,11 +30,11 @@ type rrWriteRequest struct {
 	Name     string `json:"name"`
 	Addr     string `json:"addr"`
 	Location string `json:"location"`
-	// Owner is a tenant id, or "" for 共享. Sending the same value the row
-	// already has is always allowed, even when that tenant no longer exists, so
-	// the operator can fix a name or an address on an orphaned row without first
-	// having to re-point it at a live tenant.
-	Owner string `json:"owner"`
+	// TenantID is the row's 归属 and is required: there is no shared tier, so a
+	// row without a tenant is a row nobody can pick. An orphaned row (its tenant
+	// was deleted) has to be re-bound to a live tenant on the next save -- there
+	// is no "keep it as it was" value left to send.
+	TenantID string `json:"owner"`
 }
 
 type rrIDRequest struct {
@@ -98,7 +98,7 @@ func (s *server) handleAdminRRs(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(req.Name)
 	addr := strings.TrimSpace(req.Addr)
 	location := strings.TrimSpace(req.Location)
-	owner := strings.TrimSpace(req.Owner)
+	owner := strings.TrimSpace(req.TenantID)
 	if err := validRRName(name); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -126,18 +126,23 @@ func (s *server) handleAdminRRs(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("RR 库数量已达上限 %d", rrMaxItems), http.StatusConflict)
 			return
 		}
-		// A brand-new row has no previous owner, so an owner that names nobody is
-		// simply a typo -- and a typo here means a row no tenant can ever pick.
-		if owner != "" && s.state.Tenants[owner] == nil {
+		// A row is added for a tenant, always: an empty 归属 is not "shared", it is
+		// a missing decision, and an id that names nobody is a typo -- either way
+		// the row would be one no tenant can ever pick.
+		if owner == "" {
+			http.Error(w, "RR 必须归属一个租户：先在租户表里建好那个租户，再回到这一页添加。", http.StatusBadRequest)
+			return
+		}
+		if s.state.Tenants[owner] == nil {
 			http.Error(w, "归属租户不存在："+owner, http.StatusBadRequest)
 			return
 		}
 		it := RRItem{ID: lib.nextID(), Name: name, Addr: addr, Location: location,
-			Owner: owner, CreatedAt: now}
+			TenantID: owner, CreatedAt: now}
 		lib.Items = append(lib.Items, it)
 		s.rrTouchLocked(lib, id.Username, now)
 		s.save()
-		log.Printf("rrlib: created %s addr=%s owner=%q by %s", it.ID, it.Addr, it.Owner, id.Username)
+		log.Printf("rrlib: created %s addr=%s owner=%q by %s", it.ID, it.Addr, it.TenantID, id.Username)
 		s.rrResponseLocked(w, map[string]any{"rr": s.rrRowLocked(it)})
 		return
 	}
@@ -151,12 +156,18 @@ func (s *server) handleAdminRRs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "RR 不存在", http.StatusNotFound)
 		return
 	}
-	if owner != "" && owner != it.Owner && s.state.Tenants[owner] == nil {
+	if owner == "" {
+		http.Error(w, "RR 必须归属一个租户：这一条现在没有租户，请选一个现存租户保存。", http.StatusBadRequest)
+		return
+	}
+	// Unlike create, this also catches the orphan case: an id that no longer names
+	// a tenant cannot be saved back, so fixing an orphaned row means binding it.
+	if s.state.Tenants[owner] == nil {
 		http.Error(w, "归属租户不存在："+owner, http.StatusBadRequest)
 		return
 	}
 	before := *it
-	it.Name, it.Addr, it.Location, it.Owner = name, addr, location, owner
+	it.Name, it.Addr, it.Location, it.TenantID = name, addr, location, owner
 	it.UpdatedAt = now
 	// The address is what the device dials, so a change here is the one edit that
 	// is worth a log line even when nothing else moved.
@@ -164,7 +175,7 @@ func (s *server) handleAdminRRs(w http.ResponseWriter, r *http.Request) {
 	s.rrTouchLocked(lib, id.Username, now)
 	s.save()
 	log.Printf("rrlib: updated %s addr=%s owner=%q addrChanged=%t by %s",
-		it.ID, it.Addr, it.Owner, addrChanged, id.Username)
+		it.ID, it.Addr, it.TenantID, addrChanged, id.Username)
 	s.rrResponseLocked(w, map[string]any{
 		"rr":           s.rrRowLocked(*it),
 		"addr_changed": addrChanged,
@@ -248,7 +259,7 @@ func (s *server) rrRowLocked(it RRItem) rrLibraryRow {
 	}
 	return rrLibraryRow{
 		ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location,
-		Owner: it.Owner, OwnerLabel: s.rrOwnerLabelLocked(it),
+		TenantID: it.TenantID, OwnerLabel: s.rrOwnerLabelLocked(it),
 		UsedBy: refs, UsedNames: names,
 		CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
 	}

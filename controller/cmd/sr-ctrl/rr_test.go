@@ -63,7 +63,7 @@ func rrReq(t *testing.T, s *server, method, target, body, sid string) *httptest.
 // rrCreate adds one row as the operator and returns its id.
 func rrCreate(t *testing.T, s *server, sid, name, addr, owner string) string {
 	t.Helper()
-	body, _ := json.Marshal(rrWriteRequest{Name: name, Addr: addr, Location: "lab", Owner: owner})
+	body, _ := json.Marshal(rrWriteRequest{Name: name, Addr: addr, Location: "lab", TenantID: owner})
 	rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), sid)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /api/rrs (%s %s) = %d (%s)", name, addr, rec.Code, rec.Body.String())
@@ -128,8 +128,8 @@ type wireRRRow struct {
 func TestRRAddListAndPick(t *testing.T) {
 	s, ten, _, ops := rrFixture(t)
 
-	first := rrCreate(t, s, ops, "RR 上海", "rr-sh.example.com:20200", "")
-	second := rrCreate(t, s, ops, "RR 法兰克福", "192.0.2.9:20200", "")
+	first := rrCreate(t, s, ops, "RR 上海", "rr-sh.example.com:20200", "t")
+	second := rrCreate(t, s, ops, "RR 法兰克福", "192.0.2.9:20200", "t")
 	if first != "rr1" || second != "rr2" {
 		t.Fatalf("ids = %s, %s，想要 rr1、rr2", first, second)
 	}
@@ -144,7 +144,7 @@ func TestRRAddListAndPick(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
-	if len(list.RRs) != 2 || list.RRs[0].OwnerLabel != "共享" {
+	if len(list.RRs) != 2 || list.RRs[0].OwnerLabel != "甲方网络" {
 		t.Fatalf("operator list = %+v", list.RRs)
 	}
 	for _, row := range list.RRs {
@@ -195,7 +195,7 @@ func TestRRAddressValidation(t *testing.T) {
 		{"", false},
 	}
 	for i, c := range cases {
-		body, _ := json.Marshal(rrWriteRequest{Name: fmt.Sprintf("probe-%d", i), Addr: c.addr})
+		body, _ := json.Marshal(rrWriteRequest{Name: fmt.Sprintf("probe-%d", i), Addr: c.addr, TenantID: "t"})
 		rec := rrReq(t, s, http.MethodPost, "/api/rrs", string(body), ops)
 		if ok := rec.Code == http.StatusOK; ok != c.ok {
 			t.Errorf("addr %q = %d，想要 ok=%v (%s)", c.addr, rec.Code, c.ok, rec.Body.String())
@@ -209,32 +209,30 @@ func TestRRAddressValidation(t *testing.T) {
 	}
 }
 
-func TestRROwnershipFiltersThePicker(t *testing.T) {
+func TestRRIsBoundToOneTenant(t *testing.T) {
 	s, ten, two, ops := rrFixture(t)
-	shared := rrCreate(t, s, ops, "共享 RR", "192.0.2.1:20200", "")
 	// The row name is echoed in the refusal, so it must not be a name that hands
 	// the owner away either.
 	mine := rrCreate(t, s, ops, "VIP 专线", "192.0.2.2:20200", "t")
 
-	// t sees both; t2 sees only the shared one -- and cannot even tell that the
-	// exclusive row exists, because it is not in its list.
-	if got := overlayGetView(t, s, ten).RRLibrary; len(got) != 2 {
-		t.Errorf("t 的可选列表 = %+v，想要 2 条", got)
+	// t sees its own row; t2 sees nothing -- and cannot even tell that the row
+	// exists, because it is not in its list.
+	if got := overlayGetView(t, s, ten).RRLibrary; len(got) != 1 || got[0].ID != mine {
+		t.Errorf("t 的可选列表 = %+v，想要只有 %s", got, mine)
 	}
-	got2 := overlayGetView(t, s, two).RRLibrary
-	if len(got2) != 1 || got2[0].ID != shared {
-		t.Errorf("t2 的可选列表 = %+v，想要只有 %s", got2, shared)
+	if got2 := overlayGetView(t, s, two).RRLibrary; len(got2) != 0 {
+		t.Errorf("t2 的可选列表 = %+v，想要 0 条", got2)
 	}
 
 	if rec := rrSet(t, s, two, rrStr(mine), nil); rec.Code != http.StatusBadRequest {
-		t.Fatalf("t2 选别人的独享 RR = %d，想要 400 (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("t2 选别人的 RR = %d，想要 400 (%s)", rec.Code, rec.Body.String())
 	} else if body := rec.Body.String(); strings.Contains(body, "甲方网络") {
 		t.Errorf("拒绝消息里说出了归属租户是谁: %s", body)
-	} else if !strings.Contains(body, "别的租户独享") {
+	} else if !strings.Contains(body, "不属于本租户") {
 		t.Errorf("拒绝的话没说明原因: %s", body)
 	}
 	if rec := rrSet(t, s, ten, rrStr(mine), nil); rec.Code != http.StatusOK {
-		t.Fatalf("t 选自己的独享 RR = %d (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("t 选自己的 RR = %d (%s)", rec.Code, rec.Body.String())
 	}
 	// An id that is not in the library at all is refused the same way.
 	if rec := rrSet(t, s, ten, rrStr("rr999"), nil); rec.Code != http.StatusBadRequest {
@@ -244,10 +242,47 @@ func TestRROwnershipFiltersThePicker(t *testing.T) {
 	if rec := rrSet(t, s, ten, rrStr(mine), rrStr(mine)); rec.Code != http.StatusBadRequest {
 		t.Fatalf("主备同一条 = %d，想要 400 (%s)", rec.Code, rec.Body.String())
 	}
-	// An exclusive row whose owner is not a tenant cannot be created at all.
+	// Every row is added for somebody: no 归属 is a missing decision, not "shared".
+	if rec := rrReq(t, s, http.MethodPost, "/api/rrs",
+		`{"name":"没有归属","addr":"192.0.2.3:20200"}`, ops); rec.Code != http.StatusBadRequest {
+		t.Errorf("不填归属 = %d，想要 400 (%s)", rec.Code, rec.Body.String())
+	}
+	// An 归属 that names nobody is a typo, and a typo means a row no tenant can pick.
 	if rec := rrReq(t, s, http.MethodPost, "/api/rrs",
 		`{"name":"幽灵","addr":"192.0.2.3:20200","owner":"nope"}`, ops); rec.Code != http.StatusBadRequest {
 		t.Errorf("归属填了不存在的租户 = %d，想要 400", rec.Code)
+	}
+}
+
+// A row restored from before the binding rule -- its "owner" was empty, which
+// used to mean "shared" -- must not be adopted by every tenant now. It stays in
+// the library, is visible to nobody, and is named in the checks.
+func TestRRUnboundRowIsVisibleToNobody(t *testing.T) {
+	s, ten, _, ops := rrFixture(t)
+	s.mu.Lock()
+	lib := s.rrLibraryLocked(true)
+	lib.Items = append(lib.Items, RRItem{ID: "rr50", Name: "老数据", Addr: "192.0.2.50:20200"})
+	s.overlayConfigLocked("t", true).RRPrimary = "rr50"
+	s.mu.Unlock()
+
+	if got := overlayGetView(t, s, ten).RRLibrary; len(got) != 0 {
+		t.Errorf("t 看到了没绑租户的行: %+v", got)
+	}
+	msg := hasBlockingCheck(overlayGetView(t, s, ten).Checks)
+	if !strings.Contains(msg, "rr50") || !strings.Contains(msg, "绑定租户") {
+		t.Errorf("读时检查没把「没绑租户」说清楚: %q", msg)
+	}
+	if doc := decodeRouteDoc(t, routeArtifact(t, s, "t", 1)); doc["rrs"] != nil {
+		t.Errorf("没绑租户的行还是下发了: %s", doc["rrs"])
+	}
+	// The operator's table has to explain it too, and normalize must keep the row.
+	rec := rrReq(t, s, http.MethodGet, "/api/rrs", "", ops)
+	if !strings.Contains(rec.Body.String(), "未绑定租户") {
+		t.Errorf("运营方表里没说明这一条没绑租户: %s", rec.Body.String())
+	}
+	normalizeRRs(s.state)
+	if len(s.state.RRs.Items) != 1 || s.state.RRs.Items[0].ID != "rr50" {
+		t.Fatalf("normalize 把没绑租户的行删了: %+v", s.state.RRs.Items)
 	}
 }
 
@@ -257,8 +292,8 @@ func TestRRRenderIsOptInAndNeverEmpty(t *testing.T) {
 		t.Fatal("租户还没选，第 4 段里就有 rrs 了")
 	}
 
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "")
-	b := rrCreate(t, s, ops, "RR-B", "192.0.2.11:20200", "")
+	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
+	b := rrCreate(t, s, ops, "RR-B", "192.0.2.11:20200", "t")
 	if rec := rrSet(t, s, ten, rrStr(a), rrStr(b)); rec.Code != http.StatusOK {
 		t.Fatalf("选主备 = %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -301,8 +336,8 @@ func TestRRRenderIsOptInAndNeverEmpty(t *testing.T) {
 
 func TestRRDeleteGuardAndIDNeverReturns(t *testing.T) {
 	s, ten, _, ops := rrFixture(t)
-	keep := rrCreate(t, s, ops, "被选中的 RR", "192.0.2.20:20200", "")
-	free := rrCreate(t, s, ops, "没人选", "192.0.2.21:20200", "")
+	keep := rrCreate(t, s, ops, "被选中的 RR", "192.0.2.20:20200", "t")
+	free := rrCreate(t, s, ops, "没人选", "192.0.2.21:20200", "t")
 
 	if rec := rrSet(t, s, ten, rrStr(keep), nil); rec.Code != http.StatusOK {
 		t.Fatalf("选 RR = %d", rec.Code)
@@ -326,7 +361,7 @@ func TestRRDeleteGuardAndIDNeverReturns(t *testing.T) {
 	if rec := rrReq(t, s, http.MethodPost, "/api/rrs/delete", fmt.Sprintf(`{"id":%q}`, keep), ops); rec.Code != http.StatusOK {
 		t.Fatalf("解除引用之后删 = %d (%s)", rec.Code, rec.Body.String())
 	}
-	next := rrCreate(t, s, ops, "RR 新增", "192.0.2.22:20200", "")
+	next := rrCreate(t, s, ops, "RR 新增", "192.0.2.22:20200", "t")
 	if next == keep || next == free {
 		t.Fatalf("新条目复用了已删除的 id %s：租户里那条引用会突然指向一台别的机器", next)
 	}
@@ -359,7 +394,7 @@ func TestRRDanglingReferenceIsNamedNotHealed(t *testing.T) {
 
 func TestRRPersistenceAndNormalize(t *testing.T) {
 	s, ten, _, ops := rrFixture(t)
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "")
+	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
 	if rec := rrSet(t, s, ten, rrStr(a), nil); rec.Code != http.StatusOK {
 		t.Fatalf("选 RR = %d", rec.Code)
 	}
@@ -380,7 +415,7 @@ func TestRRPersistenceAndNormalize(t *testing.T) {
 	}
 	// A row with no address cannot be dialled: normalize drops it rather than
 	// advertise an RR no device can reach.
-	st.RRs.Items = append(st.RRs.Items, RRItem{ID: "rr9", Name: "残缺", Addr: "", Owner: "t"})
+	st.RRs.Items = append(st.RRs.Items, RRItem{ID: "rr9", Name: "残缺", Addr: "", TenantID: "t"})
 	if !normalizeRRs(st) {
 		t.Error("残缺条目被留下了")
 	}
@@ -399,7 +434,7 @@ func TestRRPersistenceAndNormalize(t *testing.T) {
 		t.Errorf("normalize 把租户的选择改了: %q", st.Overlays["t"].RRPrimary)
 	}
 	// A hand-edited id higher than the counter must not be re-minted later.
-	st.RRs.Items = append(st.RRs.Items, RRItem{ID: "rr40", Name: "手写", Addr: "192.0.2.40:20200"})
+	st.RRs.Items = append(st.RRs.Items, RRItem{ID: "rr40", Name: "手写", Addr: "192.0.2.40:20200", TenantID: "t"})
 	normalizeRRs(st)
 	if st.RRs.NextID < 40 {
 		t.Errorf("计数器 %d 还低于库里已有的 rr40，下次新建会撞 id", st.RRs.NextID)
@@ -430,7 +465,7 @@ func TestRREditMarksTheDevicePending(t *testing.T) {
 	if v := decodeConfigView(t, configRequest(t, s, ten, http.MethodPut, "/api/config", string(draftBody))); v.Version != 1 {
 		t.Fatalf("存草稿 = %+v", v)
 	}
-	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "")
+	a := rrCreate(t, s, ops, "RR-A", "192.0.2.10:20200", "t")
 	if rec := rrSet(t, s, ten, rrStr(a), nil); rec.Code != http.StatusOK {
 		t.Fatalf("选 RR = %d", rec.Code)
 	}
@@ -440,7 +475,7 @@ func TestRREditMarksTheDevicePending(t *testing.T) {
 	if v := decodeConfigView(t, configRequest(t, s, ten, http.MethodGet, "/api/config?node=1", "")); v.OverlayPending {
 		t.Fatal("刚发布完就说待发布")
 	}
-	body, _ := json.Marshal(rrWriteRequest{ID: a, Name: "RR-A", Addr: "192.0.2.99:20200"})
+	body, _ := json.Marshal(rrWriteRequest{ID: a, Name: "RR-A", Addr: "192.0.2.99:20200", TenantID: "t"})
 	if rec := rrReq(t, s, http.MethodPut, "/api/rrs", string(body), ops); rec.Code != http.StatusOK {
 		t.Fatalf("改地址 = %d (%s)", rec.Code, rec.Body.String())
 	}

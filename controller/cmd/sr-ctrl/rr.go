@@ -42,17 +42,22 @@ const (
 
 // RRItem is one reflector in the library.
 //
-// Owner is the 归属 the operator sets when adding a row: "" means every tenant
-// may pick it, any other value is a tenant id and makes the row exclusive to
-// that tenant. It is deliberately a plain tenant id rather than a list -- a set
-// of allowed tenants would need its own editing surface and a reason for a
-// tenant to be excluded from an RR it shares its underlay with.
+// TenantID is the row's one and only 归属: a reflector belongs to the tenant
+// whose devices dial it. There is no shared tier (2026-10-31 定案) -- a row the
+// operator adds is always added *for* somebody. A reflector every tenant may
+// pick from is one nobody owns: its capacity, its address and its retirement
+// become everybody's problem and no one's decision.
+//
+// The JSON key stays "owner" even though the field is now a required tenant id.
+// Renaming it would drop every binding already on disk and turn those rows into
+// orphans nobody can pick -- a silent change to a customer's setting is exactly
+// what this file refuses to do.
 type RRItem struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Addr     string `json:"addr"`
 	Location string `json:"location"`
-	Owner    string `json:"owner,omitempty"`
+	TenantID string `json:"owner,omitempty"`
 
 	CreatedAt int64 `json:"created_at_unix"`
 	UpdatedAt int64 `json:"updated_at_unix,omitempty"`
@@ -81,7 +86,7 @@ func (l *RRLibrary) ensure() {
 		l.Items[i].Name = strings.TrimSpace(l.Items[i].Name)
 		l.Items[i].Addr = strings.TrimSpace(l.Items[i].Addr)
 		l.Items[i].Location = strings.TrimSpace(l.Items[i].Location)
-		l.Items[i].Owner = strings.TrimSpace(l.Items[i].Owner)
+		l.Items[i].TenantID = strings.TrimSpace(l.Items[i].TenantID)
 	}
 }
 
@@ -110,12 +115,17 @@ func (l *RRLibrary) nextID() string {
 	}
 }
 
-// visibleTo is the rows one tenant may pick: every shared row plus the rows the
-// operator marked exclusive to this tenant. Sorted the way the picker shows it.
+// visibleTo is the rows one tenant may pick: only the rows bound to it. An
+// unbound row is visible to nobody -- before this rule existed an empty owner
+// meant "everyone", so carrying that reading forward would quietly hand out rows
+// the operator never gave to anybody.
 func (l *RRLibrary) visibleTo(tenantID string) []RRItem {
 	out := []RRItem{}
+	if tenantID == "" {
+		return out
+	}
 	for _, it := range l.Items {
-		if it.Owner == "" || it.Owner == tenantID {
+		if it.TenantID == tenantID {
 			out = append(out, it)
 		}
 	}
@@ -137,17 +147,18 @@ func (s *server) rrLibraryLocked(create bool) *RRLibrary {
 }
 
 // rrOwnerLabelLocked names a row's 归属 for the operator's table. A row whose
-// owner tenant has been deleted stays in the library and says so: dropping it
-// would delete the operator's row as a side effect of deleting a customer, and
-// silently turning it shared would hand it to every other tenant.
+// tenant has been deleted -- or a row restored from before the binding rule --
+// stays in the library and says so: dropping it would delete the operator's row
+// as a side effect of deleting a customer, and there is no longer anywhere to
+// "fall back" to, so the label has to be the thing that gets it fixed.
 func (s *server) rrOwnerLabelLocked(it RRItem) string {
-	if it.Owner == "" {
-		return "共享"
+	if it.TenantID == "" {
+		return "未绑定租户（谁都选不到这一条）"
 	}
-	if t := s.state.Tenants[it.Owner]; t != nil {
-		return "独享：" + t.Name
+	if t := s.state.Tenants[it.TenantID]; t != nil {
+		return t.Name
 	}
-	return "独享：" + it.Owner + "（该租户已不存在，谁都选不到这一条）"
+	return it.TenantID + "（该租户已不存在，谁都选不到这一条）"
 }
 
 // rrReferencesLocked lists the tenants whose 主 or 备 slot names this row. The
@@ -187,7 +198,7 @@ func (s *server) rrForTenantLocked(tenantID string) []wire.RRAddress {
 	out := []wire.RRAddress{}
 	for _, id := range []string{oc.RRPrimary, oc.RRBackup} {
 		it := lib.get(id)
-		if it == nil || (it.Owner != "" && it.Owner != tenantID) {
+		if it == nil || it.TenantID != tenantID {
 			continue
 		}
 		out = append(out, wire.RRAddress{ID: it.ID, Addr: it.Addr})
@@ -224,7 +235,10 @@ func (s *server) overlayRRChecksLocked(tenantID string) []ConfigCheck {
 		case it == nil:
 			add("error", "%s 选了库里已经不存在的条目 %q：这一台设备这一版拿不到 RR，去「Overlay 配置 › 全局」重选。",
 				slot.name, slot.id)
-		case it.Owner != "" && it.Owner != tenantID:
+		case it.TenantID == "":
+			add("error", "%s 选的 %q（%s）还没绑定租户，谁都选不到：让运营方在「资产 › RR 库」把它绑到一个租户。",
+				slot.name, slot.id, it.Name)
+		case it.TenantID != tenantID:
 			add("error", "%s 选的 %q（%s）归属别的租户，本租户用不了：这一版不会把它下发。",
 				slot.name, slot.id, it.Name)
 		}
@@ -253,10 +267,10 @@ type rrLibraryRow struct {
 	Name     string `json:"name"`
 	Addr     string `json:"addr"`
 	Location string `json:"location"`
-	Owner    string `json:"owner,omitempty"`
+	TenantID string `json:"owner,omitempty"`
 	// OwnerLabel is the 归属 as a sentence, because a bare tenant id is unreadable
-	// and a page that showed "shared: true" would hide the one case that needs
-	// explaining: an exclusive row whose tenant is gone.
+	// and the two rows that need explaining -- no binding, or a tenant that no
+	// longer exists -- look identical as an empty or stale id.
 	OwnerLabel string   `json:"owner_label"`
 	UsedBy     []string `json:"used_by"`
 	UsedNames  []string `json:"used_names"`
@@ -286,7 +300,7 @@ func (s *server) rrLibraryRowsLocked() []rrLibraryRow {
 		}
 		out = append(out, rrLibraryRow{
 			ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location,
-			Owner: it.Owner, OwnerLabel: s.rrOwnerLabelLocked(it),
+			TenantID: it.TenantID, OwnerLabel: s.rrOwnerLabelLocked(it),
 			UsedBy: refs, UsedNames: names,
 			CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
 		})
@@ -373,9 +387,9 @@ func validRRName(name string) error {
 }
 
 // rrSelectionErrorLocked is the save-time half of the visibility rule. It says
-// only who may not pick a row: whether the id exists, and whether it belongs to
-// somebody else. Naming the tenant that owns an exclusive row would tell a
-// curious customer who else buys service here, so the message stops at "别的租户".
+// only who may not pick a row: whether the id exists, and whether it is bound to
+// somebody else. Naming that tenant would tell a curious customer who else buys
+// service here, so the message stops at "不属于本租户".
 func (s *server) rrSelectionErrorLocked(tenantID, id string) string {
 	if id == "" {
 		return ""
@@ -384,8 +398,10 @@ func (s *server) rrSelectionErrorLocked(tenantID, id string) string {
 	switch {
 	case it == nil:
 		return fmt.Sprintf("%q 不在 RR 库里；库里只有运营方在「资产 › RR 库」添加的那些条目", id)
-	case it.Owner != "" && it.Owner != tenantID:
-		return fmt.Sprintf("%q（%s）是别的租户独享的，本租户选不了", id, it.Name)
+	case it.TenantID == "":
+		return fmt.Sprintf("%q（%s）还没绑定租户，谁都选不了：让运营方在「资产 › RR 库」把它绑到一个租户", id, it.Name)
+	case it.TenantID != tenantID:
+		return fmt.Sprintf("%q（%s）不属于本租户：每条 RR 只归一个租户所有", id, it.Name)
 	}
 	return ""
 }
@@ -406,7 +422,9 @@ func validRRLocation(loc string) error {
 // normalizeRRs repairs the library itself. It deliberately does NOT clear a
 // tenant's selection when the id it names is missing: that would make a
 // hand-edited or restored state file lose the customer's setting without anyone
-// being told, and overlayRRChecksLocked reports the contradiction instead.
+// being told, and overlayRRChecksLocked reports the contradiction instead. The
+// same rule covers rows with no tenant: they stay, visible to nobody, and the
+// operator's table says so.
 func normalizeRRs(st *State) bool {
 	changed := false
 	// Creating the container is not a repair worth a rewrite: a state file from

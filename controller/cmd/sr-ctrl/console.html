@@ -4927,6 +4927,7 @@
     var body = rrBody(new FormData(form), "rr-n");
     if (!body.name) { rrErr("rr-new-err", "名称必填"); return; }
     if (!body.addr) { rrErr("rr-new-err", "地址必填，而且要带端口（ip:port 或 域名:port）"); return; }
+    if (!body.owner) { rrErr("rr-new-err", "先选归属租户：每条 RR 都只归一个租户"); return; }
     r.loading = true;
     r.note = null;
     api("POST", "/api/rrs", body).then(function (res) {
@@ -4942,6 +4943,7 @@
     body.id = r.edit.id;
     if (!body.name) { rrErr("rr-edit-err", "名称必填"); return; }
     if (!body.addr) { rrErr("rr-edit-err", "地址必填，而且要带端口（ip:port 或 域名:port）"); return; }
+    if (!body.owner) { rrErr("rr-edit-err", "先选归属租户：每条 RR 都只归一个租户"); return; }
     r.loading = true;
     r.note = null;
     api("PUT", "/api/rrs", body).then(function (res) {
@@ -4968,18 +4970,22 @@
 
   // 归属的候选直接取 /api/state 已经带来的租户表：GET /api/tenants 是 POST-only，
   // 为这一个下拉再开一条读口不值。
+  //
+  // 没有「共享」这一项：每条 RR 都归一个租户，所以新增时这个空值只是一个"还没选"
+  // 的占位，保存前会被拦下。
   function rrOwnerOptions(cur) {
     var ts = (S.state && S.state.tenants) || [];
-    var h = '<option value="">共享（所有租户都能选）</option>';
+    var h = '<option value="">请选择归属租户</option>';
     ts.forEach(function (t) {
       h += '<option value="' + esc(t.tenant_id) + '"' + (t.tenant_id === cur ? " selected" : "") + ">" +
         esc(t.name || t.tenant_id) + "</option>";
     });
-    // 独享条目的租户已经不在了：这个值必须仍然可选，否则运营方连"只修地址不动归属"
-    // 都保存不了（API 允许原样重存），而页面会把它悄悄改成共享。
+    // 这一条的租户已经不在了：把它作为不可选项列出来，好让运营方看见这条现在挂在哪、
+    // 为什么要改选。保存时 API 也会拒——老值不再是任何租户，绑不回去。
     var known = ts.some(function (t) { return t.tenant_id === cur; });
     if (cur && !known) {
-      h += '<option value="' + esc(cur) + '" selected>' + esc(cur) + "（该租户已不存在，谁都选不到这一条）</option>";
+      h += '<option value="' + esc(cur) + '" disabled>' + esc(cur) +
+        "（该租户已不存在，选一个现存租户保存）</option>";
     }
     return h;
   }
@@ -4995,7 +5001,7 @@
       '<div class="field"><label for="' + p + '-loc">位置（手填，纯文本）</label>' +
       '<input id="' + p + '-loc" name="' + p + '-loc" value="' + esc(v.location) +
       '" maxlength="120" placeholder="如 上海 · 机房A"></div>' +
-      '<div class="field"><label for="' + p + '-owner">归属</label>' +
+      '<div class="field"><label for="' + p + '-owner">归属租户（必填）</label>' +
       '<select id="' + p + '-owner" name="' + p + '-owner">' + rrOwnerOptions(v.owner) + "</select></div>";
   }
 
@@ -5023,8 +5029,8 @@
       '<div class="hint">反射器是设备上的路由进程拨号过去的那个角色：这一页只管「有哪些、在哪儿、归谁」，' +
       "谁选哪两条在「Overlay 配置 › 全局配置」。<b>控制器不会去连库里的地址</b>，所以这一页没有任何绿灯可给——" +
       "能不能连上只有设备自己的路由状态知道。地址必须带端口：设备上的路由进程要从 host:port 里拆出 TLS 服务名，" +
-      "少了端口只能到设备上过一遍才知道写错了。归属：<b>共享</b>对所有租户可见，<b>独享</b>只在那一个租户的下拉里出现，" +
-      "别的租户既选不到、也看不到有这一条。</div>";
+      "少了端口只能到设备上过一遍才知道写错了。<b>每条 RR 都必须归属一个租户</b>，只在那一个租户的下拉里出现，" +
+      "别的租户既选不到、也看不到有这一条。删租户不会连带删这里的行：那一条会变成「该租户已不存在」，要改选一个现存租户才能再用。</div>";
     if (!r.at && r.loading) {
       return h + '<div class="empty">正在读取 RR 库…</div></section>';
     }
@@ -5034,7 +5040,7 @@
       '<div class="err" id="rr-new-err" role="alert"></div></form>' +
       (r.note ? undNote(r.note) : "");
     if (!r.rows.length) {
-      return h + '<div class="empty" style="margin-top:10px">库里还没有 RR：先加两条，租户才有得选；' +
+      return h + '<div class="empty" style="margin-top:10px">库里还没有 RR：先给某个租户加两条，它才有得选；' +
         "一条也没有时，租户那两格只能留空，设备会继续用它盘上自己那份 <code>rrs</code>。</div></section>";
     }
     h += "<table><thead><tr><th>名称</th><th>地址</th><th>位置</th><th>归属</th>" +
@@ -5060,7 +5066,7 @@
           '<button class="primary" type="submit">保存</button> ' +
           '<button class="small" type="button" data-act="rr-edit-x">取消</button></div>' +
           '<div class="hint" style="margin:8px 0 0">整行覆盖：这一页改的就是库里这一条。' +
-          "改地址只影响下一次发布；把归属改成「共享」会让所有租户都能选到它。</div>" +
+          "改地址只影响下一次发布；把归属换成另一个租户，等于把这条 RR 从原租户手里拿走。</div>" +
           '<div class="err" id="rr-edit-err" role="alert"></div></form></td></tr>';
       }
     });
