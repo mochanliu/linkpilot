@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"sync"
 	"time"
 
 	"sdwan/controller/internal/vppapi"
@@ -51,18 +52,32 @@ type tunnelWindow struct {
 	sampled            bool
 }
 
-// Telemetry 是每台 CPE 一份的遥测采样器。并发安全由调用方保证（agent 的
-// 控制循环是单线程的）；要并发调用，把它放在一个 goroutine 里。
+// Telemetry 是每台 CPE 一份的遥测采样器。Ensure/Remove 来自隧道对账，
+// Sample 来自上报循环，两者在不同 goroutine 里跑，所以这里自带一把锁。
 type Telemetry struct {
-	dp      TelemetryPlane
+	mu      sync.Mutex
+	src     func() (TelemetryPlane, error)
 	now     func() time.Time
 	tunnels map[uint32]*tunnelWindow
 }
 
-// NewTelemetry 建一个采样器。dp 是 *vppapi.Client。
+// NewTelemetry 建一个采样器，固定用 dp 这条连接。dp 是 *vppapi.Client。
 func NewTelemetry(dp TelemetryPlane) *Telemetry {
-	return &Telemetry{dp: dp, now: time.Now, tunnels: map[uint32]*tunnelWindow{}}
+	return newTelemetry(func() (TelemetryPlane, error) {
+		if dp == nil {
+			return nil, errors.New("agent: 遥测：没有数据面连接")
+		}
+		return dp, nil
+	})
 }
+
+// newTelemetry 每次调用都现取连接。VPP 重启后 agent 会换一条 api 连接，
+// 遥测抱着旧句柄只会让每次采样都报同一个错，所以由调用方给一个取当前连接的函数。
+func newTelemetry(src func() (TelemetryPlane, error)) *Telemetry {
+	return &Telemetry{src: src, now: time.Now, tunnels: map[uint32]*tunnelWindow{}}
+}
+
+func (t *Telemetry) plane() (TelemetryPlane, error) { return t.src() }
 
 // Ensure 把一条隧道的遥测配置落进数据面，幂等。
 //
@@ -72,6 +87,12 @@ func NewTelemetry(dp TelemetryPlane) *Telemetry {
 func (t *Telemetry) Ensure(ctx context.Context, cfg wire.TunnelTelemetry) error {
 	if cfg.SwIfIndex == 0 {
 		return errors.New("agent: 遥测配置缺 sw_if_index")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	dp, err := t.plane()
+	if err != nil {
+		return err
 	}
 	peer, err := parseOverlayIP("对端", cfg.PeerIP)
 	if err != nil {
@@ -94,7 +115,7 @@ func (t *Telemetry) Ensure(ctx context.Context, cfg wire.TunnelTelemetry) error 
 	effective := cfg
 	effective.IntervalMS = interval
 
-	if err := t.dp.SetProbe(ctx, vppapi.ProbeParams{
+	if err := dp.SetProbe(ctx, vppapi.ProbeParams{
 		SwIfIndex:  cfg.SwIfIndex,
 		PeerIP:     peer,
 		LocalIP:    local,
@@ -120,12 +141,12 @@ func (t *Telemetry) Ensure(ctx context.Context, cfg wire.TunnelTelemetry) error 
 	if bfd.DetectMult == 0 {
 		bfd.DetectMult = wire.DefaultBFDDetectMult
 	}
-	cur, err := t.dp.BFDSessions(ctx)
+	cur, err := dp.BFDSessions(ctx)
 	if err != nil {
 		return fmt.Errorf("agent: 读 BFD 会话: %w", err)
 	}
 	if !hasBFDSession(cur, bfd) {
-		if err := t.dp.AddBFDSession(ctx, bfd); err != nil {
+		if err := dp.AddBFDSession(ctx, bfd); err != nil {
 			return fmt.Errorf("agent: 建 BFD 会话 sw_if=%d: %w", cfg.SwIfIndex, err)
 		}
 	}
@@ -146,10 +167,16 @@ func (t *Telemetry) Ensure(ctx context.Context, cfg wire.TunnelTelemetry) error 
 // 所以要先把这条隧道的 (local, peer) 找出来：先看自己的配置，agent 重启过就
 // 从探针会话里读（探针是按 sw_if_index 建的，这一半不依赖内存）。
 func (t *Telemetry) Remove(ctx context.Context, swIfIndex uint32) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	dp, err := t.plane()
+	if err != nil {
+		return err
+	}
 	var errs []error
-	peer, local := t.endpointsOf(ctx, swIfIndex, &errs)
+	peer, local := t.endpointsOf(ctx, dp, swIfIndex, &errs)
 	if peer != nil {
-		sessions, err := t.dp.BFDSessions(ctx)
+		sessions, err := dp.BFDSessions(ctx)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("agent: 读 BFD 会话: %w", err))
 		}
@@ -162,14 +189,14 @@ func (t *Telemetry) Remove(ctx context.Context, swIfIndex uint32) error {
 			if local != nil && !s.LocalIP.Equal(local) {
 				continue
 			}
-			if err := t.dp.DelBFDSession(ctx, vppapi.BFDSessionParams{
+			if err := dp.DelBFDSession(ctx, vppapi.BFDSessionParams{
 				LocalIP: s.LocalIP, PeerIP: s.PeerIP,
 			}); err != nil {
 				errs = append(errs, fmt.Errorf("agent: 删 BFD 会话 sw_if=%d: %w", swIfIndex, err))
 			}
 		}
 	}
-	if err := t.dp.DelProbe(ctx, swIfIndex); err != nil {
+	if err := dp.DelProbe(ctx, swIfIndex); err != nil {
 		errs = append(errs, fmt.Errorf("agent: 删探针 sw_if=%d: %w", swIfIndex, err))
 	}
 	delete(t.tunnels, swIfIndex)
@@ -178,7 +205,7 @@ func (t *Telemetry) Remove(ctx context.Context, swIfIndex uint32) error {
 
 // endpointsOf 找出某条隧道的 overlay 两端地址。配置在就用配置（不需要一次
 // dump），否则从探针会话里读 —— 这条路径也是 agent 重启后清理的唯一依据。
-func (t *Telemetry) endpointsOf(ctx context.Context, swIfIndex uint32, errs *[]error) (peer, local net.IP) {
+func (t *Telemetry) endpointsOf(ctx context.Context, dp TelemetryPlane, swIfIndex uint32, errs *[]error) (peer, local net.IP) {
 	if w := t.tunnels[swIfIndex]; w != nil {
 		peer, _ = parseOverlayIP("对端", w.cfg.PeerIP)
 		local, _ = parseOverlayIP("本地", w.cfg.LocalIP)
@@ -186,7 +213,7 @@ func (t *Telemetry) endpointsOf(ctx context.Context, swIfIndex uint32, errs *[]e
 			return peer, local
 		}
 	}
-	probes, err := t.dp.Probes(ctx)
+	probes, err := dp.Probes(ctx)
 	if err != nil {
 		*errs = append(*errs, fmt.Errorf("agent: 读探针会话: %w", err))
 		return nil, nil
@@ -206,11 +233,17 @@ func (t *Telemetry) endpointsOf(ctx context.Context, swIfIndex uint32, errs *[]e
 // 但 BFD 行必须能映射回一条隧道（cfg 里有这个 peer 的 sw_if_index），否则它
 // 不是本组件管的隧道，报出去也没有隧道键可用。
 func (t *Telemetry) Sample(ctx context.Context) ([]wire.TunnelMetrics, error) {
-	probes, err := t.dp.Probes(ctx)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	dp, err := t.plane()
+	if err != nil {
+		return nil, err
+	}
+	probes, err := dp.Probes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("agent: 读探针会话: %w", err)
 	}
-	bfds, err := t.dp.BFDSessions(ctx)
+	bfds, err := dp.BFDSessions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("agent: 读 BFD 会话: %w", err)
 	}

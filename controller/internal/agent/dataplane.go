@@ -87,6 +87,7 @@ type DataPlane interface {
 	SetInterfaceUp(ctx context.Context, swIfIndex uint32, up bool) error
 	AddDelInterfaceAddress(ctx context.Context, swIfIndex uint32, prefix netip.Prefix, add bool) error
 	SetInterfaceIPTable(ctx context.Context, swIfIndex uint32, tableID uint32) error
+	InterfaceIPTable(ctx context.Context, swIfIndex uint32) (uint32, error)
 	SetInterfaceMPLS(ctx context.Context, swIfIndex uint32, enable bool) error
 	// MPLSEnabled 读 mpls-input 弧本身回答"这张口的标签收包路径通了没"：
 	// true = 弧已摘掉丢弃路径。它是 MPLS 唯一的真假判据 —— `show mpls interface`
@@ -674,6 +675,10 @@ func (l *Link) verifyLanded(ctx context.Context, tunnelSwIfIndex uint32) error {
 	return nil
 }
 
+// localSwIfIndex 是 VPP 的 local0，恒为 0（vnet 启动时先建它，之后不会删）。
+// 它永远不会是物理出口 —— NewLink 拿 0 当"没填出口"用的就是这一条。
+const localSwIfIndex = 0
+
 // applyOverlay 把这条隧道的 overlay 身份落进 VPP：接口进 OverlayTable、带本机 /32、
 // admin-up、开 MPLS。这就是 bringup.sh 里 wg_to_overlay 的那几步。
 //
@@ -695,6 +700,30 @@ func (l *Link) applyOverlay(ctx context.Context, tunnelSwIfIndex uint32) error {
 	// 重复建是幂等的（ip_table_add_del 的注释：A table can be added multiple times）。
 	if err := l.dp.IPTableAddDel(ctx, l.cfg.OverlayTable, true); err != nil {
 		return fmt.Errorf("agent: 建 overlay 表 %d: %w", l.cfg.OverlayTable, err)
+	}
+	// 多跳 BFD 的发包查表写死在默认 FIB 上：bfd_udp_add 把包记成 RX=0 / TX=~0，
+	// ip_lookup 于是取 fib_index_by_sw_if_index[0] —— local0 所在的表。把 local0
+	// 绑到 overlay 表，对端 /32 才在 BFD 的查表路径上；不绑它，BFD 查的是 table 0
+	// （客户 VPN 0，那份是 dpo-drop），会话恒 down、sr-fib 把路径全撤掉。
+	// VPP 里没有别的旋钮能让多跳会话落在 VRF 表里，所以这一步是 BFD 的前置条件。
+	// 先读回再写：VPP 重启后 local0 会回到 table 0，这里必须能重新绑上；而表号
+	// 已经对的时候不写，热更才保持"重复下发零写"。
+	cur, err := l.dp.InterfaceIPTable(ctx, localSwIfIndex)
+	if err != nil {
+		return fmt.Errorf("agent: 读 local0 所在的表: %w", err)
+	}
+	if cur != l.cfg.OverlayTable {
+		if err := l.dp.SetInterfaceIPTable(ctx, localSwIfIndex, l.cfg.OverlayTable); err != nil {
+			return fmt.Errorf("agent: 把 local0 绑到 overlay 表 %d（多跳 BFD 的查表路径）: %w",
+				l.cfg.OverlayTable, err)
+		}
+		// set 回 0 不代表表号真的变了，读回来对一遍才算落地（本层规则 7）。
+		if got, err := l.dp.InterfaceIPTable(ctx, localSwIfIndex); err != nil {
+			return fmt.Errorf("agent: 读回 local0 所在的表: %w", err)
+		} else if got != l.cfg.OverlayTable {
+			return fmt.Errorf("agent: local0 绑表读回是 %d，不是 %d：这条口可能被别的进程改回去了",
+				got, l.cfg.OverlayTable)
+		}
 	}
 
 	addrs, err := l.dp.IPv4Addresses(ctx, tunnelSwIfIndex)

@@ -12,6 +12,7 @@ package vppapi
 //	sw_interface_set_flags          f5aec1b8   reply e8d4e804
 //	sw_interface_add_del_address    5463d73b   reply e8d4e804
 //	sw_interface_set_table          df42a577   reply e8d4e804
+//	sw_interface_get_table          2d033de4   reply a6eb0109（retval 后带 vrf_id）
 //	sw_interface_set_mpls_enable    ae6cfcfb   reply e8d4e804
 //
 // （feature_is_enabled 55db09e2/reply 03f284b5 本来在这张表里：它的 CRC 与 VPP 消息表
@@ -24,6 +25,7 @@ package vppapi
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"strconv"
@@ -96,6 +98,30 @@ func (c *Client) SetInterfaceIPTable(ctx context.Context, swIfIndex uint32, tabl
 		return err
 	}
 	return c.retval("sw_interface_set_table", frame)
+}
+
+// InterfaceIPTable 读回一张接口所在的 IPv4 表（sw_interface_get_table）。
+//
+// 存在这一条是有代价考量的：`sw_interface_set_table` 即使设成同一个表也回 0，
+// 所以"没有读回"的写法只能每轮都重设一遍 —— 在每台设备的 apply 里这算一次写，
+// 热更就不再有"重复下发零写"的性质。真值是这张接口自己的表号，问 VPP 就有。
+func (c *Client) InterfaceIPTable(ctx context.Context, swIfIndex uint32) (uint32, error) {
+	// vl_api_sw_interface_get_table_t 净体 = sw_if_index(4) + is_ipv6(1)。
+	body := make([]byte, 0, 5)
+	body = appendU32(body, swIfIndex)
+	body = append(body, 0) // is_ipv6
+	frame, err := c.call(ctx, "sw_interface_get_table", "sw_interface_get_table_reply", body)
+	if err != nil {
+		return 0, err
+	}
+	// reply = msg_id(2) + context(4) + retval(4) + vrf_id(4)
+	if len(frame) < 14 {
+		return 0, fmt.Errorf("vppapi: sw_interface_get_table_reply 太短 (%d B)", len(frame))
+	}
+	if err := c.retval("sw_interface_get_table", frame); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(frame[10:14]), nil
 }
 
 // SetInterfaceMPLS 打开/关闭一张接口的 MPLS 处理。

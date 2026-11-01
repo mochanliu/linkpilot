@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -88,6 +89,19 @@ type fakeVPP struct {
 	// alreadyGone 让 RemovePeer **删掉的同时**回 -6：模拟"数据面里这条其实
 	// 已经没了"（上次崩在中途、或对端刚被别的路径撤掉）。
 	alreadyGone bool
+	// ---- 遥测（TelemetryPlane） ----
+	//
+	// 探针按 sw_if_index 建；BFD 一律多跳（~0），按 (local, peer) 寻址 —— 和真
+	// 客户端一模一样，否则测试会掩盖"把 BFD 绑到 wg 接口上"这种致命错配。
+	// Add 出来的会话直接是 Up：真机要等对端齐了才 Up，这里测的是 agent 的上报
+	// 路径，不是一个已经验证过的 VPP 状态机。
+	probes    map[uint32]vppapi.ProbeStats
+	probeDels []uint32
+	bfds      map[string]vppapi.BFDSession
+	// bfdAddErr / probeErr 让遥测这一半单独失败：用来测"遥测建不起来，隧道
+	// apply 必须整体失败"（静默跳过会让隧道看着通、策略却没有可达性依据）。
+	bfdAddErr error
+	probeErr  error
 }
 
 func newFakeVPP() *fakeVPP {
@@ -105,6 +119,8 @@ func newFakeVPP() *fakeVPP {
 		up:        map[uint32]bool{},
 		mpls:      map[uint32]bool{},
 		mplsCount: map[uint32]int{},
+		probes:    map[uint32]vppapi.ProbeStats{},
+		bfds:      map[string]vppapi.BFDSession{},
 		// underlay 出口按真机的出生样子摆在这儿：af-packet 口 VPP 默认记 9000，
 		// 容器网卡只有 1500。这样"写完读回来"测的才是读回，而不是 map 里本来就对。
 		swIfs: []vppapi.SwInterface{{
@@ -427,6 +443,13 @@ func (f *fakeVPP) IPTableAddDel(ctx context.Context, tableID uint32, add bool) e
 
 // SetInterfaceIPTable 照抄实测的两条拒绝：表不存在（vpplab 实测 "no such table"）、
 // 接口上有地址（真 VPP 不给改表）。
+// InterfaceIPTable 是读；没绑过的接口回 0（真 VPP 的出生状态），不记进 calls
+// 之外的地方 —— 幂等测试就是靠"读不算写"来分辨 agent 有没有在热更里churn。
+func (f *fakeVPP) InterfaceIPTable(_ context.Context, swIfIndex uint32) (uint32, error) {
+	f.log("InterfaceIPTable %d", swIfIndex)
+	return f.ifTable[swIfIndex], nil
+}
+
 func (f *fakeVPP) SetInterfaceIPTable(ctx context.Context, swIfIndex uint32, tableID uint32) error {
 	f.log("SetInterfaceIPTable %d=%d", swIfIndex, tableID)
 	if !f.tables[tableID] {
@@ -1770,4 +1793,88 @@ func TestIsNoSuchEntryOnlyAcceptsMinus6(t *testing.T) {
 	if !isAlreadyRegistered(vppapi.APIError{Op: "wireguard_interface_create", Retval: -31}) {
 		t.Error("-31 应当认出来（实例号被占）")
 	}
+}
+
+// ==================== 遥测（TelemetryPlane） ====================
+
+// bfdKey 是假数据面里会话的键：真 BFD 按 (local, peer) 唯一，同一对地址不可能
+// 有两条多跳会话。
+func bfdKey(local, peer net.IP) string {
+	return local.String() + ">" + peer.String()
+}
+
+func (f *fakeVPP) SetProbe(_ context.Context, p vppapi.ProbeParams) error {
+	f.log("SetProbe sw=%d %v->%v interval=%d", p.SwIfIndex, p.LocalIP, p.PeerIP, p.IntervalMS)
+	if f.probeErr != nil {
+		return f.probeErr
+	}
+	st := f.probes[p.SwIfIndex]
+	st.SwIfIndex = p.SwIfIndex
+	st.PeerIP = append(net.IP(nil), p.PeerIP...)
+	st.LocalIP = append(net.IP(nil), p.LocalIP...)
+	st.IntervalMS = p.IntervalMS
+	st.TimeoutMS = p.TimeoutMS
+	st.Enabled = true
+	f.probes[p.SwIfIndex] = st
+	return nil
+}
+
+// DelProbe 删不存在的不报错（真客户端的约定就是幂等）。
+func (f *fakeVPP) DelProbe(_ context.Context, swIfIndex uint32) error {
+	f.log("DelProbe sw=%d", swIfIndex)
+	f.probeDels = append(f.probeDels, swIfIndex)
+	delete(f.probes, swIfIndex)
+	return nil
+}
+
+func (f *fakeVPP) Probes(context.Context) ([]vppapi.ProbeStats, error) {
+	out := make([]vppapi.ProbeStats, 0, len(f.probes))
+	for _, st := range f.probes {
+		out = append(out, st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SwIfIndex < out[j].SwIfIndex })
+	return out, nil
+}
+
+func (f *fakeVPP) AddBFDSession(_ context.Context, p vppapi.BFDSessionParams) error {
+	f.log("AddBFD %v->%v tx=%d rx=%d mult=%d", p.LocalIP, p.PeerIP, p.DesiredMinTxUS, p.RequiredMinRxUS, p.DetectMult)
+	if f.bfdAddErr != nil {
+		return f.bfdAddErr
+	}
+	f.bfds[bfdKey(p.LocalIP, p.PeerIP)] = vppapi.BFDSession{
+		SwIfIndex:       vppapi.BFDMultihopSwIfIndex,
+		LocalIP:         append(net.IP(nil), p.LocalIP...),
+		PeerIP:          append(net.IP(nil), p.PeerIP...),
+		State:           vppapi.BFDStateUp,
+		DesiredMinTxUS:  p.DesiredMinTxUS,
+		RequiredMinRxUS: p.RequiredMinRxUS,
+		DetectMult:      p.DetectMult,
+	}
+	return nil
+}
+
+// DelBFDSession 照抄真 VPP：会话不存在回 -5（bfd_udp_del 的 NO_SUCH_ENTRY
+// 不是 -6），所以 Remove 必须先 dump 再删，不能闷头删。
+func (f *fakeVPP) DelBFDSession(_ context.Context, p vppapi.BFDSessionParams) error {
+	f.log("DelBFD %v->%v", p.LocalIP, p.PeerIP)
+	k := bfdKey(p.LocalIP, p.PeerIP)
+	if _, ok := f.bfds[k]; !ok {
+		return vppapi.APIError{Op: "bfd_udp_del", Retval: -5}
+	}
+	delete(f.bfds, k)
+	return nil
+}
+
+func (f *fakeVPP) BFDSessions(context.Context) ([]vppapi.BFDSession, error) {
+	out := make([]vppapi.BFDSession, 0, len(f.bfds))
+	for _, s := range f.bfds {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].LocalIP.Equal(out[j].LocalIP) {
+			return out[i].PeerIP.String() < out[j].PeerIP.String()
+		}
+		return out[i].LocalIP.String() < out[j].LocalIP.String()
+	})
+	return out, nil
 }

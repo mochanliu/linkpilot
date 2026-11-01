@@ -73,6 +73,10 @@ type TunnelSync struct {
 	applying bool
 	fails    int
 	nextTry  time.Time
+
+	// tel 是隧道内可达性（BFD）与质量（探针）的落地点。对账装/撤隧道时顺带
+	// Ensure/Remove，心跳循环从 Telemetry() 取它做采样上报。
+	tel *Telemetry
 }
 
 // NewTunnelSync wires the reconciler. logf may be nil; now defaults to time.Now.
@@ -92,8 +96,24 @@ func NewTunnelSync(dp DataPlane, id *Identity,
 		skipped: map[string]string{},
 		state:   wire.TunnelState{Capable: true},
 	}
+	// 遥测每次现取当前连接：VPP 重启后 reconciler 会换一条 api 连接，BFD/探针
+	// 不能抱着死句柄（和 DataPlane() 是同一个理由）。
+	t.tel = newTelemetry(func() (TelemetryPlane, error) {
+		cur := t.DataPlane()
+		if cur == nil {
+			return nil, errors.New("agent: 遥测：还没有数据面连接")
+		}
+		p, ok := cur.(TelemetryPlane)
+		if !ok {
+			return nil, fmt.Errorf("agent: 遥测：数据面连接 %T 不提供 BFD/探针 API", cur)
+		}
+		return p, nil
+	})
 	return t
 }
+
+// Telemetry 是这台设备共享的遥测采样器（对账装/撤、上报循环读同一份窗口）。
+func (t *TunnelSync) Telemetry() *Telemetry { return t.tel }
 
 // SetRedial installs a factory for a fresh dataplane connection. Called by the
 // agent binary with vppapi.Dial; tests leave it nil and keep the fake.
@@ -221,6 +241,19 @@ func (t *TunnelSync) Endpoints() *[]wire.TunnelEndpoint {
 		return out[i].LocalIP < out[j].LocalIP
 	})
 	return &out
+}
+
+// teardownLink 先撤遥测再撤接口。顺序是硬的：多跳 BFD 会话不带隧道身份，
+// 接口一删就再也对不上它属于哪条隧道（Remove 还得按 sw_if_index 删探针），
+// 留下一条指向已消失隧道口的会话比撤销失败更难查。撤不下来就整条撤销失败、
+// 下一轮重试，绝不"先把接口删了再说"。
+func (t *TunnelSync) teardownLink(ctx context.Context, l *Link) error {
+	if idx := l.SWIfIndex(); idx != 0 {
+		if err := t.tel.Remove(ctx, idx); err != nil {
+			return fmt.Errorf("撤遥测: %w", err)
+		}
+	}
+	return l.Teardown(ctx)
 }
 
 // dropDeadConnection resets the dataplane handle after the api socket died.
@@ -437,7 +470,7 @@ func (t *TunnelSync) fetchAndApply(ctx context.Context, desired int) (
 		if keep[id] {
 			continue
 		}
-		if err := l.Teardown(ctx); err != nil {
+		if err := t.teardownLink(ctx, l); err != nil {
 			errs = append(errs, fmt.Sprintf("撤隧道 %s: %v", id, err))
 			continue
 		}
@@ -456,6 +489,10 @@ func (t *TunnelSync) fetchAndApply(ctx context.Context, desired int) (
 	}
 	for _, ifi := range wgIfs {
 		if ifi.UserInstance < wire.UnderlayInstanceBase || keepInst[ifi.UserInstance] {
+			continue
+		}
+		if err := t.tel.Remove(ctx, ifi.SWIfIndex); err != nil {
+			errs = append(errs, fmt.Sprintf("清理孤儿接口 inst=%d 的遥测: %v", ifi.UserInstance, err))
 			continue
 		}
 		if err := teardownTunnel(ctx, dp, ifi.SWIfIndex, ifi.Port,
@@ -486,7 +523,7 @@ func (t *TunnelSync) applySpec(ctx context.Context, b wire.UnderlayBundle,
 		// Port, instance, egress, overlay and relay are fixed per Link on
 		// purpose (each one changes the interface's identity in VPP), so a
 		// change means rebuild rather than patch.
-		if err := l.Teardown(ctx); err != nil {
+		if err := t.teardownLink(ctx, l); err != nil {
 			return fmt.Errorf("配置变了要重建，撤旧接口时: %w", err)
 		}
 		t.delLink(spec.TunnelID)
@@ -531,6 +568,17 @@ func (t *TunnelSync) applySpec(ctx context.Context, b wire.UnderlayBundle,
 	if change != PeerUnchanged {
 		t.logf("隧道 %s → node %d（%s）：peer %s", spec.TunnelID, spec.PeerNodeID,
 			spec.PeerEndpoint, change)
+	}
+	// 可达性/质量跟着隧道一起装：BFD 会话的两端就是这条隧道的 overlay /32，
+	// 探针绑在隧道接口上。放在最后一步，前面任何一步失败都不会留下悬空的会话；
+	// 隧道要重建时旧的先撤（见 teardownLink）。
+	if err := t.tel.Ensure(ctx, wire.TunnelTelemetry{
+		SwIfIndex:  l.SWIfIndex(),
+		PeerNodeID: spec.PeerNodeID,
+		LocalIP:    cfg.LocalOverlay.Addr().String(),
+		PeerIP:     cfg.PeerOverlay.Addr().String(),
+	}); err != nil {
+		return fmt.Errorf("隧道内 BFD/探针: %w", err)
 	}
 	return nil
 }

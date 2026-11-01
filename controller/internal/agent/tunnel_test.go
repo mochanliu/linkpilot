@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -124,6 +125,27 @@ func TestTunnelSyncInstallsAndIsIdempotent(t *testing.T) {
 	if _, ok := f.routes[wire.OverlayRouteTable][netip.MustParsePrefix("10.250.0.3/32")]; !ok {
 		t.Errorf("对端 overlay 的路由没装上: %v", f.routes)
 	}
+	// 多跳 BFD 的发包查表跟着 local0 走：不绑它，会话查的是 table 0（客户 VPN 0，
+	// 那份对端 /32 是 dpo-drop），隧道会一直被 sr-fib 判成不可达。
+	if f.ifTable[localSwIfIndex] != wire.OverlayRouteTable {
+		t.Errorf("local0 没绑到 overlay 表（多跳 BFD 的查表路径）: %v", f.ifTable)
+	}
+	// 会话按隧道 overlay /32 建，而且必须是多跳：绑接口会把 overlay 路由打成
+	// dpo-drop（见 internal/vppapi/telemetry.go 文件头）。
+	if len(f.bfds) != 1 {
+		t.Fatalf("BFD 会话 %d 条，期望 1: %+v", len(f.bfds), f.bfds)
+	}
+	for _, s := range f.bfds {
+		if s.SwIfIndex != vppapi.BFDMultihopSwIfIndex {
+			t.Errorf("BFD 会话不是多跳: sw_if_index=%d", s.SwIfIndex)
+		}
+		if !s.LocalIP.Equal(net.ParseIP("10.250.0.1")) || !s.PeerIP.Equal(net.ParseIP("10.250.0.3")) {
+			t.Errorf("BFD 会话地址 = %v -> %v，期望隧道两端的 overlay /32", s.LocalIP, s.PeerIP)
+		}
+	}
+	if p, ok := f.probes[swIf]; !ok || !p.PeerIP.Equal(net.ParseIP("10.250.0.3")) {
+		t.Errorf("隧道口 %d 上没有探针: %+v", swIf, f.probes)
+	}
 
 	// 再跑一遍：接口、地址、peer 都不能重做（重复加地址在真机上没定义，fake 直接 panic）。
 	before := len(f.calls)
@@ -136,7 +158,8 @@ func TestTunnelSyncInstallsAndIsIdempotent(t *testing.T) {
 	second := f.calls[before:]
 	for _, c := range second {
 		if strings.HasPrefix(c, "AddPeer") || strings.HasPrefix(c, "CreateInterface") ||
-			strings.HasPrefix(c, "AddDelInterfaceAddress") || strings.HasPrefix(c, "SetInterfaceIPTable") {
+			strings.HasPrefix(c, "AddDelInterfaceAddress") || strings.HasPrefix(c, "SetInterfaceIPTable") ||
+			strings.HasPrefix(c, "AddBFD") {
 			t.Errorf("幂等重放里出现了写操作: %s（这一段调用 %v）", c, second)
 		}
 	}
@@ -213,6 +236,14 @@ func TestTunnelSyncTearsDownRemovedTunnel(t *testing.T) {
 	}
 	if _, ok := f.routes[wire.OverlayRouteTable][netip.MustParsePrefix("10.250.0.3/32")]; ok {
 		t.Errorf("对端 overlay 路由没撤: %v", f.routes)
+	}
+	// 遥测必须跟着隧道一起撤：BFD 会话不带隧道身份（多跳只有一对地址），留着它
+	// 就是一条永远没人再读的孤儿会话，还会让 sr-fib 对着一个不存在的对端报可达。
+	if len(f.bfds) != 0 {
+		t.Errorf("隧道撤了 BFD 会话还在: %+v", f.bfds)
+	}
+	if _, ok := f.probes[swIf]; ok {
+		t.Errorf("隧道撤了探针还在: %+v", f.probes)
 	}
 	// 撤回一条隧道要把它自己的监听端口从 vpn 集合里摘掉，否则这个号被 sr-wg 占着。
 	for _, p := range f.ports {
@@ -649,5 +680,99 @@ func TestSameLinkConfigSeesEveryFixedInput(t *testing.T) {
 	d.TunnelMTU = wire.DefaultTunnelMTU
 	if !sameLinkConfig(z, d) {
 		t.Error("TunnelMTU 的 0 与默认值应当等价")
+	}
+}
+
+// 遥测是 sdwan policy 的依据，建不起来就不能把这条隧道算作装好了：
+// 静默跳过会得到一条"转发看着通、可达性没人判断"的隧道。
+func TestTunnelSyncFailsTunnelWhenTelemetryCannotBeBuilt(t *testing.T) {
+	f := newFakeVPP()
+	f.bfdAddErr = errors.New("bfd_udp_add 回 -2")
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	b := testBundle(spec)
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("单条隧道的遥测失败不该把整次 reconcile 算成失败: %v", err)
+	}
+	st := ts.State()
+	if st.OK || st.Tunnels != 0 {
+		t.Fatalf("BFD 建不起来，这条隧道不该被算作装好: %+v", st)
+	}
+	if !strings.Contains(st.Error, "t1") || !strings.Contains(st.Error, "BFD") {
+		t.Errorf("状态里要说清是这条隧道的 BFD 失败: %+v", st)
+	}
+	if len(f.bfds) != 0 {
+		t.Errorf("BFD 明明失败了却有会话: %+v", f.bfds)
+	}
+}
+
+// 隧道重建（换端口等）会换一个 sw_if_index；旧接口的探针必须跟着旧接口一起
+// 撤掉，否则它会一直按一个已经没人读的索引发包。
+func TestTunnelSyncRebuildMovesTelemetryToNewInterface(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	b := testBundle(spec)
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	ctx := context.Background()
+	if err := ts.Sync(ctx, b.Version); err != nil {
+		t.Fatal(err)
+	}
+	oldSWIf := f.ifaces[0].SWIfIndex
+
+	b2 := b
+	b2.Version = 9
+	b2.Tunnels = []wire.TunnelSpec{spec}
+	b2.Tunnels[0].ListenPort = 51830
+	ts.fetch = func(context.Context) (wire.UnderlayBundle, error) { return b2, nil }
+	if err := ts.Sync(ctx, b2.Version); err != nil {
+		t.Fatalf("Sync(换端口): %v", err)
+	}
+	newSWIf := f.ifaces[0].SWIfIndex
+	if newSWIf == oldSWIf {
+		t.Fatalf("前置条件不成立：接口号没变（%d）", oldSWIf)
+	}
+	if _, ok := f.probes[oldSWIf]; ok {
+		t.Errorf("旧接口 %d 的探针没撤: %+v", oldSWIf, f.probes)
+	}
+	if _, ok := f.probes[newSWIf]; !ok {
+		t.Errorf("新接口 %d 上没建探针: %+v", newSWIf, f.probes)
+	}
+	// 同一对 overlay 地址，会话只有一条：撤旧的时候删掉、建新的时候再加回来。
+	if len(f.bfds) != 1 {
+		t.Errorf("重建后 BFD 会话应当仍是 1 条: %+v", f.bfds)
+	}
+}
+
+// local0 的表是 VPP 的内存配置：VPP 重启后它回到 table 0，agent 认回隧道接口时
+// 必须把它重新绑回 overlay 表，否则多跳 BFD 又开始查 table 0（那份是 dpo-drop）。
+func TestLinkRebindsLocal0WhenDrifted(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	b := testBundle(spec)
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	ctx := context.Background()
+	if err := ts.Sync(ctx, b.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	f.ifTable[localSwIfIndex] = 0 // VPP 重启 / 操作员手改
+	l := ts.Links()["t1"]
+	if l == nil {
+		t.Fatal("前置条件不成立：没有 Link")
+	}
+	if _, err := l.Open(ctx); err != nil {
+		t.Fatalf("Open(认回): %v", err)
+	}
+	if f.ifTable[localSwIfIndex] != wire.OverlayRouteTable {
+		t.Errorf("local0 漂回 table 0 后没重绑: %v", f.ifTable)
 	}
 }
