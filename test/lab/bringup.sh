@@ -603,6 +603,14 @@ stage_dataplane() {
         vpp "$c" sr-wg key set 1 "$SR_KEY" >/dev/null
         vpp "$c" mpls table add 0 >/dev/null
         vpp "$c" ip table add "$OVERLAY" >/dev/null
+        # 多跳 BFD 的发包查表写死在默认 FIB 上：bfd_udp_add 把包的 RX 记成 0、
+        # TX 记成 ~0，ip_lookup 于是取 fib_index_by_sw_if_index[0] = table 0，而
+        # overlay /32 在 250（表 0 那份是 dpo-drop，会话恒 down）。local0 是唯一
+        # 能改"本机默认查表"的接口，把它绑到 250 就是 VPP 里让多跳 BFD 跑在 overlay
+        # 表下的办法。不许改成"给主表补 host route"：表 0 是客户 VPN 0，overlay
+        # 地址不该混进客户的全局路由表。
+        vpp "$c" set interface ip table local0 "$OVERLAY" >/dev/null ||
+            die "$c: 把 local0 绑到 overlay 表 $OVERLAY 失败"
         wan=$(host_if_for_ip "$c" "${WAN_IP[$n]}" 24 0)
         xc=$(host_if_for_ip "$c" "${XCONN_IP[$n]}" 24 0)
         [ -n "$xc" ] || die "$c: 客户口没交给 VPP"
@@ -958,22 +966,16 @@ stage_terms() {
 # ==================================================================
 stage_bfd() {
     log "bfd: 每对 overlay 之间建**多跳**会话（绑接口的会话会把 overlay 路由打成 dpo-drop）"
-    # 会话建起来还不够：VPP 的 BFD UDP 传输在主表（table 0）里查对端地址，而 overlay
-    # /32 只装在 table 250 —— 主表那份是 dpo-drop，BFD 包全被吃掉，状态永远 init/down。
-    # 所以每对先给主表补一条到对端 overlay /32 的单路径 host route，指向该隧道口。
-    # 必须单路径：同一前缀连加两条 via 会变成等价多路径，一半 BFD 包走错腿，会话也起不来。
+    # 会话本身不带表号：多跳 BFD 的发包查表固定走 local0 所在的表，dataplane 阶段
+    # 已把 local0 绑到 $OVERLAY，overlay /32 就在那儿，不需要任何主表路由。
     local a b aif aport aov bif bport bov pa pb tport
     while read -r a b aif aport aov bif bport bov pa pb tport; do
         local ca=lab-cpe$a cb=lab-cpe$b
-        vpp "$ca" ip route del "$bov/32" table 0 >/dev/null 2>&1 || true
-        vpp "$cb" ip route del "$aov/32" table 0 >/dev/null 2>&1 || true
-        vpp "$ca" ip route add "$bov/32" table 0 via "$aif" >/dev/null
-        vpp "$cb" ip route add "$aov/32" table 0 via "$bif" >/dev/null
         vpp "$ca" bfd udp session add multihop local-addr "$aov" peer-addr "$bov" \
             desired-min-tx 300000 required-min-rx 300000 detect-mult 3 >/dev/null
         vpp "$cb" bfd udp session add multihop local-addr "$bov" peer-addr "$aov" \
             desired-min-tx 300000 required-min-rx 300000 detect-mult 3 >/dev/null
-        note "$ca($aov) <-> $cb($bov)，主表补 $aif/$bif 的 host route"
+        note "$ca($aov) <-> $cb($bov)"
     done < <(tunnel_rows)
     # 会话 up 之前别让 sr-fib 把路径当"不可达"撤掉：BFD 是周期报文，从建会话到 up 有
     # 一到两个检测周期（3×300ms），这段时间 sr-fib 会如实报"BFD 不是 Up 该路径跳过"。

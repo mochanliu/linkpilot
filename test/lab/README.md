@@ -470,11 +470,13 @@ dpo-drop）；`--keep` 不先拆现有容器（只用于调试，状态可能是
     go test -run TestLiveBFDState ./internal/vppapi -count=1 -v'
   ```
   `SRWG_BFD_WANT=up|down|absent` 说要什么，`SRWG_BFD_WAIT_MS=5000` 轮询到超时。
-- **BFD 的报文走主表**：VPP 的 BFD UDP 传输在 table 0 查对端地址，而 overlay /32
-  只装在 table 250。所以 `--bfd` 会顺手给主表补一条对端 overlay /32 的**单路径**
-  host route（`via wgN`）——漏掉这条，会话永远是 down，而 sr-fib 会把"BFD 不是 Up"
-  当成不可达把路径全撤掉（实测 cpe1 一次撤 8 条），data plane 直接黑洞。
-  同一前缀连加两条 `via` 会变成等价多路径，一半 BFD 包走错腿，会话同样起不来。
+- **多跳 BFD 的查表跟着 local0 走**：`bfd_udp_add` 把报文的 RX 记成 0、TX 记成 ~0，
+  `ip_lookup` 于是取 `fib_index_by_sw_if_index[0]` —— 也就是 local0 所在的表。
+  dataplane 阶段 `set interface ip table local0 250` 把它绑到 overlay 表，overlay
+  /32 就在那张表里，会话才起得来；不改这一条，多跳 BFD 一律查 table 0（那份是
+  dpo-drop），会话恒 down，而 sr-fib 会把"BFD 不是 Up"当成不可达把路径全撤掉
+  （实测 cpe1 一次撤 8 条），data plane 直接黑洞。**不要用"主表补 host route"
+  绕**：table 0 是客户 VPN 0，overlay 地址不该出现在客户的路由表里。
 
 ## 导通组落到盒子（O6-b 判据专用的一对容器，2026-10-31）
 
@@ -723,7 +725,9 @@ docker exec lab-cpe1 vppctl show trace
   MPLS-over-WG 转发成立（实测 3/3 ping）。
 - **BFD 必须 multihop**：绑在接口上的会话会让 overlay 路由变成 dpo-drop
   （见 test/scripts/test-fib.sh 的实测记录）。
-- **BFD 的查表在主表，不在 overlay 表**：多跳会话的报文由 VPP 在 table 0 查对端
-  地址，而 overlay /32 只装在 250 ⇒ 主表那份是 dpo-drop，会话恒 down（实测丢包计数
-  恰好等于 300ms × 会话存活时长）。要在 250 的拓扑里跑 BFD，得给主表补一条单路径
-  `ip route add <对端 overlay>/32 table 0 via wgN`；见 `--bfd` 那节。
+- **BFD 的查表在 local0 所在的表，不在"默认主表"**：多跳会话的报文由 VPP 按
+  `fib_index_by_sw_if_index[0]` 查对端地址。dataplane 阶段把 local0 绑到 250 之后，
+  overlay /32 就在查表路径上，不需要主表路由；把 local0 绑回 table 0，会话 3 秒内掉
+  Init/Down（实测 2026-10-31，cpe1）。单跳（绑 wg 接口）不能用：它会把 overlay 路由
+  换成 dpo-drop，还在 VPP 26.06 上把进程打崩（`adj_nbr_update_rewrite_internal` →
+  wireguard → `fib_walk`，cpe2 实测 SIGABRT）。
