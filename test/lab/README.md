@@ -587,6 +587,30 @@ docker exec lab-o6b1 cat /var/lib/sr-cpe/status.json                        # v4
   新版本来了下一次心跳就去拿。改后实测 01:07:40 第三次失败并设 20s 窗口，
   01:07:41 发布 v8 ⇒ **01:07:45 就 `config v8 applied`**。
 
+### 上面这套的手工版现在有脚本了（2026-11-01，#158）
+
+`lab-o6b1`/`lab-o6b2` 已经收掉，但那条判据不该只活在本文档里。
+[test/scripts/test-overlay-bundle.sh](../scripts/test-overlay-bundle.sh) 只判设备侧那一段
+（`sr-apply` 的第 4 段 → 盘上 `route.json` → 活表），**不需要控制器、不需要 agent**：
+
+```bash
+export DOCKER_HOST=unix:///Users/louis/.colima/default/docker.sock
+BOX=lab-cpe1 test/scripts/test-overlay-bundle.sh            # 收尾把私有进程与 work 目录清掉
+BOX=lab-cpe1 test/scripts/test-overlay-bundle.sh --keep     # 保留 /tmp/sr-overlay-bundle
+```
+
+它不动盒子自己的 sr-route 与 `/etc/sdwan/route.json`：另起一个私有 sr-route（自己的端口
+`18721`、自己的配置文件），身份目录只读复用，`rrs` 指向没人听的地址——所以运行中那张表
+唯一可能的来源就是 `sr-apply` 推的 PUT。十步：基线 → 热更（pid + 启动时刻不动、设备键
+逐字不动）→ 未知键 `leak` 明说不认识并忽略 → 空表（残留 RT 当场摘掉）→ sr-route 不在时
+"已落盘、未热更"且 rc=0 → 开机重放只落盘不推、随后 sr-route 读盘就是那张表 → `rrs`
+make-before-break 只答"已开始" → 盘上缺 `status_addr` 能叠不能推 → 盘上缺 `route.json`
+整包 rc=1 而版本已装进 `versions/` → 收尾核对盒子的 pid 与哈希。当前 53 通过 / 0 失败。
+
+一条已知的、**尚未修**的产品不一致（#185，待拍）：设备键 `local_prefixes` 指向的 VPN
+若不在控制器发布的 `vrfs` 里，**运行中**只记 `local_skips`，**启动却是硬错**
+（sr-route 拒绝起来）。脚本为此让每一处"重新起 sr-route"都保有 VPN 0。
+
 ## 登进去测
 
 所有容器都是 `lab-*` 前缀，互不干扰已有的 `srwg-*` 实验环境。
