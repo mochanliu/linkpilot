@@ -1004,33 +1004,38 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 		SWIfIndex:  l.swIfIndex,
 		PathID:     pathID,
 		EndpointIP: ep.IP,
-		// 绑定身份是 (外层 dst IP, 封装前的 dst 端口)。同一对 CPE 开第二条隧道时
-		// 两条流的目的 IP 是同一个，只有端口能分清"这一包属于哪条隧道"；漏填
-		// （=0 通配）会把第二条隧道也拽进这条路径，而第二条隧道的 agent 再来一次
-		// 就把它抢走 —— 全是静默的 encap_bypass。
-		DstPort: l.cfg.ListenPort,
+		// 绑定身份是 (外层 dst IP, 封装前的 dst 端口)，而 encap 节点看到的是**发出去
+		// 那一包**的目的端口，也就是下面 WG peer 填的那个端口 —— 对端的隧道端口，
+		// 不是本机监听端口（vpp-plugin/sr_wg4_encap.c 的 Step 4：拿 udp->dst_port
+		// 查 sr_wg_bind_key(endpoint, dst_port)）。同一对 CPE 开第二条隧道时两条流
+		// 的目的 IP 相同，只有端口能分清"这一包属于哪条隧道"；填本机端口在两端
+		// 端口相同时只是碰巧对，端口不同就永远键不中 —— 静默的 encap_bypass。
+		//
+		// 0 在这个键里是通配（该 IP 上所有隧道共用这条路径），对端端口读不出来时
+		// chooseEndpoint/parseAddr 已经先报错，不会走到这里写进 0。
+		DstPort: ep.Port,
 	}); err != nil {
-		// -116：同一个 (外层 IP, 本隧道端口) 已经被另一张接口占了。两张接口抢一个
+		// -116：同一个 (外层 IP, 对端端口) 已经被另一张接口占了。两张接口抢一个
 		// 身份意味着"这个包到底走哪条路径"要看谁后写，插件选择直接拒绝，所以这里
 		// 不能重试，只能由人看出是哪一张（show sr-wg tunnels 全表可查）。
 		if hasRetval(err, -116) {
 			return "", fmt.Errorf("agent: 节点 %d：到 %s 的端口 %d 这个隧道身份已被别的接口占着：%w；"+
 				"本接口 %d 不能再抢，请用 show sr-wg tunnels 查出占着它的是哪一条",
-				p.NodeID, ep.IP, l.cfg.ListenPort, err, l.swIfIndex)
+				p.NodeID, ep.IP, ep.Port, err, l.swIfIndex)
 		}
 		return "", fmt.Errorf("agent: 节点 %d 的隧道绑定（interface %d → path %d, 端口 %d）: %w",
-			p.NodeID, l.swIfIndex, pathID, l.cfg.ListenPort, err)
+			p.NodeID, l.swIfIndex, pathID, ep.Port, err)
 	}
 
 	want := vppapi.PeerParams{
 		PublicKey:  wgPub,
 		EndpointIP: ep.IP,
-		// **这里必须是本条隧道的 vpn_port，不是观测到的映射端口。**
-		// encap 节点在 Step 4 只处理 udp 目的端口命中 vpn_ports 集合的包，Step 12
-		// 才把目的端口改写成段端口（vpp-plugin/sr_wg4_encap.c）。所以 peer 端口填
-		// 映射端口的话，包在出口上根本不会被加 SR 头，直接以普通 WG 发出去 ——
-		// 计数器上是 encap_bypass，隧道"通"但没走源路由。映射端口只进段列表。
-		Port:       l.cfg.ListenPort,
+		// 这是**发出去那一包**的外层 dst 端口，所以只能是"对端的隧道端口"（ep 来自
+		// 控制器给出的对端地址，端口就是它的监听端口/操作者显式写的端口），不能
+		// 填本机监听端口：两端端口不同时后者把包发到对端没人在听的地方，握手都完不成。
+		// 它同时是隧道绑定键的另一半（见上面的 SetTunnel），两处必须是同一个值 ——
+		// encap 节点就是拿这一包的 dst 端口去查绑定的。
+		Port:       ep.Port,
 		Keepalive:  l.keepalive,
 		SWIfIndex:  l.swIfIndex,
 		AllowedIPs: allowedIPsAny,
@@ -1143,8 +1148,10 @@ func findPeer(peers []vppapi.WgPeer, swIfIndex uint32, pub []byte) *vppapi.WgPee
 
 // checkSingleBind 确认本机接口上那条绑定要么没有、要么已经是这个人的。
 //
-// 只比 path_id：path_id 由 node_id 唯一决定（PathID），所以"等于本次的 path_id"
-// 就是"这条绑定本来就属于他"，更新它是安全的；不等就是别人的，写下去会覆盖他。
+// 只比 path_id：插件的绑定身份 (外层 endpoint, 对端端口) 只是**收包侧**的查表键，
+// 配置侧是每接口一槽，谁占着这槽要看 path_id —— 它由 node_id 唯一决定（PathID）。
+// 所以"等于本次的 path_id"就是"这条绑定本来就属于他"，更新（包括改端口）是安全的；
+// 不等就是别人的，写下去会把他的外层地址整条换掉。
 func (l *Link) checkSingleBind(ctx context.Context, nodeID, pathID uint16) error {
 	binds, err := l.dp.Tunnels(ctx, l.swIfIndex)
 	if err != nil {

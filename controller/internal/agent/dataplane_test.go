@@ -1205,12 +1205,14 @@ func TestApplyPeerEndpointPreference(t *testing.T) {
 	}
 }
 
-// NAT 场景的端口分工：观测到的**映射端口只进 SR 段**，WG peer 的目的地端口
-// 永远是本条隧道的 vpn_port。填错的后果不是报错而是静默 —— encap 的 Step 4 只处理
-// dst 命中 vpn_ports 集合的包（vpp-plugin/sr_wg4_encap.c），端口填成映射端口时包不
-// 加 SR 头直接出去，
-// 计数器上是 encap_bypass，看起来"隧道通了"其实根本没走源路由。
-func TestApplyPeerSplitsPeerPortFromSegmentPort(t *testing.T) {
+// 隧道身份在三个地方必须是同一个端口：WG peer 的目的地端口（包出去的样子）、
+// 绑定键（encap 拿包的目的端口查表）、路径终点段（relay 链最后一跳改写成的端口）。
+// 那个端口是对端的隧道端口（这里是 42000），**不是**本机监听端口 51820。
+//
+// 填本机端口的后果全是静默的：两端端口相同时只是碰巧对；不同时拼出来的包带着
+// 51820 出去，绑定键也是 51820，而 relay/对端在 42000 上听 —— 结果是握手都完不成
+// （#140 的 lab 现场：.11:20001→.3:20000 直发、node3 Transit.ok 恒为 2）。
+func TestApplyPeerUsesPeerPortForDialBindAndSegment(t *testing.T) {
 	f := newFakeVPP()
 	l, pki := newTestLink(t, f)
 	openLink(t, l)
@@ -1220,13 +1222,40 @@ func TestApplyPeerSplitsPeerPortFromSegmentPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	if seg := f.paths[1003].Segments[0]; seg.Port != 42000 || !seg.IP.Equal(net.IPv4(10, 10, 7, 7)) {
-		t.Errorf("SR 段应当带映射端口 42000: %+v", seg)
+		t.Errorf("SR 段应当带对端端口 42000: %+v", seg)
 	}
-	if p := f.peers[0]; p.Port != 51820 {
-		t.Errorf("WG peer 端口 = %d，期望 vpn_port 51820（否则 encap 会静默旁路）", p.Port)
+	if p := f.peers[0]; p.Port != 42000 {
+		t.Errorf("WG peer 端口 = %d，期望对端端口 42000（填本机端口的话包发不到对端）", p.Port)
 	}
 	if p := f.peers[0]; !p.EndpointIP.Equal(net.IPv4(10, 10, 7, 7)) {
 		t.Errorf("peer 外层地址应仍是观测到的 IP: %+v", p)
+	}
+	if bind := f.tunnels[l.SWIfIndex()]; bind.DstPort != 42000 || !bind.EndpointIP.Equal(net.IPv4(10, 10, 7, 7)) {
+		t.Errorf("绑定键 = (%v, %d)，期望 (10.10.7.7, 42000)：绑的是本机端口就永远键不中，encap 静默旁路",
+			bind.EndpointIP, bind.DstPort)
+	}
+}
+
+// 对端端口读不出来时宁可拒配：绑定表里端口 0 是通配，写进去等于"这个对端 IP 上
+// 所有隧道共用这一条路径"，同 IP 的第二条隧道会被静默拽进来。
+func TestApplyPeerRefusesZeroPeerPort(t *testing.T) {
+	for _, tc := range []struct{ name, observed, reflector string }{
+		{"观测端口为 0", "10.10.7.7:0", ""},
+		{"反射器端口为 0", "", "10.10.7.7:0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeVPP()
+			l, pki := newTestLink(t, f)
+			openLink(t, l)
+			cert, b, _ := peerMaterial(t, pki, "t1", 3)
+			_, err := l.ApplyPeer(context.Background(), target(3, cert, b, tc.observed, true, tc.reflector))
+			if err == nil {
+				t.Fatal("端口 0 是通配身份，必须拒绝")
+			}
+			if len(f.tunnels) != 0 || len(f.peers) != 0 {
+				t.Errorf("被拒之后数据面不该留下绑定/peer: tunnels=%v peers=%v", f.tunnels, f.peers)
+			}
+		})
 	}
 }
 
@@ -1359,23 +1388,23 @@ func TestTwoTunnelInterfacesEachOwnTheirPort(t *testing.T) {
 		}
 	}
 
-	// 2) 两条绑定都得活着，各自带自己的端口。
+	// 2) 两条绑定都得活着，各自带**对端**端口 —— 同 IP 下就是这两个数字把流分开。
 	bindA, bindB := f.tunnels[a.SWIfIndex()], f.tunnels[b.SWIfIndex()]
-	if bindA.PathID != 1003 || bindA.DstPort != 51820 {
-		t.Errorf("第一条隧道绑定被改了: %+v（期望 path 1003 / 端口 51820）", bindA)
+	if bindA.PathID != 1003 || bindA.DstPort != 41000 {
+		t.Errorf("第一条隧道绑定被改了: %+v（期望 path 1003 / 对端端口 41000）", bindA)
 	}
-	if bindB.PathID != 2004 || bindB.DstPort != 51830 {
-		t.Errorf("第二条隧道绑定不对: %+v（期望 path 2004 / 端口 51830）", bindB)
+	if bindB.PathID != 2004 || bindB.DstPort != 41001 {
+		t.Errorf("第二条隧道绑定不对: %+v（期望 path 2004 / 对端端口 41001）", bindB)
 	}
 
-	// 3) peer 各打自己的 vpn_port，SR 段各打自己的映射端口。
+	// 3) peer、绑定、SR 段用的是同一个端口：对端的隧道端口。
 	for _, tc := range []struct {
 		iface             uint32
 		peerPort, segPort uint16
 		path              uint16
 	}{
-		{a.SWIfIndex(), 51820, 41000, 1003},
-		{b.SWIfIndex(), 51830, 41001, 2004},
+		{a.SWIfIndex(), 41000, 41000, 1003},
+		{b.SWIfIndex(), 41001, 41001, 2004},
 	} {
 		var found *vppapi.WgPeer
 		for i := range f.peers {
@@ -1387,11 +1416,11 @@ func TestTwoTunnelInterfacesEachOwnTheirPort(t *testing.T) {
 			t.Fatalf("接口 %d 上没有 peer: %+v", tc.iface, f.peers)
 		}
 		if found.Port != tc.peerPort {
-			t.Errorf("接口 %d 的 peer 端口 = %d，期望本条隧道的 vpn_port %d",
+			t.Errorf("接口 %d 的 peer 端口 = %d，期望对端端口 %d",
 				tc.iface, found.Port, tc.peerPort)
 		}
 		if seg := f.paths[tc.path].Segments[0]; seg.Port != tc.segPort {
-			t.Errorf("path %d 的段端口 = %d，期望映射端口 %d", tc.path, seg.Port, tc.segPort)
+			t.Errorf("path %d 的段端口 = %d，期望对端端口 %d", tc.path, seg.Port, tc.segPort)
 		}
 	}
 }

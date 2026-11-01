@@ -172,15 +172,16 @@ type InterfaceParams struct {
 }
 
 // PeerParams 是一个 WG peer。Port 就是 vl_api_wireguard_peer_t.port，注释写的是
-// "destination port"，即外层 UDP 目的端口 —— 它是**本条隧道的** vpn_port
-// （定案 2：每隧道一个端口，所以这个值来自隧道自己，不是一个全局常数）。
+// "destination port"，即外层 UDP 目的端口 —— 它是**对端的**隧道端口（两端各用各的
+// 端口是 WG 的正常形态，所以这个值来自对端，不是本机的监听端口）。
 type PeerParams struct {
 	PublicKey  []byte // wgKeyLen 字节 X25519 公钥
 	EndpointIP net.IP
-	// Port 是**封装前**那个 WG 包的外层目的端口。走 SR 时必须填租户的 vpn_port：
-	// encap 节点在 Step 4 只处理 udp dst 命中 vpn_ports 集合的包，Step 12 才把
-	// 目的端口改写成段端口（vpp-plugin/sr_wg4_encap.c）。填成 NAT 映射端口的话
-	// 包根本不会被加 SR 头，计数器上是 encap_bypass —— 不报错，但源路由没了。
+	// Port 是**封装前**那个 WG 包的外层目的端口，也就是包最终要送到的那个端口。
+	// encap 节点就是拿它当隧道身份的一半去查绑定的（vpp-plugin/sr_wg4_encap.c 的
+	// Step 4：sr_wg_bind_key(endpoint, udp->dst_port)），所以 TunnelBinding.DstPort
+	// 必须填同一个值；两处对不上时包不会被加 SR 头，计数器上是 encap_bypass ——
+	// 不报错，但源路由没了。
 	Port       uint16
 	Keepalive  uint16
 	TableID    uint32
@@ -621,10 +622,11 @@ func (c *Client) Paths(ctx context.Context, pathID uint16) ([]PathInfo, error) {
 // EndpointIP 是 WG peer 的**外层** IPv4：encap 挂点挂在 underlay 出口接口上，
 // 数据面按外层目的地址查绑定，所以漏了它这条绑定永远不会命中 —— 而"没命中"在
 // 计数器上表现为 encap_bypass，看起来像"配置根本没生效"。
-// DstPort 是**封装前**那个 WG 包的外层 UDP 目的端口，也就是这条隧道的 vpn_port。
-// 一对 CPE 可以开多条隧道（定案 2：每隧道一个端口），此时 endpoint IP 相同、
-// 只有端口能区分"哪条隧道"，所以绑定身份是 (EndpointIP, DstPort)。填 0 表示
-// 端口通配 = 该 IP 上所有隧道共用这一条路径，只在单隧道时才是安全写法。
+// DstPort 是**封装前**那个 WG 包的外层 UDP 目的端口 —— 包发出去时的那个值，
+// 即 PeerParams.Port（对端的隧道端口）。一对 CPE 可以开多条隧道（定案 2：每隧道
+// 一个端口），此时 endpoint IP 相同、只有端口能区分"哪条隧道"，所以绑定身份是
+// (EndpointIP, DstPort)。填 0 表示端口通配 = 该 IP 上所有隧道共用这一条路径，
+// 只在单隧道时才是安全写法；多隧道下是静默串线，调用方不该写 0。
 type TunnelBinding struct {
 	SWIfIndex  uint32
 	PathID     uint16
