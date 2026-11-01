@@ -200,6 +200,11 @@ func main() {
 	}
 	st.setChannels(tun, *vppAPI != "")
 	reporter := &reportSender{client: client, id: id, tun: tun, logf: log.Printf}
+	// 隧道内遥测有自己的节拍，不挂在心跳上：每次 Sample 报的是"上一次采样以来的
+	// 增量"，心跳退避到 30s 时窗口会被拉长，抖动/丢包就糊掉了。
+	if tun != nil {
+		go metricsLoop(ctx, tun.Telemetry(), client, log.Printf)
+	}
 
 	var cfg *configSync
 	if *applyCfg {
@@ -336,6 +341,37 @@ func nextBackoff(cur time.Duration) time.Duration {
 		cur = 30 * time.Second
 	}
 	return cur
+}
+
+// metricsInterval 是上报窗口的长度。300ms 的探针在这一段里跑约 33 轮，够算出
+// 有意义的抖动/丢包；再短只是把同一条隧道的行刷得更勤，再长则断链要等更久才可见。
+const metricsInterval = 10 * time.Second
+
+// metricsLoop 每 metricsInterval 读一次数据面的探针/BFD 快照并上报。
+//
+// 一次失败只记日志：窗口是增量（见 agent.Telemetry.row），丢一个窗口不会污染
+// 下一个；而在这里退避或退出，只会让控制器上的数据变成"陈旧"而不是"报错"。
+// 没有隧道时也发一次空表 —— 隧道全撤了还挂着旧行，读数比空表更误导。
+func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client, logf func(string, ...any)) {
+	hadRows := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(metricsInterval):
+		}
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		rows, err := tel.Sample(rctx)
+		if err == nil && (len(rows) > 0 || hadRows) {
+			err = client.ReportMetrics(rctx, wire.MetricsReport{Tunnels: rows})
+		}
+		cancel()
+		if err != nil {
+			logf("metrics: %v", err)
+			continue
+		}
+		hadRows = len(rows) > 0
+	}
 }
 
 // readInventory takes one inventory reading for this heartbeat on its own,
