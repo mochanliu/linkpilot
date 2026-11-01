@@ -19,19 +19,10 @@ const (
 	resyncDeadline = 10 * time.Second
 )
 
-// Importer 维护"从客户侧学到、且带着约定 tag"的前缀集合。
-//
-// 为什么按 tag 过滤，而不是收下所有 BGP 路由：盒内 FRR 会把 sr-frr 导出到
-// table 1250 的前缀再分发进 BGP，那些路由在 zebra 里同样是 BGP 类型，会和
-// 客户宣告的前缀混在同一条再分发流里。客户侧邻居的入方向 route-map 统一打
-// 一个 tag，只有带这个 tag 的路由是"客户告诉我们的"；我们自己导出又转回来
-// 的路由没有 tag，天然被挡掉（这也是反向导入不形成回环的原因）。
-//
-// 集合语义是"每个前缀的最新选中路由"：一条 ADD 通知的 tag 不对，说明这个
-// 前缀眼下不归我们导入，要从集合里删掉，而不是保留旧结论。
+// Importer 维护"从客户侧学到"的前缀集合：BGP 再分发通知里的 ADD 收下，
+// DEL 撤掉。集合语义是"每个前缀的最新选中路由"。
 type Importer struct {
 	mu     sync.Mutex
-	tag    uint32
 	routes map[netip.Prefix]struct{}
 
 	// The resync window. While it is open the answers are stale ∪ pending: the
@@ -49,9 +40,8 @@ type Importer struct {
 	Logf func(format string, args ...any)
 }
 
-func NewImporter(tag uint32) *Importer {
+func NewImporter() *Importer {
 	return &Importer{
-		tag:    tag,
 		routes: map[netip.Prefix]struct{}{},
 		Now:    time.Now,
 		Logf:   log.Printf,
@@ -76,12 +66,10 @@ func (im *Importer) Handle(ev RouteEvent) {
 }
 
 func (im *Importer) apply(set map[netip.Prefix]struct{}, p netip.Prefix, ev RouteEvent) {
-	if ev.Add && ev.Tag == im.tag {
+	if ev.Add {
 		set[p] = struct{}{}
 		return
 	}
-	// 删除通知不论 tag：zebra 带的是被撤条目的 tag，正常与订阅一致；即便
-	// 不一致，这个前缀也已经不属于我们了。
 	delete(set, p)
 }
 

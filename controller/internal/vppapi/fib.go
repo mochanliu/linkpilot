@@ -65,7 +65,6 @@ type FIBPath struct {
 	TableID    uint32
 	NextHop    netip.Addr
 	Labels     []uint32
-	Weight     uint8
 	Preference uint8
 }
 
@@ -104,11 +103,7 @@ func appendFIBPath(b []byte, p FIBPath) []byte {
 	b = appendU32(b, p.SWIfIndex)
 	b = appendU32(b, p.TableID)
 	b = appendU32(b, 0) // rpf_id
-	wt := p.Weight
-	if wt == 0 {
-		wt = 1
-	}
-	b = append(b, wt)
+	b = append(b, 1)    // weight = 1
 	b = append(b, p.Preference)
 	b = appendU32(b, 0) // type = FIB_API_PATH_TYPE_NORMAL
 	b = appendU32(b, 0) // flags = FIB_API_PATH_FLAG_NONE
@@ -344,7 +339,6 @@ func readFIBPath(b []byte) FIBPath {
 	p := FIBPath{
 		SWIfIndex:  binary.BigEndian.Uint32(b[0:4]),
 		TableID:    binary.BigEndian.Uint32(b[4:8]),
-		Weight:     b[12],
 		Preference: b[13],
 	}
 	var nh [16]byte

@@ -14,8 +14,8 @@ sr-fib / sr-frr 把两套路由体系接起来。FRR 和 VPP 的接缝是 VPP �
 
 - **正向**：sr-route RIB → sr-frr → FRR `table 1250` → `redistribute
   table-direct 1250` → BGP → 客户路由器。
-- **反向**：客户路由器 eBGP → 盒内 FRR（入方向 route-map 打 `tag 1001`）→
-  sr-frr 只收 tag 1001 → `PUT /local-prefixes` → sr-route local → RR 反射 →
+- **反向**：客户路由器 eBGP → 盒内 FRR → sr-frr 收 zebra 再分发通知里的
+  BGP 前缀 → `PUT /local-prefixes` → sr-route local → RR 反射 →
   远端 CPE 的 RIB / 带标签 FIB。
 - **落地**：远端前缀由 sr-fib 直接装 VPP（压标签 1000 走 wg）；本地前缀由
   FRR 装内核主表（下一跳 = 客户路由器、出口 = `lcp-x0`），linux-nl 镜像成
@@ -86,8 +86,8 @@ lab-custN 10.99.0.2N        BGP router-id
    overlay /32 在 **table 250**——250 是 SD-WAN 传输域，不是 VPN，VPN ID
    保留 250。
 2. 客户路由器宣告自己的 LAN（10.68.N.0/24）和 loopback（172.16.N.1/32）。
-3. 盒内 FRR 的入方向 route-map 给客户路由打 `tag 1001`；sr-frr 只收带这个
-   tag 的路由，经 `PUT /local-prefixes` 变成 sr-route 的 local 集合。
+3. sr-frr 收下 zebra 再分发通知里的 BGP 前缀，经 `PUT /local-prefixes`
+   变成 sr-route 的 local 集合。
 4. sr-route 把 local 集合（本站 LAN + 从客户学到的前缀）经 lab-rr 反射给
    另外两个站点。
 5. sr-fib 只装**远端**前缀：压 1000、走对应 wg 接口、下一跳是对端 overlay。
@@ -115,8 +115,7 @@ O6-c 补了第四道 `PUT /rrs`：换反射器集合，也是整表替换、也�
 
 防环：
 
-- 我们自己导出的 table 1250 路由回到 BGP 时 tag 是 0，sr-frr 只收 tag 1001，
-  所以不会反向再吃一遍；这些前缀也只停在 table 1250，不进 zebra 主表。
+- sr-frr 不按 tag 过滤，收下再分发通知里的全部 BGP 前缀。
 - 客户也宣告本站 LAN 时，sr-route 的 local 集合按前缀去重（静态 local 与
   动态导入合并），不会出现两条同前缀。
 - linux-nl 只镜像内核表里的路由：table 0 的本地前缀来自 FRR（下一跳客户
@@ -572,8 +571,8 @@ lab-cust1# show ip route              # 远端前缀 B>* via 10.79.1.2
 # 盒内 FRR（同一个 lab-cpe1 容器里，BGP 跑在 lcp-x0 上）
 docker exec -it lab-cpe1 vtysh
 lab-cpe1# show ip route table 1250    # sr-frr 正向导出的远端前缀（黑洞，不转发）
-lab-cpe1# show bgp ipv4 unicast       # 含客户路由（tag 1001 的那个）
-lab-cpe1# show ip route 172.16.1.1/32 # 客户 loopback，带 tag 1001、via 客户路由器
+lab-cpe1# show bgp ipv4 unicast       # 含客户路由
+lab-cpe1# show ip route 172.16.1.1/32 # 客户 loopback，via 客户路由器
 lab-cpe1# show ip route               # 没有默认路由：盒内核不转发
 lab-cpe1# show bgp neighbors 10.79.1.3  # Local host: 10.79.1.2（TAP 上的会话）
 
@@ -669,9 +668,7 @@ docker exec lab-cpe1 vppctl show trace
   落到 dpo-drop（接口 up、peer established 也一样不通）。
 - **zebra 的 static 默认路由现在不需要了**：客户口在 VPP 里之后，盒子本身
   不发起经客户路由器的流量，内核也不该有默认路由（脚本会断言它是空的）。
-- **反向上报只认 `tag 1001`**：客户路由必须在 FRR 入方向 route-map 里打
-  tag，否则 sr-frr 视为"我们自己导出的路由"丢弃。我们经 table 1250 回到
-  BGP 的路由 tag 是 0，正好被同一规则挡在门外。
+- **反向上报不按 tag 过滤**：sr-frr 收下再分发通知里的全部 BGP 前缀。
 - **ZAPI v6 的命令号不是"导出那条 +18"**：实测 zebra 发来的
   REDISTRIBUTE_ROUTE_ADD/DEL 是 31/32（中间夹着 CAPABILITIES/BFD_REPLAY）。
   拿错一个会静默丢掉整条反方向的路由，所以 FRR 版本必须 pinned 10.7.1。

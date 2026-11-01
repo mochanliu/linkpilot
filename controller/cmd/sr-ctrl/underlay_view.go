@@ -74,7 +74,7 @@ type underlayTunnelView struct {
 	PathError string                    `json:"path_error,omitempty"`
 
 	// Color is the tunnel's SD-WAN color: the number the page shows in the 颜色
-	// column and the one the device turns into a VPP preference (230+颜色).
+	// column and the one the device turns into a VPP preference (10+颜色).
 	Color uint8 `json:"color"`
 
 	// MTU 0 means no device on this tunnel has reported a link MTU; delivery then

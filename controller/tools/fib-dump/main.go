@@ -1,7 +1,7 @@
 // fib-dump 读回一张 VRF 表里的路由，把每条路径的 preference 打出来。
 //
 // 存在的理由只有一句话：`vppctl show ip fib` 不打印 preference。颜色有没有真
-// 写进 VPP（230+颜色），只能从 ip_route_details 里读 —— 也就是 O1 给 vppapi
+// 写进 VPP（10+颜色），只能从 ip_route_details 里读 —— 也就是 O1 给 vppapi
 // 补上的那条读回路径。转发行为看不出来：两个 bucket 无论同色还是异色，
 // `buckets:` 都是 2，所以这条工具是"颜色落地"唯一的直接证据。
 package main
@@ -76,8 +76,8 @@ func main() {
 			if n, ok := name[p.SWIfIndex]; ok {
 				iface = n
 			}
-			fmt.Printf("  via %-15s %-8s 标签=%s 权重=%d preference=%d（颜色 %s）\n",
-				p.NextHop, iface, labels, p.Weight, p.Preference, colorOf(p.Preference))
+			fmt.Printf("  via %-15s %-8s 标签=%s preference=%d（颜色 %s）\n",
+				p.NextHop, iface, labels, p.Preference, colorOf(p.Preference))
 		}
 	}
 	if want != "" && found == 0 {
@@ -86,10 +86,10 @@ func main() {
 	}
 }
 
-// colorOf 反推 230+颜色。preference 小于 230 说明这条路径不是我们的加载器写的
-// （FRR 经 lcp-rt 装进来的路由 pref 是 0 这一档），把它和"颜色 0"分开来才不骗人。
+// colorOf 反推 10+颜色。preference 落在 10+0..7 之外说明这条路径不是我们的
+// 加载器写的（例如 FRR 经 lcp-rt 装进来的路由），把它和真颜色分开来才不骗人。
 func colorOf(pref uint8) string {
-	if pref < fib.PrefBase {
+	if pref < fib.PrefBase || pref > fib.PrefBase+fib.MaxColor {
 		return "非本加载器"
 	}
 	return fmt.Sprint(int(pref - fib.PrefBase))

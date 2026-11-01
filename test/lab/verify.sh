@@ -11,7 +11,7 @@
 #
 # 再单独验证三条联动路径：
 #   正向：sr-route RIB → sr-frr → FRR table 1250 → BGP → 客户路由器
-#   反向：客户 BGP（tag 1001）→ 盒内 FRR → sr-frr → sr-route local
+#   反向：客户 BGP → 盒内 FRR → sr-frr → sr-route local
 #   数据面接缝：FRR 主表 → zebra 装内核 → linux-nl → VPP table 0（本地前缀
 #   交给客户路由器）；远端前缀由 sr-fib 直接装 VPP 并压标签
 #
@@ -26,7 +26,6 @@ OVERLAY=250      # 隧道与 overlay 下一跳所在的表，不是 VPN
 LABEL=$((1000 + VPN))
 TUNNEL_MTU=1360
 FRR_TABLE=1250
-BGP_TAG=1001
 ROUTE_STATUS=( "" 19001 19002 19003 )
 WAN_IP=( "" 10.88.1.11 10.88.1.12 10.88.1.13 )
 LCP_IF=lcp-x0
@@ -401,18 +400,17 @@ for n in 1 2 3; do
         || bad "$c: 默认路由没指向 ${XCONN_IP[$n]}"
 done
 
-sect "8. 反向导入：客户 BGP（tag $BGP_TAG）→ 盒内 FRR → sr-frr → sr-route local"
+sect "8. 反向导入：客户 BGP → 盒内 FRR → sr-frr → sr-route local"
 for n in 1 2 3; do
     c=lab-cpe$n
     r=$(vtysh "$c" -c "show ip route ${LOOP_IP[$n]}/32")
-    echo "$r" | grep -q "tag $BGP_TAG" \
-        && ok "$c: 客户 loopback 在 zebra 里带 tag $BGP_TAG（反向上报的门槛）" \
-        || bad "$c: 客户 loopback 不带 tag $BGP_TAG（sr-frr 会丢弃它）"
+    echo "$r" | grep -qE "^B" \
+        && ok "$c: 客户 loopback 在 zebra 里是 BGP 路由" \
+        || bad "$c: 客户 loopback 不是 BGP 路由"
     echo "$r" | grep -q "${CUST_X_IP[$n]}" \
         && ok "$c: 客户 loopback 的下一跳是客户路由器 ${CUST_X_IP[$n]}" \
         || bad "$c: 客户 loopback 的下一跳不是 ${CUST_X_IP[$n]}"
-    # 我们经 table 1250 导出的远端前缀回到 BGP 时 tag 是 0，不能被反向再吃回来：
-    # 它们只能停在 table 1250，主表里必须不存在。
+    # 我们经 table 1250 导出的远端前缀回到 BGP 后是否会进 zebra 主表（回灌）。
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
         vtysh "$c" -c "show ip route ${LAN_PFX[$m]}" | grep -q "Network not in table" \

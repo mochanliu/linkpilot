@@ -151,11 +151,10 @@ func encodeRedistributeAdd(afi, routeType uint8, instance uint16) []byte {
 	return message(cmdRedistAdd, 0, p.b)
 }
 
-// RouteEvent 是 zebra 再分发通知里我们关心的部分：前缀、路由 tag、增删。
-// 下一跳等字段解码时跳过 —— 反向导入只关心"客户侧宣告了哪些前缀"。
+// RouteEvent 是 zebra 再分发通知里我们关心的部分：前缀与增删。
+// 下一跳、tag 等字段解码时跳过 —— 反向导入只关心"客户侧宣告了哪些前缀"。
 type RouteEvent struct {
 	Prefix netip.Prefix
-	Tag    uint32
 	Add    bool
 }
 
@@ -275,7 +274,7 @@ func decodeRedistributeRoute(body []byte, add bool) (RouteEvent, error) {
 		_ = r.u32()
 	}
 	if message&msgTag != 0 {
-		ev.Tag = r.u32()
+		_ = r.u32()
 	}
 	if message&msgMTU != 0 {
 		_ = r.u32()

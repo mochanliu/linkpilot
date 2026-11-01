@@ -19,7 +19,7 @@ func TestEncodeRedistributeAddGolden(t *testing.T) {
 
 // TestDecodeRedistributeRouteGolden 用按 FRR 10.7.1 zapi_route_encode 布局
 // 手写的字节验证解码：前缀 10.68.1.0/24、一条 IPV4_IFINDEX 下一跳、
-// distance/metric/tag/mtu 齐全。
+// distance/metric/tag/mtu 齐全（tag 只做跳过验证，不再参与判定）。
 func TestDecodeRedistributeRouteGolden(t *testing.T) {
 	body, err := hex.DecodeString(
 		"0a" + "0000" + "00000000" + "0000001f" + // type/instance/flags/message
@@ -40,8 +40,8 @@ func TestDecodeRedistributeRouteGolden(t *testing.T) {
 	if ev.Prefix != netip.MustParsePrefix("10.68.1.0/24") {
 		t.Errorf("prefix = %s, want 10.68.1.0/24", ev.Prefix)
 	}
-	if ev.Tag != 1001 || !ev.Add {
-		t.Errorf("ev = %+v, want tag 1001 add", ev)
+	if !ev.Add {
+		t.Errorf("ev = %+v, want add", ev)
 	}
 }
 
@@ -61,8 +61,8 @@ func TestDecodeRedistributeRouteNoTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ev.Prefix != netip.MustParsePrefix("192.168.0.0/20") || ev.Tag != 0 || ev.Add {
-		t.Errorf("ev = %+v, want 192.168.0.0/20 tag 0 del", ev)
+	if ev.Prefix != netip.MustParsePrefix("192.168.0.0/20") || ev.Add {
+		t.Errorf("ev = %+v, want 192.168.0.0/20 del", ev)
 	}
 }
 
@@ -90,18 +90,17 @@ func TestDecodeRedistributeRouteRejects(t *testing.T) {
 }
 
 func TestImporterSetSemantics(t *testing.T) {
-	im := NewImporter(1001)
+	im := NewImporter()
 	p1 := netip.MustParsePrefix("10.68.1.0/24")
 	p2 := netip.MustParsePrefix("172.16.1.0/24")
 
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
-	im.Handle(RouteEvent{Prefix: p2, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
+	im.Handle(RouteEvent{Prefix: p2, Add: true})
 	if got := im.Prefixes(); len(got) != 2 {
 		t.Fatalf("prefixes = %v, want 2 条", got)
 	}
 
-	// tag 变了：这个前缀的最新选中路由不再归我们导入，必须从集合里删掉。
-	im.Handle(RouteEvent{Prefix: p2, Tag: 2002, Add: true})
+	im.Handle(RouteEvent{Prefix: p2, Add: false})
 	if got := im.Prefixes(); len(got) != 1 || got[0] != p1 {
 		t.Fatalf("prefixes = %v, want 只剩 %s", got, p1)
 	}
@@ -112,7 +111,7 @@ func TestImporterSetSemantics(t *testing.T) {
 	}
 
 	// 重连不再清空：旧集合继续对外可见，直到窗口关闭。
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
 	im.BeginResync()
 	if im.Len() != 1 {
 		t.Fatalf("重连窗口里 Len = %d, want 1（旧集合要留着）", im.Len())
@@ -124,8 +123,8 @@ func TestImporterResyncKeepsOldSetUntilReplayQuiet(t *testing.T) {
 	im, clock := newClockImporter()
 	p1 := netip.MustParsePrefix("10.68.1.0/24")
 	p2 := netip.MustParsePrefix("172.16.1.0/24")
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
-	im.Handle(RouteEvent{Prefix: p2, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
+	im.Handle(RouteEvent{Prefix: p2, Add: true})
 
 	im.BeginResync()
 	if got := im.Prefixes(); len(got) != 2 {
@@ -134,7 +133,7 @@ func TestImporterResyncKeepsOldSetUntilReplayQuiet(t *testing.T) {
 
 	// 回放只带回 p1，p2 客户真的撤了。
 	clock.advance(100 * time.Millisecond)
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
 
 	// 回放之后 500ms 内不算完：p2 还在（宁可多留）。
 	clock.advance(300 * time.Millisecond)
@@ -159,13 +158,13 @@ func TestImporterResyncDeadline(t *testing.T) {
 	im, clock := newClockImporter()
 	p1 := netip.MustParsePrefix("10.68.1.0/24")
 	p2 := netip.MustParsePrefix("172.16.1.0/24")
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
-	im.Handle(RouteEvent{Prefix: p2, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
+	im.Handle(RouteEvent{Prefix: p2, Add: true})
 
 	im.BeginResync()
 	for i := 0; i < 20; i++ {
 		clock.advance(600 * time.Millisecond)
-		im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
+		im.Handle(RouteEvent{Prefix: p1, Add: true})
 		im.Tick(clock.now())
 	}
 	if im.resync {
@@ -181,7 +180,7 @@ func TestImporterResyncDeadline(t *testing.T) {
 func TestImporterResyncWaitsForFirstEvent(t *testing.T) {
 	im, clock := newClockImporter()
 	p1 := netip.MustParsePrefix("10.68.1.0/24")
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
 
 	im.BeginResync()
 	clock.advance(time.Second)
@@ -201,15 +200,15 @@ func TestImporterResyncWaitsForFirstEvent(t *testing.T) {
 func TestImporterNestedResyncKeepsOriginalStale(t *testing.T) {
 	im, clock := newClockImporter()
 	p1 := netip.MustParsePrefix("10.68.1.0/24")
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
 
 	im.BeginResync()
 	clock.advance(100 * time.Millisecond)
-	im.Handle(RouteEvent{Prefix: netip.MustParsePrefix("10.9.0.0/16"), Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: netip.MustParsePrefix("10.9.0.0/16"), Add: true})
 	im.BeginResync() // 又断了一次，pending 的半份回放丢掉
 
 	clock.advance(100 * time.Millisecond)
-	im.Handle(RouteEvent{Prefix: p1, Tag: 1001, Add: true})
+	im.Handle(RouteEvent{Prefix: p1, Add: true})
 	clock.advance(600 * time.Millisecond)
 	im.Tick(clock.now())
 
@@ -226,16 +225,16 @@ func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
 func newClockImporter() (*Importer, *fakeClock) {
 	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	im := NewImporter(1001)
+	im := NewImporter()
 	im.Now = c.now
 	im.Logf = func(string, ...any) {}
 	return im, c
 }
 
 func TestImporterSorts(t *testing.T) {
-	im := NewImporter(7)
+	im := NewImporter()
 	for _, p := range []string{"172.16.0.0/12", "10.68.1.0/24", "10.0.0.0/8"} {
-		im.Handle(RouteEvent{Prefix: netip.MustParsePrefix(p), Tag: 7, Add: true})
+		im.Handle(RouteEvent{Prefix: netip.MustParsePrefix(p), Add: true})
 	}
 	got := im.Prefixes()
 	want := []string{"10.0.0.0/8", "10.68.1.0/24", "172.16.0.0/12"}

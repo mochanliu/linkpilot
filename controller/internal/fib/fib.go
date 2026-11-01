@@ -50,13 +50,12 @@ const MaxVRFID uint8 = 255
 // 所以 VPN ID 取 250 会把客户路由装进 overlay 表，静默破坏隧道。
 const OverlayTable uint8 = 250
 
-// PrefBase 是 SD-WAN 路径的 VPP preference 起始值（0 最优，u8 上限 255）。
-// preference = PrefBase + 颜色（0..7 ⇒ 230..237），作用仅限 API 源内部排序。
-const PrefBase uint8 = 230
+// PrefBase 是 SD-WAN 路径的 VPP preference 起始值（0 最优）。
+// preference = PrefBase + 颜色（0..7 ⇒ 10..17），作用仅限 API 源内部排序。
+const PrefBase uint8 = 10
 
-// MaxColor 是颜色上限（PrefBase + MaxColor ≤ 255 ⇒ 25）。设计上限是 7，
-// 这里取 u8 数学上限做断言；更小的业务上限由调用方/配置层校验。
-const MaxColor uint8 = 255 - PrefBase
+// MaxColor 是颜色上限（8 种颜色，0..7）。
+const MaxColor uint8 = 7
 
 // LabelFor 是"这个 VRF 的 VPN 标签"的唯一算法。收端登记本地标签、发端压标签
 // 都用它 —— 两边各算一次还长得一样，是这套方案不需要信令的原因。
@@ -171,7 +170,7 @@ func rdString(rd uint32) string { return fmt.Sprintf("%d/%d", rd>>8, rd&0xff) }
 //
 // 链上只有最后一步有属性可比：local-pref / AS_PATH / origin / MED / eBGP 优于 iBGP
 // 本系统都没有（显式跳过，以后 policy 加属性是**插进一步**而不是改算法）；
-// IGP cost 的类比项 = 颜色，已经由 preference=230+颜色 表达，不在这里重复。
+// IGP cost 的类比项 = 颜色，已经由 preference=10+颜色 表达，不在这里重复。
 //
 // 为什么必须淘汰：同一个桶里塞两个标签 = 一半流量被投进**另一个 VPN** 的表
 // （§2.4 的静默投递）。被淘汰的那条不丢，它还留在 sr-route 的 adj-RIBs-in 里，
@@ -210,7 +209,7 @@ func pickWinner(list []cand) (win []cand, losers []uint32) {
 //
 // escape 是 §5 的逃生开关：关掉（默认）时主表只收颜色 0 的路径，颜色 0 全 down
 // 就等于这个前缀在主表里不存在（宁丢不占昂贵颜色）；打开时主表收全部颜色，
-// 谁先用由 preference=230+颜色 交给 VPP 原生排序（§2.1 实测 down 顶上、up 回落
+// 谁先用由 preference=10+颜色 交给 VPP 原生排序（§2.1 实测 down 顶上、up 回落
 // 都不需要我们再下发）。**颜色表两种情况下都照写**——它是 policy 阶段引流的落点，
 // 不是逃生开关的替代品。
 //
@@ -310,7 +309,7 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 			c := cand{Path: Path{NextHop: nh, Interface: t.Interface, Label: label, Preference: PrefBase + t.Color}, rd: rd}
 			// §4.3 第 5 步：主表收哪些颜色由逃生开关决定。关（默认）⇒ 只收颜色 0，
 			// 于是"颜色 0 全 down"时这个前缀在主表里就不存在了（宁丢不占昂贵颜色）；
-			// 开 ⇒ 全部颜色都进主表，靠 preference=230+颜色 让 VPP 自己排（§2.1 实测
+			// 开 ⇒ 全部颜色都进主表，靠 preference=10+颜色 让 VPP 自己排（§2.1 实测
 			// down 顶上、up 回落都是原生行为，我们只负责把集合与 pref 写对）。
 			if t.Color == 0 || escape {
 				k := key{table: uint32(r.Table), prefix: prefix}

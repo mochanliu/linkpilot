@@ -47,7 +47,7 @@
 | `adj-RIB-out` / `advertisedRoutes` | `reflector.go` 的 adj-rib-in + `fanout*` | RR 侧这次不动，本增量只改 CPE 读路径 |
 
 差异 ① ② 保持不动：`Route` 仍不带下一跳（这本来就是 RFC 4364 的递归解析形状），颜色→
-`preference=230+颜色`、表号公式、标签跟来源 VPN 仍在 `internal/fib`，GoBGP 的对应物是
+`preference=10+颜色`、表号公式、标签跟来源 VPN 仍在 `internal/fib`，GoBGP 的对应物是
 "Nexthop Tracking + 多路径等值平台"，位置对，不动。
 
 ## 删掉与新增的对外字段

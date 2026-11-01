@@ -453,7 +453,7 @@ func clonePath(p *TunnelPath) *TunnelPath {
 }
 
 // checkColor refuses a color whose VPP preference would either wrap (PrefBase is
-// 230 and preference is a u8 with no saturation) or land on a table-number segment
+// 10 and preference is a u8 with no saturation) or land on a table-number segment
 // nobody verified. 0..7 is the range the design committed to.
 func checkColor(c uint8) error {
 	if c > MaxTunnelColor {

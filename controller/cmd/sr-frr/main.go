@@ -48,11 +48,8 @@ type fileConfig struct {
 }
 
 // importConfig 打开反方向：把客户侧 BGP 学到的前缀上报给 sr-route。
-// tag 是客户侧邻居入方向 route-map 打的标记，用来区分"客户告诉我们的前缀"
-// 和盒内自己产生/导出的 BGP 路由。
 type importConfig struct {
 	VRFID       uint8  `json:"vrf_id"`
-	Tag         uint32 `json:"tag"`
 	PrefixesURL string `json:"prefixes_url"`
 }
 
@@ -121,9 +118,6 @@ func loadConfig(path string) (*fileConfig, error) {
 		return nil, errors.New("metric 不能为负")
 	}
 	if cfg.Import != nil {
-		if cfg.Import.Tag == 0 {
-			return nil, errors.New("import.tag 不能为 0（没有 tag 就无法区分客户路由与盒内导出的路由）")
-		}
 		if cfg.Import.PrefixesURL == "" {
 			return nil, errors.New("import.prefixes_url is required（sr-route 的 PUT /local-prefixes）")
 		}
@@ -227,7 +221,7 @@ func main() {
 	var imp *frr.Importer
 	importEnabled := cfg.Import != nil && !*once
 	if cfg.Import != nil {
-		imp = frr.NewImporter(cfg.Import.Tag)
+		imp = frr.NewImporter()
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -393,8 +387,8 @@ func main() {
 	log.Printf("sr-frr: 每 %s 从 %s 收敛到 FRR 表 %s；FRR 侧需 redistribute table-direct <表号>",
 		interval, cfg.StatusURL, tableList(tables))
 	if importEnabled {
-		log.Printf("sr-frr: 反向导入已开：tag %d 的 BGP 前缀 → sr-route vrf %d（%s）",
-			cfg.Import.Tag, cfg.Import.VRFID, cfg.Import.PrefixesURL)
+		log.Printf("sr-frr: 反向导入已开：BGP 前缀 → sr-route vrf %d（%s）",
+			cfg.Import.VRFID, cfg.Import.PrefixesURL)
 	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()

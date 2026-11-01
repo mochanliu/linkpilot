@@ -78,7 +78,7 @@ for n in 1 2 3; do
 done
 echo
 hr
-echo "盒内 FRR（lab-cpeN：BGP 跑在 $LCP_IF 上；正向导出 table $FRR_TABLE / 反向吃 tag 1001）"
+echo "盒内 FRR（lab-cpeN：BGP 跑在 $LCP_IF 上；正向导出 table $FRR_TABLE / 反向吃全部 BGP 前缀）"
 for n in 1 2 3; do
     c=lab-cpe$n
     echo "  $c:"

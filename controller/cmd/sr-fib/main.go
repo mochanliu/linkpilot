@@ -43,7 +43,7 @@ type fileConfig struct {
 
 // tunnelConfig 是控制面分配的隧道映射。下一跳必须与 RIB 里 next_hops 的某个元素逐字相同。
 //
-// Color 是这条隧道的 SD-WAN 颜色：它决定这条下一跳的 VPP preference（230+颜色），
+// Color 是这条隧道的 SD-WAN 颜色：它决定这条下一跳的 VPP preference（10+颜色），
 // 颜色 0 最优、颜色 0 全 down 时由 VPP 自己抬到存活的最小颜色。缺省 0，所以现存的
 // 配置文件不必改就能继续跑。
 type tunnelConfig struct {
@@ -56,7 +56,7 @@ const defaultVPPSocket = "/run/vpp/api.sock"
 
 // fibTunnels is the one place the box's own tunnel table becomes FIB input. It is
 // a function because a color that gets dropped here fails silently: the paths
-// still install, every one of them at preference 230.
+// still install, every one of them at preference 10.
 func fibTunnels(cfgs []tunnelConfig) []fib.Tunnel {
 	out := make([]fib.Tunnel, 0, len(cfgs))
 	for _, t := range cfgs {

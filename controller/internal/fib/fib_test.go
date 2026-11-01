@@ -218,7 +218,7 @@ func TestPlanFrom(t *testing.T) {
 			t.Fatalf("tables = %v, want %v", plan.Tables, wantTables)
 		}
 	}
-	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100, Preference: 230}
+	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100, Preference: PrefBase}
 	for _, table := range []uint32{100, colorTable(t, 0, 100)} {
 		r := mustRoute(t, plan, table, "10.1.0.0/24")
 		if len(r.Paths) != 1 || r.Paths[0] != want {
@@ -611,12 +611,12 @@ func TestPlanFromColorPreference(t *testing.T) {
 		t.Fatal(err)
 	}
 	main := mustRoute(t, plan, 100, "10.1.0.0/24")
-	if len(main.Paths) != 1 || main.Paths[0].Interface != "wg0" || main.Paths[0].Preference != 230 {
-		t.Errorf("主表 paths = %+v, want 只有 wg0（pref 230）", main.Paths)
+	if len(main.Paths) != 1 || main.Paths[0].Interface != "wg0" || main.Paths[0].Preference != PrefBase {
+		t.Errorf("主表 paths = %+v, want 只有 wg0（pref PrefBase）", main.Paths)
 	}
 	c7 := mustRoute(t, plan, colorTable(t, 7, 100), "10.1.0.0/24")
-	if len(c7.Paths) != 1 || c7.Paths[0].Interface != "wg1" || c7.Paths[0].Preference != 237 {
-		t.Errorf("颜色 7 表 paths = %+v, want 只有 wg1（pref 237）", c7.Paths)
+	if len(c7.Paths) != 1 || c7.Paths[0].Interface != "wg1" || c7.Paths[0].Preference != PrefBase+7 {
+		t.Errorf("颜色 7 表 paths = %+v, want 只有 wg1（pref PrefBase+7）", c7.Paths)
 	}
 	c0 := mustRoute(t, plan, colorTable(t, 0, 100), "10.1.0.0/24")
 	if len(c0.Paths) != 1 || c0.Paths[0].Interface != "wg0" {
@@ -684,7 +684,7 @@ func TestPlanFromEscapePutsAllColorsInMainTable(t *testing.T) {
 }
 
 // 开关最尖锐的差别在"只剩昂贵颜色"时（§5 口径）：关 ⇒ 这条前缀在主表里**不存在**，
-// 打流直接丢，不回落给昂贵颜色买单；开 ⇒ 主表用那条颜色 7 兜住，pref 仍是 230+色。
+// 打流直接丢，不回落给昂贵颜色买单；开 ⇒ 主表用那条颜色 7 兜住，pref 仍是 PrefBase+色。
 // 两种情况下颜色表 17100 都照写 —— 它是 policy 阶段的落点，不是开关的替身。
 func TestPlanFromEscapeDecidesWhetherExpensiveColorSurvives(t *testing.T) {
 	vrfs := []uint8{100}
@@ -753,7 +753,7 @@ func TestPlanFromEscapeDoesNotRelaxLabelBucket(t *testing.T) {
 }
 
 // 逃生开关存在的理由就是这一格：颜色 0 被 BFD 判死之后主表还剩什么。开 ⇒ 主表
-// 留下昂贵颜色的路径（pref=230+色 保证 VPP 先挑颜色 3 再挑颜色 7，§2.1 实测
+// 留下昂贵颜色的路径（pref=PrefBase+色 保证 VPP 先挑颜色 3 再挑颜色 7，§2.1 实测
 // down 顶上/up 回落是原生行为）；关 ⇒ 主表这条前缀直接消失，打流宁丢不买单。
 // 这是 O4 lab 判据的单元镜像，两边对的是同一件事。
 func TestPlanFromColorZeroDownWithEscape(t *testing.T) {
@@ -774,7 +774,7 @@ func TestPlanFromColorZeroDownWithEscape(t *testing.T) {
 	if len(main.Paths) != 2 {
 		t.Fatalf("逃生开、颜色 0 down：主表 paths = %+v, want wg1+wg2 两条", main.Paths)
 	}
-	// 计划不按 pref 排序（顺序交给 VPP 判定），钉的是每条路径的 pref 等于 230+色。
+	// 计划不按 pref 排序（顺序交给 VPP 判定），钉的是每条路径的 pref 等于 PrefBase+色。
 	wantPref := map[string]uint8{"wg1": PrefBase + 7, "wg2": PrefBase + 3}
 	for _, p := range main.Paths {
 		if p.Interface == "wg0" {
@@ -782,7 +782,7 @@ func TestPlanFromColorZeroDownWithEscape(t *testing.T) {
 			continue
 		}
 		if p.Preference != wantPref[p.Interface] {
-			t.Errorf("%s 的 pref = %d, want %d（230+颜色）", p.Interface, p.Preference, wantPref[p.Interface])
+			t.Errorf("%s 的 pref = %d, want %d（PrefBase+颜色）", p.Interface, p.Preference, wantPref[p.Interface])
 		}
 		delete(wantPref, p.Interface)
 	}
@@ -816,9 +816,9 @@ func TestPlanFromRejectsBadColor(t *testing.T) {
 	_, err := PlanFrom(
 		[]uint8{100},
 		[]RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2")},
-		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 230}}, nil, false)
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 8}}, nil, false)
 	if err == nil {
-		t.Fatal("Color 230 (230+230 > 255) must fail")
+		t.Fatal("Color 8 (PrefBase+8 > PrefBase+MaxColor) must fail")
 	}
 	if !strings.Contains(err.Error(), "超出上限") {
 		t.Errorf("err = %v, want mention color overflow", err)
@@ -842,10 +842,10 @@ func TestApplyDeleteThenAddOnPrefChange(t *testing.T) {
 				Paths: []Path{{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100, Preference: pref}}}},
 		}
 	}
-	if _, err := a.Apply(ctx, p(230)); err != nil {
+	if _, err := a.Apply(ctx, p(PrefBase)); err != nil {
 		t.Fatal(err)
 	}
-	res, err := a.Apply(ctx, p(235))
+	res, err := a.Apply(ctx, p(PrefBase+5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -853,8 +853,8 @@ func TestApplyDeleteThenAddOnPrefChange(t *testing.T) {
 		t.Errorf("res = %+v, want RoutesRemoved=1 + RoutesSet=1 (delete-then-add)", res)
 	}
 	paths := dp.routes["100|10.1.0.0/24"]
-	if len(paths) != 1 || paths[0].Preference != 235 {
-		t.Errorf("path pref = %+v, want single path with Preference=235", paths)
+	if len(paths) != 1 || paths[0].Preference != PrefBase+5 {
+		t.Errorf("path pref = %+v, want single path with Preference=%d", paths, PrefBase+5)
 	}
 }
 

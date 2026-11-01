@@ -89,7 +89,6 @@ LAN_PFX=( "" 10.68.1.0/24 10.68.2.0/24 10.68.3.0/24 )
 LOOP_IP=( "" 172.16.1.1 172.16.2.1 172.16.3.1 )  # 客户路由器 loopback（/32）
 BOX_AS=(  "" 65101 65102 65103 )
 CUST_AS=( "" 65001 65002 65003 )
-BGP_TAG=1001
 FRR_TABLE=1250
 TRANSIT_WAN=10.88.1.3
 VPN=0             # 客户 VPN ID，直接当 VPP 表号（0 = global；避开 250）
@@ -341,23 +340,18 @@ stage_containers() {
     local n
     for n in 1 2 3; do
         # 盒内 FRR：与自研控制面同盒子。table-direct 1250 把 sr-frr 导出的
-        # 远端前缀交给 BGP；inbound route-map 给客户路由打 tag，sr-frr 只认
-        # 这个 tag，把我方导出的 tag=0 路由挡在反向导入之外（防环）。
+        # 远端前缀交给 BGP；客户路由由 zebra 再分发通知交给 sr-frr 反向导入。
         cat > "$RUN/cpe$n.frr.conf" <<EOF
 frr defaults traditional
 hostname lab-cpe$n
 log file /var/log/frr/frr.log
 service integrated-vtysh-config
 !
-route-map CUST-IN permit 10
- set tag $BGP_TAG
-!
 router bgp ${BOX_AS[$n]}
  bgp router-id ${MGMT_IP[$n]}
  no bgp ebgp-requires-policy
  neighbor ${CUST_X_IP[$n]} remote-as ${CUST_AS[$n]}
  neighbor ${CUST_X_IP[$n]} description lab-cust$n
- neighbor ${CUST_X_IP[$n]} route-map CUST-IN in
  address-family ipv4 unicast
   redistribute table-direct $FRR_TABLE
  exit-address-family
@@ -794,14 +788,14 @@ EOF
         docker exec "$c" pgrep -x sr-fib >/dev/null 2>&1 ||
             die "$c: sr-fib 没起来（cat /var/log/sr-fib.log）"
         # 此刻 RIB 还是空的：local 全部来自客户 BGP，要等 stage frr 把
-        # sr-frr 的 tag 1001 反向导入接上。远端前缀下 FIB 的断言也在那里。
+        # sr-frr 的反向导入接上。远端前缀下 FIB 的断言也在那里。
         note "$c: sr-route/sr-fib 在跑（RIB 要等客户 BGP 反向上报才有前缀）"
     done
 }
 
 # ==================================================================
 stage_frr() {
-    log "frr: 重启 FRR（客户口已是 TAP）+ sr-frr 正向导出 table $FRR_TABLE / 反向导入 tag $BGP_TAG"
+    log "frr: 重启 FRR（客户口已是 TAP）+ sr-frr 正向导出 table $FRR_TABLE / 反向导入全部 BGP 前缀"
     local n c i remote have xc st
 
     # 客户口的地址在 stage dataplane 里从内核 eth1 搬到了 VPP，再由 lcp-sync
@@ -835,7 +829,6 @@ stage_frr() {
   "vrfs": [{"vrf_id": $VPN, "table_id": $FRR_TABLE}],
   "import": {
     "vrf_id": $VPN,
-    "tag": $BGP_TAG,
     "prefixes_url": "http://127.0.0.1:${ROUTE_STATUS[$n]}/local-prefixes"
   }
 }
@@ -860,7 +853,7 @@ EOF
     done
     note "三台盒子与客户路由器的 BGP 都 Established（客户口是 VPP，会话经 linux-cp 的 TAP）"
 
-    # 2) 反向上报：客户宣告的 LAN 与 loopback（tag $BGP_TAG）进 sr-route 的 local。
+    # 2) 反向上报：客户宣告的 LAN 与 loopback 进 sr-route 的 local。
     for n in 1 2 3; do
         c=lab-cpe$n
         for i in $(seq 1 60); do

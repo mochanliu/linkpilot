@@ -132,8 +132,7 @@ type Tunnel struct {
 	//
 	// 0..7, never more: the color is also the high digit of the VRF table number
 	// (颜色*1000+10000+主表号), and only those eight segments were checked against
-	// the tables in use. The u8 arithmetic itself tolerates 25, which is not a
-	// reason to hand out colors whose tables nobody has verified.
+	// the tables in use.
 	Color uint8 `json:"color,omitempty"`
 
 	// MTU is derived, never configured by the user: the smaller of the underlay
