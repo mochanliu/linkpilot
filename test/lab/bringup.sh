@@ -958,15 +958,31 @@ stage_terms() {
 # ==================================================================
 stage_bfd() {
     log "bfd: 每对 overlay 之间建**多跳**会话（绑接口的会话会把 overlay 路由打成 dpo-drop）"
+    # 会话建起来还不够：VPP 的 BFD UDP 传输在主表（table 0）里查对端地址，而 overlay
+    # /32 只装在 table 250 —— 主表那份是 dpo-drop，BFD 包全被吃掉，状态永远 init/down。
+    # 所以每对先给主表补一条到对端 overlay /32 的单路径 host route，指向该隧道口。
+    # 必须单路径：同一前缀连加两条 via 会变成等价多路径，一半 BFD 包走错腿，会话也起不来。
     local a b aif aport aov bif bport bov pa pb tport
     while read -r a b aif aport aov bif bport bov pa pb tport; do
         local ca=lab-cpe$a cb=lab-cpe$b
+        vpp "$ca" ip route del "$bov/32" table 0 >/dev/null 2>&1 || true
+        vpp "$cb" ip route del "$aov/32" table 0 >/dev/null 2>&1 || true
+        vpp "$ca" ip route add "$bov/32" table 0 via "$aif" >/dev/null
+        vpp "$cb" ip route add "$aov/32" table 0 via "$bif" >/dev/null
         vpp "$ca" bfd udp session add multihop local-addr "$aov" peer-addr "$bov" \
             desired-min-tx 300000 required-min-rx 300000 detect-mult 3 >/dev/null
         vpp "$cb" bfd udp session add multihop local-addr "$bov" peer-addr "$aov" \
             desired-min-tx 300000 required-min-rx 300000 detect-mult 3 >/dev/null
-        note "$ca($aov) <-> $cb($bov)"
+        note "$ca($aov) <-> $cb($bov)，主表补 $aif/$bif 的 host route"
     done < <(tunnel_rows)
+    # 会话 up 之前别让 sr-fib 把路径当"不可达"撤掉：BFD 是周期报文，从建会话到 up 有
+    # 一到两个检测周期（3×300ms），这段时间 sr-fib 会如实报"BFD 不是 Up 该路径跳过"。
+    sleep 2
+    local c n
+    for c in lab-cpe1 lab-cpe2 lab-cpe3; do
+        n=$(vpp "$c" show bfd session 2>/dev/null | awk '/configured BFD sessions/ {print $NF; exit}')
+        note "$c: 已配 BFD 会话 $n 条"
+    done
 }
 
 # ==================================================================

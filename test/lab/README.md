@@ -456,6 +456,26 @@ test/lab/bringup.sh --stage terms        # 终端默认路由
 可选：`--bfd` 在隧道内建**多跳** BFD（绑接口的会话会把 overlay 路由打成
 dpo-drop）；`--keep` 不先拆现有容器（只用于调试，状态可能是脏的）。
 
+### BFD 开着的时候怎么看状态（2026-11-01 实测）
+
+- **默认不建会话**：不加 `--bfd` 时 `Number of configured BFD sessions: 0`，
+  sr-fib 也就不看可达性（没会话 = 不判断，不会黑洞）。
+- **`vppctl show bfd session` 只给计数**（这个 VPP 构建的 `show bfd udp session`
+  同样只打计数）。逐条状态只能从二进制 API dump 读，最省事的姿势是在盒子容器里跑
+  现成的状态探针：
+  ```bash
+  docker exec lab-cpe1 sh -c 'cd /workspace/controller &&
+    SRWG_VPP_SOCK=/run/vpp/api.sock \
+    SRWG_OVERLAY_LOCAL=192.168.99.1 SRWG_OVERLAY_PEER=192.168.99.2 \
+    go test -run TestLiveBFDState ./internal/vppapi -count=1 -v'
+  ```
+  `SRWG_BFD_WANT=up|down|absent` 说要什么，`SRWG_BFD_WAIT_MS=5000` 轮询到超时。
+- **BFD 的报文走主表**：VPP 的 BFD UDP 传输在 table 0 查对端地址，而 overlay /32
+  只装在 table 250。所以 `--bfd` 会顺手给主表补一条对端 overlay /32 的**单路径**
+  host route（`via wgN`）——漏掉这条，会话永远是 down，而 sr-fib 会把"BFD 不是 Up"
+  当成不可达把路径全撤掉（实测 cpe1 一次撤 8 条），data plane 直接黑洞。
+  同一前缀连加两条 `via` 会变成等价多路径，一半 BFD 包走错腿，会话同样起不来。
+
 ## 导通组落到盒子（O6-b 判据专用的一对容器，2026-10-31）
 
 O6-b 的判据就一句话：**控制台改一次导通，不重启任何进程，在跑的 sr-route 里那张表
@@ -703,3 +723,7 @@ docker exec lab-cpe1 vppctl show trace
   MPLS-over-WG 转发成立（实测 3/3 ping）。
 - **BFD 必须 multihop**：绑在接口上的会话会让 overlay 路由变成 dpo-drop
   （见 test/scripts/test-fib.sh 的实测记录）。
+- **BFD 的查表在主表，不在 overlay 表**：多跳会话的报文由 VPP 在 table 0 查对端
+  地址，而 overlay /32 只装在 250 ⇒ 主表那份是 dpo-drop，会话恒 down（实测丢包计数
+  恰好等于 300ms × 会话存活时长）。要在 250 的拓扑里跑 BFD，得给主表补一条单路径
+  `ip route add <对端 overlay>/32 table 0 via wgN`；见 `--bfd` 那节。
