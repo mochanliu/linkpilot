@@ -109,9 +109,14 @@ O6-c 补了第四道 `PUT /rrs`：换反射器集合，也是整表替换、也�
 它跟前三道不一样，**旧会话在新会话成立之前不会摘**（make-before-break），所以 `/status` 可能返回
 `rr_wait{pending_addrs, retiring_addrs}` —— 那是"新 RR 还没成立、旧的先留着"，不是失败。
 判据不在本 lab 的盒子上，它另起三台 sr-rr 与两台 sr-route（自己的端口、自己的配置，不碰 lab 在跑的进程）：
-宿主机上跑 `test/scripts/test-rr-switch.sh`（56 条，约 150 秒，需要 `lab-o6b1`/`lab-o6b2`/`lab-rr`）。
+宿主机上跑 `test/scripts/test-rr-switch.sh`（57 条，约 150 秒）。默认吃 `lab-o6b1`/`lab-o6b2`/`lab-rr`；
+那对盒子不在时直接借用主线 lab 的两台盒子（2026-11-01 就是这样跑的，57/0）：
+```
+N1=lab-cpe1 N2=lab-cpe2 N2_IP=10.99.0.12 TENANT=tenant-a test/scripts/test-rr-switch.sh
+```
 换 RR 的正确走法只有三步，中间那步必须运营方亲眼看：**先把新 RR 加进选择并发布 → 看新 RR 的
-`/routes` 收齐全租户 → 再把旧 RR 撤掉发布**；跳过第二步会在新 RR 上留一段内容空窗（lab 量到 2.5 秒）。
+`/routes` 收齐全租户 → 再把旧 RR 撤掉发布**；跳过第二步会在新 RR 上留一段内容空窗（lab 量到 0.5 秒，
+C-c 时代是 2.5 秒；这与"可见表 = 所有会话的并集"无关 —— 新 RR 上没有的内容，并集也变不出来）。
 
 防环：
 
@@ -535,15 +540,22 @@ docker exec lab-o6b1 cat /var/lib/sr-cpe/status.json                        # v4
 [docs/overlay-console-plan.md](../../docs/overlay-console-plan.md) 的 O6-b 一节）：
 
 - 这台机器上**有两个 docker daemon，容器名是重叠的**：Docker Desktop
-  （`~/.docker/run/docker.sock`，内核 `7.0.14-linuxkit`，**lab 全套 fixture 在这里**）和
-  colima（`~/.colima/default/docker.sock`，Ubuntu 24.04 / 内核 `6.8.0-117-generic`，
-  今天**一个容器都没跑**）。`7.0.14-linuxkit` 没有 `CONFIG_NET_VRF`，`6.8.0-117-generic`
-  有——所以 #98 那次多 VPN 是在 colima 上验的。**每条 docker 命令都要显式
-  `export DOCKER_HOST=…`**，否则"同名容器"会打到另一台机器上，量出来的东西南辕北辙。
-- 这个内核（`7.0.14-linuxkit`）**没有 `CONFIG_NET_VRF`**：boot 段里
+  （`~/.docker/run/docker.sock`，内核 `7.0.14-linuxkit`）和
+  colima（`~/.colima/default/docker.sock`，Ubuntu 24.04 / 内核 `6.8.0-117-generic`）。
+  **2026-11-01 起 lab 跑在 colima 上**（理由见下一条），带 VRF 的判据只在那里成立：
+  ```
+  DOCKER_HOST=unix:///Users/louis/.colima/default/docker.sock bash test/lab/bringup.sh
+  DOCKER_HOST=unix:///Users/louis/.colima/default/docker.sock bash test/lab/verify.sh
+  ```
+  **每条 docker 命令都要显式 `export DOCKER_HOST=…`**，否则"同名容器"会打到另一台机器上，
+  量出来的东西南辕北辙。两套 lab 共用 `test/lab/run/`（证书、令牌、二进制），
+  所以**别同时在两个 daemon 上起**：后起的那次会把 `run/` 里的 CA 和令牌换成自己的，
+  先起的那套盒子下一次重连就对不上了。
+- Docker Desktop 的内核（`7.0.14-linuxkit`）**没有 `CONFIG_NET_VRF`**：boot 段里
   `ip link add … type vrf` 必失败（`Error: Unknown device type.`），而 boot 段排在叠加段
-  前面，所以整包会卡在那里。判据只用 **VPN 0**（default VRF，不建 vrf 设备）。多 VPN
-  在 Ubuntu 6.8 内核上实测通过，那是 #98，不是这里能复现的。
+  前面，所以整包会卡在那里。colima 的 `6.8.0-117-generic` 有 VRF——2026-11-01 在
+  `lab-cpe1` 里实测 `ip link add vpn100 type vrf table 100` → up → `ip -d link` 显示
+  `vrf table 100` → 删掉，全通。#98 那次多 VPN 也是在 colima 上验的。
 - **盘上没有 `route.json` = 整包失败**，而且是在另外三段都跑完之后才报错。口径已拍：
   **不给盒子分角色、也不加"这台没路由面就跳过"的分支**——那份文件是装盒子时运维要写的，
   缺了就是安装没做完，报错是对的。`lab-transit` 今天撞不到这条：它的 agent 不带 `-apply`，

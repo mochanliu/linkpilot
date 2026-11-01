@@ -47,6 +47,8 @@
 #
 # 前置：lab-o6b1（device 1）与 lab-o6b2（device 2）里有入网签好的证书（租户
 # o6b-lab），lab-rr 里有 CA 与 rr.crt（SAN 覆盖 10.99.0.100，换端口不用重签）。
+# 那对盒子不在了也不要紧：主线 lab 的 lab-cpe1/2（租户 tenant-a）同样够用 ——
+#   N1=lab-cpe1 N2=lab-cpe2 N2_IP=10.99.0.12 TENANT=tenant-a test/scripts/test-rr-switch.sh
 # 这两台盒子里正在跑的 sr-route / sr-agent 本脚本**一概不动**：另起自己的进程、
 # 自己的端口、自己的配置。lab-rr 上给 tenant-a 跑着的那个 sr-rr 同样不碰。
 #
@@ -55,17 +57,17 @@
 # --keep 保留三台 RR 与两台设备进程、以及各容器 $WORK 里的配置、日志与采样。
 set -u
 
-RR=lab-rr
-N1=lab-o6b1                       # device 1：被换的那台
-N2=lab-o6b2                       # device 2：另一台（并集之后再撤旧的那台：它一条样本都不许缺）
-CTRL=lab-ctrl                     # 只用来编译
+RR=${RR:-lab-rr}
+N1=${N1:-lab-o6b1}                # device 1：被换的那台
+N2=${N2:-lab-o6b2}                # device 2：另一台（并集之后再撤旧的那台：它一条样本都不许缺）
+CTRL=${CTRL:-lab-ctrl}            # 只用来编译
 MODULE=${MODULE:-/workspace/controller}
 WORK=${WORK:-/tmp/sr-rr-switch}
 
 RR_IP=${RR_IP:-10.99.0.100}
 N2_IP=${N2_IP:-10.99.0.4}                  # 采样器在 node1 的容器里，读 node2 要用它的容器地址
-TENANT=o6b-lab
-RT=65000:1001
+TENANT=${TENANT:-o6b-lab}         # 必须等于两台盒子证书里的租户
+RT=${RT:-65000:1001}
 PFX1=${PFX1:-10.77.77.0/24}       # device 1 宣告
 PFX2=${PFX2:-10.88.88.0/24}       # device 2 宣告
 

@@ -404,7 +404,8 @@ sect "8. 反向导入：客户 BGP → 盒内 FRR → sr-frr → sr-route local"
 for n in 1 2 3; do
     c=lab-cpe$n
     r=$(vtysh "$c" -c "show ip route ${LOOP_IP[$n]}/32")
-    echo "$r" | grep -qE "^B" \
+    # 单条前缀 zebra 走详情视图（"Known via \"bgp\""），没有表视图那种行首 B。
+    echo "$r" | grep -qE '^B|Known via "bgp"' \
         && ok "$c: 客户 loopback 在 zebra 里是 BGP 路由" \
         || bad "$c: 客户 loopback 不是 BGP 路由"
     echo "$r" | grep -q "${CUST_X_IP[$n]}" \
