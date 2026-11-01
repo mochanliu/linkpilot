@@ -696,6 +696,23 @@
   };
 
 
+  // 重建 DOM 时用来记住用户还没提交的手艺，见 render() 里的说明。
+  function keepKey(el) { return el.tagName + ":" + (el.id || el.name || ""); }
+
+  // 这个控件的值还是不是生成它时那个？比对价值属性（input）与 selected 属性
+  // （select）—— 都是服务端这一版渲染出来的原值，用户动过才不一样。
+  function editedByUser(el) {
+    // 多选框记不住：回填时只能写一个 value，会把用户另外选中的几个取消掉，
+    // 而它的选择在 change 里已经进了状态，重画自然带着。
+    if (el.multiple) return false;
+    if (el.tagName === "SELECT") {
+      var d = el.querySelector("option[selected]");
+      var base = d ? d.value : (el.options[0] ? el.options[0].value : "");
+      return el.value !== base;
+    }
+    return el.value !== el.defaultValue;
+  }
+
   function render() {
     var st = S.state;
     if (!st) return;
@@ -752,18 +769,26 @@
     // data-keep 是控件自己声明的例外：它的值是服务端状态算出来的（下拉框当前
     // 归属），不是用户还没提交的手艺。留着会把「清掉位置」重新填回旧站点，
     // 而且没有 name/id 的控件全部共用一个键，一行改的选项会串到别的行。
+    //
+    // 只记用户改过、还没提交的值（editedByUser）：没动过的控件交给新一版渲染，
+    // 服务端改了就以服务端为准；提交过的表单由 releaseForm 先 reset，不会记进来。
+    //
+    // 键优先用 id：同一页上可能有两张表单用同一个 name。例：隧道页的路径模板
+    // 「新建」(#und-path-name) 与 「编辑」(#und-path-edit-name) 都叫 name —— 按
+    // name 记，编辑框里刚改的名字会在下一次重建时被填进空着的新建框（然后被
+    // 当成新模板建出来）。id 在同一张页面上本来就唯一，没有 id 的才退回 name。
     var keep = {};
     document.querySelectorAll("#content input:not([data-keep]), #content select:not([data-keep])").forEach(function (el) {
-      var k = el.tagName + ":" + (el.name || el.id || "");
-      if (k !== "INPUT:" && el.value) keep[k] = el.value;
+      var k = keepKey(el);
+      if (k !== "INPUT:" && editedByUser(el)) keep[k] = el.value;
     });
 
     S.html = c;
     $("content").innerHTML = c;
 
     document.querySelectorAll("#content input:not([data-keep]), #content select:not([data-keep])").forEach(function (el) {
-      var k = el.tagName + ":" + (el.name || el.id || "");
-      if (!el.value && keep[k]) el.value = keep[k];
+      var k = keepKey(el);
+      if (k in keep) el.value = keep[k];
     });
     refreshClocks();
 
