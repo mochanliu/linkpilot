@@ -45,78 +45,88 @@ func (f *fakeDP) RouteDelete(_ context.Context, r Route) error {
 	return nil
 }
 
-func TestValidateTables(t *testing.T) {
-	tests := []struct {
-		name   string
-		tables []Table
-		ok     bool
-	}{
-		{"正常", []Table{{VRF: 1, ID: 1000}}, true},
-		{"空", nil, false},
-		{"VRF 0", []Table{{VRF: 0, ID: 1000}}, true},
-		{"表号 255", []Table{{VRF: 1, ID: 255}}, false},
-		{"表号 256", []Table{{VRF: 1, ID: 256}}, true},
-		{"表号过大", []Table{{VRF: 1, ID: MaxTableID + 1}}, false},
-		{"VRF 重复", []Table{{VRF: 1, ID: 1000}, {VRF: 1, ID: 1001}}, false},
-		{"表号重复", []Table{{VRF: 1, ID: 1000}, {VRF: 2, ID: 1000}}, false},
+func oifOf(v uint32) (int, error) { return 100 + int(v), nil }
+
+func TestKernelTable(t *testing.T) {
+	if got := KernelTable(0); got != 254 {
+		t.Errorf("VPN 0 应落到内核 main(254)，实际 %d", got)
 	}
-	for _, tc := range tests {
-		err := ValidateTables(tc.tables)
-		if tc.ok && err != nil {
-			t.Errorf("%s: 不该报错: %v", tc.name, err)
-		}
-		if !tc.ok && err == nil {
-			t.Errorf("%s: 期望报错", tc.name)
-		}
+	if got := KernelTable(100); got != 100 {
+		t.Errorf("VPN 100 应落到表 100，实际 %d", got)
 	}
 }
 
 func TestPlanFrom(t *testing.T) {
-	tables := []Table{{VRF: 1, ID: 1000}, {VRF: 2, ID: 1001}}
 	routes := []RIBRoute{
 		{VRF: 2, Prefix: "10.2.0.0/16", NextHops: []string{"192.168.99.2"}},
+		{VRF: 0, Prefix: "10.0.0.0/24", NextHops: []string{"192.168.99.2"}},
 		{VRF: 1, Prefix: "10.1.0.0/24", NextHops: []string{"192.168.99.2", "192.168.99.3"}},
 		{VRF: 1, Prefix: "10.1.0.1/24", NextHops: []string{"192.168.99.2"}}, // 未规范，收敛成同一个前缀
 		{VRF: 1, Prefix: "10.9.0.0/16", NextHops: nil},                      // 没有路径，不导出
+		{VRF: 3, Prefix: "10.3.0.0/16", NextHops: []string{"192.168.99.2"}}, // 不在 export_vrfs，跳过
 	}
-	plan, err := PlanFrom(tables, routes, 1, 20)
+	plan, err := PlanFrom([]uint32{2, 0, 1}, routes, oifOf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Routes) != 2 {
-		t.Fatalf("期望 2 条（去重、无路径的跳过），实际 %d: %v", len(plan.Routes), plan.Routes)
+	if len(plan.Routes) != 3 {
+		t.Fatalf("期望 3 条（去重、无路径与未导出的跳过），实际 %d: %v", len(plan.Routes), plan.Routes)
 	}
-	if got := plan.Routes[0]; got.TableID != 1000 || got.Prefix.String() != "10.1.0.0/24" {
-		t.Errorf("排序/表号不对: %+v", got)
+	if got := plan.Routes[0]; got.Table != 1 || got.OIF != 101 || got.Prefix.String() != "10.1.0.0/24" {
+		t.Errorf("排序/表号/出口不对: %+v", got)
 	}
-	if got := plan.Routes[1]; got.TableID != 1001 || got.Prefix.String() != "10.2.0.0/16" {
-		t.Errorf("排序/表号不对: %+v", got)
+	if got := plan.Routes[1]; got.Table != 2 || got.OIF != 102 || got.Prefix.String() != "10.2.0.0/16" {
+		t.Errorf("排序/表号/出口不对: %+v", got)
 	}
-	for _, r := range plan.Routes {
-		if r.Distance != 1 || r.Metric != 20 {
-			t.Errorf("distance/metric 没带上: %+v", r)
-		}
+	if got := plan.Routes[2]; got.Table != 254 || got.OIF != 100 || got.Prefix.String() != "10.0.0.0/24" {
+		t.Errorf("VPN 0 应进 main(254)、出口用 VPN 0 的 lo: %+v", got)
+	}
+}
+
+func TestPlanFromEmptyExport(t *testing.T) {
+	plan, err := PlanFrom(nil, []RIBRoute{
+		{VRF: 0, Prefix: "10.0.0.0/24", NextHops: []string{"1.1.1.1"}},
+	}, oifOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Routes) != 0 {
+		t.Fatalf("没有 export_vrfs 时不该导出任何前缀: %v", plan.Routes)
 	}
 }
 
 func TestPlanFromRejects(t *testing.T) {
-	tables := []Table{{VRF: 1, ID: 1000}}
-	tests := map[string][]RIBRoute{
-		"没配的 VRF": {{VRF: 2, Prefix: "10.2.0.0/16", NextHops: []string{"1.1.1.1"}}},
-		"前缀解析失败":  {{VRF: 1, Prefix: "10.1.0.0", NextHops: []string{"1.1.1.1"}}},
-		"IPv6":    {{VRF: 1, Prefix: "2001:db8::/32", NextHops: []string{"1.1.1.1"}}},
-		"空前缀":     {{VRF: 1, Prefix: "", NextHops: []string{"1.1.1.1"}}},
+	routes := []RIBRoute{{VRF: 5, Prefix: "10.5.0.0/16", NextHops: []string{"1.1.1.1"}}}
+	cases := map[string]struct {
+		vpns []uint32
+		oif  func(uint32) (int, error)
+	}{
+		"VPN 超过 255": {vpns: []uint32{256}, oif: oifOf},
+		"导出 overlay": {vpns: []uint32{OverlayVRF}, oif: oifOf},
+		"VPN 重复":     {vpns: []uint32{1, 1}, oif: oifOf},
+		"出口解析失败":     {vpns: []uint32{5}, oif: func(uint32) (int, error) { return 0, errors.New("没有 vpn5") }},
+		"出口 ifindex 非法": {
+			vpns: []uint32{5}, oif: func(uint32) (int, error) { return 0, nil },
+		},
 	}
-	for name, routes := range tests {
-		if _, err := PlanFrom(tables, routes, 1, 20); err == nil {
+	for name, tc := range cases {
+		if _, err := PlanFrom(tc.vpns, routes, tc.oif); err == nil {
 			t.Errorf("%s: 期望报错", name)
 		}
 	}
-	if _, err := PlanFrom(tables, nil, 0, 20); err == nil {
-		t.Error("distance 0 应报错")
+
+	badPrefix := map[string]string{
+		"没有斜杠": "10.1.0.0",
+		"IPv6": "2001:db8::/32",
+		"空串":   "",
+		"4in6": "::ffff:10.0.0.0/120",
 	}
-	if _, err := PlanFrom(nil, nil, 1, 20); err == nil {
-		t.Error("空表配置应报错")
+	for name, pfx := range badPrefix {
+		if _, err := PlanFrom([]uint32{5}, []RIBRoute{
+			{VRF: 5, Prefix: pfx, NextHops: []string{"1.1.1.1"}},
+		}, oifOf); err == nil {
+			t.Errorf("%s: 期望报错", name)
+		}
 	}
 }
 
@@ -126,8 +136,8 @@ func TestExporterApply(t *testing.T) {
 	ctx := context.Background()
 
 	plan := Plan{Routes: []Route{
-		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), TableID: 1000, Distance: 1, Metric: 20},
-		{Prefix: netip.MustParsePrefix("10.2.0.0/24"), TableID: 1000, Distance: 1, Metric: 20},
+		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), Table: 100, OIF: 5},
+		{Prefix: netip.MustParsePrefix("10.2.0.0/24"), Table: 100, OIF: 5},
 	}}
 	res, err := ex.Apply(ctx, plan)
 	if err != nil {
@@ -150,10 +160,10 @@ func TestExporterApply(t *testing.T) {
 		t.Fatalf("无变化时不该写: %+v writes %d→%d", res, before, dp.writes)
 	}
 
-	// 去掉一条、改掉一条的属性 → 一删一加，顺序是先加后删。
+	// 去掉一条、挪一条的出口 → 一删两加（出口变化用 replace 完成，不先删）。
 	plan2 := Plan{Routes: []Route{
-		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), TableID: 1000, Distance: 1, Metric: 99},
-		{Prefix: netip.MustParsePrefix("10.3.0.0/24"), TableID: 1000, Distance: 1, Metric: 20},
+		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), Table: 100, OIF: 7},
+		{Prefix: netip.MustParsePrefix("10.3.0.0/24"), Table: 100, OIF: 5},
 	}}
 	res, err = ex.Apply(ctx, plan2)
 	if err != nil {
@@ -165,8 +175,11 @@ func TestExporterApply(t *testing.T) {
 	if len(dp.installed) != 2 {
 		t.Fatalf("收敛后应有 2 条，实际 %v", dp.installed)
 	}
+	if got := dp.installed["100|10.1.0.0/24"]; got.OIF != 7 {
+		t.Fatalf("出口变化没有生效: %+v", got)
+	}
 
-	want := []string{"1000|10.1.0.0/24", "1000|10.3.0.0/24"}
+	want := []string{"100|10.1.0.0/24", "100|10.3.0.0/24"}
 	got := ex.Routes()
 	if len(got) != 2 || got[0].key() != want[0] || got[1].key() != want[1] {
 		t.Fatalf("Routes 快照不对: %v", got)
@@ -177,15 +190,15 @@ func TestExporterKeepsPrevOnFailure(t *testing.T) {
 	dp := newFakeDP()
 	ex := NewExporter(dp)
 	ctx := context.Background()
-	first := Plan{Routes: []Route{{Prefix: netip.MustParsePrefix("10.1.0.0/24"), TableID: 1000, Distance: 1}}}
+	first := Plan{Routes: []Route{{Prefix: netip.MustParsePrefix("10.1.0.0/24"), Table: 100, OIF: 5}}}
 	if _, err := ex.Apply(ctx, first); err != nil {
 		t.Fatal(err)
 	}
 
 	dp.failAt = "add"
 	second := Plan{Routes: []Route{
-		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), TableID: 1000, Distance: 1},
-		{Prefix: netip.MustParsePrefix("10.2.0.0/24"), TableID: 1000, Distance: 1},
+		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), Table: 100, OIF: 5},
+		{Prefix: netip.MustParsePrefix("10.2.0.0/24"), Table: 100, OIF: 5},
 	}}
 	if _, err := ex.Apply(ctx, second); err == nil {
 		t.Fatal("注入的失败没有传出来")
@@ -207,8 +220,8 @@ func TestExporterFlush(t *testing.T) {
 	ex := NewExporter(dp)
 	ctx := context.Background()
 	plan := Plan{Routes: []Route{
-		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), TableID: 1000, Distance: 1},
-		{Prefix: netip.MustParsePrefix("10.2.0.0/24"), TableID: 1001, Distance: 1},
+		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), Table: 100, OIF: 5},
+		{Prefix: netip.MustParsePrefix("10.2.0.0/24"), Table: 101, OIF: 6},
 	}}
 	if _, err := ex.Apply(ctx, plan); err != nil {
 		t.Fatal(err)

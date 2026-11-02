@@ -1,6 +1,7 @@
 package frr
 
 import (
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -11,8 +12,8 @@ import (
 func TestStateRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sub", "state.json")
 	routes := []Route{
-		{Prefix: netip.MustParsePrefix("10.1.0.0/24"), TableID: 1000, Distance: 1, Metric: 20},
-		{Prefix: netip.MustParsePrefix("10.2.0.0/16"), TableID: 1001, Distance: 250, Metric: 0},
+		{Prefix: netip.MustParsePrefix("10.0.0.0/24"), Table: 254, OIF: 1},
+		{Prefix: netip.MustParsePrefix("10.2.0.0/16"), Table: 100, OIF: 5},
 	}
 	if err := SaveState(path, routes); err != nil {
 		t.Fatal(err)
@@ -28,8 +29,10 @@ func TestStateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), `"prefix": "10.1.0.0/24"`) {
-		t.Fatalf("状态文件不是可读 JSON: %s", b)
+	for _, want := range []string{`"mode": "krt"`, `"table": 100`, `"oif": 5`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("状态文件缺 %s:\n%s", want, b)
+		}
 	}
 }
 
@@ -40,13 +43,29 @@ func TestLoadStateMissing(t *testing.T) {
 	}
 }
 
+// 旧文件属于已退役的 ZAPI/1250 导出：必须被认出来，而不是当新格式去撤
+// （那些条目在 zebra 的非主表里，内核 netlink 删不到）。
+func TestLoadStateLegacy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	body := `{"routes":[{"prefix":"10.0.0.0/8","table_id":1250,"distance":1,"metric":20}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadState(path); !errors.Is(err, ErrLegacyState) {
+		t.Fatalf("旧格式应返回 ErrLegacyState，实际 %v", err)
+	}
+}
+
 func TestLoadStateRejectsGarbage(t *testing.T) {
 	dir := t.TempDir()
 	cases := map[string]string{
-		"不是 JSON": `not json`,
-		"表号为 0":   `{"routes":[{"prefix":"10.0.0.0/8","table_id":0,"distance":1,"metric":0}]}`,
-		"未规范前缀":   `{"routes":[{"prefix":"10.0.0.1/8","table_id":1000,"distance":1,"metric":0}]}`,
-		"IPv6":    `{"routes":[{"prefix":"2001:db8::/32","table_id":1000,"distance":1,"metric":0}]}`,
+		"不是 JSON":      `not json`,
+		"未知 mode":      `{"mode":"zapi","routes":[]}`,
+		"表号为 0":        `{"mode":"krt","routes":[{"prefix":"10.0.0.0/8","table":0,"oif":1}]}`,
+		"表号超过 255":     `{"mode":"krt","routes":[{"prefix":"10.0.0.0/8","table":256,"oif":1}]}`,
+		"出口 ifindex 0": `{"mode":"krt","routes":[{"prefix":"10.0.0.0/8","table":100,"oif":0}]}`,
+		"未规范前缀":        `{"mode":"krt","routes":[{"prefix":"10.0.0.1/8","table":100,"oif":1}]}`,
+		"IPv6":         `{"mode":"krt","routes":[{"prefix":"2001:db8::/32","table":100,"oif":1}]}`,
 	}
 	for name, body := range cases {
 		path := filepath.Join(dir, "s.json")

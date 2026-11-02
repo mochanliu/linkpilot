@@ -12,8 +12,9 @@ sr-fib / sr-frr 把两套路由体系接起来。FRR 和 VPP 的接缝是 VPP �
 这条 TAP 上；FRR 算出的路由由 zebra 装进内核主表，`linux-nl` 插件再把内核表
 1:1 镜像进 VPP，于是**转发的每一跳都由 VPP 完成**：
 
-- **正向**：sr-route RIB → sr-frr → FRR `table 1250` → `redistribute
-  table-direct 1250` → BGP → 客户路由器。
+- **正向**：sr-route RIB → sr-frr 写内核 K 路由（VPN 0 = 主表 254，出口
+  `lo`）→ 盒内 FRR `redistribute kernel` → BGP → 客户路由器。这些路由的出口
+  是 `lo`，linux-nl 不镜像，VPP 里看不到。
 - **反向**：客户路由器 eBGP → 盒内 FRR → sr-frr 收 zebra 再分发通知里的
   BGP 前缀 → `PUT /local-prefixes` → sr-route local → RR 反射 →
   远端 CPE 的 RIB / 带标签 FIB。
@@ -93,10 +94,10 @@ lab-custN 10.99.0.2N        BGP router-id
 5. sr-fib 只装**远端**前缀：压 1000、走对应 wg 接口、下一跳是对端 overlay。
    本站/客户前缀归 FRR：zebra 装内核主表（`via 10.79.N.3 dev lcp-x0`），
    linux-nl 镜像进 VPP table 0，下一跳是客户路由器、不打标签。
-6. 反方向：sr-frr 把控制面 RIB 导成 FRR **table 1250**（黑洞下一跳），
-   `redistribute table-direct 1250` 让它们进 BGP；客户路由器于是能看到
-   远端站点的 LAN 与 loopback。这张表也会被 linux-nl 镜像成 VPP table
-   1250，但全是 `dpo-drop`——它只用于再分发，不参与转发。
+6. 反方向：sr-frr 把控制面 RIB 写成内核 **K 路由**（`RTPROT_BOOT`、出口
+   `lo`），盒内 FRR 用 `redistribute kernel` 把它们交给 BGP；客户路由器于是
+   能看到远端站点的 LAN 与 loopback。K 路由不经过 linux-nl，VPP 里没有它们
+   （转发永远只走 sr-fib 装的那条带标签的路）。
 7. 客户侧终端只需要 `default via 10.68.N.2`（客户路由器）。
 
 `sr-route` 还有一道运行时入口 `PUT /local-prefixes`（上面第 3 步就是它），O5 又补了两道：
@@ -123,9 +124,8 @@ C-c 时代是 2.5 秒；这与"可见表 = 所有会话的并集"无关 —— �
 - sr-frr 不按 tag 过滤，收下再分发通知里的全部 BGP 前缀。
 - 客户也宣告本站 LAN 时，sr-route 的 local 集合按前缀去重（静态 local 与
   动态导入合并），不会出现两条同前缀。
-- linux-nl 只镜像内核表里的路由：table 0 的本地前缀来自 FRR（下一跳客户
-  路由器），table 1250 是黑洞停车场的镜像，两者都在 VPP 里保持"转发由 VPP
-  做"这一条边界。
+- 我方注入的远端前缀再进 BGP 时 tag=0，不会满足客户路由的 tag 门槛；内核
+  主表里它们始终是 K（distance 0、出口 `lo`），不会被客户口回来的 B 覆盖。
 
 ## 起停
 
@@ -628,7 +628,7 @@ lab-cust1# show ip route              # 远端前缀 B>* via 10.79.1.2
 
 # 盒内 FRR（同一个 lab-cpe1 容器里，BGP 跑在 lcp-x0 上）
 docker exec -it lab-cpe1 vtysh
-lab-cpe1# show ip route table 1250    # sr-frr 正向导出的远端前缀（黑洞，不转发）
+lab-cpe1# show ip route                  # 远端前缀是 K（distance 0，出口 lo）
 lab-cpe1# show bgp ipv4 unicast       # 含客户路由
 lab-cpe1# show ip route 172.16.1.1/32 # 客户 loopback，via 客户路由器
 lab-cpe1# show ip route               # 没有默认路由：盒内核不转发
@@ -647,7 +647,6 @@ vppctl# show sr-wg tunnels
 vppctl# show wireguard peer
 vppctl# show ip fib table 0            # VPN 0：远端带标签 1000，本地 via 10.79.1.3 host-ethX
 vppctl# show ip fib table 250          # overlay：对端 /32 与 wg 接口所在表
-vppctl# show ip fib table 1250         # FRR 停车场镜像：全是 dpo-drop
 vppctl# show sr-wg stats
 vppctl# show trace                     # 先 trace add af-packet-input 100 再打流量
 
@@ -713,9 +712,10 @@ docker exec lab-cpe1 vppctl show trace
 - **linux-nl 只镜像内核里能落地的路由**：`local`(255) 忽略；下一跳经过未配对
   接口的路由忽略；下一跳解析不到也照样装（VPP 里是 unresolved arp 条目）。
   VPP 的 table N 就是内核 table N，不存在别的映射。
-- **FRR table 1250 会以 table 1250 出现在 VPP 里**：那是 linux-nl 的镜像，
-  全是 `dpo-drop`；它只用于 `redistribute table-direct 1250`，不参与转发。
-  别把 VPN 表也规划到 1250（本 lab：VPN 0 = table 0，overlay = 250）。
+- **K 路由不会出现在 VPP 里**：sr-frr 注入的内核路由出口是 `lo`，linux-nl
+  只镜像"能落地到 VPP 接口"的路由，`lo`/`vpn<N>` 都不算，所以 VPP 里没有
+  它们。转发始终由 sr-fib 装的那条带标签路由负责。旧的 table 1250 已退役，
+  VPP 里也不该再有这张表。
 - **地址搬进 TAP 后要重启 FRR**：eBGP 的 ConnectRetryTimer 是 120 s，不重启
   会等两分钟才从新源地址重建会话。
 - **建 WG 接口 → 登记端口 → `set sr-wg rebind-ports`**，顺序不能反：建接口

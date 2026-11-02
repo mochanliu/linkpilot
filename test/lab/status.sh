@@ -12,7 +12,6 @@ set -u
 
 VPN=0            # 客户 VPN ID，直接当 VPP 表号
 OVERLAY=250      # 隧道与 overlay 下一跳所在的表
-FRR_TABLE=1250   # FRR 的远端前缀停车场（镜像进 VPP 后全是 dpo-drop）
 LCP_IF=lcp-x0
 ROUTE_STATUS=( "" 19001 19002 19003 )
 RR_STATUS=18447
@@ -69,21 +68,20 @@ done
 echo
 hr
 echo "VPP FIB：table $VPN（客户 VPN + WAN/客户口）· table $OVERLAY（隧道/overlay）"
-echo "          · table $FRR_TABLE（FRR 停车场镜像，全 dpo-drop）"
+echo "          （sr-frr 注入的 K 路由出口是 lo，linux-nl 不镜像，VPP 里看不到）"
 for n in 1 2 3; do
     echo "  lab-cpe$n:"
     vppc "lab-cpe$n" show ip fib table "$VPN" | head -16 | sed 's/^/    '"$VPN"': /'
     vppc "lab-cpe$n" show ip fib table "$OVERLAY" | head -6 | sed "s/^/    $OVERLAY: /"
-    vppc "lab-cpe$n" show ip fib table "$FRR_TABLE" | head -6 | sed "s/^/    $FRR_TABLE: /"
 done
 echo
 hr
-echo "盒内 FRR（lab-cpeN：BGP 跑在 $LCP_IF 上；正向导出 table $FRR_TABLE / 反向吃全部 BGP 前缀）"
+echo "盒内 FRR（lab-cpeN：BGP 跑在 $LCP_IF 上；正向是内核 K 路由 / 反向吃全部 BGP 前缀）"
 for n in 1 2 3; do
     c=lab-cpe$n
     echo "  $c:"
-    vtysh "$c" -c "show ip route table $FRR_TABLE" 2>/dev/null |
-        grep -E '^[TBCSKL][>*]' | sed 's/^/    table '"$FRR_TABLE"': /'
+    vtysh "$c" -c 'show ip route' 2>/dev/null |
+        grep -E '^K>\*' | sed 's/^/    K: /'
     vtysh "$c" -c 'show bgp summary' 2>/dev/null |
         awk '/^Neighbor/{h=1;next} h&&NF{print "    bgp: "$0}'
 done

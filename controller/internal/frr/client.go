@@ -15,10 +15,10 @@ import (
 // 守护进程有问题，让本轮失败、下一轮重连，比无限等下去好。
 const writeTimeout = 5 * time.Second
 
-// Client 是到 zebra 的一条 ZAPI 连接。它做两部分事：把我们导出的前缀写成
-// TABLE 路由；订阅 BGP 再分发，把客户侧学来的前缀交回调用方。收到的其它
-// 消息一律丢弃，只把 ZEBRA_ERROR 留下来 —— 不读 socket 会让 zebra 的发送
-// 缓冲反过来堵住它自己。
+// Client 是到 zebra 的一条 ZAPI 连接，只用于**反向导入**：订阅再分发通知，
+// 把客户侧学到的前缀交回调用方。导出方向已经改成直写内核（internal/frr/krt），
+// 不再经过 zebra。收到的其它消息一律丢弃，只把 ZEBRA_ERROR 留下来 —— 不读
+// socket 会让 zebra 的发送缓冲反过来堵住它自己。
 type Client struct {
 	conn net.Conn
 
@@ -52,7 +52,8 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 }
 
 // Err 返回连接本身的死因（对端关闭、读失败……）。非 nil 后这条连接不能再
-// 用：zebra 重启会丢掉所有路由，调用方必须重连并重发整份计划。
+// 用：zebra 重启会丢掉订阅，调用方必须重连并重新订阅（导入侧用乐观窗口
+// 保住旧集合，见 Importer.BeginResync）。
 func (c *Client) Err() error {
 	c.errMu.Lock()
 	defer c.errMu.Unlock()
@@ -67,22 +68,6 @@ func (c *Client) ZebraError() error {
 	err := c.zapiErr
 	c.zapiErr = nil
 	return err
-}
-
-func (c *Client) RouteAdd(ctx context.Context, r Route) error {
-	msg, err := encodeRoute(cmdRouteAdd, r)
-	if err != nil {
-		return err
-	}
-	return c.write(ctx, msg)
-}
-
-func (c *Client) RouteDelete(ctx context.Context, r Route) error {
-	msg, err := encodeRoute(cmdRouteDelete, r)
-	if err != nil {
-		return err
-	}
-	return c.write(ctx, msg)
 }
 
 // SetRouteHandler 注册再分发通知的处理函数。必须在 SubscribeBGP 之前调用：

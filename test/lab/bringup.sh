@@ -4,7 +4,8 @@
 # 这个 lab 的目的：把已经落地的每一层放进同一张网里，并且让**盒子里同时跑**
 # 自研路由栈和 FRR——两条导入方向都要能测：
 #
-#   正向：sr-route RIB → sr-frr → FRR table 1250 → BGP → 客户路由器
+#   正向：sr-route RIB → sr-frr 写内核 K 路由（VPN 0 即 main）→ 盒内 FRR
+#         `redistribute kernel` → BGP → 客户路由器
 #   反向：客户路由器 BGP → FRR（打 tag）→ sr-frr 反向导入 → sr-route 动态
 #         local prefixes → RR 反射 → 对端 CPE 的 RIB/FIB
 #
@@ -41,7 +42,7 @@
 #   （250 保留给 overlay）。
 #   本站 LAN 与客户 loopback 都由客户路由器通过 eBGP 宣告：盒内 FRR 用 route-map
 #   给客户路由打 tag，sr-frr 只把带 tag 的 BGP 路由反向导入 sr-route 的 local
-#   prefixes；我方导出到 table 1250 再进 BGP 的路由 tag=0，不会被反向吸回（防环）。
+#   prefixes；我方写进内核的 K 路由再进 BGP 时 tag=0，不会被反向吸回（防环）。
 #
 # 管理网 10.99.0.0/24 承载控制面（RR 的 mTLS、sr-route 的 /status、控制器 8444）
 # 与各容器的第二跳，不开在数据面上。数据面的 WAN / 客户口都在 VPP 里。
@@ -89,7 +90,6 @@ LAN_PFX=( "" 10.68.1.0/24 10.68.2.0/24 10.68.3.0/24 )
 LOOP_IP=( "" 172.16.1.1 172.16.2.1 172.16.3.1 )  # 客户路由器 loopback（/32）
 BOX_AS=(  "" 65101 65102 65103 )
 CUST_AS=( "" 65001 65002 65003 )
-FRR_TABLE=1250
 TRANSIT_WAN=10.88.1.3
 VPN=0             # 客户 VPN ID，直接当 VPP 表号（0 = global；避开 250）
 OVERLAY=250       # 隧道与 overlay 下一跳所在的表，不是 VPN
@@ -339,13 +339,16 @@ stage_containers() {
     mkdir -p "$RUN" "$BIN"
     local n
     for n in 1 2 3; do
-        # 盒内 FRR：与自研控制面同盒子。table-direct 1250 把 sr-frr 导出的
-        # 远端前缀交给 BGP；客户路由由 zebra 再分发通知交给 sr-frr 反向导入。
+        # 盒内 FRR：与自研控制面同盒子。sr-frr 把远端前缀写成内核 K 路由，
+        # 这里用 `redistribute kernel` 交给 BGP；客户路由由 zebra 再分发通知
+        # 交给 sr-frr 反向导入。route-map 名字按 VPN 派生（与控制器渲染一致）。
         cat > "$RUN/cpe$n.frr.conf" <<EOF
 frr defaults traditional
 hostname lab-cpe$n
 log file /var/log/frr/frr.log
 service integrated-vtysh-config
+!
+route-map SDWAN2CPE-vpn$VPN permit 10
 !
 router bgp ${BOX_AS[$n]}
  bgp router-id ${MGMT_IP[$n]}
@@ -353,12 +356,13 @@ router bgp ${BOX_AS[$n]}
  neighbor ${CUST_X_IP[$n]} remote-as ${CUST_AS[$n]}
  neighbor ${CUST_X_IP[$n]} description lab-cust$n
  address-family ipv4 unicast
-  redistribute table-direct $FRR_TABLE
+  redistribute kernel route-map SDWAN2CPE-vpn$VPN
  exit-address-family
 !
 ! 盒内核不做转发，所以这里**没有**默认路由：客户侧流量的明细路由由 BGP
 ! 装进内核主表，linux-nl 再把它镜像成 VPP table 0；远端前缀压标签走隧道，
-! 由 sr-fib 直接写进同一张 VPP 表。
+! 由 sr-fib 直接写进同一张 VPP 表。`redistribute kernel` 只收 K 路由
+! （sr-frr 用 RTPROT_BOOT 写的那些），connected/客户 BGP 路由都不会漏出去。
 EOF
         # 客户路由器：只宣告自己的 LAN 与 loopback。两个前缀都只能经 BGP 学到
         # （盒内没有静态 local_prefixes）——这是"FRR 算路由"的前提。
@@ -413,7 +417,7 @@ EOF
             vtysh "$c" -c 'show version' >/dev/null 2>&1 && break
             sleep 0.5
         done
-        vtysh "$c" -c 'show running-config' | grep -q "redistribute table-direct $FRR_TABLE" ||
+        vtysh "$c" -c 'show running-config' | grep -q "redistribute kernel route-map SDWAN2CPE-vpn$VPN" ||
             die "$c: frr.conf 没应用（docker exec $c vtysh -c 'show running-config'）"
         drop_kernel_default "$c"
         docker exec "$c" ip route show default | grep -q . &&
@@ -803,7 +807,7 @@ EOF
 
 # ==================================================================
 stage_frr() {
-    log "frr: 重启 FRR（客户口已是 TAP）+ sr-frr 正向导出 table $FRR_TABLE / 反向导入全部 BGP 前缀"
+    log "frr: 重启 FRR（客户口已是 TAP）+ sr-frr 正向导出 VPN $VPN 的 K 路由 / 反向导入全部 BGP 前缀"
     local n c i remote have xc st
 
     # 客户口的地址在 stage dataplane 里从内核 eth1 搬到了 VPP，再由 lcp-sync
@@ -832,9 +836,7 @@ stage_frr() {
   "zserv_socket": "/run/frr/zserv.api",
   "state_file": "/var/lib/sr-frr/state.json",
   "poll_sec": 1,
-  "distance": 1,
-  "metric": 20,
-  "vrfs": [{"vrf_id": $VPN, "table_id": $FRR_TABLE}],
+  "export_vrfs": [$VPN],
   "import": {
     "vrf_id": $VPN,
     "prefixes_url": "http://127.0.0.1:${ROUTE_STATUS[$n]}/local-prefixes"

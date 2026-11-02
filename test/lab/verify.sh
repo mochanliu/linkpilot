@@ -10,10 +10,12 @@
 #   VPP 客户口 → 对端客户路由器 → 对端终端
 #
 # 再单独验证三条联动路径：
-#   正向：sr-route RIB → sr-frr → FRR table 1250 → BGP → 客户路由器
+#   正向：sr-route RIB → sr-frr 写内核 K 路由（VPN 0 = main）→ 盒内 FRR
+#         `redistribute kernel` → BGP → 客户路由器
 #   反向：客户 BGP → 盒内 FRR → sr-frr → sr-route local
 #   数据面接缝：FRR 主表 → zebra 装内核 → linux-nl → VPP table 0（本地前缀
-#   交给客户路由器）；远端前缀由 sr-fib 直接装 VPP 并压标签
+#   交给客户路由器）；远端前缀由 sr-fib 直接装 VPP 并压标签。K 路由的出口是
+#   lo，linux-nl 不镜像这类路由 —— VPP 里看不到它们（旧 1250 表已退役）。
 #
 # 只读：不改任何配置，不重启任何进程。失败项逐条打印，最后给总数。
 #
@@ -25,7 +27,6 @@ VPN=0            # 客户 VPN ID，直接当 VPP 表号（0 = global）
 OVERLAY=250      # 隧道与 overlay 下一跳所在的表，不是 VPN
 LABEL=$((1000 + VPN))
 TUNNEL_MTU=1360
-FRR_TABLE=1250
 ROUTE_STATUS=( "" 19001 19002 19003 )
 WAN_IP=( "" 10.88.1.11 10.88.1.12 10.88.1.13 )
 LCP_IF=lcp-x0
@@ -340,27 +341,26 @@ for n in 1 2 3; do
     echo "$ovf" | grep -qE "^(10\.68\.|172\.16\.)" \
         && bad "$c: overlay 表里混进了客户前缀" \
         || ok "$c: overlay 表只有隧道/overlay，没有客户前缀"
-    # table 1250 是 FRR 专用停车场的镜像：只用于再分发，转发必须全是 drop。
-    t1250=$(vppc "$c" show ip fib table "$FRR_TABLE")
-    echo "$t1250" | grep -q "fib_index" \
-        && ok "$c: VPP table $FRR_TABLE 存在（linux-nl 镜像了 FRR 停车场）" \
-        || bad "$c: VPP table $FRR_TABLE 不存在"
-    echo "$t1250" | grep -q "mpls-label" \
-        && bad "$c: table $FRR_TABLE 里有压标签路由（不该参与转发）" \
-        || ok "$c: table $FRR_TABLE 没有压标签路由"
+    # K 路由的出口是 lo：linux-nl 不镜像这类路由，所以 VPP 里不该再出现
+    # "只用于再分发"的影子表（旧的 1250 已退役）。
+    vppc "$c" show ip fib table 1250 | grep -q "fib_index" \
+        && bad "$c: VPP table 1250 还在（退役的 FRR 停车场）" \
+        || ok "$c: VPP table 1250 不存在（导出不再镜像进 VPP）"
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
-        echo "$t1250" | grep -A4 "^${LAN_PFX[$m]}" | grep -q "dpo-drop" \
-            && ok "$c: table $FRR_TABLE 的远端 ${LAN_PFX[$m]} 是 dpo-drop（不转发）" \
-            || bad "$c: table $FRR_TABLE 的远端 ${LAN_PFX[$m]} 不是 dpo-drop"
+        one=$(vppc "$c" show ip fib table "$VPN" "${LAN_PFX[$m]}")
+        echo "$one" | grep -q "dpo-drop" \
+            && bad "$c: 远端 ${LAN_PFX[$m]} 在 VPP 里是 dpo-drop（K 路由盖掉了 sr-fib 的路径）" \
+            || ok "$c: 远端 ${LAN_PFX[$m]} 未被 K 路由覆盖（仍是 sr-fib 的转发路径）"
     done
 done
 
-sect "7. 正向导入：sr-frr → FRR table $FRR_TABLE → BGP → 客户路由器"
+sect "7. 正向导出：sr-frr → 内核 K 路由 → redistribute kernel → BGP → 客户路由器"
 for n in 1 2 3; do
     c=lab-cpe$n
-    vtysh "$c" -c 'show running-config' | grep -q "redistribute table-direct $FRR_TABLE" \
-        && ok "$c: 已配置 redistribute table-direct $FRR_TABLE" || bad "$c: 缺 redistribute table-direct $FRR_TABLE"
+    vtysh "$c" -c 'show running-config' | grep -q "redistribute kernel route-map SDWAN2CPE-vpn$VPN" \
+        && ok "$c: 已配置 redistribute kernel route-map SDWAN2CPE-vpn$VPN" \
+        || bad "$c: 缺 redistribute kernel route-map SDWAN2CPE-vpn$VPN"
     retry 20 bash -c "docker exec $c vtysh -c 'show bgp summary' | grep -q '^${CUST_X_IP[$n]} '" \
         && ok "$c: BGP 与客户路由器 ${CUST_X_IP[$n]}（AS ${CUST_AS[$n]}）建立" \
         || bad "$c: BGP 与 ${CUST_X_IP[$n]} 未建立"
@@ -369,14 +369,19 @@ for n in 1 2 3; do
         grep -q "Local host: ${XCONN_IP[$n]}," \
         && ok "$c: BGP 本地源地址是 ${XCONN_IP[$n]}（走 $LCP_IF，不经过内核转发）" \
         || bad "$c: BGP 本地源地址不是 ${XCONN_IP[$n]}"
-    t1250=$(vtysh "$c" -c "show ip route table $FRR_TABLE")
+    main=$(vtysh "$c" -c 'show ip route')
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
         for pfx in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
-            echo "$t1250" | grep -q "$pfx" \
-                && ok "$c: table $FRR_TABLE 有远端 $pfx" || bad "$c: table $FRR_TABLE 缺 $pfx"
+            line=$(echo "$main" | grep -E "^K>\*[[:space:]]+${pfx}([[:space:]]|$)")
+            [ -n "$line" ] \
+                && ok "$c: 内核主表有 K 路由 $pfx（sr-frr 注入）" \
+                || bad "$c: 内核主表没有 K 路由 $pfx"
+            echo "$line" | grep -q "directly connected, lo" \
+                && ok "$c: K 路由 $pfx 的出口是 lo（不被 linux-nl 镜像进 VPP）" \
+                || bad "$c: K 路由 $pfx 的出口不是 lo"
             retry 20 bash -c "docker exec $c vtysh -c 'show bgp ipv4 unicast' | grep -q '$pfx'" \
-                && ok "$c: 本盒 BGP 里有 $pfx（box FRR 自身可见）" \
+                && ok "$c: 本盒 BGP 里有 $pfx（redistribute kernel 生效）" \
                 || bad "$c: 本盒 BGP 不可见 $pfx"
         done
     done
@@ -411,12 +416,16 @@ for n in 1 2 3; do
     echo "$r" | grep -q "${CUST_X_IP[$n]}" \
         && ok "$c: 客户 loopback 的下一跳是客户路由器 ${CUST_X_IP[$n]}" \
         || bad "$c: 客户 loopback 的下一跳不是 ${CUST_X_IP[$n]}"
-    # 我们经 table 1250 导出的远端前缀回到 BGP 后是否会进 zebra 主表（回灌）。
+    # 防环：我方注入的远端前缀再进 BGP 时 tag=0，sr-frr 只反向导入打了 tag
+    # 的客户路由，所以 sr-route 的 local 里不该出现远端前缀（第 5 节按集合核对）。
+    # 这里再看内核主表：远端前缀必须是 K（出口 lo），不是从客户口学回来的 B。
+    main=$(vtysh "$c" -c 'show ip route')
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
-        vtysh "$c" -c "show ip route ${LAN_PFX[$m]}" | grep -q "Network not in table" \
-            && ok "$c: 远端 ${LAN_PFX[$m]} 只停在 table $FRR_TABLE，没回灌主表（无环路）" \
-            || bad "$c: 远端 ${LAN_PFX[$m]} 出现在主表（可能被反向再导入）"
+        line=$(echo "$main" | grep -E "^K>\*[[:space:]]+${LAN_PFX[$m]}([[:space:]]|$)")
+        echo "$line" | grep -q "directly connected, lo" \
+            && ok "$c: 远端 ${LAN_PFX[$m]} 在主表是 K 且出口 lo（没被客户 BGP 回灌改写）" \
+            || bad "$c: 远端 ${LAN_PFX[$m]} 在主表不是 K/lo（可能被回灌）"
     done
 done
 
