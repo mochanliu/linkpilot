@@ -62,8 +62,67 @@ type RRItem struct {
 	Location string `json:"location"`
 	TenantID string `json:"owner,omitempty"`
 
+	// Identity is what the controller signed for this row the last time somebody
+	// clicked 签发身份. Only metadata lands on disk: no key material, no
+	// certificate body. The certificate is handed to the operator exactly once,
+	// and from then on the box holds the only copy of its private key.
+	Identity *RRIdentity `json:"identity,omitempty"`
+
+	// LastFetch is the grid's only earned signal: the RR really came here and
+	// asked for its peers. The controller still never dials Addr, so a fresh
+	// fetch says "the RR can reach the controller", nothing about the RR-to-RR
+	// paths.
+	LastFetchAt   int64  `json:"last_fetch_at_unix,omitempty"`
+	LastFetchAddr string `json:"last_fetch_addr,omitempty"`
+
 	CreatedAt int64 `json:"created_at_unix"`
 	UpdatedAt int64 `json:"updated_at_unix,omitempty"`
+}
+
+// RRIdentity is the record of one certificate issuance. Serial and fingerprint
+// are what a person checks on the box against what the page shows; SAN is the
+// snapshot the certificate was minted with, so an address edit can be flagged
+// as "needs re-signing" without keeping the certificate itself around.
+type RRIdentity struct {
+	Serial      string   `json:"serial"`
+	Fingerprint string   `json:"fingerprint"`
+	IssuedAt    int64    `json:"issued_at_unix"`
+	Tenant      string   `json:"tenant"`
+	RRID        string   `json:"rr_id"`
+	SAN         []string `json:"san"`
+}
+
+// rrAddrHost is the host half of a host:port row address, lower-cased so a
+// DNS-name comparison is case-insensitive and an IP compares as written. It is
+// the same value that goes into the certificate SAN and the dial's ServerName.
+func rrAddrHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.Trim(host, "[]"))
+}
+
+// resignReason is the row's post-issuance check, computed on read. An identity
+// covers exactly the tenant, the rr id and the address host it was minted for:
+// change any of the three and the certificate no longer names the box that
+// holds it. Nothing is re-signed behind the operator's back -- delivering a
+// private key takes a person.
+func (it RRItem) resignReason() string {
+	id := it.Identity
+	if id == nil {
+		return ""
+	}
+	if id.Tenant != it.TenantID || id.RRID != it.ID {
+		return fmt.Sprintf("归属或编号已改（证书里是 %s/rr/%s），身份需重签。", id.Tenant, id.RRID)
+	}
+	host := rrAddrHost(it.Addr)
+	for _, san := range id.SAN {
+		if strings.EqualFold(san, host) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("地址已改（%s 不在证书 SAN 里），身份需重签。", host)
 }
 
 // RRLibrary is the whole RR table. One document, not a per-tenant map, because
@@ -309,13 +368,17 @@ func (s *server) overlayRRBindChecksLocked(tenantID string) []ConfigCheck {
 // tenant's) and no reference count from other tenants, which is not this
 // tenant's business.
 type rrRow struct {
-	ID        string      `json:"id"`
-	Name      string      `json:"name"`
-	Addr      string      `json:"addr"`
-	Location  string      `json:"location"`
-	Devices   []rrBindRef `json:"devices"`
-	CreatedAt int64       `json:"created_at_unix"`
-	UpdatedAt int64       `json:"updated_at_unix,omitempty"`
+	ID            string      `json:"id"`
+	Name          string      `json:"name"`
+	Addr          string      `json:"addr"`
+	Location      string      `json:"location"`
+	Devices       []rrBindRef `json:"devices"`
+	Identity      *RRIdentity `json:"identity,omitempty"`
+	NeedsResign   string      `json:"needs_resign,omitempty"`
+	LastFetchAt   int64       `json:"last_fetch_at_unix,omitempty"`
+	LastFetchAddr string      `json:"last_fetch_addr,omitempty"`
+	CreatedAt     int64       `json:"created_at_unix"`
+	UpdatedAt     int64       `json:"updated_at_unix,omitempty"`
 }
 
 func (s *server) rrRowsLocked(tenantID string) []rrRow {
@@ -333,7 +396,9 @@ func (s *server) rrRowOfLocked(it RRItem) rrRow {
 	}
 	return rrRow{
 		ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location,
-		Devices: devices, CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
+		Devices: devices, Identity: it.Identity, NeedsResign: it.resignReason(),
+		LastFetchAt: it.LastFetchAt, LastFetchAddr: it.LastFetchAddr,
+		CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
 	}
 }
 

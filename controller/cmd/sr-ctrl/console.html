@@ -132,6 +132,7 @@
   .form-row input[name=claim_max_uses]{width:230px}
   .form-row input[name=max_uses]{width:120px}
   .form-row select{width:180px}
+  .row-actions{white-space:nowrap}
   .row-actions button{display:inline-block}
   .row-actions button + button{margin-left:6px}
   .row-actions select{margin-right:6px}
@@ -396,6 +397,13 @@
     function p(n) { return n < 10 ? "0" + n : "" + n; }
     return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
       p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  function stamp(unix) {
+    if (!unix) return "—";
+    var d = new Date(unix * 1000);
+    function p(n) { return n < 10 ? "0" + n : "" + n; }
+    return p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+      p(d.getHours()) + ":" + p(d.getMinutes());
   }
   function hms(unix) {
     if (!unix) return "—";
@@ -4942,9 +4950,11 @@
 
   function ovRRDelete(id, name) {
     if (!confirm("删除 RR「" + name + "」（" + id + "）？\n\n控制器不会去连这个地址，所以删它不碰任何设备。" +
-      "被某台设备的 RR 1 / RR 2 选着的会拒绝删除：要先到「导通策略」里把那一格改成别的。")) return;
+      "被某台设备的 RR 1 / RR 2 选着的会拒绝删除：要先到「导通策略」里把那一格改成别的。\n\n" +
+      "它已经在网格里的话，本租户其它 RR 下一次拉取（≤30s）就会把这个邻居去掉；这条 RR 自己再来拉会拿到 404，sr-rr 会据此停服退出。")) return;
     var o = ovStore();
     api("POST", "/api/rrs/delete", { id: id }).then(function (res) {
+      if (o.secret && o.secret.rr_id === id) o.secret = null;
       ovRRApply(res, "已删除 " + id + "。它的号不会再发给新的条目。", "已删除");
     }).catch(function (err) {
       if (!o.doc) return;
@@ -4952,6 +4962,107 @@
       blurContent();
       render();
     });
+  }
+
+  /* ---------------- RR 身份：签发一次，私钥只出现一次 ---------------- */
+
+  // 身份只活在本页内存（o.secret）：刷新、退出或点「收起」就没了，控制器那边
+  // 只留序列号/指纹/SAN 快照。这和入网码「只显示一次」是同一种口径。
+  function ovRRIdentityCell(row) {
+    var id = row.identity;
+    if (!id) return '<span class="muted">未签发</span>';
+    var shortFP = String(id.fingerprint || "").slice(0, 12);
+    var h = '<span class="mono" title="指纹 ' + esc(id.fingerprint) + '">' + esc(shortFP) + "</span>" +
+      '<div class="muted" style="font-size:12px" title="' + esc(clock(id.issued_at_unix)) + '">' +
+      esc(stamp(id.issued_at_unix)) + " 签发</div>";
+    if (row.needs_resign) {
+      var why = row.needs_resign.indexOf("地址") === 0 ? "需重签：地址已改" : "需重签：归属或编号已改";
+      h += '<div class="tag plan" style="margin-top:4px" title="' + esc(row.needs_resign) + '">' +
+        esc(why) + "</div>";
+    }
+    return h;
+  }
+
+  // 「最近拉取」是网格里唯一挣来的信号：这台 RR 真的来控制器拉过邻居。控制器
+  // 仍然不去拨库里的地址，所以它只说明「RR 能到控制器」，不说明 RR 之间通。
+  function ovRRFetchCell(row) {
+    if (!row.last_fetch_at_unix) return '<span class="muted">还没来拉过配置</span>';
+    return '<span class="muted" style="font-size:12px" title="' + esc(clock(row.last_fetch_at_unix)) + '">' +
+      esc(stamp(row.last_fetch_at_unix)) +
+      " · " + esc(ago(row.last_fetch_at_unix)) +
+      (row.last_fetch_addr ? '<div class="mono">' + esc(row.last_fetch_addr) + "</div>" : "") + "</span>";
+  }
+
+  function ovRRIssue(id, name) {
+    var o = ovStore();
+    if (!o.doc) return;
+    var row = ovRRRow(id);
+    var again = !!(row && row.identity);
+    var msg = again
+      ? "重新签发「" + name + "」（" + id + "）的身份？\n\n会换一对新密钥、新序列号；旧证书在到期前仍然有效（控制器没有吊销）。"
+      : "为「" + name + "」（" + id + "）签发身份？\n\n控制器用平台 CA 签一张 srou://<租户>/rr/<id> 的证书，" +
+        "地址的主机部分写进 SAN（端口不进证书）。私钥随响应返回一次，控制器不保存、日志里也没有。";
+    if (!confirm(msg)) return;
+    api("POST", "/api/rrs/identity", { id: id }).then(function (res) {
+      if (!res || !res.rr) return;
+      var rows = o.doc.rr_library || [];
+      for (var i = 0; i < rows.length; i++) if (rows[i].id === res.rr.id) rows[i] = res.rr;
+      o.secret = res;
+      o.note = { kind: "", text: "已为 " + id + " 签发身份（指纹 " +
+        String(res.fingerprint || "").slice(0, 12) + "）。私钥只显示这一次：先复制或下载，再离开本页。" };
+      blurContent();
+      render();
+      toast("已签发 " + id);
+    }).catch(function (err) {
+      o.note = undErrNote(err);
+      blurContent();
+      render();
+    });
+  }
+
+  function ovRRSecretBox(res) {
+    function pem(id, label, text) {
+      return '<label style="display:block;margin-top:10px;font-size:12.5px;color:var(--muted)">' +
+        esc(label) + "</label>" +
+        '<textarea id="' + id + '" class="cmd" readonly spellcheck="false" ' +
+        'style="width:100%;height:118px;resize:vertical;margin-top:4px">' + esc(text || "") + "</textarea>";
+    }
+    return '<div class="result show" id="ov-rr-secret">' +
+      '<div class="ttl">已为 ' + esc(res.rr_id) + " 签发身份</div>" +
+      "<div>私钥只出现在这一次响应里，关掉或刷新就取不回来；控制器不缓存，日志里也没有。" +
+      "再点一次「签发身份」会换一对新密钥，旧证书在到期前仍然有效（平台没有吊销）。</div>" +
+      '<div class="hint">指纹 <span class="mono">' + esc(res.fingerprint) + "</span> · 序列号 " +
+      '<span class="mono">' + esc(res.serial) + "</span> · 租户 " + esc(res.tenant) +
+      " · 地址 " + esc(res.addr) + "</div>" +
+      pem("ov-rr-secret-cert", "证书（cert.pem）", res.cert_pem) +
+      pem("ov-rr-secret-key", "私钥（key.pem）", res.key_pem) +
+      pem("ov-rr-secret-ca", "CA（ca.pem）", res.ca_pem) +
+      '<div class="copybox" style="margin-top:10px">' +
+      '<button class="small" data-act="ov-rr-copy-field" data-field="ov-rr-secret-cert">复制证书</button>' +
+      '<button class="small" data-act="ov-rr-copy-field" data-field="ov-rr-secret-key">复制私钥</button>' +
+      '<button class="small" data-act="ov-rr-copy-field" data-field="ov-rr-secret-ca">复制 CA</button>' +
+      '<button class="small" data-act="ov-rr-download">下载 rr-identity.json</button>' +
+      '<button class="small" data-act="ov-rr-secret-x">已装好，收起</button></div>' +
+      "</div>";
+  }
+
+  function ovRRDownloadIdentity() {
+    var s = S.ov && S.ov.secret;
+    if (!s) return;
+    var doc = {
+      rr_id: s.rr_id, tenant: s.tenant, addr: s.addr,
+      cert_pem: s.cert_pem, key_pem: s.key_pem, ca_pem: s.ca_pem,
+      fingerprint: s.fingerprint, serial: s.serial, issued_at_unix: s.issued_at_unix
+    };
+    var url = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" }));
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "rr-identity-" + s.rr_id + ".json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+    toast("已下载 " + a.download);
   }
 
   function ovRRFields(p, v) {
@@ -4981,7 +5092,7 @@
   function ovRRUpdatedCell(row) {
     var t = row.updated_at_unix || row.created_at_unix;
     if (!t) return '<span class="muted">—</span>';
-    return '<span class="muted" style="font-size:12px">' + esc(clock(t)) +
+    return '<span class="muted" style="font-size:12px" title="' + esc(clock(t)) + '">' + esc(stamp(t)) +
       (row.updated_at_unix ? "" : "（建）") + " · " + esc(ago(t)) + "</span>";
   }
 
@@ -4996,6 +5107,10 @@
       "没被任何设备选中的条目在库里躺着，不影响任何设备。</div>" +
       '<div class="hint">地址必须带端口：设备上的路由进程要从 host:port 里拆出 TLS 服务名，' +
       "少了端口只能到设备上过一遍才知道写错了。同一条地址不能加两次——一台盒子两个身份会把同一份路由反射两遍。</div>" +
+      '<div class="hint">「签发身份」给这台 RR 一张带 <span class="mono">srou://租户/rr/号</span> 的证书：' +
+      "它拿这张证书来拉本租户的邻居清单，本租户的 RR 自动组成网格。新增一条只让新 RR 去拨已有的，已有 RR 的会话不重建；" +
+      "网格变化在本 RR 下一次拉取（≤ 轮询间隔，默认 30s）生效。私钥只给一次，平台没有吊销；" +
+      "地址或归属改了会标「需重签」，不会自动签发。</div>" +
       '<form id="ov-rr-new-form"><div class="fields">' + ovRRFields("ov-rr-new", null) +
       '<button class="primary" type="submit"' + (max && rows.length >= max ? " disabled" : "") +
       ">添加</button></div>" +
@@ -5004,23 +5119,28 @@
       return h + '<div class="empty" style="margin-top:10px">还没有 RR：控制器不下发 <code>rrs</code> 这个键，' +
         "设备继续用它盘上自己那一份。要让控制器接管，就在上面添加。</div></section>";
     }
-    h += "<table><thead><tr><th>名称</th><th>地址</th><th>位置</th><th>用它的设备</th><th>更新</th><th></th></tr></thead><tbody>";
+    h += "<table><thead><tr><th>名称</th><th>地址</th><th>位置</th><th>身份</th><th>最近拉取</th><th>用它的设备</th><th>更新</th><th></th></tr></thead><tbody>";
     rows.forEach(function (row) {
       var editing = o.rre && o.rre.id === row.id;
       h += "<tr>" +
         "<td><b>" + esc(row.name) + '</b> <span class="muted mono">' + esc(row.id) + "</span></td>" +
-        '<td class="mono">' + esc(row.addr) + "</td>" +
-        "<td>" + (row.location ? esc(row.location) : '<span class="muted">未填</span>') + "</td>" +
+        '<td class="mono" style="white-space:nowrap">' + esc(row.addr) + "</td>" +
+        "<td" + (row.location ? ' style="white-space:nowrap"' : "") + ">" +
+        (row.location ? esc(row.location) : '<span class="muted">未填</span>') + "</td>" +
+        "<td>" + ovRRIdentityCell(row) + "</td>" +
+        "<td>" + ovRRFetchCell(row) + "</td>" +
         "<td>" + ovRRUsedCell(row) + "</td>" +
         "<td>" + ovRRUpdatedCell(row) + "</td>" +
         '<td class="row-actions">' +
+        '<button class="small" data-act="ov-rr-issue" data-id="' + esc(row.id) +
+        '" data-name="' + esc(row.name) + '">' + (row.identity ? "重新签发" : "签发身份") + '</button>' +
         '<button class="small" data-act="ov-rr-edit" data-id="' + esc(row.id) + '">' +
         (editing ? "收起" : "编辑") + '</button>' +
         '<button class="small danger" data-act="ov-rr-del" data-id="' + esc(row.id) +
         '" data-name="' + esc(row.name) + '">删除</button>' +
         "</td></tr>";
       if (editing) {
-        h += '<tr><td colspan="6"><form id="ov-rr-edit-form"><div class="fields">' +
+        h += '<tr><td colspan="8"><form id="ov-rr-edit-form"><div class="fields">' +
           ovRRFields("ov-rr-edit", o.rre) +
           '<button class="primary" type="submit">保存</button> ' +
           '<button class="small" type="button" data-act="ov-rr-edit-x">取消</button></div>' +
@@ -5030,14 +5150,15 @@
     });
     h += "</tbody></table>" +
       '<div class="hint" style="margin-top:8px">号（rr1、rr2…）删了不回收，所以下一次添加的一定是个新号，' +
-      "不会复活刚删掉的那一条。</div>";
+      "不会复活刚删掉的那一条。</div>" +
+      (o.secret ? ovRRSecretBox(o.secret) : "");
     return h + "</section>";
   }
 
   /* ---------------- Overlay：全局（反射器 + 逃生开关）与导通策略 ---------------- */
 
   function ovStore() {
-    if (!S.ov) S.ov = { doc: null, at: 0, loading: false, note: null, g: null, edit: null, rre: null };
+    if (!S.ov) S.ov = { doc: null, at: 0, loading: false, note: null, g: null, edit: null, rre: null, secret: null };
     return S.ov;
   }
 
@@ -6995,6 +7116,21 @@
         else if (act === "ov-rr-del") {
           ovRRDelete(el.getAttribute("data-id"), el.getAttribute("data-name") || "该 RR");
         }
+        else if (act === "ov-rr-issue") {
+          ovRRIssue(el.getAttribute("data-id"), el.getAttribute("data-name") || "该 RR");
+        }
+        else if (act === "ov-rr-secret-x") {
+          if (S.ov) { S.ov.secret = null; S.ov.note = null; }
+          blurContent();
+          render();
+        }
+        else if (act === "ov-rr-copy-field") {
+          var fld = document.getElementById(el.getAttribute("data-field"));
+          if (fld) copyText(fld.value);
+        }
+        else if (act === "ov-rr-download") {
+          ovRRDownloadIdentity();
+        }
         else if (act === "ov-reload") {
           var orl = ovStore();
           orl.doc = null;
@@ -7002,6 +7138,7 @@
           orl.rre = null;
           orl.edit = null;
           orl.note = null;
+          orl.secret = null;
           blurContent();
           render();
           loadOverlay();

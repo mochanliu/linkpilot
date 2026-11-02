@@ -374,6 +374,7 @@ func (s *server) adminHandler() http.Handler {
 	// the writes below are scoped to the session's tenant.
 	mux.HandleFunc("/api/rrs", s.handleTenantRRs)
 	mux.HandleFunc("/api/rrs/delete", s.handleTenantRRDelete)
+	mux.HandleFunc("/api/rrs/identity", s.handleTenantRRIdentity)
 	mux.HandleFunc("/api/tenants", s.handleAdminTenants)
 	mux.HandleFunc("/api/claims", s.handleAdminClaims)
 	mux.HandleFunc("/api/claims/code", s.handleAdminClaimCode)

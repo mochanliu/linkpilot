@@ -915,6 +915,43 @@ func signDevice(ca *x509.Certificate, caKey ed25519.PrivateKey, pub ed25519.Publ
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), nil
 }
 
+// signRR issues a route reflector's certificate. It is signDevice's sibling with
+// three differences that all come from what an RR is:
+//
+//   - the identity URI names the rr role, so keybinding.RefOf reads it as an RR
+//     and a node certificate can never be mistaken for one (or vice versa);
+//   - the EKU carries serverAuth as well as clientAuth: an RR both dials (the
+//     controller, its peers) and is dialled (by its tenant's devices);
+//   - the address host goes into the SAN, because devices and peer RRs use the
+//     row's addr host as their TLS ServerName. The port is not part of a name.
+func signRR(ca *x509.Certificate, caKey ed25519.PrivateKey, pub ed25519.PublicKey, tenant, rrID, host string) (string, error) {
+	u, err := url.Parse(fmt.Sprintf("srou://%s/rr/%s", tenant, rrID))
+	if err != nil {
+		return "", err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: newSerial(),
+		Subject:      pkix.Name{CommonName: fmt.Sprintf("%s-rr-%s", tenant, rrID)},
+		NotBefore:    time.Now().Add(-time.Hour),
+		// Longer than a device's year: an RR is operator infrastructure, and a
+		// lapsed certificate there is an outage that needs a person at the box.
+		NotAfter:    time.Now().AddDate(2, 0, 0),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		URIs:        []*url.URL{u},
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+	} else {
+		tmpl.DNSNames = append(tmpl.DNSNames, host)
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, pub, caKey)
+	if err != nil {
+		return "", err
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), nil
+}
+
 // peerTenantFromCert is the ONLY place a caller's tenant identity is decided.
 func peerTenantFromCert(r *http.Request) (tenant string, nodeID uint16, err error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
@@ -2186,6 +2223,7 @@ func main() {
 	mux.HandleFunc("/v1/enroll", s.handleEnroll)
 	mux.HandleFunc("/v1/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/v1/config/bundle", s.handleConfigBundle)
+	mux.HandleFunc("/v1/rr/config", s.handleRRConfig)
 	mux.HandleFunc("/v1/underlay/bundle", s.handleUnderlayBundle)
 	mux.HandleFunc("/v1/mapping", s.handleMapping)
 	mux.HandleFunc("/v1/observe", s.handleObserve)

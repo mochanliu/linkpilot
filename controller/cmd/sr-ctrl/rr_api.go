@@ -14,12 +14,23 @@ package main
 // lands.
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"sdwan/controller/internal/keybinding"
 )
 
 // rrWriteRequest is the body for create and edit. The whole row is sent both
@@ -45,6 +56,7 @@ type rrIDRequest struct {
 // exactly the ones a tenant is going to ask about after adding a reflector: who
 // is affected, and when it takes effect.
 const rrChangeNote = "改动只影响下一次发布：设备要在「配置 › 基础配置」发布以后才会换成新的 RR 列表。" +
+	"网格里的其它 RR 下一次来拉配置（≤ 轮询间隔，默认 30s）就按新清单增删邻居，已在跑的会话不重建。" +
 	"控制器不会去连这些地址，所以这里没有任何连通性结论可给。"
 
 // rrResponseLocked writes the tenant's whole list back after every mutation. The
@@ -231,6 +243,219 @@ func (s *server) handleTenantRRDelete(w http.ResponseWriter, r *http.Request) {
 	s.save()
 	log.Printf("rrlib: tenant=%s deleted %s addr=%s by %s", id.TenantID, removed.ID, removed.Addr, id.Username)
 	s.rrResponseLocked(w, id.TenantID, map[string]any{"deleted": targetID})
+}
+
+// ---------------------------------------------------------------- identities
+
+// rrIdentityRequest is all a signing request carries. The tenant and address are
+// NOT accepted from the body: the session decides the tenant and the row decides
+// the address, so no request can sign a certificate for somebody else's row or
+// for an address the operator never typed.
+type rrIdentityRequest struct {
+	ID string `json:"id"`
+}
+
+// rrIdentityResponse is the one and only delivery of the private key. It is not
+// cached, not logged, and not stored: once this response is gone the controller
+// cannot reproduce it, and losing the box's copy means signing again.
+type rrIdentityResponse struct {
+	OK          bool   `json:"ok"`
+	CertPEM     string `json:"cert_pem"`
+	KeyPEM      string `json:"key_pem"`
+	CAPEM       string `json:"ca_pem"`
+	RRID        string `json:"rr_id"`
+	Tenant      string `json:"tenant"`
+	Addr        string `json:"addr"`
+	Serial      string `json:"serial"`
+	Fingerprint string `json:"fingerprint"`
+	IssuedAt    int64  `json:"issued_at_unix"`
+	Note        string `json:"note"`
+	RR          rrRow  `json:"rr"`
+}
+
+const rrIdentityNote = "私钥只出现在这一次响应里，关掉就取不回来——控制器不缓存、日志里也没有。" +
+	"把它和证书一起装到这台 RR 上；再点一次「签发身份」会换一对新密钥，旧证书在到期前仍然有效（控制器没有吊销）。"
+
+// handleTenantRRIdentity signs the row's certificate. A second call is a
+// re-issuance: new key, new serial, and the row's identity metadata is replaced.
+//
+// The old certificate is not revoked -- there is no CRL/OCSP in this platform
+// (device certificates have the same gap). The one cheap close is on the RR
+// side: a deleted row's /v1/rr/config is a 404, and sr-rr treats that as "I no
+// longer exist" and stops serving.
+func (s *server) handleTenantRRIdentity(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var req rrIdentityRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	targetID := strings.TrimSpace(req.ID)
+	if targetID == "" {
+		http.Error(w, "缺少 id", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lib := s.rrLibraryLocked(false)
+	it := lib.get(targetID)
+	if it == nil || it.TenantID != id.TenantID {
+		http.Error(w, "RR 不存在", http.StatusNotFound)
+		return
+	}
+	host := rrAddrHost(it.Addr)
+	if host == "" {
+		// Every address saved through the API has a host; reaching this means the
+		// state file was edited. A certificate with no SAN is one no device can
+		// complete a handshake with, so it is better to refuse than to hand out.
+		http.Error(w, "这条 RR 的地址没有可用的主机部分，先改地址再签发", http.StatusConflict)
+		return
+	}
+	if s.caCert == nil || len(s.caKey) == 0 {
+		http.Error(w, "控制器没有 CA，签不出身份", http.StatusInternalServerError)
+		return
+	}
+	caPEM, err := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
+	if err != nil {
+		http.Error(w, "读不到控制器 CA", http.StatusInternalServerError)
+		return
+	}
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		http.Error(w, "生成密钥失败", http.StatusInternalServerError)
+		return
+	}
+	certPEM, err := signRR(s.caCert, s.caKey, pub, it.TenantID, it.ID, host)
+	if err != nil {
+		http.Error(w, "签发失败", http.StatusInternalServerError)
+		return
+	}
+	blk, _ := pem.Decode([]byte(certPEM))
+	if blk == nil {
+		http.Error(w, "签发失败", http.StatusInternalServerError)
+		return
+	}
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		http.Error(w, "签发失败", http.StatusInternalServerError)
+		return
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		http.Error(w, "生成密钥失败", http.StatusInternalServerError)
+		return
+	}
+	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+
+	sum := sha256.Sum256(cert.Raw)
+	now := time.Now().Unix()
+	it.Identity = &RRIdentity{
+		Serial:      cert.SerialNumber.Text(16),
+		Fingerprint: hex.EncodeToString(sum[:16]),
+		IssuedAt:    now,
+		Tenant:      it.TenantID,
+		RRID:        it.ID,
+		SAN:         []string{host},
+	}
+	it.UpdatedAt = now
+	s.rrTouchLocked(lib, id.Username, now)
+	s.save()
+	// The fingerprint identifies the certificate; the key never appears in a log
+	// line, a state file, or any other response.
+	log.Printf("rrlib: tenant=%s issued identity %s serial=%s fp=%s san=%s by %s",
+		id.TenantID, it.ID, it.Identity.Serial, it.Identity.Fingerprint, host, id.Username)
+
+	writeJSON(w, rrIdentityResponse{
+		OK: true, CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: string(caPEM),
+		RRID: it.ID, Tenant: it.TenantID, Addr: it.Addr,
+		Serial: it.Identity.Serial, Fingerprint: it.Identity.Fingerprint,
+		IssuedAt: now, Note: rrIdentityNote, RR: s.rrRowOfLocked(*it),
+	})
+}
+
+// ---------------------------------------------------------------- RR config
+
+type rrPeer struct {
+	ID   string `json:"id"`
+	Addr string `json:"addr"`
+}
+
+// rrConfigResponse is what an RR pulls to learn its grid. Only the peers: which
+// local interface to listen on and how often to poll are the box's own business
+// and stay out of the controller's answer.
+type rrConfigResponse struct {
+	Tenant          string   `json:"tenant"`
+	RRID            string   `json:"rr_id"`
+	Peers           []rrPeer `json:"peers"`
+	GeneratedAtUnix int64    `json:"generated_at_unix"`
+}
+
+// handleRRConfig is the grid's read side: an RR presents its certificate and
+// gets every other row of its tenant, sorted by id.
+//
+// The certificate is the authorization. A node certificate is refused (401)
+// because "a device asking for RR peers" is not a thing, and a tenant other than
+// the row's owner gets the same 404 as an unknown id -- whether some other
+// tenant has a row with this id is not something a probe may learn.
+func (s *server) handleRRConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "需要客户端证书", http.StatusUnauthorized)
+		return
+	}
+	ref, err := keybinding.RefOf(r.TLS.PeerCertificates[0])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if ref.Role != keybinding.RoleRR {
+		http.Error(w, "这是设备身份，不是 RR 身份", http.StatusUnauthorized)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lib := s.rrLibraryLocked(false)
+	it := lib.get(ref.RRID)
+	if it == nil || it.TenantID != ref.Tenant {
+		// A deleted row must be able to tell that it is gone: this is the whole
+		// replacement for a revocation list. sr-rr stops serving on this answer.
+		http.Error(w, "RR 不存在", http.StatusNotFound)
+		return
+	}
+	peers := []rrPeer{}
+	for _, row := range lib.visibleTo(ref.Tenant) {
+		if row.ID == it.ID {
+			continue
+		}
+		peers = append(peers, rrPeer{ID: row.ID, Addr: row.Addr})
+	}
+	now := time.Now().Unix()
+	it.LastFetchAt = now
+	it.LastFetchAddr = remoteHost(r.RemoteAddr)
+	s.save()
+
+	writeJSON(w, rrConfigResponse{
+		Tenant: ref.Tenant, RRID: it.ID, Peers: peers, GeneratedAtUnix: now,
+	})
+}
+
+func remoteHost(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
 }
 
 func indexOfRRLocked(lib *RRLibrary, id string) int {
