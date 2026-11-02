@@ -15,13 +15,14 @@
 #       两个 VPN 不串；主表 254 里一条 10.100/10.101/10.200 都没有。
 #   (F) touch 窗口：sr-frr 用 `/config` + `refresh_vrfs` 原地重刷（协议集合
 #       变化时的真实路径），逐条测 del→add 间隔，BGP 版本号不许动。
-#   (G) 全程 sr-frr / sr-route / FRR 守护进程 pid 不变；只有 sr-fib 会重启
-#       ——它**没有热更入口**（docs/overlay-console-plan.md:125-127，D3 已拍
-#       要补 `PUT`，还没做）。这是本脚本唯一的中断点，也必须点名。
+#   (G) 全程 sr-frr / sr-route / sr-fib / FRR 守护进程 pid 不变：VPN 集合
+#       变化走 sr-route `PUT /vrfs` 与 sr-fib `PUT /config`（D3，2026-11-02），
+#       没有任何一步靠重启。sr-fib 那次 PUT 期间也量了客户流量（800 包）；
+#       窗口撞上 lab 的 BFD 假 down 就重测，警告行数与丢包数一起打印。
 #
 # 前置：lab 已起好并跑到 verify.sh 全绿（基线 = 只有 VPN 0）。
-# 收尾：默认把 lab 恢复成基线（sr-frr/sr-route PUT 回 [0]、FRR 热删、内核
-# VRF 设备删掉、fib.json 回 [0] 并重启一次 sr-fib）；`--keep` 留着现场。
+# 收尾：默认把 lab 恢复成基线（sr-frr/sr-route/sr-fib PUT 回 [0]、FRR 热删、
+# 内核 VRF 设备删掉）；`--keep` 留着现场。
 # 结束后可以直接再跑 test/lab/verify.sh。
 #
 # 用法:
@@ -55,6 +56,7 @@ retry() {   # <秒> <命令...>
 LAN_PFX=( "" "10.68.1.0/24" "10.68.2.0/24" "10.68.3.0/24" )
 AS=( "" 65101 65102 65103 )
 ROUTE_PORT=( "" 19001 19002 19003 )
+FIB_PORT=( "" 19011 19012 19013 )
 
 srfrr_body() {   # <mode: multi|base>
     if [ "$1" = "multi" ]; then
@@ -136,28 +138,52 @@ frr_del() {   # <n>
     dx "$c" sh -c 'python3 /usr/lib/frr/frr-reload.py --test /etc/frr/frr.conf >/dev/null 2>&1'
 }
 
-fib_set() {   # <n> <vrfs-json>
-    # 必须 -i：python3 - 从 stdin 读脚本，docker exec 不接 stdin 时会读到 EOF
-    # 然后安静地什么都不做（fib.json 不变，sr-fib 起来还是旧 VRF 集合）。
-    docker exec -i "lab-cpe$1" python3 - "$2" <<'PY'
-import json, sys
-p = "/etc/sdwan/fib.json"
-d = json.load(open(p))
-d["vrfs"] = json.loads(sys.argv[1])
-open(p, "w").write(json.dumps(d, indent=2) + "\n")
-PY
+fib_put() {   # <n> <vrfs-json> -> HTTP 码；改的是运行中那份（PUT /config），fib.json 不动
+    local body
+    body=$(docker exec "lab-cpe$1" python3 -c 'import json,sys
+d=json.load(open("/etc/sdwan/fib.json"))
+print(json.dumps({"vrfs": json.loads(sys.argv[1]), "tunnels": d["tunnels"],
+                  "escape_all_colors": d.get("escape_all_colors", False)}))' "$2")
+    [ -n "$body" ] || return 1
+    dx "lab-cpe$1" curl -s -o /dev/null -w '%{http_code}' -X PUT \
+        -H 'Content-Type: application/json' -d "$body" \
+        "http://127.0.0.1:${FIB_PORT[$1]}/config"
 }
 
-srfib_restart() {   # <n>
-    local c=lab-cpe$1
-    dx "$c" sh -c 'kill -TERM $(pgrep -x sr-fib) 2>/dev/null
-        for i in $(seq 1 25); do pgrep -x sr-fib >/dev/null || break; sleep 0.2; done'
-    docker exec -d "$c" sh -c 'exec /usr/local/bin/sr-fib -config /etc/sdwan/fib.json >> /var/log/sr-fib.log 2>&1'
-    retry 20 bash -c "docker exec $c sh -c 'tail -n 3 /var/log/sr-fib.log | grep -q \"$2 个 VRF\"'"
+fib_status() {   # <n>
+    dx "lab-cpe$1" curl -s "http://127.0.0.1:${FIB_PORT[$1]}/status"
 }
 
-pids_of() {   # <cpe> -> "zebra=.. bgpd=.. staticd=.. sr-frr=.. sr-route=.."
-    dx "$1" sh -c 'for p in zebra bgpd staticd sr-frr sr-route; do
+ping_loss() {   # <log> -> 丢包百分数（不带 %），读不到则为空
+    # 不能用 grep -o '[0-9]*% packet loss'：11.25% 会匹配成 "25%"。
+    dx lab-term1 cat "$1" | python3 -c '
+import re, sys
+m = re.search(r"([0-9]+(?:\.[0-9]+)?)% packet loss", sys.stdin.read())
+print(m.group(1) if m else "")'
+}
+
+fib_flap_count() {   # <cpe> <since-epoch> <until-epoch> -> 窗口内 BFD 假 down 警告行数
+    # lab 跑在共享 VM 上，BFD 会话每分钟会假 down 1~3 次（verify.sh 里记过）。
+    # sr-fib 会照设计撤掉该下一跳的全部路由 ~1s —— 和本次 PUT 无关。判据要把
+    # 它和「PUT 引起的丢包」分开，而不是把 lab 噪声算进客户可见窗口。
+    dx "$1" cat /var/log/sr-fib.log | python3 -c '
+import sys, datetime
+s, e = int(sys.argv[1]), int(sys.argv[2])
+n = 0
+for ln in sys.stdin:
+    if "BFD 会话不是 Up" not in ln:
+        continue
+    try:
+        t = datetime.datetime.strptime(ln[:19], "%Y/%m/%d %H:%M:%S").timestamp()
+    except ValueError:
+        continue
+    if s <= t <= e:
+        n += 1
+print(n)' "$2" "$3"
+}
+
+pids_of() {   # <cpe> -> "zebra=.. bgpd=.. staticd=.. sr-frr=.. sr-route=.. sr-fib=.."
+    dx "$1" sh -c 'for p in zebra bgpd staticd sr-frr sr-route sr-fib; do
         printf "%s=%s " "$p" "$(pgrep -x $p || echo -)"
     done'
 }
@@ -254,26 +280,60 @@ assert d["last_error"]=="", d["last_error"]' \
             || bad "lab-cpe$n: 有进程被重启（$pids -> $(pids_of "lab-cpe$n")）"
     done
 
-    sect "5. sr-fib 装 VPN 100/101（唯一中断点：它没有热更入口）"
-    for n in 1 2 3; do
-        fib_set "$n" '[0,100,101]'
+    sect "5. sr-fib 装 VPN 100/101（PUT /config 热更，进程不重启）"
+    # 量这次热更的客户可见窗口：term1 -> term2（这条路径在改动前后都该通）。
+    # 窗口撞上 BFD 假 down（lab 噪声）就重测，最多 3 次；只有「丢包且窗口里没有
+    # BFD 警告」才算 PUT 本身的问题。
+    local fib_pid0="" fib_pid1="" attempt=0 loss="" flaps=0 t0 t1
+    fib_pid0=$(dx lab-cpe1 pgrep -x sr-fib)
+    while [ "$attempt" -lt 3 ]; do
+        attempt=$((attempt + 1))
+        t0=$(date +%s)
+        docker exec -d lab-term1 sh -c 'exec ping -i 0.01 -c 800 10.68.2.10 > /tmp/ping-srfib-hot.log 2>&1'
+        sleep 1
+        if [ "$attempt" -eq 1 ]; then
+            for n in 1 2 3; do
+                code=$(fib_put "$n" '[0,100,101]')
+                [ "$code" = "200" ] \
+                    && ok "lab-cpe$n: PUT /config 200（这一轮已收敛）" \
+                    || bad "lab-cpe$n: PUT /config 返回 $code（$(fib_status "$n")）"
+                fib_status "$n" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+assert d["vrfs"]==[0,100,101], d["vrfs"]
+assert d["last"]["converged"] is True, d["last"]' \
+                    && ok "lab-cpe$n: /status 里是 3 个 VRF、converged=true" \
+                    || bad "lab-cpe$n: /status 不符（$(fib_status "$n")）"
+            done
+        else
+            # 重测时先撤后加，窗口里仍是一次真实的表集合变更（两个方向都是热更）。
+            for n in 1 2 3; do
+                fib_put "$n" '[0]' >/dev/null
+                fib_put "$n" '[0,100,101]' >/dev/null
+            done
+        fi
+        sleep 8
+        # 800 个包 × 10ms ≈ 8.8s；要等 ping 自己收尾，否则读到的可能不是整篇。
+        for i in $(seq 1 40); do
+            docker exec lab-term1 pgrep -x ping >/dev/null 2>&1 || break
+            sleep 0.5
+        done
+        t1=$(date +%s)
+        loss=$(ping_loss /tmp/ping-srfib-hot.log)
+        flaps=0
+        for n in 1 2 3; do
+            flaps=$((flaps + $(fib_flap_count "lab-cpe$n" "$t0" "$t1")))
+        done
+        echo "  .... 第 $attempt 次窗口 ${t0}-${t1}: 丢包 ${loss:-读不到}%、BFD 假 down 警告 $flaps 行"
+        [ "$loss" = "0" ] && break
+        [ "$flaps" -gt 0 ] || break
     done
-    # 量这次重启的客户可见窗口：term1 -> term2（这条路径在改动前后都该通）。
-    docker exec -d lab-term1 sh -c 'exec ping -i 0.01 -c 800 10.68.2.10 > /tmp/ping-srfib-restart.log 2>&1'
-    sleep 1
-    for n in 1 2 3; do
-        srfib_restart "$n" 3 && ok "lab-cpe$n: sr-fib 已按 3 个 VRF 收敛" \
-            || bad "lab-cpe$n: sr-fib 没收敛到 3 个 VRF（tail /var/log/sr-fib.log）"
-    done
-    sleep 8
-    # 800 个包 × 10ms ≈ 8.8s；要等 ping 自己收尾，否则读到的是进度行。
-    for i in $(seq 1 40); do
-        docker exec lab-term1 pgrep -x ping >/dev/null 2>&1 || break
-        sleep 0.5
-    done
-    # 最后一行是 rtt，丢包率在倒数第二行；整篇只出现一次。
-    loss=$(dx lab-term1 sh -c 'cat /tmp/ping-srfib-restart.log' | grep -o '[0-9]*% packet loss' | head -1)
-    echo "  .... sr-fib 重启窗口 lab-term1 -> term2 丢包: ${loss:-测量失败}"
+    fib_pid1=$(dx lab-cpe1 pgrep -x sr-fib)
+    [ "$fib_pid0" = "$fib_pid1" ] && [ -n "$fib_pid0" ] \
+        && ok "lab-cpe1: sr-fib pid 全程没变（$fib_pid0）" \
+        || bad "lab-cpe1: sr-fib 被重启（$fib_pid0 -> $fib_pid1）"
+    [ "${loss:-x}" = "0" ] \
+        && ok "lab-term1 -> term2: PUT /config 期间 0% 丢包（第 $attempt 次窗口）" \
+        || bad "lab-term1 -> term2: PUT /config 期间有丢包（第 $attempt 次窗口 ${loss:-读不到}%、BFD 假 down $flaps 行）"
     retry 10 bash -c 'for n in 1 2 3; do
         docker exec lab-cpe$n ip route show table 100 | grep -q "10.100.0.0/24\|10.100.1.0/24\|10.100.2.0/24\|10.100.3.0/24" || exit 1
     done'
@@ -364,7 +424,7 @@ assert d["pending"]==[], d["pending"]' \
     sleep 2.5
     sleep 4   # 等 timeout 7 退出
     # 注意：不能用 `python3 - <<PY` 读日志——heredoc 会占掉 python 的 stdin，
-    # sys.stdin 读到的是 EOF（和 fib_set 的坑一样）。脚本先存进变量，再 -c。
+    # sys.stdin 读到的是 EOF（piping 给 python3 - 的老坑）。脚本先存进变量，再 -c。
     py=$(cat <<'PY'
 import re, sys, datetime
 # ip -ts monitor route 的真实格式（实测）：
@@ -442,9 +502,14 @@ restore_baseline() {
             python3 -c "import json,sys; print(\" \".join(sorted(json.load(sys.stdin)[\"rib\"])))")" = 0 ] || exit 1
     done'
     for n in 1 2 3; do
-        fib_set "$n" '[0]'
-        srfib_restart "$n" 1 && ok "lab-cpe$n: sr-fib 回到 1 个 VRF" \
-            || bad "lab-cpe$n: sr-fib 没回到 1 个 VRF"
+        [ "$(fib_put "$n" '[0]')" = "200" ] && ok "lab-cpe$n: sr-fib PUT 回 1 个 VRF（不重启）" \
+            || bad "lab-cpe$n: sr-fib PUT 回 [0] 失败（$(fib_status "$n")）"
+        fib_status "$n" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+assert d["vrfs"]==[0], d["vrfs"]
+assert d["last"]["converged"] is True, d["last"]' \
+            && ok "lab-cpe$n: sr-fib 已收敛到 VPN 0" \
+            || bad "lab-cpe$n: sr-fib 没回到 VPN 0"
     done
     for n in 1 2 3; do
         [ "$(rib_keys "$n")" = "0" ] && ok "lab-cpe$n: RIB 只剩 VPN 0" \
@@ -486,7 +551,7 @@ done
 setup
 verify_scenario
 
-sect "G. 进程不重启（sr-fib 除外，见文件头）"
+sect "G. 进程不重启（含 sr-fib：VPN 集合全程走 PUT）"
 NOW_PIDS=""
 for n in 1 2 3; do
     NOW_PIDS="$NOW_PIDS lab-cpe$n[$(pids_of "lab-cpe$n")]"

@@ -96,6 +96,7 @@ OVERLAY=250       # 隧道与 overlay 下一跳所在的表，不是 VPN
 LABEL=$((1000 + VPN))  # VPN 标签 = 基址 1000 + VPN ID（16 是 IPv4 显式空标签）
 LCP_IF=lcp-x0     # 客户口在盒内核里的镜像 TAP 名（每台盒子自己的 netns，不冲突）
 ROUTE_STATUS=( "" 19001 19002 19003 )
+FIB_STATUS=( "" 19011 19012 19013 )   # sr-fib 自己的 /status + PUT /config（D3）
 SR_KEY=00112233445566778899aabbccddeeff
 TUNNEL_MTU=1360
 MSS=$((TUNNEL_MTU - 44))
@@ -755,6 +756,7 @@ EOF
         cat > "$RUN/cpe$n.fib.json" <<EOF
 {
   "status_url": "http://127.0.0.1:${ROUTE_STATUS[$n]}/status",
+  "status_addr": "0.0.0.0:${FIB_STATUS[$n]}",
   "vpp_socket": "/run/vpp/api.sock",
   "poll_sec": 1,
   "vrfs": [$VPN],

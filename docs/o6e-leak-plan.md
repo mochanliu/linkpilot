@@ -417,17 +417,22 @@ GET 的返回**不造数据**：设备没上报就说没上报，实例有没有
 
 - **基线**：`test/lab/verify.sh` 313 通过 / 0 失败；升级 sr-frr 到带链路监听的版本后仍是
   313/0，三次升级全程 sr-frr / sr-route / FRR pid 不变。
-- **多 VRF（以前从没测过）**：`test/lab/test-multivrf.sh` 112 通过 / 0 失败。VPN 0/100/101
+- **多 VRF（以前从没测过）**：`test/lab/test-multivrf.sh` 120 通过 / 0 失败（D3 补齐 sr-fib
+  `PUT /config` 后重跑）。VPN 0/100/101
   同时在线：sr-route RIB 各 4 条、盒内核 table 100/101 各 4 条 K（出口 vpn100/vpn101）、
   zebra 的 VRF 实例各 4 条 `K>*`、BGP VRF 实例各 4 条；同一前缀 `10.200.N.0/24` 在 100/101
   里各一份且出口不同；主表 254 没有任何 100/101/200 前缀；VPP table 100 的远端路径不是
   dpo-drop（K 没有盖掉 sr-fib）。
 - **touch 窗口**（§5.3 的待量项）：`PUT /config` + `refresh_vrfs:[0,100,101]` 原地重刷，
-  `ip -ts monitor route` 逐条测 4 条前缀的 del→add：**174 / 6 / 7 / 6 µs**（最坏 174µs）。
+  `ip -ts monitor route` 逐条测 4 条前缀的 del→add：**211 / 5 / 6 / 5 µs**（最坏 211µs，
+  2026-11-02 重跑）。
   sr-frr pid、配置指纹、客户侧 BGP vrf 表版本号全程不变（客户看不到撤/发）。
   结论：维持"只 touch 协议集合变化的 VPN"，不需要页面点名中断，也不需要额外的降级方案。
-- **唯一必然中断**：sr-fib 没有热更入口（D3 待补 `PUT`），装 VPN 100/101 要重启它。
-  实测 lab-term1 → lab-term2 800 包（10ms 间隔）：800/800，0% 丢包。
+- **sr-fib 装 VPN 100/101**：D3 已补 `PUT /config`（只改内存，不写盘、不重启）。三台各自
+  200、`/status` 里 `converged=true`、pid 不变；热更窗口 lab-term1 → term2 800 包
+  （10ms 间隔）：**0% 丢包**。第一次实测窗口撞上 lab 的 BFD 假 down（800 里丢 90、
+  seq 655–746 连续缺，与 cpe1 同一秒的 24 条路由撤离同刻），脚本重测后 0/800；
+  这次也修了脚本里 `grep -o '[0-9]*% packet loss'` 把 `11.25%` 读成 `25%` 的解析 bug。
 - **sr-frr 升级本身**：customer BGP 侧每 15–20ms 采一次可见前缀，0 次撤/发。
 - **zebra 的两个坑**（均已收口/记录，不靠重启绕过）：
   1. 接口 down、删接口、删地址会让 zebra 清掉自己 RIB 里的**全部** K 路由（内核里还在、

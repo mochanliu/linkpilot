@@ -25,8 +25,8 @@
 | VPN 号本身 | 控制器 | **有**，`ConfigVPN{ID,Name,BGP,OSPF}`（[cmd/sr-ctrl/config.go:44-50](../controller/cmd/sr-ctrl/config.go)） |
 | 每个 VPN 的 import/export RT | 设备上的 `sr-route.json` | **没有** |
 | 本端宣告的前缀（sr-route 的本地集合） | 设备上运行中的 `sr-route`（`sr-frr` 经 `PUT /local-prefixes` 推） | **没有**（内核侧的 `Statics` 有，overlay 侧那份没有） |
-| 逃生开关 `escape_all_colors` | 设备上的 `sr-fib.json` | **没有** |
-| sr-fib 的 `vrfs` + `tunnels`（带颜色） | 设备上的 `sr-fib.json` | **没有**（隧道数据控制器有，只是没渲染） |
+| 逃生开关 `escape_all_colors` | 设备上的 `sr-fib.json` | **没有**（设备侧已开 `PUT /config`，§1.3；控制器还没渲染） |
+| sr-fib 的 `vrfs` + `tunnels`（带颜色） | 设备上的 `sr-fib.json` | **没有**（同上；隧道数据控制器有，只是没渲染） |
 | sr-frr 的 `vrfs` + `import`（反向导入） | 设备上的 `/etc/sr-frr.json` | **没有** |
 
 证据：`export_rts` / `import_rts` / `escape_all_colors` 这几个键在控制器代码里**只出现在设备侧
@@ -122,14 +122,18 @@ O6-a 之后我把两边都读了一遍：
 日志与 `status.json` 里必须明写"已落盘、未热更"，不写成完成。
 
 
-sr-fib 那份（`vrfs` + `tunnels` + `escape_all_colors`）同样要由 `sr-apply` 写盘，但它**没有热更入口**
-（sr-fib 一轮轮询自己读 RIB，配置文件只在启动时读一次）⇒ 逃生开关/VPN 集合改了要等 sr-fib
-自然重启才生效。D3 已拍"照 O5-b 给 sr-fib 也开一道 `PUT`"。
-**原计划把写盘那半放进 O6-b，落地时挪到 D3 那一步了**，理由不是省事：`fib.json` 的
-`tunnels[].interface` 是**盒子侧才知道的键**（wg 口的名字由 `sr-agent -tunnels` 现场落地时定，
-控制器今天不知道），所以那半份不能照 `route.json` 那样"控制器渲染 + 设备叠加"，得先想清楚
-是控制器发还是按 next_hop 合并。同一个叠加逻辑写两遍、第二遍还建在没定的问题上，不如一步做完。
-O6-b 因此只动 `route.json` 一个文件。
+sr-fib 那份（`vrfs` + `tunnels` + `escape_all_colors`）同样要由 `sr-apply` 写盘。
+**D3（2026-11-02）已给它补了 `PUT /config`**：整份替换运行中那三个键，只改内存、不写盘
+（写盘仍归 `sr-apply`），校验复用 `fib.PlanFrom`（250 保留、VRF 不重复、颜色 ≤ 上限、
+隧道下一跳是规范 IPv4），收敛失败回 202 并在 `last.error` 里说明、下一轮轮询重试。
+`/status` 回当前配置 + 上一次收敛结果，`status_addr` 是进程级参数（`fib.json` 里可省略）。
+`fib.json` 的 `tunnels[].interface` 仍是**盒子侧才知道的键**（wg 口名字由 `sr-agent -tunnels`
+现场落地时定，控制器今天不知道），所以 `sr-apply` 的写盘那半还没接：**D3 只解决了"运行中
+改表不重启"，没有替 `sr-apply` 决定 interface 从哪来**。同一个叠加逻辑写两遍、第二遍还建在
+没定的问题上，不如等那个问题定了再做。
+实测（`test/lab/test-multivrf.sh` §5，2026-11-02）：三台盒子 PUT `[0,100,101]` 各自 200、
+`converged=true`、pid 不变；800 包 @10ms 的热更窗口 0% 丢包（第一次窗口撞上 lab 的 BFD 假
+down 时脚本会重测，并把警告行数与丢包数一起打印）。
 
 #### O6-b 落地后实测到的三件事（不是 bug，排障时要知道）
 
@@ -226,6 +230,8 @@ O6-a/O6-b 是后端，O6-c 才见效。**最快能让他看到东西的一步是
   ② 离线开机恢复出来的是一份**可能已过期的**对端表（对端口被改/被吊销时，盒子无从判断），
   所以磁盘那份必须带"我是哪一版、我从哪台控制器拿的"，并且 `check` 要能说出来。
 - **D3｜sr-fib 热更**：按我建议 —— 给 `sr-fib` 开一道 `PUT`（照 O5-b 的形状）。**排在 O6-b 之后单独一步。**
+  **已落地（2026-11-02）**：`PUT /config` + `GET /status`，只改内存；`sr-apply` 写盘那半仍等
+  `tunnels[].interface` 的归属拍板（§1.3）。
 - **D4｜"没有不跑 FRR 的盒子"** ⇒ 不加代码闸，`sr-apply` 无条件重启 FRR 保持不动；lab 那两个
   不跑 FRR 的测试盒子是**形态不一致**，修法是把 FRR 装进 dev 镜像（待做，不改判据脚本）。
   顺带把他反问的那句记在这里，因为它说明"盒子"这个词在我们之间是有歧义的：**盒子 ≠ 虚拟机**，

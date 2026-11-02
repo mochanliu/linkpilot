@@ -64,6 +64,7 @@ lab-ctrl 10.99.0.200:8444   sr-ctrl（入网 / CA / 设备证书）
          127.0.0.1:8088     sr-ctrl 控制台（宿主机回环 → 容器 8080，账号或运营令牌换会话）
 lab-rr   10.99.0.100:18446  sr-rr（tenant-a 的反射器）
 lab-cpeN 10.99.0.1N         sr-route /status（1900N，sr-fib/sr-frr 从这里取）
+         127.0.0.1:1901N    sr-fib /status 与 PUT /config（fib.json 的 status_addr；不配则只跑不发）
 lab-custN 10.99.0.2N        BGP router-id
 ```
 
@@ -106,6 +107,14 @@ lab-custN 10.99.0.2N        BGP router-id
 不重启进程也不问 RR。**本 lab 不用这两道**（这里的隧道与 VPN 表由 `bringup.sh` 一次性配好），
 判据在 srwg-node1/2 上跑 `test/scripts/test-refresh.sh`（51 条断言，五个进程一次都没重启）。
 要知道哪条前缀被本机扣下了，读同一份 `/status` 里的 `pending` 与 `local_skips`。
+
+`sr-fib` 的第四道是 D3（2026-11-02）补的 `PUT /config`：`vrfs` + `tunnels` +
+`escape_all_colors` 整份替换，只改内存、不写盘、不重启；`GET /status` 回当前配制 +
+上一次收敛结果。校验复用 `fib.PlanFrom`（250 保留、VRF 不重复、颜色 ≤ 上限、下一跳
+必须是规范 IPv4），不合格整份不接、回 400 且旧表继续跑；收敛失败回 202，`last.error`
+说明原因，下一轮轮询重试。`fib.json` 里的 `status_addr` 是进程级参数，缺省就没有监听口
+（老配置照原样能跑）。注意 `vrfs` 在 JSON 里是 `[0,100]` 数组，不是 `[]uint8` 编码出来的
+base64。
 
 O6-c 补了第四道 `PUT /rrs`：换反射器集合，也是整表替换、也只改内存（磁盘那份要下次启动才回来）。
 它跟前三道不一样，**旧会话在新会话成立之前不会摘**（make-before-break），所以 `/status` 可能返回
@@ -151,11 +160,13 @@ test/lab/teardown.sh           # 拆掉 lab-*，不碰 srwg-*
 test/lab/teardown.sh --purge   # 连 test/lab/run/（含一次性 CA）一起删
 ```
 
-`test-multivrf.sh`（2026-11-02，112 条断言）回答的是"多个 VPN 到底能不能同时工作"：
+`test-multivrf.sh`（2026-11-02，120 条断言）回答的是"多个 VPN 到底能不能同时工作"：
 sr-route RIB 分桶、盒内核 table 100/101 的 K 路由、zebra/BGP 的 VRF 实例、VPP 对应表、
 两个 VPN 同前缀不串、主表不被污染，以及 touch 窗口（`PUT /config` + `refresh_vrfs`）
-和 sr-fib 重启这一次中断点的实测。`--keep` 保留现场，默认收尾把 sr-frr/sr-route/FRR/
-内核 VRF 设备全部热改回基线（只重启一次 sr-fib）。跑完可以紧接着再跑 `verify.sh`。
+和 sr-fib `PUT /config` 的热更窗口。sr-fib 那段也量客户流量（800 包 @10ms）：窗口撞上
+lab 的 BFD 假 down（共享 VM 每分钟 1–3 次，sr-fib 会照设计撤路由 ~1s）时脚本重测，
+并把丢包数与警告行数一起打印，最多 3 次。`--keep` 保留现场，默认收尾把 sr-frr/sr-route/
+sr-fib/FRR/内核 VRF 设备全部热改回基线（**一次都不重启**）。跑完可以紧接着再跑 `verify.sh`。
 
 ## 控制台与 vCPE 入网（GUI 全流程）
 
