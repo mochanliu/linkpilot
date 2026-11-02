@@ -1631,6 +1631,7 @@
     var h = cfgHostPanel(cfg);
     h += cfgVPNPanel(cfg);
     h += cfgIfacePanel(cs, cfg);
+    h += cfgVRRPPanel(cs, cfg);
     h += cfgStaticPanel(cfg);
     h += cfgDynamicPanel(cs, cfg);
     h += cfgChecksPanel(cs);
@@ -1693,7 +1694,7 @@
     return '<section class="panel"><header><h2>客户口</h2>' +
       '<button class="small" data-act="cfg-if-add">添加客户口</button></header>' +
       '<div class="hint">接口 IP 交给 FRR（配在内核 TAP 上，linux-nl 同步进 VPP）；VPP 只管这张表、MTU、开关和 lcp。</div>' +
-      (cs.edit ? cfgIfaceEditor(cs) : "") +
+      (cs.edit && cs.edit.kind === "iface" ? cfgIfaceEditor(cs) : "") +
       "<table><thead><tr><th>VPP 口</th><th>内核 TAP</th><th>地址</th><th>VPN</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>" +
       rows + "</tbody></table></section>";
   }
@@ -1722,6 +1723,175 @@
       '<div class="cfg-bar" style="margin:10px 0 0"><span style="flex:1"></span>' +
       '<button class="small" data-act="cfg-if-cancel">取消</button>' +
       '<button class="small primary" data-act="cfg-if-save">保存客户口</button></div></div>';
+  }
+
+  // 站点里两台盒子的内侧第一跳冗余（VRRP）。它挂在客户口上，所以排在客户口后面。
+  //
+  // 这一层没有「主 / 备」字段：谁当主由 priority 决定，页面上把这句话写出来，
+  // 否则租户会去找一个根本不存在的开关。改 priority / 间隔会把这条 VR 删了重建，
+  // 它要重新选一次主备，所以这个代价必须在这里点名，不能等设备上才发现。
+  function cfgVRRPPanel(cs, cfg) {
+    var list = cfg.vrrp || [];
+    var rows = list.length ? list.map(function (v, i) {
+      var it = cfgIfaceOf(cfg, v.vpp);
+      var issue = cfgVRRPIssue(cfg, v, i);
+      return "<tr>" +
+        '<td class="mono">' + esc(v.vpp || "(没选口)") + "</td>" +
+        '<td class="num">' + esc(v.vr_id) + "</td>" +
+        '<td class="num">' + esc(v.priority) + "</td>" +
+        '<td class="num">' + (v.interval_ms ? esc(v.interval_ms) + " ms" : "默认") + "</td>" +
+        '<td class="mono">' + esc(v.virtual_addr || "—") + "</td>" +
+        "<td>" + (v.preempt ? '<span class="tag plan">抢占</span>' : '<span class="tag pending">不回切</span>') +
+        (v.accept ? ' <span class="muted" style="font-size:12px">accept</span>' : "") +
+        (it && !it.up ? ' <span class="tag stale">口 down</span>' : "") +
+        (issue ? ' <span class="tag revoked">' + esc(issue) + "</span>" : "") + "</td>" +
+        '<td class="row-actions"><button class="small" data-act="cfg-vr-edit" data-i="' + i + '">编辑</button>' +
+        '<button class="small danger" data-act="cfg-vr-del" data-i="' + i + '">删除</button></td>' +
+        "</tr>";
+    }).join("") : '<tr><td colspan="7" class="empty">还没有虚拟路由器。一个站点两台盒子时，客户侧网关就是这个地址。</td></tr>';
+    return '<section class="panel"><header><h2>VRRP（站点第一跳冗余）</h2>' +
+      '<button class="small" data-act="cfg-vr-add">添加虚拟路由器</button></header>' +
+      '<div class="hint">虚拟地址是这一台盒子在这个客户口上的网关地址：谁优先级高谁回答 ARP，另一台待命。' +
+      '没有「主 / 备」开关——优先级就是角色，两台各配一条同 vr_id、虚拟地址相同的记录即可。' +
+      '通告间隔留空按 1000 ms。</div>' +
+      '<div class="hint" style="margin:6px 0 0">这一段在设备上是最后下发的，且只走 VPP 的二进制 API。' +
+      '改优先级或间隔会把这条 VR 删了重建、重新选一次主备，客户侧网关会在一段时间内落在另一台上（约 3 倍通告间隔再加一个 skew；双机上的实测时长还没量出来，量到之前这里只给公式）；' +
+      '一次配置只改一台，另一台保持原优先级即可避免双主。</div>' +
+      (cs.edit && cs.edit.kind === "vrrp" ? cfgVRRPEditor(cs) : "") +
+      "<table><thead><tr><th>VPP 口</th><th>vr_id</th><th>优先级</th><th>通告间隔</th><th>虚拟地址</th><th>标志 / 问题</th><th></th></tr></thead><tbody>" +
+      rows + "</tbody></table></section>";
+  }
+
+  function cfgVRRPEditor(cs) {
+    var v = cs.edit.v;
+    var opts = cs.draft.ifaces.map(function (it) {
+      return '<option value="' + esc(it.vpp) + '"' + (it.vpp === v.vpp ? " selected" : "") + ">" +
+        esc(it.vpp) + (it.ip ? " · " + esc(it.ip) + "/" + esc(it.prefix_len) : " · 没配地址") +
+        " (VPN " + esc(it.vpn) + ")" + "</option>";
+    }).join("");
+    var sel = null;
+    for (var i = 0; i < cs.draft.ifaces.length; i++) {
+      if (cs.draft.ifaces[i].vpp === v.vpp) sel = cs.draft.ifaces[i];
+    }
+    var subnet = sel && sel.ip ? sel.ip + "/" + sel.prefix_len : "（先选一个已配地址的客户口）";
+    return '<div class="subcard"><div class="subhead"><b>' + (cs.edit.idx >= 0 ? "编辑虚拟路由器" : "新虚拟路由器") + "</b></div>" +
+      '<div class="fields">' +
+      '<div class="field"><label for="vr-vpp">VPP 口</label><select id="vr-vpp" data-vr="vpp">' + opts + "</select></div>" +
+      '<div class="field"><label for="vr-id">vr_id</label><input id="vr-id" type="number" min="1" max="255" value="' + esc(v.vr_id) + '" style="width:90px"></div>' +
+      '<div class="field"><label for="vr-prio">优先级</label><input id="vr-prio" type="number" min="1" max="254" value="' + esc(v.priority) + '" style="width:90px"></div>' +
+      '<div class="field"><label for="vr-int">通告间隔 ms</label><input id="vr-int" type="number" min="100" max="60000" step="10" value="' + (v.interval_ms ? esc(v.interval_ms) : "") + '" placeholder="1000" style="width:120px"></div>' +
+      '<div class="field"><label for="vr-addr">虚拟地址</label><input id="vr-addr" value="' + esc(v.virtual_addr) + '" spellcheck="false" placeholder="10.68.1.1"></div>' +
+      '<div class="field"><label for="vr-preempt">抢占</label><select id="vr-preempt"><option value="1"' +
+      (v.preempt ? " selected" : "") + '>开（主机恢复后收回）</option><option value="0"' +
+      (!v.preempt ? " selected" : "") + ">关（故障切换后不回切）</option></select></div>" +
+      '<div class="field"><label for="vr-accept">accept</label><select id="vr-accept"><option value="0"' +
+      (!v.accept ? " selected" : "") + '>关（虚拟地址只当网关）</option><option value="1"' +
+      (v.accept ? " selected" : "") + ">开（本机也应答发给它的包）</option></select></div>" +
+      "</div>" +
+      '<div class="hint" style="margin:10px 0 0">直连网段：' + esc(subnet) +
+      "。虚拟地址必须是这个网段里一个没被占用的主机地址，而且两台盒子要填同一个。</div>" +
+      '<div class="cfg-bar" style="margin:10px 0 0"><span style="flex:1"></span>' +
+      '<button class="small" data-act="cfg-vr-cancel">取消</button>' +
+      '<button class="small primary" data-act="cfg-vr-save">保存虚拟路由器</button></div></div>';
+  }
+
+  function cfgIfaceOf(cfg, name) {
+    var list = cfg.ifaces || [];
+    for (var i = 0; i < list.length; i++) if (list[i].vpp === name) return list[i];
+    return null;
+  }
+
+  function cfgIPv4Num(s) {
+    var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(s || "").trim());
+    if (!m) return null;
+    var n = 0;
+    for (var i = 1; i <= 4; i++) {
+      var o = Number(m[i]);
+      if (o > 255) return null;
+      n = n * 256 + o;
+    }
+    return n;
+  }
+
+  // The subnet arithmetic is done by division, not by & / <<: a JS bitwise
+  // operator turns 0xFFFFFFFF into -1, and a broadcast address is exactly the
+  // case where that matters.
+  function cfgSubnetOf(ip, bits) {
+    var n = cfgIPv4Num(ip);
+    if (n === null || !(bits >= 0 && bits <= 32)) return null;
+    var stride = Math.pow(2, 32 - bits);
+    var net = Math.floor(n / stride) * stride;
+    return { net: net, bcast: net + stride - 1, stride: stride };
+  }
+
+  function cfgNumToIPv4(n) {
+    var out = [];
+    for (var i = 3; i >= 0; i--) out.push(Math.floor(n / Math.pow(2, 8 * i)) % 256);
+    return out.join(".");
+  }
+
+  // cfgVRRPIssue is the page's copy of the rules that a box cannot notice for
+  // itself. It returns the short label shown on the row, or "" when the row is
+  // fine; the full sentence is the toast on save. `skip` is the index of the row
+  // being compared (the editor's scratch copy is not in the list yet, so it has
+  // to be named). The server re-checks every one of these, and more, before a
+  // publish -- this is a preview, not the gate.
+  function cfgVRRPIssue(cfg, v, skip) {
+    var list = cfg.vrrp || [];
+    for (var i = 0; i < list.length; i++) {
+      if (i === skip) continue;
+      var o = list[i];
+      if (o.vpp === v.vpp && o.vr_id === v.vr_id) return "vr_id 重复";
+      if (v.virtual_addr && o.virtual_addr === v.virtual_addr) return "虚拟地址重复";
+    }
+    var it = cfgIfaceOf(cfg, v.vpp);
+    if (!it) return "口不在客户口里";
+    var vip = cfgIPv4Num(v.virtual_addr);
+    if (vip === null) return "地址不合法";
+    if (vip === cfgIPv4Num(it.ip)) return "等于口自己的地址";
+    var s = cfgSubnetOf(it.ip, it.prefix_len);
+    if (!s) return "口没有合法地址";
+    if (vip < s.net || vip > s.bcast) return "不在直连网段";
+    if (s.stride > 1 && (vip === s.net || vip === s.bcast)) return "是网络/广播地址";
+    var others = cfg.ifaces || [];
+    for (var j = 0; j < others.length; j++) {
+      var x = others[j];
+      if (x.vpp === it.vpp || x.vpn !== it.vpn) continue;
+      if (cfgIPv4Num(x.ip) === vip) return "已被 " + x.vpp + " 占用";
+    }
+    return "";
+  }
+
+  function cfgVRRPDetail(cfg, v, skip) {
+    var list = cfg.vrrp || [];
+    for (var i = 0; i < list.length; i++) {
+      if (i === skip) continue;
+      var o = list[i];
+      if (o.vpp === v.vpp && o.vr_id === v.vr_id) return "这个口上 vr_id " + v.vr_id + " 已经有一条了";
+      if (o.virtual_addr === v.virtual_addr) return "虚拟地址 " + v.virtual_addr + " 已经属于另一条";
+    }
+    var it = cfgIfaceOf(cfg, v.vpp);
+    if (!it) return "虚拟路由器只能挂在上面配好的客户口上";
+    var vip = cfgIPv4Num(v.virtual_addr);
+    if (vip === null) return "虚拟地址不是合法 IPv4：" + (v.virtual_addr || "(空)");
+    if (vip === cfgIPv4Num(it.ip)) return "虚拟地址等于客户口 " + it.vpp + " 自己的地址：" + it.ip;
+    var s = cfgSubnetOf(it.ip, it.prefix_len);
+    if (!s) return "客户口 " + it.vpp + " 没有合法的地址与掩码，判断不了虚拟地址落在哪个网段";
+    if (vip < s.net || vip > s.bcast) {
+      return "虚拟地址 " + v.virtual_addr + " 不在客户口 " + it.vpp + " 的直连网段 " +
+        cfgNumToIPv4(s.net) + "/" + it.prefix_len + " 内：客户侧主机不会把它当网关";
+    }
+    if (s.stride > 1 && vip === s.net) return "虚拟地址是网段的网络地址，不能当网关用";
+    if (s.stride > 1 && vip === s.bcast) return "虚拟地址是网段的广播地址，不能当网关用";
+    var others = cfg.ifaces || [];
+    for (var j = 0; j < others.length; j++) {
+      var x = others[j];
+      if (x.vpp === it.vpp || x.vpn !== it.vpn) continue;
+      if (cfgIPv4Num(x.ip) === vip) {
+        return "虚拟地址 " + v.virtual_addr + " 已经是同一 VPN " + it.vpn + " 里客户口 " + x.vpp + " 的地址";
+      }
+    }
+    return "";
   }
 
   function cfgStaticPanel(cfg) {
@@ -1961,9 +2131,19 @@
     render();
   }
 
+  // 客户口编辑器和虚拟路由器编辑器共用 cs.edit 这一个槽位。开着其中一个时点另一个
+  // 的「添加 / 编辑」会把它顶掉，正在填的那半就静默没了 —— 与其丢内容，说一句。
+  function csEditBusy(kind) {
+    var cs = S.cfg;
+    if (!cs || !cs.edit || cs.edit.kind === kind) return false;
+    toast("先把「" + (cs.edit.kind === "vrrp" ? "虚拟路由器" : "客户口") + "」保存或取消");
+    return true;
+  }
+
   function cfgAddIface() {
     var cs = S.cfg;
     if (!cs || !cs.draft) return;
+    if (csEditBusy("iface")) return;
     if (cs.draft.ifaces.length >= 64) { toast("一个设备最多 64 个客户口"); return; }
     var maxVpp = 1, maxLcp = -1;
     cs.draft.ifaces.forEach(function (it) {
@@ -1972,7 +2152,7 @@
       var b = String(it.lcp || "").match(/(\d+)$/);
       if (b) maxLcp = Math.max(maxLcp, Number(b[1]));
     });
-    cs.edit = { idx: -1, v: {
+    cs.edit = { kind: "iface", idx: -1, v: {
       vpp: "host-eth" + (maxVpp + 1), lcp: "lcp-x" + (maxLcp + 1),
       ip: "", prefix_len: 24, vpn: cfgVPNExists(cs.draft, cs.vpn) ? cs.vpn : 0,
       mtu: 1500, arp_ignore: true, up: true
@@ -1983,7 +2163,8 @@
   function cfgEditIface(i) {
     var cs = S.cfg;
     if (!cs || !cs.draft || !cs.draft.ifaces[i]) return;
-    cs.edit = { idx: i, v: cfgClone(cs.draft.ifaces[i]) };
+    if (csEditBusy("iface")) return;
+    cs.edit = { kind: "iface", idx: i, v: cfgClone(cs.draft.ifaces[i]) };
     render();
   }
 
@@ -2015,6 +2196,84 @@
     if (!cfgVPNExists(cs.draft, v.vpn)) { toast("VPN " + v.vpn + " 不存在"); return; }
     if (cs.edit.idx >= 0) cs.draft.ifaces[cs.edit.idx] = v;
     else cs.draft.ifaces.push(v);
+    cs.edit = null;
+    csMarkDirty();
+    render();
+  }
+
+  function cfgAddVR() {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    if (csEditBusy("vrrp")) return;
+    if (cs.draft.vrrp && cs.draft.vrrp.length >= 64) { toast("一台设备最多 64 条虚拟路由器"); return; }
+    if (!cs.draft.ifaces.length) {
+      toast("先配好客户口：虚拟路由器要挂在一个已经配好的客户口上");
+      return;
+    }
+    var maxID = 0;
+    (cs.draft.vrrp || []).forEach(function (v) {
+      if (v.vpp === cs.draft.ifaces[0].vpp) maxID = Math.max(maxID, v.vr_id);
+    });
+    cs.edit = { kind: "vrrp", idx: -1, v: {
+      vpp: cs.draft.ifaces[0].vpp, vr_id: maxID + 1, priority: 120,
+      interval_ms: 0, preempt: true, accept: false, virtual_addr: ""
+    } };
+    render();
+  }
+
+  function cfgEditVR(i) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft || !cs.draft.vrrp || !cs.draft.vrrp[i]) return;
+    if (csEditBusy("vrrp")) return;
+    cs.edit = { kind: "vrrp", idx: i, v: cfgClone(cs.draft.vrrp[i]) };
+    render();
+  }
+
+  function cfgDelVR(i) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft || !cs.draft.vrrp) return;
+    if (!confirm("删除虚拟路由器 " + cs.draft.vrrp[i].vpp + " vr" + cs.draft.vrrp[i].vr_id +
+      "？发布后这台盒子会把它从 VPP 里删掉，虚拟地址由对端接管。")) return;
+    cs.draft.vrrp.splice(i, 1);
+    cs.edit = null;
+    csMarkDirty();
+    render();
+  }
+
+  function cfgSaveVR() {
+    var cs = S.cfg;
+    if (!cs || !cs.edit || cs.edit.kind !== "vrrp" || !cs.draft) return;
+    if (!cs.draft.vrrp) cs.draft.vrrp = [];
+    var v = cs.edit.v;
+    v.vpp = cfgVal("vr-vpp");
+    v.vr_id = Number(cfgVal("vr-id"));
+    v.priority = Number(cfgVal("vr-prio"));
+    var int = cfgVal("vr-int");
+    v.interval_ms = int === "" ? 1000 : Number(int); // 与后端 vrrpDefaultIntervalMS 同值
+    v.virtual_addr = cfgVal("vr-addr");
+    v.preempt = cfgVal("vr-preempt") === "1";
+    v.accept = cfgVal("vr-accept") === "1";
+    if (!cfgIfaceOf(cs.draft, v.vpp)) { toast("先配好客户口：虚拟路由器要挂在一个已经配好的客户口上"); return; }
+    if (!(v.vr_id >= 1 && v.vr_id <= 255) || Math.trunc(v.vr_id) !== v.vr_id) {
+      toast("vr_id 需在 1–255 之间");
+      return;
+    }
+    if (!(v.priority >= 1 && v.priority <= 254) || Math.trunc(v.priority) !== v.priority) {
+      toast("优先级需在 1–254 之间：0 是备机停发通告时用的，255 留给真正持有这个地址的路由器");
+      return;
+    }
+    if (!(v.interval_ms >= 100 && v.interval_ms <= 60000) || v.interval_ms % 10 !== 0) {
+      toast("通告间隔需在 100–60000 ms 之间，并且是 10 的整数倍（VPP 按厘秒计数）");
+      return;
+    }
+    if (!cfgIPv4(v.virtual_addr)) { toast("虚拟地址不是合法 IPv4：" + (v.virtual_addr || "(空)")); return; }
+    var why = cfgVRRPDetail(cs.draft, v, cs.edit.idx);
+    if (why) { toast(why); return; }
+    if (cs.edit.idx >= 0) cs.draft.vrrp[cs.edit.idx] = v;
+    else cs.draft.vrrp.push(v);
+    cs.draft.vrrp.sort(function (a, b) {
+      return a.vpp === b.vpp ? a.vr_id - b.vr_id : (a.vpp < b.vpp ? -1 : 1);
+    });
     cs.edit = null;
     csMarkDirty();
     render();
@@ -6635,6 +6894,14 @@
       if (S.cfg) S.cfg.vpn = Number(cv.value);
       render();
     });
+    var vvp = $("vr-vpp");
+    if (vvp) vvp.addEventListener("change", function () {
+      var cs = S.cfg;
+      if (!cs || !cs.edit || cs.edit.kind !== "vrrp") return;
+      cs.edit.v.vpp = vvp.value;
+      blurContent();
+      render();
+    });
     document.querySelectorAll("#content [data-cfg]").forEach(function (el) {
       el.addEventListener("input", function () {
         if (!S.cfg || !S.cfg.draft) return;
@@ -7047,6 +7314,11 @@
         else if (act === "cfg-if-del") cfgDelIface(Number(el.getAttribute("data-i")));
         else if (act === "cfg-if-cancel") { S.cfg.edit = null; render(); }
         else if (act === "cfg-if-save") cfgSaveIface();
+        else if (act === "cfg-vr-add") cfgAddVR();
+        else if (act === "cfg-vr-edit") cfgEditVR(Number(el.getAttribute("data-i")));
+        else if (act === "cfg-vr-del") cfgDelVR(Number(el.getAttribute("data-i")));
+        else if (act === "cfg-vr-cancel") { S.cfg.edit = null; render(); }
+        else if (act === "cfg-vr-save") cfgSaveVR();
         else if (act === "cfg-st-add") cfgAddStatic();
         else if (act === "cfg-st-del") cfgDelStatic(Number(el.getAttribute("data-i")));
         else if (act === "cfg-nb-add") cfgAddNeighbor();

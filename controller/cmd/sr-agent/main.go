@@ -211,6 +211,10 @@ func main() {
 		store := apply.Store{Root: *storeRoot}
 		applier := apply.New(store)
 		applier.VPPCtl = *vppctl
+		// The same socket the inventory reads from. It is not a new privilege here:
+		// -apply already writes VPP through vppctl. Left empty, a bundle with a
+		// virtual router fails with the reason in its text instead of half-applying.
+		applier.VPPAPI = *vppAPI
 		applier.FRRConf = *frrConf
 		applier.FRRReload = *frrReload
 		applier.RouteConf = *routeConf

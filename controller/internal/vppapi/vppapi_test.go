@@ -48,8 +48,14 @@ type fakeVPP struct {
 	bfdRaw     [][]byte // bfd_udp_session_dump 回的明细净体
 	ipRouteRaw [][]byte // ip_route_dump 回的明细净体
 	mplsRaw    [][]byte // mpls_route_dump 回的明细净体
-	cliReply   string   // cli_inband 的应答字符串
-	requests   chan request
+	// vrrpRaw 是 vrrp_vr_dump 回的 details 净体。**故意无视请求里的口号、原样全发**：
+	// 实测这台盒子会过滤（C7），但客户端不能依赖它，所以假端比真机更宽松，
+	// 让"只留被问的那张口"这条由 VRRPDump 自己证明。
+	vrrpRaw         [][]byte
+	vrrpUpdateIdx   uint32 // vrrp_vr_update_reply 带回来的全局池下标
+	vrrpUpdateNoIdx bool   // 只回 retval：复现应答比约定短 4 字节的帧
+	cliReply        string // cli_inband 的应答字符串
+	requests        chan request
 }
 
 type request struct {
@@ -262,6 +268,22 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 	case "ip_route_dump":
 		for _, raw := range f.ipRouteRaw {
 			f.sendFrameOf(conn, "ip_route_details", reqCtx, raw)
+		}
+	case "vrrp_vr_add_del", "vrrp_vr_del", "vrrp_vr_start_stop":
+		// 三条应答同形（CRC 都是 e8d4e804）：只有 retval。实测的 -7/-116/-6/-73
+		// 就从这里回，客户端必须原样变成 APIError 而不是"没报错"。
+		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
+	case "vrrp_vr_update":
+		// vl_api_vrrp_vr_update_reply_t = retval(4) + vrrp_index(4)，是这套 API 里
+		// 唯一能读到那个全局池下标的地方。
+		out := uint32Bytes(uint32(f.retvals[name]))
+		if !f.vrrpUpdateNoIdx {
+			out = append(out, uint32Bytes(f.vrrpUpdateIdx)...)
+		}
+		f.reply(conn, name, reqCtx, out)
+	case "vrrp_vr_dump":
+		for _, raw := range f.vrrpRaw {
+			f.sendFrameOf(conn, "vrrp_vr_details", reqCtx, raw)
 		}
 	case "mpls_route_dump":
 		for _, raw := range f.mplsRaw {

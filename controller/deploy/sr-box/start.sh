@@ -272,7 +272,11 @@ do_apply() {
         return
     fi
     say apply "重放磁盘上那版（sr-apply boot）"
-    if "$SR_BIN/sr-apply" boot --root "$APPLY_ROOT" --route-conf "$ROUTE_CONF" >>"$LOG/apply.log" 2>&1; then
+    local args=(boot --root "$APPLY_ROOT" --route-conf "$ROUTE_CONF")
+    # vrrp 段只认 api.sock 这条通路（这一版 VPP 没有 vrrp CLI，实测 2026-11-02）。
+    # 没配路径时不塞空值：装了虚拟路由器的盒子会在 boot 里显式失败，而不是"没重放"。
+    [ -n "$AGENT_VPP_API" ] && args+=(--vpp-api "$AGENT_VPP_API")
+    if "$SR_BIN/sr-apply" "${args[@]}" >>"$LOG/apply.log" 2>&1; then
         say apply "重放完成：$(json_field "$APPLY_ROOT/status.json" "'v%s %s %s' % (d.get('version'), d.get('source'), 'ok' if d.get('ok') else 'FAIL')")"
     else
         fail apply "sr-apply boot 返回非 0（看 $LOG/apply.log）"

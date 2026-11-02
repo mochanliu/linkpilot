@@ -162,6 +162,102 @@ func validateBasicConfig(c *BasicConfig) []ConfigCheck {
 		}
 	}
 
+	// VRRP: one virtual router per row, keyed by (VPP port, vr_id). The rules
+	// here are the ones a box cannot notice for itself -- a VR hung on a port it
+	// does not own, or a gateway address outside the subnet it is supposed to be
+	// the gateway of, is configured happily and then never answers an ARP.
+	if len(c.VRRP) > cfgMaxVRRP {
+		add("error", "VRRP 条目数量超过上限 %d。", cfgMaxVRRP)
+	}
+	seenVR := map[string]bool{}
+	vipOwner := map[string]string{}
+	for _, v := range c.VRRP {
+		label := fmt.Sprintf("VRRP %s vr_id=%d", v.VPP, v.VRID)
+		if v.VPP == "" {
+			add("error", "存在没有 VPP 接口名的 VRRP 条目。")
+			label = "VRRP"
+		}
+		if v.VRID < vrrpMinVRID || v.VRID > vrrpMaxVRID {
+			add("error", "%s 的 vr_id 需在 %d–%d 之间。", label, vrrpMinVRID, vrrpMaxVRID)
+		}
+		if v.Priority < vrrpMinPriority || v.Priority > vrrpMaxPriority {
+			add("error", "%s 的 priority 需在 %d–%d 之间：0 是备机停发通告时用的，255 留给真正持有这个地址的路由器。",
+				label, vrrpMinPriority, vrrpMaxPriority)
+		}
+		if v.IntervalMS != 0 {
+			// A row that reaches here with interval 0 was never normalized; an
+			// empty field on the page is filled with vrrpDefaultIntervalMS before
+			// this function runs, because VPP refuses 0 outright (retval=-7).
+			switch {
+			case v.IntervalMS < vrrpMinInterval || v.IntervalMS > vrrpMaxInterval:
+				add("error", "%s 的通告间隔需在 %d–%d ms 之间（留空按 %d ms 处理）。",
+					label, vrrpMinInterval, vrrpMaxInterval, vrrpDefaultIntervalMS)
+			case v.IntervalMS%10 != 0:
+				// VPP stores this as a u16 count of centiseconds, so a value that
+				// is not a whole centisecond would be silently rounded.
+				add("error", "%s 的通告间隔只能到 10 ms 一档，%d 会被 VPP 取整。", label, v.IntervalMS)
+			}
+		}
+
+		vip, vipOK := parseIPv4(v.VirtualAddr)
+		if !vipOK {
+			add("error", "%s 的虚拟地址「%s」不是合法 IPv4 地址。", label, v.VirtualAddr)
+		} else if owner, dup := vipOwner[v.VirtualAddr]; dup {
+			add("error", "虚拟地址 %s 同时属于 %s 和 %s。", v.VirtualAddr, owner, label)
+		} else {
+			vipOwner[v.VirtualAddr] = label
+		}
+
+		it, ok := ifaceByVPP(c, v.VPP)
+		if v.VPP != "" && !ok {
+			add("error", "%s 挂的客户口 %s 不在这台设备的接口列表里：VRRP 只能跑在基础配置已经配好的客户口上。", label, v.VPP)
+			continue
+		}
+		vrKey := fmt.Sprintf("%s|%d", it.VPP, v.VRID)
+		if seenVR[vrKey] {
+			add("error", "%s 重复定义。", label)
+		}
+		seenVR[vrKey] = true
+		if !it.Up {
+			add("warning", "%s 挂的客户口 %s 没有置为 up，VPP 不会在 down 的口上发 VRRP 通告。", label, it.VPP)
+		}
+
+		p, pOK := ifacePrefix(it)
+		if !pOK {
+			add("warning", "%s 挂的客户口 %s 还没有合法的地址与掩码，无法判断虚拟地址落在不在它的网段里。", label, it.VPP)
+			continue
+		}
+		if !vipOK {
+			continue
+		}
+		if vip.String() == it.IP {
+			add("error", "%s 的虚拟地址等于客户口 %s 自己的地址 %s：主备两台会把网关和自己的地址搞混。", label, it.VPP, it.IP)
+			continue
+		}
+		if !p.Contains(vip) {
+			add("error", "%s 的虚拟地址 %s 不在客户口 %s 的直连网段 %s 内，客户侧主机不会把它当网关。", label, vip, it.VPP, p)
+			continue
+		}
+		network, broadcast := subnetBounds(p)
+		if vip == network || vip == broadcast {
+			which := "广播"
+			if vip == network {
+				which = "网络"
+			}
+			add("error", "%s 的虚拟地址 %s 是网段 %s 的%s地址，不能当网关用。", label, vip, p, which)
+		}
+		// A second port in the same VPN already owns this address: two gateways
+		// for one broadcast domain, and the ARP answer becomes a race.
+		for _, other := range c.Ifaces {
+			if other.VPP == it.VPP || other.VPN != it.VPN {
+				continue
+			}
+			if o, ok := parseIPv4(other.IP); ok && o == vip {
+				add("error", "%s 的虚拟地址 %s 已被同一 VPN %d 的客户口 %s 占用。", label, vip, it.VPN, other.VPP)
+			}
+		}
+	}
+
 	type ridUse struct {
 		vpn   uint32
 		owner string

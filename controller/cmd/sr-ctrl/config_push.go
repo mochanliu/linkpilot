@@ -201,6 +201,8 @@ func bundleFor(p *PublishedBundle, nodeID uint16) apply.Bundle {
 			VPP:   p.Artifacts.VPP,
 			Boot:  p.Artifacts.Boot,
 			Route: p.Artifacts.Route,
+			Srfrr: p.Artifacts.Srfrr,
+			Vrrp:  p.Artifacts.Vrrp,
 		},
 	}
 }

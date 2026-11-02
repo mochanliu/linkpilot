@@ -329,10 +329,59 @@ type configArtifacts struct {
 	// leak row turns the leak off instead of leaving the old document in place.
 	// omitempty only spares pre-O6-e bundles.
 	Srfrr string `json:"srfrr,omitempty"`
+	// Vrrp is bundle 第 6 段: the virtual routers this box must run on its
+	// customer ports. Unlike the other five it is not a file the box keeps --
+	// VRRP lives in VPP's memory and is configured through the binary API, so
+	// this segment is a reconciliation instruction, and sr-apply must send the
+	// empty list when the tenant removes the last row. omitempty only spares
+	// bundles published before VRRP existed.
+	Vrrp string `json:"vrrp,omitempty"`
+}
+
+// vrrpArtifact is the decoded form of the 6th segment. The rows are keyed by
+// the VPP interface name, never by sw_if_index: an index is box-local and is
+// reassigned when VPP restarts, which is precisely the reboot this segment has
+// to survive.
+type vrrpArtifact struct {
+	VRRP []vrrpEntry `json:"vrrp"`
+}
+
+type vrrpEntry struct {
+	VPP        string   `json:"vpp"`
+	VRID       uint8    `json:"vr_id"`
+	Priority   uint8    `json:"priority"`
+	IntervalMS uint16   `json:"interval_ms,omitempty"`
+	Preempt    bool     `json:"preempt,omitempty"`
+	Accept     bool     `json:"accept,omitempty"`
+	Addrs      []string `json:"addrs"`
 }
 
 func renderArtifacts(c *BasicConfig) configArtifacts {
-	return configArtifacts{FRR: renderFRR(c, nil), VPP: renderVPP(c), Boot: renderBoot(c)}
+	return configArtifacts{FRR: renderFRR(c, nil), VPP: renderVPP(c), Boot: renderBoot(c), Vrrp: renderVRRPArtifact(c)}
+}
+
+// renderVRRPArtifact emits the 6th segment. An empty list is still emitted:
+// "no VRs" has to be distinguishable from "this bundle predates VRRP" (empty
+// string), and the box reconciles against exactly that list.
+func renderVRRPArtifact(c *BasicConfig) string {
+	a := vrrpArtifact{VRRP: make([]vrrpEntry, 0, len(c.VRRP))}
+	for _, v := range c.VRRP {
+		a.VRRP = append(a.VRRP, vrrpEntry{
+			VPP:        v.VPP,
+			VRID:       v.VRID,
+			Priority:   v.Priority,
+			IntervalMS: v.IntervalMS,
+			Preempt:    v.Preempt,
+			Accept:     v.Accept,
+			Addrs:      []string{v.VirtualAddr},
+		})
+	}
+	b, err := json.MarshalIndent(a, "", "  ")
+	if err != nil {
+		// Only plain scalars and a slice of one string; unreachable.
+		return ""
+	}
+	return string(b) + "\n"
 }
 
 func renderSrfrrArtifact(a srfrrArtifact) string {
@@ -356,5 +405,6 @@ func (s *server) artifactsLocked(tenantID string, nodeID uint16, c *BasicConfig,
 		Boot:  renderBoot(c),
 		Route: s.overlayRouteArtifactLocked(tenantID, nodeID),
 		Srfrr: renderSrfrrArtifact(srfrr),
+		Vrrp:  renderVRRPArtifact(c),
 	}
 }

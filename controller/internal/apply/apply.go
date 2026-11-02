@@ -16,6 +16,9 @@
 //     daemons through vtysh (no restart -- see AGENTS.md)
 //  5. overlay segment: merged into /etc/sdwan/route.json, then PUT to the running
 //     sr-route (see route.go)
+//  6. VRRP segment: reconciled against VPP's live virtual routers over the binary
+//     API (see vrrp.go) -- last, so a box that did not fully land its config never
+//     wins the site's VIP
 //
 // Addresses are deliberately absent: FRR owns them, and lcp-sync mirrors them
 // into VPP. Setting them here would fight the mirror (measured on lab-cpe1).
@@ -41,6 +44,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sdwan/controller/internal/vppapi"
 )
 
 // ErrNoConfig means the box has never had a version installed.
@@ -53,16 +58,19 @@ type Check struct {
 	Text     string `json:"text"`
 }
 
-// Artifacts is the five-way split the controller renders. Route is the overlay
+// Artifacts is the six-way split the controller renders. Route is the overlay
 // segment (the tunnels/vrfs keys of the box's route.json) and Srfrr is the two
 // controller-owned keys of the box's sr-frr.json; both are empty in a bundle
-// published before their stage, and sr-apply must keep reading those.
+// published before their stage, and sr-apply must keep reading those. Vrrp is
+// not a file the box keeps at all -- it is the list of virtual routers VPP must
+// be running, reconciled against the live dump (see vrrp.go).
 type Artifacts struct {
 	FRR   string `json:"frr"`
 	VPP   string `json:"vpp"`
 	Boot  string `json:"boot"`
 	Route string `json:"route,omitempty"`
 	Srfrr string `json:"srfrr,omitempty"`
+	Vrrp  string `json:"vrrp,omitempty"`
 }
 
 // Bundle is what the controller hands out and what the box persists.
@@ -121,6 +129,7 @@ type Installed struct {
 	Boot     string
 	Route    string
 	Srfrr    string
+	Vrrp     string
 }
 
 const (
@@ -129,6 +138,7 @@ const (
 	bootFile  = "boot.sh"
 	routeFile = "route.json"
 	srfrrFile = "srfrr.json"
+	vrrpFile  = "vrrp.json"
 )
 
 // artifactFile is one file inside a version directory.
@@ -176,7 +186,8 @@ func (s Store) Install(b Bundle) (Installed, error) {
 			return Installed{}, fmt.Errorf("version %d exists but cannot be read: %w", b.Version, err)
 		}
 		if cur.FRR != b.Artifacts.FRR || cur.VPP != b.Artifacts.VPP ||
-			cur.Boot != b.Artifacts.Boot || cur.Route != b.Artifacts.Route || cur.Srfrr != b.Artifacts.Srfrr {
+			cur.Boot != b.Artifacts.Boot || cur.Route != b.Artifacts.Route ||
+			cur.Srfrr != b.Artifacts.Srfrr || cur.Vrrp != b.Artifacts.Vrrp {
 			return Installed{}, fmt.Errorf("version %d is already installed with different content", b.Version)
 		}
 		return cur, nil
@@ -198,6 +209,9 @@ func (s Store) Install(b Bundle) (Installed, error) {
 	}
 	if b.Artifacts.Srfrr != "" {
 		files = append(files, artifactFile{name: srfrrFile, content: b.Artifacts.Srfrr})
+	}
+	if b.Artifacts.Vrrp != "" {
+		files = append(files, artifactFile{name: vrrpFile, content: b.Artifacts.Vrrp})
 	}
 	hashes := make(map[string]string, len(files))
 	for _, f := range files {
@@ -275,6 +289,7 @@ func (s Store) read(version int) (Installed, error) {
 		{bootFile, &inst.Boot, false},
 		{routeFile, &inst.Route, true},
 		{srfrrFile, &inst.Srfrr, true},
+		{vrrpFile, &inst.Vrrp, true},
 	} {
 		data, err := os.ReadFile(filepath.Join(dir, f.name))
 		if os.IsNotExist(err) && f.optional {
@@ -397,14 +412,21 @@ type Applier struct {
 	SrfrrSock string
 	// NoSrfrrPush suppresses the hot PUT to sr-frr (boot replay only).
 	NoSrfrrPush bool
-	Wait        time.Duration
-	DryRun      bool
-	Exec        Executor
-	Sleep       func(time.Duration)
-	TAPExists   func(string) bool
-	Logf        func(format string, args ...any)
-	Now         func() time.Time
-	HTTP        *http.Client
+	// VPPAPI is the box's VPP api.sock. Only the 6th segment needs it: vrrp has no
+	// CLI on this build, so its reconciliation goes through the binary API while
+	// everything above still goes through vppctl. Empty means no VR can be
+	// configured, which is an error for a bundle that carries a 6th segment.
+	VPPAPI string
+	// DialVRRP opens the vrrp plane. A test seam; the default is vppapi.Dial.
+	DialVRRP  func(ctx context.Context, socket string) (vrrpPlane, error)
+	Wait      time.Duration
+	DryRun    bool
+	Exec      Executor
+	Sleep     func(time.Duration)
+	TAPExists func(string) bool
+	Logf      func(format string, args ...any)
+	Now       func() time.Time
+	HTTP      *http.Client
 }
 
 // New fills the defaults used on a box.
@@ -415,6 +437,13 @@ func New(store Store) *Applier {
 		FRRConf:   "/etc/frr/frr.conf",
 		RouteConf: "/etc/sdwan/route.json",
 		SrfrrConf: defaultSrfrrConf,
+		DialVRRP: func(ctx context.Context, socket string) (vrrpPlane, error) {
+			c, err := vppapi.Dial(ctx, socket, "sr-apply-vrrp")
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
 		Wait:      10 * time.Second,
 		Exec:      execRunner{},
 		Sleep:     time.Sleep,
@@ -438,6 +467,9 @@ func (a *Applier) setDefaults() {
 	}
 	if a.SrfrrConf == "" {
 		a.SrfrrConf = def.SrfrrConf
+	}
+	if a.DialVRRP == nil {
+		a.DialVRRP = def.DialVRRP
 	}
 	if a.HTTP == nil {
 		a.HTTP = def.HTTP
@@ -477,8 +509,9 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		return fmt.Errorf("read current version: %w", perr)
 	}
 	if a.DryRun {
-		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B, srfrr %d B)", b.Version,
-			len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot), len(b.Artifacts.Route), len(b.Artifacts.Srfrr))
+		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B, srfrr %d B, vrrp %d B)", b.Version,
+			len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot), len(b.Artifacts.Route),
+			len(b.Artifacts.Srfrr), len(b.Artifacts.Vrrp))
 		inst := Installed{
 			Dir:      "<dry-run>",
 			Manifest: Manifest{Version: b.Version},
@@ -487,6 +520,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 			Boot:     b.Artifacts.Boot,
 			Route:    b.Artifacts.Route,
 			Srfrr:    b.Artifacts.Srfrr,
+			Vrrp:     b.Artifacts.Vrrp,
 		}
 		if err := a.replay(ctx, inst); err != nil {
 			return err
@@ -495,7 +529,10 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		if _, err := a.applyRoute(ctx, inst, !a.NoRoutePush); err != nil {
 			return err
 		}
-		return a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush)
+		if err := a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush); err != nil {
+			return err
+		}
+		return a.applyVRRP(ctx, inst)
 	}
 	inst, err := a.Store.Install(b)
 	if err != nil {
@@ -530,6 +567,12 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 	// K routes appear, or zebra never sees the addition it should redistribute.
 	if err == nil {
 		err = a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush)
+	}
+	// VRRP is the very last thing: the VIP is this box's claim to be the site's
+	// first hop, and a box whose remaining segments only half landed must not win
+	// it. If anything above failed, the peer keeps the address.
+	if err == nil {
+		err = a.applyVRRP(ctx, inst)
 	}
 	a.record(inst.Manifest.Version, "apply", err, notes)
 	return err
@@ -566,6 +609,12 @@ func (a *Applier) Boot(ctx context.Context, frrDiff bool) error {
 	// Same for sr-frr: start.sh launches it after apply, so no push.
 	if err == nil {
 		err = a.applySrfrr(ctx, inst, inst, false)
+	}
+	// VRRP last here too. The VRs are VPP's own memory -- they are in no file --
+	// so whatever a VPP restart erases, it erases them, and without this replay a
+	// restarted box simply stops being a candidate for the VIP.
+	if err == nil {
+		err = a.applyVRRP(ctx, inst)
 	}
 	a.record(inst.Manifest.Version, "boot", err, notes)
 	return err

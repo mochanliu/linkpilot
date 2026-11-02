@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -378,5 +380,61 @@ func TestExecRunnerReturnsExitErrorWithOutput(t *testing.T) {
 	}
 	if !strings.Contains(out, "boom") || !strings.Contains(out, "detail") {
 		t.Fatalf("out = %q", out)
+	}
+}
+
+// Every segment has to survive the store: Install writes it to a file and read()
+// hands it back to the boot replayer. Both are lists someone maintains by hand,
+// and the controller lost 第 5 段 and 第 6 段 that way, so this test enumerates the
+// two structs by field name instead of listing the segments. A segment added to
+// Artifacts without a matching Installed field -- or one the store forgets to
+// write, or forgets to compare -- fails here, not on a box that silently never
+// gets told about it.
+func TestStoreRoundTripsEverySegment(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+
+	artT := reflect.TypeOf(Artifacts{})
+	instT := reflect.TypeOf(Installed{})
+	names := make([]string, 0, artT.NumField())
+	for i := 0; i < artT.NumField(); i++ {
+		f := artT.Field(i)
+		if f.Type.Kind() != reflect.String {
+			t.Fatalf("Artifacts.%s is %s, not a string", f.Name, f.Type.Kind())
+		}
+		if _, ok := instT.FieldByName(f.Name); !ok {
+			t.Fatalf("Installed has no %s field: this segment cannot reach the boot replayer", f.Name)
+		}
+		names = append(names, f.Name)
+	}
+
+	b := testBundle()
+	av := reflect.ValueOf(&b.Artifacts).Elem()
+	for i, name := range names {
+		av.Field(i).SetString(fmt.Sprintf("segment %d of %s\n", i+1, name))
+	}
+	if _, err := store.Install(b); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	cur, err := store.Current()
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	rv := reflect.ValueOf(cur)
+	for i, name := range names {
+		if got := rv.FieldByName(name).String(); got != av.Field(i).String() {
+			t.Errorf("%s: wrote %q, the store reads back %q", name, av.Field(i).String(), got)
+		}
+	}
+
+	// And each one is part of the version's identity: changing only that segment
+	// must be refused as "same version, different content", or editing one segment
+	// would silently overwrite what the box is running.
+	for i, name := range names {
+		mutated := b
+		mav := reflect.ValueOf(&mutated.Artifacts).Elem()
+		mav.Field(i).SetString(av.Field(i).String() + "extra\n")
+		if _, err := store.Install(mutated); err == nil || !strings.Contains(err.Error(), "different content") {
+			t.Errorf("%s: reinstall with only this segment changed = %v, want different-content refusal", name, err)
+		}
 	}
 }

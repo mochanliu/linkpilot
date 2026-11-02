@@ -60,16 +60,22 @@ func usage() {
   sr-apply status [--root DIR]
 
 apply validates the bundle, persists it under <root>/versions/<n>, then applies
-VPP -> kernel -> FRR -> overlay route tables -> sr-frr tables in that order. boot
-replays the current version after VPP starts; the FRR config is already installed,
-so no controller is contacted. boot does not push to sr-route or sr-frr: at that
-point in the boot checklist neither process is running yet, and the files this
-writes are the update.
+VPP -> kernel -> FRR -> overlay route tables -> sr-frr tables -> VRRP virtual
+routers in that order. boot replays the current version after VPP starts; the FRR
+config is already installed, so no controller is contacted. boot does not push to
+sr-route or sr-frr: at that point in the boot checklist neither process is running
+yet, and the files this writes are the update. The VRRP segment is last precisely
+because a box whose config only half landed must not win the customer's VIP.
 
 common: --root DIR (default /var/lib/sr-cpe), --vppctl PATH, --frr-conf PATH,
         --frr-reload TOOL, --route-conf PATH (default /etc/sdwan/route.json),
         --no-route-push, --srfrr-conf PATH (default /etc/sr-frr.json),
-        --srfrr-sock PATH, --no-srfrr-push, --wait DURATION`)
+        --srfrr-sock PATH, --no-srfrr-push, --vpp-api PATH, --wait DURATION
+
+--vpp-api is empty by default, like the agent's -vpp-api. Only the 6th segment
+uses it, and a bundle that carries a virtual router without it is a failure with
+the reason in its text -- vrrp has no CLI on this VPP (measured 2026-11-02), so
+there is nothing to fall back to.`)
 }
 
 // commonOpts are the paths and knobs every subcommand needs. They are struct
@@ -85,8 +91,11 @@ type commonOpts struct {
 	srfrrConf   string
 	srfrrSock   string
 	noSrfrrPush bool
-	wait        time.Duration
-	dry         bool
+	// vppAPI is empty by default: only the 6th (vrrp) segment uses it, and the box
+	// is the one that knows where its api.sock is (start.sh passes /run/vpp/api.sock).
+	vppAPI string
+	wait   time.Duration
+	dry    bool
 }
 
 func (o *commonOpts) register(fs *flag.FlagSet) {
@@ -104,6 +113,8 @@ func (o *commonOpts) register(fs *flag.FlagSet) {
 		"sr-frr control socket (default: the file's control_socket, then /run/sr-frr/control.sock)")
 	fs.BoolVar(&o.noSrfrrPush, "no-srfrr-push", false,
 		"只改盘上那份，不推给运行中的 sr-frr（下次 sr-frr 启动才生效）")
+	fs.StringVar(&o.vppAPI, "vpp-api", "",
+		"VPP 的 api.sock；第 6 段（vrrp 虚拟路由器）只认这条通路，vrrp 在这一版 VPP 没有 CLI（实测 2026-11-02）")
 	fs.DurationVar(&o.wait, "wait", 10*time.Second, "how long to wait for lcp TAPs")
 	fs.BoolVar(&o.dry, "dry-run", false, "print the planned commands without changing anything")
 }
@@ -111,6 +122,7 @@ func (o *commonOpts) register(fs *flag.FlagSet) {
 func (o *commonOpts) applier() *apply.Applier {
 	a := apply.New(apply.Store{Root: o.root})
 	a.VPPCtl = o.vppctl
+	a.VPPAPI = o.vppAPI
 	a.FRRConf = o.frrConf
 	a.FRRReload = o.frrReload
 	a.RouteConf = o.routeConf

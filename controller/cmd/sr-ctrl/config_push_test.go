@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -273,4 +274,77 @@ func TestHeartbeatCarriesDesiredVersionAndStoresDeviceState(t *testing.T) {
 	if other.Config != nil {
 		t.Fatalf("node 2 picked up node 1's state: %+v", other.Config)
 	}
+}
+
+// bundleFor hands the device a struct it builds field by field, which makes it
+// the one place a segment can be published, shown in the console, and still
+// never reach a box. That happened twice: 第 5 段 and 第 6 段 were both dropped
+// here, and neither the harness nor the page noticed, because the admin download
+// reads the frozen snapshot directly instead of going through this conversion.
+// So the test enumerates both structs by reflection: a 7th segment added to
+// configArtifacts without teaching bundleFor about it fails here, not on a device.
+func TestEveryPublishedSegmentReachesTheDevice(t *testing.T) {
+	want := artifactKeys(configArtifacts{})
+	got := artifactKeys(apply.Artifacts{})
+	for k := range want {
+		if _, ok := got[k]; !ok {
+			t.Errorf("控制器渲染了 %q 段，设备的 apply.Artifacts 没有这个键", k)
+		}
+	}
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			t.Errorf("设备侧认得 %q 段，控制器渲染不出", k)
+		}
+	}
+
+	// Distinct value per segment: a drop and a swap are both visible, an empty
+	// string is not (omitempty would hide it).
+	pub := configArtifacts{}
+	pv := reflect.ValueOf(&pub).Elem()
+	markers := map[string]string{}
+	for i := 0; i < pv.NumField(); i++ {
+		k := jsonKey(pv.Type().Field(i))
+		if k == "" {
+			continue
+		}
+		m := "segment-" + k
+		pv.Field(i).SetString(m)
+		markers[k] = m
+	}
+
+	data, err := json.Marshal(bundleFor(&PublishedBundle{Version: 7, Artifacts: pub}, 1).Artifacts)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	onTheWire := map[string]string{}
+	if err := json.Unmarshal(data, &onTheWire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for k, m := range markers {
+		if onTheWire[k] != m {
+			t.Errorf("%q 段在设备 bundle 里是 %q，期望 %q", k, onTheWire[k], m)
+		}
+	}
+	if len(onTheWire) != len(markers) {
+		t.Errorf("设备 bundle 有 %d 段，控制器发布 %d 段", len(onTheWire), len(markers))
+	}
+}
+
+func artifactKeys(v any) map[string]bool {
+	out := map[string]bool{}
+	t := reflect.TypeOf(v)
+	for i := 0; i < t.NumField(); i++ {
+		if k := jsonKey(t.Field(i)); k != "" {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+func jsonKey(f reflect.StructField) string {
+	k := strings.Split(f.Tag.Get("json"), ",")[0]
+	if k == "-" {
+		return ""
+	}
+	return k
 }
