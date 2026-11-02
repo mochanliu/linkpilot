@@ -264,6 +264,8 @@ router bgp 65101
   delete+add（纯内核，不进 VPP），触发 zebra 重新计算再分发。
   **这一步对客户侧可见的窗口必须先量**（BGP 可能撤/发一次，OSPF 可能重发 LSA），数字写进判据；
   超过可接受范围就改成"只对新增协议的那一个 VPN touch"，仍不行则在页面点名这个中断。
+  2026-11-02 实测（VPN 100 的 4 条前缀）：单条 del→add 6–174µs，客户 BGP vrf 表版本号不动，
+  维持现方案（详见 §9 的「L-6 实测结果」）。
 - sr-frr 的配置热更**绝不重启**：重启会主动撤掉自己上报的全部前缀（已有退出清理逻辑），
   等于全网抖动一次；老路（改文件+重启）不保留。
 
@@ -411,6 +413,32 @@ GET 的返回**不造数据**：设备没上报就说没上报，实例有没有
 | L-6 | lab 端到端：两台盒子 + RR；客户前缀按来源/白名单上行；远端前缀经 K 进客户 BGP；同前缀与回环 | 前后两组数字（BGP 前缀数、FRR K 条数、VPP FIB 条数、sr-frr pid、邻居 uptime）；VPP FIB 不因 K 变化 |
 | L-7 | 退役收尾：删 `local_prefixes`、旧 README/脚本/判据；#185 关闭 | 全仓 grep 零命中；盒子重启后开机重放仍正确 |
 
+### L-6 实测结果（2026-11-02，lab-cpe1/2/3 + lab-cust1/2）
+
+- **基线**：`test/lab/verify.sh` 313 通过 / 0 失败；升级 sr-frr 到带链路监听的版本后仍是
+  313/0，三次升级全程 sr-frr / sr-route / FRR pid 不变。
+- **多 VRF（以前从没测过）**：`test/lab/test-multivrf.sh` 112 通过 / 0 失败。VPN 0/100/101
+  同时在线：sr-route RIB 各 4 条、盒内核 table 100/101 各 4 条 K（出口 vpn100/vpn101）、
+  zebra 的 VRF 实例各 4 条 `K>*`、BGP VRF 实例各 4 条；同一前缀 `10.200.N.0/24` 在 100/101
+  里各一份且出口不同；主表 254 没有任何 100/101/200 前缀；VPP table 100 的远端路径不是
+  dpo-drop（K 没有盖掉 sr-fib）。
+- **touch 窗口**（§5.3 的待量项）：`PUT /config` + `refresh_vrfs:[0,100,101]` 原地重刷，
+  `ip -ts monitor route` 逐条测 4 条前缀的 del→add：**174 / 6 / 7 / 6 µs**（最坏 174µs）。
+  sr-frr pid、配置指纹、客户侧 BGP vrf 表版本号全程不变（客户看不到撤/发）。
+  结论：维持"只 touch 协议集合变化的 VPN"，不需要页面点名中断，也不需要额外的降级方案。
+- **唯一必然中断**：sr-fib 没有热更入口（D3 待补 `PUT`），装 VPN 100/101 要重启它。
+  实测 lab-term1 → lab-term2 800 包（10ms 间隔）：800/800，0% 丢包。
+- **sr-frr 升级本身**：customer BGP 侧每 15–20ms 采一次可见前缀，0 次撤/发。
+- **zebra 的两个坑**（均已收口/记录，不靠重启绕过）：
+  1. 接口 down、删接口、删地址会让 zebra 清掉自己 RIB 里的**全部** K 路由（内核里还在、
+     sr-frr 仍报 `injected=N`），`redistribute kernel` 从此静默停发。sr-frr 现在订阅这三类
+     链路事件（300ms 去抖）后自动 touch 重放，实测删 VRF 设备后 zebra 仍见 4 条 K。
+  2. K 路由的 delete 不会摘掉 zebra RIB 里的条目，随后的 re-add 会多出一条非选中的
+     `K *`（每个前缀最多 2 条，不累积；BGP 只宣告一条）。属观感问题，文档记录，不重启 zebra。
+- **lab 环境噪声**：共享 CPU 的 VM 里 BFD 每分钟 1–3 次漏检（约 1s 自愈），
+  `verify.sh` 的 FIB 断言改成最多等 10s 收敛，避免把环境噪声记成产品失败。
+
+
 ## 10. 不做
 
 - 不做 prefix 级 A→B（per-prefix RT）——那是 O6-f。
@@ -436,4 +464,5 @@ S-0 已把原第 1 项解掉：`redistribute kernel route-map` + prefix-list 在
 
 剩余待拍：
 
-1. §5.3 的 touch 窗口实测后若超过可接受范围，是"只 touch 新增协议的那个 VPN"还是接受中断并在页面点名。
+（无。原第 1 项 §5.3 的 touch 窗口已于 2026-11-02 实测：最坏 174µs、客户 BGP 版本号不动，
+不需要降级也不需要页面点名。）

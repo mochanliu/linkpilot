@@ -88,6 +88,27 @@ retry() {   # <秒> <命令...>
     "$@" >/dev/null 2>&1
 }
 
+# FIB 里远端前缀的断言不能用「抓一次就判」：BFD 在共享 CPU 的 lab VM 里实测
+# 每分钟会漏掉 1–3 次检测（六个会话同时掉，~1s 后自己恢复），sr-fib 按规矩
+# 把那条路径撤掉、下一轮再装回来。这里先等 FIB 回到「远端齐全且不是
+# dpo-drop」，把这份 dump 存下来供逐条断言用；10s 仍不收敛才算红。
+fib_ready() {   # <cpe> <n>
+    local c=$1 n=$2 m p out
+    out=$(vppc "$c" show ip fib table "$VPN")
+    for m in 1 2 3; do
+        [ "$m" = "$n" ] && continue
+        for p in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
+            echo "$out" | grep -q "^$p" || return 1
+            echo "$out" | grep -A8 "^$p" | grep -q "dpo-drop" && return 1
+        done
+    done
+    printf '%s\n' "$out" > "/tmp/verify-fib-$c"
+}
+fib_prefix_not_drop() {   # <cpe> <prefix>
+    vppc "$1" show ip fib table "$VPN" | grep -A8 "^$2" | grep -q "dpo-drop" && return 1
+    return 0
+}
+
 # 在容器里用 python3 断言 /status（Go 的 JSON 是紧凑格式，用 JSON 解析而不是 grep）
 # want_rib 格式："prefix:nh,prefix:nh"；want_local 是逗号分隔的 prefix。
 status_check() {   # <cpe> <port> <want_rib> <want_local>
@@ -298,7 +319,8 @@ sect "6. VPP FIB（FRR 算路由、VPP 转发：远端压 $LABEL，本地交给�
 for n in 1 2 3; do
     c=lab-cpe$n
     xc=$(vpp_if_for_ip "$c" "${XCONN_IP[$n]}")
-    fib=$(vppc "$c" show ip fib table "$VPN")
+    retry 20 fib_ready "$c" "$n"
+    fib=$(cat "/tmp/verify-fib-$c" 2>/dev/null)
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
         for pfx in "${LAN_PFX[$m]}" "${LOOP_IP[$m]}/32"; do
@@ -348,6 +370,7 @@ for n in 1 2 3; do
         || ok "$c: VPP table 1250 不存在（导出不再镜像进 VPP）"
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
+        retry 20 fib_prefix_not_drop "$c" "${LAN_PFX[$m]}"
         one=$(vppc "$c" show ip fib table "$VPN" "${LAN_PFX[$m]}")
         echo "$one" | grep -q "dpo-drop" \
             && bad "$c: 远端 ${LAN_PFX[$m]} 在 VPP 里是 dpo-drop（K 路由盖掉了 sr-fib 的路径）" \

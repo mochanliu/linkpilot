@@ -145,10 +145,17 @@ lab-cpe3）4 条 K 路由每条 delete→add 5–6 µs、全程 0.2 ms，sr-frr 
 ```bash
 test/lab/bringup.sh            # 全量重建（约几十秒，取决于镜像本地是否已有）
 test/lab/verify.sh             # 端到端体检，非 0 退出表示有失败项
+test/lab/test-multivrf.sh      # L-6 多 VRF 判据（VPN 0/100/101 同时泄露），跑完自动回基线
 test/lab/status.sh             # 只读快照
 test/lab/teardown.sh           # 拆掉 lab-*，不碰 srwg-*
 test/lab/teardown.sh --purge   # 连 test/lab/run/（含一次性 CA）一起删
 ```
+
+`test-multivrf.sh`（2026-11-02，112 条断言）回答的是"多个 VPN 到底能不能同时工作"：
+sr-route RIB 分桶、盒内核 table 100/101 的 K 路由、zebra/BGP 的 VRF 实例、VPP 对应表、
+两个 VPN 同前缀不串、主表不被污染，以及 touch 窗口（`PUT /config` + `refresh_vrfs`）
+和 sr-fib 重启这一次中断点的实测。`--keep` 保留现场，默认收尾把 sr-frr/sr-route/FRR/
+内核 VRF 设备全部热改回基线（只重启一次 sr-fib）。跑完可以紧接着再跑 `verify.sh`。
 
 ## 控制台与 vCPE 入网（GUI 全流程）
 
@@ -693,6 +700,7 @@ docker exec lab-cpe1 vppctl show trace
 | [console.sh](console.sh) | 控制台地址/登录 token；重启 sr-ctrl |
 | [vcpe.sh](vcpe.sh) | 起停一台 vCPE（`sr-lab-vcpe`）；`--apply` 拉取发布配置，`--id` 换身份目录 |
 | [verify.sh](verify.sh) | 从容器/VPP 一直到终端到终端、双向导入的 290+ 条断言 |
+| [test-multivrf.sh](test-multivrf.sh) | L-6 多 VRF（VPN 0/100/101 同时泄露）112 条断言；默认收尾回基线 |
 | [status.sh](status.sh) | 只读状态快照 |
 | [teardown.sh](teardown.sh) | 拆除 |
 | `run/` | 生成的配置、取出的二进制、控制器 CA（.gitignore） |
