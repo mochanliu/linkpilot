@@ -110,9 +110,14 @@ type DeviceConfig struct {
 	// Configs, which is also what makes the move provable in the state file.
 	PreAuthID string      `json:"preauth_id,omitempty"`
 	Draft     BasicConfig `json:"draft"`
-	Version   int         `json:"version"`
-	UpdatedAt int64       `json:"updated_at_unix"`
-	UpdatedBy string      `json:"updated_by,omitempty"`
+	// Leak is the 路由泄露 rows of this device, both directions. It deliberately
+	// lives here and not inside BasicConfig: the 基础配置 page saves a whole
+	// BasicConfig, and a leak row stored in it would be wiped by every save from
+	// that page.
+	Leak      LeakSet `json:"leak"`
+	Version   int     `json:"version"`
+	UpdatedAt int64   `json:"updated_at_unix"`
+	UpdatedBy string  `json:"updated_by,omitempty"`
 
 	Published *PublishedBundle `json:"published,omitempty"`
 }

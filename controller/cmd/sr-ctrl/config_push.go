@@ -32,17 +32,22 @@ type publishRequest struct {
 // It reports whether anything changed: re-publishing an identical bundle is not a
 // new instruction and must not bump any timestamp the page shows.
 //
-// The overlay is part of what is published, so an edit to a 导通组 counts as a
-// change even when the draft text did not move -- and it has to produce a NEW
-// version number. The box's store treats the version as identity (same number
-// with different content is refused as "already installed with different
-// content"), so reusing the old number would mean the change never reaches the
-// device. Bumping it keeps one numbering scheme for the page's "有没有未发布的改动".
+// The overlay and leak layers are part of what is published, so an edit to a
+// 导通组 or a prefix-list counts as a change even when the draft text did not
+// move -- and it has to produce a NEW version number. The box's store treats the
+// version as identity (same number with different content is refused as "already
+// installed with different content"), so reusing the old number would mean the
+// change never reaches the device. Bumping it keeps one numbering scheme for the
+// page's "有没有未发布的改动".
+//
+// The comparison is over every artifact, not just route.json: a prefix-list edit
+// can change FRR and the srfrr segment without touching route.json or the draft
+// version, and that is exactly the "重新发布引用它的设备" case.
 func (s *server) publishConfigLocked(tenantID string, nodeID uint16, dc *DeviceConfig,
 	checks []ConfigCheck, by string, now int64) bool {
-	route := s.overlayRouteArtifactLocked(tenantID, nodeID)
+	art := s.artifactsLocked(tenantID, nodeID, &dc.Draft)
 	if dc.Published != nil {
-		if dc.Published.Version == dc.Version && dc.Published.Artifacts.Route == route {
+		if dc.Published.Version == dc.Version && dc.Published.Artifacts == art {
 			return false
 		}
 		if dc.Published.Version == dc.Version {
@@ -54,9 +59,23 @@ func (s *server) publishConfigLocked(tenantID string, nodeID uint16, dc *DeviceC
 		PublishedAt: now,
 		PublishedBy: by,
 		Checks:      checks,
-		Artifacts:   s.artifactsLocked(tenantID, nodeID, &dc.Draft),
+		Artifacts:   art,
 	}
 	return true
+}
+
+// publishDeviceLocked is the one publish body every console entry point uses
+// (基础配置 page, 泄露 device row, prefix-list republish, batch). It adds the
+// event the console's SSE stream listens for; the callers still own save().
+func (s *server) publishDeviceLocked(tenantID string, nodeID uint16, dc *DeviceConfig,
+	checks []ConfigCheck, by string, now int64) bool {
+	changed := s.publishConfigLocked(tenantID, nodeID, dc, checks, by, now)
+	if changed {
+		if n := s.state.Nodes[key(tenantID, nodeID)]; n != nil {
+			s.admin.publish("config.published", tenantID, n)
+		}
+	}
+	return changed
 }
 
 // handleAdminConfigPublish is the tenant's explicit "make the device run this".
@@ -108,12 +127,7 @@ func (s *server) handleAdminConfigPublish(w http.ResponseWriter, r *http.Request
 		http.Error(w, "这台设备还没有保存过草稿（v0），没有可发布的配置", http.StatusConflict)
 		return
 	}
-	checks := validateBasicConfig(&dc.Draft)
-	// The overlay groups that name this device are checked here too: a VPN that
-	// has since been removed from the base config would otherwise reach the box as
-	// a VRF it cannot create, and the error would surface in a device log instead
-	// of on the page that caused it.
-	checks = append(checks, s.overlayNodeChecksLocked(id.TenantID, req.NodeID)...)
+	checks := s.publishChecksLocked(id.TenantID, req.NodeID, dc)
 	for _, c := range checks {
 		if c.Severity == "error" {
 			http.Error(w, fmt.Sprintf("草稿 v%d 还有一个校验错误：%s先在页面上改掉——强制下发只在设备侧 CLI（sr-apply --force）",
@@ -121,9 +135,8 @@ func (s *server) handleAdminConfigPublish(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	if s.publishConfigLocked(id.TenantID, req.NodeID, dc, checks, id.Username, time.Now().Unix()) {
+	if s.publishDeviceLocked(id.TenantID, req.NodeID, dc, checks, id.Username, time.Now().Unix()) {
 		s.save()
-		s.admin.publish("config.published", dc.TenantID, n)
 	}
 	writeJSON(w, s.buildConfigView(n, dc))
 }

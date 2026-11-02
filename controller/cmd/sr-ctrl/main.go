@@ -292,6 +292,12 @@ type State struct {
 	// nothing in it references a tunnel or a port.
 	Overlays map[string]*OverlayConfig `json:"overlays"`
 
+	// LeakConfigs is each tenant's 路由泄露 prefix-list library, keyed by tenant
+	// id. It is per tenant on purpose (2026-11-02 拍板): nothing here is shared
+	// across tenants, and the operator view does not show it. The rules that
+	// reference a list live on DeviceConfig.Leak, not here.
+	LeakConfigs map[string]*LeakConfig `json:"leak_configs"`
+
 	// RRs is the route-reflector table. One document rather than a per-tenant map,
 	// because the id counter has to be minted in one place and never rewound; but
 	// every row is bound to exactly one tenant (2026-11-01 定案), that tenant is the
@@ -403,17 +409,18 @@ func (f *fileStore) Load() (*State, error) {
 func seedState() *State {
 	now := time.Now().Unix()
 	s := &State{
-		Nodes:      map[string]*NodeRecord{},
-		NextNodeID: map[string]uint16{},
-		Tenants:    map[string]*Tenant{},
-		Claims:     claimMap{},
-		PKeyRings:  map[string][]wire.PKey{},
-		Accounts:   map[string]*Account{},
-		Configs:    map[string]*DeviceConfig{},
-		Underlays:  map[string]*UnderlayConfig{},
-		Overlays:   map[string]*OverlayConfig{},
-		Sites:      map[string]*Site{},
-		PreAuths:   map[string]*PreAuth{},
+		Nodes:       map[string]*NodeRecord{},
+		NextNodeID:  map[string]uint16{},
+		Tenants:     map[string]*Tenant{},
+		Claims:      claimMap{},
+		PKeyRings:   map[string][]wire.PKey{},
+		Accounts:    map[string]*Account{},
+		Configs:     map[string]*DeviceConfig{},
+		Underlays:   map[string]*UnderlayConfig{},
+		Overlays:    map[string]*OverlayConfig{},
+		LeakConfigs: map[string]*LeakConfig{},
+		Sites:       map[string]*Site{},
+		PreAuths:    map[string]*PreAuth{},
 
 		PreAuthConfigs: map[string]*DeviceConfig{},
 	}
@@ -470,6 +477,28 @@ func normalizeState(s *State) bool {
 	for _, oc := range s.Overlays {
 		if oc != nil {
 			oc.ensure()
+		}
+	}
+	if s.LeakConfigs == nil {
+		s.LeakConfigs = map[string]*LeakConfig{}
+	}
+	// Every tenant's library is repaired at load: a missing counter would mint a
+	// duplicate pl id, and an empty library would leave CPE-SDWAN with nothing to
+	// select. Leak rows on the drafts are normalized for the same reason -- an
+	// older file has none, and a hand-edited one may carry duplicates.
+	for _, lc := range s.LeakConfigs {
+		if lc != nil {
+			lc.ensure()
+		}
+	}
+	for _, dc := range s.Configs {
+		if dc != nil {
+			normalizeLeakSet(&dc.Leak)
+		}
+	}
+	for _, dc := range s.PreAuthConfigs {
+		if dc != nil {
+			normalizeLeakSet(&dc.Leak)
 		}
 	}
 	// A tenant account whose tenant no longer exists authorizes nothing; drop it

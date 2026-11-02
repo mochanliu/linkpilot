@@ -359,6 +359,16 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/overlay/settings", s.handleAdminOverlaySettings)
 	mux.HandleFunc("/api/overlay/device-rr", s.handleAdminOverlayDeviceRR)
 	mux.HandleFunc("/api/overlay/group", s.handleAdminOverlayGroup)
+	// 路由泄露 (O6-e): the tenant's own prefix-list library and its per-device
+	// rules. Tenant-only for the same reason the layers above are -- which
+	// customer prefixes may cross the overlay is part of a customer's network.
+	// Publishing is NOT a new endpoint: every entry point calls the same
+	// /api/config/publish body below.
+	mux.HandleFunc("/api/leak", s.handleAdminLeak)
+	mux.HandleFunc("/api/leak/rows", s.handleAdminLeakRows)
+	mux.HandleFunc("/api/leak/batch", s.handleAdminLeakBatch)
+	mux.HandleFunc("/api/leak/republish", s.handleAdminLeakRepublish)
+	mux.HandleFunc("/api/prefix-lists", s.handleAdminPrefixLists)
 	// The RR list is the tenant's own (2026-11-01 定案: an RR belongs to one
 	// tenant). Reads come inside /api/overlay with the devices that selected them;
 	// the writes below are scoped to the session's tenant.
