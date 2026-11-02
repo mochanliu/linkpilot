@@ -188,7 +188,9 @@ type exportState struct {
 	dp      *krt.Client
 	ex      *frr.Exporter
 	lastSig string
+	skipSig string
 	plan    []frr.Route
+	skipped []frr.Route
 	lastErr string
 }
 
@@ -284,11 +286,32 @@ func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtim
 		return err
 	}
 	e.plan = e.ex.Routes()
+	e.skipped = res.Skipped
 	e.lastErr = ""
 	if res.Changed() {
 		log.Printf("sr-frr: 收敛 routes+%d/-%d（%s）", res.Added, res.Removed, exportList(cfg.exportVRFs))
 	}
+	if res.Adopted > 0 {
+		log.Printf("sr-frr: 收编上一轮留下的 %d 条 K 路由", res.Adopted)
+	}
+	// 跳过的前缀只在集合变化时打一行：盒子自己的网段（或别人的同前缀路由）
+	// 永远不注入，但这件事必须留痕，否则"少了几条"看起来像丢路由。
+	if sig := planSig(res.Skipped); sig != e.skipSig {
+		e.skipSig = sig
+		if len(res.Skipped) > 0 {
+			log.Printf("sr-frr: 跳过 %d 条（盒子自己已有同前缀路由或就是它的接口网段，不覆盖）: %s",
+				len(res.Skipped), routeList(res.Skipped))
+		}
+	}
 	return nil
+}
+
+func routeList(routes []frr.Route) string {
+	parts := make([]string, 0, len(routes))
+	for _, r := range routes {
+		parts = append(parts, fmt.Sprintf("%s(表 %d)", r.Prefix, r.Table))
+	}
+	return strings.Join(parts, ",")
 }
 
 // touch forces zebra to recompute redistribution for the given VPNs: when a
@@ -879,6 +902,10 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 		rc := rt.snapshot()
 		exp.mu.Lock()
 		injected := len(exp.plan)
+		skipped := make([]string, 0, len(exp.skipped))
+		for _, sr := range exp.skipped {
+			skipped = append(skipped, sr.Prefix.String())
+		}
 		exportErr := exp.lastErr
 		exp.mu.Unlock()
 		st.mu.Lock()
@@ -909,6 +936,7 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			"export_vrfs":         rc.exportVRFs,
 			"import_rules":        rules,
 			"injected":            injected,
+			"skipped":             skipped,
 			"reported":            reported,
 			"dropped_loop":        loop,
 			"dropped_unknown_vrf": unknown,

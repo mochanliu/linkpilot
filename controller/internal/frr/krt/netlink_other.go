@@ -5,6 +5,7 @@ package krt
 import (
 	"context"
 	"errors"
+	"net/netip"
 
 	"sdwan/controller/internal/frr"
 )
@@ -20,6 +21,12 @@ func (c *Client) Close() error { return nil }
 
 func (c *Client) RouteAdd(context.Context, frr.Route) error { return errUnsupported }
 
+func (c *Client) RouteReplace(context.Context, frr.Route) error { return errUnsupported }
+
 func (c *Client) RouteDelete(context.Context, frr.Route) error { return errUnsupported }
+
+func (c *Client) Owns(context.Context, frr.Route) (bool, error) { return false, errUnsupported }
+
+func (c *Client) LocalSubnets(uint32) map[netip.Prefix]bool { return nil }
 
 var _ frr.DP = (*Client)(nil)

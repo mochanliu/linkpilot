@@ -125,16 +125,31 @@ func sortRoutes(routes []Route) {
 	})
 }
 
+// ErrRouteExists 表示目标表里已经有同前缀的路由（任何 proto / metric）。
+var ErrRouteExists = errors.New("前缀已在目标表里")
+
 // DP 是写路的一端；*krt.Client 是生产实现（直写内核表），测试用内存版。
+//
+// RouteAdd 只建不覆盖：同前缀已经在表里就回 ErrRouteExists。覆盖语义
+// （RouteReplace）只允许用在我们自己写过的前缀上 —— 曾经用 replace 注入，
+// 把盒子自己的 connected 路由（mgmt 网段）换成了 dev lo，随后撤掉那一刻
+// 盒子的控制面就断了（2026-11-02，lab-cpe1）。
 type DP interface {
 	RouteAdd(ctx context.Context, r Route) error
+	RouteReplace(ctx context.Context, r Route) error
 	RouteDelete(ctx context.Context, r Route) error
+	// Owns 判断表里这条前缀是不是我们写的（proto/scope/type/出口都对得上）。
+	Owns(ctx context.Context, r Route) (bool, error)
+	// LocalSubnets 返回该表所属 VRF 里盒子自己配了地址的前缀。
+	LocalSubnets(table uint32) map[netip.Prefix]bool
 }
 
 // Result 是一轮收敛实际发出的写操作数，用于日志。
 type Result struct {
 	Added   int
 	Removed int
+	Adopted int // 内核里本来就是我们的（上次被杀留下的），这轮只是收编
+	Skipped []Route
 }
 
 func (r Result) Changed() bool { return r.Added > 0 || r.Removed > 0 }
@@ -171,19 +186,62 @@ func (e *Exporter) Apply(ctx context.Context, plan Plan) (Result, error) {
 	for _, r := range plan.Routes {
 		desired[r.key()] = r
 	}
+	// 每个表只问一次"哪些前缀是盒子自己的网段"。
+	local := map[uint32]map[netip.Prefix]bool{}
+	isLocal := func(r Route) bool {
+		m, ok := local[r.Table]
+		if !ok {
+			m = e.dp.LocalSubnets(r.Table)
+			local[r.Table] = m
+		}
+		return m[r.Prefix]
+	}
 
 	// 先加后删：前缀挪表或出口变化时宁可短暂重复，也不要出现空窗。
 	next := make(map[string]Route, len(desired))
 	for k, r := range desired {
-		if old, ok := e.prev[k]; ok && old == r {
-			next[k] = old
+		// 盒子自己的接口网段永远不注入：K 和 connected 同前缀会把那条
+		// connected 换成 dev lo（地址还在、路由被顶掉），盒子的控制面当场断。
+		// prev 里如果有我们以前留下的，交给下面的删除循环撤掉。
+		if isLocal(r) {
+			res.Skipped = append(res.Skipped, r)
+			delete(desired, k)
 			continue
 		}
-		if err := e.dp.RouteAdd(ctx, r); err != nil {
-			return res, fmt.Errorf("frr: 加 %s 到表 %d: %w", r.Prefix, r.Table, err)
+		if old, ok := e.prev[k]; ok {
+			if old == r {
+				next[k] = old
+				continue
+			}
+			// 我们自己的，出口 ifindex 变了：替换同一个键。
+			if err := e.dp.RouteReplace(ctx, r); err != nil {
+				return res, fmt.Errorf("frr: 换 %s 到表 %d: %w", r.Prefix, r.Table, err)
+			}
+			next[k] = r
+			res.Added++
+			continue
 		}
-		next[k] = r
-		res.Added++
+		err := e.dp.RouteAdd(ctx, r)
+		switch {
+		case errors.Is(err, ErrRouteExists):
+			ours, oerr := e.dp.Owns(ctx, r)
+			if oerr != nil {
+				return res, fmt.Errorf("frr: 查 %s 表 %d 的归属: %w", r.Prefix, r.Table, oerr)
+			}
+			if ours {
+				// 上次被杀时留下的：内核里就是我们的，收编进账本，退出时再撤。
+				next[k] = r
+				res.Adopted++
+				continue
+			}
+			// 同前缀已经有主（别人的路由）：不覆盖，也不删。
+			res.Skipped = append(res.Skipped, r)
+		case err != nil:
+			return res, fmt.Errorf("frr: 加 %s 到表 %d: %w", r.Prefix, r.Table, err)
+		default:
+			next[k] = r
+			res.Added++
+		}
 	}
 	for k, r := range e.prev {
 		if _, ok := desired[k]; ok {
@@ -195,6 +253,7 @@ func (e *Exporter) Apply(ctx context.Context, plan Plan) (Result, error) {
 		res.Removed++
 	}
 	e.prev = next
+	sortRoutes(res.Skipped)
 	return res, nil
 }
 

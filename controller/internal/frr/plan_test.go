@@ -10,11 +10,16 @@ import (
 
 type fakeDP struct {
 	installed map[string]Route
+	foreign   map[string]bool // 同前缀有别人的路由：加会回 ErrRouteExists、归属不是我们
+	local     map[uint32]map[netip.Prefix]bool
 	writes    int
+	replaces  int
 	failAt    string // 一次性注入失败：add / del
 }
 
-func newFakeDP() *fakeDP { return &fakeDP{installed: map[string]Route{}} }
+func newFakeDP() *fakeDP {
+	return &fakeDP{installed: map[string]Route{}, foreign: map[string]bool{}}
+}
 
 func (f *fakeDP) fail(op string) error {
 	if f.failAt != op {
@@ -26,6 +31,19 @@ func (f *fakeDP) fail(op string) error {
 
 func (f *fakeDP) RouteAdd(_ context.Context, r Route) error {
 	f.writes++
+	if err := f.fail("add"); err != nil {
+		return err
+	}
+	if _, ok := f.installed[r.key()]; ok || f.foreign[r.key()] {
+		return fmt.Errorf("%w: %s", ErrRouteExists, r.key())
+	}
+	f.installed[r.key()] = r
+	return nil
+}
+
+func (f *fakeDP) RouteReplace(_ context.Context, r Route) error {
+	f.writes++
+	f.replaces++
 	if err := f.fail("add"); err != nil {
 		return err
 	}
@@ -45,7 +63,13 @@ func (f *fakeDP) RouteDelete(_ context.Context, r Route) error {
 	return nil
 }
 
-func oifOf(v uint32) (int, error) { return 100 + int(v), nil }
+func (f *fakeDP) Owns(_ context.Context, r Route) (bool, error) {
+	got, ok := f.installed[r.key()]
+	return ok && got.OIF == r.OIF, nil
+}
+
+func (f *fakeDP) LocalSubnets(table uint32) map[netip.Prefix]bool { return f.local[table] }
+func oifOf(v uint32) (int, error)                                 { return 100 + int(v), nil }
 
 func TestKernelTable(t *testing.T) {
 	if got := KernelTable(0); got != 254 {
@@ -235,5 +259,71 @@ func TestExporterFlush(t *testing.T) {
 	}
 	if err := ex.Flush(ctx); err != nil {
 		t.Fatalf("空 Flush 应成功: %v", err)
+	}
+}
+
+// 同前缀已经有别人的路由：不覆盖、不删、进 Skipped。这是 2026-11-02
+// lab-cpe1 那次事故的判据（replace 把 mgmt 的 connected 路由顶掉）。
+func TestApplySkipsForeignPrefix(t *testing.T) {
+	dp := newFakeDP()
+	p := netip.MustParsePrefix("10.99.0.0/24")
+	dp.foreign["254|"+p.String()] = true
+	ex := NewExporter(dp)
+	ctx := context.Background()
+
+	res, err := ex.Apply(ctx, Plan{Routes: []Route{{Prefix: p, Table: 254, OIF: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Added != 0 || len(res.Skipped) != 1 || res.Skipped[0].Prefix != p {
+		t.Fatalf("同前缀有主时应该跳过: %+v", res)
+	}
+	if len(dp.installed) != 0 || len(ex.Routes()) != 0 {
+		t.Fatalf("跳过的前缀不该进账本: dp=%v ex=%v", dp.installed, ex.Routes())
+	}
+}
+
+// 前缀就是盒子自己某个接口的网段：哪怕表里暂时没有 connected 路由（地址
+// 还挂着 noprefixroute、或者上一版把它顶掉过），也永远不注入。
+func TestApplySkipsLocalSubnet(t *testing.T) {
+	dp := newFakeDP()
+	p := netip.MustParsePrefix("10.99.0.0/24")
+	dp.local = map[uint32]map[netip.Prefix]bool{254: {p: true}}
+	// 账本里有一条上一版留下的（出口 lo），这轮要被撤掉。
+	prev := Route{Prefix: p, Table: 254, OIF: 1}
+	dp.installed[prev.key()] = prev
+	ex := NewExporterFrom(dp, []Route{prev})
+	ctx := context.Background()
+
+	res, err := ex.Apply(ctx, Plan{Routes: []Route{{Prefix: p, Table: 254, OIF: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Skipped) != 1 || res.Removed != 1 || res.Added != 0 {
+		t.Fatalf("接口网段应跳过并撤掉残留: %+v", res)
+	}
+	if len(dp.installed) != 0 || len(ex.Routes()) != 0 {
+		t.Fatalf("残留应被撤干净: dp=%v ex=%v", dp.installed, ex.Routes())
+	}
+}
+
+// 内核里已经有我们的路由（上次被杀、状态文件没写全）：收编而不是报错。
+func TestApplyAdoptsOwnLeftover(t *testing.T) {
+	dp := newFakeDP()
+	p := netip.MustParsePrefix("10.1.0.0/24")
+	r := Route{Prefix: p, Table: 100, OIF: 5}
+	dp.installed[r.key()] = r
+	ex := NewExporter(dp)
+	ctx := context.Background()
+
+	res, err := ex.Apply(ctx, Plan{Routes: []Route{r}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Added != 0 || res.Adopted != 1 || len(res.Skipped) != 0 {
+		t.Fatalf("应原样收编: %+v", res)
+	}
+	if got := ex.Routes(); len(got) != 1 || got[0] != r {
+		t.Fatalf("收编后账本应有这条: %v", got)
 	}
 }

@@ -210,6 +210,8 @@ type LeakRule struct {
   旧格式（无 `mode`）直接删掉并记一条日志，**不按旧内容去删 1250**（那些是 zebra 的条目）。
   退出 / 崩溃恢复时按状态逐条 `RTM_DELROUTE`；`ESRCH`（内核里已经没了，例如容器重启换了 netns）
   视为成功。
+- **只建不覆盖**（§5.6）：`RouteAdd` 是 `NLM_F_CREATE|NLM_F_EXCL`，EEXIST 不由本层吞掉；
+  `RouteReplace` 只用于 `prev` 里确认是我们自己的前缀（出口 ifindex 变了）。
 - 已知代价：内核会认为这些前缀挂在 `lo` / `vpn<N>` 上。盒子 `ip_forward=0`、没有默认路由、
   也不主动访问客户前缀，所以不影响转发；若将来有盒子自身发起去这些前缀的流量，会落到 `lo`，
   这是这个机制的边界，写进 README。
@@ -296,6 +298,31 @@ router bgp 65101
 - 升级顺序：控制器的新 bundle 先落盘（给 sr-apply 加一个只在升级时用的 `--persist-only`）→
   停 sr-frr、换二进制、启动 → 之后的发布全走 `PUT /config`。窗口内 SDWAN→CPE 的宣告会消失，
   与上面的进程重启是同一段中断。
+
+### 5.6 注入的所有权安全（2026-11-02 实测）
+
+注入曾经用 `NLM_F_CREATE|NLM_F_REPLACE`，在 lab 上踩出两个问题，现在的契约就是按这两条收的：
+
+1. **顶掉盒子自己的 connected 路由**：`10.99.0.0/24 dev eth0` 被同前缀的 K 换成 `dev lo`，
+   地址还在、路由没了，盒子到 RR 的控制面当场断。现在的规则：注入前先看
+   `LocalSubnets(table)`（VPN 0 = 没挂 VRF 的接口；VPN N = `vpn<N>` 与它的从属接口），
+   接口网段一律跳过；EEXIST 时用 `Owns`（proto=BOOT、scope=LINK、type=unicast、出口 ifindex 一致）
+   判断归属，不是我们的一律不碰。跳过的前缀进日志（集合变化时打一行）与 `/status.skipped`。
+2. **zebra 累积重复 K 条目，撤不掉**：旧路径每次对账都 replace 一次已存在的内核路由，
+   zebra 每次长出一条新的 RIB 条目（实测同一前缀两条，uptime 对应两次重启，`nexthopGroupId` 相同）。
+   后来删除只删掉一条，另一条仍是 `Installed`，BGP 于是**永远不向客户撤**。
+   新路径只在路由不存在时写内核；杀进程留下的残留由 `Owns` 收编，不再产生任何内核写。
+
+实测（lab-cpe1/2/3，FRR 10.7.1）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 5 轮 `PUT /config` 导出开/关 | 每轮 K=4~5、zebra 每前缀 1 条，重复 0 |
+| `kill -9` 后重启（状态文件在/不在各一次） | 收编 4~5 条，重复 0，客户侧计数无跳变 |
+| 撤回导出（客户侧 /proc/net/route 5 ms 采样） | 5 → 0 单次跳变，2.46 s（含 1 s 轮询）；收编后再撤 1.98 s |
+| cpe2 从 1250 迁移到 K（该迁移必然换注入路径） | 客户 5 → 0 → 5，窗口 **5.54 s**；bgpd pid 990 不变，reload 复检 0 差异 |
+| cpe1/cpe3 换二进制（`kill -9` + 收编） | 客户计数无跳变（采样零次变化） |
+
 
 ## 6. 控制器 API 与页面
 

@@ -4,6 +4,7 @@ package krt
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -50,12 +51,47 @@ func TestRouteRoundTrip(t *testing.T) {
 	if err := c.RouteAdd(ctx, r); err != nil {
 		t.Fatalf("加: %v", err)
 	}
+	// 只建不覆盖：再来一次必须回 ErrRouteExists，不能悄悄替换。
+	if err := c.RouteAdd(ctx, r); !errors.Is(err, frr.ErrRouteExists) {
+		t.Fatalf("重复加应回 ErrRouteExists，实际 %v", err)
+	}
+	if ok, err := c.Owns(ctx, r); err != nil || !ok {
+		t.Fatalf("刚写的路由应认成我们的: ok=%v err=%v", ok, err)
+	}
+	other := frr.Route{Prefix: netip.MustParsePrefix("10.255.254.0/24"), Table: 198, OIF: lo}
+	if ok, err := c.Owns(ctx, other); err != nil || ok {
+		t.Fatalf("不存在的路由不该认成我们的: ok=%v err=%v", ok, err)
+	}
 	if err := c.RouteDelete(ctx, r); err != nil {
 		t.Fatalf("删: %v", err)
 	}
 	// 已经删掉了；内核回 ESRCH，RouteDelete 必须当成功。
 	if err := c.RouteDelete(ctx, r); err != nil {
 		t.Fatalf("重复删应容忍 ESRCH: %v", err)
+	}
+}
+
+// TestLocalSubnets 确认能读出盒子自己配了地址的前缀（VPN 0 的网段）。
+func TestLocalSubnets(t *testing.T) {
+	c, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	subs := c.LocalSubnets(254)
+	if len(subs) == 0 {
+		t.Fatal("默认 VRF 至少应有 lo 的 127.0.0.0/8")
+	}
+	if !subs[netip.MustParsePrefix("127.0.0.0/8")] {
+		t.Fatalf("lo 的 127.0.0.0/8 不在结果里: %v", subs)
+	}
+	for p := range subs {
+		if p != p.Masked() {
+			t.Fatalf("应返回规范前缀: %s", p)
+		}
+	}
+	if got := c.LocalSubnets(199); len(got) != 0 {
+		t.Fatalf("不存在的 vpn199 不该有地址: %v", got)
 	}
 }
 

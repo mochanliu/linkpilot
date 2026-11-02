@@ -7,9 +7,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
+
+	"net"
+	"net/netip"
 
 	"sdwan/controller/internal/frr"
 )
@@ -19,14 +24,17 @@ import (
 const (
 	rtmNewRoute = 24
 	rtmDelRoute = 25
+	rtmGetRoute = 26
 
 	nlmsgError = 2
 	nlmsgDone  = 3
 
 	nlmFRequest = 0x01
 	nlmFAck     = 0x04
+	nlmFExcl    = 0x200
 	nlmFReplace = 0x100
 	nlmFCreate  = 0x400
+	nlmFDump    = 0x300
 
 	rtProtBoot  = 3 // RTPROT_BOOT：ip route add 的默认协议，zebra 认成 K
 	rtScopeLink = 253
@@ -72,21 +80,108 @@ func (c *Client) Close() error {
 	return err
 }
 
-// RouteAdd 用 replace 语义（NLM_F_CREATE|NLM_F_REPLACE）：Exporter 只在
-// 计划变化时调用，重复下发同一条不该报 EEXIST；出口 ifindex 变了也由这一次
-// 替换完成。
+// RouteAdd 只建不覆盖（NLM_F_CREATE|NLM_F_EXCL）：同前缀已经在表里就回
+// ErrRouteExists，由 Exporter 决定是收编（我们自己的残留）还是跳过（别人的）。
+// 绝不用 replace —— 那会把盒子的 connected 路由换成 dev lo（2026-11-02 实测
+// 把 mgmt 网段顶掉，盒子当场连不上 RR）。
 func (c *Client) RouteAdd(ctx context.Context, r frr.Route) error {
+	err := c.request(ctx, rtmNewRoute, nlmFRequest|nlmFAck|nlmFCreate|nlmFExcl, r)
+	if errors.Is(err, syscall.EEXIST) {
+		return fmt.Errorf("%w: %s（表 %d）", frr.ErrRouteExists, r.Prefix, r.Table)
+	}
+	return err
+}
+
+// RouteReplace 只用于我们自己写过的前缀（出口 ifindex 变了）。同前缀的键
+// 会被原地替换，所以调用方必须先确认那条是我们的（Exporter 用 prev 保证）。
+func (c *Client) RouteReplace(ctx context.Context, r frr.Route) error {
 	return c.request(ctx, rtmNewRoute, nlmFRequest|nlmFAck|nlmFCreate|nlmFReplace, r)
 }
 
 // RouteDelete 把 ESRCH 当成功：内核里已经没有了（上一次终于删掉、或者整个
-// netns 换了），对账要能继续往下走。
+// netns 换了），对账要能继续往下走。删除消息带出口 ifindex，内核按
+// （前缀, 表, 出口）匹配，不会误删挂在别的接口上的同前缀路由。
 func (c *Client) RouteDelete(ctx context.Context, r frr.Route) error {
 	err := c.request(ctx, rtmDelRoute, nlmFRequest|nlmFAck, r)
 	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
 	return err
+}
+
+// Owns 判断表里这条前缀是不是我们写的：proto=RTPROT_BOOT、scope=LINK、
+// type=unicast，而且出口 ifindex 与计划一致。只在 RouteAdd 报 EEXIST 时调用
+// （罕见），平时不做全表扫描。
+func (c *Client) Owns(ctx context.Context, r frr.Route) (bool, error) {
+	es, err := c.dump(ctx, r.Table)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range es {
+		if e.Prefix != r.Prefix {
+			continue
+		}
+		if e.Proto == rtProtBoot && e.Scope == rtScopeLink && e.Type == rtnUnicast && e.OIF == r.OIF {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// LocalSubnets 返回该表所属 VRF 里盒子自己配了地址的前缀。VPN 0（main）
+// 看默认 VRF 的全部接口，VPN N 看 vpn<N> 设备与挂在它下面的接口。
+// 这些前缀碰不得：K 与 connected 同前缀会把 connected 换成 dev lo，地址还在、
+// 路由没了，盒子自己到这一段就断了。
+func (c *Client) LocalSubnets(table uint32) map[netip.Prefix]bool {
+	out := map[netip.Prefix]bool{}
+	want := ""
+	if table != 254 {
+		want = fmt.Sprintf("vpn%d", table)
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return out
+	}
+	for _, ifi := range ifaces {
+		if want == "" {
+			if masterOf(ifi.Name) != "" {
+				continue
+			}
+		} else if ifi.Name != want && masterOf(ifi.Name) != want {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipn.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			ones, bits := ipn.Mask.Size()
+			if bits != 32 {
+				continue
+			}
+			addr := netip.AddrFrom4([4]byte{ip4[0], ip4[1], ip4[2], ip4[3]})
+			out[netip.PrefixFrom(addr, ones).Masked()] = true
+		}
+	}
+	return out
+}
+
+// masterOf 返回接口挂在哪个 VRF 设备下面（/sys/class/net/<if>/master），
+// 默认 VRF 的接口返回空串。
+func masterOf(name string) string {
+	p, err := os.Readlink(filepath.Join("/sys/class/net", name, "master"))
+	if err != nil {
+		return ""
+	}
+	return filepath.Base(p)
 }
 
 func (c *Client) request(ctx context.Context, msgType, flags uint16, r frr.Route) error {
@@ -188,7 +283,151 @@ func (c *Client) waitAck(ctx context.Context, seq uint32, r frr.Route) error {
 	}
 }
 
-// encodeRoute 组一条 RTM_NEWROUTE/RTM_DELROUTE：rtmsg + RTA_DST/RTA_OIF/RTA_TABLE。
+// dumpEntry 是 RTM_GETROUTE dump 里一条路由的判断字段。
+type dumpEntry struct {
+	Prefix netip.Prefix
+	Proto  uint8
+	Scope  uint8
+	Type   uint8
+	OIF    int
+}
+
+// dump 拉一张表的全部 IPv4 路由。只用于 EEXIST 时查归属；正常对账不做全表
+// 扫描（客户侧可能有几十万条路由）。
+func (c *Client) dump(ctx context.Context, table uint32) ([]dumpEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	msg, err := encodeDump(table)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fd < 0 {
+		return nil, errors.New("krt: 客户端已关闭")
+	}
+	c.seq++
+	seq := c.seq
+	binary.NativeEndian.PutUint32(msg[8:12], seq)
+	if err := setDeadline(c.fd, ctx); err != nil {
+		return nil, err
+	}
+	if err := syscall.Sendto(c.fd, msg, 0, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}); err != nil {
+		if errors.Is(err, syscall.EINTR) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("krt: 拉表 %d: %w", table, err)
+	}
+
+	var out []dumpEntry
+	buf := make([]byte, 1<<16)
+	for {
+		n, _, err := syscall.Recvfrom(c.fd, buf, 0)
+		if err != nil {
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				return nil, fmt.Errorf("krt: 拉表 %d 超过 %s", table, ackTimeout)
+			}
+			return nil, fmt.Errorf("krt: 读表 %d 的 dump: %w", table, err)
+		}
+		for off := 0; off+16 <= n; {
+			mlen := int(binary.NativeEndian.Uint32(buf[off : off+4]))
+			if mlen < 16 || off+mlen > n {
+				return nil, fmt.Errorf("krt: netlink 报文长度 %d 非法（收到 %d 字节）", mlen, n)
+			}
+			typ := binary.NativeEndian.Uint16(buf[off+4 : off+6])
+			got := binary.NativeEndian.Uint32(buf[off+8 : off+12])
+			if got != seq {
+				off += (mlen + 3) &^ 3
+				continue
+			}
+			switch typ {
+			case nlmsgDone:
+				return out, nil
+			case nlmsgError:
+				if mlen < 20 {
+					return nil, errors.New("krt: NLMSG_ERROR 短于 20 字节")
+				}
+				errno := int32(binary.NativeEndian.Uint32(buf[off+16 : off+20]))
+				if errno == 0 {
+					return out, nil
+				}
+				return nil, syscall.Errno(-errno)
+			case rtmNewRoute:
+				if e, ok := parseDumpEntry(buf[off : off+mlen]); ok {
+					out = append(out, e)
+				}
+			}
+			off += (mlen + 3) &^ 3
+		}
+	}
+}
+
+// encodeDump 组一条 RTM_GETROUTE + NLM_F_DUMP：rtmsg 里给 family 与表号，
+// 其它字段留空表示"不过这几种"。表号 1..255 用 rtm_table 一个字节即可。
+func encodeDump(table uint32) ([]byte, error) {
+	if table == 0 || table > 255 {
+		return nil, fmt.Errorf("krt: 表号 %d 不在 1..255", table)
+	}
+	b := make([]byte, 16+12)
+	binary.NativeEndian.PutUint32(b[0:4], uint32(len(b)))
+	binary.NativeEndian.PutUint16(b[4:6], rtmGetRoute)
+	binary.NativeEndian.PutUint16(b[6:8], nlmFRequest|nlmFDump)
+	b[16] = afInet
+	b[20] = uint8(table)
+	return b, nil
+}
+
+// parseDumpEntry 解一条 RTM_NEWROUTE。属性区在 nlmsghdr(16)+rtmsg(12) 之后。
+func parseDumpEntry(b []byte) (dumpEntry, bool) {
+	if len(b) < 28 || b[16] != afInet {
+		return dumpEntry{}, false
+	}
+	dstLen := int(b[17])
+	table := uint32(b[20])
+	e := dumpEntry{Proto: b[21], Scope: b[22], Type: b[23]}
+	var dst netip.Addr
+	attrs := b[28:]
+	for len(attrs) >= 4 {
+		alen := int(binary.NativeEndian.Uint16(attrs[0:2]))
+		atyp := binary.NativeEndian.Uint16(attrs[2:4])
+		if alen < 4 || alen > len(attrs) {
+			break
+		}
+		payload := attrs[4:alen]
+		switch atyp {
+		case rtaDst:
+			if len(payload) >= 4 {
+				dst = netip.AddrFrom4([4]byte{payload[0], payload[1], payload[2], payload[3]})
+			}
+		case rtaOif:
+			if len(payload) >= 4 {
+				e.OIF = int(binary.NativeEndian.Uint32(payload[:4]))
+			}
+		case rtaTable:
+			if len(payload) >= 4 {
+				table = binary.NativeEndian.Uint32(payload[:4])
+			}
+		}
+		attrs = attrs[(alen+3)&^3:]
+	}
+	if table > 255 || dstLen > 32 {
+		return dumpEntry{}, false
+	}
+	if dstLen == 0 {
+		dst = netip.AddrFrom4([4]byte{})
+	}
+	if !dst.IsValid() || !dst.Is4() {
+		return dumpEntry{}, false
+	}
+	e.Prefix = netip.PrefixFrom(dst, dstLen).Masked()
+	return e, true
+}
+
 // 表号只有 0..255，rtmsg.rtm_table 一个字节就装得下；RTA_TABLE 仍然带上，
 // 与 iproute2 对 32 位表号的处理保持一致。
 func encodeRoute(msgType, flags uint16, r frr.Route) ([]byte, error) {
