@@ -45,7 +45,7 @@ type publishRequest struct {
 // version, and that is exactly the "重新发布引用它的设备" case.
 func (s *server) publishConfigLocked(tenantID string, nodeID uint16, dc *DeviceConfig,
 	checks []ConfigCheck, by string, now int64) bool {
-	art := s.artifactsLocked(tenantID, nodeID, &dc.Draft)
+	art := s.artifactsLocked(tenantID, nodeID, &dc.Draft, dc.Leak)
 	if dc.Published != nil {
 		if dc.Published.Version == dc.Version && dc.Published.Artifacts == art {
 			return false

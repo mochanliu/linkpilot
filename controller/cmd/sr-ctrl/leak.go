@@ -303,6 +303,74 @@ func leakDirectionLabel(direction string) string {
 	return "CPE-SDWAN"
 }
 
+// srfrrArtifact is bundle 第 5 段: the keys of /etc/sr-frr.json the controller
+// owns (docs/o6e-leak-plan.md §4). Both lists are always non-nil so removing the
+// last row produces an explicit "leak nothing" document rather than dropping the
+// segment and leaving the box's previous document in place.
+type srfrrArtifact struct {
+	ExportVRFs  []uint32          `json:"export_vrfs"`
+	ImportRules []srfrrImportRule `json:"import_rules"`
+}
+
+// srfrrImportRule is one CPE-SDWAN VPN with its whitelist already expanded.
+// The box filters by these entries; it never reads the tenant's library.
+type srfrrImportRule struct {
+	VPN      uint32        `json:"vpn"`
+	Sources  []string      `json:"sources"`
+	Prefixes []PrefixEntry `json:"prefixes"`
+}
+
+// leakRenderLocked expands the tenant's library into the two shapes a publish
+// needs: SDWAN-CPE rows for renderFRR and the srfrr segment. A list that
+// vanished expands to nothing; the publish gate has already refused that case,
+// so this only keeps a page preview deterministic.
+func (s *server) leakRenderLocked(tenantID string, set LeakSet) ([]leakRenderRule, srfrrArtifact) {
+	lc := s.leakConfigLocked(tenantID, true)
+	expand := func(id string) []PrefixEntry {
+		if id == "" {
+			return nil
+		}
+		pl := lc.list(id)
+		if pl == nil {
+			return nil
+		}
+		out := make([]PrefixEntry, len(pl.Entries))
+		copy(out, pl.Entries)
+		return out
+	}
+
+	art := srfrrArtifact{ExportVRFs: []uint32{}, ImportRules: []srfrrImportRule{}}
+	var rules []leakRenderRule
+	for _, r := range set.ToCPE {
+		if len(r.Protocols) == 0 {
+			continue
+		}
+		rules = append(rules, leakRenderRule{
+			VPN: r.VPN, Protocols: r.Protocols,
+			Entries: expand(r.PrefixList), HasList: r.PrefixList != "",
+		})
+		art.ExportVRFs = append(art.ExportVRFs, r.VPN)
+	}
+	for _, r := range set.ToSDWAN {
+		if len(r.Protocols) == 0 {
+			continue
+		}
+		prefixes := expand(r.PrefixList)
+		if prefixes == nil {
+			prefixes = []PrefixEntry{}
+		}
+		art.ImportRules = append(art.ImportRules, srfrrImportRule{
+			VPN: r.VPN, Sources: r.Protocols, Prefixes: prefixes,
+		})
+	}
+	// normalizeLeakSet already sorts, but the artifact is compared byte for byte
+	// and map-fed callers exist; sorting here keeps two renders identical.
+	sort.Slice(rules, func(i, j int) bool { return rules[i].VPN < rules[j].VPN })
+	sort.Slice(art.ExportVRFs, func(i, j int) bool { return art.ExportVRFs[i] < art.ExportVRFs[j] })
+	sort.Slice(art.ImportRules, func(i, j int) bool { return art.ImportRules[i].VPN < art.ImportRules[j].VPN })
+	return rules, art
+}
+
 func configVPNOf(c *DeviceConfig, vpnID uint32) *ConfigVPN {
 	if c == nil {
 		return nil
@@ -596,7 +664,7 @@ func (s *server) leakViewLocked(tenantID string, now int64) leakView {
 			set = leakSetCopy(dc.Leak)
 			if dc.Published != nil {
 				row.PublishedVersion = dc.Published.Version
-				art := s.artifactsLocked(tenantID, n.NodeID, &dc.Draft)
+				art := s.artifactsLocked(tenantID, n.NodeID, &dc.Draft, dc.Leak)
 				row.Pending = dc.Published.Version != dc.Version || dc.Published.Artifacts != art
 			}
 		}

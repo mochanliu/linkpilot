@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -8,11 +9,36 @@ import (
 
 func vrfName(vpn uint32) string { return fmt.Sprintf("vpn%d", vpn) }
 
-// renderFRR emits the customer-side FRR config. It deliberately does not emit
-// the overlay pieces (tag 1001 route-map, redistribute table-direct 1250);
-// those belong to the overlay layer and are marked as comments so a reader of
-// the artifact can see where they would go.
-func renderFRR(c *BasicConfig) string {
+// sdwan2cpePolicyName is derived from the VPN id because FRR keeps route-map
+// and prefix-list names global to the daemon, not per VRF (docs/o6e-leak-plan.md
+// §2.2). Reusing one name on the second VPN would overwrite the first.
+func sdwan2cpePolicyName(vpn uint32) string { return fmt.Sprintf("SDWAN2CPE-vpn%d", vpn) }
+
+// leakRenderRule is one SDWAN-CPE row with its prefix-list already expanded.
+// The entries are frozen at publish time: editing the library afterwards does
+// not change what a box is running until it is published again.
+type leakRenderRule struct {
+	VPN       uint32
+	Protocols []string
+	Entries   []PrefixEntry
+	HasList   bool
+}
+
+func (r leakRenderRule) hasProtocol(p string) bool {
+	for _, got := range r.Protocols {
+		if got == p {
+			return true
+		}
+	}
+	return false
+}
+
+// renderFRR emits the customer-side FRR config. Overlay pieces (tag 1001
+// route-map, redistribute table-direct 1250) are gone: SDWAN-CPE now injects K
+// routes into the VPN's own kernel table and redistributes `kernel` here.
+// toCPE carries the expanded SDWAN-CPE rows; passing nil emits none of their
+// lines.
+func renderFRR(c *BasicConfig, toCPE []leakRenderRule) string {
 	var b strings.Builder
 	line := func(format string, args ...any) {
 		fmt.Fprintf(&b, format, args...)
@@ -77,6 +103,42 @@ func renderFRR(c *BasicConfig) string {
 		}
 	}
 
+	// SDWAN-CPE: the prefix-lists and route-maps come first, then each selected
+	// protocol instance redistributes `kernel`. An empty list means "全放过"
+	// (docs/o6e-leak-plan.md §3.1), so it must NOT get a match line -- an empty
+	// FRR prefix-list matches nothing and would silently deny every prefix.
+	toCPEByVPN := map[uint32]leakRenderRule{}
+	for _, r := range toCPE {
+		toCPEByVPN[r.VPN] = r
+	}
+	if len(toCPE) > 0 {
+		line("! SDWAN-CPE 泄露：列表与 route-map 名字按 VPN 派生（FRR 的这两个名字是 daemon 全局的）")
+		for _, r := range toCPE {
+			if !r.HasList || len(r.Entries) == 0 {
+				continue
+			}
+			name := sdwan2cpePolicyName(r.VPN)
+			for i, e := range r.Entries {
+				mask := ""
+				if e.GE > 0 {
+					mask += fmt.Sprintf(" ge %d", e.GE)
+				}
+				if e.LE > 0 {
+					mask += fmt.Sprintf(" le %d", e.LE)
+				}
+				line("ip prefix-list %s seq %d permit %s%s", name, (i+1)*5, e.Prefix, mask)
+			}
+		}
+		for _, r := range toCPE {
+			name := sdwan2cpePolicyName(r.VPN)
+			line("route-map %s permit 10", name)
+			if r.HasList && len(r.Entries) > 0 {
+				line(" match ip address prefix-list %s", name)
+			}
+			line("!")
+		}
+	}
+
 	for _, v := range c.VPNs {
 		if !v.BGP.On {
 			continue
@@ -97,7 +159,9 @@ func renderFRR(c *BasicConfig) string {
 			}
 		}
 		line(" address-family ipv4 unicast")
-		line("  ! overlay 层生成，本页不编辑：redistribute table-direct 1250 / CUST-IN tag 1001")
+		if r, ok := toCPEByVPN[v.ID]; ok && r.hasProtocol(leakProtoBGP) {
+			line("  redistribute kernel route-map %s", sdwan2cpePolicyName(v.ID))
+		}
 		for _, n := range v.BGP.Neighbors {
 			if n.RemoteAS == v.BGP.ASN && n.NextHopSelf {
 				line("  neighbor %s next-hop-self", n.IP)
@@ -121,6 +185,9 @@ func renderFRR(c *BasicConfig) string {
 		}
 		for _, p := range vpnPrefixes(c, v.ID) {
 			line(" network %s area %d", p, v.OSPF.Area)
+		}
+		if r, ok := toCPEByVPN[v.ID]; ok && r.hasProtocol(leakProtoOSPF) {
+			line(" redistribute kernel route-map %s", sdwan2cpePolicyName(v.ID))
 		}
 		line("!")
 	}
@@ -255,17 +322,39 @@ type configArtifacts struct {
 	// §1.2). omitempty because bundles published before O6-b have no such key and
 	// sr-apply must keep reading them.
 	Route string `json:"route,omitempty"`
+	// Srfrr is bundle 第 5 段: the two keys of /etc/sr-frr.json the controller
+	// owns -- export_vrfs and import_rules. Same overlay rule as Route: the box
+	// keeps status_url, zserv_socket, state_file and poll_sec. It is always
+	// present on a new publish (empty arrays included) so that removing the last
+	// leak row turns the leak off instead of leaving the old document in place.
+	// omitempty only spares pre-O6-e bundles.
+	Srfrr string `json:"srfrr,omitempty"`
 }
 
 func renderArtifacts(c *BasicConfig) configArtifacts {
-	return configArtifacts{FRR: renderFRR(c), VPP: renderVPP(c), Boot: renderBoot(c)}
+	return configArtifacts{FRR: renderFRR(c, nil), VPP: renderVPP(c), Boot: renderBoot(c)}
 }
 
-// artifactsLocked adds the per-device overlay artifact to the three text
-// fragments. Route depends on the tenant's groups *and* this device's tunnels,
-// so it cannot be rendered from the draft alone.
-func (s *server) artifactsLocked(tenantID string, nodeID uint16, c *BasicConfig) configArtifacts {
-	a := renderArtifacts(c)
-	a.Route = s.overlayRouteArtifactLocked(tenantID, nodeID)
-	return a
+func renderSrfrrArtifact(a srfrrArtifact) string {
+	b, err := json.MarshalIndent(a, "", "  ")
+	if err != nil {
+		// Only plain scalars and slices of them; unreachable.
+		return ""
+	}
+	return string(b) + "\n"
+}
+
+// artifactsLocked adds the per-device overlay and leak artifacts to the three
+// text fragments. Route depends on the tenant's groups *and* this device's
+// tunnels, and the leak half depends on the tenant's prefix-list library, so
+// neither can be rendered from the draft alone.
+func (s *server) artifactsLocked(tenantID string, nodeID uint16, c *BasicConfig, set LeakSet) configArtifacts {
+	rules, srfrr := s.leakRenderLocked(tenantID, set)
+	return configArtifacts{
+		FRR:   renderFRR(c, rules),
+		VPP:   renderVPP(c),
+		Boot:  renderBoot(c),
+		Route: s.overlayRouteArtifactLocked(tenantID, nodeID),
+		Srfrr: renderSrfrrArtifact(srfrr),
+	}
 }

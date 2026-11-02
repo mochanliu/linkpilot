@@ -207,7 +207,7 @@ func TestRenderArtifacts(t *testing.T) {
 	cfg.VPNs[1].OSPF = OSPFConfig{On: true, RouterID: "10.99.0.12"}
 	cfg.VPNs[0].BGP.Neighbors[1].NextHopSelf = true
 
-	frr := renderFRR(&cfg)
+	frr := renderFRR(&cfg, nil)
 	for _, want := range []string{
 		"hostname edge-1",
 		"interface lcp-x0\n ip address 10.79.1.2/24",
