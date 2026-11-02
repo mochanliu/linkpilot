@@ -83,7 +83,12 @@ rm -f "$TMP"/*.json "$TMP"/*.log 2>/dev/null || true
 # ==================================================================
 say "1. 控制器构建（零第三方依赖，容器里的 Go 1.22.5）"
 docker rm -f "$CTRL" >/dev/null 2>&1 || true
+# --cap-add=NET_ADMIN：internal/frr/krt 的 TestRouteRoundTrip 以 root 跑时会真的往
+# scratch 表 198 写一条路由再删掉，Docker 默认能力集里没有 NET_ADMIN，两个 daemon
+# （Docker Desktop / colima）实测都是 "加: operation not permitted"。路由写在容器
+# 自己的 netns 里，动不到宿主机。
 docker run -d --name "$CTRL" --network "$NET" --ip "$CTRL_IP" \
+    --cap-add=NET_ADMIN \
     --network-alias ctrl -v "$CTRL_DIR":/workspace/controller \
     srwg-dev:latest sleep infinity >/dev/null || { bad "srwg-ctrl 起不来"; exit 1; }
 
