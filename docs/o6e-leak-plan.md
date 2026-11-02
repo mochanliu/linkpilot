@@ -43,11 +43,53 @@ table 1250、`sr-frr.json` 的 `vrfs/table_id`、`redistribute table-direct 1250
 另两条实测结论（本次为写方案补测）：
 
 - **FRR 的 `vrf_id` 是内核 VRF 设备的 ifindex，不是 VPN 号/表号**：
-  `vpn100 → id 8, table 100`，`vpn101 → id 9, table 101`；默认 VRF 是 0。
+  2026-11-02 复测 `vpn100 → id 10, table 100`，`vpn101 → id 11, table 101`；默认 VRF 是 0。
   → CPE-SDWAN 多 VPN 归属靠这个映射（`/sys/class/net/vpn<N>/ifindex` 或 netlink link dump）。
 - BGP 侧 `redistribute kernel route-map` + prefix-list 已验证（4 条 → 只留 1 条）；
-  **OSPF 的 route-map + prefix-list 没在本 lab 验成**（当时 ospfd 是临时起的，没从 mgmtd
-  同步 route-map）。FRR 文档支持，S-0 用真配置复核；若不支持，SPF 侧降级为不带前缀过滤并如实报错。
+  **OSPF 的 route-map + prefix-list 在 S-0 已用真配置验成**（见下）。
+
+### 1.1 S-0 spike 结论（2026-11-02，lab-cpe1，FRR 10.7.1）
+
+**① ZAPI 通知头 `vrf_id` 可用，但订阅必须按 VRF 发。**
+
+- 收到的每条 `ZEBRA_REDISTRIBUTE_ROUTE_ADD/DEL` 头里 `vrf_id` = **路由所在 VRF 的 ifindex**
+  （`vpn100` 的路由是 10，`vpn101` 是 11），不是常量 0；默认 VRF 的路由是 0。
+- 但 `ZEBRA_REDISTRIBUTE_ADD` 的订阅是按头里的 `vrf_id` 注册的（zebra 的
+  `client->redist[afi][type]` 是按 vrf 的位图）。**只发一个默认订阅只会收到默认 VRF 的路由**，
+  其它 VPN 一条都不来。所以 sr-frr 要按每个 VPN 的 ifindex 各发一组
+  `REDISTRIBUTE_ADD`（一条连接可以订阅多个 VRF），收到后用头里的 vrf_id 反查 VPN。
+- 报文里没有别的 VRF 归属字段；不要试图从 nexthop 猜（导入路由的 nexthop vrf 可能是 0）。
+
+**② 四个来源的类型号（以 FRR 10.7.1 `route_types.txt` 顺序为准，已逐条实测）：**
+
+| 来源 | type | 实测方式 |
+| --- | --- | --- |
+| connected | 2 | vpn100 的 `10.200.0.0/30` 收到通知 |
+| static | 4 | vpn100 的 `203.0.113.0/24 blackhole` 收到通知（type 3 是 local，别用） |
+| ospf | 7 | vpn100 从 OSPF 学到的 `10.201.0.1/32` 收到通知 |
+| bgp | 10 | 与既有结论一致 |
+| kernel | 1 | 注入 vpn100 的 K 路由收到通知 |
+
+**③ OSPF 的 `redistribute kernel route-map` + prefix-list 支持前缀过滤（实测）。**
+
+vpn100 里两条 K 路由（`198.51.100.0/24`、`198.51.102.0/24`），prefix-list 只 permit 前者，
+`redistribute kernel route-map SDWAN2CPE-vpn100` 后在 `show ip ospf vrf vpn100 database external`
+里只出现 `198.51.100.0/24`（Type-5，metric-type 2，forward-address 0.0.0.0，metric 20）。
+旧 lab 失败的原因确认是临时 ospfd 没同步 route-map，不是 FRR 不支持。
+同时再次证实"先有路由、后加 redistribute 不会重算"：加完配置必须先 touch 一次才出 LSA。
+
+**④ 注入的 K 路由不会被当成 BGP 再学回来（防回环的直接证据）。**
+
+- 只有 K 的前缀（`198.51.100.0/24` 等）：订阅 bgp 类型时**没有任何通知**。
+- 人为让 K 压住一条 BGP 路由（往 vpn100 注入 `10.68.1.0/24`）：zebra 立刻发该前缀的
+  BGP `DEL`（不再是选中路由）；删掉 K 后 BGP `ADD` 回来。
+  → K 在表里时 zebra 不会把同前缀当 BGP 再分发。§5.4 的集合交集仍保留（不靠这个概率）。
+
+**⑤ VPP 侧复测：** `dev vpn100` / `dev lo` 注入的 K 路由在 VPP（table 100 与主表）都不出现；
+`blackhole` 路由**会**镜像进 VPP（dpo-drop）——所以注入绝不能带黑洞下一跳，出口只用
+`vpn<N>` / `lo`。测试用的 VRF、BGP 导入、OSPF 实例已全部撤掉，`frr.conf` 未改。
+（副作用：VPP 里留下一个只有默认表项的 `ipv4-VRF:100`，无路由、不影响转发。）
+
 
 今天的基线（必须一起退役）：sr-frr 走 ZAPI `ZEBRA_ROUTE_TABLE` + 黑洞下一跳 → FRR `T>*` →
 内核 table 1250（`unreachable (blackhole)`）→ VPP `ipv4-VRF:1250` 全是 dpo-drop →
@@ -226,15 +268,17 @@ router bgp 65101
 ### 5.4 CPE-SDWAN 的导入
 
 - Importer 从"一个前缀集合"扩成 **`(vpn, prefix) → 来源集合`**：
-  每个来源一条订阅（BGP / OSPF / STATIC / CONNECTED，类型号以 FRR 10.7.1 的
-  `route_types` 为准，S-0 实测确认，BGP=10 已验）。
-- 通知归属 VPN：先读 ZAPI 头的 `vrf_id`，用 ifindex 映射换成 VPN 号（§1 实测规则）；
-  未知 id 的通知丢弃并计数（不猜、不并到 VPN 0）。S-0 先确认头里确实带的是这个 id。
+  **按（VPN, 来源）发订阅**——`REDISTRIBUTE_ADD` 的头 `vrf_id` 填该 VPN 的设备 ifindex，
+  再按来源各发一条（connected=2 / static=4 / ospf=7 / bgp=10，kernel=1，§1.1 实测）。
+  只订默认 VRF 会漏掉其它 VPN 的全部路由。
+- 通知归属 VPN：读 ZAPI 头的 `vrf_id`，用 ifindex→VPN 映射换算（§1.1 实测：头里就是路由所在 VRF）；
+  未知 id 的通知丢弃并计数（不猜、不并到 VPN 0）。
+- VPN 0 用默认 VRF（ifindex 0 的订阅），无需映射。
 - 输出：只保留**该 VPN 规则里选中的来源**，且命中该 VPN 的白名单；没规则的 VPN 一条都不报。
   取消一个来源立即生效（从保留的 per-source 集合重算），不等 zebra 撤路由。
 - **防回环**：同一 VPN 的 `export_vrfs` 注入集合里的前缀，永远不在上报集合里出现
-  （`K` 压过 BGP 后，理论上 zebra 不会再给 BGP 类型的再分发通知；但这里用集合交集写死，
-  不靠这个概率）。被压掉的条数进 `/status` 和日志。
+  （S-0 已证 K 压过 BGP 时 zebra 不会再发 BGP 通知；这里仍用集合交集写死，不靠这个概率）。
+  被压掉的条数进 `/status` 和日志。
 - 上报仍是整份替换 `PUT /local-prefixes`（单写者；每条带 `vrf_id`，sr-route 现有校验要求该 VPN
   在 route.json 的 `vrfs` 里——§3.2 的"必须在导通组里"就是为它准备的）。
 
@@ -331,7 +375,7 @@ GET 的返回**不造数据**：设备没上报就说没上报，实例有没有
 
 | 步 | 内容 | 判据 |
 | --- | --- | --- |
-| S-0 | spike：ZAPI 通知头 `vrf_id` 是否可用、四个来源的类型号、OSPF route-map 前缀匹配、注入后是否产生 BGP 自导入 | 结论写回本文；不改生产代码 |
+| S-0 | spike：ZAPI 通知头 `vrf_id` 是否可用、四个来源的类型号、OSPF route-map 前缀匹配、注入后是否产生 BGP 自导入 | **已完成**，结论在 §1.1；不改生产代码 |
 | L-1 | 控制器：prefix-list 库 + 每设备泄露行 + API + 校验 + 单测 | 单测覆盖归一化、引用检查、导通组/协议/VPN 闸门 |
 | L-2 | 渲染：`renderFRR` 出 SDWAN-CPE 三件套；第 5 段 `srfrr` 出 `export_vrfs`/`import_rules` | 逐行快照测试；空规则不出任何行、不进 export_vrfs |
 | L-3 | sr-frr：netlink 注入 + 状态文件 + 退出清理；退役 1250/ZAPI 导出 | lab：`K>*` 存在、VPP 对应表无新增、sr-frr 重启后按状态文件对账（ESRCH 容忍）；撤行后 K 与客户 BGP 都撤掉 |
@@ -360,8 +404,9 @@ GET 的返回**不造数据**：设备没上报就说没上报，实例有没有
 4. prefix-list 是**每个租户自己的**配置（`State.LeakConfigs[tenantID]`），不跨租户共享；
    跨租户共享的对象属于运营商视图，等你点名再做。租户内两个模块共用同一份。
 
-剩余待拍（S-0 出数后再定）：
+S-0 已把原第 1 项解掉：`redistribute kernel route-map` + prefix-list 在 VRF 里过滤生效
+（两条 K 只出来了被允许的那一条，见 §1.1 ③），不需要 OSPF 侧降级。
 
-1. OSPF 的 `redistribute kernel route-map` 前缀匹配若实测不支持，SPF 侧降级为不带前缀过滤
-   并如实报错——是否接受这个降级（§1 末条）。
-2. §5.3 的 touch 窗口实测后若超过可接受范围，是"只 touch 新增协议的那个 VPN"还是接受中断并在页面点名。
+剩余待拍：
+
+1. §5.3 的 touch 窗口实测后若超过可接受范围，是"只 touch 新增协议的那个 VPN"还是接受中断并在页面点名。
