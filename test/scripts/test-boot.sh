@@ -121,7 +121,26 @@ done
 [ -f "$START_SRC" ] || die "找不到被验的清单：$START_SRC"
 
 dx()  { docker exec "$1" bash -lc "$2"; }
+dxi() { docker exec -i "$1" bash -lc "$2"; }
 vpp() { docker exec "$1" bash -lc "vppctl $2" 2>/dev/null | tr -d '\r'; }
+
+# push_local <container> <port> <vrf> <prefix> <label> —— sr-route 的配置里不写本端
+# 前缀：它只从 PUT /local-prefixes 进来（真盒子上由 sr-frr 推）。
+# 这台判据盒不跑 sr-frr（bridge 一律 SKIP），所以由 harness 在每次 up 之后替它推
+# 一次 —— 重试是因为 sr-route 刚被清单拉起、端口还没 listen。
+push_local() {   # <container> <port> <vrf> <prefix> <label>
+    local c=$1 port=$2 vrf=$3 pfx=$4 label=$5 i=0 code
+    local body="{\"prefixes\":[{\"vrf_id\":$vrf,\"prefix\":\"$pfx\"}]}"
+    while [ "$i" -lt 50 ]; do
+        code=$(printf '%s' "$body" | dxi "$c" \
+            "curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @- http://127.0.0.1:$port/local-prefixes" 2>/dev/null)
+        [ "$code" = 200 ] && { ok "$label"; return 0; }
+        sleep 0.2
+        i=$((i + 1))
+    done
+    bad "$label（超时）"
+    return 1
+}
 
 # ---------------------------------------------------------------- 断言工具
 
@@ -236,6 +255,13 @@ run_box() {   # <container> <up|check|stop> -> 设 BOX_RC / BOX_OUT，并把清�
 }
 box_pid() {   # <container> <step> —— pid + 内核记录的启动时刻（/proc/<pid>/stat 第 22 字段）
     dx "$1" "p=\$(cat $BOX_RUN/$2.pid 2>/dev/null); [ -n \"\$p\" ] && awk '{print \$1\"/\"\$22}' /proc/\$p/stat || echo none"
+}
+
+# up_box <container> <port> <vrf> <prefix> —— 清单 up + 替 sr-frr 推本端前缀。
+# 判据要看的前缀宣告就此回到"进程活着"的同一状态，和真盒子开机后的样子一致。
+up_box() {
+    run_box "$1" up || return $?
+    push_local "$1" "$2" "$3" "$4" "$1：本端前缀 $4@$3 已推回 sr-route"
 }
 wait_vppctl() {   # <container> <limit_s>
     local c=$1 limit=$2 i=0
@@ -379,7 +405,6 @@ cat > "$BOX_ROUTE" <<EOF
   "rrs": [{"id": "rr-a", "addr": "$RR_ADDR:$RR_PORT"}],
   "tunnels": [{"peer_device_id": 2, "next_hop": "$OVERLAY_N2"}],
   "vrfs": [{"id": $VRF_1, "export_rts": ["65000:$VRF_1"], "import_rts": ["65000:$VRF_2"]}],
-  "local_prefixes": [{"vrf_id": $VRF_1, "prefix": "$PFX_1"}],
   "status_addr": "127.0.0.1:$S1"
 }
 EOF
@@ -468,7 +493,6 @@ cat > "$BOX_ROUTE" <<EOF
   "rrs": [{"id": "rr-a", "addr": "$RR_ADDR:$RR_PORT"}],
   "tunnels": [{"peer_device_id": 1, "next_hop": "$OVERLAY_N1"}],
   "vrfs": [{"id": $VRF_2, "export_rts": ["65000:$VRF_2"], "import_rts": ["65000:$VRF_1"]}],
-  "local_prefixes": [{"vrf_id": $VRF_2, "prefix": "$PFX_2"}],
   "status_addr": "127.0.0.1:$S2"
 }
 EOF
@@ -549,12 +573,12 @@ wait_json "$N1" "$RR_STATUS" "d is not None" "RR 的状态口在回话" 25
 # ---------------------------------------------------------------- 2 一遍 up（热 VPP）
 
 info "2. 第一次 up：清单把路由面自己带起来（VPP 是热的，不该被碰）"
-run_box "$N1" up && ok "node1 up 退出码 0" || bad "node1 up 退出码 $BOX_RC"
+up_box "$N1" "$S1" "$VRF_1" "$PFX_1" && ok "node1 up 退出码 0" || bad "node1 up 退出码 $BOX_RC"
 has_re "$BOX_OUT" "^vpp.*已在" && ok "node1：vpp 那一步是「已在」，没有重启热着的 VPP" || bad "node1：vpp 步骤不说「已在」"
 has_line "$BOX_OUT" "重放完成" && ok "node1：apply 重放了磁盘上那版" || bad "node1：apply 没报重放完成"
 has_re "$BOX_OUT" "^frr[[:space:]]+SKIP" && has_re "$BOX_OUT" "^bridge[[:space:]]+SKIP" &&
     ok "node1：frr/bridge 两步各有各的一行，跳过的也留在结论里" || bad "node1：跳过的步骤没出现在 up 的输出里"
-run_box "$N2" up && ok "node2 up 退出码 0" || bad "node2 up 退出码 $BOX_RC"
+up_box "$N2" "$S2" "$VRF_2" "$PFX_2" && ok "node2 up 退出码 0" || bad "node2 up 退出码 $BOX_RC"
 
 wait_json "$N1" "$S1" "any(s['connected'] and s['synced'] for s in d['sessions'])" \
     "node1 的 sr-route 连上 RR 并同步完" 40
@@ -593,7 +617,7 @@ sleep 1
 [ -z "$(dx "$N1" "pgrep -x sr-route")" ] || die "sr-route 没死干净"
 ok "node1 的 sr-route 被杀掉（模拟进程崩了）"
 
-run_box "$N1" up && ok "第二遍 up 退出码 0" || bad "第二遍 up 退出码 $BOX_RC"
+up_box "$N1" "$S1" "$VRF_1" "$PFX_1" && ok "第二遍 up 退出码 0" || bad "第二遍 up 退出码 $BOX_RC"
 p2_route=$(box_pid "$N1" route)
 [ "$p2_route" != "$p1_route" ] && [ "$p2_route" != none ] &&
     ok "sr-route 补上了（$p1_route → $p2_route）：清单只补它缺的那一步" ||
@@ -610,7 +634,7 @@ wait_fn "VPP 表 $VRF_1 里的 $PFX_2 又回来了（老的 sr-fib 下一轮轮�
     labeled_via "$N1" "$VRF_1" "$PFX_2" "$LBL_2" "$OVERLAY_N2"
 term_ping "sr-route 崩过又补回来之后"
 
-run_box "$N1" up >/dev/null && ok "第三遍 up 退出码 0（没得补的时候它就该什么都不做）" || bad "第三遍 up 退出码 $BOX_RC"
+up_box "$N1" "$S1" "$VRF_1" "$PFX_1" >/dev/null && ok "第三遍 up 退出码 0（没得补的时候它就该什么都不做）" || bad "第三遍 up 退出码 $BOX_RC"
 p3_route=$(box_pid "$N1" route); p3_fib=$(box_pid "$N1" fib); p3_agent=$(box_pid "$N1" agent)
 if [ "$p3_route" = "$p2_route" ] && [ "$p3_fib" = "$p2_fib" ] && [ "$p3_agent" = "$p2_agent" ]; then
     ok "第三遍 up 一个 pid 都没变（$p3_route / $p3_fib / $p3_agent）：幂等"
@@ -640,7 +664,7 @@ for c in "$N1" "$N2"; do
 done
 
 info "B2a. 每台盒子只敲一条命令：start.sh up（此时 RR 还没起来）"
-run_box "$N1" up && ok "node1 up 退出码 0（RR 不在场，清单不该因此失败）" || bad "node1 up 退出码 $BOX_RC"
+up_box "$N1" "$S1" "$VRF_1" "$PFX_1" && ok "node1 up 退出码 0（RR 不在场，清单不该因此失败）" || bad "node1 up 退出码 $BOX_RC"
 has_re "$BOX_OUT" "^vpp.*起来了" &&
     ok "node1：vpp 那一步写着「起来了」—— 容器里没人管 VPP，是这份清单把它拉起来的" ||
     bad "node1：VPP 不是清单拉起来的（输出里没有「起来了」）"
@@ -656,7 +680,7 @@ wait_json "$N1" "$S1" "all(not s['connected'] for s in d['sessions']) and d['ses
 has_line "$BOX_OUT" "磁盘上没有那份表" &&
     ok "node1：清单把「隧道 0 条、这一层我恢复不了」写在结论里（诚实的缺口比假装的完成有用）" ||
     bad "node1：tunnels 那两行诚实文案没出现"
-run_box "$N2" up && ok "node2 也是同一条命令、退出码 0" || bad "node2 up 退出码 $BOX_RC"
+up_box "$N2" "$S2" "$VRF_2" "$PFX_2" && ok "node2 也是同一条命令、退出码 0" || bad "node2 up 退出码 $BOX_RC"
 mpls_table "$N2" "$MK_2" && ok "node2：MPLS 表 $MK_2 回来了" || bad "node2：MPLS 表 $MK_2 没回来"
 
 info "B2b. RR 起来 —— 已经开完机的两台盒子自己接上，谁都不用再碰"
@@ -752,7 +776,7 @@ has_re "$BOX_OUT" "^route[[:space:]]+有.*配置在，进程没跑" &&
     bad "stop 之后的 check 没说 route 没在跑：$(printf '%s' "$BOX_OUT" | grep route || echo 无 route 行)"
 
 info "C2. 再 up 一遍：缺的那三步补回来，VPP 依旧没被碰"
-run_box "$N1" up && ok "stop 之后 up 退出码 0" || bad "stop 之后 up 退出码 $BOX_RC"
+up_box "$N1" "$S1" "$VRF_1" "$PFX_1" && ok "stop 之后 up 退出码 0" || bad "stop 之后 up 退出码 $BOX_RC"
 n_route=$(box_pid "$N1" route); n_fib=$(box_pid "$N1" fib); n_agent=$(box_pid "$N1" agent)
 [ "$n_route" != "$c_route" ] && [ "$n_route" != none ] &&
     ok "sr-route 换成了新的进程（$c_route → $n_route）" || bad "sr-route 没被补起来（$n_route）"

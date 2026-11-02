@@ -129,7 +129,7 @@ type RRItem struct {
 2. 编译 + `gofmt -l` 空 + `go vet` + `go test -count=1 -race ./...` 全绿（14 个包，2026-10-31）、
    `test-vbond.sh` 全绿（**196 passed / 0 failed**，2026-10-31 复跑）。
 3. **真浏览器**（不是只看接口）：运营方建两条 RR → 租户登录，下拉里选到它们 → 保存 → 刷新还在；`GET /api/config/bundle?node=1` 里能读到那两条；导通页建组 → 两行 RT 自动写入。截图存档。**（C-b）**
-4. 设备侧（lab `lab-o6b1`/`lab-o6b2`）：发布一次 ⇒ 两台 `route.json` 的 `rrs` 变成选中的那两条，**盘上其余键逐字没动**（`tenant/device_id/serial/hold_sec/local_prefixes/status_addr/identity_dir`）；**`sr-route` 的 pid 不许变**——O6-b 那条"改导通不重启任何进程"的判据不能被这一步破坏。**（C-b 之后才能整条走：要有一个能选 RR 的页面；C-a 已单测覆盖合并语义本身）**
+4. 设备侧（lab `lab-o6b1`/`lab-o6b2`）：发布一次 ⇒ 两台 `route.json` 的 `rrs` 变成选中的那两条，**盘上其余键逐字没动**（`tenant/device_id/serial/hold_sec/status_addr/identity_dir`）；**`sr-route` 的 pid 不许变**——O6-b 那条"改导通不重启任何进程"的判据不能被这一步破坏。**（C-b 之后才能整条走：要有一个能选 RR 的页面；C-a 已单测覆盖合并语义本身）**
 5. 反证 E1 的那条：重启盒子（`docker restart` + 一条 `start.sh up`）后 `/status` 里连的 RR 就是页面上选的那对。**（C-c 做完 make-before-break 之后，这条要改成"不重启盒子也能换"）**
 
 > 判据里的 VPN：这一版仍按 **VPN 0** 走（O6-b 那条约束还在）。补充一条今天查到的环境事实：

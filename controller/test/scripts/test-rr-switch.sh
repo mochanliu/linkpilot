@@ -101,6 +101,25 @@ die()  { echo "FATAL: $*" >&2; exit 2; }
 dx()  { docker exec "$1" bash -lc "$2"; }
 dxi() { docker exec -i "$1" bash -lc "$2"; }
 
+# push_local <container> <status port> <prefix> <label> —— 扮演 sr-frr：sr-route 只从
+# PUT /local-prefixes 收本端前缀。进程刚起时端口还没 listen，curl 直接失败不是被测
+# 行为，所以要重试。
+push_local() {
+    local c=$1 st=$2 pfx=$3 label=$4 i=0
+    while [ "$i" -lt 50 ]; do
+        if dx "$c" "curl -sf --max-time 2 -X PUT http://127.0.0.1:$st/local-prefixes \
+            -H 'Content-Type: application/json' \
+            -d '{\"prefixes\":[{\"vrf_id\":0,\"prefix\":\"$pfx\"}]}'" >/dev/null 2>&1; then
+            ok "$label"
+            return 0
+        fi
+        sleep 0.2
+        i=$((i+1))
+    done
+    bad "$label（超时）"
+    return 1
+}
+
 # ---------------------------------------------------------------- 状态口读法
 
 get_url() {   # <container> <url> —— 读不到就空，让调用方按"还没好"处理
@@ -191,14 +210,15 @@ start_node() {   # <container> <device id> <serial> <status port> <rrs json>
   "status_addr": "0.0.0.0:$st",
   "rrs": $rrs,
   "tunnels": [{"peer_device_id": $peer, "next_hop": "$nh"}],
-  "vrfs": [{"id": 0, "export_rts": ["$RT"], "import_rts": ["$RT"]}],
-  "local_prefixes": [{"vrf_id": 0, "prefix": "$pfx"}]
+  "vrfs": [{"id": 0, "export_rts": ["$RT"], "import_rts": ["$RT"]}]
 }
 JSON
     dx "$c" "cd $WORK && nohup ./bin/sr-route -config $WORK/node$dev.json > $WORK/node$dev.log 2>&1 & echo \$! > $WORK/node$dev.pid" >/dev/null ||
         die "起 device $dev 的 sr-route 失败"
     wait_json "$c" "http://127.0.0.1:$st/status" "d['device_id'] == $dev" \
         "device $dev 的 sr-route 起来了（状态口 $st）" 15 >/dev/null
+    push_local "$c" "$st" "$pfx" "device $dev 宣告 $pfx（扮演 sr-frr）" ||
+        die "device $dev 的前缀推不进去"
 }
 
 cleanup() {

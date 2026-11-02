@@ -365,7 +365,7 @@ router bgp ${BOX_AS[$n]}
 ! （sr-frr 用 RTPROT_BOOT 写的那些），connected/客户 BGP 路由都不会漏出去。
 EOF
         # 客户路由器：只宣告自己的 LAN 与 loopback。两个前缀都只能经 BGP 学到
-        # （盒内没有静态 local_prefixes）——这是"FRR 算路由"的前提。
+        # （盒内没有静态的本端前缀）——这是"FRR 算路由"的前提。
         cat > "$RUN/cust$n.frr.conf" <<EOF
 frr defaults traditional
 hostname lab-cust$n

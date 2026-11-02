@@ -23,7 +23,6 @@ const boxRouteFile = `{
   "hold_sec": 9,
   "rrs": [{"addr": "203.0.113.9:8081"}],
   "status_addr": "0.0.0.0:8084",
-  "local_prefixes": [{"vrf_id": 0, "prefix": "10.10.0.0/24"}],
   "tunnels": [{"peer_device_id": 9, "next_hop": "10.68.0.9"}],
   "vrfs": [{"id": 9, "export_rts": ["65000:9999"], "import_rts": []}]
 }`
@@ -75,7 +74,7 @@ func TestOverlayMergeKeepsBoxKeys(t *testing.T) {
 
 	doc := readRouteKeys(t, path)
 	for _, k := range []string{"tenant", "device_id", "identity_dir", "serial", "hold_sec",
-		"rrs", "status_addr", "local_prefixes"} {
+		"rrs", "status_addr"} {
 		if _, ok := doc[k]; !ok {
 			t.Errorf("盒子自己的键 %s 被抹掉了", k)
 		}
@@ -136,7 +135,7 @@ func TestOverlayRRReplacesTheBoxListAndKeepsTheRest(t *testing.T) {
 		t.Errorf("rrs 里的 id 被丢了: %s", got)
 	}
 	for _, k := range []string{"tenant", "device_id", "identity_dir", "serial", "hold_sec",
-		"status_addr", "local_prefixes", "rrs"} {
+		"status_addr", "rrs"} {
 		if _, ok := doc[k]; !ok {
 			t.Errorf("键 %s 没了", k)
 		}

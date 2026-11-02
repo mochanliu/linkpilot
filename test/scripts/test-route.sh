@@ -95,6 +95,25 @@ assert_status() {   # <url> <expr> <label>
     fi
 }
 
+# push_local <status-port> <prefix> <label> —— 扮演 sr-frr：sr-route 只从
+# PUT /local-prefixes 收本端前缀。进程刚起时端口还没 listen，curl 直接失败不是
+# 被测行为，所以要重试。
+push_local() {
+    local port=$1 prefix=$2 label=$3 i=0
+    while [ "$i" -lt 50 ]; do
+        if curl -sf --max-time 2 -X PUT "http://127.0.0.1:$port/local-prefixes" \
+            -H 'Content-Type: application/json' \
+            -d "{\"prefixes\":[{\"vrf_id\":5,\"prefix\":\"$prefix\"}]}" >/dev/null; then
+            ok "$label"
+            return 0
+        fi
+        sleep 0.2
+        i=$((i+1))
+    done
+    bad "$label（超时）"
+    return 1
+}
+
 # ---------------------------------------------------------------- 环境与构建
 
 info "准备 $WORK 并编译二进制"
@@ -161,9 +180,10 @@ sed -e 's/"rr-a"/"rr-b"/' \
 
 # node1: import 65000:6（能收 node2）；node2: export 65000:6（RT 命中就收，
 # RR 不管谁跟谁有隧道）；node3: export 65000:7（到了 node1，但 RT 不匹配 ⇒
-# 必须被拒收）。每台只在自己进程内配隧道表，线上从不发它。
-write_node() {   # <n> <tunnels-json> <prefix> <export> <import-csv> <status-port>
-    local n=$1 tunnels=$2 prefix=$3 export=$4 imports=$5 status=$6
+# 必须被拒收）。每台只在自己进程内配隧道表，线上从不发它。本端前缀不在配置里：
+# 启动后由 push_local 扮演 sr-frr 推进去。
+write_node() {   # <n> <tunnels-json> <export> <import-csv> <status-port>
+    local n=$1 tunnels=$2 export=$3 imports=$4 status=$5
     cat > "$WORK/node$n.json" <<EOF
 {
   "tenant": "tenant-a",
@@ -179,23 +199,22 @@ write_node() {   # <n> <tunnels-json> <prefix> <export> <import-csv> <status-por
   "vrfs": [
     {"id": 5, "export_rts": ["$export"], "import_rts": [$imports]}
   ],
-  "local_prefixes": [{"vrf_id": 5, "prefix": "$prefix"}],
   "status_addr": "127.0.0.1:$status"
 }
 EOF
 }
 write_node 1 '[{"peer_device_id": 2, "next_hop": "192.168.99.2"},
               {"peer_device_id": 3, "next_hop": "192.168.99.3"}]' \
-    10.10.0.0/16 65000:5 '"65000:6"' "$N1_STATUS"
+    65000:5 '"65000:6"' "$N1_STATUS"
 write_node 2 '[{"peer_device_id": 1, "next_hop": "192.168.99.1"},
               {"peer_device_id": 3, "next_hop": "192.168.99.3"}]' \
-    10.20.0.0/16 65000:6 '"65000:5"' "$N2_STATUS"
+    65000:6 '"65000:5"' "$N2_STATUS"
 # node3 同时 import 65000:5（收 node1）与 65000:6（收 node2）。
 # 对 node1 有两条并行隧道：同一条 prefix 必须解析出两个等价下一跳（ECMP）。
 write_node 3 '[{"peer_device_id": 1, "next_hop": "192.168.99.1"},
               {"peer_device_id": 1, "next_hop": "192.168.88.1"},
               {"peer_device_id": 2, "next_hop": "192.168.99.2"}]' \
-    10.30.0.0/16 65000:7 '"65000:5", "65000:6"' "$N3_STATUS"
+    65000:7 '"65000:5", "65000:6"' "$N3_STATUS"
 
 # ---------------------------------------------------------------- 启动
 
@@ -220,6 +239,11 @@ URL_RR_A="http://127.0.0.1:$RR_A_STATUS/status"
 URL_N1="http://127.0.0.1:$N1_STATUS/status"
 URL_N2="http://127.0.0.1:$N2_STATUS/status"
 URL_N3="http://127.0.0.1:$N3_STATUS/status"
+
+info "推本端前缀（扮演 sr-frr 的 PUT /local-prefixes）"
+push_local "$N1_STATUS" 10.10.0.0/16 "node1 宣告 10.10.0.0/16@vrf5" || die "node1 前缀推不进去"
+push_local "$N2_STATUS" 10.20.0.0/16 "node2 宣告 10.20.0.0/16@vrf5" || die "node2 前缀推不进去"
+push_local "$N3_STATUS" 10.30.0.0/16 "node3 宣告 10.30.0.0/16@vrf5" || die "node3 前缀推不进去"
 
 # ---------------------------------------------------------------- 断言
 
@@ -287,8 +311,9 @@ info "(E) 闸在收端：node2 只剩到 node3 的隧道，node1 的路由被收
 kill "$N2" 2>/dev/null || true
 wait "$N2" 2>/dev/null || true
 write_node 2 '[{"peer_device_id": 3, "next_hop": "192.168.99.3"}]' \
-    10.20.0.0/16 65000:6 '"65000:5"' "$N2_STATUS"
+    65000:6 '"65000:5"' "$N2_STATUS"
 start sr-route "$WORK/node2.json" "$WORK/node2.log.2"; N2=$LAST_PID
+push_local "$N2_STATUS" 10.20.0.0/16 "node2 重启后把 10.20.0.0/16 推回去" || die "node2 前缀推不进去"
 wait_status "$URL_N2" \
     "d['rib_ready'] and any(p['prefix']=='10.10.0.0/16' and p['reason']=='no_path' for p in d['pending'])" \
     "node2 把 node1 的路由停在 no_path（收到了，本机没有到 node1 的隧道）" 25

@@ -754,7 +754,7 @@ O1..O4 是"数据面+本地选路"，O5 是"不重启进程也能收敛"，O6 �
     （`start.sh:311-314`）。O5-d 判据量到的"重启后 0 条"是脚本**故意**把控制器指向
     127.0.0.1:18799（没人监听）造成的，量的是"离线开机"那一格，不是常态。
     ② 所以"进配置包"真正要补的是**另一批数据**：每台每 VPN 的 `export/import_rts`、
-    overlay 侧的 `local_prefixes`、`escape_all_colors`、sr-fib 的 `vrfs`+`tunnels`、
+    overlay 侧的本端前缀集合（`sr-frr` 经 `PUT /local-prefixes` 推）、`escape_all_colors`、sr-fib 的 `vrfs`+`tunnels`、
     sr-frr 的 `vrfs`+`import` —— 这些今天只存在于设备上、由 `test/lab/bringup.sh` 手写，
     控制器代码里 grep 不到（`internal/apply` 里 `Tunnel` 零命中，bundle 只有
     `Artifacts{FRR,VPP,Boot}` 三段文本）。

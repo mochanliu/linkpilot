@@ -263,7 +263,7 @@ vCPE 跑的是 `controller/cmd/sr-agent`：入网一次、然后每 5 秒心跳�
 - eBGP 邻居必须落在该 VPN 某个客户口的直连网段内（TTL 1，否则建不起来）；
   iBGP 允许非直连，但要求直连网段或静态路由能递归到它，未开 next-hop-self
   会给警告；BGP/OSPF router-id 跨 VPN 复用也会提示；
-- VPN 250（overlay）与 1250（FRR table-direct）保留，不能配成客户 VPN。
+- VPN 250（overlay）保留，不能配成客户 VPN（1250 的 table-direct 已随 ZAPI 导出退役）。
 
 配置归属按实测（lab-cpe1，2026-10-27）划分：FRR 管主机名、接口 IP、静态路由、
 BGP/OSPF；VPP 只管接口所在 table、MTU、管理状态与 lcp TAP；内核管 VRF、
@@ -555,7 +555,8 @@ docker exec -i -e CODE=<激活码> lab-o6b1 bash -c \
 
 `/etc/sdwan/route.json` **先由运维手工写一份**，控制器那一段只覆盖 `tunnels`+`vrfs`
 （D6=S1 先叠加，从不创建这个文件）：`identity_dir`/`status_addr`/`rrs`/`tenant`/
-`device_id`/`serial`/`hold_sec`/`local_prefixes` 都是盒子自己的键。`rrs` 故意指向
+`device_id`/`serial`/`hold_sec` 都是盒子自己的键。本端前缀不在这份文件里 —— 运行时
+由盒内 `sr-frr` 经 `PUT /local-prefixes` 推给 sr-route。`rrs` 故意指向
 `10.99.0.250:18446`（没人听，id 就叫 `rr-none`）——**这对容器没有 RR**，所以运行中
 那张表唯一可能的来源就是 `sr-apply` 推的 `PUT /vrfs`，"没重启进程而表变了"才说明问题。
 
@@ -627,9 +628,9 @@ BOX=lab-cpe1 test/scripts/test-overlay-bundle.sh --keep     # 保留 /tmp/sr-ove
 make-before-break 只答"已开始" → 盘上缺 `status_addr` 能叠不能推 → 盘上缺 `route.json`
 整包 rc=1 而版本已装进 `versions/` → 收尾核对盒子的 pid 与哈希。当前 53 通过 / 0 失败。
 
-一条已知的、**尚未修**的产品不一致（#185，待拍）：设备键 `local_prefixes` 指向的 VPN
-若不在控制器发布的 `vrfs` 里，**运行中**只记 `local_skips`，**启动却是硬错**
-（sr-route 拒绝起来）。脚本为此让每一处"重新起 sr-route"都保有 VPN 0。
+本端前缀只在运行时存在：sr-route 启动时一条都不宣告，由盒内 `sr-frr` 经
+`PUT /local-prefixes` 推当前集合。所以不存在"配置里写了某个 VPN、运行中那个 VPN
+却不在发布的 `vrfs` 里"这种形态；#185 随之作废。
 
 ## 登进去测
 

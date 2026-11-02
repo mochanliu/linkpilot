@@ -51,6 +51,16 @@ func testClient(t *testing.T, cfg route.ClientConfig) *route.Client {
 	return c
 }
 
+// testClientWithLocal is testClient plus the local set sr-frr would have pushed.
+func testClientWithLocal(t *testing.T, cfg route.ClientConfig, lps ...route.LocalPrefix) *route.Client {
+	t.Helper()
+	c := testClient(t, cfg)
+	if err := c.SetLocalPrefixes(lps); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
+	}
+	return c
+}
+
 func newServer(t *testing.T, c *route.Client) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(statusMux(c))
@@ -92,7 +102,7 @@ func getStatus(t *testing.T, srv *httptest.Server) statusDoc {
 }
 
 func TestStatusReportsTheTablesInForce(t *testing.T) {
-	c := testClient(t, route.ClientConfig{
+	c := testClientWithLocal(t, route.ClientConfig{
 		VRFs: []route.VRFConfig{
 			{ID: 5, ExportRTs: []string{"65000:5"}, ImportRTs: []string{"65000:6"}},
 			{ID: 6, ExportRTs: []string{"65000:6"}}, // a hub VRF: exports only
@@ -101,8 +111,7 @@ func TestStatusReportsTheTablesInForce(t *testing.T) {
 			{Peer: 22, NextHop: "192.168.100.2"},
 			{Peer: 20, NextHop: "192.168.99.2"},
 		},
-		LocalPrefixes: []route.LocalPrefix{{VRFID: 5, Prefix: "10.10.0.0/16"}},
-	})
+	}, route.LocalPrefix{VRFID: 5, Prefix: "10.10.0.0/16"})
 	srv := newServer(t, c)
 
 	// No session was ever run, so the table is empty and nothing is pending --
@@ -219,12 +228,11 @@ func TestPutTunnelsReplacesAndRejects(t *testing.T) {
 // its prefixes rather than leave them announced under a policy nobody configured
 // -- and they have to come back, and be reported the whole time.
 func TestPutVrfsWithdrawsAndRestoresLocalRoutes(t *testing.T) {
-	c := testClient(t, route.ClientConfig{
+	c := testClientWithLocal(t, route.ClientConfig{
 		VRFs: []route.VRFConfig{
 			{ID: 5, ExportRTs: []string{"65000:5"}, ImportRTs: []string{"65000:6"}},
 		},
-		LocalPrefixes: []route.LocalPrefix{{VRFID: 5, Prefix: "10.10.0.0/16"}},
-	})
+	}, route.LocalPrefix{VRFID: 5, Prefix: "10.10.0.0/16"})
 	srv := newServer(t, c)
 	if n := len(getStatus(t, srv).Local); n != 1 {
 		t.Fatalf("local = %d, want 1", n)
@@ -273,8 +281,50 @@ func TestPutVrfsWithdrawsAndRestoresLocalRoutes(t *testing.T) {
 	}
 }
 
-// GET and PUT share one shape per table, so the body an operator reads out of
-// /status is a body they can PUT back.
+// PUT /local-prefixes is the only way a local prefix gets announced: sr-frr
+// publishes what the in-box FRR learned and the box's own config carries no
+// prefix list. So the seam has to replace (not merge) and it has to refuse a
+// set whose VRF nobody has published.
+func TestPutLocalPrefixesReplacesAndValidates(t *testing.T) {
+	c := testClientWithLocal(t, route.ClientConfig{
+		VRFs: []route.VRFConfig{{ID: 5, ExportRTs: []string{"65000:5"}}},
+	}, route.LocalPrefix{VRFID: 5, Prefix: "10.10.0.0/16"})
+	srv := newServer(t, c)
+
+	code, raw := call(t, srv, http.MethodPut, "/local-prefixes",
+		`{"prefixes":[{"vrf_id":5,"prefix":"10.20.0.0/16"},{"vrf_id":5,"prefix":"10.30.0.0/16"}]}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT /local-prefixes = %d: %s", code, raw)
+	}
+	doc := getStatus(t, srv)
+	if len(doc.Local) != 2 || doc.Local[0].Prefix != "10.20.0.0/16" || doc.Local[1].Prefix != "10.30.0.0/16" {
+		t.Fatalf("local = %+v, want the replaced set only", doc.Local)
+	}
+
+	// A misspelled field must not read as "withdraw everything".
+	code, raw = call(t, srv, http.MethodPut, "/local-prefixes",
+		`{"prefix":[{"vrf_id":5,"prefix":"10.40.0.0/16"}]}`)
+	if code != http.StatusBadRequest || !strings.Contains(raw, "unknown field") {
+		t.Fatalf("unknown field = %d: %s", code, raw)
+	}
+	// A VRF the table does not have is a 400, and leaves the set alone.
+	code, raw = call(t, srv, http.MethodPut, "/local-prefixes",
+		`{"prefixes":[{"vrf_id":9,"prefix":"10.0.0.0/8"}]}`)
+	if code != http.StatusBadRequest || !strings.Contains(raw, "unconfigured vrf") {
+		t.Fatalf("unknown vrf = %d: %s", code, raw)
+	}
+	if got := getStatus(t, srv).Local; len(got) != 2 {
+		t.Fatalf("a rejected PUT changed the announcements: %+v", got)
+	}
+
+	// GET reads back the same shape, so sr-frr's own debugging and the console
+	// both see the set in force.
+	code, raw = call(t, srv, http.MethodGet, "/local-prefixes", "")
+	if code != http.StatusOK || !strings.Contains(raw, "10.20.0.0/16") {
+		t.Fatalf("GET /local-prefixes = %d: %s", code, raw)
+	}
+}
+
 func TestStatusListsRoundTripThroughPut(t *testing.T) {
 	c := testClient(t, route.ClientConfig{
 		VRFs: []route.VRFConfig{
@@ -316,10 +366,9 @@ func TestHeldListIsBoundedAndSaysSo(t *testing.T) {
 	for i := 0; i < n; i++ {
 		lps = append(lps, route.LocalPrefix{VRFID: 5, Prefix: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256)})
 	}
-	c := testClient(t, route.ClientConfig{
-		VRFs:          []route.VRFConfig{{ID: 5, ExportRTs: []string{"65000:5"}}},
-		LocalPrefixes: lps,
-	})
+	c := testClientWithLocal(t, route.ClientConfig{
+		VRFs: []route.VRFConfig{{ID: 5, ExportRTs: []string{"65000:5"}}},
+	}, lps...)
 	srv := newServer(t, c)
 	if got := getStatus(t, srv).LocalSkipsTotal; got != 0 {
 		t.Fatalf("skips before = %d", got)

@@ -35,9 +35,6 @@ func validateBasicConfig(c *BasicConfig) []ConfigCheck {
 		if v.ID == vpnReservedOverlay {
 			add("error", "VPN 250 是 overlay 保留表，不能给客户口使用。")
 		}
-		if v.ID == vpnReservedTable {
-			add("error", "VPN 1250 是 FRR table-direct 保留表，不能给客户口使用。")
-		}
 	}
 	if !seenVPN[0] {
 		add("error", "缺少 VPN 0：默认 VPN 不能被删除。")

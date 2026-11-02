@@ -102,13 +102,6 @@ func TestValidateBasicConfig(t *testing.T) {
 			severity: "error", substr: "overlay 保留表",
 		},
 		{
-			name: "reserved frr table",
-			mutate: func(c *BasicConfig) {
-				c.VPNs = append(c.VPNs, ConfigVPN{ID: 1250})
-			},
-			severity: "error", substr: "table-direct 保留表",
-		},
-		{
 			name: "same address in two VRFs is legal",
 			mutate: func(c *BasicConfig) {
 				c.Ifaces[1].IP = "10.79.1.2"

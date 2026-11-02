@@ -16,7 +16,7 @@
 #       1 条路径（buckets:1）、标签是 RD 更小的那个源（2/41）、并且 fib.log 里
 #       有"择一"的警告。反例是"两条都装，VPP 自己取一个" —— 那 FIB 里没有的那
 #       个源就静默消失了，出了故障查不到痕迹。
-#   (4) 择一规则不是插入顺序也不是运气：把 41 那份撤掉重启，同一个前缀必须
+#   (4) 择一规则不是插入顺序也不是运气：把 41 那份从宣告集合里撤掉，同一个前缀必须
 #       **改压 1042**；再把 41 加回来，又回到 1041。三轮下来才说明它跟着 RD 走。
 #
 # 前置：**必须先跑过 test/scripts/test-e2e.sh --keep**（node1↔node2 的
@@ -94,6 +94,24 @@ die()  { echo "FATAL: $*" >&2; exit 2; }
 
 dx()  { docker exec "$1" bash -lc "$2"; }
 vpp() { docker exec "$1" bash -lc "vppctl $2" 2>/dev/null | tr -d '\r'; }
+
+# push_local <container> <status-port> <body-json> <label> —— 扮演 sr-frr：sr-route
+# 只从 PUT /local-prefixes 收本端前缀。进程刚起时端口还没 listen，curl 直接失败
+# 不是被测行为，所以要重试。
+push_local() {
+    local c=$1 port=$2 body=$3 label=$4 i=0
+    while [ "$i" -lt 50 ]; do
+        if dx "$c" "curl -sf --max-time 2 -X PUT http://127.0.0.1:$port/local-prefixes \
+            -H 'Content-Type: application/json' -d '$body'" >/dev/null; then
+            ok "$label"
+            return 0
+        fi
+        sleep 0.2
+        i=$((i+1))
+    done
+    bad "$label（超时）"
+    return 1
+}
 
 # ---------------------------------------------------------------- 断言工具
 
@@ -212,15 +230,6 @@ kill_one() {   # <container> <name>
 port_busy() {   # <port> —— node1 上有没有人在听这个口
     dx "$N1" "ss -ltn" 2>/dev/null | grep -q ":$1 "
 }
-wait_port_free() {   # <port> [timeout_s]
-    local port=$1 limit=${2:-10} i=0
-    while port_busy "$port"; do
-        i=$((i + 1))
-        [ "$i" -ge $((limit * 5)) ] && return 1
-        sleep 0.2
-    done
-    return 0
-}
 warn_line() {   # 最近一条 sr-fib 警告
     dx "$N1" "grep 警告 $WORK/$1 | tail -1" 2>/dev/null
 }
@@ -233,7 +242,7 @@ cleanup() {
     tap_del "$N1" "$TAP_N1"
     tap_del "$N2" "$TAP_N2"
     kill_one "$N2" fib
-    for n in fib node2b node2 node1 rr; do kill_one "$N1" "$n"; done
+    for n in fib node2 node1 rr; do kill_one "$N1" "$n"; done
     sleep 0.3
     dx "$N1" "$WORK/bin/sr-fib -config $WORK/fib.json -reset" >/dev/null 2>&1 || true
     dx "$N2" "$WORK/bin/sr-fib -config $WORK/fib2.json -reset" >/dev/null 2>&1 || true
@@ -309,17 +318,15 @@ cat > "$WORK/node1.json" <<EOF
   "rrs": [{"id": "rr-a", "addr": "127.0.0.1:$RR_PORT"}],
   "tunnels": [{"peer_device_id": 2, "next_hop": "$OVERLAY_N2"}],
   "vrfs": [{"id": $VRF_DST, "export_rts": ["65000:40"], "import_rts": ["65000:41", "65000:42"]}],
-  "local_prefixes": [{"vrf_id": $VRF_DST, "prefix": "$PFX_DST"}],
   "status_addr": "127.0.0.1:$N1_STATUS"
 }
 EOF
 
 # node2：VPN 41 与 42 都送 $PFX_SHARED —— 同一个前缀两个来源，就是负向那段的输入。
 # 42 的 import 挂一个永不命中的 RT：它只负责导出，免得 node2 的 RIB 多出键 42。
-write_node2() {   # <shared-in-41: 0|1> <outfile>
-    local both=$1 out=$2 extra=""
-    [ "$both" = 1 ] && extra=",{\"vrf_id\": $VRF_SRC, \"prefix\": \"$PFX_SHARED\"}"
-    cat > "$out" <<EOF
+# 宣告哪个集合不在配置里：启动后由 push_local 扮演 sr-frr 推进去，第 (4) 段换的
+# 就是推的那份集合（撤回 41 的那一条），进程本身不重启。
+cat > "$WORK/node2.json" <<EOF
 {
   "tenant": "tenant-a",
   "device_id": 2,
@@ -330,14 +337,9 @@ write_node2() {   # <shared-in-41: 0|1> <outfile>
   "tunnels": [{"peer_device_id": 1, "next_hop": "$OVERLAY_N1"}],
   "vrfs": [{"id": $VRF_SRC, "export_rts": ["65000:41"], "import_rts": ["65000:40"]},
            {"id": $VRF_SRC2, "export_rts": ["65000:42"], "import_rts": ["65000:99"]}],
-  "local_prefixes": [{"vrf_id": $VRF_SRC, "prefix": "$PFX_SRC"}$extra,
-                     {"vrf_id": $VRF_SRC2, "prefix": "$PFX_SHARED"}],
   "status_addr": "0.0.0.0:$N2_STATUS"
 }
 EOF
-}
-write_node2 1 "$WORK/node2.json"     # 阶段 A：41 与 42 都送 $PFX_SHARED
-write_node2 0 "$WORK/node2b.json"    # 阶段 B：只留 42 送它
 
 cat > "$WORK/fib.json" <<EOF
 {
@@ -359,20 +361,6 @@ nohup ./bin/sr-route -config node2.json > node2.log 2>&1 & echo $! > node2.pid
 nohup ./bin/sr-fib   -config fib.json   > fib.log   2>&1 & echo $! > fib.pid
 EOF
 chmod +x "$WORK/start.sh"
-
-# 换配置重启 node2 的 sr-route（择一那两段用）。pid 必须由这个脚本自己写：
-# `cd $WORK && nohup prog > log & echo $! > x.pid` 这种写法里 `&` 把整条
-# `cd && nohup` 变成后台子 shell，echo 是在**登录目录**执行的 —— pid 落到 /root
-# 而不是 $WORK，于是 cleanup 找不到它，旧进程一直占着 node2 的状态口，
-# 下一轮 sr-route 起来说 "bind: address already in use"，失败还伪装成
-# "对端路由没装上"。这个脚本自己 cd 再写 pid，$! 就是 sr-route 本身。
-cat > "$WORK/start-route.sh" <<'EOF'
-#!/bin/bash
-set -e
-cd "$(dirname "$0")"
-nohup ./bin/sr-route -config "$1" > "$2" 2>&1 & echo $! > "$3"
-EOF
-chmod +x "$WORK/start-route.sh"
 EOS
 
 # node2 的 sr-fib：VPP 在它自己的容器里，RIB 从 node1 内核口上的 node2 状态口拉。
@@ -432,6 +420,14 @@ for p in "$RR_PORT" "$N1_STATUS" "$N2_STATUS"; do
 done
 dx "$N1" "bash $WORK/start.sh" || die "启动失败"
 sleep 0.5
+
+info "   推本端前缀（扮演 sr-frr 的 PUT /local-prefixes）"
+push_local "$N1" "$N1_STATUS" \
+    "{\"prefixes\":[{\"vrf_id\":$VRF_DST,\"prefix\":\"$PFX_DST\"}]}" \
+    "node1 宣告 $PFX_DST@vrf$VRF_DST" || die "node1 前缀推不进去"
+push_local "$N1" "$N2_STATUS" \
+    "{\"prefixes\":[{\"vrf_id\":$VRF_SRC,\"prefix\":\"$PFX_SRC\"},{\"vrf_id\":$VRF_SRC,\"prefix\":\"$PFX_SHARED\"},{\"vrf_id\":$VRF_SRC2,\"prefix\":\"$PFX_SHARED\"}]}" \
+    "node2 宣告 $PFX_SRC@vrf$VRF_SRC 与 $PFX_SHARED@vrf$VRF_SRC/vrf$VRF_SRC2" || die "node2 前缀推不进去"
 
 wait_json "$N1_STATUS" \
     "sorted([(r['vrf_id'], r['prefix']) for r in d['rib'].get('$VRF_DST', [])]) == [($VRF_SRC, '$PFX_SRC'), ($VRF_SRC, '$PFX_SHARED'), ($VRF_SRC2, '$PFX_SHARED')]" \
@@ -499,13 +495,10 @@ warn_line fib.log | grep -q 择一 &&
 # ---------------------------------------------------------------- 6 择一跟着 RD
 
 info "(4) 撤掉 VPN $VRF_SRC 那份 $PFX_SHARED：同一前缀必须改压 $LBL_SRC2"
-restart_node2() {   # <config> <log> —— pid 一律写 node2.pid，收尾才杀得到
-    kill_one "$N1" node2
-    wait_port_free "$N2_STATUS" 10 || die "node2 的状态口 $N2_STATUS 杀完还占着"
-    dx "$N1" "bash $WORK/start-route.sh $1 $2 node2.pid" || die "node2 用 $1 重启失败"
-    sleep 0.5
-}
-restart_node2 node2b.json node2b.log
+# 盒子上的"撤回"是 sr-frr 重新推一份集合，不是重启 sr-route：这里照做。
+push_local "$N1" "$N2_STATUS" \
+    "{\"prefixes\":[{\"vrf_id\":$VRF_SRC,\"prefix\":\"$PFX_SRC\"},{\"vrf_id\":$VRF_SRC2,\"prefix\":\"$PFX_SHARED\"}]}" \
+    "node2 只留 vrf$VRF_SRC2 送 $PFX_SHARED" || die "node2 前缀集推不进去"
 wait_json "$N1_STATUS" \
     "[r['vrf_id'] for r in d['rib'].get('$VRF_DST', []) if r['prefix'] == '$PFX_SHARED'] == [$VRF_SRC2]" \
     "node1 的 RIB 里 $PFX_SHARED 只剩来源 $VRF_SRC2（41 那份已被撤回）" 30
@@ -516,7 +509,9 @@ path_label "$N1" "$VRF_DST" "$PFX_SHARED" "$LBL_SRC" &&
     ok "$LBL_SRC 那份已经不在了（赢家随来源变化重算，不是先到先得）"
 
 info "(4) 把 VPN $VRF_SRC 那份加回来：又回到 $LBL_SRC 胜出"
-restart_node2 node2.json node2c.log
+push_local "$N1" "$N2_STATUS" \
+    "{\"prefixes\":[{\"vrf_id\":$VRF_SRC,\"prefix\":\"$PFX_SRC\"},{\"vrf_id\":$VRF_SRC,\"prefix\":\"$PFX_SHARED\"},{\"vrf_id\":$VRF_SRC2,\"prefix\":\"$PFX_SHARED\"}]}" \
+    "node2 恢复 vrf$VRF_SRC 也送 $PFX_SHARED" || die "node2 前缀集推不进去"
 wait_json "$N1_STATUS" \
     "sorted([(r['vrf_id'], r['prefix']) for r in d['rib'].get('$VRF_DST', []) if r['prefix'] == '$PFX_SHARED']) == [($VRF_SRC, '$PFX_SHARED'), ($VRF_SRC2, '$PFX_SHARED')]" \
     "node1 的 RIB 里 $PFX_SHARED 又回到两个来源" 30
@@ -528,7 +523,7 @@ warn_line fib.log | grep -q 择一 && ok "警告仍在（这一轮又丢了一�
 echo
 echo "== 结果：$PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then
-    for f in fib node1 node2 node2b node2c rr; do
+    for f in fib node1 node2 rr; do
         echo "---- $f.log" >&2
         dx "$N1" "tail -25 $WORK/$f.log" >&2 2>/dev/null || true
     done

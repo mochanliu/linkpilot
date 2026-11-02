@@ -22,18 +22,30 @@ func testClientConfig() ClientConfig {
 			ExportRTs: []string{"65000:5"},
 			ImportRTs: []string{"65000:6"},
 		}},
-		LocalPrefixes: []LocalPrefix{{VRFID: 5, Prefix: "10.10.0.0/16"}},
-		Tunnels:       []Tunnel{{Peer: 20, NextHop: "192.168.99.2"}},
-		RRs:           []RRConfig{{ID: "rr-a", Addr: "rr-a"}},
-		Dial:          func(context.Context, string) (net.Conn, error) { return nil, nil },
+		Tunnels: []Tunnel{{Peer: 20, NextHop: "192.168.99.2"}},
+		RRs:     []RRConfig{{ID: "rr-a", Addr: "rr-a"}},
+		Dial:    func(context.Context, string) (net.Conn, error) { return nil, nil },
 	}
 }
 
+// testLocalPrefixes is the baseline prefix every client used to carry in its
+// config. It is injected the way production injects it now (sr-frr → PUT
+// /local-prefixes → SetLocalPrefixes), so the tests exercise the same path.
+var testLocalPrefixes = []LocalPrefix{{VRFID: 5, Prefix: "10.10.0.0/16"}}
+
 func startClient(t *testing.T, cfg ClientConfig) *Client {
+	t.Helper()
+	return startClientWithLocal(t, cfg, testLocalPrefixes)
+}
+
+func startClientWithLocal(t *testing.T, cfg ClientConfig, lps []LocalPrefix) *Client {
 	t.Helper()
 	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.SetLocalPrefixes(lps); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -98,11 +110,6 @@ func TestNewClientValidation(t *testing.T) {
 		}, "twice"},
 		{"bad export rt", func(c *ClientConfig) { c.VRFs[0].ExportRTs = []string{"x"} }, "bad RT"},
 		{"bad import rt", func(c *ClientConfig) { c.VRFs[0].ImportRTs = []string{"1:"} }, "bad RT"},
-		{"unknown vrf", func(c *ClientConfig) { c.LocalPrefixes = []LocalPrefix{{VRFID: 9, Prefix: "10.0.0.0/8"}} }, "unconfigured vrf"},
-		{"no export rts", func(c *ClientConfig) {
-			c.VRFs[0].ExportRTs = nil
-		}, "no export RTs"},
-		{"bad local prefix", func(c *ClientConfig) { c.LocalPrefixes[0].Prefix = "10.10.1.1/16" }, "not canonical"},
 		{"tunnel to this device", func(c *ClientConfig) {
 			c.Tunnels = []Tunnel{{Peer: 10, NextHop: "192.168.99.9"}}
 		}, "this device"},
@@ -140,8 +147,53 @@ func TestClientWithoutTunnelsIsValid(t *testing.T) {
 	if n := len(c.Tunnels()); n != 0 {
 		t.Fatalf("tunnels = %d, want 0", n)
 	}
-	if n := len(c.LocalRoutes()); n != 1 {
-		t.Fatalf("local routes = %d", n)
+	// And a freshly built client announces nothing: the local set has one
+	// owner (SetLocalPrefixes, fed by the in-box FRR), not a config key.
+	if n := len(c.LocalRoutes()); n != 0 {
+		t.Fatalf("local routes = %d, want 0 before any SetLocalPrefixes", n)
+	}
+}
+
+func TestSetLocalPrefixesValidation(t *testing.T) {
+	c, err := NewClient(testClientConfig())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.SetLocalPrefixes(testLocalPrefixes); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
+	}
+	cases := []struct {
+		name string
+		lps  []LocalPrefix
+		want string
+	}{
+		{"unknown vrf", []LocalPrefix{{VRFID: 9, Prefix: "10.0.0.0/8"}}, "unconfigured vrf"},
+		{"bad local prefix", []LocalPrefix{{VRFID: 5, Prefix: "10.10.1.1/16"}}, "not canonical"},
+		// One bad entry rejects the whole set: a half-applied import cannot be
+		// described to the operator afterwards.
+		{"one bad in a good set", []LocalPrefix{
+			{VRFID: 5, Prefix: "10.30.0.0/16"},
+			{VRFID: 9, Prefix: "10.0.0.0/8"},
+		}, "unconfigured vrf"},
+	}
+	for _, tc := range cases {
+		if err := c.SetLocalPrefixes(tc.lps); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: error = %v, want containing %q", tc.name, err, tc.want)
+		}
+	}
+	if got := c.LocalRoutes(); len(got) != 1 || got[0].Prefix != "10.10.0.0/16" {
+		t.Fatalf("a rejected set changed the announcements: %+v", got)
+	}
+
+	// A VRF with no export RTs cannot announce anything: the route would carry
+	// no RT for anyone to import, so the prefix is refused rather than blamed
+	// on the VRF later.
+	if err := c.SetVRFs([]VRFConfig{{ID: 5, ImportRTs: []string{"65000:6"}}}); err != nil {
+		t.Fatalf("SetVRFs: %v", err)
+	}
+	if err := c.SetLocalPrefixes([]LocalPrefix{{VRFID: 5, Prefix: "10.40.0.0/16"}}); err == nil ||
+		!strings.Contains(err.Error(), "no export RTs") {
+		t.Fatalf("prefix on an exporting-nothing vrf: error = %v", err)
 	}
 }
 
@@ -176,10 +228,15 @@ func TestLocalRoutesArePathFree(t *testing.T) {
 	cfg := testClientConfig()
 	cfg.VRFs[0].ExportRTs = []string{"65000:50", "65000:5"}
 	cfg.VRFs = append(cfg.VRFs, VRFConfig{ID: 6, ExportRTs: []string{"65000:6"}, ImportRTs: []string{"65000:7"}})
-	cfg.LocalPrefixes = append(cfg.LocalPrefixes, LocalPrefix{VRFID: 6, Prefix: "10.20.0.0/16"})
 	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.SetLocalPrefixes([]LocalPrefix{
+		{VRFID: 5, Prefix: "10.10.0.0/16"},
+		{VRFID: 6, Prefix: "10.20.0.0/16"},
+	}); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
 	}
 	got := c.LocalRoutes()
 	if len(got) != 2 {
@@ -964,12 +1021,11 @@ func TestSetVRFsRestampsAndWithdrawsLocalRoutes(t *testing.T) {
 		{ID: 5, ExportRTs: []string{"65000:5"}, ImportRTs: []string{"65000:6"}},
 		{ID: 6, ExportRTs: []string{"65000:6"}, ImportRTs: []string{"65000:9"}},
 	}
-	cfg.LocalPrefixes = []LocalPrefix{
+	cfg.Dial = srv.dial
+	c := startClientWithLocal(t, cfg, []LocalPrefix{
 		{VRFID: 5, Prefix: "10.10.0.0/16"},
 		{VRFID: 6, Prefix: "10.20.0.0/16"},
-	}
-	cfg.Dial = srv.dial
-	c := startClient(t, cfg)
+	})
 	waitFor(t, "the RR holds both prefixes", func() bool { return len(rr.RoutesOf(10)) == 2 })
 
 	// Drop vrf 6 and change vrf 5's export RT in one step. The prefix on the
@@ -1009,6 +1065,9 @@ func TestRejectedChangeLeavesTheTablesAlone(t *testing.T) {
 	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.SetLocalPrefixes(testLocalPrefixes); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
 	}
 	cases := []struct {
 		name string
@@ -1063,7 +1122,8 @@ func TestTableChangeWhileNoSessionIsAnnouncedOnReconnect(t *testing.T) {
 	}
 	srv.revive()
 	waitForWithin(t, 20*time.Second, "the new session to carry the prefix", func() bool {
-		return len(rr.Sessions()) == 1 && len(rr.RoutesOf(10)) == 2
+		rs := rr.RoutesOf(10)
+		return len(rr.Sessions()) == 1 && len(rs) == 1 && rs[0].Prefix == "10.50.0.0/16"
 	})
 	if n := len(c.Tunnels()); n != 2 {
 		t.Fatalf("tunnels = %d, want 2", n)

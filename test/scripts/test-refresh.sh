@@ -231,6 +231,25 @@ put() {   # <port> <path> <body>
     return 1
 }
 
+# push_local <port> <body> <label> —— 重启后把本端前缀推回去。盒子上这一步是
+# sr-frr 干的（它盯着盒内 FRR，把学到的前缀 PUT 到这个入口）；这支判据只跑
+# rr + 两台 sr-route，所以由脚本替 sr-frr 推同一份集合。重试是因为进程刚起：
+# 端口还没 listen 时 curl 直接失败，不是被测行为。
+push_local() {   # <port> <body> <label>
+    local port=$1 body=$2 label=$3 i=0
+    while [ "$i" -lt 50 ]; do
+        if put "$port" "/local-prefixes" "$body" 2>/dev/null; then
+            ok "$label"
+            return 0
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
+    bad "$label（超时）"
+    return 1
+}
+
+
 # ---------------------------------------------------------------- 清理
 
 kill_one() {   # <container> <name>
@@ -327,8 +346,6 @@ cat > "$WORK/node1.json" <<EOF
   "tunnels": [],
   "vrfs": [{"id": $VRF_DST, "export_rts": ["65000:50"], "import_rts": ["65000:99"]},
            {"id": $VRF_LEAK, "export_rts": ["65000:53"]}],
-  "local_prefixes": [{"vrf_id": $VRF_DST, "prefix": "$PFX_DST"},
-                     {"vrf_id": $VRF_LEAK, "prefix": "$PFX_LEAK"}],
   "status_addr": "127.0.0.1:$N1_STATUS"
 }
 EOF
@@ -345,7 +362,6 @@ cat > "$WORK/node2.json" <<EOF
   "rrs": [{"id": "rr-a", "addr": "127.0.0.1:$RR_PORT"}],
   "tunnels": [{"peer_device_id": 1, "next_hop": "$OVERLAY_N1"}],
   "vrfs": [{"id": $VRF_SRC, "export_rts": ["65000:51"], "import_rts": ["65000:50", "65000:53"]}],
-  "local_prefixes": [{"vrf_id": $VRF_SRC, "prefix": "$PFX_SRC"}],
   "status_addr": "0.0.0.0:$N2_STATUS"
 }
 EOF
@@ -480,6 +496,16 @@ for s in "$stamp_rr" "$stamp_n1" "$stamp_n2" "$stamp_f1" "$stamp_f2"; do
     esac
 done
 ok "五个进程的 pid + 启动时刻已记下，阶段 G 回来比"
+
+# 本端前缀的唯一入口是 PUT /local-prefixes（生产上由 sr-frr 推）；sr-route 的
+# 配置里不再有本端前缀这个键。这里替 sr-frr 推一次，之后就再也不动。
+info "3. 推本端前缀（扮演 sr-frr 的 PUT /local-prefixes）"
+push_local "$N1_STATUS" \
+    "{\"prefixes\":[{\"vrf_id\":$VRF_DST,\"prefix\":\"$PFX_DST\"},{\"vrf_id\":$VRF_LEAK,\"prefix\":\"$PFX_LEAK\"}]}" \
+    "node1 宣告 $PFX_DST@$VRF_DST 与 $PFX_LEAK@$VRF_LEAK" || exit 1
+push_local "$N2_STATUS" \
+    "{\"prefixes\":[{\"vrf_id\":$VRF_SRC,\"prefix\":\"$PFX_SRC\"}]}" \
+    "node2 宣告 $PFX_SRC@$VRF_SRC" || exit 1
 
 # ---------------------------------------------------------------- A 空隧道表
 

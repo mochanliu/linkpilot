@@ -20,8 +20,7 @@ import (
 )
 
 const (
-	vpnReservedOverlay = 250  // overlay table, owned by the route plane
-	vpnReservedTable   = 1250 // FRR table-direct, owned by overlay
+	vpnReservedOverlay = 250 // overlay table, owned by the route plane
 	vpnMaxID           = 65535
 
 	cfgMaxVPNs      = 64

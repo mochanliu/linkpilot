@@ -107,6 +107,25 @@ record() {   # <key> <value>
 dx()  { docker exec "$1" bash -lc "$2"; }
 vpp() { docker exec "$1" bash -lc "vppctl $2" 2>/dev/null | tr -d '\r'; }
 
+# push_local <container> <status-port> <prefix> <label> —— 扮演 sr-frr：sr-route 只从
+# PUT /local-prefixes 收本端前缀。进程刚起时端口还没 listen，curl 直接失败不是被测
+# 行为，所以要重试。
+push_local() {
+    local c=$1 port=$2 prefix=$3 label=$4 i=0
+    while [ "$i" -lt 50 ]; do
+        if dx "$c" "curl -sf --max-time 2 -X PUT http://127.0.0.1:$port/local-prefixes \
+            -H 'Content-Type: application/json' \
+            -d '{\"prefixes\":[{\"vrf_id\":$VRF,\"prefix\":\"$prefix\"}]}'" >/dev/null; then
+            ok "$label"
+            return 0
+        fi
+        sleep 0.2
+        i=$((i+1))
+    done
+    bad "$label（超时）"
+    return 1
+}
+
 # ---------------------------------------------------------------- 断言工具
 
 has_iface() { vpp "$1" "show interface $2" | awk -v n="$2" '$1==n {f=1} END {exit !f}'; }
@@ -405,7 +424,6 @@ for n in 1 2; do
   "tunnels": [{"peer_device_id": $PEER, "next_hop": "$PA"},
               {"peer_device_id": $PEER, "next_hop": "$PB"}],
   "vrfs": [{"id": $VRF, "export_rts": ["65000:100"], "import_rts": ["65000:100"]}],
-  "local_prefixes": [{"vrf_id": $VRF, "prefix": "$LP"}],
   "status_addr": "$ST"
 }
 EOF
@@ -514,6 +532,10 @@ fi
 
 dx "$N1" "bash $WORK/start.sh" || die "启动失败"
 sleep 0.5
+
+info "   推本端前缀（扮演 sr-frr 的 PUT /local-prefixes）"
+push_local "$N1" "$N1_STATUS" "$LOCAL_PFX" "node1 宣告 $LOCAL_PFX@vrf$VRF" || die "node1 前缀推不进去"
+push_local "$N2" "$N2_STATUS" "$REMOTE_PFX" "node2 宣告 $REMOTE_PFX@vrf$VRF" || die "node2 前缀推不进去"
 
 if [ "$(status_hops)" != "$HOPS_WANT" ]; then
     i=0

@@ -45,7 +45,6 @@ type fileConfig struct {
 	RRs           []wire.RRAddress `json:"rrs"`
 	Tunnels       []tunnelConfig   `json:"tunnels"`
 	VRFs          []vrfConfig      `json:"vrfs"`
-	LocalPrefixes []prefixConfig   `json:"local_prefixes"`
 	StatusAddr    string           `json:"status_addr"`
 }
 
@@ -60,11 +59,6 @@ type vrfConfig struct {
 	ID        uint8    `json:"id"`
 	ExportRTs []string `json:"export_rts"`
 	ImportRTs []string `json:"import_rts"`
-}
-
-type prefixConfig struct {
-	VRFID  uint8  `json:"vrf_id"`
-	Prefix string `json:"prefix"`
 }
 
 func loadConfig(path string) (*fileConfig, error) {
@@ -162,16 +156,13 @@ func main() {
 	for _, v := range cfg.VRFs {
 		clientCfg.VRFs = append(clientCfg.VRFs, route.VRFConfig{ID: v.ID, ExportRTs: v.ExportRTs, ImportRTs: v.ImportRTs})
 	}
-	for _, p := range cfg.LocalPrefixes {
-		clientCfg.LocalPrefixes = append(clientCfg.LocalPrefixes, route.LocalPrefix{VRFID: p.VRFID, Prefix: p.Prefix})
-	}
 
 	c, err := route.NewClient(clientCfg)
 	if err != nil {
 		log.Fatalf("route client: %v", err)
 	}
-	log.Printf("sr-route: device %d (tenant %s), %d local prefixes, %d tunnels, %d RRs",
-		cfg.DeviceID, cfg.Tenant, len(c.LocalRoutes()), len(c.Tunnels()), len(cfg.RRs))
+	log.Printf("sr-route: device %d (tenant %s), %d tunnels, %d RRs (local prefixes arrive from sr-frr)",
+		cfg.DeviceID, cfg.Tenant, len(c.Tunnels()), len(cfg.RRs))
 
 	if cfg.StatusAddr != "" {
 		go serveStatus(cfg.StatusAddr, c)
@@ -403,9 +394,9 @@ func statusMux(c *route.Client) *http.ServeMux {
 		}
 		writeJSON(w, statusFor(c))
 	})
-	// PUT replaces the dynamic local set (static local_prefixes are kept).
-	// This is the reverse-import entry point: sr-frr watches the in-box FRR
-	// for customer-learned BGP prefixes and publishes the current set here.
+	// PUT replaces the local set. This is the reverse-import entry point: sr-frr
+	// watches the in-box FRR for customer-learned BGP prefixes and publishes the
+	// current set here.
 	mux.HandleFunc("/local-prefixes", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -423,7 +414,7 @@ func statusMux(c *route.Client) *http.ServeMux {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			log.Printf("sr-route: 动态 local prefixes = %d 条", len(lps))
+			log.Printf("sr-route: local prefixes = %d 条", len(lps))
 			writeJSON(w, localPrefixesDoc{Prefixes: localPrefixes(c)})
 		default:
 			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)

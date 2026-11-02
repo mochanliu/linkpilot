@@ -8,7 +8,7 @@
 #   (1) 基线：盘上是运维手写的那份 route.json（全部设备键 + 一张旧表），sr-route 读它起来；
 #   (2) apply v2：第 4 段盖掉 tunnels/vrfs；活表同一次 apply 就变；sr-route 的 pid 与
 #       启动时刻一动不动；设备键（tenant/device_id/identity_dir/serial/hold_sec/
-#       tls_server_name/rrs/local_prefixes/status_addr）逐字不动；
+#       tls_server_name/rrs/status_addr）逐字不动；
 #   (3) 第 4 段多带一个键（将来的 `leak`）：明写"不认识"并忽略，盘上不写它，活表不动；
 #   (4) 导通组删掉（tunnels/vrfs 都是空表）：活表清空，残留 RT 当场摘掉；
 #   (5) sr-route 不在：apply 仍然 rc=0，明写"已落盘、未热更"，status.json 带着那句注记
@@ -29,9 +29,8 @@
 #     自己的配置文件），身份目录只读复用（sr-route 要求入网证书，且配置里的 tenant/
 #     device_id 必须与证书一致，所以这两个值从 state.json 读出来生成）。rrs 指向没人听的
 #     地址 ⇒ 运行中那张表唯一可能的来源就是 sr-apply 推的 PUT。
-#   - 已登记的（#185，待拍）：设备键 local_prefixes 指向的 VPN 若不在控制器发布的 vrfs
-#     里，**运行中**只记 local_skips，**启动却是硬错**（sr-route 拒绝起来）。所以本脚本
-#     让每一处"重新起 sr-route"都保有 VPN 0；第 (4) 步的空表只换活表、不重启进程。
+#   - 本端前缀不在这份文件里：sr-route 启动时一条都不宣告，运行中由 sr-frr 经
+#     PUT /local-prefixes 推进来。本脚本不碰那一路，所以每次重启都是零宣告起来。
 #
 # 前置：
 #   - lab 在跑（默认 BOX=lab-cpe1，容器里有 /etc/sdwan/identity 与 /workspace 挂载）；
@@ -210,7 +209,7 @@ dxi "cat > $VERIFY" <<'PY'
 import json, sys
 
 KEYS = ["tenant", "device_id", "identity_dir", "serial", "hold_sec", "tls_server_name",
-        "rrs", "tunnels", "vrfs", "local_prefixes", "status_addr"]
+        "rrs", "tunnels", "vrfs", "status_addr"]
 
 A = {"tunnels": [{"peer_device_id": 2, "next_hop": "10.108.0.2"}],
      "vrfs": [{"id": 0, "export_rts": ["65000:1000"], "import_rts": ["65000:1000"]}]}
@@ -236,7 +235,6 @@ def gen(_):
         # 运维手写的那张旧表：peer 99 / RT 65000:999，等第 4 段来盖
         "tunnels": [{"peer_device_id": 99, "next_hop": "10.99.99.99"}],
         "vrfs": [{"id": 0, "export_rts": ["65000:999"], "import_rts": ["65000:999"]}],
-        "local_prefixes": [{"vrf_id": 0, "prefix": "10.66.66.0/24"}],
         "status_addr": "127.0.0.1:" + port,
     }
     assert set(seed) == set(KEYS), "seed 的键集合变了"

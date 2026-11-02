@@ -24,7 +24,7 @@
 | 隧道（对端设备 + overlay /32 + 颜色） | 控制器 | **有**，`internal/underlay/state.go:122-152`（`Endpoint.NodeID` + `Endpoint.Overlay` + `Color`） |
 | VPN 号本身 | 控制器 | **有**，`ConfigVPN{ID,Name,BGP,OSPF}`（[cmd/sr-ctrl/config.go:44-50](../controller/cmd/sr-ctrl/config.go)） |
 | 每个 VPN 的 import/export RT | 设备上的 `sr-route.json` | **没有** |
-| 本端宣告的前缀（`local_prefixes`） | 设备上的 `sr-route.json` | **没有**（内核侧的 `Statics` 有，overlay 侧那份没有） |
+| 本端宣告的前缀（sr-route 的本地集合） | 设备上运行中的 `sr-route`（`sr-frr` 经 `PUT /local-prefixes` 推） | **没有**（内核侧的 `Statics` 有，overlay 侧那份没有） |
 | 逃生开关 `escape_all_colors` | 设备上的 `sr-fib.json` | **没有** |
 | sr-fib 的 `vrfs` + `tunnels`（带颜色） | 设备上的 `sr-fib.json` | **没有**（隧道数据控制器有，只是没渲染） |
 | sr-frr 的 `vrfs` + `import`（反向导入） | 设备上的 `/etc/sr-frr.json` | **没有** |
@@ -77,7 +77,7 @@ O6-a 之后我把两边都读了一遍：
 | `rrs` | **控制器今天完全没有这个概念**：`wire.RRAddress` 全仓库只有两处引用（类型定义 + `sr-route` 的那个字段），`sr-ctrl` 零命中 —— sr-route 配置里那句注释"the controller pushes these at enrollment"是**没实现的话** | `[{rr-a,10.99.0.100:18446}]`（我手写的） |
 | `tenant` / `device_id` / `serial` | 控制器知道（入网记录） | `tenant-a` / `1` / `lab-cpe1` |
 | `tunnels` / `vrfs` | 控制器知道，且这正是 O6 要接管的两份 | 手写 |
-| `local_prefixes` | 不在文件里也行 —— `sr-frr` 运行时 `POST /local-prefixes` 送 | 缺 |
+| 本端前缀 | 不在文件里 —— `sr-frr` 运行时经 `PUT /local-prefixes` 送 | 缺 |
 
 所以第 4 段的形状定成**控制器只发它拥有的那两个键**：
 
@@ -200,7 +200,7 @@ C-a 那句"要 sr-route 下次启动才生效"现在只对**磁盘那份**成立
 | 步 | 内容 | 判据 |
 | --- | --- | --- |
 | O6-a ✅ | 控制器 overlay 模型 + `OverlayGroup` 的 CRUD API + RT 分配与渲染（不动 UI） | 单测：建组→渲染出的每台 `export/import_rts` 逐字对；编辑组减设备⇒残留 RT 消失；两条闸门各一条负向 |
-| O6-b ✅ | bundle 第 4 段（只发 `tunnels`+`vrfs`）+ `sr-apply` 叠加写盘 + `sr-apply` 推 `PUT /vrfs` `/tunnels` | lab 实测（2026-10-31，`lab-o6b1`/`lab-o6b2` 两台新盒子 + 控制器 `o6b-lab` 租户，见 [test/lab/README.md](../test/lab/README.md)）：控制台建组 65000:1000 一发布，两台 `route.json` 的第 4 段盖掉运维那份旧表（`peer 99`/`65000:999` → `peer 2`/`65000:1000`），`/status` 活表同一次心跳后跟着变，**`sr-route` 的 pid 从头到尾没换**（137 / 2421）；删组再发布 ⇒ 活表回到 `vrfs: []`，残留 RT 当场摘掉；把盒子改成"控制器不可达"再 `docker restart`，只敲一条 `start.sh up` ⇒ `apply 重放磁盘上那版 → v2 boot ok`、`/status` 里还是导通那张表（磁盘回来的，全程没有控制器）。设备独有键 `tenant/device_id/serial/hold_sec/rrs/local_prefixes/status_addr` 逐字没动；盘上没有 `route.json` 的手工负向按 §1.3 报错并 `rc=1`。单测/编译/harness：`go test -count=1 -race ./...` 全绿、`test-vbond.sh` 196 条全绿 |
+| O6-b ✅ | bundle 第 4 段（只发 `tunnels`+`vrfs`）+ `sr-apply` 叠加写盘 + `sr-apply` 推 `PUT /vrfs` `/tunnels` | lab 实测（2026-10-31，`lab-o6b1`/`lab-o6b2` 两台新盒子 + 控制器 `o6b-lab` 租户，见 [test/lab/README.md](../test/lab/README.md)）：控制台建组 65000:1000 一发布，两台 `route.json` 的第 4 段盖掉运维那份旧表（`peer 99`/`65000:999` → `peer 2`/`65000:1000`），`/status` 活表同一次心跳后跟着变，**`sr-route` 的 pid 从头到尾没换**（137 / 2421）；删组再发布 ⇒ 活表回到 `vrfs: []`，残留 RT 当场摘掉；把盒子改成"控制器不可达"再 `docker restart`，只敲一条 `start.sh up` ⇒ `apply 重放磁盘上那版 → v2 boot ok`、`/status` 里还是导通那张表（磁盘回来的，全程没有控制器）。设备独有键 `tenant/device_id/serial/hold_sec/rrs/status_addr` 逐字没动；盘上没有 `route.json` 的手工负向按 §1.3 报错并 `rc=1`。单测/编译/harness：`go test -count=1 -race ./...` 全绿、`test-vbond.sh` 196 条全绿 |
 | O6-c | 控制台「Overlay 配置」页：全局 + 导通两块（leak 先不放）＋运营方的 RR 库。**方案与拍板都在 [o6c-overlay-page-plan.md](o6c-overlay-page-plan.md)；分三步：C-a 后端 ✅（2026-10-31）/ C-b 控制台 ✅（2026-10-31）/ C-c `PUT /rrs` make-before-break ✅（2026-10-31，落地实录见那份方案的 §7）** | 真浏览器：新增规则后两行 RT 自动写入、编辑减设备后残留被摘、被丢路由三态有数。C-c 的 lab 判据：`test/scripts/test-rr-switch.sh` **56/56**（三台真 sr-rr + 两台真 sr-route，全程不重启进程）—— 先加新时两台的表零缺口、两台 RR 上会话 `since` 一动不动；撤旧时被换的那台 `withdrawn` 全程 0、先立后破重叠 **2074ms**（两边各自记录相减）；新 RR 起不来时 `rr_wait{pending,retiring}` 挂 3 秒不变、C 一监听就靠重连退避自己接上（没有第二次 PUT）；五个非法 PUT 全 400 且集合没动、`DELETE` 405；pid + 启动时刻与磁盘 `route.json` 全程不变 |
 | O6-d | 被丢路由三态上控制台（`pending` / `local_skips` / `rt_mismatch`，走心跳摘要字段） | 控制台显示的数与设备 `/status` 的数逐字相同；设备没上报时明写"未上报" |
 | O6-e | leak（第三块）：sr-frr 的 prefix 过滤 + FRR redistribute 字段 | 单独出方案，本文不展开 |

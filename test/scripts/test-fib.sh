@@ -71,7 +71,24 @@ info() { echo "== $*"; }
 die()  { echo "FATAL: $*" >&2; exit 2; }
 
 dx()  { docker exec "$1" bash -lc "$2"; }
+dxi() { docker exec -i "$1" bash -lc "$2"; }
 vpp() { docker exec "$1" bash -lc "vppctl $2" 2>/dev/null | tr -d '\r'; }
+
+# push_local <port> <body> <label> —— sr-route 不再从配置读本端前缀：它只有一个
+# 入口 PUT /local-prefixes（盒子上由 sr-frr 推这个入口）。重试是因为
+# 进程刚起、端口还没 listen 时 curl 直接失败，那不是被测行为。
+push_local() {   # <port> <body> <label>
+    local port=$1 body=$2 label=$3 i=0 code
+    while [ "$i" -lt 50 ]; do
+        code=$(printf '%s' "$body" | dxi "$N1" \
+            "curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @- http://127.0.0.1:$port/local-prefixes" 2>/dev/null)
+        [ "$code" = 200 ] && { ok "$label"; return 0; }
+        sleep 0.2
+        i=$((i + 1))
+    done
+    bad "$label（超时）"
+    return 1
+}
 
 # ---------------------------------------------------------------- 清理
 
@@ -291,7 +308,6 @@ write_node() {   # <n> <peer-device> <peer-overlay> <prefix> <export> <import> <
   "rrs": [{"id": "rr-a", "addr": "127.0.0.1:$RR_PORT"}],
   "tunnels": [{"peer_device_id": $2, "next_hop": "$3"}],
   "vrfs": [{"id": $VRF, "export_rts": ["$5"], "import_rts": ["$6"]}],
-  "local_prefixes": [{"vrf_id": $VRF, "prefix": "$4"}],
   "status_addr": "$7"
 }
 EOF
@@ -377,6 +393,13 @@ ok "VRF $VRF 干净、两端无本脚本的 BFD 会话"
 info "2. 启动 rr / node1 / node2 / sr-fib（全部在 $N1 的 loopback 上）"
 dx "$N1" "bash $WORK/start.sh" || die "启动失败"
 sleep 0.5
+
+# 本端前缀的唯一入口现在是 PUT /local-prefixes（盒子上由 sr-frr 推）。
+info "2b. 推本端前缀（扮演 sr-frr）"
+push_local "$N1_STATUS" "{\"prefixes\":[{\"vrf_id\":$VRF,\"prefix\":\"$LOCAL_PFX\"}]}" \
+    "node1 宣告 $LOCAL_PFX@$VRF" || die "node1 前缀推不进去"
+push_local "$N2_STATUS" "{\"prefixes\":[{\"vrf_id\":$VRF,\"prefix\":\"$REMOTE_PFX\"}]}" \
+    "node2 宣告 $REMOTE_PFX@$VRF" || die "node2 前缀推不进去"
 
 wait_json "$N1_STATUS" \
     "[(r['prefix'], r['next_hops']) for r in d['rib'].get('$VRF', [])] == [('$REMOTE_PFX', ['$OVERLAY_N2'])]" \

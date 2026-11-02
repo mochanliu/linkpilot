@@ -411,7 +411,7 @@ GET 的返回**不造数据**：设备没上报就说没上报，实例有没有
 | L-4 | sr-frr：多来源/多 VPN 导入 + 白名单 + 防回环 + `PUT /config`、`GET /status`；sr-apply 落盘+推送 | sr-frr pid/启动时刻不变；改来源/列表后 1 个轮询内上报集合变化；退出清理仍能撤干净 |
 | L-5 | 控制台两页 + prefix-list 编辑器 + 批量模版 + 三处发布入口（设备行 / 列表行 / 批量） | 真浏览器点完一遍；语法检查；设备缺 VPN/协议时的丢弃原因可见；三处发布走同一个 `/api/config/publish`，版本号连续且不重复下发 |
 | L-6 | lab 端到端：两台盒子 + RR；客户前缀按来源/白名单上行；远端前缀经 K 进客户 BGP；同前缀与回环 | 前后两组数字（BGP 前缀数、FRR K 条数、VPP FIB 条数、sr-frr pid、邻居 uptime）；VPP FIB 不因 K 变化 |
-| L-7 | 退役收尾：删 `local_prefixes`、旧 README/脚本/判据；#185 关闭 | 全仓 grep 零命中；盒子重启后开机重放仍正确 |
+| L-7 ✅ | 退役收尾：本端前缀只走 `PUT /local-prefixes`，删掉配置里的那个键与旧 README/脚本/判据；#185 关闭（形态不再存在） | `git grep` 零命中；盒子重启后开机重放仍正确 |
 
 ### L-6 实测结果（2026-11-02，lab-cpe1/2/3 + lab-cust1/2）
 
@@ -437,6 +437,26 @@ GET 的返回**不造数据**：设备没上报就说没上报，实例有没有
      `K *`（每个前缀最多 2 条，不累积；BGP 只宣告一条）。属观感问题，文档记录，不重启 zebra。
 - **lab 环境噪声**：共享 CPU 的 VM 里 BFD 每分钟 1–3 次漏检（约 1s 自愈），
   `verify.sh` 的 FIB 断言改成最多等 10s 收敛，避免把环境噪声记成产品失败。
+
+### L-7 实测结果（2026-11-02，lab-cpe3）
+
+- **零命中**：`git grep` 在跟踪文件里已找不到那个键；剩下的命中只在未跟踪的构建产物
+  （`controller/bin/sr-route`、`test/lab/run/bin/sr-route`）里。
+- **负向**：把那个键放回 `route.json` 的副本再起新 sr-route，拒绝启动并说清原因：
+  `config: parse /tmp/route-legacy-key.json: json: unknown field "local_prefixes"`，`rc=1`。
+  也就是说"配置里留旧键"不会再被静默当成空集合吃掉。
+- **重放**（路由面按清单顺序冷启：route → frrbridge；VPP/FRR/隧道不动——这次改动不碰
+  数据面，而重启整盒要用 bringup 重建 lab）：基线本端前缀 2 条（`10.68.3.0/24`、
+  `172.16.3.1/32`）；新 sr-route 起来时 `/local-prefixes` 是 **0 条**，随后从 RR 同步
+  RIB 4 条；sr-frr 起来后 **1061ms**（一个轮询）把 2 条推回，控制口
+  `reported=2 / injected=4 / dropped_loop=0 / last_error=""`。对端视角的撤/回：
+  cpe1 在 12:11:35 看到 0 条、12:11:42 回到 2 条（窗口含人工停两个进程的时刻）；
+  cpe1/cpe2 的 RIB 里两条前缀回到原下一跳，cust3 的 BGP 6 条、cpe3 内核 K 4 条。
+  sr-fib 全程"保留上次成功的计划"（只打两条 connection refused，恢复后无重装），
+  所以 VPP FIB 不因这次冷启抖动。
+- **顺手退役 1250 的保留判据**：那条 table-direct 路径在 L-3 已拆掉，后端校验、
+  控制台文案与 VPN 落表说明里的 1250 一起删掉，避免"后端允许、页面拒绝"的分叉。
+- **lab 体检**：`test/lab/verify.sh` 313 通过 / 0 失败。
 
 
 ## 10. 不做

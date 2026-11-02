@@ -58,13 +58,12 @@ type RRConfig struct {
 // the local paths that can reach N. Several entries may lead to the same peer
 // (parallel tunnels); all of them are installed as ECMP paths.
 type ClientConfig struct {
-	Tenant        string
-	DeviceID      uint16
-	VRFs          []VRFConfig
-	LocalPrefixes []LocalPrefix
-	Tunnels       []Tunnel
-	RRs           []RRConfig
-	HoldSec       int
+	Tenant   string
+	DeviceID uint16
+	VRFs     []VRFConfig
+	Tunnels  []Tunnel
+	RRs      []RRConfig
+	HoldSec  int
 	// Dial opens a transport to an RR. It must already be authenticated as
 	// DeviceID (mTLS), because the RR trusts the certificate for identity and
 	// treats hello's device_id as a claim to cross-check.
@@ -230,9 +229,8 @@ type Client struct {
 	vrfs     map[uint8]*localVRF
 	vrfIDs   []uint8            // vrfs 的升序：Targets 要有稳定顺序（map 迭代是随机的）
 	exports  map[uint8][]string // vrf -> canonical export RTs, stamped on local routes
-	base     map[localKey]LocalPrefix
 	dynamic  map[localKey]LocalPrefix
-	local    []Route     // effective set, rebuilt from base ∪ dynamic + the VRF table
+	local    []Route     // effective set, rebuilt from dynamic + the VRF table
 	skipped  []LocalSkip // the same inputs that could not become routes
 	tunnels  []Tunnel
 	nextHops map[uint16][]string // peer -> ascending next hops of its tunnels
@@ -334,7 +332,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	c := &Client{
 		cfg:     cfg,
 		hold:    hold,
-		base:    map[localKey]LocalPrefix{},
 		dynamic: map[localKey]LocalPrefix{},
 		loc:     newLocRib(),
 	}
@@ -349,14 +346,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, err
 	}
 	c.tunnels, c.nextHops = tunnels, nextHops
-
-	for _, lp := range cfg.LocalPrefixes {
-		if _, err := c.localRoute(lp); err != nil {
-			return nil, err
-		}
-		c.base[lp.key()] = lp
-	}
-	c.rebuildLocalLocked()
 
 	for _, rr := range cfg.RRs {
 		c.sessions = append(c.sessions, newSession(rr))
@@ -460,9 +449,9 @@ func copyTunnels(in []Tunnel) []Tunnel {
 }
 
 // LocalRoutes returns the routes this CPE announces (one per VRF × prefix, no
-// next hops): the static configuration plus whatever SetLocalPrefixes last
-// installed, stamped with the export RTs of the VRF table as it stands. A prefix
-// whose VRF is gone is not here -- see LocalSkips for why.
+// next hops): whatever SetLocalPrefixes last installed, stamped with the export
+// RTs of the VRF table as it stands. A prefix whose VRF is gone is not here --
+// see LocalSkips for why.
 func (c *Client) LocalRoutes() []Route {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -520,19 +509,9 @@ func (c *Client) newLocalRoute(lp LocalPrefix) (Route, string) {
 //
 // Must be called with c.mu held.
 func (c *Client) rebuildLocalLocked() {
-	m := make(map[localKey]LocalPrefix, len(c.base)+len(c.dynamic))
-	for k, lp := range c.base {
-		m[k] = lp
-	}
-	// A dynamic prefix identical to a static one collapses to one route: the
-	// same (device, vrf, prefix) must be announced once, or a withdraw of one
-	// copy would take the other with it.
-	for k, lp := range c.dynamic {
-		m[k] = lp
-	}
-	routes := make([]Route, 0, len(m))
+	routes := make([]Route, 0, len(c.dynamic))
 	var skipped []LocalSkip
-	for _, lp := range m {
+	for _, lp := range c.dynamic {
 		rt, reason := c.newLocalRoute(lp)
 		if reason != "" {
 			skipped = append(skipped, LocalSkip{VRFID: lp.VRFID, Prefix: lp.Prefix, Reason: reason})
@@ -550,11 +529,10 @@ func (c *Client) rebuildLocalLocked() {
 	c.skipped = skipped
 }
 
-// SetLocalPrefixes replaces the dynamic local set (customer prefixes learned
-// from the in-box FRR). The static local_prefixes from the config are always
-// kept. Every live session receives the difference immediately; a session
-// still streaming its snapshot reconciles against its own announced set once
-// the snapshot is done.
+// SetLocalPrefixes replaces the local set (customer prefixes learned from the
+// in-box FRR). Every live session receives the difference immediately; a
+// session still streaming its snapshot reconciles against its own announced set
+// once the snapshot is done.
 func (c *Client) SetLocalPrefixes(lps []LocalPrefix) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

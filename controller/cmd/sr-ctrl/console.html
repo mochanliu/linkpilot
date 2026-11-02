@@ -1527,7 +1527,7 @@
       (cfgIsPA(cs)
         ? "这台设备还没有入网：保存只写控制器的草稿，没有「发布」也没有配置包，因为接收方还不存在。现场工程师用 <code>sr-agent --preauth 「这台设备的索引」</code> 认领它之后，这份草稿会原样挪到它的 node 上（版本不变），那时候才能发布。"
         : "保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在 -apply 模式下于下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。") +
-      "VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 / 1250 被 overlay 占用。</div>" +
+      "VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 被 overlay 占用。</div>" +
       "</section>";
   }
 
@@ -1645,7 +1645,7 @@
       cfg.ifaces.forEach(function (it) { if (it.vpn === v.id) ni++; });
       cfg.statics.forEach(function (r) { if (r.vpn === v.id) ns++; });
       var note = v.id === 0 ? "默认表" : (v.id === 250 ? "保留：overlay"
-        : (v.id === 1250 ? "保留：table-direct" : "VPP table " + v.id));
+        : "VPP table " + v.id);
       return "<tr>" +
         '<td class="mono">' + esc(v.id) + "</td>" +
         '<td><input data-cfg="vpn.name" data-vpn="' + esc(v.id) + '" value="' + esc(v.name || "") +
@@ -1927,7 +1927,7 @@
     var id = Number(cfgVal("vpn-id"));
     var name = cfgVal("vpn-name");
     if (!(id >= 1 && id <= 65535) || Math.trunc(id) !== id) { toast("VPN ID 必须是 1–65535 的整数"); return; }
-    if (id === 250 || id === 1250) { toast("VPN " + id + " 被 overlay 保留，换一个"); return; }
+    if (id === 250) { toast("VPN 250 被 overlay 保留，换一个"); return; }
     if (cfgVPNExists(cs.draft, id)) { toast("VPN " + id + " 已经存在"); return; }
     if (cs.draft.vpns.length >= 64) { toast("一个设备最多 64 个 VPN"); return; }
     cs.draft.vpns.push({ id: id, name: name,
