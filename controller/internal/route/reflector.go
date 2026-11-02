@@ -198,13 +198,95 @@ func (r *Reflector) ServeConn(conn net.Conn, id PeerIdentity) error {
 		out:   make(chan Envelope, 1024),
 		done:  make(chan struct{}),
 		since: time.Now(),
+		hold:  r.hold,
 	}
 	go r.writeLoop(s)
-	if err := r.attach(s); err != nil {
+	helloOK := Envelope{Type: MsgHelloOK, Version: ProtocolVersion, RRID: r.rrID, HoldSec: int(r.hold / time.Second)}
+	if err := r.attach(s, &helloOK); err != nil {
 		s.shutdown()
 		return err
 	}
-	go r.keepaliveLoop(s, r.hold/3)
+	go r.keepaliveLoop(s, s.hold/3)
+	defer r.detach(s)
+
+	return r.readLoop(s, br)
+}
+
+// DialConn runs one outbound session to another reflector. The caller has
+// already completed the TLS handshake (with this box's own certificate as the
+// client certificate) and must derive id from the verified peer certificate.
+//
+// The only difference from ServeConn is who speaks first: here we send hello,
+// and an rr hello carries no device id. After hello_ok the session is attached,
+// snapshotted, kept alive and read exactly like an inbound one -- BGP uses one
+// FSM for both directions, and so do we.
+//
+// Blocking; run one goroutine per peer. Returning an error is normal on
+// disconnect -- the caller decides whether to log it.
+func (r *Reflector) DialConn(conn net.Conn, id PeerIdentity) error {
+	if err := id.Validate(); err != nil {
+		conn.Close()
+		return fmt.Errorf("reflector: dial: %w", err)
+	}
+	if id.Role != RoleRR {
+		conn.Close()
+		return fmt.Errorf("reflector: dial: peer certificate is a %s, not a reflector", id.Role)
+	}
+	if id.Tenant != r.tenant {
+		conn.Close()
+		return fmt.Errorf("reflector: dial: peer tenant %q is not served by this reflector", id.Tenant)
+	}
+	if id.RRID == r.rrID {
+		conn.Close()
+		return errors.New("reflector: dial: refusing to peer with itself")
+	}
+
+	key := id.Key()
+	conn.SetDeadline(time.Now().Add(r.hold))
+	br := bufio.NewReaderSize(conn, 64<<10)
+	if err := WriteEnvelope(conn, Envelope{Type: MsgHello, Version: ProtocolVersion}); err != nil {
+		conn.Close()
+		return fmt.Errorf("reflector: %s: send hello: %w", key, err)
+	}
+	env, err := ReadEnvelope(br)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("reflector: %s: read hello_ok: %w", key, err)
+	}
+	if env.Type == MsgError {
+		conn.Close()
+		return fmt.Errorf("reflector: %s: peer rejected hello: %s", key, env.Message)
+	}
+	if env.Type != MsgHelloOK {
+		conn.Close()
+		return fmt.Errorf("reflector: %s: expected hello_ok, got %q", key, env.Type)
+	}
+	if env.Version != ProtocolVersion {
+		conn.Close()
+		return fmt.Errorf("reflector: %s: peer speaks protocol version %d (want %d)", key, env.Version, ProtocolVersion)
+	}
+	hold, err := HoldDuration(env.HoldSec)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("reflector: %s: hello_ok: %w", key, err)
+	}
+	conn.SetDeadline(time.Time{})
+
+	s := &serverSession{
+		id:    id,
+		key:   key,
+		conn:  conn,
+		out:   make(chan Envelope, 1024),
+		done:  make(chan struct{}),
+		since: time.Now(),
+		hold:  hold,
+	}
+	go r.writeLoop(s)
+	if err := r.attach(s, nil); err != nil {
+		s.shutdown()
+		return err
+	}
+	go r.keepaliveLoop(s, hold/3)
 	defer r.detach(s)
 
 	return r.readLoop(s, br)
@@ -217,7 +299,10 @@ func reject(conn net.Conn, msg string) error {
 	return errors.New("reflector: " + msg)
 }
 
-func (r *Reflector) attach(s *serverSession) error {
+// attach registers s and sends it the initial snapshot + EOR. helloOK is the
+// reply to a peer that spoke first (inbound); nil means this side spoke first
+// (DialConn) and the peer's hello_ok has already been read.
+func (r *Reflector) attach(s *serverSession, helloOK *Envelope) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -232,8 +317,7 @@ func (r *Reflector) attach(s *serverSession) error {
 	}
 	r.sessions[s.key] = s
 
-	hello := Envelope{Type: MsgHelloOK, Version: ProtocolVersion, RRID: r.rrID, HoldSec: int(r.hold / time.Second)}
-	if !s.trySend(hello) {
+	if helloOK != nil && !s.trySend(*helloOK) {
 		delete(r.sessions, s.key)
 		s.shutdown()
 		return fmt.Errorf("reflector: %s: cannot accept hello_ok", s.key)
@@ -289,7 +373,7 @@ func (r *Reflector) snapshotForLocked(dst PeerIdentity) []Route {
 
 func (r *Reflector) readLoop(s *serverSession, br *bufio.Reader) error {
 	for {
-		s.conn.SetReadDeadline(time.Now().Add(r.hold))
+		s.conn.SetReadDeadline(time.Now().Add(s.hold))
 		env, err := ReadEnvelope(br)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -527,11 +611,26 @@ func (r *Reflector) detach(s *serverSession) {
 	s.shutdown()
 }
 
+// CloseSession tears down the live session with this key, if any. The mesh
+// manager uses it when a peer disappears from the controller's list: closing
+// the socket makes the read loop return and detach withdraws that session's
+// routes, without waiting for the hold timer.
+func (r *Reflector) CloseSession(key string) bool {
+	r.mu.Lock()
+	s := r.sessions[key]
+	r.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	s.shutdown()
+	return true
+}
+
 func (r *Reflector) writeLoop(s *serverSession) {
 	for {
 		select {
 		case env := <-s.out:
-			s.conn.SetWriteDeadline(time.Now().Add(r.hold))
+			s.conn.SetWriteDeadline(time.Now().Add(s.hold))
 			if err := WriteEnvelope(s.conn, env); err != nil {
 				s.shutdown()
 				return
@@ -642,6 +741,7 @@ type serverSession struct {
 	done  chan struct{}
 	once  sync.Once
 	since time.Time
+	hold  time.Duration // negotiated per session: inbound uses ours, outbound the peer's
 
 	synced bool // guarded by Reflector.mu: peer finished its initial snapshot
 }

@@ -677,3 +677,176 @@ func TestReflectorSessionRules(t *testing.T) {
 		}
 	})
 }
+
+// fakeRR is the accepting half of a net.Pipe in the outbound tests: it reads
+// what DialConn put on the wire and answers like a reflector would.
+type fakeRR struct {
+	t    *testing.T
+	conn net.Conn
+	br   *bufio.Reader
+}
+
+func (f *fakeRR) send(env Envelope) {
+	f.t.Helper()
+	f.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := WriteEnvelope(f.conn, env); err != nil {
+		f.t.Fatalf("fake rr write %s: %v", env.Type, err)
+	}
+}
+
+func (f *fakeRR) recvErr() (Envelope, error) {
+	f.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	return ReadEnvelope(f.br)
+}
+
+func (f *fakeRR) recv() Envelope {
+	f.t.Helper()
+	env, err := f.recvErr()
+	if err != nil {
+		f.t.Fatalf("fake rr read: %v", err)
+	}
+	return env
+}
+
+// TestDialConnSpeaksFirstWithoutADeviceID pins the one thing that differs
+// between the two directions: the outbound side sends hello, and an rr hello
+// carries no device id.
+func TestDialConnSpeaksFirstWithoutADeviceID(t *testing.T) {
+	r := newTestReflector(t, ReflectorConfig{RRID: "rr-a"})
+	srv, cli := net.Pipe()
+	defer cli.Close()
+	errCh := make(chan error, 1)
+	peer := PeerIdentity{Tenant: "tenant-a", Role: RoleRR, RRID: "rr-b"}
+	go func() { errCh <- r.DialConn(cli, peer) }()
+
+	f := &fakeRR{t: t, conn: srv, br: bufio.NewReader(srv)}
+	env := f.recv()
+	if env.Type != MsgHello {
+		t.Fatalf("first frame = %s, want hello", env.Type)
+	}
+	if env.DeviceID != 0 {
+		t.Fatalf("hello claims device %d; an rr session speaks for no device", env.DeviceID)
+	}
+	if env.Version != ProtocolVersion {
+		t.Fatalf("hello version = %d, want %d", env.Version, ProtocolVersion)
+	}
+
+	f.send(Envelope{Type: MsgHelloOK, Version: ProtocolVersion, RRID: "rr-b", HoldSec: int(DefaultHoldSec)})
+	if env := f.recv(); env.Type != MsgEOR {
+		t.Fatalf("after hello_ok got %s, want the empty snapshot's EOR", env.Type)
+	}
+	waitFor(t, "outbound session attached", func() bool { return len(r.Sessions()) == 1 })
+	if sn := r.Sessions(); sn[0].Key != "rr/rr-b" || sn[0].Role != RoleRR {
+		t.Fatalf("sessions = %+v", sn)
+	}
+
+	srv.Close()
+	if err := waitServe(t, errCh); err == nil {
+		t.Fatal("DialConn returned nil after the peer closed")
+	}
+}
+
+// TestDialConnHonoursThePeerHold: the session's deadline and keepalive cadence
+// come from the peer's hello_ok, not from our own hold_sec (the accepting side
+// made the same choice in ServeConn).
+func TestDialConnHonoursThePeerHold(t *testing.T) {
+	r := newTestReflector(t, ReflectorConfig{RRID: "rr-a", HoldSec: 300})
+	srv, cli := net.Pipe()
+	defer cli.Close()
+	errCh := make(chan error, 1)
+	peer := PeerIdentity{Tenant: "tenant-a", Role: RoleRR, RRID: "rr-b"}
+	go func() { errCh <- r.DialConn(cli, peer) }()
+
+	f := &fakeRR{t: t, conn: srv, br: bufio.NewReader(srv)}
+	f.recv()
+	f.send(Envelope{Type: MsgHelloOK, Version: ProtocolVersion, RRID: "rr-b", HoldSec: 3})
+	if env := f.recv(); env.Type != MsgEOR {
+		t.Fatalf("want EOR, got %s", env.Type)
+	}
+	// Our own hold is 300s, so a keepalive here can only come from the peer's 3s.
+	srv.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if env, err := ReadEnvelope(f.br); err != nil || env.Type != MsgKeepalive {
+		t.Fatalf("keepalive within 2s = %+v, %v (peer hold was ignored)", env, err)
+	}
+	srv.Close()
+	waitServe(t, errCh)
+}
+
+// TestDialConnCarriesRoutesAcrossTheMesh runs two reflectors over net.Pipe and
+// checks the same snapshot/fanout/withdraw path an inbound session uses: each
+// client sees the other side's route, and a withdrawal follows.
+func TestDialConnCarriesRoutesAcrossTheMesh(t *testing.T) {
+	a := newTestReflector(t, ReflectorConfig{RRID: "rr-a"})
+	b := newTestReflector(t, ReflectorConfig{RRID: "rr-b"})
+
+	srv, cli := net.Pipe()
+	defer cli.Close()
+	aErr := make(chan error, 1)
+	bErr := make(chan error, 1)
+	idA := PeerIdentity{Tenant: a.tenant, Role: RoleRR, RRID: "rr-a"}
+	idB := PeerIdentity{Tenant: b.tenant, Role: RoleRR, RRID: "rr-b"}
+	go func() { bErr <- b.ServeConn(srv, idA) }()
+	go func() { aErr <- a.DialConn(cli, idB) }()
+	waitFor(t, "mesh session attached on both sides", func() bool { return len(a.Sessions()) == 1 && len(b.Sessions()) == 1 })
+
+	ca, _ := dial(t, a, 1)
+	ca.join()
+	cb, _ := dial(t, b, 2)
+	cb.join()
+
+	rt1 := testRoute(1, 1, "10.1.0.0/16")
+	ca.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt1}})
+	if got := cb.recv(); got.Type != MsgAnnounce || len(got.Routes) != 1 || !got.Routes[0].Equal(rt1) {
+		t.Fatalf("device 2 got %+v, want device 1's route through the mesh", got)
+	}
+
+	rt2 := testRoute(2, 1, "10.2.0.0/16")
+	cb.send(Envelope{Type: MsgAnnounce, Routes: []Route{rt2}})
+	if got := ca.recv(); got.Type != MsgAnnounce || len(got.Routes) != 1 || !got.Routes[0].Equal(rt2) {
+		t.Fatalf("device 1 got %+v, want device 2's route through the mesh", got)
+	}
+
+	ca.send(Envelope{Type: MsgWithdraw, Keys: []RouteKey{rt1.Key()}})
+	if got := cb.recv(); got.Type != MsgWithdraw || len(got.Keys) != 1 || got.Keys[0] != rt1.Key() {
+		t.Fatalf("device 2 got %+v, want the withdraw", got)
+	}
+
+	cli.Close() // the mesh session dies; both sides drop the other's routes
+	waitServe(t, aErr)
+	waitServe(t, bErr)
+	if n := len(b.RoutesOf(1)); n != 0 {
+		t.Fatalf("b still holds %d routes for device 1 after the mesh died", n)
+	}
+}
+
+// TestDialConnRejections: a peer that is not a reflector for this tenant, or
+// that is ourselves, is refused before any session state exists.
+func TestDialConnRejections(t *testing.T) {
+	cases := []struct {
+		name string
+		id   PeerIdentity
+		want string
+	}{
+		{"node identity", PeerIdentity{Tenant: "tenant-a", Role: RoleClient, DeviceID: 3}, "not a reflector"},
+		{"cross tenant", PeerIdentity{Tenant: "tenant-b", Role: RoleRR, RRID: "rr-b"}, "tenant"},
+		{"itself", PeerIdentity{Tenant: "tenant-a", Role: RoleRR, RRID: "rr-a"}, "itself"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestReflector(t, ReflectorConfig{RRID: "rr-a"})
+			srv, cli := net.Pipe()
+			defer cli.Close()
+			err := r.DialConn(srv, tc.id)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DialConn(%+v) = %v, want error containing %q", tc.id, err, tc.want)
+			}
+			cli.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := cli.Read(make([]byte, 1)); err == nil {
+				t.Fatal("rejected connection was left open")
+			}
+			if n := len(r.Sessions()); n != 0 {
+				t.Fatalf("%d sessions attached after a rejection", n)
+			}
+		})
+	}
+}

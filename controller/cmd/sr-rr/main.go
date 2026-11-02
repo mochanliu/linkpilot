@@ -22,6 +22,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -30,6 +31,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -41,12 +43,21 @@ import (
 )
 
 type fileConfig struct {
-	RRID       string   `json:"rr_id"`
-	Tenant     string   `json:"tenant"`
-	HoldSec    int      `json:"hold_sec"`
-	Listen     string   `json:"listen"`
-	StatusAddr string   `json:"status_addr"`
-	TLS        tlsFiles `json:"tls"`
+	RRID       string            `json:"rr_id"`
+	Tenant     string            `json:"tenant"`
+	HoldSec    int               `json:"hold_sec"`
+	Listen     string            `json:"listen"`
+	StatusAddr string            `json:"status_addr"`
+	TLS        tlsFiles          `json:"tls"`
+	Controller *controllerConfig `json:"controller"`
+}
+
+// controllerConfig is optional: without it this RR only accepts sessions and
+// its config file needs no change. With it the RR pulls its grid every
+// poll_sec and dials the peers the controller lists.
+type controllerConfig struct {
+	Addr    string `json:"addr"`     // https://host:port of the device-facing API
+	PollSec int    `json:"poll_sec"` // 0 = 30
 }
 
 type tlsFiles struct {
@@ -76,6 +87,15 @@ func loadConfig(path string) (*fileConfig, error) {
 		return nil, errors.New("listen is required (host:port)")
 	case cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "" || cfg.TLS.CAFile == "":
 		return nil, errors.New("tls.cert_file, tls.key_file and tls.ca_file are required (CPEs verify us against the tenant CA)")
+	}
+	if cfg.Controller != nil {
+		u, err := url.Parse(cfg.Controller.Addr)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return nil, fmt.Errorf("controller.addr %q must be an https://host:port URL", cfg.Controller.Addr)
+		}
+		if cfg.Controller.PollSec != 0 && (cfg.Controller.PollSec < 3 || cfg.Controller.PollSec > 3600) {
+			return nil, fmt.Errorf("controller.poll_sec must be 3..3600 (got %d)", cfg.Controller.PollSec)
+		}
 	}
 	return &cfg, nil
 }
@@ -112,6 +132,29 @@ func main() {
 	if !pool.AppendCertsFromPEM(caPEM) {
 		log.Fatalf("tls: %s has no usable certificate", cfg.TLS.CAFile)
 	}
+
+	// The certificate is this RR's name on the wire. A box that joins the grid
+	// must present the identity its config claims, or it would ask the
+	// controller for one RR's peers and open sessions as another.
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		log.Fatalf("tls: %v", err)
+	}
+	self, refErr := keybinding.RefOf(leaf)
+	if cfg.Controller != nil {
+		if refErr != nil {
+			log.Fatalf("identity: %v (controller is configured, so this RR needs srou://%s/rr/<id>)", refErr, cfg.Tenant)
+		}
+		if self.Role != keybinding.RoleRR || self.Tenant != cfg.Tenant || self.RRID != cfg.RRID {
+			log.Fatalf("identity: certificate is %s but config says tenant %q rr_id %q", self, cfg.Tenant, cfg.RRID)
+		}
+	} else if refErr != nil || self.Role != keybinding.RoleRR {
+		// An inbound-only RR never has to name itself to anyone, so a hand-made
+		// certificate without a role URI keeps working -- it just cannot join a
+		// grid until it is re-issued.
+		log.Printf("sr-rr %s: certificate has no srou://.../rr/ identity; incoming sessions only", cfg.RRID)
+	}
+
 	// RequireAndVerifyClientCert: a CPE that cannot prove a tenant-CA identity
 	// must not even complete the handshake. Identity is read from this
 	// certificate below, so "verified" here is what makes PeerIdentity trusted.
@@ -127,8 +170,42 @@ func main() {
 	}
 	log.Printf("sr-rr %s: tenant %s listening on %s (hold=%ds)", cfg.RRID, cfg.Tenant, cfg.Listen, cfg.HoldSec)
 
+	var grid *mesh
+	if cfg.Controller != nil {
+		poll := 30 * time.Second
+		if cfg.Controller.PollSec > 0 {
+			poll = time.Duration(cfg.Controller.PollSec) * time.Second
+		}
+		base := &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      pool,
+		}
+		grid = newMesh(meshParams{
+			addr:    cfg.Controller.Addr,
+			poll:    poll,
+			tenant:  cfg.Tenant,
+			rrID:    cfg.RRID,
+			tlsBase: base,
+			hc:      &http.Client{Transport: &http.Transport{TLSClientConfig: base.Clone()}},
+			ref:     ref,
+			logf:    log.Printf,
+		})
+		log.Printf("sr-rr %s: grid from %s, poll %s", cfg.RRID, cfg.Controller.Addr, poll)
+		go func() {
+			if err := grid.run(context.Background()); err != nil {
+				// 404 means the row is gone; 401/403 mean this certificate is not
+				// accepted. Either way serving on is worse than exiting: the
+				// supervisor gets to see it instead of a silent ghost RR.
+				log.Printf("sr-rr %s: %v -- stopping", cfg.RRID, err)
+				ln.Close()
+				os.Exit(1)
+			}
+		}()
+	}
+
 	if cfg.StatusAddr != "" {
-		go serveStatus(cfg.StatusAddr, cfg, ref)
+		go serveStatus(cfg.StatusAddr, cfg, ref, grid)
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -195,7 +272,7 @@ func sessionIdentity(peer keybinding.Ref) (route.PeerIdentity, error) {
 	}
 }
 
-func serveStatus(addr string, cfg *fileConfig, ref *route.Reflector) {
+func serveStatus(addr string, cfg *fileConfig, ref *route.Reflector, grid *mesh) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -206,12 +283,17 @@ func serveStatus(addr string, cfg *fileConfig, ref *route.Reflector) {
 		for dev, routes := range ref.Routes() {
 			counts[strconv.Itoa(int(dev))] = len(routes)
 		}
+		peers := []peerStatus{}
+		if grid != nil {
+			peers = grid.Status()
+		}
 		writeJSON(w, struct {
 			RRID     string              `json:"rr_id"`
 			Tenant   string              `json:"tenant"`
 			Sessions []route.SessionInfo `json:"sessions"`
 			Routes   map[string]int      `json:"routes"`
-		}{cfg.RRID, cfg.Tenant, ref.Sessions(), counts})
+			Peers    []peerStatus        `json:"peers"`
+		}{cfg.RRID, cfg.Tenant, ref.Sessions(), counts, peers})
 	})
 	mux.HandleFunc("/routes", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

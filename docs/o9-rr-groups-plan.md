@@ -381,3 +381,57 @@ PEM（可复制）+ `rr-identity.json` 下载，文案写明「私钥只出现�
 
 b2c 后端（签发 + 配置端点 + 单测）→ b2c 控制台（签发/指纹/最近拉取，真浏览器验证）→ b2b（反射器
 拨出入口 + sr-rr 拉取与维护 + 单测）→ `test-rr-mesh.sh` → 文档与提交。每个增量单独提交、单独验绿。
+
+## O9-b2b 落地状态（2026-11-02，RR↔RR 网格）
+
+b2c 已提交（`c04656a`），本条是 b2b：反射器拨出侧 + sr-rr 的拉取与网格维护 + e2e。
+
+**实现**
+
+- `internal/route`：`DialConn(conn, id)` 是接入侧的镜像——发 hello（不带 `device_id`）→ 读
+  hello_ok → `attach` 快照 + EOR，之后与接入侧**同一套** readLoop/keepalive/撤销。`attach` 的
+  hello_ok 改成可空参数（拨出侧不发它）。`serverSession.hold` 按会话记：接入侧用自己的，
+  拨出侧用 hello_ok 里对端给的（`HoldDuration`）。新增 `CloseSession(key)`：删 peer 时直接关
+  套接字，`DialConn` 立刻返回，不用等 hold 超时。
+- `cmd/sr-rr/mesh.go`：每 `poll_sec` 拉 `GET /v1/rr/config`，只做 peer diff——新 peer 起拨出
+  协程（`self.rr_id < peer.id` 才拨），消失的取消并关连接，在跑的协程原样留着。拨出协程自带
+  1s→30s 指数退避；一条会话活过 5s 就把退避重置回 1s。401/403/404 是致命错误：返回给 main，
+  关监听并 `os.Exit(1)`。其余错误保留当前网格、退避重试、同一条错误只刷一行日志。
+  `Status()` 的 `connected`/`since` 直接读反射器的会话表（反射器是唯一事实），不复制一份状态。
+- `cmd/sr-rr/main.go`：配置加可选 `controller: {addr, poll_sec}`；没有这个键就只跑接入侧（lab
+  现有手写 `rr.json` 一行不用改）。启动自检分两档：配了 controller 时证书必须是
+  `srou://<tenant>/rr/<id>` 且与配置一致，否则退出；没配 controller 时只告警
+  （`incoming sessions only`），手搓证书仍可用。
+
+**实现中修正了方案里的两处**
+
+- 方案例子里写 `poll_sec=2`，但配置校验的下限是 3（`3..3600`，防止把控制器打爆）。e2e 用 3。
+- 方案判据 3 写的是「删掉 RR-3 → 经它反射的路由撤回、设备表恢复原样」。实际拓扑是**全互联**：
+  删掉第三台时路由还在 RR-A↔RR-B 那条路上，设备表本来就该一条不动。所以删行这一段的判据改成
+  更强的一条：设备表、`withdrawn`、pid 全不变，变的是 RR-A/RR-B 的 peer 表少了 RR-3。
+- RR 库的读写接口是租户作用域的（`requireTenant`），运营方令牌在这里用不上。e2e 改成租户账号
+  登录；口令只从环境变量进子进程、经 stdin 进容器，脚本不打印 PEM/口令/cookie，私钥只写进
+  容器内 `$WORK/id/<rr_id>/`（0600，随 `$WORK` 删除）。
+
+**判据（全绿）**
+
+- `gofmt` / `go vet ./cmd/sr-rr ./internal/route` / `go test ./...`：全绿
+  （`internal/route` 4.4s，含拨出侧 5 组新单测：首帧 hello 无 device_id、对端 hold 生效、
+  跨网格反射与撤销、三种拒绝）。
+- `controller/test/scripts/test-rr-mesh.sh`：**41/0**（lab，租户 `tenant-a`，lab-cpe1/2，
+  poll 3s）。三台 RR 都从控制器签发身份、拉邻居：
+  1. 两条行 → 每对恰好一条会话，小 id 拨大 id（拨端 `dialing=true`、被拨端 `false`，两侧
+     都 `synced`）；两条行都有 `last_fetch_at_unix`。
+  2. node1 只挂 RR-A、node2 只挂 RR-B，两台互相学到了对方前缀，而 RR-A 上没有 device 2 的
+     客户端会话（路由只可能来自网格）。
+  3. 加第三条行：RR-A↔RR-B 的 `since` 两侧都不变，新 RR 只多两条入向会话、从快照拿到两台
+     设备的全表；两台设备 `withdrawn` 仍是 0。
+  4. 删第三条行：下一轮轮询拿到 `HTTP 404: RR 不存在 -- stopping`，退出码 1；RR-A/RR-B 在
+     一轮内把 `rr/<id3>` 从 peers 与 sessions 里摘干净，RR-A↔RR-B 的 `since` 仍不变，两台
+     设备表满、`withdrawn`=0、pid+lstart 不变。
+  5. 收尾只删本脚本建的行：RR 库回到空表（`next_id` 前进、id 不回收），`$WORK` 三个容器里
+     全删，只打印过指纹。
+- `controller/test/scripts/test-rr-switch.sh`：**59/0**（同一套 lab 容器、`tenant-a`），
+  接入侧（双 RR、make-before-break、冷 RR 反例）口径不变。
+- 没跑 `test-boot.sh`：不碰开机清单与 agent。
+
