@@ -60,15 +60,16 @@ func usage() {
   sr-apply status [--root DIR]
 
 apply validates the bundle, persists it under <root>/versions/<n>, then applies
-VPP -> kernel -> FRR -> overlay route tables in that order. boot replays the
-current version after VPP starts; the FRR config is already installed, so no
-controller is contacted. boot does not push to sr-route: at that point in the
-boot checklist sr-route is not running yet, and the route.json this writes is
-the update.
+VPP -> kernel -> FRR -> overlay route tables -> sr-frr tables in that order. boot
+replays the current version after VPP starts; the FRR config is already installed,
+so no controller is contacted. boot does not push to sr-route or sr-frr: at that
+point in the boot checklist neither process is running yet, and the files this
+writes are the update.
 
 common: --root DIR (default /var/lib/sr-cpe), --vppctl PATH, --frr-conf PATH,
         --frr-reload TOOL, --route-conf PATH (default /etc/sdwan/route.json),
-        --no-route-push, --wait DURATION`)
+        --no-route-push, --srfrr-conf PATH (default /etc/sr-frr.json),
+        --srfrr-sock PATH, --no-srfrr-push, --wait DURATION`)
 }
 
 // commonOpts are the paths and knobs every subcommand needs. They are struct
@@ -81,6 +82,9 @@ type commonOpts struct {
 	frrReload   string
 	routeConf   string
 	noRoutePush bool
+	srfrrConf   string
+	srfrrSock   string
+	noSrfrrPush bool
 	wait        time.Duration
 	dry         bool
 }
@@ -94,6 +98,12 @@ func (o *commonOpts) register(fs *flag.FlagSet) {
 		"sr-route config file; the bundle's 4th segment is merged into it (it is never created here)")
 	fs.BoolVar(&o.noRoutePush, "no-route-push", false,
 		"只改盘上那份，不推给运行中的 sr-route（下次 sr-route 启动才生效）")
+	fs.StringVar(&o.srfrrConf, "srfrr-conf", "/etc/sr-frr.json",
+		"sr-frr config file; the bundle's 5th segment is merged into it (it is never created here)")
+	fs.StringVar(&o.srfrrSock, "srfrr-sock", "",
+		"sr-frr control socket (default: the file's control_socket, then /run/sr-frr/control.sock)")
+	fs.BoolVar(&o.noSrfrrPush, "no-srfrr-push", false,
+		"只改盘上那份，不推给运行中的 sr-frr（下次 sr-frr 启动才生效）")
 	fs.DurationVar(&o.wait, "wait", 10*time.Second, "how long to wait for lcp TAPs")
 	fs.BoolVar(&o.dry, "dry-run", false, "print the planned commands without changing anything")
 }
@@ -105,6 +115,9 @@ func (o *commonOpts) applier() *apply.Applier {
 	a.FRRReload = o.frrReload
 	a.RouteConf = o.routeConf
 	a.NoRoutePush = o.noRoutePush
+	a.SrfrrConf = o.srfrrConf
+	a.SrfrrSock = o.srfrrSock
+	a.NoSrfrrPush = o.noSrfrrPush
 	a.Wait = o.wait
 	a.DryRun = o.dry
 	return a

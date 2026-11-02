@@ -86,13 +86,14 @@ func (f *fakeZebra) serve() {
 }
 
 // redistFrame 拼一条 ZEBRA_REDISTRIBUTE_ROUTE_ADD：没有下一跳等可选字段，
-// 只有类型/实例/标志/消息位/safi/family/前缀长度/前缀字节。
-func redistFrame(prefix netip.Prefix) []byte {
+// 只有类型/实例/标志/消息位/safi/family/前缀长度/前缀字节。头里的 vrf_id 与
+// payload 里的类型都要能带过去（多 VRF 与多来源都靠它们）。
+func redistFrame(vrfID uint32, typ uint8, prefix netip.Prefix) []byte {
 	p := prefix.Masked()
-	body := []byte{routeTypeBGP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, safiUnicast, familyIPv4, uint8(p.Bits())}
+	body := []byte{typ, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, safiUnicast, familyIPv4, uint8(p.Bits())}
 	a := p.Addr().As4()
 	body = append(body, a[:(p.Bits()+7)/8]...)
-	return message(cmdRedistRouteAdd, 0, body)
+	return message(cmdRedistRouteAdd, vrfID, body)
 }
 
 func TestClientHelloAndSubscribe(t *testing.T) {
@@ -119,13 +120,17 @@ func TestClientHelloAndSubscribe(t *testing.T) {
 		t.Fatal("没收到 HELLO")
 	}
 
-	if err := c.SubscribeBGP(ctx); err != nil {
+	if err := c.SubscribeRoutes(ctx, 10, routeTypeBGP); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case frame := <-fz.routes:
 		if got := binary.BigEndian.Uint16(frame[8:10]); got != cmdRedistAdd {
 			t.Fatalf("命令号 %d want %d", got, cmdRedistAdd)
+		}
+		// 头里的 vrf_id 是 VRF ifindex，不是 VPN 号。
+		if got := binary.BigEndian.Uint32(frame[4:8]); got != 10 {
+			t.Fatalf("订阅的 vrf_id = %d, want 10", got)
 		}
 		// payload：afi、route type、instance。
 		if got := frame[10:13]; got[0] != afiIPv4 || got[1] != routeTypeBGP || got[2] != 0 {
@@ -137,11 +142,14 @@ func TestClientHelloAndSubscribe(t *testing.T) {
 
 	events := make(chan RouteEvent, 1)
 	c.SetRouteHandler(func(ev RouteEvent) { events <- ev })
-	fz.push <- redistFrame(netip.MustParsePrefix("10.20.0.0/16"))
+	fz.push <- redistFrame(10, RouteOSPF, netip.MustParsePrefix("10.20.0.0/16"))
 	select {
 	case ev := <-events:
 		if ev.Prefix.String() != "10.20.0.0/16" || !ev.Add {
 			t.Fatalf("再分发通知解错: %+v", ev)
+		}
+		if ev.VRFID != 10 || ev.Type != RouteOSPF {
+			t.Fatalf("vrf/type = %d/%d, want 10/%d", ev.VRFID, ev.Type, RouteOSPF)
 		}
 	case <-ctx.Done():
 		t.Fatal("没收到再分发通知")
@@ -161,7 +169,7 @@ func TestClientReportsZebraError(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.SubscribeBGP(ctx); err != nil {
+	if err := c.SubscribeRoutes(ctx, 0, routeTypeBGP); err != nil {
 		t.Fatal(err)
 	}
 	<-fz.routes
@@ -199,7 +207,7 @@ func TestClientDetectsDisconnect(t *testing.T) {
 	for time.Now().Before(deadline) {
 		if c.Err() != nil {
 			// 连接已死时再写必须立刻报错，而不是静默成功。
-			if err := c.SubscribeBGP(ctx); err == nil {
+			if err := c.SubscribeRoutes(ctx, 0, routeTypeBGP); err == nil {
 				t.Fatal("死连接上的写入没有报错")
 			}
 			return

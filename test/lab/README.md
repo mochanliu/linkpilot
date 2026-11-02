@@ -15,8 +15,9 @@ sr-fib / sr-frr 把两套路由体系接起来。FRR 和 VPP 的接缝是 VPP �
 - **正向**：sr-route RIB → sr-frr 写内核 K 路由（VPN 0 = 主表 254，出口
   `lo`）→ 盒内 FRR `redistribute kernel` → BGP → 客户路由器。这些路由的出口
   是 `lo`，linux-nl 不镜像，VPP 里看不到。
-- **反向**：客户路由器 eBGP → 盒内 FRR → sr-frr 收 zebra 再分发通知里的
-  BGP 前缀 → `PUT /local-prefixes` → sr-route local → RR 反射 →
+- **反向**：客户路由器 eBGP → 盒内 FRR → sr-frr 按 `import_rules` 选中的
+  (VPN, 来源) 收下 zebra 再分发通知，命中该 VPN 白名单、且不在本机导出集合里的
+  前缀 → `PUT /local-prefixes` → sr-route local → RR 反射 →
   远端 CPE 的 RIB / 带标签 FIB。
 - **落地**：远端前缀由 sr-fib 直接装 VPP（压标签 1000 走 wg）；本地前缀由
   FRR 装内核主表（下一跳 = 客户路由器、出口 = `lcp-x0`），linux-nl 镜像成
@@ -87,8 +88,8 @@ lab-custN 10.99.0.2N        BGP router-id
    overlay /32 在 **table 250**——250 是 SD-WAN 传输域，不是 VPN，VPN ID
    保留 250。
 2. 客户路由器宣告自己的 LAN（10.68.N.0/24）和 loopback（172.16.N.1/32）。
-3. sr-frr 收下 zebra 再分发通知里的 BGP 前缀，经 `PUT /local-prefixes`
-   变成 sr-route 的 local 集合。
+3. sr-frr 按 `import_rules` 订阅选中的 (VPN, zebra 类型)，把命中该 VPN 白名单、
+   且不在本机导出集合里的前缀经 `PUT /local-prefixes` 变成 sr-route 的 local 集合。
 4. sr-route 把 local 集合（本站 LAN + 从客户学到的前缀）经 lab-rr 反射给
    另外两个站点。
 5. sr-fib 只装**远端**前缀：压 1000、走对应 wg 接口、下一跳是对端 overlay。
@@ -121,11 +122,23 @@ C-c 时代是 2.5 秒；这与"可见表 = 所有会话的并集"无关 —— �
 
 防环：
 
-- sr-frr 不按 tag 过滤，收下再分发通知里的全部 BGP 前缀。
+- sr-frr 的导入按 `import_rules` 选 (VPN, 来源)：没规则的 VPN 一条都不报；
+  同一 VPN 的导出集合（本机注入的 K 路由）永远不进上报集合（集合求交写死，不靠概率）。
 - 客户也宣告本站 LAN 时，sr-route 的 local 集合按前缀去重（静态 local 与
   动态导入合并），不会出现两条同前缀。
 - 我方注入的远端前缀再进 BGP 时 tag=0，不会满足客户路由的 tag 门槛；内核
   主表里它们始终是 K（distance 0、出口 `lo`），不会被客户口回来的 B 覆盖。
+
+**sr-frr 的配置面**：`/etc/sr-frr.json` 里只有 `export_vrfs` / `import_rules` 两个键
+归控制器（bundle 第 5 段）；`status_url` / `zserv_socket` / `state_file` / `poll_sec` /
+`control_socket` 是盒子自己的键，sr-apply 只叠加、不覆盖，并把旧 schema 的
+`vrfs` / `import` / `distance` / `metric` 在合并时删掉。运行中的进程走 Unix socket
+`PUT /config`（默认 `/run/sr-frr/control.sock`，0600）：先 PUT 并核对回执的
+`config_hash`，对上了才原子落盘；PUT 失败这次 apply 就失败、盘上保留旧文件。
+`GET /status` 给 hash、注入条数、上报条数、丢环/未知 VRF 计数、订阅与最近错误。
+某 VPN 的协议集合变化（比如只导出 BGP 的 VPN 又加了 OSPF）会带在 `refresh_vrfs` 里，
+sr-frr 对它已有的 K 路由做一次 delete+add 触发再分发重算 —— 实测（2026-11-02，
+lab-cpe3）4 条 K 路由每条 delete→add 5–6 µs、全程 0.2 ms，sr-frr pid 不变。
 
 ## 起停
 
@@ -726,7 +739,9 @@ docker exec lab-cpe1 vppctl show trace
   落到 dpo-drop（接口 up、peer established 也一样不通）。
 - **zebra 的 static 默认路由现在不需要了**：客户口在 VPP 里之后，盒子本身
   不发起经客户路由器的流量，内核也不该有默认路由（脚本会断言它是空的）。
-- **反向上报不按 tag 过滤**：sr-frr 收下再分发通知里的全部 BGP 前缀。
+- **反向上报按 `import_rules` 走**：只报选中的 (VPN, 来源)、命中该 VPN 白名单、
+  且不在本机导出集合里的前缀；白名单空数组 = 一条都不报（fail-closed，
+  与 CPE-SDWAN 侧「空列表=全放过」相反）。
 - **ZAPI v6 的命令号不是"导出那条 +18"**：实测 zebra 发来的
   REDISTRIBUTE_ROUTE_ADD/DEL 是 31/32（中间夹着 CAPABILITIES/BFD_REPLAY）。
   拿错一个会静默丢掉整条反方向的路由，所以 FRR 版本必须 pinned 10.7.1。

@@ -1,9 +1,11 @@
 package frr
 
 import (
+	"fmt"
 	"log"
 	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,58 +21,209 @@ const (
 	resyncDeadline = 10 * time.Second
 )
 
-// Importer 维护"从客户侧学到"的前缀集合：BGP 再分发通知里的 ADD 收下，
-// DEL 撤掉。集合语义是"每个前缀的最新选中路由"。
+// ImportRule is one (VPN) CPE-SDWAN row after the tenant's prefix-list has been
+// expanded by the controller. Sources are route types (RouteConnected...); an
+// empty Allow list matches nothing -- CPE-SDWAN always names a list, and fail
+// closed is the only safe default for a whitelist.
+type ImportRule struct {
+	VPN     uint8
+	Sources []uint8
+	Allow   []AllowEntry
+}
+
+// AllowEntry is one permit line. FRR prefix-list semantics: with neither ge nor
+// le the entry matches exactly that prefix length; ge/le widen it.
+type AllowEntry struct {
+	Prefix netip.Prefix
+	GE     int
+	LE     int
+}
+
+func (e AllowEntry) allows(p netip.Prefix) bool {
+	if p.Bits() < e.Prefix.Bits() || !e.Prefix.Contains(p.Addr()) {
+		return false
+	}
+	if e.GE == 0 && e.LE == 0 {
+		return p.Bits() == e.Prefix.Bits()
+	}
+	if e.GE > 0 && p.Bits() < e.GE {
+		return false
+	}
+	if e.LE > 0 && p.Bits() > e.LE {
+		return false
+	}
+	return true
+}
+
+// Allows reports whether the row's whitelist permits p. No entries = nothing.
+func (r ImportRule) Allows(p netip.Prefix) bool {
+	for _, e := range r.Allow {
+		if e.allows(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// WantsSource reports whether this row selected the zebra route type.
+func (r ImportRule) WantsSource(t uint8) bool {
+	for _, s := range r.Sources {
+		if s == t {
+			return true
+		}
+	}
+	return false
+}
+
+// SourceName is the tenant-facing name of a zebra route type.
+func SourceName(t uint8) string {
+	switch t {
+	case RouteConnected:
+		return "connected"
+	case RouteStatic:
+		return "static"
+	case RouteOSPF:
+		return "ospf"
+	case RouteBGP:
+		return "bgp"
+	default:
+		return fmt.Sprintf("type%d", t)
+	}
+}
+
+// ParseSource maps a rule's source name to the zebra type measured in S-0.
+func ParseSource(name string) (uint8, bool) {
+	switch name {
+	case "connected":
+		return RouteConnected, true
+	case "static":
+		return RouteStatic, true
+	case "ospf":
+		return RouteOSPF, true
+	case "bgp":
+		return RouteBGP, true
+	default:
+		return 0, false
+	}
+}
+
+// ImportKey is one prefix in one VPN. The source set is what lets a withdraw of
+// the BGP copy keep the connected copy (zebra notifies per route type).
+type ImportKey struct {
+	VPN    uint8
+	Prefix netip.Prefix
+}
+
+func (k ImportKey) String() string {
+	return fmt.Sprintf("vpn%d %s", k.VPN, k.Prefix)
+}
+
+type sourceSet map[uint8]struct{}
+
+// ReportedPrefix is one line of PUT /local-prefixes.
+type ReportedPrefix struct {
+	VPN    uint8
+	Prefix netip.Prefix
+}
+
+// ReportStats is what /status shows. LoopDropped is the size of the current
+// intersection with this VPN's export set (S-0 proved K shadows BGP, but the
+// intersection is written down rather than relied on).
+type ReportStats struct {
+	Tracked     int
+	Reported    int
+	LoopDropped int
+	UnknownVRF  uint64
+}
+
+// Importer maintains "what the customer side told us", keyed by (VPN, prefix)
+// with the set of route types that produced it.
 type Importer struct {
 	mu     sync.Mutex
-	routes map[netip.Prefix]struct{}
+	routes map[ImportKey]sourceSet
 
 	// The resync window. While it is open the answers are stale ∪ pending: the
 	// last good set stays published and the replay fills pending alongside it.
 	// Closing it adopts pending alone, which is the only moment a prefix can be
 	// withdrawn because of a reconnect.
-	stale   map[netip.Prefix]struct{}
-	pending map[netip.Prefix]struct{}
+	stale   map[ImportKey]sourceSet
+	pending map[ImportKey]sourceSet
 	resync  bool
 	seen    bool // at least one notify arrived on the new connection
 	started time.Time
 	last    time.Time
 
+	// vpnOf maps a ZAPI header vrf_id (kernel VRF ifindex) to the VPN. Unknown
+	// ids are dropped and counted, never folded into VPN 0.
+	vpnOf   func(vrfID uint32) (uint8, bool)
+	unknown map[uint32]struct{}
+	badVRF  uint64
+
 	Now  func() time.Time
 	Logf func(format string, args ...any)
 }
 
-func NewImporter() *Importer {
+// NewImporter takes the ifindex→VPN mapping measured in S-0. A nil mapper keeps
+// only the default VRF (id 0 → VPN 0).
+func NewImporter(vpnOf func(vrfID uint32) (uint8, bool)) *Importer {
+	if vpnOf == nil {
+		vpnOf = func(vrfID uint32) (uint8, bool) { return 0, vrfID == 0 }
+	}
 	return &Importer{
-		routes: map[netip.Prefix]struct{}{},
-		Now:    time.Now,
-		Logf:   log.Printf,
+		routes:  map[ImportKey]sourceSet{},
+		vpnOf:   vpnOf,
+		unknown: map[uint32]struct{}{},
+		Now:     time.Now,
+		Logf:    log.Printf,
 	}
 }
 
-// Handle 处理一条 zebra 再分发通知。
+// Handle processes one zebra redistribute notification. The header's vrf_id is
+// the route's VRF ifindex; the payload's type is its source.
 func (im *Importer) Handle(ev RouteEvent) {
 	if !ev.Prefix.IsValid() || !ev.Prefix.Addr().Is4() {
 		return
 	}
-	p := ev.Prefix.Masked()
+	vpn, ok := im.vpnOf(ev.VRFID)
+	if !ok {
+		im.mu.Lock()
+		im.badVRF++
+		first := false
+		if _, seen := im.unknown[ev.VRFID]; !seen {
+			im.unknown[ev.VRFID] = struct{}{}
+			first = true
+		}
+		im.mu.Unlock()
+		if first {
+			im.Logf("sr-frr: 再分发通知里的 vrf_id %d 没有对应的 VPN，丢弃（不并到 VPN 0）", ev.VRFID)
+		}
+		return
+	}
+	k := ImportKey{VPN: vpn, Prefix: ev.Prefix.Masked()}
+
 	im.mu.Lock()
 	defer im.mu.Unlock()
+	set := im.routes
 	if im.resync {
-		im.apply(im.pending, p, ev)
+		set = im.pending
 		im.seen = true
 		im.last = im.Now()
-		return
 	}
-	im.apply(im.routes, p, ev)
-}
-
-func (im *Importer) apply(set map[netip.Prefix]struct{}, p netip.Prefix, ev RouteEvent) {
 	if ev.Add {
-		set[p] = struct{}{}
+		src := set[k]
+		if src == nil {
+			src = sourceSet{}
+			set[k] = src
+		}
+		src[ev.Type] = struct{}{}
 		return
 	}
-	delete(set, p)
+	if src := set[k]; src != nil {
+		delete(src, ev.Type)
+		if len(src) == 0 {
+			delete(set, k)
+		}
+	}
 }
 
 // BeginResync opens the window after a (re)connect. The old set is kept, not
@@ -90,7 +243,7 @@ func (im *Importer) BeginResync() {
 	}
 	// A second reconnect before the first window closed keeps the original
 	// stale set: it is still the last thing the device really had.
-	im.pending = map[netip.Prefix]struct{}{}
+	im.pending = map[ImportKey]sourceSet{}
 	im.resync = true
 	im.seen = false
 	im.started = im.Now()
@@ -98,7 +251,7 @@ func (im *Importer) BeginResync() {
 }
 
 // Tick closes the window once the replay has been quiet long enough, or the
-// deadline is reached. The poll loop calls it before reading Prefixes; nothing
+// deadline is reached. The poll loop calls it before reading Report; nothing
 // else needs to run on a timer.
 func (im *Importer) Tick(now time.Time) {
 	im.mu.Lock()
@@ -116,8 +269,8 @@ func (im *Importer) Tick(now time.Time) {
 		}
 	}
 	kept, dropped := 0, 0
-	for p := range im.stale {
-		if _, ok := im.pending[p]; ok {
+	for k := range im.stale {
+		if _, ok := im.pending[k]; ok {
 			kept++
 			continue
 		}
@@ -139,29 +292,76 @@ func (im *Importer) Tick(now time.Time) {
 	im.Logf("sr-frr: 重连对账完成：保留 %d 条，撤掉 %d 条", kept, dropped)
 }
 
-// Prefixes 返回排好序的前缀快照。
-func (im *Importer) Prefixes() []netip.Prefix {
+// Report applies the current rules to the visible set: selected source, the
+// VPN's whitelist, and the anti-loop intersection with what this VPN exports.
+// Everything is computed at read time, so removing a source or a prefix from a
+// whitelist takes effect on the next poll without waiting for zebra.
+func (im *Importer) Report(rules []ImportRule, exported map[uint8]map[netip.Prefix]struct{}) ([]ReportedPrefix, ReportStats) {
 	im.mu.Lock()
-	set := im.routes
+	visible := map[ImportKey]sourceSet{}
+	add := func(set map[ImportKey]sourceSet) {
+		for k, src := range set {
+			dst := visible[k]
+			if dst == nil {
+				dst = sourceSet{}
+				visible[k] = dst
+			}
+			for t := range src {
+				dst[t] = struct{}{}
+			}
+		}
+	}
+	add(im.routes)
 	if im.resync {
-		set = map[netip.Prefix]struct{}{}
-		for p := range im.stale {
-			set[p] = struct{}{}
-		}
-		for p := range im.pending {
-			set[p] = struct{}{}
-		}
+		add(im.stale)
+		add(im.pending)
 	}
-	out := make([]netip.Prefix, 0, len(set))
-	for p := range set {
-		out = append(out, p)
-	}
+	stats := ReportStats{Tracked: len(visible), UnknownVRF: im.badVRF}
 	im.mu.Unlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-	return out
+
+	byVPN := make(map[uint8]ImportRule, len(rules))
+	for _, r := range rules {
+		byVPN[r.VPN] = r
+	}
+	out := make([]ReportedPrefix, 0, len(visible))
+	for k, src := range visible {
+		rule, ok := byVPN[k.VPN]
+		if !ok {
+			continue
+		}
+		wanted := false
+		for t := range src {
+			if rule.WantsSource(t) {
+				wanted = true
+				break
+			}
+		}
+		if !wanted || !rule.Allows(k.Prefix) {
+			continue
+		}
+		if set := exported[k.VPN]; set != nil {
+			if _, loop := set[k.Prefix]; loop {
+				stats.LoopDropped++
+				continue
+			}
+		}
+		out = append(out, ReportedPrefix{VPN: k.VPN, Prefix: k.Prefix})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].VPN != out[j].VPN {
+			return out[i].VPN < out[j].VPN
+		}
+		return out[i].Prefix.String() < out[j].Prefix.String()
+	})
+	stats.Reported = len(out)
+	return out, stats
 }
 
-// Len 返回当前对外可见的集合大小（日志用）。
-func (im *Importer) Len() int {
-	return len(im.Prefixes())
+// Signature is a stable form of a reported set, used to avoid pointless PUTs.
+func Signature(ps []ReportedPrefix) string {
+	var b strings.Builder
+	for _, p := range ps {
+		b.WriteString(fmt.Sprintf("%d|%s\n", p.VPN, p.Prefix))
+	}
+	return b.String()
 }

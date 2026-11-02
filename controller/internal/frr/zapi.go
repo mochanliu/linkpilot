@@ -37,9 +37,16 @@ const (
 	cmdRedistRouteDel uint16 = 32
 	cmdError          uint16 = 120
 
-	// routeTypeBGP 是我们反方向订阅的类型：客户侧路由器学来的前缀在
-	// zebra 的 RIB 里是 BGP 路由。
-	routeTypeBGP uint8 = 10
+	// 反方向订阅的路由类型，取自 FRR 10.7.1 的 route_types.txt 并在 lab
+	// 逐条实测（docs/o6e-leak-plan.md §1.1）：connected=2、static=4、ospf=7、
+	// bgp=10。kernel=1 不开放给租户选，只在 S-0 里验证过。
+	RouteConnected uint8 = 2
+	RouteStatic    uint8 = 4
+	RouteOSPF      uint8 = 7
+	RouteBGP       uint8 = 10
+
+	// routeTypeBGP 保留给旧调用点；新代码用 RouteBGP。
+	routeTypeBGP = RouteBGP
 
 	// protoSharp 只是"我是谁"的标识；订阅再分发不需要真实守护进程的身份，
 	// 用 sharp 是因为没有真守护进程会和我们抢。
@@ -81,8 +88,8 @@ func (w *zapiBuf) u32(v uint32) { w.b = binary.BigEndian.AppendUint32(w.b, v) }
 func (w *zapiBuf) raw(p []byte) { w.b = append(w.b, p...) }
 
 // message 在 payload 前面补上 ZAPI 头。头里的 vrf_id 是这条消息所属的
-// **FRR VRF**（内核 VRF 设备的 ifindex），不是控制面的 VPN 号；当前导入只
-// 订默认 VRF（0），多 VRF 的 ifindex 映射在订阅侧完成。
+// **FRR VRF**（内核 VRF 设备的 ifindex），不是控制面的 VPN 号；订阅与通知
+// 都按这个 id 走，换算由 Importer 的 VPNOf 完成。
 func message(cmd uint16, vrfID uint32, payload []byte) []byte {
 	w := zapiBuf{b: make([]byte, 0, zapiHeaderSize+len(payload))}
 	w.u16(uint16(zapiHeaderSize + len(payload)))
@@ -105,19 +112,24 @@ func encodeHello(instance uint16) []byte {
 	return message(cmdHello, 0, p.b)
 }
 
-// encodeRedistributeAdd 订阅某类路由的再分发通知。zebra 收到后会先把该类型
-// 已经选中的路由整份回放一遍，再逐条推增量 —— 重连后不需要另外要快照。
-func encodeRedistributeAdd(afi, routeType uint8, instance uint16) []byte {
+// encodeRedistributeAdd 订阅某个 VRF 里某类路由的再分发通知。zebra 按
+// (vrf_id, afi, type) 注册订阅，只发一个默认 VRF 会漏掉其它 VPN 的全部路由
+// （docs/o6e-leak-plan.md §1.1）。收到订阅后 zebra 会先把已选中的路由整份
+// 回放一遍，再逐条推增量 —— 重连后不需要另外要快照。
+func encodeRedistributeAdd(afi, routeType uint8, instance uint16, vrfID uint32) []byte {
 	var p zapiBuf
 	p.u8(afi)
 	p.u8(routeType)
 	p.u16(instance)
-	return message(cmdRedistAdd, 0, p.b)
+	return message(cmdRedistAdd, vrfID, p.b)
 }
 
-// RouteEvent 是 zebra 再分发通知里我们关心的部分：前缀与增删。
-// 下一跳、tag 等字段解码时跳过 —— 反向导入只关心"客户侧宣告了哪些前缀"。
+// RouteEvent 是 zebra 再分发通知里我们关心的部分：哪个 VRF、哪个来源类型、
+// 前缀与增删。头里的 VRFID 是内核 VRF 设备的 ifindex（默认 VRF 是 0），
+// 不是 VPN 号。下一跳、tag 等字段解码时跳过。
 type RouteEvent struct {
+	VRFID  uint32
+	Type   uint8
 	Prefix netip.Prefix
 	Add    bool
 }
@@ -179,7 +191,8 @@ const knownMessageFlags = msgNexthop | msgDistance | msgMetric | msgTag | msgMTU
 	msgSrcPfx | msgBackup | msgNHG | msgTableID | msgSRTE | msgOpaque
 
 // decodeRedistributeRoute 解一条 ZEBRA_REDISTRIBUTE_ROUTE_ADD/DEL 的 payload。
-func decodeRedistributeRoute(body []byte, add bool) (RouteEvent, error) {
+// vrfID 来自 ZAPI 头：它是路由所在 VRF 的 ifindex（§1.1 实测）。
+func decodeRedistributeRoute(body []byte, add bool, vrfID uint32) (RouteEvent, error) {
 	var ev RouteEvent
 	r := &zapiReader{b: body}
 	typ := r.u8()
@@ -192,8 +205,12 @@ func decodeRedistributeRoute(body []byte, add bool) (RouteEvent, error) {
 	if r.err != nil {
 		return ev, r.err
 	}
-	if typ != routeTypeBGP {
-		return ev, fmt.Errorf("再分发通知的路由类型是 %d，不是 BGP", typ)
+	switch typ {
+	case RouteConnected, RouteStatic, RouteOSPF, RouteBGP:
+	default:
+		// 我们只订阅这四种；收到别的说明订阅/版本对不上，不能当普通路由
+		// 收下 —— 来源决定它会不会被上报。
+		return ev, fmt.Errorf("再分发通知的路由类型是 %d，不在已订阅的 connected/static/ospf/bgp 里", typ)
 	}
 	if safi != safiUnicast || family != familyIPv4 {
 		return ev, fmt.Errorf("再分发通知是 safi %d family %d，只处理 IPv4 unicast", safi, family)
@@ -210,6 +227,8 @@ func decodeRedistributeRoute(body []byte, add bool) (RouteEvent, error) {
 		return ev, r.err
 	}
 	ev.Prefix = netip.PrefixFrom(netip.AddrFrom4(a), int(plen)).Masked()
+	ev.VRFID = vrfID
+	ev.Type = typ
 	ev.Add = add
 
 	if message&msgSrcPfx != 0 {

@@ -70,7 +70,7 @@ func (c *Client) ZebraError() error {
 	return err
 }
 
-// SetRouteHandler 注册再分发通知的处理函数。必须在 SubscribeBGP 之前调用：
+// SetRouteHandler 注册再分发通知的处理函数。必须在 SubscribeRoutes 之前调用：
 // zebra 接受订阅后会立刻回放当前已经选中的路由。
 func (c *Client) SetRouteHandler(fn func(RouteEvent)) {
 	c.handlerMu.Lock()
@@ -78,9 +78,11 @@ func (c *Client) SetRouteHandler(fn func(RouteEvent)) {
 	c.handlerMu.Unlock()
 }
 
-// SubscribeBGP 订阅 zebra 里 BGP 类型的 IPv4 unicast 路由（含立即回放）。
-func (c *Client) SubscribeBGP(ctx context.Context) error {
-	return c.write(ctx, encodeRedistributeAdd(afiIPv4, routeTypeBGP, 0))
+// SubscribeRoutes 订阅某个 VRF（内核 ifindex，默认 VRF 是 0）里某类 IPv4
+// unicast 路由的再分发通知（含立即回放）。一条连接可以反复调用它订阅多个
+// VRF × 来源；每一对都是一次独立注册。
+func (c *Client) SubscribeRoutes(ctx context.Context, vrfID uint32, routeType uint8) error {
+	return c.write(ctx, encodeRedistributeAdd(afiIPv4, routeType, 0, vrfID))
 }
 
 func (c *Client) write(ctx context.Context, msg []byte) error {
@@ -118,6 +120,7 @@ func (c *Client) readLoop() {
 		size := int(binary.BigEndian.Uint16(hdr[0:2]))
 		marker := hdr[2]
 		version := hdr[3]
+		vrfID := binary.BigEndian.Uint32(hdr[4:8])
 		cmd := binary.BigEndian.Uint16(hdr[8:10])
 		if marker != zapiHeaderMarker || version != zservVersion {
 			c.setIOErr(fmt.Errorf("ZAPI 头不对: marker=0x%02x version=%d", marker, version))
@@ -136,7 +139,7 @@ func (c *Client) readLoop() {
 		case cmdError:
 			c.setZAPIErr(body)
 		case cmdRedistRouteAdd, cmdRedistRouteDel:
-			ev, err := decodeRedistributeRoute(body, cmd == cmdRedistRouteAdd)
+			ev, err := decodeRedistributeRoute(body, cmd == cmdRedistRouteAdd, vrfID)
 			if err != nil {
 				// 线格式对不上就重连：带着一条解歪的流继续跑，后面的
 				// 通知只会错得更隐蔽。

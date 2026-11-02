@@ -837,10 +837,9 @@ stage_frr() {
   "state_file": "/var/lib/sr-frr/state.json",
   "poll_sec": 1,
   "export_vrfs": [$VPN],
-  "import": {
-    "vrf_id": $VPN,
-    "prefixes_url": "http://127.0.0.1:${ROUTE_STATUS[$n]}/local-prefixes"
-  }
+  "import_rules": [
+    {"vpn": $VPN, "sources": ["bgp"], "prefixes": [{"prefix": "0.0.0.0/0", "le": 32}]}
+  ]
 }
 EOF
         docker cp "$RUN/cpe$n.sr-frr.json" "$c:/etc/sr-frr.json" >/dev/null

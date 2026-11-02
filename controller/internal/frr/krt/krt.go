@@ -37,9 +37,29 @@ func Index(vpn uint32) (int, error) {
 	if vpn != 0 {
 		name = fmt.Sprintf("vpn%d", vpn)
 	}
+	return LinkIndex(name)
+}
+
+// LinkIndex 返回内核接口的 ifindex。导入侧要的是 VRF 设备本身的 ifindex
+// （FRR 的 vrf_id 就是它），与导出侧用什么出口无关。
+func LinkIndex(name string) (int, error) {
 	ifi, err := net.InterfaceByName(name)
 	if err != nil {
-		return 0, fmt.Errorf("krt: 找出口 %s: %w", name, err)
+		return 0, fmt.Errorf("krt: 找接口 %s: %w", name, err)
 	}
 	return ifi.Index, nil
+}
+
+// ImportIndex 返回 VPN 在 ZAPI 里用的 vrf_id：VPN 0 是默认 VRF（0），其余是
+// vpn<N> 设备的 ifindex。设备不存在就是配置错误 —— 订阅一个不存在的 VRF
+// 只会让 zebra 回 ZEBRA_NO_VRF，或者干脆一条通知都不来。
+func ImportIndex(vpn uint8) (uint32, error) {
+	if vpn == 0 {
+		return 0, nil
+	}
+	i, err := LinkIndex(fmt.Sprintf("vpn%d", vpn))
+	if err != nil {
+		return 0, err
+	}
+	return uint32(i), nil
 }

@@ -1,21 +1,18 @@
-// sr-frr 把 sr-route 的 RIB 以**内核 K 路由**的形式写进盒子的对应 VPN 表，
-// 让客户侧的路由进程（BGP/OSPF）用 `redistribute kernel` 把远端站点前缀再
-// 分发进客户内网。
+// sr-frr 是盒子内核与客户侧 FRR 之间的两个方向的接缝：
 //
-// 它和 sr-fib 是一对平行的"输出端"，但两者刻意不做同一件事：
+//   - SDWAN → 客户：sr-route 的 RIB 以**内核 K 路由**写进对应 VPN 表（VPN 0 =
+//     main/254，其余 = table N、出口 vpn<N>），客户侧 BGP/OSPF 用
+//     `redistribute kernel` 再分发。linux-nl 不镜像这类路由，VPP 看不到；
+//     zebra 把它们认成 K（distance 0）。
+//   - 客户 → SDWAN：按（VPN, 来源）订阅 zebra 的再分发通知，按该 VPN 的白名单
+//     过滤、扣掉本 VPN 正在导出的前缀（防回环），整份 PUT 给 sr-route。
 //
-//   - sr-fib 写 VPP：谁的流量、从哪条隧道出去、压什么标签 —— 这是转发。
-//   - sr-frr 写内核：哪些前缀存在 —— 这是给客户路由看的事实。客户侧自己
-//     决定怎么 redistribute、加什么 route-map。
+// 配置由控制器发布（bundle 第 5 段）并经 sr-apply 推到
+// /run/sr-frr/control.sock 的 PUT /config；PUT 只换运行时配置，绝不重启进程
+// （退出会把上报的前缀清空一次，等于全网抖一下）。
 //
-// VPN 0 写内核 main（254），VPN N 写 table N、出口 vpn<N>（见 internal/frr/krt
-// 与 internal/frr.KernelTable）。linux-nl 不镜像这类路由，VPP 完全看不到；
-// zebra 把它们认成 K（distance 0）。FRR 侧需要在对应实例里配好
-// `redistribute kernel`（可再套 route-map）。为什么不再走 ZAPI 的 TABLE 路
-// 由：那条路会在 VPP 里镜像出一张全 dpo-drop 的死表（docs/o6e-leak-plan.md §1）。
-//
-// 退出与崩溃的账都算清楚：正常退出逐条撤掉再删状态文件；被强杀时状态文件
-// 还在，下次启动先把它当基线做差量 —— 内核不会替我们收尾。
+// 退出与崩溃的账：正常退出逐条撤掉 K 路由再删状态文件；被强杀时状态文件还
+// 在，下次启动先把它当基线做差量 —— 内核不会替我们收尾。
 package main
 
 import (
@@ -27,12 +24,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,32 +44,26 @@ import (
 )
 
 type fileConfig struct {
-	StatusURL   string        `json:"status_url"`
-	ZServSocket string        `json:"zserv_socket"`
-	StateFile   string        `json:"state_file"`
-	PollSec     int           `json:"poll_sec"`
-	ExportVRFs  []uint32      `json:"export_vrfs"`
-	Import      *importConfig `json:"import"`
+	StatusURL     string          `json:"status_url"`
+	ZServSocket   string          `json:"zserv_socket"`
+	StateFile     string          `json:"state_file"`
+	PollSec       int             `json:"poll_sec"`
+	ControlSocket string          `json:"control_socket"`
+	ExportVRFs    json.RawMessage `json:"export_vrfs"`
+	ImportRules   json.RawMessage `json:"import_rules"`
 
-	// 已退役的导出键（ZAPI 的 table-direct 1250）。只用来识别旧配置：
-	// 出现就告警并关掉导出，绝不按它们的值去写。
+	// 已退役的旧 schema（ZAPI/1250 导出 + 单 VRF 只订 BGP 的 import）。出现
+	// 就告警并把两个方向都置空：绝不按旧值继续跑（那条导出路径已经删了）。
+	LegacyImport   json.RawMessage `json:"import"`
 	LegacyVRFs     json.RawMessage `json:"vrfs"`
 	LegacyDistance *int            `json:"distance"`
 	LegacyMetric   *int            `json:"metric"`
 }
 
-// importConfig 打开反方向：把客户侧 BGP 学到的前缀上报给 sr-route。
-type importConfig struct {
-	VRFID       uint8  `json:"vrf_id"`
-	PrefixesURL string `json:"prefixes_url"`
-}
-
-// importVRF 是 import 用的默认 FRR 实例（L-3 只搬导出方向；多 VRF 导入在 L-4）。
-const importVRF uint8 = 0
-
 const (
-	defaultZServSocket = "/run/frr/zserv.api"
-	defaultStateFile   = "/run/sr-frr/state.json"
+	defaultZServSocket   = "/run/frr/zserv.api"
+	defaultStateFile     = "/run/sr-frr/state.json"
+	defaultControlSocket = "/run/sr-frr/control.sock"
 
 	// onceSettle 只在 -once 里等一下：netlink ACK 表示内核已经装好，但 zebra
 	// 是通过内核的 netlink 组播异步学到的，紧接着用 vtysh 看 `show ip route`
@@ -92,29 +89,401 @@ func loadConfig(path string) (*fileConfig, error) {
 	if cfg.StateFile == "" {
 		cfg.StateFile = defaultStateFile
 	}
+	if cfg.ControlSocket == "" {
+		cfg.ControlSocket = defaultControlSocket
+	}
 	if cfg.PollSec == 0 {
 		cfg.PollSec = 2
 	}
 	if cfg.PollSec < 0 {
 		return nil, errors.New("poll_sec 不能为负")
 	}
-	if cfg.Import != nil && cfg.Import.PrefixesURL == "" {
-		return nil, errors.New("import.prefixes_url is required（sr-route 的 PUT /local-prefixes）")
-	}
-	if cfg.LegacyVRFs != nil || cfg.LegacyDistance != nil || cfg.LegacyMetric != nil {
-		if len(cfg.ExportVRFs) > 0 {
-			return nil, errors.New("配置里同时出现退役的 vrfs/distance/metric 与 export_vrfs；删掉退役键再启动")
+	if cfg.LegacyImport != nil || cfg.LegacyVRFs != nil || cfg.LegacyDistance != nil || cfg.LegacyMetric != nil {
+		if len(bytes.TrimSpace(cfg.ExportVRFs)) > 0 || len(bytes.TrimSpace(cfg.ImportRules)) > 0 {
+			return nil, errors.New("配置里同时出现旧 schema（vrfs/import/distance/metric）与 export_vrfs/import_rules；删掉旧键再启动")
 		}
-		log.Printf("sr-frr: 配置里有已退役的键 vrfs/distance/metric（旧 ZAPI 1250 导出），已忽略并关闭导出；请改成 export_vrfs")
+		log.Printf("sr-frr: 配置是旧 schema（vrfs/import/distance/metric），export 与 import 都置空；等控制器重写 /etc/sr-frr.json")
 		cfg.ExportVRFs = nil
+		cfg.ImportRules = nil
 	}
 	return &cfg, nil
 }
 
-// statusDoc 是 sr-route /status 里本进程用到的部分。
+// runtimeConfig is one applied configuration. Slices are never mutated in
+// place: a PUT swaps the whole struct, so readers can share them.
+type runtimeConfig struct {
+	exportVRFs []uint32
+	rules      []frr.ImportRule
+	exportRaw  []byte
+	importRaw  []byte
+	hash       string
+}
+
+func compileRuntime(exportRaw, importRaw []byte) (runtimeConfig, error) {
+	var cfg runtimeConfig
+	vrfs, err := frr.CompileExportVRFs(exportRaw)
+	if err != nil {
+		return cfg, err
+	}
+	rules, err := frr.CompileImportRules(importRaw)
+	if err != nil {
+		return cfg, err
+	}
+	// 出口与订阅的 ifindex 都在这里暴露，而不是等第一轮轮询才发现。
+	for _, v := range vrfs {
+		if _, err := krt.Index(v); err != nil {
+			return cfg, fmt.Errorf("导出 VPN %d 的出口: %w", v, err)
+		}
+	}
+	h, err := frr.ConfigHash(exportRaw, importRaw)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.exportVRFs = vrfs
+	cfg.rules = rules
+	cfg.exportRaw = append([]byte(nil), exportRaw...)
+	cfg.importRaw = append([]byte(nil), importRaw...)
+	cfg.hash = h
+	return cfg, nil
+}
+
+type runtimeStore struct {
+	mu  sync.RWMutex
+	cfg runtimeConfig
+}
+
+func (s *runtimeStore) snapshot() runtimeConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+func (s *runtimeStore) set(cfg runtimeConfig) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+}
+
+// vpnMapper maps a ZAPI header vrf_id (kernel VRF ifindex) to a VPN. It is
+// replaced as a whole so the read loop never blocks on a config change.
+type vpnMapper struct {
+	p atomic.Pointer[map[uint32]uint8]
+}
+
+func (m *vpnMapper) set(v map[uint32]uint8) { m.p.Store(&v) }
+
+func (m *vpnMapper) lookup(id uint32) (uint8, bool) {
+	p := m.p.Load()
+	if p == nil {
+		return 0, id == 0
+	}
+	v, ok := (*p)[id]
+	return v, ok
+}
+
+// exportState owns the netlink client and the K-route reconciler. One mutex
+// covers the poll loop, the control socket's touch, and /status.
+type exportState struct {
+	mu      sync.Mutex
+	dp      *krt.Client
+	ex      *frr.Exporter
+	lastSig string
+	plan    []frr.Route
+	lastErr string
+}
+
+func planSig(routes []frr.Route) string {
+	var b strings.Builder
+	for _, r := range routes {
+		b.WriteString(strconv.FormatUint(uint64(r.Table), 10))
+		b.WriteByte('|')
+		b.WriteString(r.Prefix.String())
+		b.WriteByte('|')
+		b.WriteString(strconv.Itoa(r.OIF))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func exportList(vrfs []uint32) string {
+	parts := make([]string, 0, len(vrfs))
+	for _, v := range vrfs {
+		parts = append(parts, fmt.Sprintf("vpn%d→table %d", v, frr.KernelTable(uint8(v))))
+	}
+	return strings.Join(parts, ",")
+}
+
+func vpnOfTable(table uint32) uint32 {
+	if table == 254 {
+		return 0
+	}
+	return table
+}
+
+// exportedSet is the anti-loop input: what this VPN currently has as K routes.
+// Read under the same lock as Apply so a concurrent config change cannot make
+// it claim prefixes that were just withdrawn.
+func (e *exportState) exportedSet(exportVRFs []uint32) map[uint8]map[netip.Prefix]struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[uint8]map[netip.Prefix]struct{}, len(exportVRFs))
+	for _, r := range e.plan {
+		vpn := vpnOfTable(r.Table)
+		if vpn > 255 {
+			continue
+		}
+		set := out[uint8(vpn)]
+		if set == nil {
+			set = map[netip.Prefix]struct{}{}
+			out[uint8(vpn)] = set
+		}
+		set[r.Prefix] = struct{}{}
+	}
+	return out
+}
+
+// reconcile brings the kernel tables in line with sr-route's RIB. Callers are
+// the poll loop; the control socket only touches prefixes that already exist.
+// statusURL and stateFile are box keys, not part of the published config, so
+// they come from the file the process was started with.
+func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtimeConfig, statusURL, stateFile string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	var routes []frr.RIBRoute
+	if len(cfg.exportVRFs) > 0 {
+		var err error
+		routes, err = fetchRIB(ctx, hc, statusURL)
+		if err != nil {
+			e.lastErr = err.Error()
+			return fmt.Errorf("读 RIB: %w", err)
+		}
+	}
+	plan, err := frr.PlanFrom(cfg.exportVRFs, routes, krt.Index)
+	if err != nil {
+		e.lastErr = err.Error()
+		return err
+	}
+	// 先落盘再下发：中途被杀时，文件里是"打算写的全部"，最多多删几条不存在
+	// 的路由，不会漏删。计划为空时删文件 —— 状态文件存在就代表我们留了东西。
+	if sig := planSig(plan.Routes); sig != e.lastSig {
+		if len(plan.Routes) == 0 {
+			err = frr.RemoveState(stateFile)
+		} else {
+			err = frr.SaveState(stateFile, plan.Routes)
+		}
+		if err != nil {
+			e.lastErr = err.Error()
+			return fmt.Errorf("写状态文件: %w", err)
+		}
+		e.lastSig = sig
+	}
+	res, err := e.ex.Apply(ctx, plan)
+	if err != nil {
+		e.lastErr = err.Error()
+		return err
+	}
+	e.plan = e.ex.Routes()
+	e.lastErr = ""
+	if res.Changed() {
+		log.Printf("sr-frr: 收敛 routes+%d/-%d（%s）", res.Added, res.Removed, exportList(cfg.exportVRFs))
+	}
+	return nil
+}
+
+// touch forces zebra to recompute redistribution for the given VPNs: when a
+// protocol is added to a VPN that was already exporting, the K routes are
+// already in the table and `redistribute kernel` does not look at them again
+// (measured, §1.3). Delete+add is pure kernel; VPP never sees it.
+func (e *exportState) touch(ctx context.Context, vrfs []uint32) (map[uint32]int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	want := make(map[uint32]bool, len(vrfs))
+	for _, v := range vrfs {
+		want[v] = true
+	}
+	touched := map[uint32]int{}
+	for _, r := range e.plan {
+		vpn := vpnOfTable(r.Table)
+		if !want[vpn] {
+			continue
+		}
+		if err := e.dp.RouteDelete(ctx, r); err != nil {
+			return touched, fmt.Errorf("touch 删 %s（表 %d）: %w", r.Prefix, r.Table, err)
+		}
+		if err := e.dp.RouteAdd(ctx, r); err != nil {
+			return touched, fmt.Errorf("touch 加 %s（表 %d）: %w", r.Prefix, r.Table, err)
+		}
+		touched[vpn]++
+	}
+	return touched, nil
+}
+
+// importState is the read side's bookkeeping: connection, subscription
+// signature, and the numbers /status reports.
+type importState struct {
+	mu       sync.Mutex
+	cl       *frr.Client
+	clSig    string
+	lastWarn string
+	lastErr  string
+	reported int
+	loop     int
+	unknown  uint64
+	subs     []string
+	subSig   string
+}
+
+func (s *importState) setPoll(err error, reps int, loop int, unknown uint64, subs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reported = reps
+	s.loop = loop
+	s.unknown = unknown
+	s.subs = subs
+	if err != nil {
+		s.lastErr = err.Error()
+	} else {
+		s.lastErr = ""
+	}
+}
+
+func (s *importState) setWarn(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if msg != s.lastWarn {
+		s.lastWarn = msg
+		if msg != "" {
+			log.Printf("sr-frr: %s", msg)
+		}
+	}
+}
+
+func (s *importState) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cl != nil {
+		s.cl.Close()
+		s.cl = nil
+		s.clSig = ""
+	}
+}
+
+type subSpec struct {
+	VPN   uint8
+	VRFID uint32
+	Type  uint8
+}
+
+func subsSig(subs []subSpec) string {
+	var b strings.Builder
+	for _, s := range subs {
+		fmt.Fprintf(&b, "%d:%d@%d,", s.VPN, s.Type, s.VRFID)
+	}
+	return b.String()
+}
+
+func subNames(subs []subSpec) []string {
+	out := make([]string, 0, len(subs))
+	for _, s := range subs {
+		out = append(out, fmt.Sprintf("vpn%d/type%d@%d", s.VPN, s.Type, s.VRFID))
+	}
+	return out
+}
+
+// subsFor resolves the (VRF, source) pairs to subscribe and the ifindex→VPN
+// map notifications will be attributed with. A VPN whose vpn<N> device does
+// not exist is a warning: the rest still work, and the missing one shows up in
+// /status instead of silently subscribing nothing.
+func subsFor(rules []frr.ImportRule) ([]subSpec, map[uint32]uint8, []string) {
+	vmap := map[uint32]uint8{0: 0}
+	var subs []subSpec
+	var warns []string
+	for _, r := range rules {
+		if len(r.Sources) == 0 {
+			continue
+		}
+		id, err := krt.ImportIndex(r.VPN)
+		if err != nil {
+			warns = append(warns, fmt.Sprintf("VPN %d 的 VRF 设备不在，导入跳过：%v", r.VPN, err))
+			continue
+		}
+		if prev, ok := vmap[id]; ok && prev != r.VPN {
+			warns = append(warns, fmt.Sprintf("VPN %d 与 VPN %d 解析到同一个 vrf_id %d，后者被忽略", prev, r.VPN, id))
+			continue
+		}
+		vmap[id] = r.VPN
+		for _, t := range r.Sources {
+			subs = append(subs, subSpec{VPN: r.VPN, VRFID: id, Type: t})
+		}
+	}
+	sort.Slice(subs, func(i, j int) bool {
+		if subs[i].VRFID != subs[j].VRFID {
+			return subs[i].VRFID < subs[j].VRFID
+		}
+		return subs[i].Type < subs[j].Type
+	})
+	return subs, vmap, warns
+}
+
+// ensureImport reconnects when zebra died or the subscription set changed. A
+// reconnect opens the optimistic window: the old set stays published while the
+// replay rebuilds it, so a subscription edit cannot make every remote site see
+// "this box has no prefixes" for a moment.
+func ensureImport(ctx context.Context, st *importState, imp *frr.Importer, path string, subs []subSpec) error {
+	sig := subsSig(subs)
+	st.mu.Lock()
+	cl := st.cl
+	clSig := st.clSig
+	st.mu.Unlock()
+	if cl != nil && cl.Err() == nil && clSig == sig {
+		return nil
+	}
+	if cl != nil {
+		if err := cl.Err(); err != nil {
+			log.Printf("sr-frr: 与 zebra 的连接断开（%v），重连", err)
+		}
+		cl.Close()
+	}
+	st.mu.Lock()
+	st.cl = nil
+	st.clSig = ""
+	st.mu.Unlock()
+	if len(subs) == 0 {
+		return nil
+	}
+	c, err := frr.Dial(ctx, path)
+	if err != nil {
+		return err
+	}
+	imp.BeginResync()
+	c.SetRouteHandler(imp.Handle)
+	for _, s := range subs {
+		if err := c.SubscribeRoutes(ctx, s.VRFID, s.Type); err != nil {
+			c.Close()
+			return fmt.Errorf("订阅 vpn%d type%d@%d: %w", s.VPN, s.Type, s.VRFID, err)
+		}
+	}
+	st.mu.Lock()
+	st.cl = c
+	st.clSig = sig
+	st.mu.Unlock()
+	if len(subs) > 0 {
+		log.Printf("sr-frr: 已订阅 %d 组（vpn/来源/ifindex）", len(subs))
+	}
+	return nil
+}
+
+func (s *importState) zebraConnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cl != nil && s.cl.Err() == nil
+}
+
+// statusDoc is sr-route /status 里本进程用到的部分。
 //
-// rib 的**键是目标主表**（本机 import 命中了的 VPN）—— 要往客户内网通告的就是这一份，
-// 条目里的 vrf_id 是来源 VPN（只决定标签，与本进程无关，所以不声明）。
+// rib 的**键是目标主表**（本机 import 命中了的 VPN）—— 要往客户内网通告的
+// 就是这一份，条目里的 vrf_id 是来源 VPN（只决定标签，与本进程无关）。
 type statusDoc struct {
 	RIB map[string][]ribRoute `json:"rib"`
 }
@@ -154,27 +523,6 @@ func fetchRIB(ctx context.Context, hc *http.Client, url string) ([]frr.RIBRoute,
 	return out, nil
 }
 
-func planSig(routes []frr.Route) string {
-	var b strings.Builder
-	for _, r := range routes {
-		b.WriteString(strconv.FormatUint(uint64(r.Table), 10))
-		b.WriteByte('|')
-		b.WriteString(r.Prefix.String())
-		b.WriteByte('|')
-		b.WriteString(strconv.Itoa(r.OIF))
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
-func exportList(vrfs []uint32) string {
-	parts := make([]string, 0, len(vrfs))
-	for _, v := range vrfs {
-		parts = append(parts, fmt.Sprintf("vpn%d→table %d", v, frr.KernelTable(uint8(v))))
-	}
-	return strings.Join(parts, ",")
-}
-
 // loadStale 读上一轮的状态文件。旧格式（ZAPI/1250）直接删掉：那些条目在
 // zebra 的表里，用内核 netlink 既删不对也删不到，留着只会误导下一次对账。
 func loadStale(path string) ([]frr.Route, error) {
@@ -184,6 +532,16 @@ func loadStale(path string) ([]frr.Route, error) {
 		return nil, frr.RemoveState(path)
 	}
 	return stale, err
+}
+
+func prefixesURL(status string) (string, error) {
+	u, err := url.Parse(status)
+	if err != nil {
+		return "", err
+	}
+	u.Path = "/local-prefixes"
+	u.RawQuery = ""
+	return u.String(), nil
 }
 
 func main() {
@@ -204,25 +562,31 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	rt := &runtimeStore{}
+	initial, err := compileRuntime(cfg.ExportVRFs, cfg.ImportRules)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	rt.set(initial)
+
 	stale, err := loadStale(cfg.StateFile)
 	if err != nil {
 		log.Fatalf("sr-frr: %v", err)
 	}
 
-	// 反向导入只在常驻模式打开：-once 只跑一轮导出，订阅回放还没到齐就退出，
-	// 反而会用一份不完整的集合清掉 sr-route 里上一轮的结论。
-	var imp *frr.Importer
-	importEnabled := cfg.Import != nil && !*once
-	if cfg.Import != nil {
-		imp = frr.NewImporter()
+	dp, err := krt.New()
+	if err != nil {
+		log.Fatalf("sr-frr: %v", err)
 	}
+	defer dp.Close()
+	ex := frr.NewExporterFrom(dp, stale)
+	exp := &exportState{dp: dp, ex: ex, lastSig: planSig(stale), plan: ex.Routes()}
 
+	importURL, err := prefixesURL(cfg.StatusURL)
+	if err != nil {
+		log.Fatalf("sr-frr: status_url: %v", err)
+	}
 	if *reset {
-		dp, err := krt.New()
-		if err != nil {
-			log.Fatalf("sr-frr: %v", err)
-		}
-		defer dp.Close()
 		n := 0
 		for _, r := range stale {
 			if err := dp.RouteDelete(ctx, r); err != nil {
@@ -234,169 +598,131 @@ func main() {
 			log.Fatalf("sr-frr: 删状态文件: %v", err)
 		}
 		log.Printf("sr-frr: reset 撤掉 %d 条内核路由", n)
-		clearImports(cfg.Import)
+		if len(initial.rules) > 0 {
+			clearImports(importURL)
+		}
 		return
 	}
 
-	if len(cfg.ExportVRFs) == 0 && !importEnabled {
-		log.Fatal("sr-frr: export_vrfs 为空且没有 import，无事可做；检查配置")
+	needExport := len(initial.exportVRFs) > 0
+	needImport := len(initial.rules) > 0
+	if !*once && !needExport && !needImport && len(stale) == 0 {
+		log.Fatal("sr-frr: export_vrfs 与 import_rules 都为空，无事可做；检查配置")
+	}
+	if (*once || needExport || needImport) && cfg.StatusURL == "" {
+		log.Fatal("sr-frr: 需要 status_url（sr-route 的 /status）")
 	}
 
-	var (
-		dp *krt.Client
-		ex *frr.Exporter
-	)
-	if len(cfg.ExportVRFs) > 0 {
-		if cfg.StatusURL == "" {
-			log.Fatal("sr-frr: 导出需要 status_url（sr-route 的 /status）")
+	mapper := &vpnMapper{}
+	imp := frr.NewImporter(mapper.lookup)
+	st := &importState{}
+
+	hc := &http.Client{Timeout: 5 * time.Second}
+	lastImportSig := ""
+
+	poll := func() {
+		rc := rt.snapshot()
+
+		if err := exp.reconcile(ctx, hc, rc, cfg.StatusURL, cfg.StateFile); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("sr-frr: 本轮导出收敛失败（保留上次成功的计划）: %v", err)
+			}
 		}
-		// 先用空 RIB 跑一次校验：阈值/出口 ifindex 都在这里暴露，而不是等
-		// 第一轮收敛时才发现。
-		if _, err := frr.PlanFrom(cfg.ExportVRFs, nil, krt.Index); err != nil {
-			log.Fatalf("config: %v", err)
+
+		subs, vmap, warns := subsFor(rc.rules)
+		mapper.set(vmap)
+		st.setWarn(strings.Join(warns, "；"))
+		var ierr error
+		if err := ensureImport(ctx, st, imp, cfg.ZServSocket, subs); err != nil {
+			ierr = err
+			log.Printf("sr-frr: 反向导入未连上 zebra: %v", err)
+		} else if st.zebraConnected() {
+			st.mu.Lock()
+			cl := st.cl
+			st.mu.Unlock()
+			if zerr := cl.ZebraError(); zerr != nil {
+				ierr = zerr
+				log.Printf("sr-frr: %v", zerr)
+			}
+			imp.Tick(time.Now())
+			reps, stats := imp.Report(rc.rules, exp.exportedSet(rc.exportVRFs))
+			if sig := frr.Signature(reps); sig != lastImportSig {
+				if err := pushLocalPrefixes(ctx, hc, importURL, reps); err != nil {
+					ierr = err
+					log.Printf("sr-frr: 上报客户侧前缀失败（下次重试）: %v", err)
+				} else {
+					lastImportSig = sig
+					log.Printf("sr-frr: 客户侧前缀 %d 条 → sr-route（%d 个 VPN）", len(reps), vpnCount(reps))
+				}
+			}
+			st.setPoll(ierr, stats.Reported, stats.LoopDropped, stats.UnknownVRF, subNames(subs))
+			return
 		}
-		dp, err = krt.New()
+		if len(rc.rules) == 0 && lastImportSig != "" {
+			// 规则被撤光：把上一份上报清掉，不等 zebra 重新通知。
+			if err := pushLocalPrefixes(ctx, hc, importURL, nil); err != nil {
+				log.Printf("sr-frr: 清空客户侧前缀失败: %v", err)
+			} else {
+				lastImportSig = ""
+				log.Printf("sr-frr: import_rules 为空，已清空上报")
+			}
+		}
+		st.setPoll(ierr, 0, 0, 0, subNames(subs))
+	}
+
+	if !*once {
+		ln, err := listenControl(cfg.ControlSocket)
 		if err != nil {
 			log.Fatalf("sr-frr: %v", err)
 		}
-		defer dp.Close()
-		// 崩溃残留就是内核里现在真实存在的集合：拿它当基线，第一次 Apply
-		// 只补差量，同一条前缀不会先删后加。
-		ex = frr.NewExporterFrom(dp, stale)
-	}
-
-	var cl *frr.Client
-	connectImport := func() error {
-		if cl != nil && cl.Err() == nil {
-			return nil
-		}
-		if cl != nil {
-			log.Printf("sr-frr: 与 zebra 的连接断开（%v），重连", cl.Err())
-			cl.Close()
-			cl = nil
-		}
-		c, err := frr.Dial(ctx, cfg.ZServSocket)
-		if err != nil {
-			return err
-		}
-		// 新连接上的回放会重建整份 BGP 视图；旧连接的条目不会再收到
-		// 删除通知。这里不清空，而是开一个乐观窗口：旧集合继续对外可见，
-		// 回放灌完（静默 500ms 或 10s 上限）后再一次性对账。
-		imp.BeginResync()
-		c.SetRouteHandler(imp.Handle)
-		if err := c.SubscribeBGP(ctx); err != nil {
-			c.Close()
-			return fmt.Errorf("订阅 BGP 再分发: %w", err)
-		}
-		cl = c
-		return nil
-	}
-	defer func() {
-		if cl != nil {
-			cl.Close()
-		}
-	}()
-
-	hc := &http.Client{Timeout: 5 * time.Second}
-	// 状态文件当前就代表 stale 这一份；计划与它一致时不必重写。
-	lastSig := planSig(stale)
-	lastImportSig := ""
-
-	poll := func() error {
-		if ex != nil {
-			routes, err := fetchRIB(ctx, hc, cfg.StatusURL)
-			if err != nil {
-				return fmt.Errorf("读 RIB: %w", err)
+		srv := &http.Server{Handler: controlMux(rt, exp, st, cfg, ctx)}
+		go func() {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("sr-frr: 控制口退出: %v", err)
 			}
-			plan, err := frr.PlanFrom(cfg.ExportVRFs, routes, krt.Index)
-			if err != nil {
-				return err
-			}
-			// 先落盘再下发：中途被杀时，文件里是"打算写的全部"，最多多删几条
-			// 并不存在的路由，不会漏删。计划为空时删文件 —— 状态文件存在就代表
-			// 我们留了东西。
-			if sig := planSig(plan.Routes); sig != lastSig {
-				if len(plan.Routes) == 0 {
-					err = frr.RemoveState(cfg.StateFile)
-				} else {
-					err = frr.SaveState(cfg.StateFile, plan.Routes)
-				}
-				if err != nil {
-					return fmt.Errorf("写状态文件: %w", err)
-				}
-				lastSig = sig
-			}
-			res, err := ex.Apply(ctx, plan)
-			if err != nil {
-				return err
-			}
-			if res.Changed() {
-				log.Printf("sr-frr: 收敛 routes+%d/-%d（%s）", res.Added, res.Removed, exportList(cfg.ExportVRFs))
-			}
-		}
-
-		if importEnabled {
-			// 导入和导出是两条独立的路：zebra 没连上不该挡住 K 路由收敛。
-			if err := connectImport(); err != nil {
-				log.Printf("sr-frr: 反向导入未连上 zebra: %v", err)
-				return nil
-			}
-			if zerr := cl.ZebraError(); zerr != nil {
-				log.Printf("sr-frr: %v", zerr)
-				return nil
-			}
-			// 窗口到期判定放在每一次收敛里：订阅回放是异步的，只有轮询
-			// 这一侧知道"已经安静多久了"。
-			imp.Tick(time.Now())
-			ps := imp.Prefixes()
-			if sig := importSig(cfg.Import.VRFID, ps); sig != lastImportSig {
-				if err := pushLocalPrefixes(ctx, hc, cfg.Import, ps); err != nil {
-					log.Printf("sr-frr: 上报客户侧前缀失败（下次重试）: %v", err)
-					return nil
-				}
-				lastImportSig = sig
-				log.Printf("sr-frr: 客户侧前缀 %d 条 → sr-route vrf %d", len(ps), cfg.Import.VRFID)
-			}
-		}
-		return nil
+		}()
+		defer func() {
+			shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdown)
+		}()
+		log.Printf("sr-frr: 控制口 %s（PUT /config, GET /status）", cfg.ControlSocket)
 	}
 
 	if *once {
-		if err := poll(); err != nil {
-			log.Fatalf("sr-frr: %v", err)
-		}
+		poll()
 		time.Sleep(onceSettle)
 		return
 	}
 
 	interval := time.Duration(cfg.PollSec) * time.Second
-	if ex != nil {
-		log.Printf("sr-frr: 每 %s 从 %s 收敛 %s 到内核；FRR 侧用 redistribute kernel（默认实例或 vpn<N>）",
-			interval, cfg.StatusURL, exportList(cfg.ExportVRFs))
+	if len(initial.exportVRFs) > 0 {
+		log.Printf("sr-frr: 每 %s 从 %s 收敛 %s 到内核；FRR 侧用 redistribute kernel",
+			interval, cfg.StatusURL, exportList(initial.exportVRFs))
 	}
-	if importEnabled {
-		log.Printf("sr-frr: 反向导入已开：BGP 前缀 → sr-route vrf %d（%s）",
-			cfg.Import.VRFID, cfg.Import.PrefixesURL)
+	if len(initial.rules) > 0 {
+		log.Printf("sr-frr: 反向导入已开：%d 个 VPN → %s", len(initial.rules), importURL)
 	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
-		if err := poll(); err != nil {
-			// 失败不退出：sr-route 可能还没起来。Exporter 的基线保留着，
-			// 下一轮成功后整份计划会重新对账。
-			if ctx.Err() == nil {
-				log.Printf("sr-frr: 本轮收敛失败（保留上次成功的计划）: %v", err)
-			}
-		}
+		poll()
 		select {
 		case <-ctx.Done():
+			st.close()
 			fctx, fcancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer fcancel()
-			if ex != nil && len(ex.Routes()) > 0 {
-				log.Printf("sr-frr: 停止，撤掉自己下发的 %d 条内核路由", len(ex.Routes()))
-				if err := ex.Flush(fctx); err != nil {
+			exp.mu.Lock()
+			routes := exp.ex.Routes()
+			exp.mu.Unlock()
+			if len(routes) > 0 {
+				log.Printf("sr-frr: 停止，撤掉自己下发的 %d 条内核路由", len(routes))
+				exp.mu.Lock()
+				ferr := exp.ex.Flush(fctx)
+				exp.mu.Unlock()
+				if ferr != nil {
 					// 留着状态文件，下次启动按它对账。
-					log.Printf("sr-frr: 退出清理未完成（状态文件已保留）: %v", err)
+					log.Printf("sr-frr: 退出清理未完成（状态文件已保留）: %v", ferr)
 					return
 				}
 				if err := frr.RemoveState(cfg.StateFile); err != nil {
@@ -405,8 +731,8 @@ func main() {
 			} else {
 				log.Printf("sr-frr: 停止")
 			}
-			if importEnabled {
-				if err := pushLocalPrefixes(fctx, hc, cfg.Import, nil); err != nil {
+			if len(rt.snapshot().rules) > 0 {
+				if err := pushLocalPrefixes(fctx, hc, importURL, nil); err != nil {
 					log.Printf("sr-frr: 退出时清空本地前缀失败: %v", err)
 				}
 			}
@@ -416,13 +742,18 @@ func main() {
 	}
 }
 
-func clearImports(ic *importConfig) {
-	if ic == nil {
-		return
+func vpnCount(ps []frr.ReportedPrefix) int {
+	seen := map[uint8]bool{}
+	for _, p := range ps {
+		seen[p.VPN] = true
 	}
+	return len(seen)
+}
+
+func clearImports(importURL string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := pushLocalPrefixes(ctx, &http.Client{Timeout: 5 * time.Second}, ic, nil); err != nil {
+	if err := pushLocalPrefixes(ctx, &http.Client{Timeout: 5 * time.Second}, importURL, nil); err != nil {
 		log.Printf("sr-frr: 清空本地前缀失败: %v", err)
 	}
 }
@@ -437,26 +768,16 @@ type localPrefixesDoc struct {
 	Prefixes []localPrefixJSON `json:"prefixes"`
 }
 
-func importSig(vrf uint8, ps []netip.Prefix) string {
-	var b strings.Builder
-	b.WriteString(strconv.Itoa(int(vrf)))
-	for _, p := range ps {
-		b.WriteByte('|')
-		b.WriteString(p.String())
-	}
-	return b.String()
-}
-
-func pushLocalPrefixes(ctx context.Context, hc *http.Client, ic *importConfig, ps []netip.Prefix) error {
+func pushLocalPrefixes(ctx context.Context, hc *http.Client, url string, ps []frr.ReportedPrefix) error {
 	doc := localPrefixesDoc{Prefixes: make([]localPrefixJSON, 0, len(ps))}
 	for _, p := range ps {
-		doc.Prefixes = append(doc.Prefixes, localPrefixJSON{VRFID: ic.VRFID, Prefix: p.String()})
+		doc.Prefixes = append(doc.Prefixes, localPrefixJSON{VRFID: p.VPN, Prefix: p.Prefix.String()})
 	}
 	body, err := json.Marshal(doc)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, ic.PrefixesURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -468,7 +789,140 @@ func pushLocalPrefixes(ctx context.Context, hc *http.Client, ic *importConfig, p
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("PUT %s: %s: %s", ic.PrefixesURL, resp.Status, strings.TrimSpace(string(msg)))
+		return fmt.Errorf("PUT %s: %s: %s", url, resp.Status, strings.TrimSpace(string(msg)))
 	}
 	return nil
+}
+
+// listenControl prepares the Unix socket. A stale file from a killed process is
+// removed; the directory is created here because nothing else owns it.
+func listenControl(path string) (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("删旧控制口 %s: %w", path, err)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("监听 %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+type controlBody struct {
+	ExportVRFs  json.RawMessage `json:"export_vrfs"`
+	ImportRules json.RawMessage `json:"import_rules"`
+	RefreshVRFs []uint32        `json:"refresh_vrfs"`
+}
+
+func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileConfig, ctx context.Context) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "PUT required", http.StatusMethodNotAllowed)
+			return
+		}
+		var body controlBody
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err := dec.Decode(&body); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if len(bytes.TrimSpace(body.ExportVRFs)) == 0 || len(bytes.TrimSpace(body.ImportRules)) == 0 {
+			http.Error(w, "export_vrfs 与 import_rules 都必须在请求里（空数组表示没有）", http.StatusBadRequest)
+			return
+		}
+		next, err := compileRuntime(body.ExportVRFs, body.ImportRules)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Touch only VPNs that stay exported: re-adding a prefix in a table the
+		// new config no longer exports would just be deleted one poll later.
+		var refresh []uint32
+		keep := map[uint32]bool{}
+		for _, v := range next.exportVRFs {
+			keep[v] = true
+		}
+		for _, v := range body.RefreshVRFs {
+			if keep[v] {
+				refresh = append(refresh, v)
+			}
+		}
+		touched, err := exp.touch(ctx, refresh)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var touchedList []uint32
+		for v, n := range touched {
+			touchedList = append(touchedList, v)
+			log.Printf("sr-frr: touch vpn%d %d 条（协议集合变化，触发再分发重算）", v, n)
+		}
+		sort.Slice(touchedList, func(i, j int) bool { return touchedList[i] < touchedList[j] })
+		rt.set(next)
+		log.Printf("sr-frr: 配置热更 export_vrfs=%v import_rules=%d hash=%s",
+			next.exportVRFs, len(next.rules), next.hash[:12])
+		writeJSON(w, map[string]any{
+			"config_hash":  next.hash,
+			"refreshed":    touchedList,
+			"export_vrfs":  next.exportVRFs,
+			"import_rules": len(next.rules),
+		})
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		rc := rt.snapshot()
+		exp.mu.Lock()
+		injected := len(exp.plan)
+		exportErr := exp.lastErr
+		exp.mu.Unlock()
+		st.mu.Lock()
+		reported, loop, unknown := st.reported, st.loop, st.unknown
+		subs, ierr := append([]string(nil), st.subs...), st.lastErr
+		st.mu.Unlock()
+		errText := ierr
+		if exportErr != "" {
+			if errText != "" {
+				errText = exportErr + "；" + errText
+			} else {
+				errText = exportErr
+			}
+		}
+		rules := make([]map[string]any, 0, len(rc.rules))
+		for _, ru := range rc.rules {
+			srcs := make([]string, 0, len(ru.Sources))
+			for _, t := range ru.Sources {
+				srcs = append(srcs, frr.SourceName(t))
+			}
+			rules = append(rules, map[string]any{
+				"vpn": ru.VPN, "sources": srcs, "prefixes": len(ru.Allow),
+			})
+		}
+		writeJSON(w, map[string]any{
+			"pid":                 os.Getpid(),
+			"config_hash":         rc.hash,
+			"export_vrfs":         rc.exportVRFs,
+			"import_rules":        rules,
+			"injected":            injected,
+			"reported":            reported,
+			"dropped_loop":        loop,
+			"dropped_unknown_vrf": unknown,
+			"subscriptions":       subs,
+			"zebra_connected":     st.zebraConnected(),
+			"last_error":          errText,
+			"state_file":          cfg.StateFile,
+			"control_socket":      cfg.ControlSocket,
+		})
+	})
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }

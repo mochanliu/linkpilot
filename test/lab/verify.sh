@@ -416,9 +416,10 @@ for n in 1 2 3; do
     echo "$r" | grep -q "${CUST_X_IP[$n]}" \
         && ok "$c: 客户 loopback 的下一跳是客户路由器 ${CUST_X_IP[$n]}" \
         || bad "$c: 客户 loopback 的下一跳不是 ${CUST_X_IP[$n]}"
-    # 防环：我方注入的远端前缀再进 BGP 时 tag=0，sr-frr 只反向导入打了 tag
-    # 的客户路由，所以 sr-route 的 local 里不该出现远端前缀（第 5 节按集合核对）。
-    # 这里再看内核主表：远端前缀必须是 K（出口 lo），不是从客户口学回来的 B。
+    # 防环：sr-frr 的反向上报按 import_rules 只收选中的 (VPN, 来源)，且把该 VPN
+    # 的导出集合求交扣掉；所以 sr-route 的 local 里不该出现远端前缀
+    # （第 5 节按集合核对）。这里再看内核主表：远端前缀必须是 K（出口 lo），
+    # 不是从客户口学回来的 B。
     main=$(vtysh "$c" -c 'show ip route')
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue

@@ -53,14 +53,16 @@ type Check struct {
 	Text     string `json:"text"`
 }
 
-// Artifacts is the four-way split the controller renders. Route is the overlay
-// segment (the tunnels/vrfs keys of the box's route.json) and is empty in a
-// bundle published before O6-b -- sr-apply must keep reading those.
+// Artifacts is the five-way split the controller renders. Route is the overlay
+// segment (the tunnels/vrfs keys of the box's route.json) and Srfrr is the two
+// controller-owned keys of the box's sr-frr.json; both are empty in a bundle
+// published before their stage, and sr-apply must keep reading those.
 type Artifacts struct {
 	FRR   string `json:"frr"`
 	VPP   string `json:"vpp"`
 	Boot  string `json:"boot"`
 	Route string `json:"route,omitempty"`
+	Srfrr string `json:"srfrr,omitempty"`
 }
 
 // Bundle is what the controller hands out and what the box persists.
@@ -118,6 +120,7 @@ type Installed struct {
 	VPP      string
 	Boot     string
 	Route    string
+	Srfrr    string
 }
 
 const (
@@ -125,6 +128,7 @@ const (
 	vppFile   = "vpp.conf"
 	bootFile  = "boot.sh"
 	routeFile = "route.json"
+	srfrrFile = "srfrr.json"
 )
 
 // artifactFile is one file inside a version directory.
@@ -172,7 +176,7 @@ func (s Store) Install(b Bundle) (Installed, error) {
 			return Installed{}, fmt.Errorf("version %d exists but cannot be read: %w", b.Version, err)
 		}
 		if cur.FRR != b.Artifacts.FRR || cur.VPP != b.Artifacts.VPP ||
-			cur.Boot != b.Artifacts.Boot || cur.Route != b.Artifacts.Route {
+			cur.Boot != b.Artifacts.Boot || cur.Route != b.Artifacts.Route || cur.Srfrr != b.Artifacts.Srfrr {
 			return Installed{}, fmt.Errorf("version %d is already installed with different content", b.Version)
 		}
 		return cur, nil
@@ -191,6 +195,9 @@ func (s Store) Install(b Bundle) (Installed, error) {
 	}
 	if b.Artifacts.Route != "" {
 		files = append(files, artifactFile{name: routeFile, content: b.Artifacts.Route})
+	}
+	if b.Artifacts.Srfrr != "" {
+		files = append(files, artifactFile{name: srfrrFile, content: b.Artifacts.Srfrr})
 	}
 	hashes := make(map[string]string, len(files))
 	for _, f := range files {
@@ -267,6 +274,7 @@ func (s Store) read(version int) (Installed, error) {
 		{vppFile, &inst.VPP, false},
 		{bootFile, &inst.Boot, false},
 		{routeFile, &inst.Route, true},
+		{srfrrFile, &inst.Srfrr, true},
 	} {
 		data, err := os.ReadFile(filepath.Join(dir, f.name))
 		if os.IsNotExist(err) && f.optional {
@@ -382,6 +390,13 @@ type Applier struct {
 	// NoRoutePush suppresses the hot PUT to sr-route, so a change waits for the
 	// next sr-route start. A lab judgement knob, not a normal way to run.
 	NoRoutePush bool
+	// SrfrrConf is the box's own sr-frr file. The 5th segment is merged into it.
+	SrfrrConf string
+	// SrfrrSock overrides the control socket named by the file. Empty means use
+	// the file's `control_socket`, then /run/sr-frr/control.sock.
+	SrfrrSock string
+	// NoSrfrrPush suppresses the hot PUT to sr-frr (boot replay only).
+	NoSrfrrPush bool
 	Wait        time.Duration
 	DryRun      bool
 	Exec        Executor
@@ -399,6 +414,7 @@ func New(store Store) *Applier {
 		VPPCtl:    "vppctl",
 		FRRConf:   "/etc/frr/frr.conf",
 		RouteConf: "/etc/sdwan/route.json",
+		SrfrrConf: defaultSrfrrConf,
 		Wait:      10 * time.Second,
 		Exec:      execRunner{},
 		Sleep:     time.Sleep,
@@ -419,6 +435,9 @@ func (a *Applier) setDefaults() {
 	}
 	if a.RouteConf == "" {
 		a.RouteConf = def.RouteConf
+	}
+	if a.SrfrrConf == "" {
+		a.SrfrrConf = def.SrfrrConf
 	}
 	if a.HTTP == nil {
 		a.HTTP = def.HTTP
@@ -451,9 +470,15 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 	if errs := b.BlockingErrors(); len(errs) > 0 && !allowBlocking {
 		return fmt.Errorf("refusing to apply version %d: %d blocking error(s), first: %s", b.Version, len(errs), errs[0])
 	}
+	// The previously installed version is what says which VPNs stay exported and
+	// only gained a redistribute instance -- the touch list for sr-frr (§5.3).
+	prev, perr := a.Store.Current()
+	if perr != nil && !errors.Is(perr, ErrNoConfig) {
+		return fmt.Errorf("read current version: %w", perr)
+	}
 	if a.DryRun {
-		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B)", b.Version,
-			len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot), len(b.Artifacts.Route))
+		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B, srfrr %d B)", b.Version,
+			len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot), len(b.Artifacts.Route), len(b.Artifacts.Srfrr))
 		inst := Installed{
 			Dir:      "<dry-run>",
 			Manifest: Manifest{Version: b.Version},
@@ -461,6 +486,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 			VPP:      b.Artifacts.VPP,
 			Boot:     b.Artifacts.Boot,
 			Route:    b.Artifacts.Route,
+			Srfrr:    b.Artifacts.Srfrr,
 		}
 		if err := a.replay(ctx, inst); err != nil {
 			return err
@@ -469,7 +495,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		if _, err := a.applyRoute(ctx, inst, !a.NoRoutePush); err != nil {
 			return err
 		}
-		return nil
+		return a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush)
 	}
 	inst, err := a.Store.Install(b)
 	if err != nil {
@@ -499,6 +525,11 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		} else if note != "" {
 			notes = append(notes, note)
 		}
+	}
+	// sr-frr last, after FRR: `redistribute kernel` has to be in place before the
+	// K routes appear, or zebra never sees the addition it should redistribute.
+	if err == nil {
+		err = a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush)
 	}
 	a.record(inst.Manifest.Version, "apply", err, notes)
 	return err
@@ -531,6 +562,10 @@ func (a *Applier) Boot(ctx context.Context, frrDiff bool) error {
 		} else if note != "" {
 			notes = append(notes, note)
 		}
+	}
+	// Same for sr-frr: start.sh launches it after apply, so no push.
+	if err == nil {
+		err = a.applySrfrr(ctx, inst, inst, false)
 	}
 	a.record(inst.Manifest.Version, "boot", err, notes)
 	return err

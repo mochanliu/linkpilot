@@ -14,6 +14,8 @@ const OverlayVRF = 250
 
 // KernelTable 返回 VPN 在盒子内核里的路由表号。VPN 0 是默认 VRF，对应内核
 // 的 main（254）；其余 VPN 用 vpn<N> 设备，boot 配置里建的就是 table N。
+// 253/254/255 是内核的 default/main/local，所以这三个 VPN 不能用于导出
+// （PlanFrom/CompileExportVRFs 会拒绝），否则会和盒子自身撞表。
 func KernelTable(vpn uint8) uint32 {
 	if vpn == 0 {
 		return 254 // RT_TABLE_MAIN
@@ -66,6 +68,9 @@ func PlanFrom(exportVRFs []uint32, routes []RIBRoute, oif func(uint32) (int, err
 		}
 		if v == OverlayVRF {
 			return Plan{}, fmt.Errorf("frr: export_vrfs 不能包含 %d（overlay 传输域，不是 VPN）", OverlayVRF)
+		}
+		if v >= 253 {
+			return Plan{}, fmt.Errorf("frr: export_vrfs 不能包含 %d：内核表 253/254/255 是 default/main/local", v)
 		}
 		if _, dup := idx[v]; dup {
 			return Plan{}, fmt.Errorf("frr: export_vrfs 里 VPN %d 重复", v)

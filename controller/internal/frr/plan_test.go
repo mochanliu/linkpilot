@@ -103,6 +103,7 @@ func TestPlanFromRejects(t *testing.T) {
 	}{
 		"VPN 超过 255": {vpns: []uint32{256}, oif: oifOf},
 		"导出 overlay": {vpns: []uint32{OverlayVRF}, oif: oifOf},
+		"导出内核保留表":    {vpns: []uint32{253}, oif: oifOf},
 		"VPN 重复":     {vpns: []uint32{1, 1}, oif: oifOf},
 		"出口解析失败":     {vpns: []uint32{5}, oif: func(uint32) (int, error) { return 0, errors.New("没有 vpn5") }},
 		"出口 ifindex 非法": {
