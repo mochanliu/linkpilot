@@ -1,0 +1,219 @@
+# 环路/站点 HA 实验台（4 台 CPE，站点 1+2 共用一条客户 LAN）。
+#
+# 和 lab-compose.yml（3 站点、verify.sh 的口径）是两套并存的网，子网全部错开，
+# 所以同一台 VM 上两套的容器名/网络名/网段都不会撞。环路测试期间只跑这一套。
+#
+#   站点 12（一个站点两台盒子 = HA 形态）
+#     lp-cpe1 10.76.12.11 ┐
+#     lp-cpe2 10.76.12.12 ┼─ lp_site12 10.76.12.0/24 ─ lp-cust12 10.76.12.13
+#     VRRP VIP 10.76.12.10 ┘        （客户路由器只有一台，两台盒子都接它）
+#     cust12 与两台盒子跑 OSPF area 0，播 172.16.12.1/32
+#     ——1 与 2 之间**不建隧道**：它们靠这条共享 LAN 互通，这正是站点 HA 的形状。
+#
+#   站点 3 / 4（各自独立，一台盒子一台客户路由器）
+#     lp-cpe3 10.76.3.2 <-> lp-cust3 10.76.3.3  eBGP 65103/65003，播 172.16.3.1/32
+#     lp-cpe4 10.76.4.2 <-> lp-cust4 10.76.4.3  eBGP 65104/65004，播 172.16.4.1/32
+#
+#   公共：lp_wan 10.88.2.0/24（underlay）、lp_mgmt 10.99.2.0/24（控制面）
+#     lp-rr 10.88.2.100 / 10.99.2.100，lp-ctrl 10.88.2.200 / 10.99.2.200
+#
+# 数据面沿用 3 站点 lab 已经验证过的那套形状：盒内核一个包都不转发，客户口的
+# IP 在 VPP 里，linux-cp 把客户口镜像成内核 TAP lcp-x0 给 FRR 用，linux-nl 把
+# 内核主表镜像回 VPP table 0。中转盒子这里不需要（所有隧道直连），所以不建。
+#
+# 控制台走 127.0.0.1:8089 -> lp-ctrl:8080（与 3 站点 lab 的 8088 错开）。
+name: sdwan-loop
+
+x-cpe: &cpe
+  image: srwg-lab:latest
+  privileged: true
+  tty: true
+  stdin_open: true
+  volumes:
+    - ../../vpp-plugin:/workspace/vpp-plugin
+    - ../../test:/workspace/test
+    - ../../controller:/workspace/controller
+  cap_add:
+    - NET_ADMIN
+    - SYS_NICE
+  sysctls:
+    - net.ipv4.ip_forward=0
+    - net.ipv4.conf.all.rp_filter=0
+
+x-cust: &cust
+  image: quay.io/frrouting/frr:10.7.1
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+    - SYS_ADMIN
+  sysctls:
+    - net.ipv4.ip_forward=1
+    - net.ipv4.conf.all.rp_filter=0
+
+x-term: &term
+  image: srwg-lab:latest
+  command: ["sleep", "infinity"]
+  cap_add:
+    - NET_RAW
+    - NET_ADMIN
+
+x-net-nomasq: &net-nomasq
+  driver: bridge
+  driver_opts:
+    com.docker.network.bridge.enable_ip_masquerade: "false"
+
+services:
+  cpe1:
+    <<: *cpe
+    container_name: lp-cpe1
+    hostname: lp-cpe1
+    environment:
+      VPP_CPU: "2"
+    networks:
+      lp_wan: { ipv4_address: 10.88.2.11 }
+      lp_site12: { ipv4_address: 10.76.12.11 }
+      lp_mgmt: { ipv4_address: 10.99.2.11 }
+
+  cpe2:
+    <<: *cpe
+    container_name: lp-cpe2
+    hostname: lp-cpe2
+    environment:
+      VPP_CPU: "3"
+    networks:
+      lp_wan: { ipv4_address: 10.88.2.12 }
+      lp_site12: { ipv4_address: 10.76.12.12 }
+      lp_mgmt: { ipv4_address: 10.99.2.12 }
+
+  cpe3:
+    <<: *cpe
+    container_name: lp-cpe3
+    hostname: lp-cpe3
+    environment:
+      VPP_CPU: "4"
+    networks:
+      lp_wan: { ipv4_address: 10.88.2.13 }
+      lp_xconn3: { ipv4_address: 10.76.3.2 }
+      lp_mgmt: { ipv4_address: 10.99.2.13 }
+
+  cpe4:
+    <<: *cpe
+    container_name: lp-cpe4
+    hostname: lp-cpe4
+    environment:
+      VPP_CPU: "5"
+    networks:
+      lp_wan: { ipv4_address: 10.88.2.14 }
+      lp_xconn4: { ipv4_address: 10.76.4.2 }
+      lp_mgmt: { ipv4_address: 10.99.2.14 }
+
+  cust12:
+    <<: *cust
+    container_name: lp-cust12
+    hostname: lp-cust12
+    networks:
+      lp_site12: { ipv4_address: 10.76.12.13 }
+      lp_lan12: { ipv4_address: 10.66.12.2 }
+      lp_mgmt: { ipv4_address: 10.99.2.25 }
+
+  cust3:
+    <<: *cust
+    container_name: lp-cust3
+    hostname: lp-cust3
+    networks:
+      lp_xconn3: { ipv4_address: 10.76.3.3 }
+      lp_lan3: { ipv4_address: 10.66.3.2 }
+      lp_mgmt: { ipv4_address: 10.99.2.23 }
+
+  cust4:
+    <<: *cust
+    container_name: lp-cust4
+    hostname: lp-cust4
+    networks:
+      lp_xconn4: { ipv4_address: 10.76.4.3 }
+      lp_lan4: { ipv4_address: 10.66.4.2 }
+      lp_mgmt: { ipv4_address: 10.99.2.26 }
+
+  term12:
+    <<: *term
+    container_name: lp-term12
+    hostname: lp-term12
+    networks:
+      lp_lan12: { ipv4_address: 10.66.12.10 }
+      lp_mgmt: { ipv4_address: 10.99.2.35 }
+
+  term3:
+    <<: *term
+    container_name: lp-term3
+    hostname: lp-term3
+    networks:
+      lp_lan3: { ipv4_address: 10.66.3.10 }
+      lp_mgmt: { ipv4_address: 10.99.2.33 }
+
+  term4:
+    <<: *term
+    container_name: lp-term4
+    hostname: lp-term4
+    networks:
+      lp_lan4: { ipv4_address: 10.66.4.10 }
+      lp_mgmt: { ipv4_address: 10.99.2.34 }
+
+  rr:
+    <<: *cpe
+    container_name: lp-rr
+    hostname: lp-rr
+    networks:
+      lp_wan: { ipv4_address: 10.88.2.100 }
+      lp_mgmt: { ipv4_address: 10.99.2.100 }
+
+  ctrl:
+    <<: *cpe
+    container_name: lp-ctrl
+    hostname: lp-ctrl
+    ports:
+      - "127.0.0.1:8089:8080"
+    networks:
+      lp_wan: { ipv4_address: 10.88.2.200 }
+      lp_mgmt: { ipv4_address: 10.99.2.200 }
+
+networks:
+  lp_wan:
+    <<: *net-nomasq
+    ipam:
+      config:
+        - subnet: 10.88.2.0/24
+  lp_site12:
+    <<: *net-nomasq
+    ipam:
+      config:
+        - subnet: 10.76.12.0/24
+  lp_xconn3:
+    <<: *net-nomasq
+    ipam:
+      config:
+        - subnet: 10.76.3.0/24
+  lp_xconn4:
+    <<: *net-nomasq
+    ipam:
+      config:
+        - subnet: 10.76.4.0/24
+  lp_lan12:
+    <<: *net-nomasq
+    ipam:
+      config:
+        - subnet: 10.66.12.0/24
+  lp_lan3:
+    <<: *net-nomasq
+    ipam:
+      config:
+        - subnet: 10.66.3.0/24
+  lp_lan4:
+    <<: *net-nomasq
+    ipam:
+      config:
+        - subnet: 10.66.4.0/24
+  lp_mgmt:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.99.2.0/24
