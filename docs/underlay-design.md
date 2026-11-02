@@ -282,3 +282,39 @@ overlay ping 双向各 4/4、0% loss；中转盒 `show sr-wg stats` 的 `Transit
 - **运营方看不到位置**同样是结构性的：站点挂在 `/api/state` 的 `runtime` 里，而运营方那份节点副本从不填 `runtime`；`TestStateCarriesSiteForTenantOnly` 盯住"租户有、运营方整块没有"。
 - **接口**：`GET/POST/PUT /api/underlay/sites`、`POST /api/underlay/sites/delete`、`PUT /api/underlay/node-site`（放设备进去或清掉）。每次写入都回**全量站点清单 + `unplaced_nodes`**，前端据此刷新列表并让拓扑缓存失效——刚挪了位置的设备不能还画在老点上。删除只对 0 台设备的站点开放，否则 409 带上还有几台。
 - **经纬度是手填的**：控制器不测量、也不猜。空值被拒（`(0,0)` 是几内亚湾的真实坐标，填 0 会被画到那里），非数字与非有限值也被拒；lab 里给不同城市手工填坐标是被允许的（D6），值只进 lab 运行时数据。
+
+## 15. 两跳中转（3 段）的 lab 端到端（2026-11-02，已通过）
+
+§12 只证明了单跳中转（2 段）。多跳的路径是**有序**的，顺序错了照样能"通"（只是绕路或走错盒子），所以这一轮用 trace 盯住每一跳的 `seg_left` 和 `next_hop`，而不是只看 ping。
+
+环境：租户 `tenant-a` 的 node 1–4，四台都跑 `sr-agent -tunnels`。中转端口 `15000`（§0 决策 5），WAN 接口 cpe1/cpe2/transit = `host-eth1`、cpe3 = `host-eth0`。建隧道 t6（控制台手动，有序两跳；两端地址手填，`matches_observation:false`）：
+
+| 项 | 值 |
+|---|---|
+| 端点 | node 1 `lab-cpe1` 10.88.1.11（overlay 10.250.0.7） ↔ node 2 `lab-cpe2` 10.88.1.12（overlay 10.250.0.8） |
+| 有序中转跳 | `[node 3 lab-cpe3 10.88.1.13, node 4 lab-transit 10.88.1.3]`（**cpe3 先被命中，transit 后**） |
+| MTU | 1368（`mtu_is_default:false`，按最坏段数预算，与跳数无关） |
+
+两端 `show sr-wg paths` 各一条 3 段路径，`seg[0]` 是终点、`seg[1..2]` 是跳，顺序就是表单里的顺序：
+
+```
+cpe1  path_id=1002 seg_count=3
+      seg[0]: 10.88.1.12:20000   seg[1]: 10.88.1.3:15000   seg[2]: 10.88.1.13:15000
+cpe2  path_id=1001 seg_count=3
+      seg[0]: 10.88.1.11:20000   seg[1]: 10.88.1.3:15000   seg[2]: 10.88.1.13:15000
+```
+
+绑定都在 `wg1006`（实例号 = 1000 + 隧道序号）且 `usable`。overlay ping 双向各 4/4、0% loss（cpe1→cpe2 0.67–0.77 ms，cpe2→cpe1 0.54–0.85 ms）。
+
+**顺序证据（两端 relay 同时开 trace）**：
+
+```
+lab-cpe3   SR-WG-TRANSIT: hmac_id=1 path_id=1001 seg_left=1/3 next_hop=10.88.1.3:15000 err=0
+           SR-WG-TRANSIT: hmac_id=1 path_id=1002 seg_left=1/3 next_hop=10.88.1.3:15000 err=0
+lab-transit SR-WG-TRANSIT: hmac_id=1 path_id=1002 seg_left=0/3 next_hop=10.88.1.12:20000 err=0
+           SR-WG-TRANSIT: hmac_id=1 path_id=1001 seg_left=0/3 next_hop=10.88.1.11:20000 err=0
+```
+
+cpe3 收到的包 `seg_left=1/3`、把下一跳指到 transit；transit 收到的包 `seg_left=0/3`、下一跳就是隧道终点的 VPN 端口（20000）。两端 `err=0`，`show sr-wg stats` 的 `hmac_fail/seg_exhausted/bad_*` 全 0，收端 `Decap ok` 持续增长。**不要用 `Transit: ok` 的差值当证据**：隧道里 50 ms 的 BFD 一直在打，计数器会被背景流量淹没；干净的判据是 paths + trace + 端到端 ping。
+
+收尾：`DELETE /api/underlay/tunnels?id=t6` 后四台都回执 `隧道 t6 已从控制器配置里删除，接口已撤掉` + `隧道配置 v11 已收敛`，两端 `show interface wg1006` 报 unknown、path 1001/1002 消失。中转盒的 `transit 15000` 与 `hmac_id=1` 密钥环**留在原地**——它们是"这台设备是中转盒"的属性，不是某条隧道的产物（§12 的那条教训）。trace 用 `clear trace` 关掉，没有留在设备上。
