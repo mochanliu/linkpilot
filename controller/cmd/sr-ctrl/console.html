@@ -3854,6 +3854,18 @@
     var h = '<div class="subcard"><div class="subhead"><b>' + (b.applied ? "批量创建结果" : "这次会创建") + "</b>" +
       '<span class="sp">批次 ' + esc(b.batch_id || "—") + " · 新增 " + b.created + " 条 · 跳过 " +
       (b.skipped || []).length + " 台</span></div>";
+    // 逐对列出来，不只给一个数：这一批建了哪几条、分别连到谁，操作者要能对上
+    // 隧道表里的行；跳过的另一半在下面一张表里。
+    if ((b.createdList || []).length) {
+      h += '<table style="margin-top:10px"><thead><tr><th>已创建</th><th>隧道</th><th>路径</th></tr></thead><tbody>';
+      b.createdList.forEach(function (t) {
+        var an = (t.a && (t.a.serial || ("node-" + t.a.node_id))) || "—";
+        var bn = (t.b && (t.b.serial || ("node-" + t.b.node_id))) || "—";
+        h += "<tr><td>" + esc(an) + " ↔ " + esc(bn) +
+          '</td><td class="mono">' + esc(t.id) + "</td><td>" + undPathText(t) + "</td></tr>";
+      });
+      h += "</tbody></table>";
+    }
     if ((b.skipped || []).length) {
       h += '<table style="margin-top:10px"><thead><tr><th>跳过的对端</th><th>原因</th></tr></thead><tbody>';
       b.skipped.forEach(function (s) {
@@ -3959,7 +3971,8 @@
           "）；隧道段随心跳下发：开着 -tunnels 的设备下一轮心跳会拉走，结果回报在本页「设备与中转端口」表的「隧道下发」列。" };
       } else {
         u.batch = { applied: true, batch_id: res.batch_id,
-          created: (res.tunnels || []).length, skipped: res.skipped || [],
+          created: (res.tunnels || []).length, createdList: res.tunnels || [],
+          skipped: res.skipped || [],
           text: "路径：" + chain + "。新增的隧道段随心跳下发，被跳过的对端一条也没动。" };
         u.note = null;
       }
