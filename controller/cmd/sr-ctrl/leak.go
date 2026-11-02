@@ -42,6 +42,12 @@ const (
 	leakDefaultListName = "ALL"
 )
 
+// kernelReservedVPN reports whether vpn is a kernel table the box already uses
+// for something else. sr-frr injects a VPN N prefix into kernel table N, and
+// 253/254/255 are default/main/local — a leak row on them would write into the
+// kernel's own tables.
+func kernelReservedVPN(vpn uint32) bool { return vpn >= 253 }
+
 // PrefixEntry is one line of a prefix-list. FRR semantics: a prefix with no
 // ge/le matches exactly; ge/le widen it to a length range. Zero means "not
 // written", so /0 prefixes are still expressible through Prefix.
@@ -464,6 +470,10 @@ func (s *server) leakRuleChecksLocked(tenantID string, nodeID uint16, direction 
 		add("error", "VPN %d 是 overlay 保留表（隧道与对外下一跳用的那张），不能泄露。", r.VPN)
 		return out
 	}
+	if kernelReservedVPN(r.VPN) {
+		add("error", "VPN %d 是内核保留表（253 default / 254 main / 255 local）：盒内把 VPN N 落进内核表 N，泄露出去会覆盖内核自己的表。", r.VPN)
+		return out
+	}
 	if !configHasVPN(dc, r.VPN) {
 		add("error", "设备 %d 的基础配置里没有 VPN %d：先在「配置 › 基础配置」加这个 VPN。", nodeID, r.VPN)
 		return out
@@ -710,6 +720,8 @@ func (s *server) leakViewLocked(tenantID string, now int64) leakView {
 					route.MaxVRFID, route.MaxVRFID)
 			case vp.ID == vpnReservedOverlay:
 				vrow.Note = "overlay 保留表（隧道与对外下一跳），不参与泄露。"
+			case kernelReservedVPN(vp.ID):
+				vrow.Note = fmt.Sprintf("VPN %d 是内核保留表（253 default / 254 main / 255 local），不参与泄露。", vp.ID)
 			case !row.HasDraft:
 				vrow.Note = "这台设备还没有保存过基础配置草稿（v0）。"
 			case !vrow.InGroup:

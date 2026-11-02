@@ -228,6 +228,7 @@ func TestLeakRuleGates(t *testing.T) {
 		{"vpn not in a group", 1, leakToCPE, LeakRule{VPN: 20, Protocols: []string{"bgp"}}, "不在任何导通策略里"},
 		{"vpn not in base config", 1, leakToCPE, LeakRule{VPN: 30, Protocols: []string{"bgp"}}, "没有 VPN 30"},
 		{"reserved overlay table", 1, leakToCPE, LeakRule{VPN: vpnReservedOverlay, Protocols: []string{"bgp"}}, "overlay 保留表"},
+		{"kernel reserved table", 1, leakToCPE, LeakRule{VPN: 254, Protocols: []string{"bgp"}}, "内核保留表"},
 		{"beyond vrf width", 1, leakToCPE, LeakRule{VPN: 300, Protocols: []string{"bgp"}}, "超出泄露规则范围"},
 		{"no protocols", 1, leakToCPE, LeakRule{VPN: 10}, "至少选一个来源"},
 		{"sdwan needs a list", 1, leakToSDWAN, LeakRule{VPN: 10, Protocols: []string{"bgp"}}, "必须选一个 prefix-list"},
@@ -268,6 +269,16 @@ func TestLeakViewShowsWhatTheDeviceHas(t *testing.T) {
 	}
 	if row := leakVPN(t, v, 2, 0); !row.Selectable || row.HasBGP || !row.HasOSPF {
 		t.Fatalf("node 2 VPN 0 row = %+v, want selectable, OSPF only", row)
+	}
+}
+
+func TestLeakViewMarksKernelReservedVPNs(t *testing.T) {
+	s, ten, _ := leakFixture(t)
+	dc := s.state.Configs[configKey("t", 1)]
+	dc.Draft.VPNs = append(dc.Draft.VPNs, ConfigVPN{ID: 254, Name: "main"})
+	row := leakVPN(t, leakGet(t, s, ten), 1, 254)
+	if row.Selectable || !strings.Contains(row.Note, "内核保留表") {
+		t.Fatalf("VPN 254 row = %+v, want non-selectable with a kernel-reserved note", row)
 	}
 }
 

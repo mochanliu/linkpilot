@@ -320,7 +320,8 @@
       <div class="sect" data-roles="tenant">Overlay 配置</div>
       <a class="child" href="#overlay-settings" data-view="overlay-settings" data-roles="tenant">全局配置</a>
       <a class="child" href="#overlay-groups" data-view="overlay-groups" data-roles="tenant">导通策略配置</a>
-      <a class="child dis" data-roles="tenant">路由泄露 · 尚未规划</a>
+      <a class="child" href="#leak-to-sdwan" data-view="leak-to-sdwan" data-roles="tenant">路由泄露 · CPE-SDWAN</a>
+      <a class="child" href="#leak-to-cpe" data-view="leak-to-cpe" data-roles="tenant">路由泄露 · SDWAN-CPE</a>
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a class="child" href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
@@ -447,6 +448,8 @@
     S.und = null;
     S.topo = null;
     S.sites = null;
+    S.ov = null;
+    S.lk = null;
     S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
     clearInterval(S.timer);
@@ -692,12 +695,26 @@
       sub: "VPN 互通域：把几台设备的几个 VPN 放进同一条策略，控制器给它分配一个 RT 并写进每个成员的导入与导出。成员表的 RR 1 / RR 2 两列选这台设备连哪两台反射器。RT 由控制器拥有，页面上只读",
       roles: ["tenant"]
     },
+    "leak-to-sdwan": {
+      title: "路由泄露 · CPE-SDWAN",
+      sub: "客户侧前缀上报进 SD-WAN：按（设备, VPN）选来源、挂 prefix-list 白名单，命中白名单的前缀才进 overlay。prefix-list 库两个方向共用；保存只写草稿，发布走和「基础配置」同一条路径（设备下一次心跳拉取）",
+      roles: ["tenant"]
+    },
+    "leak-to-cpe": {
+      title: "路由泄露 · SDWAN-CPE",
+      sub: "overlay 前缀下发到客户侧：注入这台设备的内核表（K 路由），再由该 VPN 的 BGP/OSPF 分发给客户；不挂 prefix-list = 全放过。保存只写草稿，发布走和「基础配置」同一条路径",
+      roles: ["tenant"]
+    },
     account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" }
   };
 
 
   // 重建 DOM 时用来记住用户还没提交的手艺，见 render() 里的说明。
-  function keepKey(el) { return el.tagName + ":" + (el.id || el.name || ""); }
+  // 没有 id/name 的控件不记：它们的键全都一样，一行改的值会被填进另一行。
+  function keepKey(el) {
+    var n = el.id || el.name;
+    return n ? el.tagName + ":" + n : "";
+  }
 
   // 这个控件的值还是不是生成它时那个？比对价值属性（input）与 selected 属性
   // （select）—— 都是服务端这一版渲染出来的原值，用户动过才不一样。
@@ -753,6 +770,8 @@
     else if (S.view === "underlay-topology") c = viewUnderlayTopology();
     else if (S.view === "overlay-settings") c = viewOverlaySettings();
     else if (S.view === "overlay-groups") c = viewOverlayGroups();
+    else if (S.view === "leak-to-sdwan") c = viewLeakToSDWAN();
+    else if (S.view === "leak-to-cpe") c = viewLeakToCPE();
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "account") c = viewAccount();
     else c = viewPlaceholder();
@@ -780,7 +799,7 @@
     var keep = {};
     document.querySelectorAll("#content input:not([data-keep]), #content select:not([data-keep])").forEach(function (el) {
       var k = keepKey(el);
-      if (k !== "INPUT:" && editedByUser(el)) keep[k] = el.value;
+      if (k && editedByUser(el)) keep[k] = el.value;
     });
 
     S.html = c;
@@ -1882,7 +1901,7 @@
       render();
       return;
     }
-    if (!confirm("发布 v" + v.version + " 到 node-" + cs.nodeID + "？\n\n设备下一次心跳会拉取并安装，安装会重启 FRR。发布之后继续改草稿不影响设备，直到你再次发布。")) return;
+    if (!confirm("发布 v" + v.version + " 到 node-" + cs.nodeID + "？\n\n设备下一次心跳会拉取并安装（FRR 配置按差量热更，不重启进程）。发布之后继续改草稿不影响设备，直到你再次发布。")) return;
     var prev = v.published_version || 0;
     api("POST", "/api/config/publish", { node_id: cs.nodeID }).then(function (nv) {
       if (S.cfg !== cs) return;
@@ -5551,6 +5570,820 @@
     });
   }
 
+  /* ---------------- 路由泄露：CPE-SDWAN 与 SDWAN-CPE ---------------- */
+
+  // Both pages are one skeleton over two directions. The direction only changes
+  // which protocols exist, whether a prefix-list is mandatory, and the copy; the
+  // library, the device list and every publish path are shared. Nothing on this
+  // page publishes on save — a row is draft material until「发布到设备」.
+  var LK_CPE = "to_cpe";      // SDWAN-CPE
+  var LK_SDWAN = "to_sdwan";  // CPE-SDWAN
+
+  function lkRole() { return !!(S.me && S.me.role === "tenant"); }
+
+  function lkStore() {
+    if (!S.lk) {
+      S.lk = { doc: null, at: 0, loading: false, note: null, dir: LK_SDWAN,
+        open: {}, edit: {}, filter: "", lib: null, batch: null, repub: null };
+    }
+    return S.lk;
+  }
+
+  function ensureLeak() {
+    var o = lkStore();
+    if (!lkRole()) return o;
+    if (o.loading) return o;
+    if (!o.doc || nowSec() - o.at >= 10) loadLeak(false);
+    return o;
+  }
+
+  function loadLeak(force) {
+    var o = lkStore();
+    if (!lkRole() || o.loading) return;
+    if (!force && o.doc && nowSec() - o.at < 10) return;
+    o.loading = true;
+    api("GET", "/api/leak").then(function (doc) {
+      o.loading = false;
+      if (!doc) { render(); return; }
+      lkSetDoc(doc);
+      if (o.note && o.note.fromLoad) o.note = null;
+      render();
+    }).catch(function (err) {
+      o.loading = false;
+      o.note = undErrNote(err);
+      o.note.fromLoad = true;
+      render();
+    });
+  }
+
+  function lkSetDoc(doc) {
+    var o = lkStore();
+    o.doc = doc;
+    o.at = nowSec();
+    o.loading = false;
+    lkPrune(doc);
+  }
+
+  // An unenrolled device or a deleted list cannot stay in an open editor or a
+  // stored batch: the next save would target something that no longer exists.
+  function lkPrune(doc) {
+    var o = lkStore();
+    var nodes = {};
+    (doc.nodes || []).forEach(function (n) { nodes[String(n.node_id)] = true; });
+    Object.keys(o.open).forEach(function (k) { if (!nodes[k]) delete o.open[k]; });
+    Object.keys(o.edit).forEach(function (k) { if (!nodes[k.split(":")[0]]) delete o.edit[k]; });
+    if (o.batch) {
+      o.batch.req.node_ids = o.batch.req.node_ids.filter(function (id) { return nodes[String(id)]; });
+      if (o.batch.view) o.batch.stale = true;
+    }
+    if (o.repub && !lkListOf(doc, o.repub.list_id)) o.repub = null;
+    if (o.lib && o.lib.id && !lkListOf(doc, o.lib.id)) o.lib = null;
+  }
+
+  function lkListOf(doc, id) {
+    var out = null;
+    ((doc && doc.prefix_lists) || []).forEach(function (pl) { if (pl.id === id) out = pl; });
+    return out;
+  }
+
+  function lkListName(doc, id) {
+    var pl = lkListOf(doc, id);
+    return pl ? pl.name : id;
+  }
+
+  function lkErrJSON(err) {
+    var msg = err && err.message ? err.message : String(err);
+    try { return JSON.parse(msg); } catch (_) { return null; }
+  }
+
+  function lkChecksText(checks) {
+    return (checks || []).map(function (c) {
+      var label = { error: "错误", warning: "警告", info: "提示" }[c.severity] || c.severity;
+      return label + "：" + c.text;
+    }).join("；");
+  }
+
+  function lkFormErr(form, text) {
+    var el = form ? form.querySelector("[data-lk-err]") : null;
+    if (el) el.textContent = text;
+  }
+
+  function lkRowErr(key, text) {
+    var el = document.querySelector('#lk-root [data-lk-row-err="' + key + '"]');
+    if (el) el.textContent = text;
+  }
+
+  function lkDirProtocols(dir) {
+    var out = [{ v: "bgp", label: "BGP" }, { v: "ospf", label: "OSPF" }];
+    // static/connected have no FRR instance to ask; they only exist as an origin
+    // on the customer side, which is why only CPE-SDWAN offers them (§8).
+    if (dir === LK_SDWAN) {
+      out.push({ v: "static", label: "静态" });
+      out.push({ v: "connected", label: "直连" });
+    }
+    return out;
+  }
+
+  // "10.0.0.0/8" or "10.0.0.0/8 ge 16 le 24", one per line. Parsing here is only
+  // for a readable error; the controller re-validates every entry.
+  function lkParseEntries(text) {
+    var entries = [], errs = [];
+    String(text || "").split(/\n/).forEach(function (line, i) {
+      line = line.trim();
+      if (!line || line.charAt(0) === "#") return;
+      var words = line.split(/\s+/);
+      var e = { prefix: words[0] };
+      var bad = words.length % 2 === 0;
+      for (var k = 1; !bad && k < words.length; k += 2) {
+        var op = words[k], num = Number(words[k + 1]);
+        if ((op !== "ge" && op !== "le") || !/^\d+$/.test(words[k + 1] || "") ||
+            num < 0 || num > 32) bad = true;
+        else if (op === "ge") e.ge = num;
+        else e.le = num;
+      }
+      if (bad) {
+        errs.push("第 " + (i + 1) + " 行看不懂：写成 10.0.0.0/8 或 10.0.0.0/8 ge 16 le 24");
+        return;
+      }
+      entries.push(e);
+    });
+    return { entries: entries, errs: errs };
+  }
+
+  function lkEntriesText(entries) {
+    return (entries || []).map(function (e) {
+      return e.prefix + (e.ge ? " ge " + e.ge : "") + (e.le ? " le " + e.le : "");
+    }).join("\n");
+  }
+
+  function viewLeakToSDWAN() { return viewLeak(LK_SDWAN); }
+  function viewLeakToCPE() { return viewLeak(LK_CPE); }
+
+  function viewLeak(dir) {
+    var o = lkStore();
+    o.dir = dir;
+    var doc = ensureLeak().doc;
+    if (!doc) {
+      return '<section class="panel"><div class="empty">' +
+        esc(o.note ? o.note.text : "正在读取路由泄露配置…") + "</div></section>";
+    }
+    var h = '<div id="lk-root">';
+    if (o.note) h += undNote(o.note);
+    h += lkLibraryPanel(dir, doc, o);
+    h += lkBatchPanel(dir, doc, o);
+    h += lkDevicesPanel(dir, doc, o);
+    h += '<section class="panel"><header><h2>这一页与发布的关系</h2></header>' +
+      '<div class="hint">保存规则/列表只写控制器草稿，设备上什么都不变。三个发布入口走的是同一条路径' +
+      "（<code>POST /api/config/publish</code>）：设备行的「发布到设备」、prefix-list 行的「重新发布」、" +
+      "批量模版的「应用并发布」。发布以后设备在下一次心跳（≤" +
+      esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
+      " 秒）拉取；设备是否已经装上，看设备行里的「设备已装」，那是设备自己的回报，不是发布记录。" +
+      "改前缀列表内容本身不会推到设备，编辑完要回到引用它的设备上再发布一次。</div></section>";
+    return h + "</div>";
+  }
+
+  /* ---------------- prefix-list 库 ---------------- */
+
+  function lkLibOpen(pl) {
+    var o = lkStore();
+    if (pl && o.lib && o.lib.id === pl.id) o.lib = null;
+    else o.lib = pl
+      ? { mode: "edit", id: pl.id, name: pl.name, text: lkEntriesText(pl.entries) }
+      : { mode: "new", id: "", name: "", text: "" };
+    blurContent();
+    render();
+  }
+
+  function lkLibForm(pl) {
+    var o = lkStore();
+    var cur = (o.lib && (o.lib.id || "") === (pl ? pl.id : "")) ? o.lib : null;
+    var name = cur && cur.name != null ? cur.name : (pl ? pl.name : "");
+    var text = cur && cur.text != null ? cur.text : (pl ? lkEntriesText(pl.entries) : "");
+    return '<form data-lk-form="lib" data-lk-lib-id="' + esc(pl ? pl.id : "") + '">' +
+      '<div class="fields"><div class="field"><label>名称</label>' +
+      '<input id="lk-lib-name" name="name" data-lk-lib="name" maxlength="32" value="' + esc(name) +
+      '" autocomplete="off" spellcheck="false"></div></div>' +
+      '<div class="field" style="margin-top:8px"><label>条目（一行一条，<code>#</code> 开头的行忽略）</label>' +
+      '<textarea id="lk-lib-text" name="entries" data-lk-lib="text" class="cmd" spellcheck="false" ' +
+      'style="width:100%;min-height:110px;resize:vertical">' + esc(text) + "</textarea></div>" +
+      '<div style="margin-top:8px"><button class="primary" type="submit">' +
+      (pl ? "保存列表" : "新建列表") + '</button> ' +
+      '<button class="small" type="button" data-lk="lib-cancel">取消</button></div>' +
+      '<div class="err" data-lk-err role="alert"></div></form>';
+  }
+
+  function lkLibraryPanel(dir, doc, o) {
+    var lists = doc.prefix_lists || [];
+    var h = '<section class="panel"><header><h2>prefix-list 库</h2>' +
+      '<span class="muted" style="font-size:12.5px">' + lists.length + " / " + esc(doc.max_prefix_lists) +
+      '</span><span style="flex:1"></span>' +
+      '<button class="small" data-lk="lib-new"' + (o.lib && !o.lib.id ? " disabled" : "") +
+      ">新建列表</button></header>" +
+      '<div class="hint">' + esc(doc.notes.library) +
+      "条目一行一条：<code>10.0.0.0/8</code> 只匹配这一条，<code>10.0.0.0/8 ge 16 le 24</code> 匹配长度范围。" +
+      "「重新发布」只重新发布引用它的那些设备；列表内容本身不会自动推到任何盒子。</div>";
+    if (o.lib && !o.lib.id) h += '<div class="und-box" style="margin-bottom:10px">' + lkLibForm(null) + "</div>";
+    h += '<table><thead><tr><th>列表</th><th>条目</th><th>引用 / 待发布</th><th></th></tr></thead><tbody>';
+    if (!lists.length) {
+      h += '<tr><td colspan="4" class="muted">库里没有列表。CPE-SDWAN 至少要有一个（默认的 ALL 被删掉后会重新给一个空列表）。</td></tr>';
+    }
+    lists.forEach(function (pl) {
+      var preview = lkEntriesText(pl.entries).split("\n").filter(Boolean);
+      h += "<tr><td><b>" + esc(pl.name) + '</b> <span class="muted mono">' + esc(pl.id) + "</span></td>" +
+        '<td class="muted" style="font-size:12.5px">' +
+        (preview.length
+          ? esc(preview.slice(0, 3).join(" · ")) +
+            (preview.length > 3 ? " …（共 " + preview.length + " 条）" : "")
+          : '<span class="tag stale">空列表</span>') + "</td>" +
+        "<td>" + esc(pl.referenced_by) + " 台" +
+        (pl.pending_devices
+          ? ' <span class="tag stale">' + esc(pl.pending_devices) + " 台待重新发布</span>"
+          : "") + "</td>" +
+        '<td class="row-actions">' +
+        '<button class="small" type="button" data-lk="lib-edit" data-id="' + esc(pl.id) + '">' +
+        (o.lib && o.lib.id === pl.id ? "收起" : "编辑") + "</button>" +
+        '<button class="small" type="button" data-lk="lib-repub" data-id="' + esc(pl.id) + '"' +
+        (pl.referenced_by ? "" : " disabled") + ">重新发布（" + esc(pl.referenced_by) + " 台）</button>" +
+        '<button class="small danger" type="button" data-lk="lib-del" data-id="' + esc(pl.id) +
+        '" data-name="' + esc(pl.name) + '">删除</button></td></tr>';
+      if (o.lib && o.lib.id === pl.id) {
+        h += '<tr><td colspan="4">' + lkLibForm(pl) + "</td></tr>";
+      }
+    });
+    h += "</tbody></table>";
+    if (o.repub) h += lkRepubPanel(o.repub);
+    return h + "</section>";
+  }
+
+  function lkSaveLib(form) {
+    var o = lkStore();
+    var id = form.getAttribute("data-lk-lib-id") || "";
+    var nameEl = form.querySelector('[name="name"]');
+    var textEl = form.querySelector('[name="entries"]');
+    var parsed = lkParseEntries(textEl ? textEl.value : "");
+    if (parsed.errs.length) { lkFormErr(form, parsed.errs.join("；")); return; }
+    var body = { name: (nameEl ? nameEl.value : "").trim(), entries: parsed.entries };
+    if (id) body.id = id;
+    api(id ? "PUT" : "POST", "/api/prefix-lists", body).then(function (res) {
+      if (res && res.leak) lkSetDoc(res.leak);
+      o.lib = null;
+      o.note = { kind: "", text: id
+        ? "列表「" + (res.list ? res.list.name : body.name) + "」已保存。引用它的设备要发布一次才会换上这一版。"
+        : "已新建列表「" + (res.list ? res.list.name : body.name) + "」。下一步把它挂到设备行的规则上。" };
+      blurContent();
+      render();
+      toast(id ? "列表已保存" : "列表已创建");
+    }).catch(function (err) {
+      var j = lkErrJSON(err);
+      lkFormErr(form, (j && j.error ? j.error : err.message) + (j && j.checks ? "（" + lkChecksText(j.checks) + "）" : ""));
+    });
+  }
+
+  function lkDeleteLib(id, name) {
+    if (!confirm("删除列表「" + name + "」？被设备规则引用时控制器会拒绝。")) return;
+    var o = lkStore();
+    api("DELETE", "/api/prefix-lists?id=" + encodeURIComponent(id)).then(function (res) {
+      if (res && res.leak) lkSetDoc(res.leak);
+      o.lib = null;
+      o.repub = null;
+      o.note = { kind: "", text: "已删除列表「" + name + "」。" };
+      blurContent();
+      render();
+      toast("已删除");
+    }).catch(function (err) {
+      var j = lkErrJSON(err);
+      o.note = { kind: "bad", text: (j && j.error) || err.message };
+      blurContent();
+      render();
+    });
+  }
+
+  function lkRepublish(id) {
+    var o = lkStore();
+    api("POST", "/api/leak/republish", { prefix_list_id: id }).then(function (v) {
+      o.repub = { list_id: id, view: v };
+      o.note = null;
+      blurContent();
+      render();
+    }).catch(function (err) {
+      var j = lkErrJSON(err);
+      o.note = { kind: "bad", text: (j && j.error) || err.message };
+      blurContent();
+      render();
+    });
+  }
+
+  function lkRepublishApply() {
+    var o = lkStore();
+    if (!o.repub) return;
+    api("POST", "/api/leak/republish", { prefix_list_id: o.repub.list_id, apply: true })
+      .then(function (v) {
+        o.repub = { list_id: o.repub.list_id, view: v };
+        o.note = { kind: "", text: "已重新发布「" + (v.prefix_list_name || o.repub.list_id) + "」引用的 " +
+          (v.results || []).length + " 台设备；设备在下一次心跳拉取。" };
+        loadLeak(true);
+        toast("已重新发布");
+      }).catch(function (err) {
+        var j = lkErrJSON(err);
+        if (j && j.republish) o.repub = { list_id: o.repub.list_id, view: j.republish };
+        o.note = { kind: "bad", text: (j && j.error) || err.message };
+        blurContent();
+        render();
+      });
+  }
+
+  function lkRepubPanel(rp) {
+    var v = rp.view || { rows: [] };
+    var h = '<div class="und-box" style="margin-top:10px"><h3>重新发布「' +
+      esc(v.prefix_list_name || rp.list_id) + "」</h3>" +
+      '<table><thead><tr><th>设备</th><th>已发布</th><th>结果</th><th>说明</th></tr></thead><tbody>';
+    (v.rows || []).forEach(function (r) {
+      h += '<tr><td class="mono">node-' + esc(r.node_id) + "</td><td>" +
+        (r.published_version ? "v" + esc(r.published_version) : '<span class="muted">未发布</span>') + "</td>" +
+        "<td>" + (r.will_publish ? '<span class="tag online">发布</span>'
+          : '<span class="tag stale">跳过</span>') + "</td>" +
+        '<td class="muted" style="font-size:12.5px">' + esc(r.reason || "") + "</td></tr>";
+    });
+    h += "</tbody></table>";
+    if (v.results && v.results.length) {
+      h += '<div class="hint">' + v.results.map(function (x) {
+        return "node-" + esc(x.node_id) + " → v" + esc(x.version || 0);
+      }).join(" · ") + "</div>";
+    }
+    if (!v.results) {
+      h += '<div style="margin-top:8px"><button class="small primary" type="button" data-lk="repub-apply"' +
+        (v.blocked ? " disabled" : "") + ">发布到这些设备</button> " +
+        '<button class="small" type="button" data-lk="repub-close">关闭</button></div>';
+      if (v.blocked) h += '<div class="hint">有设备现在发布不了：整批不发布，先把原因改掉。</div>';
+    } else {
+      h += '<div style="margin-top:8px"><button class="small" type="button" data-lk="repub-close">关闭</button></div>';
+    }
+    return h + "</div>";
+  }
+
+  /* ---------------- 批量模版 ---------------- */
+
+  function lkBatchInit(dir, doc) {
+    var o = lkStore();
+    if (o.batch && o.batch.req.direction === dir) return o.batch;
+    var proto = {};
+    lkDirProtocols(dir).forEach(function (p) { proto[p.v] = true; });
+    var firstList = (doc.prefix_lists && doc.prefix_lists[0]) ? doc.prefix_lists[0].id : "";
+    o.batch = { req: { direction: dir, node_ids: [], vpns: [0], protocols: proto,
+      prefix_list: dir === LK_SDWAN ? firstList : "" }, view: null, stale: false };
+    return o.batch;
+  }
+
+  function lkListOptions(dir, doc, cur) {
+    var h = '<option value=""' + (cur ? "" : " selected") + ">" +
+      (dir === LK_CPE ? "不挂列表（全放过）" : "选择列表") + "</option>";
+    var found = !cur;
+    (doc.prefix_lists || []).forEach(function (pl) {
+      if (pl.id === cur) found = true;
+      h += '<option value="' + esc(pl.id) + '"' + (pl.id === cur ? " selected" : "") + ">" +
+        esc(pl.name) + "（" + esc((pl.entries || []).length) + " 条）</option>";
+    });
+    if (!found) {
+      h += '<option value="' + esc(cur) + '" selected>' + esc(cur) + "（列表已不存在）</option>";
+    }
+    return h;
+  }
+
+  function lkBatchPanel(dir, doc, o) {
+    var b = lkBatchInit(dir, doc);
+    var req = b.req;
+    var h = '<section class="panel"><header><h2>批量模版</h2>' +
+      '<span class="muted" style="font-size:12.5px">一次成型，不保存</span></header>' +
+      '<div class="hint">' + esc(doc.notes[dir]) + "</div>" +
+      '<div class="lk-batch"><div class="fields" style="align-items:end">' +
+      '<div class="field"><label>设备（可多选）</label>' +
+      dpHtml("lk-batch-nodes", "lk-batch-nodes", dpNodeItems(doc.nodes), req.node_ids.map(String),
+        { multiple: true, unit: "台", size: 6, ph: "过滤：名称 / 序列号 / 站点 / 状态",
+          aria: "过滤设备列表" }) + "</div>" +
+      '<div class="field"><label for="lk-batch-vpns">VPN 号</label>' +
+      '<input id="lk-batch-vpns" name="lk-batch-vpns" value="' + esc(req.vpns.join(", ")) +
+      '" placeholder="例如 0, 10" autocomplete="off"></div>' +
+      '<div class="field"><label>来源</label>';
+    lkDirProtocols(dir).forEach(function (p) {
+      h += '<label class="chk" style="margin-right:10px"><input type="checkbox" data-lk-batch-p="' + p.v + '"' +
+        (req.protocols[p.v] ? " checked" : "") + "> " + p.label + "</label>";
+    });
+    h += "</div>" +
+      '<div class="field"><label>prefix-list</label><select id="lk-batch-list">' +
+      lkListOptions(dir, doc, req.prefix_list) + "</select></div>" +
+      '<div class="field"><button class="small primary" type="button" data-lk="batch-preview">预览</button> ' +
+      '<button class="small" type="button" data-lk="batch-reset">清空</button></div>' +
+      "</div></div>" +
+      '<div class="hint" style="margin-top:6px">每台设备的每张 VPN 各自展开：这台设备没有的 VPN、' +
+      "没有对应实例的来源都会被去掉并写清原因；一行都不剩的（设备, VPN）整行丢弃。整批要么全写、要么一行不写；" +
+      "写完后每台受影响的设备各发布一次。</div>";
+    h += '<div class="hint" data-lk-batch-stale hidden style="color:var(--warn)">' +
+      "参数改过了：重新预览以后再应用。</div>";
+    if (b.view) h += lkBatchPreview(dir, b.view);
+    return h + "</section>";
+  }
+
+  function lkBatchCapture(dir) {
+    var o = lkStore();
+    var b = lkBatchInit(dir, o.doc);
+    var sel = document.getElementById("lk-batch-nodes");
+    var nodes = sel ? Array.prototype.slice.call(sel.selectedOptions).map(function (x) {
+      return Number(x.value);
+    }).filter(Boolean) : [];
+    var vpns = String((document.getElementById("lk-batch-vpns") || {}).value || "")
+      .split(/[\s,]+/).filter(Boolean).map(Number);
+    var protocols = [];
+    document.querySelectorAll("#lk-root [data-lk-batch-p]").forEach(function (el) {
+      if (el.checked) protocols.push(el.getAttribute("data-lk-batch-p"));
+    });
+    var list = document.getElementById("lk-batch-list");
+    return { b: b, nodes: nodes, vpns: vpns, protocols: protocols, prefix_list: list ? list.value : "" };
+  }
+
+  function lkBatchPreviewRun() {
+    var o = lkStore();
+    var cap = lkBatchCapture(o.dir);
+    if (!cap.nodes.length) { o.note = { kind: "warn", text: "先选至少一台设备。" }; blurContent(); render(); return; }
+    if (!cap.vpns.length || cap.vpns.some(function (v) { return !(v >= 0 && v <= 255); })) {
+      o.note = { kind: "warn", text: "VPN 号要写 0–255 的整数，用逗号分隔（例如 0, 10）。" };
+      blurContent(); render(); return;
+    }
+    if (!cap.protocols.length) { o.note = { kind: "warn", text: "至少选一个来源。" }; blurContent(); render(); return; }
+    var proto = {};
+    cap.protocols.forEach(function (p) { proto[p] = true; });
+    cap.b.req = { direction: o.dir, node_ids: cap.nodes, vpns: cap.vpns, protocols: proto,
+      prefix_list: cap.prefix_list };
+    cap.b.view = null;
+    cap.b.stale = false;
+    o.note = null;
+    api("POST", "/api/leak/batch", {
+      direction: o.dir, node_ids: cap.nodes, vpns: cap.vpns,
+      protocols: cap.protocols, prefix_list: cap.prefix_list, apply: false
+    }).then(function (v) {
+      cap.b.view = v;
+      blurContent();
+      render();
+    }).catch(function (err) {
+      var j = lkErrJSON(err);
+      o.note = { kind: "bad", text: (j && j.error) || err.message, checks: j && j.checks };
+      blurContent();
+      render();
+    });
+  }
+
+  function lkBatchPreview(dir, v) {
+    var keep = (v.rows || []).filter(function (r) { return r.keep; }).length;
+    var h = '<div class="und-box" style="margin-top:10px"><h3>预览 · ' + keep + " 行写入 / " +
+      (v.rows || []).length + " 行</h3>" +
+      '<table><thead><tr><th>设备</th><th>VPN</th><th>结果</th><th>说明</th></tr></thead><tbody>';
+    (v.rows || []).forEach(function (r) {
+      h += '<tr><td class="mono">node-' + esc(r.node_id) + "</td><td>VPN " + esc(r.vpn) + "</td>" +
+        "<td>" + (r.keep ? '<span class="tag online">写入</span>' : '<span class="tag stale">丢弃</span>') + "</td>" +
+        '<td class="muted" style="font-size:12.5px">' + esc(r.reason || "") +
+        (r.checks && r.checks.length ? "<br>" + esc(lkChecksText(r.checks)) : "") + "</td></tr>";
+    });
+    h += "</tbody></table>";
+    if (v.results && v.results.length) {
+      h += '<div class="hint">已发布：' + v.results.map(function (x) {
+        return "node-" + esc(x.node_id) + " v" + esc(x.version || 0);
+      }).join("、") + "</div>";
+    } else {
+      h += '<div style="margin-top:8px"><button class="small primary" type="button" data-lk="batch-apply"' +
+        (v.blocked ? " disabled" : "") + ">应用并发布（" + keep + " 行）</button></div>";
+      if (v.blocked) {
+        h += '<div class="hint">预览里有会被丢弃或校验不过的行：整批不会写入。改上面的参数重新预览，' +
+          "或者先把这些设备的问题解决。</div>";
+      } else {
+        h += '<div class="hint">写入以后马上按同一份草稿发布这些设备：一次写完、一台失败就整批不落地。</div>';
+      }
+    }
+    return h + "</div>";
+  }
+
+  function lkBatchApply() {
+    var o = lkStore();
+    var b = o.batch;
+    if (!b || !b.view || b.stale) return;
+    var req = b.req;
+    var protocols = Object.keys(req.protocols).filter(function (k) { return req.protocols[k]; });
+    api("POST", "/api/leak/batch", {
+      direction: req.direction, node_ids: req.node_ids, vpns: req.vpns,
+      protocols: protocols, prefix_list: req.prefix_list, apply: true
+    }).then(function (v) {
+      if (v.leak) lkSetDoc(v.leak);
+      o.batch = null;
+      o.note = { kind: "", text: "已写入并发布：" + (v.results || []).map(function (x) {
+        return "node-" + x.node_id + " v" + (x.version || 0);
+      }).join("、") + "。设备在下一次心跳拉取。" };
+      blurContent();
+      render();
+      toast("已写入并发布");
+    }).catch(function (err) {
+      var j = lkErrJSON(err);
+      if (j && j.batch) { b.view = j.batch; b.stale = false; }
+      o.note = { kind: "bad", text: (j && j.error) || err.message };
+      blurContent();
+      render();
+    });
+  }
+
+  /* ---------------- 设备与规则 ---------------- */
+
+  function lkDevicesPanel(dir, doc, o) {
+    return '<section class="panel"><header><h2>设备与规则</h2>' +
+      '<span class="muted" style="font-size:12.5px">按（设备, VPN）保存</span></header>' +
+      '<div class="fields"><div class="field"><label for="lk-q">过滤设备</label>' +
+      '<input id="lk-q" data-lk-q value="' + esc(o.filter) +
+      '" placeholder="node 号 / 名称 / 状态" autocomplete="off"></div></div>' +
+      '<div id="lk-dev">' + lkDevBody(dir, doc, o) + "</div></section>";
+  }
+
+  function lkDevBody(dir, doc, o) {
+    var q = String(o.filter || "").trim().toLowerCase();
+    var rows = (doc.nodes || []).filter(function (n) {
+      if (!q) return true;
+      var hay = ("node-" + n.node_id + " " + (n.name || "") + " " + dpStatusText(n)).toLowerCase();
+      return q.split(/\s+/).every(function (w) { return hay.indexOf(w) >= 0; });
+    });
+    if (!(doc.nodes || []).length) {
+      return '<div class="empty">这个租户还没有已入网设备。</div>';
+    }
+    if (!rows.length) {
+      return '<div class="empty">没有匹配「' + esc(o.filter) + "」的设备。</div>";
+    }
+    var h = '<div class="hint">共 ' + rows.length + " / " + doc.nodes.length + " 台</div>";
+    rows.forEach(function (n) { h += lkDeviceBox(dir, doc, n, o); });
+    return h;
+  }
+
+  function lkDeviceBox(dir, doc, n, o) {
+    var open = !!o.open[String(n.node_id)];
+    var h = '<div class="und-box" style="margin-top:8px">' +
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+      '<button class="small" type="button" data-lk="dev-toggle" data-node="' + esc(n.node_id) + '">' +
+      (open ? "▾" : "▸") + "</button>" +
+      '<b class="mono">node-' + esc(n.node_id) + "</b>" +
+      (n.name ? ' <span class="muted">' + esc(n.name) + "</span>" : "") +
+      ' <span class="tag ' + esc(n.status === "online" ? "online" : n.status === "stale" ? "stale" : "pending") +
+      '">' + esc(dpStatusText(n)) + "</span>" +
+      (n.has_draft
+        ? ' <span class="muted">草稿 v' + esc(n.version) +
+          (n.published_version ? " · 已发布 v" + esc(n.published_version) : " · 未发布") + "</span>"
+        : ' <span class="tag stale">v0 · 还没有基础配置草稿</span>') +
+      (n.pending ? ' <span class="tag stale">有未发布的改动</span>' : "") +
+      '<span style="flex:1"></span>' +
+      '<button class="small primary" type="button" data-lk="dev-publish" data-node="' + esc(n.node_id) + '"' +
+      (n.has_draft ? "" : " disabled") + ">发布到设备</button>" +
+      "</div>";
+    if (!open) return h + "</div>";
+
+    h += lkDelivery(n);
+    if (!n.has_draft) {
+      h += '<div class="hint">这台设备还没有保存过基础配置草稿：先去「配置 › 基础配置」保存一次，' +
+        "否则泄露规则没有可以挂靠的 VPN。</div>" + "</div>";
+      return h;
+    }
+    if (n.checks && n.checks.length) {
+      h += '<ul class="chk-list" style="padding-left:18px">' + n.checks.map(undCheckRow).join("") + "</ul>";
+    }
+    h += '<table style="margin-top:8px"><thead><tr><th>VPN</th><th>来源</th><th>prefix-list</th><th></th></tr></thead><tbody>';
+    (n.vpns || []).forEach(function (v) { h += lkVPNRow(dir, doc, n, v); });
+    h += "</tbody></table></div>";
+    return h;
+  }
+
+  // Two facts side by side: what the controller froze (published) and what the
+  // box says it runs (device_state). A published version the box has not
+  // confirmed is shown as waiting, never as applied.
+  function lkDelivery(n) {
+    var d = n.device_state || null;
+    var pub = n.published_version || 0;
+    var tag = '<span class="tag pending">尚未发布</span>';
+    if (pub && !d) tag = '<span class="tag pending">等待设备回报</span>';
+    else if (pub && d && !d.capable) tag = '<span class="tag stale">设备未启用 -apply</span>';
+    else if (pub && d && d.applying) tag = '<span class="tag plan">设备安装中 v' + esc(d.applying_version) + "</span>";
+    else if (pub && d && d.version === pub && d.ok) tag = '<span class="tag online">设备已装 v' + esc(pub) + "</span>";
+    else if (pub && d && d.version > pub) tag = '<span class="tag plan">设备 v' + esc(d.version) + "（比已发布的新）</span>";
+    else if (pub && d) tag = '<span class="tag stale">设备仍是 v' + esc(d.version || 0) + "</span>";
+    var got = '<span class="muted">还没有上报配置状态</span>';
+    if (d && d.capable) {
+      got = d.version ? "v" + esc(d.version) : "没有安装过";
+      if (d.applying) got += ' · <span class="tag plan">正在安装 v' + esc(d.applying_version) + "</span>";
+      else if (d.ok) got += ' · 最近一次安装成功';
+      else if (d.error) got += ' · <span class="tag revoked">最近一次安装失败</span>：' + esc(d.error);
+    } else if (d) {
+      got = "agent 没有启用 <code>-apply</code>：不会拉取配置";
+    }
+    return '<table style="margin-top:8px"><tbody>' +
+      "<tr><th>期望版本</th><td>" + (pub ? "v" + esc(pub) : "尚未发布" +
+        (n.version ? "（草稿 v" + esc(n.version) + " 在控制器）" : "")) + " · " + tag + "</td></tr>" +
+      "<tr><th>设备已装</th><td>" + got + "</td></tr></tbody></table>";
+  }
+
+  function lkEditState(dir, n, v) {
+    var o = lkStore();
+    var key = n.node_id + ":" + dir + ":" + v.id;
+    if (!o.edit[key]) {
+      var r = dir === LK_CPE ? v.to_cpe : v.to_sdwan;
+      var p = {};
+      (r ? r.protocols : []).forEach(function (x) { p[x] = true; });
+      o.edit[key] = { p: p, list: r ? r.prefix_list || "" : "" };
+    }
+    return o.edit[key];
+  }
+
+  function lkRuleText(doc, r) {
+    if (!r) return '<span class="muted">没有规则</span>';
+    return esc((r.protocols || []).join(" + ")) + " · " +
+      (r.prefix_list ? esc(lkListName(doc, r.prefix_list)) : '<span class="muted">不挂列表</span>');
+  }
+
+  function lkVPNRow(dir, doc, n, v) {
+    var rule = dir === LK_CPE ? v.to_cpe : v.to_sdwan;
+    var label = "<b>VPN " + esc(v.id) + "</b>" + (v.name ? ' <span class="muted">' + esc(v.name) + "</span>" : "");
+    if (!v.selectable) {
+      return "<tr><td>" + label + "</td>" +
+        '<td colspan="2" class="muted" style="font-size:12.5px">' + esc(v.note || "不可选") +
+        (rule ? "<br>现有规则：" + lkRuleText(doc, rule) : "") + "</td>" +
+        '<td class="row-actions">' + (rule
+          ? '<button class="small danger" type="button" data-lk="row-del" data-node="' + esc(n.node_id) +
+            '" data-vpn="' + esc(v.id) + '">删除规则</button>'
+          : "") + "</td></tr>";
+    }
+    var key = n.node_id + ":" + dir + ":" + v.id;
+    var e = lkEditState(dir, n, v);
+    var h = "<tr><td>" + label +
+      (rule ? '<div class="muted" style="font-size:11.5px">当前：' + lkRuleText(doc, rule) + "</div>" : "") + "</td><td>";
+    lkDirProtocols(dir).forEach(function (p) {
+      var has = p.v === "bgp" ? v.has_bgp : p.v === "ospf" ? v.has_ospf : true;
+      h += '<label class="chk" style="margin-right:10px"' +
+        (has ? "" : ' title="这个 VPN 没有启用 ' + p.label + ' 实例"') + ">" +
+        '<input type="checkbox" data-lk-p="' + p.v + '" data-lk-key="' + esc(key) + '"' +
+        (e.p[p.v] ? " checked" : "") + (has ? "" : " disabled") + "> " + p.label + "</label>";
+    });
+    h += '</td><td><select data-lk-list="1" data-lk-key="' + esc(key) + '">' +
+      lkListOptions(dir, doc, e.list) + "</select></td>" +
+      '<td class="row-actions">' +
+      '<button class="small primary" type="button" data-lk="row-save" data-node="' + esc(n.node_id) +
+      '" data-vpn="' + esc(v.id) + '">保存规则</button>' +
+      (rule ? '<button class="small danger" type="button" data-lk="row-del" data-node="' + esc(n.node_id) +
+        '" data-vpn="' + esc(v.id) + '">删除</button>' : "") +
+      '<div class="err" data-lk-row-err="' + esc(key) + '"></div></td></tr>';
+    return h;
+  }
+
+  function lkSaveRow(dir, nodeID, vpn, empty) {
+    var o = lkStore();
+    var key = nodeID + ":" + dir + ":" + vpn;
+    var e = o.edit[key] || { p: {}, list: "" };
+    var protocols = empty ? [] : Object.keys(e.p).filter(function (k) { return e.p[k]; });
+    api("PUT", "/api/leak/rows", {
+      node_id: nodeID, direction: dir, vpn: vpn, protocols: protocols, prefix_list: empty ? "" : e.list || ""
+    }).then(function (res) {
+      if (res && res.leak) lkSetDoc(res.leak);
+      delete o.edit[key];
+      o.note = { kind: "", text: res && res.removed
+        ? "node-" + nodeID + " 的 VPN " + vpn + " 规则已删除（这一行不再泄露任何东西）。"
+        : "node-" + nodeID + " 的 VPN " + vpn + " 规则已保存。这是草稿：到设备行点「发布到设备」才会生效。" };
+      blurContent();
+      render();
+      toast(res && res.removed ? "规则已删除" : "规则已保存");
+    }).catch(function (err) {
+      var j = lkErrJSON(err);
+      lkRowErr(key, (j && j.error) || err.message);
+      if (j && j.checks) lkRowErr(key, ((j && j.error) || err.message) + "（" + lkChecksText(j.checks) + "）");
+    });
+  }
+
+  function lkPublish(nodeID) {
+    var hb = (S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30;
+    if (!confirm("发布 node-" + nodeID + " 的当前草稿？\n\n设备在下一次心跳（≤" + hb +
+      " 秒）拉取并安装：FRR 配置按差量热更，不重启进程。")) return;
+    var o = lkStore();
+    api("POST", "/api/config/publish", { node_id: nodeID }).then(function (nv) {
+      o.note = { kind: "", text: "已发布 node-" + nodeID + " v" + ((nv && nv.published_version) || 0) +
+        "：设备在下一次心跳（≤" + hb + " 秒）拉取，结果以设备回报为准。" };
+      loadLeak(true);
+      toast("已发布");
+    }).catch(function (err) {
+      o.note = undErrNote(err);
+      blurContent();
+      render();
+    });
+  }
+
+  function lkDevRefresh() {
+    var o = lkStore();
+    var el = document.getElementById("lk-dev");
+    if (!el || !o.doc) return;
+    el.innerHTML = lkDevBody(o.dir, o.doc, o);
+  }
+
+  /* ---------------- actions（页面自己的委托，挂在每次重建都会换掉的 #lk-root 上） ---------------- */
+
+  function lkClick(ev) {
+    var el = ev.target.closest ? ev.target.closest("[data-lk]") : null;
+    if (!el) return;
+    var act = el.getAttribute("data-lk");
+    var o = lkStore();
+    var node = Number(el.getAttribute("data-node"));
+    var vpn = Number(el.getAttribute("data-vpn"));
+    if (act === "dev-toggle") {
+      o.open[String(node)] = !o.open[String(node)];
+      blurContent();
+      render();
+    } else if (act === "dev-publish") {
+      lkPublish(node);
+    } else if (act === "row-save") {
+      lkSaveRow(o.dir, node, vpn, false);
+    } else if (act === "row-del") {
+      if (confirm("删除 node-" + node + " 的 VPN " + vpn + " 规则？发布以后设备上对应的 K 路由/上报会消失。")) {
+        lkSaveRow(o.dir, node, vpn, true);
+      }
+    } else if (act === "lib-new") {
+      lkLibOpen(null);
+    } else if (act === "lib-edit") {
+      lkLibOpen(lkListOf(o.doc, el.getAttribute("data-id")));
+    } else if (act === "lib-cancel") {
+      o.lib = null;
+      blurContent();
+      render();
+    } else if (act === "lib-del") {
+      lkDeleteLib(el.getAttribute("data-id"), el.getAttribute("data-name"));
+    } else if (act === "lib-repub") {
+      lkRepublish(el.getAttribute("data-id"));
+    } else if (act === "repub-apply") {
+      lkRepublishApply();
+    } else if (act === "repub-close") {
+      o.repub = null;
+      blurContent();
+      render();
+    } else if (act === "batch-preview") {
+      lkBatchPreviewRun();
+    } else if (act === "batch-apply") {
+      lkBatchApply();
+    } else if (act === "batch-reset") {
+      o.batch = null;
+      o.note = null;
+      blurContent();
+      render();
+    }
+  }
+
+  function lkChange(ev) {
+    var el = ev.target;
+    if (!el || !el.getAttribute) return;
+    var o = lkStore();
+    var key = el.getAttribute("data-lk-key");
+    var p = el.getAttribute("data-lk-p");
+    if (p && key) {
+      if (!o.edit[key]) o.edit[key] = { p: {}, list: "" };
+      o.edit[key].p[p] = !!el.checked;
+      return;
+    }
+    if (el.getAttribute("data-lk-list") && key) {
+      if (!o.edit[key]) o.edit[key] = { p: {}, list: "" };
+      o.edit[key].list = el.value;
+      return;
+    }
+    if (el.closest && el.closest(".lk-batch")) lkBatchTouched();
+  }
+
+  function lkInput(ev) {
+    var el = ev.target;
+    if (!el || !el.getAttribute) return;
+    var o = lkStore();
+    if (el.getAttribute("data-lk-q") != null && el.id === "lk-q") {
+      o.filter = el.value;
+      lkDevRefresh();
+      return;
+    }
+    var lib = el.getAttribute("data-lk-lib");
+    if (lib && o.lib) {
+      if (lib === "name") o.lib.name = el.value;
+      else o.lib.text = el.value;
+      return;
+    }
+    if (el.closest && el.closest(".lk-batch")) lkBatchTouched();
+  }
+
+  function lkSubmit(ev) {
+    var form = ev.target;
+    if (!form || form.getAttribute("data-lk-form") !== "lib") return;
+    ev.preventDefault();
+    lkSaveLib(form);
+  }
+
+  function lkBatchTouched() {
+    var o = lkStore();
+    if (!o.batch || !o.batch.view) return;
+    o.batch.stale = true;
+    var b = document.querySelector('#lk-root [data-lk="batch-apply"]');
+    if (b) b.disabled = true;
+    var m = document.querySelector("#lk-root [data-lk-batch-stale]");
+    if (m) m.hidden = false;
+  }
+
   /* ---------------- actions ---------------- */
 
   // The 10s poll skips re-render while a form field has focus, so it cannot
@@ -5976,6 +6809,17 @@
     // string; this attaches the behaviour and paints the canvas from S.topo.
     if (S.view === "underlay-topology") undMapAttach();
 
+    // The leak pages replace only their inner containers on filter typing, so
+    // the handlers live on #lk-root: it is rebuilt by every full render (and
+    // therefore never accumulates listeners) but survives those inner swaps.
+    var lkRoot = $("lk-root");
+    if (lkRoot) {
+      lkRoot.addEventListener("click", lkClick);
+      lkRoot.addEventListener("change", lkChange);
+      lkRoot.addEventListener("input", lkInput);
+      lkRoot.addEventListener("submit", lkSubmit);
+    }
+
     document.querySelectorAll("#content [data-act]").forEach(function (el) {
       el.addEventListener("click", function () {
         var act = el.getAttribute("data-act");
@@ -6081,6 +6925,7 @@
           if (S.sites) S.sites.note = null;
           if (S.pa) S.pa.note = null;
           if (S.ov) S.ov.note = null;
+          if (S.lk) S.lk.note = null;
           blurContent();
           render();
         }
