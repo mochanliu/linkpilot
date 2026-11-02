@@ -342,6 +342,72 @@ func (e *exportState) touch(ctx context.Context, vrfs []uint32) (map[uint32]int,
 	return touched, nil
 }
 
+// linkSettle 把一次拆除（VRF 设备 + 挂在它下面的接口 + 地址）产生的连续事件
+// 合成一个窗口，避免对同一次变化重放好几遍。
+const linkSettle = 300 * time.Millisecond
+
+// watchLinkEvents 守住「zebra 丢 K 路由视图」这个实测坑：接口 down、删接口、
+// 删地址都会让 zebra 把自己 RIB 里的 K 路由整表清掉，内核里还在、sr-frr 也
+// 以为还注入着，redistribute kernel 于是静默停发，客户侧从此学不到远端前缀。
+// zebra 对重复 add 不发通知，只有 delete+add 能让它重新学到 —— 复用 touch。
+func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore) {
+	ch, err := krt.WatchLinks(ctx)
+	if err != nil {
+		log.Printf("sr-frr: 链路事件监听没开（接口一变更、zebra 可能丢 K 路由视图，只能等下一轮路由变化自愈）: %v", err)
+		return
+	}
+	for {
+		var evs []krt.LinkEvent
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			evs = append(evs, ev)
+		}
+		timer := time.NewTimer(linkSettle)
+	collect:
+		for {
+			select {
+			case ev, ok := <-ch:
+				if !ok {
+					break collect
+				}
+				evs = append(evs, ev)
+			case <-timer.C:
+				break collect
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			}
+		}
+		timer.Stop()
+		touched, terr := exp.touch(ctx, rt.snapshot().exportVRFs)
+		total := 0
+		for _, n := range touched {
+			total += n
+		}
+		if terr != nil {
+			log.Printf("sr-frr: 链路事件（%s）后重放 K 路由失败: %v", describeEvents(evs), terr)
+			continue
+		}
+		if total > 0 {
+			log.Printf("sr-frr: 链路事件（%s）后重放 %d 条 K 路由（zebra 会清掉自己的内核路由视图）",
+				describeEvents(evs), total)
+		}
+	}
+}
+
+func describeEvents(evs []krt.LinkEvent) string {
+	parts := make([]string, 0, len(evs))
+	for _, ev := range evs {
+		parts = append(parts, fmt.Sprintf("%s:%s", ev.Kind, ev.Name))
+	}
+	return strings.Join(parts, ",")
+}
+
 // importState is the read side's bookkeeping: connection, subscription
 // signature, and the numbers /status reports.
 type importState struct {
@@ -717,6 +783,8 @@ func main() {
 		time.Sleep(onceSettle)
 		return
 	}
+
+	go watchLinkEvents(ctx, exp, rt)
 
 	interval := time.Duration(cfg.PollSec) * time.Second
 	if len(initial.exportVRFs) > 0 {

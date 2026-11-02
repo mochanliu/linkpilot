@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -44,9 +45,12 @@ const (
 	rtaOif   = 4
 	rtaTable = 15
 
+	iflaIfname = 3
+
 	afInet = 2
 
-	ackTimeout = 5 * time.Second
+	ackTimeout  = 5 * time.Second
+	recvTimeout = 500 * time.Millisecond
 )
 
 // Client 是一条到内核的 NETLINK_ROUTE socket。请求串行化：一条 socket 上
@@ -78,6 +82,110 @@ func (c *Client) Close() error {
 	err := syscall.Close(c.fd)
 	c.fd = -1
 	return err
+}
+
+// WatchLinks 订阅链路/地址事件，只把「破坏性」的几种发到返回的 channel：
+// 接口删除、接口 down、地址删除。用一条独立 socket：请求/回执那条 socket 按
+// seq 对账，异步通知混进它的读循环会把回执认错。
+//
+// 为什么关心：lab 实测（2026-11-02）接口 down、删接口、删地址都会让 zebra 把
+// 自己 RIB 里的 K 路由**整表**清掉（内核里还在、redistribute kernel 却不再
+// 宣告），而 zebra 对重复 add 不发通知，只有 delete+add 能让它重新学到。
+func WatchLinks(ctx context.Context) (<-chan LinkEvent, error) {
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, syscall.NETLINK_ROUTE)
+	if err != nil {
+		return nil, fmt.Errorf("krt: 开链路监听 socket: %w", err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK, Groups: rtnlGroups()}); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("krt: bind 链路监听: %w", err)
+	}
+	tv := syscall.NsecToTimeval(recvTimeout.Nanoseconds())
+	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+
+	out := make(chan LinkEvent, 16)
+	go func() {
+		defer syscall.Close(fd)
+		defer close(out)
+		buf := make([]byte, 32*1024)
+		for ctx.Err() == nil {
+			n, _, err := syscall.Recvfrom(fd, buf, 0)
+			if err != nil {
+				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EINTR) {
+					continue
+				}
+				return
+			}
+			msgs, err := syscall.ParseNetlinkMessage(buf[:n])
+			if err != nil {
+				continue
+			}
+			for _, m := range msgs {
+				ev, ok := parseLinkEvent(m)
+				if !ok {
+					continue
+				}
+				select {
+				case out <- ev:
+				default: // 队列满说明已经有事件在等处理，多丢一个不误事
+				}
+			}
+		}
+	}()
+	return out, nil
+}
+
+// parseLinkEvent 从一条 netlink 消息里认出三种破坏性事件。NEWLINK 是
+// 「状态变化」：造一个 down 的接口也会来一条，但那种不触发 zebra 清表，
+// 多认一次只是多重放一遍 K 路由，代价可接受；漏认 down 的代价是导出静默停掉。
+func parseLinkEvent(m syscall.NetlinkMessage) (LinkEvent, bool) {
+	switch m.Header.Type {
+	case syscall.RTM_DELLINK:
+		return LinkEvent{Name: ifName(&m), Kind: LinkDeleted}, true
+	case syscall.RTM_NEWLINK:
+		if len(m.Data) < syscall.SizeofIfInfomsg {
+			return LinkEvent{}, false
+		}
+		flags := binary.NativeEndian.Uint32(m.Data[8:12])
+		if flags&syscall.IFF_UP != 0 {
+			return LinkEvent{}, false
+		}
+		return LinkEvent{Name: ifName(&m), Kind: LinkDown}, true
+	case syscall.RTM_DELADDR:
+		if len(m.Data) < syscall.SizeofIfAddrmsg {
+			return LinkEvent{}, false
+		}
+		idx := int(binary.NativeEndian.Uint32(m.Data[4:8]))
+		return LinkEvent{Name: ifaceName(idx), Kind: AddrDeleted}, true
+	}
+	return LinkEvent{}, false
+}
+
+// rtnlGroups：RTNLGRP_LINK = 1、RTNLGRP_IPV4_IFADDR = 5；Groups 是位图，
+// 组号 n 对应第 n-1 位。
+func rtnlGroups() uint32 {
+	return 1<<(1-1) | 1<<(5-1)
+}
+
+func ifaceName(index int) string {
+	ifi, err := net.InterfaceByIndex(index)
+	if err != nil {
+		return ""
+	}
+	return ifi.Name
+}
+
+func ifName(m *syscall.NetlinkMessage) string {
+	attrs, err := syscall.ParseNetlinkRouteAttr(m)
+	if err != nil {
+		return ""
+	}
+	for _, a := range attrs {
+		if a.Attr.Type == iflaIfname {
+			return strings.TrimRight(string(a.Value), "\x00")
+		}
+	}
+	return ""
 }
 
 // RouteAdd 只建不覆盖（NLM_F_CREATE|NLM_F_EXCL）：同前缀已经在表里就回

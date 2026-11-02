@@ -63,3 +63,16 @@ func ImportIndex(vpn uint8) (uint32, error) {
 	}
 	return uint32(i), nil
 }
+
+// LinkEvent 是内核里会让 zebra 清掉自己 K 路由视图的那几类事件（实测见
+// netlink_linux.go 的 WatchLinks）。Kind 只用于日志。
+type LinkEvent struct {
+	Name string
+	Kind string
+}
+
+const (
+	LinkDeleted = "del"
+	LinkDown    = "down"
+	AddrDeleted = "addr-del"
+)

@@ -29,4 +29,6 @@ func (c *Client) Owns(context.Context, frr.Route) (bool, error) { return false, 
 
 func (c *Client) LocalSubnets(uint32) map[netip.Prefix]bool { return nil }
 
+func WatchLinks(context.Context) (<-chan LinkEvent, error) { return nil, errUnsupported }
+
 var _ frr.DP = (*Client)(nil)
