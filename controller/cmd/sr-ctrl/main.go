@@ -79,7 +79,19 @@ type NodeRecord struct {
 	UDPMapping string `json:"udp_mapping"` // as OBSERVED BY THE REFLECTOR
 	LocalPort  int    `json:"local_port"`
 	Symmetric  bool   `json:"symmetric_nat"`
-	Reflector  string `json:"reflector"`
+	// SymmetricKnown is stored, not just checked on the way in: without it, a
+	// node that was never measured and a node measured as non-symmetric both
+	// read as Symmetric=false, and the second one is the only one a tunnel can
+	// be planned from. The console and the planner both have to tell them apart.
+	SymmetricKnown bool   `json:"symmetric_known,omitempty"`
+	Reflector      string `json:"reflector"`
+	// ProbeLocal is the source address the device's own probe socket used on the
+	// way to Reflector (see wire.MappingReport.ProbeLocal). It is stored apart
+	// from LocalAddrs because it is a measurement, not a declaration: LocalAddrs
+	// says which addresses this box owns, this says which of them the outer path
+	// actually went out through. That is the only pairing that survives a NAT --
+	// the observed public address belongs to nobody's interface table.
+	ProbeLocal string `json:"probe_local,omitempty"`
 	Reach      string `json:"reach"`
 	LastSeen   int64  `json:"last_seen_unix"`
 	EnrolledAt int64  `json:"enrolled_at_unix"`
@@ -688,6 +700,10 @@ type server struct {
 	nextSub  int
 	hbSec    int
 	tlsAddrs []string
+	// reflectors are the STUN endpoints advertised to agents (see serveStun). Set
+	// once at boot before any listener starts and never mutated, so handlers read
+	// it without the mutex. Empty = this controller runs no reflector service.
+	reflectors []string
 
 	caCert  *x509.Certificate
 	caKey   ed25519.PrivateKey
@@ -1139,6 +1155,11 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := s.enrollResponse(tenant, rec, certPEM, string(caPEM))
+	// The agent asked how many reflectors it can probe; hand it at most that
+	// many. An agent built without a probe socket sends 0 and gets an empty list,
+	// so it never reports "address discovery failed" for a service it has no
+	// client for.
+	resp.Reflectors = s.advertiseStun(req.UDPRelfectorN)
 	if pa != nil {
 		// The echo is the agent's proof that the configuration it asked for is
 		// the one attached to this identity.
@@ -1305,6 +1326,12 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		BindingErr:    bindingErr,
 		ConfigVersion: s.desiredConfigVersionLocked(tenant, nodeID),
 		TunnelVersion: s.underlayVersionLocked(tenant),
+		// Every beat, not just enrollment: a restarted agent already has an
+		// identity and so never asks again, and a controller that started its
+		// reflector after this device enrolled must still reach it. The heartbeat
+		// carries no reflector offer, so the full list goes out and the agent
+		// applies its own cap.
+		Reflectors: s.advertiseStun(-1),
 	})
 }
 
@@ -1336,12 +1363,16 @@ func (s *server) handleMapping(w http.ResponseWriter, r *http.Request) {
 		rec.MappingAt = time.Now().Unix()
 	}
 	rec.LocalPort = rep.LocalPort
+	rec.ProbeLocal = rep.ProbeLocal
 	// A verdict is only stored when the reporter says it measured one. An agent
 	// that has not run the two-reflector comparison sends the zero value, and
 	// recording that as "not symmetric" would let the planner build a tunnel
 	// that cannot work.
+	rec.SymmetricKnown = rep.SymmetricKnown
 	if rep.SymmetricKnown {
 		rec.Symmetric = rep.SymmetricNAT
+	} else {
+		rec.Symmetric = false
 	}
 	rec.Reflector = rep.Reflector
 	rec.LastSeen = time.Now().Unix()
@@ -2169,6 +2200,11 @@ func main() {
 		// showing the last good window -- the wrong answer here is a dead tunnel
 		// that still looks healthy.
 		metricsTTL = flag.Int("metrics-ttl", 30, "seconds a telemetry window stays readable after its last report")
+		// The built-in STUN reflector, for devices that must learn their own outer
+		// address to be reachable at all. Off unless named, and each entry is
+		// bound AND advertised verbatim -- see parseStunAddrs for why the host
+		// part can never be left out.
+		stunAddrs = flag.String("stun", "", "comma-separated ip:port UDP addresses to answer STUN on (empty disables address discovery; two entries are what makes the symmetric-NAT verdict measurable)")
 	)
 
 	flag.Parse()
@@ -2200,12 +2236,31 @@ func main() {
 		log.Fatal(err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// The reflector binds before the listeners open, so a port already in use is
+	// a boot failure with the port named -- not a device population that silently
+	// grows without outer addresses.
+	var reflectors []string
+	if strings.TrimSpace(*stunAddrs) != "" {
+		binds, err := parseStunAddrs(*stunAddrs)
+		if err != nil {
+			log.Fatal(err)
+		}
+		refs, err := serveStun(ctx, binds, log.Printf)
+		if err != nil {
+			log.Fatal(err)
+		}
+		reflectors = refs
+	}
+
 	s := &server{
 		state:      st,
 		store:      store,
 		subs:       map[int]*subscriber{},
 		hbSec:      *hbSec,
 		tlsAddrs:   []string{*listen},
+		reflectors: reflectors,
 		caCert:     ca,
 		caKey:      caKey,
 		dataDir:    *dataDir,
@@ -2216,7 +2271,6 @@ func main() {
 		adminToken: *adminTokenF,
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
 	go s.ttlSweeper(ctx)
 
 	mux := http.NewServeMux()

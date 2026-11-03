@@ -17,15 +17,20 @@ import (
 // because "the controller configured it" and "this box runs it" are exactly the
 // two facts a console must not conflate.
 //
-// Empty values are deliberate where the agent has no measurement: this binary
-// has no reflector client, so it cannot say what a third party saw
-// (UDPMapping/Reflector stay empty and SymmetricKnown stays false). Sending the
-// zero value is only honest because that flag says "not measured".
+// Empty values are deliberate where the agent has no measurement: an address
+// is only reported when a reflector actually answered for it and the verdict is
+// still fresh (see agent.StunSync), so UDPMapping/Reflector/ProbeLocal stay
+// empty and SymmetricKnown stays false until that happens. Sending the zero
+// value is honest only because that flag says "not measured".
 type reportSender struct {
 	client *agent.Client
 	id     *agent.Identity
 	tun    *agent.TunnelSync // nil: this agent has no tunnel applier
-	logf   func(string, ...any)
+	// stun is nil only when the binary was started with --stun-reflectors 0: no
+	// probe socket, so no third-party observation of this box is available and
+	// the mapping report carries the binding and the declared addresses alone.
+	stun *agent.StunSync
+	logf func(string, ...any)
 
 	lastErr string // the last warning, so an unchanged failure is not repeated
 }
@@ -48,6 +53,9 @@ func (r *reportSender) reportMapping(ctx context.Context, ifaces *[]wire.IfaceIn
 		Binding:    &b,
 		LocalAddrs: localAddrs(ifaces),
 	}
+	// The observation half comes from the probe loop, and only while it is fresh:
+	// this is the one field in the report the device cannot assert for itself.
+	r.stun.Apply(&req)
 	// A tunnel table is declared only when a tunnel applier exists: nil means
 	// "not reported" (keep what the registry has), while an empty list means
 	// "I run no tunnels" and clears the next hops peers resolve routes against.
@@ -65,6 +73,14 @@ func (r *reportSender) reportMapping(ctx context.Context, ifaces *[]wire.IfaceIn
 		// "tunnel is up, no traffic". That must be loud, not swallowed.
 		r.warnf("控制器没接受本机的密钥担保: %s", ack.BindingErr)
 		return
+	}
+	if req.UDPMapping == "" {
+		// A failed probe is not a failed report, but it is the only sentence that
+		// explains why the console still says 未上报 for this box's outer address.
+		if why := r.stun.Snapshot().Err; why != "" {
+			r.warnf("地址探测没有结果（本机外层地址将保持未上报）: %s", why)
+			return
+		}
 	}
 	r.lastErr = ""
 }

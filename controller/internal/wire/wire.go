@@ -59,12 +59,18 @@ const ProtocolVersion = 3
 // both are known. Trying to squeeze it in here would mean signing a message
 // containing values the signer had not been told yet.
 type EnrollRequest struct {
-	Serial        string `json:"serial"`
-	ClaimCode     string `json:"claim_code"`
-	PublicKey     string `json:"public_key"` // base64(ed25519 public key)
-	ProtocolVer   int    `json:"protocol_ver"`
-	AgentVersion  string `json:"agent_version"`
-	UDPRelfectorN int    `json:"udp_reflectors"` // how many reflector addrs the agent can probe
+	Serial       string `json:"serial"`
+	ClaimCode    string `json:"claim_code"`
+	PublicKey    string `json:"public_key"` // base64(ed25519 public key)
+	ProtocolVer  int    `json:"protocol_ver"`
+	AgentVersion string `json:"agent_version"`
+	// UDPRelfectorN is the agent's offer, not a request: it says how many
+	// reflector addresses this device can actually probe (0 when the binary has
+	// no probe socket at all). The controller answers with however many it runs,
+	// capped at this number -- a symmetric-NAT verdict needs two DISTINCT
+	// destinations, and a device that can only send one probe must not be told to
+	// compare two.
+	UDPRelfectorN int `json:"udp_reflectors"`
 	// PreAuth is the index of a 预授权 record the tenant created in advance --
 	// today its name, typed by whoever is standing at the rack. Optional: an
 	// empty value is an ordinary enrollment. It is NOT a protocol-version change
@@ -87,9 +93,16 @@ type RRAddress struct {
 // Enrollment does exactly one thing: it binds this device to the tenant the
 // claim code belongs to and issues the certificate that proves the binding.
 // Everything else the device will eventually run with -- function ports,
-// overlay MTU, hop-MAC key ring, reflector list, RR neighbours, tunnels -- is
-// the tenant's configuration, and it reaches the device only after the
-// customer configures that device in the console (the node-plan contract).
+// overlay MTU, hop-MAC key ring, RR neighbours, tunnels -- is the tenant's
+// configuration, and it reaches the device only after the customer configures
+// that device in the console (the node-plan contract).
+//
+// The reflector list is the deliberate exception, and it is an exception
+// because of WHEN it is needed, not what it is: address discovery is what makes
+// a device reachable at all, so a device that has enrolled and not yet been
+// configured must still be able to ask. It is therefore the controller's own
+// observation service (like TLSAddrs below), carries no tenant configuration,
+// and is empty when the controller runs no reflectors.
 //
 // The split is not cosmetic. When enrollment also pushed configuration, a
 // device that had merely been associated with a tenant was already running a
@@ -108,6 +121,11 @@ type EnrollResponse struct {
 	TLSAddrs     []string `json:"tls_addrs"`
 	HeartbeatSec int      `json:"heartbeat_sec"`
 	Epoch        uint32   `json:"epoch"` // controller-assigned; devices never compute this themselves
+	// Reflectors are the STUN endpoints ("ip:port") this device should probe to
+	// learn its outer address. Empty = the controller runs no reflector service,
+	// which is a real deployment (a lab, or a customer with public-address CPEs),
+	// and the agent then reports no mapping rather than guessing an address.
+	Reflectors []string `json:"reflectors,omitempty"`
 
 	// PreAuthName echoes the 预授权 index this enrollment bound, if any. It exists
 	// so the agent can prove the hand-over happened: an agent that asked for an
@@ -381,9 +399,19 @@ type MappingReport struct {
 	// value. An agent that has not run the two-reflector comparison cannot tell,
 	// and reporting false would let the planner build a tunnel that cannot work.
 	// The controller only records the verdict when this is true.
-	SymmetricKnown bool                `json:"symmetric_known,omitempty"`
-	Reflector      string              `json:"reflector_addr"` // which reflector produced this mapping
-	Binding        *keybinding.Binding `json:"key_binding,omitempty"`
+	SymmetricKnown bool   `json:"symmetric_known,omitempty"`
+	Reflector      string `json:"reflector_addr"` // which reflector produced this mapping
+	// ProbeLocal is the LOCAL source address ("ip:port") the probe socket used
+	// toward Reflector, read from the kernel's own route decision (it is not a
+	// claim, and it is not in the STUN报文 anywhere). It exists because behind
+	// NAT the observed address is nobody's interface: the only address on this
+	// box that can be matched against the interface inventory -- the only way to
+	// learn WHICH port the tunnel must leave from -- is the one the kernel chose
+	// on the way out. Empty means "no probe ran"; a value that matches no
+	// reported interface is a contradiction the planner must refuse, not smooth
+	// over: it means the probe left through a path the dataplane does not own.
+	ProbeLocal string              `json:"probe_local,omitempty"`
+	Binding    *keybinding.Binding `json:"key_binding,omitempty"`
 
 	// VpnPort / TransitPort are what this node's dataplane REALLY listens on,
 	// which is not necessarily what enrollment pushed: a node that could not
@@ -641,6 +669,12 @@ type HeartbeatResponse struct {
 	// no underlay configuration exists yet (nothing published, no tunnels). The
 	// device pulls /v1/underlay/bundle when this differs from what it runs.
 	TunnelVersion int `json:"tunnel_version,omitempty"`
+	// Reflectors re-advertises the STUN endpoints on every beat, not just at
+	// enrollment: a device that enrolled before the operator started the
+	// reflector service, or a restarted agent that has an identity and so never
+	// enrolls again, must still find out. The agent keeps one probe socket for
+	// its lifetime, so a changed list is re-probed rather than appended to.
+	Reflectors []string `json:"reflectors,omitempty"`
 }
 
 // ------------------------------------------------------------------ rendezvous

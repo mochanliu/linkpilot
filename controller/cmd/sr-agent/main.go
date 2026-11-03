@@ -13,6 +13,12 @@
 // the device is the only place that knows which ports it has. It is a reading
 // of VPP's interface table, never a write, so it stays on this side of the
 // "agent does not configure the dataplane" line.
+//
+// Address discovery lives here too, and it is on this same side of that line:
+// the STUN probe is a kernel UDP socket that writes nothing to VPP. It belongs
+// to the agent because the fact being measured is "where does a third party see
+// THIS box", which the controller cannot observe by itself and the dataplane has
+// no reason to answer for.
 package main
 
 import (
@@ -76,11 +82,25 @@ func main() {
 		// read-only inventory above: an operator who gave this agent the socket
 		// to report interfaces did not thereby hand over the dataplane.
 		tunnels = flag.Bool("tunnels", false, "install the controller's tunnel section into VPP (needs -vpp-api)")
+
+		// Address discovery runs on a KERNEL socket, so it needs neither root nor
+		// the dataplane. The device does not learn the reflector addresses from
+		// here -- the controller advertises them (see agent.StunSync) -- and this
+		// number only says how many of them this process is willing to probe.
+		// Two is the minimum that can produce a symmetric-NAT verdict, which is
+		// why it is the default; 0 switches discovery off.
+		stunN    = flag.Int("stun-reflectors", 2, "how many reflector addresses the controller may hand this agent to probe (0 disables address discovery)")
+		stunBind = flag.String("stun-bind", ":0", "local UDP source for the STUN probes (\"ip:port\" to pin the egress address and port)")
 	)
 	flag.Parse()
 
 	if *tunnels && strings.TrimSpace(*vppAPI) == "" {
 		log.Fatal("--tunnels needs --vpp-api: the applier works through VPP's api socket")
+	}
+	if *stunN < 0 {
+		// Negative is not "off": the cap would silently pass a nonsense number to
+		// the controller, so say what the flag means instead of guessing.
+		log.Fatalf("--stun-reflectors must be 0 (no discovery) or more, got %d", *stunN)
 	}
 
 	if strings.TrimSpace(*ctrl) == "" {
@@ -107,6 +127,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Address discovery. Off with --stun-reflectors 0, and quiet until the
+	// controller names a reflector: an agent that was never given an address to
+	// probe reports no observation rather than a failure, because "nobody told me
+	// where to look" is not this device's fault and must not read as one.
+	ss := agent.NewStunSync(*stunBind, *stunN, log.Printf)
+	defer ss.Close()
+
 	hbSec := 5
 	if !id.Enrolled() {
 		if *claim == "" {
@@ -116,10 +143,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("pinned CA: %v", err)
 		}
-		// Zero reflectors requested: the agent has no dataplane to send probes
-		// from, so asking the controller to pick reflectors would be asking for a
-		// fact it cannot use.
-		req := id.EnrollRequest(*claim, agentVersion, 0, *preAuth)
+		// The reflector count is this agent's own limit, not a request for a
+		// service: it says how many addresses the controller may hand back for
+		// this device to probe. Two is the floor for a symmetric-NAT verdict.
+		req := id.EnrollRequest(*claim, agentVersion, *stunN, *preAuth)
 		ectx, ecancel := context.WithTimeout(ctx, 20*time.Second)
 		resp, err := agent.Enroll(ectx, base, roots, req)
 		ecancel()
@@ -133,6 +160,7 @@ func main() {
 			hbSec = resp.HeartbeatSec
 		}
 		log.Printf("enrolled: tenant=%s node=%d serial=%s epoch=%d", resp.TenantID, resp.NodeID, idSerial, resp.Epoch)
+		ss.SetReflectors(resp.Reflectors)
 		// 预授权 hand-over is only finished when the controller says so. An agent
 		// that asked for an index and got an empty echo did NOT get the config
 		// waiting behind it -- and from a rack, that is otherwise invisible.
@@ -199,7 +227,14 @@ func main() {
 		log.Printf("tunnel applier on (vpp api %s)", *vppAPI)
 	}
 	st.setChannels(tun, *vppAPI != "")
-	reporter := &reportSender{client: client, id: id, tun: tun, logf: log.Printf}
+	st.setStun(ss)
+	reporter := &reportSender{client: client, id: id, tun: tun, stun: ss, logf: log.Printf}
+	// Address discovery runs on its own beat, not the heartbeat's: a round is two
+	// reflectors times two tries, and a device must never miss a beat because it is
+	// waiting for a third party to answer.
+	if *stunN > 0 {
+		go ss.Loop(ctx, 2*time.Second)
+	}
 	// 隧道内遥测有自己的节拍，不挂在心跳上：每次 Sample 报的是"上一次采样以来的
 	// 增量"，心跳退避到 30s 时窗口会被拉长，抖动/丢包就糊掉了。
 	if tun != nil {
@@ -264,7 +299,16 @@ func main() {
 			}
 		}
 		// Reported AFTER applying, so the tunnel table the controller stores is
-		// what the dataplane really has, not what the bundle asked for.
+		// what the dataplane really has, not what the bundle asked for. -once has
+		// no probe loop running, so discovery takes its one round here: a printed
+		// status without a mapping must mean "the reflector did not answer" (the
+		// reason is in the stun section), not "we exited before asking".
+		if *stunN > 0 {
+			ss.SetReflectors(resp.Reflectors)
+			sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
+			ss.Sync(sctx)
+			scancel()
+		}
 		reporter.send(ctx, req.Ifaces)
 		b, _ := json.MarshalIndent(st.snapshot(), "", "  ")
 		fmt.Println(string(b))
@@ -302,6 +346,10 @@ func main() {
 		} else {
 			st.markOK(resp)
 			backoff = 0
+			// The controller may start its reflector service after this box already
+			// enrolled, and a restarted agent never enrolls again -- so the list
+			// rides every ack, and a changed list makes the loop take a new round.
+			ss.SetReflectors(resp.Reflectors)
 			if resp.BindingErr != "" {
 				log.Printf("controller rejected a key binding: %s", resp.BindingErr)
 			}
@@ -460,6 +508,9 @@ type agentStatus struct {
 	// binary has no dataplane at all" must not report the same thing.
 	tun       *agent.TunnelSync
 	hasVPPAPI bool
+	// stun is the discovery loop. It guards its own state, so the snapshot below
+	// reads it through its own accessor rather than copying it under s.mu.
+	stun *agent.StunSync
 
 	hbInterval int
 	Heartbeats int64  `json:"heartbeats"`
@@ -490,6 +541,11 @@ type statusView struct {
 	// no dataplane (no -vpp-api); capable:false = the channel exists but
 	// -tunnels is off.
 	Tunnel *wire.TunnelState `json:"tunnel"`
+	// Stun is what this box's own probes measured: the reflectors the controller
+	// advertised, the outer address they saw, the local source the probe left
+	// from, and the symmetric verdict when there were two reflectors to compare.
+	// An empty mapping means nobody answered -- it is not "no outer address".
+	Stun agent.StunSnapshot `json:"stun"`
 }
 
 func (s *agentStatus) snapshot() statusView {
@@ -504,6 +560,10 @@ func (s *agentStatus) snapshot() statusView {
 		DataPlane: s.dataPlaneDesc(),
 		Tunnel:    s.tunnelReportLocked(),
 	}
+	// StunSync guards its own state, and it never calls back into agentStatus, so
+	// reading it under s.mu has a fixed lock order. Taking its lock out here would
+	// let a heartbeat write race the page it is meant to describe.
+	v.Stun = s.stun.Snapshot()
 	if s.cfg != nil {
 		cur := s.cfg.State()
 		v.Config = &cur
@@ -555,6 +615,12 @@ func (s *agentStatus) setChannels(tun *agent.TunnelSync, hasVPPAPI bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tun, s.hasVPPAPI = tun, hasVPPAPI
+}
+
+func (s *agentStatus) setStun(ss *agent.StunSync) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stun = ss
 }
 
 func (s *agentStatus) setConfig(cfg *configSync) {

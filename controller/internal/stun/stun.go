@@ -1,8 +1,12 @@
-// Package stun -- RFC 5389 Binding Request 的编解码（零依赖）。
+// Package stun -- RFC 5389 Binding Request/Success 的编解码 + 收发（零依赖）。
 //
-// 只有报文格式，没有发送/收包路径：探针从哪个 socket 出、回包从哪里读，
-// 属于数据面接缝，尚未定案（当前唯一能跑通的探针是 cmd/sr-stunprobe，
-// 它走内核 socket，只能验证协议本身）。
+// 三块：报文格式（本文件）、应答器 reflector.go（控制器侧，内核 UDP）、
+// 探测客户端 client.go（盒子侧，一个复用的内核 UDP socket + 对称 NAT 判定）。
+//
+// 2026-11-03 定案：地址发现走内核 socket，不在 VPP 数据面里做反射器或探针。
+// 代价是"探针的源"和"隧道的源"必须自己证明是同一条路 —— 所以 Mapping 里
+// Local（本地源）和 Addr（观测到的外层源）是两个都必须上报的字段，控制器拿
+// Local 去对数据面接口清单，对不上就不许用这条观测建隧道。
 //
 // 移植自 develop 的 src/control/internal/dpdiscover（同一份报文代码，
 // 删掉了依赖 dp.Client 的 Role/Both 循环）。

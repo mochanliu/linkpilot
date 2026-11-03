@@ -46,11 +46,15 @@ SR Header 位于 WG 加密载荷之外（明文），保证中转节点可路由
 职责 = CPE 安全入网 + NAT 地址发现 + 隧道参数下发，协议是 JSON over mTLS：
 
 - **cmd/sr-ctrl/**：控制器。自建 CA → claim code 入网签发设备证书 → 注册表 + watch 推送。
-- **cmd/sr-stunprobe/**：内核 socket 的 RFC 5389 探针，只用于验证协议与 reflector，
-  **不代表数据面 socket 的映射**。
+- **cmd/sr-stunprobe/**：手工探针，复用 `internal/stun` 的那个 `Prober`（和设备里跑的是
+  同一份代码），所以它除了验证协议与 reflector，也当场打印 `local=`（这条 socket 的
+  本地源）。**不代表数据面 socket 的映射**：探针从内核出去，不碰 VPP。
 - **internal/wire/**：控制面协议类型的唯一来源（服务端与 agent 共用，字段不可能两侧漂移）。
 - **internal/keybinding/**：Ed25519 设备身份 + "这把 X25519 公钥是我的"的签名接缝。
-- **internal/stun/**：RFC 5389 Binding Request/Success 编解码，不含收发路径。
+- **internal/stun/**：RFC 5389 编解码 + 内核 UDP 的收发两端 —— `reflector.go`（控制器侧
+  应答器）与 `client.go`（设备侧 `Prober`：一条复用的 socket、逐目的地探测、给对称 NAT
+  判定）。`Mapping` 里 `Addr`（反射器看到的我）和 `Local`（内核给这条 socket 选的本地源）
+  两个都必须上报：前者是"对端该拨哪儿"，后者才是"我从哪个口出去"。
 - **test/scripts/test-vbond.sh**：acceptance harness（复用数据面实验室的 `docker_net_ctrl`）。
 - **test/scripts/vbond-client.sh**：openssl+curl 的手工客户端，不依赖 agent。
 

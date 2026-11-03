@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	"sdwan/controller/internal/agent"
+	"sdwan/controller/internal/stun"
 	"sdwan/controller/internal/wire"
 )
 
@@ -86,4 +88,79 @@ func TestReportSenderWithoutDataPlaneDoesNotPanic(t *testing.T) {
 	r := &reportSender{}
 	r.send(context.Background(), nil)
 	r.reportObservations(context.Background(), nil)
+}
+
+// 状态页上的三种状态必须分得开：控制器没给反射器、给了但这一台没探到、探到了。
+// 这正是控制台"未上报"的出处 —— AGENTS.md 第 2 条不许显示 0 或占位值，靠的就是
+// 这里三个字段各自为空/非空的组合。
+func TestStatusSeparatesUnadvertisedFromUnprobed(t *testing.T) {
+	st := &agentStatus{}
+	none := st.snapshot().Stun
+	if len(none.Reflectors) != 0 || none.Mapping != "" || none.Err != "" {
+		t.Errorf("没开探测时状态页却有内容：%+v", none)
+	}
+
+	ref := startTestReflector(t)
+	okSync := agent.NewStunSync("127.0.0.1:0", 2, nil)
+	defer okSync.Close()
+	st.setStun(okSync)
+	okSync.SetReflectors([]string{ref})
+	okSync.Sync(context.Background())
+	got := st.snapshot().Stun
+	if got.Mapping == "" || got.ProbeLocal == "" || len(got.Reflectors) != 1 {
+		t.Errorf("探到了却没写进状态页：%+v", got)
+	}
+	if got.Err != "" || got.AgeSec < 0 {
+		t.Errorf("成功的一轮里带了错误：%+v", got)
+	}
+
+	// 探不到的一台：只能有原因，不许有地址。页面据此写"未上报（附原因）"。
+	bad := agent.NewStunSync("256.256.256.256:0", 1, nil)
+	defer bad.Close()
+	st.setStun(bad)
+	bad.SetReflectors([]string{ref})
+	bad.Sync(context.Background())
+	b := st.snapshot().Stun
+	if b.Mapping != "" || b.ProbeLocal != "" {
+		t.Errorf("探测失败却还留着地址：%+v", b)
+	}
+	if b.Err == "" {
+		t.Errorf("探测失败却没留下原因：%+v（页面会显示成一切正常）", b)
+	}
+}
+
+// startTestReflector 起一个只用来回答的内核 UDP 反射器，返回它的地址。
+// 测试要的是"有人应答"这件事，所以不复用产品的 Reflector：那样一旦反射器自己
+// 坏了，这条测试就分不清是设备的错还是应答器的错。
+func startTestReflector(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("起反射器：%v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if !stun.IsBindingRequest(buf[:n]) {
+				continue
+			}
+			udp, ok := from.(*net.UDPAddr)
+			if !ok || udp.IP.To4() == nil {
+				continue
+			}
+			tx := make([]byte, 12)
+			copy(tx, buf[8:20])
+			resp, err := stun.Response(tx, udp.IP.To4().String(), udp.Port)
+			if err != nil {
+				continue
+			}
+			_, _ = conn.WriteTo(resp, from)
+		}
+	}()
+	return conn.LocalAddr().String()
 }
