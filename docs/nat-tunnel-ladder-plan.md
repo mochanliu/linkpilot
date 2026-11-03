@@ -186,7 +186,9 @@
 
 ## 9. D-3：两台 CPE 之间多条隧道，代码里还不支持的地方（2026-11-03 全量审计）
 
-背景是产品要求（每台盒子目标 3000 条隧道、软件层 4096；8 个颜色 ⇒ 同对端最多 8 条）。
+背景是产品要求（每台盒子目标 3000 条隧道、软件层 4096）。**同两台设备之间的隧道上限是 8 条，
+颜色可以重复**——8 条全是颜色 0、或全是颜色 1 都合法（用户 2026-11-03 更正：他从未要求
+"同对端的隧道颜色互不相同"，之前把它推成"8 个颜色 ⇒ 8 条"并要求判据带颜色，是我的擅自设定）。
 下面每一条都我自己读到过那一行，不是转述。**修它们一律用新搭的一次性私有环境**（用户
 2026-11-03 规则：修缺陷期间不许动现有 lab），改完再由我按最新代码重搭 lab。
 
@@ -195,16 +197,26 @@
 1. **控制器上游门禁**：[internal/underlay/tunnel.go:100-103](../controller/internal/underlay/tunnel.go)
    在 `create()` 最前面按**无序设备对**查 `pairTunnel`（[:313-326](../controller/internal/underlay/tunnel.go)），
    命中就回 `ErrPairTaken`（[state.go:20-24](../controller/internal/underlay/state.go)，API 层转 409）。
-   判据里没有颜色。错误文案自己把原因说清了：「每台设备只有一把 WireGuard 静态密钥，
-   VPP 的 peer 表按公钥跨接口去重，第二条会被数据面以 -116 拒掉」。
-2. **根因：一条设备一把 WG keypair**。私钥只有一把
+   判据只认设备对。错误文案自己把原因说清了：「每台设备只有一把 WireGuard 静态密钥，
+   VPP 的 peer 表按公钥跨接口去重，第二条会被数据面以 -116 拒掉」——**这句要改**：
+   "peer 表按公钥跨接口去重"是 VPP 插件的实现，不是 WireGuard 协议的限制（见本条第 13 项）。
+2. **根因：一条设备一把 WG keypair，撞上 VPP 插件的全局 peer 池**。私钥只有一把
    （[internal/agent/identity.go:177-192](../controller/internal/agent/identity.go)），
    对账时 `priv := t.id.WGPrivateKey()` 一次取出、传给**每一条** Link
    （[internal/agent/tunnel.go:422](../controller/internal/agent/tunnel.go) → `PrivateKey: priv` :612）。
-   于是同一对端的第二条隧道要装**同一把对端公钥**，撞上 VPP 跨接口去重：
-   [internal/agent/dataplane.go:1094-1112](../controller/internal/agent/dataplane.go) 那段 -116 分支
-   就是这个（注释写"真机实测"）。
-   ⇒ 这条不是"放宽判据"能绕开的。要做的是**每隧道一把 keypair**，牵连三处：
+   于是同一对端的第二条隧道要装**同一把对端公钥**，撞上 -116：
+   [internal/agent/dataplane.go:1094-1112](../controller/internal/agent/dataplane.go) 那段分支就是这个。
+   挡路的代码在上游 VPP 26.06 里，逐行是：`src/plugins/wireguard/wireguard_peer.c` 的
+   `wg_peer_add()` 在装 peer 之前 `pool_foreach (peer, wg_peer_pool)` **只比 `peer->remote.r_public`**
+   （不比 `peer->wg_sw_if_index`），命中就 `return VNET_API_ERROR_ENTRY_ALREADY_EXISTS`（=-116）——
+   `wg_peer_pool` 是**全插件一个池**，所以"跨接口去重"是它的实现事实。
+   这条不是随手加的校验，收包侧确实依赖它：同文件上方 `wg_remote_get()`（`wireguard_if.c`）
+   是握手 initiation 到达时"这个发送者是谁"的唯一入口，它 `wg_peer_walk` 遍历**全局池**、
+   只按对端公钥匹配，**报文从哪张接口进来不参与判断**；两张口共用一把对端公钥时，
+   应答会被挂到池里先命中的那条 peer 上（peer 记录里的 `wg_sw_if_index` 只有一个）。
+   ⇒ 结论：**在 VPP 上做同对端多条隧道，必须每隧道一把 keypair**（第 13 项 Q2 实测 0/0），
+   或者改 VPP 插件把 peer 查找按接口收口（分叉上游代码 + 每台盒子重编 VPP）。
+   走前一条的话，牵连三处：
    设备身份要持有多把（identity 现在只存一把）、
    密钥担保的主语要扩（[internal/keybinding/binding.go:115-195](../controller/internal/keybinding/binding.go)
    的 `Message/Verify` 只签 `(tenant, node_id, key_gen, x25519_pub)`，没有隧道维度）、
@@ -214,7 +226,7 @@
    同样只比设备对（[:311-321](../controller/internal/underlay/plan.go)）；
    `Fan` 一批一个颜色、每个对端一条（[:41-96](../controller/internal/underlay/fan.go)，
    单条 create 被拒就变成一条 `FanSkip`）。
-   症状比硬错更难查：full-mesh / hub-spoke 永远补不出第 2..8 色，拓扑上留下没人解释的洞。
+   症状比硬错更难查：full-mesh / hub-spoke 永远补不出同对端的第 2..8 条，拓扑上留下没人解释的洞。
 
 13. **2026-11-03 实测：把"端口是主键"和"peer 表按公钥去重"这两件事分清**。
     上面第 2 条把根因写成"VPP 的 peer 表按公钥跨接口去重（真机实测 -116）"，这条断言和
@@ -235,17 +247,44 @@
 
     三条结论，逐条对上层的意义：
     - **-116 与本地私钥无关**：Q1 的两张口本来就各用自己的私钥，仍然 -116。
-      挡路的是 VPP 的 peer 表以**对端公钥**为键且键里不含接口，所以第 2 条的归因成立、
-      "改成本地私钥不同就能救"是不成立的。
+      挡路的是 VPP 的 peer 表以**对端公钥**为键且键里不含接口，所以"换成本地私钥不同就能救"
+      是不成立的。
     - **"端口做主键"在 VPP 的配置面完全不设防**：Q4 连"同私钥同端口"都收，说明 VPP
       既不按公钥也不按端口给 WG 设备去重。所以"每隧道每端口唯一"这条不变式**只有我们的
       分配器在守**（`allocPort`，[state.go:296-339](../controller/internal/underlay/state.go)），
       放开门禁不会撞上 VPP 的端口检查，但也不会得到 VPP 的任何保护。
-    - **M-2 是 M-3 的前置，方向不变**：只放宽 pair 门禁（M-3）而不给每条隧道一把对端
-      keypair，盒子侧第二次 `wireguard_peer_add` 仍回 -116 —— 那是把控制器里的硬错换成
-      "控制器说已下发、agent 装不上"的静默失败。Q2 的 0 是 M-2 值得做的直接证据；
-      它证明的是**配置面收得下**，两条隧道各自跑通的**数据面**判据要在 M-2 实施时另测
-      （握手互不串台、BFD/探针各自成会话），不能拿这张表当已验。
+    - **只放宽 pair 门禁而不给每条隧道一把对端 keypair，盒子侧第二次 `wireguard_peer_add`
+      仍回 -116** —— 那是把控制器里的硬错换成"控制器说已下发、agent 装不上"的静默失败。
+      Q2 的 0/0 是每隧道一把 keypair 值得做的直接证据；它证明的是**配置面收得下**，
+      两条隧道各自跑通的**数据面**判据要在实施时另测（握手互不串台、BFD/探针各自成会话），
+      不能拿这张表当已验。
+
+14. **2026-11-03 补测：内核 WireGuard 侧，用户的判断成立**（我原先把 VPP 的实现说成了
+    WireGuard 的限制，那是我说错了）。同一台 `mtn-node1`（LinuxKit 内核 7.0.14，
+    内核自带 wireguard 模块；容器里的 iproute2 不认 wireguard 参数，改装
+    `wireguard-tools v1.0.20210914` 后测），号段 51977–51980、endpoint 一律 TEST-NET：
+
+    | 问的是 | 形状 | 内核回的值 |
+    |---|---|---|
+    | K1 用户的原话形状 | 三张接口**各一把本地私钥**，装**同一把对端公钥**、各挂不同 endpoint | 三张**全收**，`wg show <if> peers` 每张都列出同一把公钥 |
+    | K3 同接口重复 | 同一张接口再把同一把公钥 add 一次（换 endpoint） | **收**（内核把 peer 表挂在接口上，这就是"更新 endpoint"那条路径） |
+    | K6 本地私钥跨接口共用 | `wgA(priv1,51977)` 与 `wgD(priv1,51980)` | **两张都建成**，内核不拦 |
+
+    ⇒ "多台隧道共用一套公私钥、靠监听端口区分"在**内核 WireGuard 上是原生支持的**：
+    peer 表是**按接口各自的**，本端接口由 UDP 目的端口选中，公钥只在"同一张接口内部"当键。
+    VPP 26.06 的插件不是这个形状：一个全局 `wg_peer_pool` + 全局 `index_table`，
+    握手 initiation 靠 `wg_remote_get()` 遍历全局池按公钥命中（见第 2 条），
+    报文从哪张口进来不参与判断。**所以 -116 是 VPP 的实现约束，不是协议约束。**
+    两条可走的路，代价差得很远，要拍一条：
+    - **甲：每隧道一把 keypair**（M-2）。不动 VPP，代价是设备身份从一把扩到多把、
+      密钥担保主语加隧道维度、轮换与开机重放跟着改。
+    - **乙：分叉 VPP 的 wireguard 插件**，把 peer 查找收口到接口内（`wg_peer_add` 的去重
+      加 `sw_if_index`、`wg_remote_get` 带上到达接口），密钥模型一行不改、且**与内核 WireGuard
+      语义一致**。代价：VPP 不再是 packagecloud 的官方包，每台盒子（含 lab 镜像与物理盒）
+      都要自己编译维护 VPP，升级 VPP 版本时这块要跟；改的是收包热路径，要重测握手与吞吐。
+
+    我原先写的"VPP 的 peer 表按公钥跨接口去重"这句话本身没错（Q1 就是它），
+    但我据此说成"WG 原生不支持共用一套密钥"，是把 VPP 当成了协议，收回。
 
 ### 9.2 静默覆盖：会改到在线转发行为，且 retval 全 0
 
@@ -304,7 +343,8 @@
     设备侧 keep 集合按 `TunnelID`（[agent/tunnel.go:444-466](../controller/internal/agent/tunnel.go)）、
     apply 整表替换（[apply/route.go:198-259](../controller/internal/apply/route.go)）。
 11. **控制台**：对端下拉不排除已有隧道的对，硬错原文进 `undErrNote`（可接受）；
-    拓扑边折叠成 `firstRelayed || tunnels[0]` + "N 条"标签是刻意的，但边明细缺"颜色"列。
+    拓扑边折叠成 `firstRelayed || tunnels[0]` + "N 条"标签是刻意的，但边明细缺"隧道号"列
+    （颜色可重复 ⇒ 只有颜色不够认，见 §9.5 M-6）。
 12. **lab 脚本**：[test/lab/loop-console.py:328-333,354-358](../test/lab/loop-console.py)
     用 `frozenset(设备对)` 做集合等值断言，隐含"一对一条"；属 lab，重搭 lab 时随最新代码改。
 
@@ -314,7 +354,7 @@
 |---|---|---|---|
 | M-4 | 遥测行加 `TunnelID`（+`ReachReport` 加或删） | P-1 判据要用它，是阶梯的硬前置；改动面小、只到 wire/agent/控制器/控制台 | **是** |
 | M-1 | path_id 每隧道唯一（`PathIDBase` 不再恒 1000） | 唯一会**静默改在线转发**的一条；纯编号派生，不动密钥 | 否（阶梯改的是同一条隧道的 peer） |
-| M-2 | 每隧道一把 WG keypair（identity 多把 + keybinding 主语 + 控制器按 (node,tunnel) 存 + agent 装 peer 用隧道私钥） | 9.1 的根因，工作量最大（密钥生命周期、担保、轮换）；配置面可行性见 9.1 第 13 条 Q2（实测 0） | 否 |
-| M-3 | 放宽 pair 门禁为 (a,b,color)，批量/扇出带颜色，同色重复仍拒 | 必须排在 M-2 之后：门禁放宽到没有数据面支撑 = 把硬错换成静默失败（同条 Q1：不放 keypair 就是 -116） | 否 |
+| M-2 / M-2' | **两条路线，先拍这条**：M-2 = 每隧道一把 WG keypair（identity 多把 + keybinding 主语加隧道 + 控制器按 (node,tunnel) 存 + agent 装 peer 用隧道私钥）；M-2' = 分叉 VPP 的 wireguard 插件，把 peer 去重与 `wg_remote_get` 收口到接口内，密钥模型不动 | 9.1 第 2 条的根因。M-2 配置面可行性见 9.1 第 13 条 Q2（实测 0/0）；M-2' 语义与内核 WireGuard 一致（9.1 第 14 条 K1/K3/K6 实测全收），代价是 VPP 变自维护 + 动收包热路径 | 否 |
+| M-3 | 放宽 pair 门禁：**同设备对最多 8 条，颜色可重复**（不是按 (a,b,color) 判重）；批量/扇出同一色可以连发多条 | 必须排在 M-2/M-2' 之后：门禁放宽到没有数据面支撑 = 把硬错换成静默失败（Q1：不放就是 -116） | 否 |
 | M-5 | 把 9.7 那三处判据显式收紧成 (local, peer) | 去掉对"/32 全局唯一"的隐式依赖，和 M-4 一批做几乎免费 | 否 |
-| M-6 | 拓扑边明细补颜色列；lab 断言键改 (pair,color) | 展示与测试脚本，最后 | 否 |
+| M-6 | 拓扑边明细补"隧道号/颜色"列；lab 断言键改"设备对 + 条数 ≤8" | 展示与测试脚本，最后 | 否 |
