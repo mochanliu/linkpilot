@@ -112,7 +112,8 @@ sr_wg_show_keys_command_fn (vlib_main_t *vm, unformat_input_t *input,
   sr_wg_main_t *sm = &sr_wg_main;
   u32 i;
 
-  vlib_cli_output (vm, "%u key(s) configured:", sm->key_count);
+  vlib_cli_output (vm, "%u key(s) configured (容量 %u，一把钥匙一个签名身份):",
+                   sm->key_count, (u32) SR_WG_MAX_KEYS);
 
   for (i = 0; i < sm->key_count; i++)
     {
@@ -610,7 +611,12 @@ sr_wg_key_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vec_free (key_hex);
 
   rv = sr_wg_key_add (sm, (u16) hmac_id, key);
-  if (rv != 0)
+  if (rv == SR_WG_KEY_ERR_FULL)
+    return clib_error_return (
+      0, "密钥表已满（%d 把）。hmac_id=%u 是新身份，装不下；"
+         "`show sr-wg keys` 看现状，先 `sr-wg key del` 腾位，或扩 SR_WG_MAX_KEYS",
+      SR_WG_MAX_KEYS, hmac_id);
+  if (rv != SR_WG_KEY_OK)
     return clib_error_return (0, "sr_wg_key_add failed (rv=%d)", rv);
 
   vlib_cli_output (vm, "SR-WG key hmac_id=%u set.", hmac_id);

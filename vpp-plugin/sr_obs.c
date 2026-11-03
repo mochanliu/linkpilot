@@ -1,14 +1,18 @@
 /*
  * sr_obs.c - 外层源观测表实现
  *
- * 直接映射：slot = hash(src_ip, src_port, dst_port) % SR_OBS_SLOTS。
- * 命中（三元组完全相同）就更新 last_seen/hits/verified；不命中就覆盖该槽，
- * 覆盖掉有效条目时计一次 eviction。没有 LRU、没有分配、没有锁。
+ * 开放寻址：home = hash(src_ip, src_port, dst_port)，从 home 起最多探测
+ * SR_OBS_PROBE_WINDOW 个槽。命中（三元组完全相同）就更新 last_seen/hits/
+ * verified；窗口里的第一个空槽就新建；窗口占满就覆盖 home 并计一次 eviction。
+ * 没有 LRU、没有分配、没有锁，热路径工作量是常数。
  * 可信度分档的语义（verified）见 sr_obs.h 文件头。
  */
 #include "sr_obs.h"
 
 #include <string.h>
+
+_Static_assert((SR_OBS_SLOTS & (SR_OBS_SLOTS - 1)) == 0,
+               "SR_OBS_SLOTS must be a power of two (sr_obs_slot masks with &)");
 
 /*
  * 哈希：把端口挪位后与 ip 混合。
@@ -35,20 +39,52 @@ sr_obs_slot(uint32_t src_ip, uint16_t src_port, uint16_t dst_port)
     return h & (SR_OBS_SLOTS - 1);   /* SR_OBS_SLOTS 必须是 2 的幂 */
 }
 
+/* 元组判同：只有三元组，rx_if 与时间不参与（理由见 sr_obs_record） */
+static int
+sr_obs_same(const sr_obs_entry_t *e, uint32_t src_ip, uint16_t src_port,
+            uint16_t dst_port)
+{
+    return e->src_ip == src_ip && e->src_port == src_port &&
+           e->dst_port == dst_port;
+}
+
 void
 sr_obs_record(sr_obs_table_t *t, uint32_t src_ip, uint16_t src_port,
               uint16_t dst_port, uint16_t rx_if, uint64_t now_sec,
               uint8_t verified)
 {
-    sr_obs_entry_t *e;
+    sr_obs_entry_t *e = 0;
+    uint32_t home, k;
 
     if (!t)
         return;
 
-    e = &t->slots[sr_obs_slot(src_ip, src_port, dst_port)];
+    home = sr_obs_slot(src_ip, src_port, dst_port);
 
-    if (e->valid && e->src_ip == src_ip && e->src_port == src_port &&
-        e->dst_port == dst_port) {
+    /*
+     * 有界线性探测。命中同元组就更新；撞到空槽就是"不在表里"，落在这儿。
+     *
+     * "空槽 = 不存在"这条推理要求槽位一旦有效就永不单独转空 —— 本表只有整体
+     * clear，没有单条删除，所以成立。将来若加"按元组过期删除"，必须同时改成
+     * 带墓碑的探测，否则探测会在删除点提前停下、把后面的条目看成不存在。
+     */
+    for (k = 0; k < SR_OBS_PROBE_WINDOW; k++) {
+        sr_obs_entry_t *p = &t->slots[(home + k) & (SR_OBS_SLOTS - 1)];
+
+        if (!p->valid) {
+            e = p;
+            break;
+        }
+        if (sr_obs_same(p, src_ip, src_port, dst_port)) {
+            e = p;
+            break;
+        }
+    }
+
+    if (!e)
+        e = &t->slots[home];    /* 窗口占满：新条目赢，覆盖 home */
+
+    if (e->valid && sr_obs_same(e, src_ip, src_port, dst_port)) {
         e->last_seen = now_sec;
         e->hits++;
         /* 认证过是不可降级的事实：先收到旁路包(0)、后收到 SR 验签包(1) 会升到 1 */

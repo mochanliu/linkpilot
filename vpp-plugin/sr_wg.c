@@ -155,8 +155,9 @@ sr_wg_init (vlib_main_t *vm)
   /* 路径表初始化 */
   sr_path_table_init (&sm->path_table);
 
-  /* 密钥表清零 */
+  /* 密钥表清零（定位表和条目必须一起清：只清 keys 会让 index 指向幽灵槽） */
   clib_memset (sm->keys, 0, sizeof (sm->keys));
+  clib_memset (sm->key_index, 0, sizeof (sm->key_index));
   sm->key_count = 0;
 
   /* 计数器清零 */

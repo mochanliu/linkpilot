@@ -24,7 +24,22 @@
 #include "sr_wg_probe.h"
 
 #define SR_WG_PLUGIN_NAME  "sr_wg"
-#define SR_WG_MAX_KEYS     64
+
+/*
+ * 密钥表容量：一把 p-key 对应一个"发签/验签的身份"，今天控制器是**每租户一把**
+ * （不是每隧道一把），所以这个数不是隧道数上限。但中转盒要给多个租户的流量验
+ * 签，同一张表要装下所有引用到的身份；64 是早期随手定的，跟路径表一样抬到
+ * 4096，免得"密钥表先满"变成一个看不见的租户上限。
+ */
+#define SR_WG_MAX_KEYS     4096
+
+/* hmac_id 是 16 位，定位表可以定长：一次数组访问拿到槽位。 */
+#define SR_WG_KEY_ID_SPAN  65536
+
+/* sr_wg_key_add 的返回值（调用方必须分得清"参数不对"和"表满了"） */
+#define SR_WG_KEY_OK          0
+#define SR_WG_KEY_ERR_PARAM  (-1)
+#define SR_WG_KEY_ERR_FULL   (-2)
 
 /* 外层 IP4(20) + UDP(8) 回退量（无 IPv4 选项场景） */
 #define SR_OUTER_HDR_LEN   (20 + 8)
@@ -91,6 +106,16 @@ typedef struct {
 
   /* 密钥表 */
   sr_wg_key_entry_t keys[SR_WG_MAX_KEYS];
+  /*
+   * key_index[hmac_id] = 槽位下标 + 1，0 表示"这把钥匙不在表里"。
+   * 存 +1 是因为槽 0 是合法位置，而 0 必须留给"没有"。
+   *
+   * 这张表存在的理由是**热路径**：sr-wg4-transit 与 sr-wg4-input 每个收包都要按
+   * 头部声明的 hmac_id 取一次密钥，4096 把线性扫在最坏情况下要比较 4096 次。
+   * keys[] 仍保持紧凑（[0..key_count-1] 有效，删除用末位搬移），dump/CLI 的遍历
+   * 照旧走 key_count。
+   */
+  u16 key_index[SR_WG_KEY_ID_SPAN];
   u32 key_count;
 
   /* ==================== UDP 目的端口集合（功能多路复用键） ====================
@@ -192,6 +217,11 @@ extern vlib_log_class_registration_t sr_wg_log;
 
 /* ==================== 密钥管理 ==================== */
 
+/*
+ * 添加/更新密钥（同一 hmac_id 再来一次就是换密钥，会同步刷新路径里的副本）。
+ * 返回 SR_WG_KEY_OK；参数非法 SR_WG_KEY_ERR_PARAM；表里已有 SR_WG_MAX_KEYS 把
+ * 且 hmac_id 是新的，SR_WG_KEY_ERR_FULL —— 覆盖已有密钥不受容量限制。
+ */
 int sr_wg_key_add(sr_wg_main_t *sm, u16 hmac_id, const u8 *key);
 int sr_wg_key_del(sr_wg_main_t *sm, u16 hmac_id);
 sr_wg_key_entry_t *sr_wg_key_lookup(sr_wg_main_t *sm, u16 hmac_id);

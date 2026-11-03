@@ -266,7 +266,8 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
        *
        * 只在**接受**（交给 wg4-input）时记录：HMAC 失败/无密钥/seg_left 非 0
        * 的包不是"某个 peer 的 socket 到了"的证据，记进表只会让陌生人挤掉
-       * 真条目（表仅 SR_OBS_SLOTS 槽、冲突即覆盖；evictions 会暴露这种干扰）。
+       * 真条目（表是 SR_OBS_SLOTS 槽的开放寻址，窗口占满才覆盖 home 槽；
+       * evictions 会暴露这种干扰）。
        *
        * verified 的取值必须如实：**只有走完 SR HMAC 校验的解封装包**才算被
        * 认证（持有 p-key 的一方才签得出来；签名不覆盖外层 IP 头，认的是发送者

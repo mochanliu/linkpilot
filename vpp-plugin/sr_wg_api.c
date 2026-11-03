@@ -200,8 +200,15 @@ vl_api_sr_wg_key_set_t_handler (vl_api_sr_wg_key_set_t *mp)
   int rv;
 
   rv = sr_wg_key_add (sm, hmac_id, mp->key);
-  if (rv != 0)
-    rv = VNET_API_ERROR_NO_SUCH_TABLE;
+  /*
+   * 两种失败要分开：表满（4096 把）是容量问题，控制器要报"这台盒子密钥装不下"；
+   * 其余是参数问题。以前都回 NO_SUCH_TABLE，运维看到它只会去查表名，
+   * 永远想不到是密钥装满了。
+   */
+  if (rv == SR_WG_KEY_ERR_FULL)
+    rv = VNET_API_ERROR_LIMIT_EXCEEDED;
+  else if (rv != SR_WG_KEY_OK)
+    rv = VNET_API_ERROR_INVALID_VALUE;
 
   REPLY_MACRO (VL_API_SR_WG_KEY_SET_REPLY);
 }
