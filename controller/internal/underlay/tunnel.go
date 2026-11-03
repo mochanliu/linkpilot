@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/wire"
 )
 
@@ -98,8 +99,9 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 		return Tunnel{}, err
 	}
 	if id, ok := s.pairTunnel(req.A.NodeID, req.B.NodeID); ok {
-		return Tunnel{}, fmt.Errorf("%w %s：设备 %d 和 %d 之间只能有一条隧道——每台设备只有一把 WireGuard 静态密钥，VPP 的 peer 表按公钥跨接口去重，第二条会被数据面以 -116 拒掉；先删掉现有隧道再建",
-			ErrPairTaken, id, req.A.NodeID, req.B.NodeID)
+		return Tunnel{}, fmt.Errorf("%w %s：设备 %d 和 %d 之间只能有一条隧道。每台设备已经有 %d 把 WireGuard 密钥、"+
+			"隧道也带上了密钥槽号，同设备对的第二条只差这一道门禁（任务 M-3）；先删掉现有隧道再建",
+			ErrPairTaken, id, req.A.NodeID, req.B.NodeID, keybinding.WGKeySlots)
 	}
 	va, err := viewOf(views, "本端", req.A.NodeID)
 	if err != nil {

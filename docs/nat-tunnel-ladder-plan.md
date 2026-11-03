@@ -453,9 +453,11 @@ VPP 收（Q3/Q4，§9.1 第 13 条），内核 WireGuard 也收（K6，第 14 �
    VPP 不重启、不删口。**这句要在一次性环境实测出丢包数与时长才能当结论**，
    现在它是设计依据，不是测量结果。
 
-**待拍（10.7）**：槽号的 `key_gen` 是每槽一个计数器还是设备级共用一个。我的倾向是**每槽一个**：
-设备级一个计数器意味着"换第 3 槽的密钥"会把另外 7 槽的代次一起推进，
-对端就没法区分"哪一把变了"（现在 `applyBinding` 的 :2017-2018 防重放判据是按单一计数器写的）。
+**已定案（2026-11-03 用户拍，原 10.7 第 2 条）**：`key_gen` 每槽一个计数器。
+设备级共用一个意味着"换第 3 槽的密钥"会把另外 7 槽的代次一起推进，
+对端就没法区分"哪一把变了"；控制器侧的防重放判据（`b.KeyGen < cur.KeyGen`，
+[main.go:2056-2060](../controller/cmd/sr-ctrl/main.go)）现在也是**逐槽**比的，
+`TestApplyBindingsRotationAndReplayPerSlot` 钉住"槽 2 涨到 2 不许让槽 0 看起来也换了"。
 
 ### 10.5 改动清单（按落点，一处一行）
 
@@ -465,8 +467,8 @@ VPP 收（Q3/Q4，§9.1 第 13 条），内核 WireGuard 也收（K6，第 14 �
 | [identity.go:155-192](../controller/internal/agent/identity.go) `loadOrCreateX25519`/`setWGKey`/`WGPrivateKey`/`WGPublicKey` | 单把读写 | 加 slot 参数；新增"8 把公钥两两不同"自检 |
 | [identity.go:310-336](../controller/internal/agent/identity.go) `Binding()`/`RotateWGKey()` | 签那把、换那把 | `Binding(slot)`/`RotateWGKey(slot)`，`key_gen` 按槽 |
 | [binding.go:63-67,132-147,195-214](../controller/internal/keybinding/binding.go) | 主语无槽，域串 v1 | `Binding.Slot`、`Message` 带槽字节、域串 v2 |
-| [sr-agent/main.go:271,328,441-450](../controller/cmd/sr-agent/main.go)、[report.go:47-53](../controller/cmd/sr-agent/report.go)、[client.go](../controller/internal/agent/client.go) | 心跳/mapping 带**一把** binding | 带 8 把（一次报完，控制器按槽落位；旧格式在迁移期允许只带槽 0） |
-| [main.go:127-133,2003-2032](../controller/cmd/sr-ctrl/main.go) `NodeRecord.Binding`/`applyBinding` | 每设备一把 + 单一计数器 | 每设备 8 槽数组、按槽 diff 并返回"变了哪几槽"、state.json 旧格式迁移（单把 → 槽 0） |
+| [sr-agent/main.go:271,328,441-450](../controller/cmd/sr-agent/main.go)、[report.go:47-53](../controller/cmd/sr-agent/report.go)、[client.go](../controller/internal/agent/client.go) | 心跳/mapping 带**一把** binding | 带 8 把（一次报完，控制器按槽落位）。**不留"旧设备只带槽 0"的兼容读路径**（定案见 10.7 第 3 条）：一份 v1 签名在新域串下验不过，那是真拒，不是半信 |
+| [main.go:127-133,2003-2032](../controller/cmd/sr-ctrl/main.go) `NodeRecord.Binding`/`applyBinding` | 每设备一把 + 单一计数器 | 每设备 8 槽数组、逐槽验并入库（一把坏只砸那一格）、`changed` 只报真实变化。**控制器侧的旧 `key_binding` 不迁移而是丢弃**：那份签名的 v1 域串在新校验下验不过，留着就是往对端 relay 一份对方必然拒收的担保；agent 下一次心跳就重报整环 |
 | [underlay_delivery.go:113-136](../controller/cmd/sr-ctrl/underlay_delivery.go) `tunnelSpecLocked` | `PeerBinding: prec.Binding` | `prec.Bindings[t.Slot]`；该槽没上报 ⇒ 沿用现有"没上报公钥担保"跳过文案 |
 | [wire.go:414,611,726,536](../controller/internal/wire/wire.go) | 四处单把字段 | `MappingReport`/`HeartbeatRequest`/`PeerInfo` 变数组；`TunnelSpec.PeerBinding` **保持单把**（它本来就是一条隧道一份，天然带槽） |
 | [tunnel.go:422,612](../controller/internal/agent/tunnel.go) `priv := t.id.WGPrivateKey()` | 一次取出传给**每一条** Link | 按这条隧道的槽取；`LinkConfig.PrivateKey` 已是 per-link（[dataplane.go:172-174](../controller/internal/agent/dataplane.go)），不动语义 |
@@ -474,15 +476,47 @@ VPP 收（Q3/Q4，§9.1 第 13 条），内核 WireGuard 也收（K6，第 14 �
 | [plan.go:105-108,311-321](../controller/internal/underlay/plan.go) `HasPair`、[fan.go:41-96](../controller/internal/underlay/fan.go) `Fan` | 每对只发一条 | 批量/扇出带条数，>8 才拒 |
 | [state.go:20-24,119-121](../controller/internal/underlay/state.go)、[console.html:5146-5148](../controller/cmd/sr-ctrl/console.html) | "一对一条"文案 | 同上新口径 |
 
-**顺序硬约束**：`Slot` 落地前必须先做 M-1（path_id 每隧道唯一，§9.2 第 4 条）。
-否则同一个设备对的第 2 条隧道会和对端抢同一个 `PathID = base + PeerNodeID`，
-后写的段列表静默覆盖前一条、retval 全 0——那是真会改在线转发的那一条。
+**顺序硬约束（2026-11-03 更正）**：M-1（path_id 每隧道唯一，§9.2 第 4 条）**必须先于 M-3**
+（放开"同设备对 ≤8 条"那道门），而不是先于 `Slot`。理由：`PathID = base + PeerNodeID` 只按
+设备对算，同设备对的第二条隧道会和对端抢同一个 path_id，后写的段列表静默覆盖前一条、retval 全 0
+——那是真会改在线转发的那一条。而 `Slot` 本身不制造第二条隧道：**slice 1 落地的同时同设备对仍然
+只允许一条**，槽号全程是 0，磁盘上那把旧密钥就是槽 0，所以 M-1 没做也不会撞上覆盖。把 `Slot`
+拆在 M-1 之前反而更好：它把"槽"这条通路一次打通并让存量零中断，M-3 只需要改分配器和门禁。
+
+**slice 划分与落地状态**：
+- **slice 1（本增量，已落地并通过单测）**：上表前九行——agent 8 把密钥与逐槽担保、`keybinding` v2
+  带槽、wire 三处数组化、控制器逐槽验存、`tunnelSpecLocked` 按 `t.Slot` 取对端担保、
+  `TunnelSpec.Slot` 下发、设备侧按槽取私钥装 peer 并拒绝槽号不一致的规格。
+  隧道模型里 `Tunnel.Slot` 恒 0（分配器还没放开第二条），行为与升级前一致。
+- **slice 2 = M-1**：path_id 每隧道唯一。
+- **slice 3 = M-3**：`pairSlots(a,b)` 分配最低空闲槽 + `ErrPairFull` + 扇出/批量带条数 +
+  上表后四行的"一对一条"文案口径（含 [console.html:5146](../controller/cmd/sr-ctrl/console.html)）。
 
 ### 10.6 判据（做完怎么算过，前后两组数字都要有）
 
 - 单测：8 把公钥两两不同；对内槽号不重复；槽满报 `ErrPairFull`；v1 形状的签名在 v2 域下**必须**验不过；
   `state.json` 旧格式迁移后槽 0 公钥与迁移前逐字节相同。
+  **slice 1 已钉住的部分**（`go test ./...` 全绿，容器内 `--cap-add=NET_ADMIN`）：
+  两两不同与撞槽拒启动 [`TestLoadOrCreateKeysAndPermissions`/`TestLoadOrCreateRefusesDuplicateSlotKeys`](../controller/internal/agent/identity_test.go)、
+  槽号越界五个入口 [`TestSlotIsBoundsChecked`](../controller/internal/agent/identity_test.go)、
+  逐槽担保与逐槽重放 [`TestApplyBindings*`](../controller/cmd/sr-ctrl/keyring_test.go)、
+  v1 签名被拒 [`TestV1SignatureIsRefused`](../controller/internal/keybinding/binding_test.go)、
+  v1 标量 `key_gen` 迁进槽 0 [`TestDecodeStateMigratesV1KeyGen`](../controller/internal/agent/identity_test.go)、
+  下发与落地带槽 [`TestBundleSpecCarriesTheTunnelsKeySlot`](../controller/cmd/sr-ctrl/underlay_delivery_test.go)、
+  [`TestTunnelSyncInstallsKeySlotFromSpec`/`...RefusesSpecWithMismatchedBindingSlot`/`...RefusesOutOfRangeKeySlot`](../controller/internal/agent/tunnel_test.go)。
+  "对内槽号不重复 / 槽满 `ErrPairFull`" 属于 slice 3（M-3），现在还没有这条路径。
 - **只用新建的一次性私有环境**（`srwg-*` / `osc-*` / 环路台都是别的会话的活现场，不许动）。
+- **slice 1 的控制面判据已量（2026-11-03，同一私有环境 `m2-*` / 网络 `m2net` 10.137.0.0/24，
+  跑完 `m2` 残留 0 个、`lp-*` 十二个容器一台没动）**：
+  `test-vbond.sh` 改前 **196 passed / 0 failed**，改后 **201 passed / 0 failed**（+5 条是
+  按槽下发、槽号不一致拒收、逐槽担保与逐槽重放、越界拒绝）。日志在宿主 `/tmp/m2-priv/`。
+- **还没量的两条，都不属于"改代码就能过"的范畴**：
+  ①～⑤ 那五项要求**同一对设备真的有两口隧道**，而 pair 门禁要到 slice 3（M-3）才放开 ⇒
+  在 slice 3 之前这五项只能靠私有环境里手工往 VPP 塞第二口来测，测出来的不是产品路径。
+  所以它们记在 slice 3 的收口判据里，不在这里假称已过。
+  ⑥ "升 agent 不中断"（`adopt` 认领现成接口，10.7 第 3 条依赖的那句话）需要**带 VPP 的
+  私有环境**：本次 `m2-*` 只有控制面（`sleep infinity` 覆盖镜像启动命令，不起数据面），
+  所以"0 丢包"至今仍是**设计依据**而不是实测。
 - 环境里同一对设备建 2 条隧道（**故意同色 0**），逐项看：
   ① 两口各自的 peer 公钥确实是不同槽（用我们的 vppapi dump 读公钥，
   **不要用 `show wireguard interface`——它打印私钥，输出不许进仓库、报告或日志**）；
@@ -492,17 +526,25 @@ VPP 收（Q3/Q4，§9.1 第 13 条），内核 WireGuard 也收（K6，第 14 �
 - 升级不中断：升 agent 前后同一口径打流（丢包数、时延）、邻居 uptime、VPP FIB/RIB 条数、进程 pid，
   两组数字写进提交说明。
 
-### 10.7 三点要你拍
+### 10.7 三点定案（2026-11-03 用户拍，本节不再是待拍）
 
-1. **8 把密钥的生成时机与落盘形态**：我的默认是 agent 启动时一次性补齐 8 个独立文件、
-   槽 0 复用现有 `wg_x25519.key` 字节不动（理由见 10.3）。要不要改成"用一个文件存 8×32 字节"随你。
-2. **`key_gen` 的粒度**：每槽一个计数器（我推荐，理由见 10.4 末），还是设备级共用一个。
-3. **协议 v2 的兼容读路径留不留**：不留（一次换掉，控制器 + 全部 agent 在同一个维护窗口里升完，
-   窗口内"建隧道"这个动作会失败、已在跑的流量不掉，理由和实测要求见 10.4），
-   还是留一条"旧设备只带槽 0 的 v1 binding 仍然接受"。留的代价是校验分支和一份永远删不掉的兼容层。
+1. **8 把密钥的生成时机与落盘形态** —— 「开局就把 8 把钥匙生成」：`LoadOrCreate` 一次补齐
+   8 个独立文件（槽 0 沿用 `wg_x25519.key` 字节不动，槽 1..7 是 `wg_x25519.slotN.key`），
+   加载后立刻自检"八把两两不同"，撞了就报错拒绝启动而不是静默重生。
+   不做"一个文件存 8×32 字节"：磁盘上已有七个存量文件形状的目录，多一把密钥只是多一个文件，
+   存量那把的字节完全不用搬家。
+2. **`key_gen` 的粒度** —— 「按你推荐」：**每槽一个计数器**。理由与判据见 10.4 末。
+3. **协议 v2 的兼容读路径** —— 「不留」：控制器 + 全部 agent 同一个维护窗口一次升完。
+   窗口代价与"已在跑的客户流量不掉"的论证见 10.4；那句话里"agent 重启认领现成接口"
+   仍需在一次性私有环境实测出丢包数与时长才算结论（10.6）。
 
 ### 10.8 已知未决
 
+- **（2026-11-03 用户确认，这一条从"疑似缺陷"里划掉）**：批量建隧道默认全是颜色 0，
+  而当前这对设备已经有颜色 0 的隧道时**直接跳过**——这是**期望结果**，不是 bug。
+  slice 3 放宽门禁时要保留这个跳过语义，只是把"跳过"的判据从"这对设备已有隧道"
+  改成"按 (pair, color) 去重后没有可用槽"，并把跳过条数如实报在批量结果里，
+  不许静默。
 - VPP 的 `MAX_PEERS` 上限值还没量到（`wireguard_peer.c` 里那个检查，§9.1 第 2 条），
   它关系到"每盒 3000 条隧道"的产品目标能不能站住，与本次改动正交，但要在 M-2 实施期间一起量。
 - 8 把 × 每台设备 = 每台盒子 8 把公钥要上报、存储、验签；`keybinding` 现在是每心跳重验一把，

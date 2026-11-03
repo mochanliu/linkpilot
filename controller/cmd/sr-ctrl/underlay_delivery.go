@@ -110,11 +110,15 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	if strings.TrimSpace(prec.CertPEM) == "" {
 		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 没有证书，设备无法自己验证它", peer.NodeID)
 	}
-	if prec.Binding == nil {
-		// The binding carries the peer's WireGuard static public key. Without it
-		// there is literally nothing to install a peer with -- and inventing one
-		// would be the controller asserting a key it does not hold.
-		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 还没有上报 WireGuard 公钥担保（key binding）", peer.NodeID)
+	// The tunnel's key slot, not the peer's whole keyring: this end installs
+	// exactly the one attestation that covers the key its peer will hold for this
+	// tunnel. A slot the peer has never reported is the same "nothing to install"
+	// hole a missing key always was -- and saying which slot failed is what makes
+	// a half-upgraded device diagnosable instead of mysterious.
+	peerBinding := bindingAt(prec.Bindings, t.Slot)
+	if peerBinding == nil {
+		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 的密钥槽 %d 还没有上报 WireGuard 公钥担保（key binding）",
+			peer.NodeID, t.Slot)
 	}
 
 	instance, err := tunnelInstance(t.ID)
@@ -133,7 +137,8 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 		ListenPort:   self.Port,
 		PeerEndpoint: peerEp,
 		PeerCertPEM:  prec.CertPEM,
-		PeerBinding:  prec.Binding,
+		Slot:         t.Slot,
+		PeerBinding:  peerBinding,
 		MTU:          t.MTU,
 	}
 	// The pool hands out bare addresses and the console renders them bare; the

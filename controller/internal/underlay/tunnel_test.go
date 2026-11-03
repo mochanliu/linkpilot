@@ -242,17 +242,21 @@ func TestUpdateAndDelete(t *testing.T) {
 	}
 }
 
-// One WireGuard static key per device means VPP's peer table (deduped by public
-// key, across interfaces) rejects a second tunnel to the same peer with -116.
-// The controller must refuse it up front, not let the device fail at apply time.
+// The pair gate is still closed: one tunnel per device pair. It used to be
+// forced by the dataplane (VPP dedupes its peer pool by public key, so a second
+// tunnel to the same peer with the same key is refused with -116). M-2 gave every
+// device eight WireGuard keys and put the slot number on the tunnel, so that
+// collision is no longer the reason -- what is left is this gate, which M-3 opens.
+// Until then the controller must refuse up front, not let the device fail at
+// apply time, and the refusal must name the tunnel that occupies the pair.
 func TestCreateRejectsSecondTunnelOnSamePair(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2)
 	first := mustCreate(t, s, views, 1, 2, nil)
 
 	_, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 2}, B: EndpointSpec{NodeID: 1}, Now: 2000}, views)
-	if err == nil || !strings.Contains(err.Error(), "-116") || !strings.Contains(err.Error(), first.ID) {
-		t.Fatalf("同对设备第二条隧道应被拒绝并说明原因，实际 %v", err)
+	if err == nil || !errors.Is(err, ErrPairTaken) || !strings.Contains(err.Error(), first.ID) {
+		t.Fatalf("同对设备第二条隧道应被拒绝并点名占了这一对的那条，实际 %v", err)
 	}
 	if len(s.Tunnels) != 1 {
 		t.Fatalf("被拒的请求不该留下隧道: %d", len(s.Tunnels))
@@ -376,9 +380,10 @@ func TestTunnelColorIsStoredAndRecolorable(t *testing.T) {
 }
 
 // Colors above 7 have no verified table-number segment behind them
-// (颜色*1000+10000+主表号), and a color that overflowed the u8 preference would
-// quietly invert the order -- the failure docs/overlay-design-draft.md §2.7
-// measured on the FRR side (kernel metric 300 => VPP preference 44).
+// (颜色*1000+主表号，八段落在 0..7255), and a color that overflowed the u8
+// preference would quietly invert the order -- the failure
+// docs/overlay-design-draft.md §2.7 measured on the FRR side (kernel metric 300
+// => VPP preference 44).
 func TestColorOutOfRangeIsRefused(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2)

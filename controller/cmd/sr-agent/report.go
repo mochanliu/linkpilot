@@ -44,13 +44,13 @@ func (r *reportSender) send(ctx context.Context, ifaces *[]wire.IfaceInfo) {
 }
 
 func (r *reportSender) reportMapping(ctx context.Context, ifaces *[]wire.IfaceInfo) {
-	b, err := r.id.Binding()
+	bs, err := r.id.Bindings()
 	if err != nil {
 		r.warnf("映射回报跳过：取不出 WG 密钥担保: %v", err)
 		return
 	}
 	req := wire.MappingReport{
-		Binding:    &b,
+		Bindings:   bs,
 		LocalAddrs: localAddrs(ifaces),
 	}
 	// The observation half comes from the probe loop, and only while it is fresh:

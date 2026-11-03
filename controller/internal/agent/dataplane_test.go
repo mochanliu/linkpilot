@@ -715,14 +715,23 @@ func randomBytes(t *testing.T, n int) []byte {
 // peerMaterial 造一个"合法对端"：自己的 Ed25519 身份密钥 + 一张本租户 CA 签的
 // 证书 + 由身份密钥签出来的 WG 公钥担保。三件必须配套，否则验身份那关就过不去 ——
 // 这正是想要的：测试里的通过必须是真的通过。
+//
+// 这一层（Link）不认识槽号："这条隧道该用第几把"是上一层 TunnelSync 的事
+// （见 tunnel.go 的 applySpec 与它的槽一致检查），所以这里默认签在槽 0。
 func peerMaterial(t *testing.T, pki *testPKI, tenant string, node uint16) (certPEM string, binding *keybinding.Binding, wgPub []byte) {
+	t.Helper()
+	return peerMaterialSlot(t, pki, tenant, node, 0)
+}
+
+// peerMaterialSlot 同 peerMaterial，只是点名担保的是第 slot 把密钥。
+func peerMaterialSlot(t *testing.T, pki *testPKI, tenant string, node uint16, slot uint8) (certPEM string, binding *keybinding.Binding, wgPub []byte) {
 	t.Helper()
 	idPub, idPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wgPub = randomBytes(t, keybinding.X25519PubLen)
-	b, err := keybinding.Sign(deviceSigner{k: idPriv}, tenant, node, 1, wgPub)
+	b, err := keybinding.Sign(deviceSigner{k: idPriv}, tenant, node, slot, 1, wgPub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1085,7 +1094,7 @@ func TestApplyPeerAuthenticationGatesEveryWrite(t *testing.T) {
 
 	// 担保里的公钥被人换过：证书没错，绑定是用另一把 WG 私钥签的
 	cert7, _, _ := peerMaterial(t, pki, "t1", 7)
-	swapped, err := keybinding.Sign(deviceSigner{k: mustEd25519(t)}, "t1", 7, 1, randomBytes(t, keybinding.X25519PubLen))
+	swapped, err := keybinding.Sign(deviceSigner{k: mustEd25519(t)}, "t1", 7, 0, 1, randomBytes(t, keybinding.X25519PubLen))
 	if err != nil {
 		t.Fatal(err)
 	}

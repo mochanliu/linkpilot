@@ -46,7 +46,7 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 	signer, pub := newIdentity(t)
 	pubKey := x25519Pub(t, 0xa5)
 
-	b, err := Sign(signer, "tenant-a", 2, 1, pubKey)
+	b, err := Sign(signer, "tenant-a", 2, 0, 1, pubKey)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 // key-agreement public key in transit must be detected, not merely ineffective.
 func TestTamperedX25519PubIsRejected(t *testing.T) {
 	signer, pub := newIdentity(t)
-	b, err := Sign(signer, "tenant-a", 2, 1, x25519Pub(t, 0xa5))
+	b, err := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestTamperedX25519PubIsRejected(t *testing.T) {
 
 func TestTamperedSignatureIsRejected(t *testing.T) {
 	signer, pub := newIdentity(t)
-	b, _ := Sign(signer, "tenant-a", 2, 1, x25519Pub(t, 0xa5))
+	b, _ := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
 
 	raw := []byte(b.Sig)
 	raw[0] ^= 0x01
@@ -90,10 +90,62 @@ func TestTamperedSignatureIsRejected(t *testing.T) {
 
 func TestTamperedKeyGenIsRejected(t *testing.T) {
 	signer, pub := newIdentity(t)
-	b, _ := Sign(signer, "tenant-a", 2, 1, x25519Pub(t, 0xa5))
+	b, _ := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
 	b.KeyGen = 2 // a replayed binding from a later generation
 	if _, err := b.Verify("tenant-a", 2, pub); err == nil {
 		t.Fatal("changing key_gen still verified")
+	}
+}
+
+// TestSameKeyDifferentSlotIsRejected is the guarantee the key-slot model rests
+// on: a device holds WGKeySlots keys and the eight attestations are not
+// interchangeable. If the slot were not covered, an operator who handed a peer
+// the slot-1 attestation for a tunnel that uses key 0 would find every peer
+// entry "valid" while pointing at the wrong key -- and the only symptom would be
+// a tunnel that never completes a handshake.
+func TestSameKeyDifferentSlotIsRejected(t *testing.T) {
+	signer, pub := newIdentity(t)
+	key := x25519Pub(t, 0xa5)
+
+	b0, err := Sign(signer, "tenant-a", 2, 0, 1, key)
+	if err != nil {
+		t.Fatalf("Sign slot 0: %v", err)
+	}
+	b1, err := Sign(signer, "tenant-a", 2, 1, 1, key)
+	if err != nil {
+		t.Fatalf("Sign slot 1: %v", err)
+	}
+	if b0.Sig == b1.Sig {
+		t.Fatal("the same key signed at two slots produced the same signature -- slot is not covered")
+	}
+	// Each verifies under its own slot...
+	if _, err := b0.Verify("tenant-a", 2, pub); err != nil {
+		t.Fatalf("slot 0 binding did not verify: %v", err)
+	}
+	if _, err := b1.Verify("tenant-a", 2, pub); err != nil {
+		t.Fatalf("slot 1 binding did not verify: %v", err)
+	}
+	// ...and neither passes for the other slot. Verify takes the slot from the
+	// binding itself, so the caller must compare b.Slot with the slot it meant.
+	if b0.Slot == b1.Slot {
+		t.Fatal("Slot field is not being carried")
+	}
+}
+
+func TestSlotOutOfRangeIsRejected(t *testing.T) {
+	signer, pub := newIdentity(t)
+	if _, err := Sign(signer, "tenant-a", 2, WGKeySlots, 1, x25519Pub(t, 0xa5)); err == nil {
+		t.Fatal("Sign accepted a slot past the end of the keyring")
+	}
+	b, err := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	// A relayed binding whose slot byte was rewritten to something the device
+	// does not hold must not be verified against a keyring index either.
+	b.Slot = WGKeySlots
+	if _, err := b.Verify("tenant-a", 2, pub); err == nil {
+		t.Fatal("Verify accepted an out-of-range slot")
 	}
 }
 
@@ -101,7 +153,7 @@ func TestTamperedKeyGenIsRejected(t *testing.T) {
 // tenant or one node must not be usable as another.
 func TestBindingsAreNotTransferableAcrossIdentity(t *testing.T) {
 	signer, pub := newIdentity(t)
-	b, _ := Sign(signer, "tenant-a", 2, 1, x25519Pub(t, 0xa5))
+	b, _ := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
 
 	for _, tc := range []struct {
 		name   string
@@ -123,7 +175,7 @@ func TestBindingsAreNotTransferableAcrossIdentity(t *testing.T) {
 func TestAnotherIdentityKeyIsRejected(t *testing.T) {
 	signer, _ := newIdentity(t)
 	_, otherPub := newIdentity(t)
-	b, _ := Sign(signer, "tenant-a", 2, 1, x25519Pub(t, 0xa5))
+	b, _ := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
 	if _, err := b.Verify("tenant-a", 2, otherPub); err == nil {
 		t.Fatal("a binding verified under an identity key that did not sign it")
 	}
@@ -138,22 +190,33 @@ func TestMessageIsInjective(t *testing.T) {
 	inputs := []struct {
 		tenant string
 		node   uint16
+		slot   uint8
 		keyGen uint32
 	}{
-		{"a", 0x0102, 3},
-		{"a\x01", 0x0200, 3},
-		{"a", 0x0001, 3},
-		{"a", 0x0100, 3},
-		{"a\x00", 0x0102, 3},
-		{"ab", 0x0102, 3},
-		{"", 0x0102, 3},
-		{"a", 0x0102, 0},
-		{"a", 0x0102, 0x03000000},
+		{"a", 0x0102, 0, 3},
+		{"a\x01", 0x0200, 0, 3},
+		{"a", 0x0001, 0, 3},
+		{"a", 0x0100, 0, 3},
+		{"a\x00", 0x0102, 0, 3},
+		{"ab", 0x0102, 0, 3},
+		{"", 0x0102, 0, 3},
+		{"a", 0x0102, 0, 0},
+		{"a", 0x0102, 0, 0x03000000},
+		// The slot sits between two fixed-width fields, so the near-miss worth
+		// testing here is a byte that could be read as the end of key_gen in one
+		// entry and as the slot of another: keygen 0x03 with slot 0 must not
+		// encode the same as keygen 0x0300 with slot 0, nor as keygen 0 with
+		// slot 3.
+		{"a", 0x0102, 1, 3},
+		{"a", 0x0102, 3, 0},
+		{"a", 0x0102, 0, 0x0300},
+		{"a", 0x0102, 7, 0},
+		{"a", 0x0102, 0, 0x030000},
 	}
 	seen := map[string]string{}
 	for _, in := range inputs {
-		label := fmt.Sprintf("tenant=%q node=0x%04x keygen=%d", in.tenant, in.node, in.keyGen)
-		key := string(Message(in.tenant, in.node, in.keyGen, pub))
+		label := fmt.Sprintf("tenant=%q node=0x%04x slot=%d keygen=%d", in.tenant, in.node, in.slot, in.keyGen)
+		key := string(Message(in.tenant, in.node, in.slot, in.keyGen, pub))
 		if prev, dup := seen[key]; dup {
 			t.Fatalf("two inputs share signed bytes: %s and %s", prev, label)
 		}
@@ -201,7 +264,7 @@ func TestVerifyPeerCert(t *testing.T) {
 
 	certPEM, devPriv := newDeviceCert(t, caCert, caKey, tenant, node)
 	signer := &fakeElement{priv: devPriv}
-	b, err := Sign(signer, tenant, node, 1, x25519Pub(t, 0xa5))
+	b, err := Sign(signer, tenant, node, 0, 1, x25519Pub(t, 0xa5))
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -219,7 +282,7 @@ func TestVerifyPeerCert(t *testing.T) {
 		// device's certificate and binding, hoping nobody checks the identity.
 		otherPEM, otherPriv := newDeviceCert(t, caCert, caKey, tenant, 3)
 		otherSigner := &fakeElement{priv: otherPriv}
-		otherBinding, _ := Sign(otherSigner, tenant, 3, 1, x25519Pub(t, 0x77))
+		otherBinding, _ := Sign(otherSigner, tenant, 3, 0, 1, x25519Pub(t, 0x77))
 		if _, err := VerifyPeerCert(pool, otherPEM, tenant, node, otherBinding); err == nil {
 			t.Fatal("node 3's certificate was accepted as node 2")
 		}
@@ -244,7 +307,7 @@ func TestVerifyPeerCert(t *testing.T) {
 		// A different device signs a binding claiming to be tenant-a/node/2.
 		_, strangerPriv := newDeviceCert(t, caCert, caKey, tenant, 9)
 		strangerSigner := &fakeElement{priv: strangerPriv}
-		forged, _ := Sign(strangerSigner, tenant, node, 1, x25519Pub(t, 0x33))
+		forged, _ := Sign(strangerSigner, tenant, node, 0, 1, x25519Pub(t, 0x33))
 		if _, err := VerifyPeerCert(pool, certPEM, tenant, node, forged); err == nil {
 			t.Fatal("a binding signed by another device was accepted")
 		}
@@ -253,7 +316,7 @@ func TestVerifyPeerCert(t *testing.T) {
 	t.Run("expired certificate", func(t *testing.T) {
 		expiredPEM, expiredPriv := newExpiredDeviceCert(t, caCert, caKey, tenant, node)
 		expiredSigner := &fakeElement{priv: expiredPriv}
-		expiredBinding, _ := Sign(expiredSigner, tenant, node, 1, x25519Pub(t, 0x55))
+		expiredBinding, _ := Sign(expiredSigner, tenant, node, 0, 1, x25519Pub(t, 0x55))
 		if _, err := VerifyPeerCert(pool, expiredPEM, tenant, node, expiredBinding); err == nil {
 			t.Fatal("an expired device certificate was accepted")
 		}
@@ -266,9 +329,48 @@ func TestVerifyPeerCert(t *testing.T) {
 	})
 }
 
+// TestV1SignatureIsRefused is why upgrading the message is a protocol change and
+// not a flag: a signature over the v1 bytes (no slot, v1 domain string) does not
+// verify under v2, and there is deliberately no code path that still accepts it.
+// The upgrade therefore has to land on the controller and every agent in one
+// batch -- which is what the plan's 同批升完 requirement is paying for.
+func TestV1SignatureIsRefused(t *testing.T) {
+	signer, pub := newIdentity(t)
+	b, err := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if DomainSeparator != "srou-keybinding-v2" {
+		t.Fatalf("域串是 %q，不是 v2：换代没落地", DomainSeparator)
+	}
+	if _, err := b.Verify("tenant-a", 2, pub); err != nil {
+		t.Fatalf("the v2 binding does not verify: %v", err)
+	}
+
+	// The same (tenant, node, key_gen, key) the way v1 spelled it: the v1 domain
+	// string and no slot byte between key_gen and the public key.
+	xpub, _ := base64.StdEncoding.DecodeString(b.X25519Pub)
+	v1 := make([]byte, 0, 64)
+	v1 = append(v1, []byte("srou-keybinding-v1")...)
+	v1 = append(v1, byte(len("tenant-a")>>8), byte(len("tenant-a")))
+	v1 = append(v1, "tenant-a"...)
+	v1 = append(v1, 0, 2)
+	v1 = append(v1, 0, 0, 0, 1)
+	v1 = append(v1, xpub...)
+	v1Sig, err := signer.Sign(v1)
+	if err != nil {
+		t.Fatalf("sign v1: %v", err)
+	}
+	stale := Binding{Slot: 0, X25519Pub: b.X25519Pub, KeyGen: 1,
+		Sig: base64.StdEncoding.EncodeToString(v1Sig)}
+	if _, err := stale.Verify("tenant-a", 2, pub); err == nil {
+		t.Fatal("一个 v1 时代的签名在 v2 下验过了 —— 兼容读路径没有真的删掉")
+	}
+}
+
 func TestDecodeRejectsMalformedBindings(t *testing.T) {
 	signer, _ := newIdentity(t)
-	good, _ := Sign(signer, "tenant-a", 2, 1, x25519Pub(t, 0xa5))
+	good, _ := Sign(signer, "tenant-a", 2, 0, 1, x25519Pub(t, 0xa5))
 
 	for _, tc := range []struct {
 		name string

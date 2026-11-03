@@ -40,8 +40,8 @@ type Endpoint struct {
 }
 
 // MaxTunnelColor is the highest color a tunnel may carry. See Tunnel.Color: the
-// eight segments 颜色*1000+10000..+255 are the ones that were checked against the
-// table numbers already in use.
+// eight segments 颜色*1000..颜色*1000+255（合计 0..7255）are the ones that were
+// checked against the table numbers already in use.
 const MaxTunnelColor uint8 = 7
 
 // MaxRelayHops is the deepest relay chain a path may carry.
@@ -116,23 +116,32 @@ type Roles struct {
 // ID is controller-internal: the user never types or sees it as an identity,
 // but the API needs a stable handle for edit/delete.
 //
-// One tunnel per device pair: Create refuses a second one (see pairTunnel) --
-// with one WireGuard static key per device, VPP rejects the duplicate peer on a
-// second interface.
+// One tunnel per device pair for now: Create refuses a second one (see
+// pairTunnel). That is a policy gate, not a key limit -- a device now holds
+// keybinding.WGKeySlots keys, and the gate is what still says one.
 type Tunnel struct {
 	ID   string      `json:"id"`
 	A    Endpoint    `json:"a"`
 	B    Endpoint    `json:"b"`
 	Path *TunnelPath `json:"path,omitempty"`
 
+	// Slot is which key pair of the two devices this tunnel uses: the pair's
+	// n-th tunnel uses key n on BOTH ends, so the two ends never have to exchange
+	// a keyring to agree (docs/nat-tunnel-ladder-plan.md §10). Derived at creation,
+	// never typed. It is always 0 while the pair gate allows one tunnel per pair,
+	// and 0 is exactly where a device's pre-slot key already lives -- which is why
+	// introducing this field costs no re-handshake on running tunnels.
+	Slot uint8 `json:"slot,omitempty"`
+
 	// Color is the tunnel's SD-WAN color. It is the only thing the data plane
 	// learns from this field: VPP's preference for the FIB paths that go through
 	// this tunnel is PrefBase+Color, so color 0 wins while it is alive and the
 	// next-lowest live color takes over on its own (docs/overlay-design-draft.md §4).
 	//
-	// 0..7, never more: the color is also the high digit of the VRF table number
-	// (颜色*1000+10000+主表号), and only those eight segments were checked against
-	// the tables in use.
+	// 0..7, never more: the color is also the high digits of the VRF table number
+	// (颜色*1000+主表号, 主表号 = VPN 表号 ∈ 0..255 ⇒ 落点 0..7255), and only those
+	// eight segments were checked against the tables in use. 颜色 0 折出来就是主表
+	// 本身，不另建表。
 	Color uint8 `json:"color,omitempty"`
 
 	// MTU is derived, never configured by the user: the smaller of the underlay

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/vppapi"
 	"sdwan/controller/internal/wire"
 )
@@ -39,14 +41,15 @@ func testPKeys() []wire.PKey {
 }
 
 // tunnelSpec 造一条"能装上"的隧道规格：出口是真机名字（fake 里那张 host-eth0）、
-// 端口/实例/overlay 都按控制器的派生规则来。
+// 端口/实例/overlay 都按控制器的派生规则来。默认用密钥槽 0（与 peerMaterial 的担保
+// 同号），要测别的槽就在返回的规格上改 Slot 并换一份同号的对端担保。
 func tunnelSpec(t *testing.T, pki *testPKI, id string, peerNode uint16, instance uint32,
 	port uint16, localOverlay, peerOverlay, peerEndpoint string) wire.TunnelSpec {
 
 	t.Helper()
 	certPEM, binding, _ := peerMaterial(t, pki, "t1", peerNode)
 	return wire.TunnelSpec{
-		TunnelID: id, PeerNodeID: peerNode,
+		TunnelID: id, PeerNodeID: peerNode, Slot: 0,
 		Instance: instance, PathIDBase: wire.UnderlayPathIDBase,
 		Iface: "host-eth0", SrcIP: "10.10.1.2",
 		ListenPort: port, PeerEndpoint: peerEndpoint,
@@ -568,6 +571,105 @@ func TestTunnelSyncKickReportsPartialAsNotConverged(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if calls.Load() != callsBefore {
 		t.Fatalf("退避窗口内又去拉了配置（%d -> %d）", callsBefore, calls.Load())
+	}
+}
+
+// 槽号必须真的走到数据面：控制器在规格里点名第 n 把，agent 就把那一把交给 VPP 建口。
+// 故意用槽 3 —— 槽 0 恰好等于"这个字段不存在时用的那把"，拿它测不出字段有没有被用上。
+func TestTunnelSyncInstallsKeySlotFromSpec(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	const slot = 3
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	spec.Slot = slot
+	certPEM, b3, _ := peerMaterialSlot(t, pki, "t1", 3, slot)
+	spec.PeerCertPEM, spec.PeerBinding = certPEM, b3
+	b := testBundle(spec)
+
+	ts, id := newTunnelSync(t, f, pki, b)
+	ctx := context.Background()
+	if err := ts.Sync(ctx, b.Version); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if st := ts.State(); !st.OK {
+		t.Fatalf("槽 %d 的隧道没装上: %s", slot, st.Error)
+	}
+	if len(f.ifaces) != 1 {
+		t.Fatalf("接口表 %+v", f.ifaces)
+	}
+	want, err := id.WGPublicKey(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(f.ifaces[0].PublicKey, want) {
+		t.Errorf("隧道接口上装的不是槽 %d 的那把密钥", slot)
+	}
+	slot0, err := id.WGPublicKey(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(f.ifaces[0].PublicKey, slot0) {
+		t.Error("规格里写槽 3、接口上却是槽 0 的密钥：spec.Slot 根本没被用上")
+	}
+}
+
+// 规格里写密钥槽 3、转给本端的对端担保却是槽 2：这两处的来源不一致，装上去
+// 等于"这条隧道用的其实是别条隧道的密钥"。整条拒绝，并且在跑的其它隧道不动。
+func TestTunnelSyncRefusesSpecWithMismatchedBindingSlot(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	spec.Slot = 3
+	certPEM, b2, _ := peerMaterialSlot(t, pki, "t1", 3, 2)
+	spec.PeerCertPEM, spec.PeerBinding = certPEM, b2
+	b := testBundle(spec)
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	st := ts.State()
+	if st.OK {
+		t.Fatal("担保槽号与规格槽号不一致，却仍然报收敛")
+	}
+	if !strings.Contains(st.Error, "密钥槽") {
+		t.Errorf("错误没点出是槽号不一致: %s", st.Error)
+	}
+	if len(f.ifaces) != 0 {
+		t.Errorf("被拒绝的规格不该留下接口: %+v", f.ifaces)
+	}
+}
+
+// 越界的槽号同样只砸这一条：spec.Slot 是从控制器下发的字符串里来的外部输入，
+// agent 是长期进程，一个坏字段不该把已经在转发的隧道一起带走。
+func TestTunnelSyncRefusesOutOfRangeKeySlot(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	bad := tunnelSpec(t, pki, "t-bad", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	bad.Slot = keybinding.WGKeySlots
+	good := tunnelSpec(t, pki, "t-good", 4, 1002, 51821,
+		"10.250.0.1/32", "10.250.0.4/32", "10.10.1.4:51821")
+	b := testBundle(bad, good)
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	st := ts.State()
+	if st.OK {
+		t.Fatal("槽号越界的规格却报收敛")
+	}
+	if !strings.Contains(st.Error, "越界") {
+		t.Errorf("错误没点出是槽号越界: %s", st.Error)
+	}
+	if len(f.ifaces) != 1 || f.ifaces[0].UserInstance != 1002 {
+		t.Errorf("越界那条该只砸自己，好的那条要照常装上: %+v", f.ifaces)
+	}
+	if st.Tunnels != 1 {
+		t.Errorf("装上的隧道数 %d，期望 1", st.Tunnels)
 	}
 }
 

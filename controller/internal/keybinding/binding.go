@@ -1,5 +1,9 @@
-// Package keybinding attests a node's X25519 (key-agreement) public key with
-// the Ed25519 identity key inside its controller-issued certificate.
+// Package keybinding attests one of a node's X25519 (key-agreement) public keys
+// with the Ed25519 identity key inside its controller-issued certificate.
+//
+// A device holds WGKeySlots keypairs and a binding names WHICH one it attests
+// (Binding.Slot), so the eight attestations of one node are not interchangeable:
+// a key meant for tunnel 3 cannot be installed on tunnel 1.
 //
 // The problem it solves. The controller is a MEDIATOR for each node's
 // WireGuard STATIC public key: it carries that key-agreement material to the
@@ -42,7 +46,13 @@ import (
 // signature made here from being valid in any other context: a signature is
 // only as narrow as the message it covers, and an unprefixed message invites
 // one protocol's signature to authorise another's action.
-const DomainSeparator = "srou-keybinding-v1"
+//
+// v2 added the key-slot byte to the signed bytes. A signature made under v1
+// covers a different message, so it does not verify here -- that is the point of
+// bumping the separator instead of the field list alone. There is deliberately
+// no v1 read path: a device that has not been upgraded is unbound, not
+// half-trusted (see docs/nat-tunnel-ladder-plan.md §10.4).
+const DomainSeparator = "srou-keybinding-v2"
 
 const (
 	// X25519PubLen is the size of an X25519 public key.
@@ -51,16 +61,38 @@ const (
 	SigLen = ed25519.SignatureSize
 	// maxTenantLen bounds the length-prefixed tenant field (uint16).
 	maxTenantLen = 0xFFFF
+	// WGKeySlots is how many WireGuard keypairs one device holds.
+	//
+	// It equals the product limit on tunnels between a single device pair: the
+	// n-th tunnel between two devices uses keypair n on BOTH sides, so a device
+	// needs exactly this many keys to carry its fullest pair. Two different pairs
+	// may use the same slot, because the key that has to be unique inside a
+	// device's peer table is the PEER's public key, and peers differ.
+	//
+	// 8 is a limit the operator typed, not one derived from the color table.
+	// VPP's wireguard plugin dedupes peers by remote public key across interfaces
+	// (docs/nat-tunnel-ladder-plan.md §9.1 item 2), which is why a second tunnel
+	// to the same peer needs a second key at all.
+	WGKeySlots = 8
 )
 
 // Binding is what actually travels over the wire and through the controller.
 //
-// KeyGen is a per-device counter that the device bumps whenever it replaces its
-// X25519 key. Without it, an old binding replayed after a rotation would be
-// indistinguishable from the current one. The tenant's crypto epoch is NOT part
-// of the binding: an epoch bump must not invalidate every signature in the
-// tenant (that would be a re-signing storm), it only re-derives the O-key.
+// Slot names WHICH of the device's WG keypairs this attests (0..WGKeySlots-1).
+// It is inside the signature, not just alongside it: without it, one device's
+// eight attestations would be interchangeable and a key meant for tunnel 3 could
+// be installed on tunnel 1.
+//
+// KeyGen is a per-SLOT counter that the device bumps whenever it replaces that
+// slot's X25519 key. Without it, an old binding replayed after a rotation would
+// be indistinguishable from the current one. It is per slot rather than
+// per-device because rotating slot 3 must not advance the generation of the
+// other seven, and a shared counter would leave a receiver unable to tell which
+// key actually changed. The tenant's crypto epoch is NOT part of the binding: an
+// epoch bump must not invalidate every signature in the tenant (that would be a
+// re-signing storm), it only re-derives the O-key.
 type Binding struct {
+	Slot      uint8  `json:"slot"`
 	X25519Pub string `json:"x25519_pub"` // base64, X25519PubLen bytes
 	KeyGen    uint32 `json:"key_gen"`
 	Sig       string `json:"sig"` // base64, SigLen bytes
@@ -109,11 +141,12 @@ func (s *SoftwareSigner) Public() ed25519.PublicKey {
 //
 // Layout (integers big-endian):
 //
-//	"srou-keybinding-v1"   17 bytes, fixed domain separator
+//	"srou-keybinding-v2"   18 bytes, fixed domain separator
 //	uint16 len(tenant)
 //	tenant                 len(tenant) bytes
 //	uint16 node_id
 //	uint32 key_gen
+//	uint8  slot
 //	[32]byte x25519_pub
 //
 // Every field is either length-prefixed or fixed-width, which makes the
@@ -129,9 +162,9 @@ func (s *SoftwareSigner) Public() ed25519.PublicKey {
 //
 // This is the same class of failure as the byte-order iron rule in doc 18 §8:
 // when this breaks, it breaks in the ENCODING, never in the maths.
-func Message(tenant string, nodeID uint16, keyGen uint32, x25519Pub []byte) []byte {
+func Message(tenant string, nodeID uint16, slot uint8, keyGen uint32, x25519Pub []byte) []byte {
 	var b bytes.Buffer
-	b.Grow(len(DomainSeparator) + 2 + len(tenant) + 2 + 4 + len(x25519Pub))
+	b.Grow(len(DomainSeparator) + 2 + len(tenant) + 2 + 4 + 1 + len(x25519Pub))
 	b.WriteString(DomainSeparator)
 	var u16 [2]byte
 	binary.BigEndian.PutUint16(u16[:], uint16(len(tenant)))
@@ -142,23 +175,28 @@ func Message(tenant string, nodeID uint16, keyGen uint32, x25519Pub []byte) []by
 	var u32 [4]byte
 	binary.BigEndian.PutUint32(u32[:], keyGen)
 	b.Write(u32[:])
+	b.WriteByte(slot)
 	b.Write(x25519Pub)
 	return b.Bytes()
 }
 
-// Sign produces the binding for (tenant, nodeID)'s X25519 public key.
-func Sign(s Signer, tenant string, nodeID uint16, keyGen uint32, x25519Pub []byte) (Binding, error) {
+// Sign produces the binding for one key slot of (tenant, nodeID).
+func Sign(s Signer, tenant string, nodeID uint16, slot uint8, keyGen uint32, x25519Pub []byte) (Binding, error) {
 	if len(x25519Pub) != X25519PubLen {
 		return Binding{}, fmt.Errorf("x25519 public key must be %d bytes, got %d", X25519PubLen, len(x25519Pub))
+	}
+	if int(slot) >= WGKeySlots {
+		return Binding{}, fmt.Errorf("key slot %d is out of range (a device holds %d)", slot, WGKeySlots)
 	}
 	if len(tenant) > maxTenantLen {
 		return Binding{}, fmt.Errorf("tenant name too long (%d bytes)", len(tenant))
 	}
-	sig, err := s.Sign(Message(tenant, nodeID, keyGen, x25519Pub))
+	sig, err := s.Sign(Message(tenant, nodeID, slot, keyGen, x25519Pub))
 	if err != nil {
 		return Binding{}, err
 	}
 	return Binding{
+		Slot:      slot,
 		X25519Pub: base64.StdEncoding.EncodeToString(x25519Pub),
 		KeyGen:    keyGen,
 		Sig:       base64.StdEncoding.EncodeToString(sig),
@@ -186,7 +224,8 @@ func (b Binding) Decode() (x25519Pub, sig []byte, err error) {
 }
 
 // Verify checks that `identity` signed this binding for exactly
-// (tenant, nodeID), and returns the attested X25519 public key.
+// (tenant, nodeID) at this binding's key slot, and returns the attested X25519
+// public key.
 //
 // Everything the check is worth comes from `identity` being trustworthy: the
 // caller must obtain it from a certificate that chains to the pinned tenant CA,
@@ -199,16 +238,20 @@ func (b Binding) Verify(tenant string, nodeID uint16, identity ed25519.PublicKey
 	if len(tenant) > maxTenantLen {
 		return nil, fmt.Errorf("tenant name too long (%d bytes)", len(tenant))
 	}
+	if int(b.Slot) >= WGKeySlots {
+		return nil, fmt.Errorf("key slot %d is out of range (a device holds %d)", b.Slot, WGKeySlots)
+	}
 	x25519Pub, sig, err := b.Decode()
 	if err != nil {
 		return nil, err
 	}
-	if !ed25519.Verify(identity, Message(tenant, nodeID, b.KeyGen, x25519Pub), sig) {
+	if !ed25519.Verify(identity, Message(tenant, nodeID, b.Slot, b.KeyGen, x25519Pub), sig) {
 		// The message is rebuilt here from the VALUES we expect, not from
 		// values we parsed out of the binding -- so a binding made for another
-		// tenant, another node or another key generation simply does not
-		// validate. Nothing is "adjusted" to make it fit.
-		return nil, fmt.Errorf("binding signature does not cover (tenant=%q node=%d key_gen=%d)", tenant, nodeID, b.KeyGen)
+		// tenant, another node, another slot or another key generation simply
+		// does not validate. Nothing is "adjusted" to make it fit.
+		return nil, fmt.Errorf("binding signature does not cover (tenant=%q node=%d slot=%d key_gen=%d)",
+			tenant, nodeID, b.Slot, b.KeyGen)
 	}
 	return x25519Pub, nil
 }

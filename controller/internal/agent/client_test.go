@@ -264,7 +264,11 @@ func TestEnrollRequestCarriesIdentityKeyNotWGKey(t *testing.T) {
 	if !ed25519.PublicKey(pub).Equal(id.IdentityPublicKey()) {
 		t.Error("public_key 不是本机身份公钥")
 	}
-	if bytes.Equal(pub, id.WGPublicKey()) {
+	wgPub, err := id.WGPublicKey(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(pub, wgPub) {
 		t.Error("public_key 交成了 WG 公钥")
 	}
 }
@@ -317,15 +321,17 @@ func TestAuthenticatedCallsFillNodeIDAndCarryBinding(t *testing.T) {
 		t.Errorf("心跳里的 node_id=%d，客户端本该按证书填 7", gotHB.NodeID)
 	}
 
-	binding, err := id.Binding()
+	// 一次交八份，而不是逐槽点调：控制器要能回答"这条隧道我用第 n 把"，
+	// 前提是它手里这台设备的八份担保都是齐的。
+	bindings, err := id.Bindings()
 	if err != nil {
-		t.Fatalf("Binding: %v", err)
+		t.Fatalf("Bindings: %v", err)
 	}
-	stub.resps["/v1/mapping"] = map[string]any{"ok": true, "binding_err": "binding signature does not cover (tenant=\"t1\" node=7)"}
+	stub.resps["/v1/mapping"] = map[string]any{"ok": true, "binding_err": "binding signature does not cover (tenant=\"t1\" node=7 slot=0)"}
 	ack, err := c.ReportMapping(callCtx(t), wire.MappingReport{
 		UDPMapping:  "203.0.113.5:41111",
 		LocalPort:   51820,
-		Binding:     &binding,
+		Bindings:    bindings,
 		VpnPort:     51820,
 		TransitPort: 51821,
 		LocalAddrs:  []string{"10.10.1.2/24"},
@@ -340,8 +346,16 @@ func TestAuthenticatedCallsFillNodeIDAndCarryBinding(t *testing.T) {
 	}
 	var gotMap wire.MappingReport
 	stub.lastBody(t, "/v1/mapping", &gotMap)
-	if gotMap.Binding == nil || gotMap.Binding.X25519Pub != binding.X25519Pub {
-		t.Errorf("映射报告里的绑定丢了或换了: %+v", gotMap.Binding)
+	// 下标就是槽号，所以这里既查长度也查每一格：少一份或错位，控制器就会把
+	// 槽 5 的公钥装进槽 2 的隧道。
+	if len(gotMap.Bindings) != keybinding.WGKeySlots {
+		t.Fatalf("映射报告里的担保 %d 份，期望 %d 份", len(gotMap.Bindings), keybinding.WGKeySlots)
+	}
+	for slot := range bindings {
+		got := gotMap.Bindings[slot]
+		if got.Slot != uint8(slot) || got.X25519Pub != bindings[slot].X25519Pub || got.Sig != bindings[slot].Sig {
+			t.Errorf("槽 %d 的担保在上报里丢了或换了: %+v", slot, got)
+		}
 	}
 	if gotMap.VpnPort != 51820 || gotMap.TransitPort != 51821 {
 		t.Errorf("端口没送出去（重绑过就必须告诉对端在哪找我）: %+v", gotMap)

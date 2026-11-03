@@ -23,8 +23,12 @@ import (
 )
 
 // giveIdentity fills in the two facts a peer spec needs and that the fixture
-// does not have: a certificate and a key binding. Neither is verified here --
-// the render only refuses to describe a peer without them.
+// does not have: a certificate and the eight key bindings. Neither is verified
+// here -- the render only refuses to describe a peer without them.
+//
+// Every slot gets its own public key because that is what the model promises:
+// the n-th tunnel between two devices is dialled with key n, and two slots
+// holding the same key would put both tunnels on one peer in the dataplane.
 func giveIdentity(t *testing.T, s *server, tenant string, ids ...uint16) {
 	t.Helper()
 	s.mu.Lock()
@@ -35,9 +39,15 @@ func giveIdentity(t *testing.T, s *server, tenant string, ids ...uint16) {
 			t.Fatalf("node %s/%d is not in the registry", tenant, id)
 		}
 		rec.CertPEM = "-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n"
-		rec.Binding = &keybinding.Binding{
-			X25519Pub: base64.StdEncoding.EncodeToString(make([]byte, keybinding.X25519PubLen)),
-			KeyGen:    1,
+		rec.Bindings = make([]*keybinding.Binding, keybinding.WGKeySlots)
+		for slot := range rec.Bindings {
+			pub := make([]byte, keybinding.X25519PubLen)
+			pub[0] = byte(slot + 1)
+			rec.Bindings[slot] = &keybinding.Binding{
+				Slot:      uint8(slot),
+				X25519Pub: base64.StdEncoding.EncodeToString(pub),
+				KeyGen:    1,
+			}
 		}
 	}
 }
@@ -100,10 +110,12 @@ func TestBundleSkipsAPeerWithNoBinding(t *testing.T) {
 		t.Fatalf("create tunnel = %d (%s)", rec.Code, rec.Body.String())
 	}
 	giveIdentity(t, s, "t", 1, 2)
-	// The peer has a certificate but never reported its WireGuard key binding:
-	// there is literally no public key to install a peer with.
+	// The peer has a certificate but the ONE key this tunnel dials with is
+	// missing: the other seven slots are still there, so this also proves the
+	// render looks the binding up BY SLOT instead of grabbing whatever exists.
+	// A peer with no public key for this tunnel is literally un-installable.
 	s.mu.Lock()
-	s.state.Nodes[key("t", 2)].Binding = nil
+	s.state.Nodes[key("t", 2)].Bindings[0] = nil
 	s.mu.Unlock()
 
 	b := bundleOf(t, s, "t", 1)
@@ -112,6 +124,38 @@ func TestBundleSkipsAPeerWithNoBinding(t *testing.T) {
 	}
 	if len(b.Skipped) != 1 || !strings.Contains(b.Skipped[0].Reason, "公钥担保") {
 		t.Fatalf("node 1 应看到对端缺担保的跳过项，实际 %+v", b.Skipped)
+	}
+}
+
+// 规格里两处槽号必须同号：本端拿 Slot 去取自己第 n 把私钥，PeerBinding 说的是
+// 对端担保的第 m 把。n != m 装上去就是"这条隧道用的是别条隧道的密钥"，
+// agent 那一侧会整条拒绝（见 internal/agent/tunnel.go 的 applySpec）。
+//
+// 这一段的期望值是"两边都 0"：本增量只把槽号打通，同设备对仍然只放开一条隧道，
+// 而槽 0 就是升级前磁盘上那把 —— 存量隧道的公钥因此一个字节都没变。
+func TestBundleSpecCarriesTheTunnelsKeySlot(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	if rec := createTunnel(t, s, ten, manualTunnel(1, 2, "wan0")); rec.Code != http.StatusCreated {
+		t.Fatalf("create tunnel = %d (%s)", rec.Code, rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2)
+
+	for _, node := range []uint16{1, 2} {
+		b := bundleOf(t, s, "t", node)
+		if len(b.Tunnels) != 1 {
+			t.Fatalf("node %d: %d tunnel(s), skipped=%+v", node, len(b.Tunnels), b.Skipped)
+		}
+		spec := b.Tunnels[0]
+		if spec.Slot != 0 {
+			t.Errorf("node %d: 本端槽号 %d，同设备对只放开一条隧道时期望 0", node, spec.Slot)
+		}
+		if spec.PeerBinding == nil {
+			t.Fatalf("node %d: 对端担保为空", node)
+		}
+		if spec.PeerBinding.Slot != spec.Slot {
+			t.Errorf("node %d: 本端用槽 %d，对端担保却是槽 %d", node, spec.Slot, spec.PeerBinding.Slot)
+		}
 	}
 }
 

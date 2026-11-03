@@ -7,6 +7,7 @@
 package agent
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -28,12 +29,25 @@ import (
 const (
 	deviceKeyFile = "device_ed25519.key"
 	wgKeyFile     = "wg_x25519.key"
+	wgKeySlotFmt  = "wg_x25519.slot%d.key"
 	stateFile     = "state.json"
 	nodeCertFile  = "node_cert.pem"
 	caCertFile    = "ca_cert.pem"
 	keyPerm       = 0o600
 	dirPerm       = 0o700
 )
+
+// wgKeyPath 是第 slot 把 WG 私钥的文件名。
+//
+// 槽 0 沿用 wg_x25519.key、字节不动，不只是省事：存量设备上那条文件里的密钥正被
+// 每一条在跑的隧道用着，给它换个名字等于换密钥 —— 对端 peer 里记的公钥就对不上了，
+// 那是一次真握手。所以升级只新增槽 1..7 的文件。
+func wgKeyPath(slot int) string {
+	if slot == 0 {
+		return wgKeyFile
+	}
+	return fmt.Sprintf(wgKeySlotFmt, slot)
+}
 
 // deviceSigner 把磁盘上的 Ed25519 私钥适配成 keybinding.Signer。
 //
@@ -50,14 +64,41 @@ func (d deviceSigner) Public() ed25519.PublicKey {
 }
 
 // state 是 enroll 之后才知道的那部分身份；私钥不进这个文件。
+//
+// KeyGens 按槽下标存：一把密钥一个轮换计数，换槽 3 的密钥不会让槽 0 的绑定
+// 看起来也换了（控制器就是按这个计数把"轮换"和"重放旧绑定"分开的）。
 type state struct {
-	Serial   string `json:"serial"`
-	KeyGen   uint32 `json:"key_gen"`
-	TenantID string `json:"tenant_id"`
-	NodeID   uint16 `json:"node_id"`
+	Serial   string                        `json:"serial"`
+	KeyGens  [keybinding.WGKeySlots]uint32 `json:"key_gens"`
+	TenantID string                        `json:"tenant_id"`
+	NodeID   uint16                        `json:"node_id"`
 }
 
-// Identity 是一台 CPE 的完整身份：签名密钥、WG 密钥对、以及控制器签发的证书。
+// decodeState 读 state.json，把两种历史格式并成一种。
+//
+// v1 的设备只有一把 WG 密钥，key_gen 是一个标量 —— 那把就是今天的槽 0。
+// 不接住这个值，升级后的第一次 rotate 会把计数从 0 起，控制器会把它当成重放
+// 拒掉（见 cmd/sr-ctrl/main.go 的 applyBinding）。这是本地存档的迁移，不是
+// 线上协议的兼容：v1 的**签名**在这里不认。
+func decodeState(raw []byte) (state, error) {
+	var onDisk struct {
+		Serial   string                        `json:"serial"`
+		KeyGen   uint32                        `json:"key_gen"`
+		KeyGens  [keybinding.WGKeySlots]uint32 `json:"key_gens"`
+		TenantID string                        `json:"tenant_id"`
+		NodeID   uint16                        `json:"node_id"`
+	}
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		return state{}, fmt.Errorf("agent: 读 %s: %w", stateFile, err)
+	}
+	st := state{Serial: onDisk.Serial, KeyGens: onDisk.KeyGens, TenantID: onDisk.TenantID, NodeID: onDisk.NodeID}
+	if st.KeyGens == [keybinding.WGKeySlots]uint32{} {
+		st.KeyGens[0] = onDisk.KeyGen
+	}
+	return st, nil
+}
+
+// Identity 是一台 CPE 的完整身份：签名密钥、八把 WG 密钥对、以及控制器签发的证书。
 //
 // 顺序有硬性依赖：X25519 公钥要用**身份密钥**签名（keybinding），而签名消息里
 // 含 (tenant, node_id) —— 这两个值只有 enroll 之后才知道。所以私钥先生成、
@@ -65,8 +106,10 @@ type state struct {
 type Identity struct {
 	dir    string
 	signer deviceSigner
-	wgPriv []byte // 32 字节，交给 VPP 的那把（定案 3）
-	wgPub  []byte
+	// wgPriv/wgPub 按槽下标存，长度恒为 keybinding.WGKeySlots。第 n 条隧道
+	// （同一设备对内）两端各用第 n 把 —— 这是"同对设备能建 8 条隧道"的根据。
+	wgPriv [keybinding.WGKeySlots][]byte // 32 字节，交给 VPP 的那把（定案 3）
+	wgPub  [keybinding.WGKeySlots][]byte
 	state  state
 	ready  bool // SetEnrolled 成功 = 有可用证书与 CA
 
@@ -92,18 +135,27 @@ func LoadOrCreate(dir, serial string) (*Identity, error) {
 	}
 	id.signer = deviceSigner{k: priv}
 
-	wg, err := loadOrCreateX25519(filepath.Join(dir, wgKeyFile))
-	if err != nil {
-		return nil, err
+	for slot := 0; slot < keybinding.WGKeySlots; slot++ {
+		wg, err := loadOrCreateX25519(filepath.Join(dir, wgKeyPath(slot)))
+		if err != nil {
+			return nil, err
+		}
+		if err := id.setWGKey(slot, wg); err != nil {
+			return nil, err
+		}
 	}
-	if err := id.setWGKey(wg); err != nil {
+	// 「八把两两不同」是同设备对第 n 条隧道各用第 n 把不撞 VPP -116 的前提之一，
+	// 而这件事 agent 自己就能查。放在启动时查，不留到隧道建到一半由数据面报错。
+	if err := id.checkWGKeysDistinct(); err != nil {
 		return nil, err
 	}
 
 	if raw, err := os.ReadFile(filepath.Join(dir, stateFile)); err == nil {
-		if err := json.Unmarshal(raw, &id.state); err != nil {
-			return nil, fmt.Errorf("agent: 读 %s: %w", stateFile, err)
+		st, err := decodeState(raw)
+		if err != nil {
+			return nil, err
 		}
+		id.state = st
 		// serial 以调用方为准：它是操作者输入的标识，不该被磁盘上的旧值顶掉。
 		id.state.Serial = serial
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -175,26 +227,73 @@ func loadOrCreateX25519(path string) ([]byte, error) {
 }
 
 // setWGKey 由私钥推出公钥并存下来。公钥是唯一对外可见的那半。
-func (id *Identity) setWGKey(priv []byte) error {
+func (id *Identity) setWGKey(slot int, priv []byte) error {
 	k, err := ecdh.X25519().NewPrivateKey(priv)
 	if err != nil {
-		return fmt.Errorf("agent: WG 私钥不合法: %w", err)
+		return fmt.Errorf("agent: 槽 %d 的 WG 私钥不合法: %w", slot, err)
 	}
-	id.wgPriv = append([]byte(nil), priv...)
-	id.wgPub = k.PublicKey().Bytes()
+	id.wgPriv[slot] = append([]byte(nil), priv...)
+	id.wgPub[slot] = k.PublicKey().Bytes()
+	return nil
+}
+
+// checkWGKeysDistinct 保证八把公钥互不相同。
+//
+// 这是密钥槽模型的前提：同设备对的两条隧道靠"各自用第 n 把"来让对端公钥不同，
+// 如果两把其实是同一把，那两条隧道在 VPP 里就是同一个人 —— 第二条 -116。
+// 报错只带槽号：公钥本身是公开材料，但这里没必要让日志变成密钥清单。
+func (id *Identity) checkWGKeysDistinct() error {
+	for a := 0; a < keybinding.WGKeySlots; a++ {
+		for b := a + 1; b < keybinding.WGKeySlots; b++ {
+			if !bytes.Equal(id.wgPub[a], id.wgPub[b]) {
+				continue
+			}
+			return fmt.Errorf("agent: 槽 %d 与槽 %d 的 WG 公钥相同（%s 与 %s 是同一把密钥）。"+
+				"同设备对的两条隧道会因此撞在数据面的 peer 去重上，删掉其中一个文件让 agent 重新生成",
+				a, b, wgKeyPath(a), wgKeyPath(b))
+		}
+	}
 	return nil
 }
 
 // WGPrivateKey 交给数据面装入 VPP（定案 3：agent 生成，控制器只是中继）。
-func (id *Identity) WGPrivateKey() []byte { return append([]byte(nil), id.wgPriv...) }
+//
+// slot 是从控制器下发的隧道规格里来的，属于外部输入，所以越界要报错而不是 panic：
+// agent 是长期进程，一个坏字段不该把已经在转发的隧道一起带走。
+func (id *Identity) WGPrivateKey(slot int) ([]byte, error) {
+	if err := checkSlot(slot); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), id.wgPriv[slot]...), nil
+}
 
 // WGPublicKey 是要签进 keybinding、再交给对端做 `wireguard peer add` 的那 32 字节。
-func (id *Identity) WGPublicKey() []byte { return append([]byte(nil), id.wgPub...) }
+func (id *Identity) WGPublicKey(slot int) ([]byte, error) {
+	if err := checkSlot(slot); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), id.wgPub[slot]...), nil
+}
+
+func checkSlot(slot int) error {
+	if slot < 0 || slot >= keybinding.WGKeySlots {
+		return fmt.Errorf("agent: 密钥槽号 %d 越界（本机只有 %d 把 WG 密钥，槽号 0..%d）",
+			slot, keybinding.WGKeySlots, keybinding.WGKeySlots-1)
+	}
+	return nil
+}
 
 func (id *Identity) Serial() string   { return id.state.Serial }
 func (id *Identity) TenantID() string { return id.state.TenantID }
 func (id *Identity) NodeID() uint16   { return id.state.NodeID }
-func (id *Identity) KeyGen() uint32   { return id.state.KeyGen }
+
+// KeyGen 是第 slot 把密钥的轮换计数。每槽独立：换槽 3 不会让槽 0 的绑定看起来也换了。
+func (id *Identity) KeyGen(slot int) (uint32, error) {
+	if err := checkSlot(slot); err != nil {
+		return 0, err
+	}
+	return id.state.KeyGens[slot], nil
+}
 
 // IdentityPublicKey 是 enroll 请求里那个 base64 public_key 的来源。
 func (id *Identity) IdentityPublicKey() ed25519.PublicKey { return id.signer.Public() }
@@ -305,33 +404,64 @@ func (id *Identity) save() error {
 	return os.WriteFile(filepath.Join(id.dir, stateFile), raw, 0o644)
 }
 
-// Binding 产出当前 WG 公钥的身份担保。未 enroll 时调用是错误，不是空值 ——
+// Binding 产出第 slot 把 WG 公钥的身份担保。未 enroll 时调用是错误，不是空值 ——
 // 绑定消息里含 (tenant, node_id)，缺了它们签出来的东西对端一定验不过。
-func (id *Identity) Binding() (keybinding.Binding, error) {
+func (id *Identity) Binding(slot int) (keybinding.Binding, error) {
 	if !id.ready {
 		return keybinding.Binding{}, errors.New("agent: 尚未 enroll，签不出有效的 key binding")
 	}
-	return keybinding.Sign(id.signer, id.state.TenantID, id.state.NodeID, id.state.KeyGen, id.wgPub)
+	pub, err := id.WGPublicKey(slot)
+	if err != nil {
+		return keybinding.Binding{}, err
+	}
+	gen, err := id.KeyGen(slot)
+	if err != nil {
+		return keybinding.Binding{}, err
+	}
+	return keybinding.Sign(id.signer, id.state.TenantID, id.state.NodeID, uint8(slot), gen, pub)
 }
 
-// RotateWGKey 换一把 WG 私钥并递增 key_gen。
+// Bindings 一次交出八份担保，下标就是槽号。
+//
+// 心跳/上报走这个而不是逐槽点调：一份隧道规格里对端用哪把是控制器决定的，
+// 而控制器只有拿到全部八份才能回答"这条隧道我用第 n 把"。八份不可互换，
+// 所以这里也不能压成一份。
+func (id *Identity) Bindings() ([]keybinding.Binding, error) {
+	out := make([]keybinding.Binding, keybinding.WGKeySlots)
+	for slot := range out {
+		b, err := id.Binding(slot)
+		if err != nil {
+			return nil, err
+		}
+		out[slot] = b
+	}
+	return out, nil
+}
+
+// RotateWGKey 换第 slot 把 WG 私钥并递增那一槽的 key_gen。
 //
 // key_gen 必须单调递增：控制器与对端都靠它把"轮换"和"重放旧绑定"分开
 // （见 keybinding.Binding 的注释）。落盘顺序是私钥先、state 后 —— 中途崩溃
 // 只会导致公钥比 key_gen 新一次，多签一次无害；反过来则会用旧 gen 签新钥，
 // 对端会当成重放丢掉。
-func (id *Identity) RotateWGKey() error {
+//
+// 只换一把：其余七把的隧道不受影响，这正是每槽独立计数的意义 —— 换槽 3 之后
+// 槽 0 的担保仍是旧 gen、旧公钥，对端不必重握手。
+func (id *Identity) RotateWGKey(slot int) error {
+	if err := checkSlot(slot); err != nil {
+		return err
+	}
 	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("agent: 生成新 WG 密钥: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(id.dir, wgKeyFile), k.Bytes(), keyPerm); err != nil {
+	if err := os.WriteFile(filepath.Join(id.dir, wgKeyPath(slot)), k.Bytes(), keyPerm); err != nil {
 		return fmt.Errorf("agent: 写新 WG 私钥: %w", err)
 	}
-	if err := id.setWGKey(k.Bytes()); err != nil {
+	if err := id.setWGKey(slot, k.Bytes()); err != nil {
 		return err
 	}
-	id.state.KeyGen++
+	id.state.KeyGens[slot]++
 	return id.save()
 }
 

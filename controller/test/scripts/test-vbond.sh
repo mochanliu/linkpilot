@@ -25,8 +25,9 @@
 #      console 会话鉴权（无 token 401、错误 token 401、正确 token 拿到 cookie）
 #  10c. 多角色：租户账号只看自己（state + SSE 都在服务端过滤）、租户对运营方
 #      接口一律 403、运营方 state 不含 runtime/端口、口令策略/改密/禁用/限速
-#  11. WG 静态公钥的设备身份担保（keybinding）：控制器验签后存储并 relay 原文；
-#      签名正确但覆盖对象不对（拿别人的 tenant/node 签）必须被拒
+#  11. WG 密钥环的设备身份担保（keybinding，每设备 8 把、槽号在签名里）：控制器逐槽
+#      验签后存储并 relay 原文；签名正确但覆盖对象不对（拿别人的 tenant/node 签）必须
+#      被拒；只报三把（老版本 agent）整份拒绝，一格都不动
 #  12. 观测回报 /v1/observe：按"我看到的源"归因到具体节点，逐读者渲染；
 #      陌生人地址不猜、落在非数据面端口的不算、node_id 冒充被拒、
 #      先观测到后申报地址的迟到归因、reset 让消失的源真的消失
@@ -100,9 +101,9 @@ else
 fi
 BIN=$(dx "$CTRL" 'cd /workspace/controller && go build -o /tmp/sr-ctrl ./cmd/sr-ctrl && go build -o /tmp/sr-stunprobe ./cmd/sr-stunprobe && echo BIN_OK')
 [ "$BIN" = "BIN_OK" ] && ok "两个二进制产出（sr-ctrl / sr-stunprobe）" || { bad "二进制构建失败：$BIN"; exit 1; }
-# 客户端状态目录必须每轮清空：srwg-node1 是常驻容器，上一轮的 dev*.bind.json /
-# *.key 会留在里面，而 mapping 会"有 bind.json 就带上"。上一轮的合法 binding
-# 混进本轮，就能把"这一轮伪造的 binding 没进注册表"验证成假阳性/假阴性。
+# 客户端状态目录必须每轮清空：srwg-node1 是常驻容器，上一轮的 dev*.bindings.json /
+# *.x25519*.key 会留在里面，而 mapping 会"有 bindings.json 就带上"。上一轮的合法
+# 关键环混进本轮，就能把"这一轮伪造的担保没进注册表"验证成假阳性/假阴性。
 dx "$N1" 'rm -rf /opt/vbond && mkdir -p /opt/vbond' >/dev/null
 docker cp "$CTRL:/tmp/sr-stunprobe" "$TMP/sr-stunprobe" >/dev/null && \
 docker cp "$TMP/sr-stunprobe" "$N1:/opt/vbond/sr-stunprobe" >/dev/null
@@ -427,8 +428,14 @@ echo "$W" | grep -q "snapshot" && ok "watch 建连即发 snapshot，无需额外
     || bad "watch 没有 snapshot"
 
 # ==================================================================
-say "9. WG 静态公钥的设备身份担保（覆盖项 11）"
-# 用 dev2 的身份私钥签一个"声称 tenant-b / node 1"的 binding：签名本身是真的，
+say "9. WG 密钥环的设备身份担保（覆盖项 11）"
+# 一台设备有 8 把 WireGuard 密钥，每把单独担保，槽号在签名里。这一节立三件事：
+# 担保真的被验（不是只看有没有签名字段）、不满八把整份拒绝、控制器 relay 的是
+# 原文且槽号对得上（没换钥匙）。"一把坏的只砸那一格、其余七把照常入库"不在这里，
+# 它由 cmd/sr-ctrl/keyring_test.go 的 TestApplyBindingsKeepsGoodSlotsWhenOneIsBad
+# 逐槽验：手工客户端要么整份合法要么整份冒充，做不出"只有第三把坏"的关键环。
+#
+# 用 dev2 的身份私钥签一个"声称 tenant-b / node 1"的关键环：签名本身是真的，
 # 覆盖的对象是假的。控制器如果只检查"有没有签名字段"就会收下，然后把它 relay 给
 # 对端 —— 这一条就是用来区分"验签"和"验了个格式"。
 cli bind dev2 tenant-b 1 1 >/dev/null || { bad "bind 失败（openssl pkeyutl -rawin 可用？）"; }
@@ -436,32 +443,65 @@ FB=$(cli mapping dev2 "10.99.2.2:41780" 41780 "$CTRL_IP:3478" "10.99.2.2")
 echo "$FB" | sed 's/^/    /'
 echo "$FB" | grep -q '"binding_err":"[^"]' \
     && ok "签名正确但对象不对（冒充 tenant-b/node1）→ 拒绝并报出原因" \
-    || bad "伪造的 binding 被接受了：$FB"
-# 控制器不能顺手清掉上一次的正确存储：dev2 此刻应当仍然没有可用 binding（第一次就是伪造）。
+    || bad "伪造的关键环被接受了：$FB"
+# 控制器不能顺手清掉上一次的正确存储：dev2 此刻应当仍然没有可用担保（第一次就是伪造）。
 R2a=$(cli registry dev2)
 echo "$R2a" | grep -A1 "node=2 " | grep -q "binding=无" \
-    && ok "被拒的 binding 没有进注册表（node2 仍是无担保状态）" \
-    || bad "被拒的 binding 出现在注册表里：$R2a"
+    && ok "被拒的关键环没有进注册表（node2 仍是无担保状态）" \
+    || bad "被拒的关键环出现在注册表里：$R2a"
 
-# 现在换成真身份：tenant-a / node 2。
+# 只报三把 = 老版本 agent 的痕迹。收下等于把另外五格清空，而注册表里的隧道还可能
+# 指着它们 —— 必须整份拒绝，一格都不动。
+# 槽数走环境变量：cli() 是 `$*` 拼串，为了传第 6 个参数而写空的 tenant/node 会被
+# 压掉，命令实际变成 `bind dev2 1 3`（把 1 当 tenant、3 当 node），测出来的是冒充
+# 身份而不是长度不合。
+dx "$N1" 'VBOND_SLOTS=3 /opt/vbond-client.sh bind dev2' >/dev/null || { bad "bind（三把）失败"; }
+PB=$(cli mapping dev2 "10.99.2.2:41780" 41780 "$CTRL_IP:3478" "10.99.2.2")
+echo "$PB" | grep -q '"binding_err":"keyring has 3 entries' \
+    && ok "不满八把的关键环整份拒绝，并报出实际几把：$(echo "$PB" | sed -n 's/.*"binding_err":"\([^"]*\)".*/\1/p')" \
+    || bad "三把的关键环被接受了：$PB"
+R2b=$(cli registry dev2)
+echo "$R2b" | grep -A1 "node=2 " | grep -q "binding=无" \
+    && ok "整份拒绝时一格都没存（node2 仍是无担保状态）" \
+    || bad "被整份拒绝的关键环留下了存量：$R2b"
+
+# 现在换成真身份：tenant-a / node 2，八把齐。
 X2=$(cli bind dev2 | sed -n 's/.*x25519=\([^ ]*\).*/\1/p')
 MB=$(cli mapping dev2 "10.99.2.2:41780" 41780 "$CTRL_IP:3478" "10.99.2.2")
-echo "$MB" | grep -q '"binding_err":""' && ok "同租户同 node 的 binding 通过校验（binding_err 空）" \
-    || bad "正当 binding 被拒：$MB"
+echo "$MB" | grep -q '"binding_err":""' && ok "同租户同 node 的八把担保全部通过校验（binding_err 空）" \
+    || bad "正当关键环被拒：$MB"
 # 先重新取一份注册表快照，再取文件：docker cp 拿到的是容器里上一轮的旧 JSON，
 # 拿它比对会得出"公钥没 relay"的假结论（本轮就差点被这个坑骗过去）。
 cli registry dev2 >/dev/null
 docker cp "$N1:/opt/vbond/dev2.reg.json" "$TMP/dev2.reg.json" >/dev/null
+docker cp "$N1:/opt/vbond/dev2.bindings.json" "$TMP/dev2.bindings.json" >/dev/null
 RELAY=$(python3 -c '
 import json,sys
 d=json.load(open(sys.argv[1]))
 for p in d["peers"]:
     if p["node_id"] == 2:
-        b = p.get("key_binding") or {}
-        print(b.get("x25519_pub",""))' "$TMP/dev2.reg.json")
-[ -n "$X2" ] && [ "$RELAY" = "$X2" ] \
-    && ok "注册表 relay 的就是那把 X25519 公钥原文（逐字节一致，控制器没换钥匙）" \
-    || bad "relay 的公钥对不上：客户端=$X2 注册表=$RELAY"
+        for b in p.get("key_bindings") or []:
+            print("%d %s" % (b["slot"], b["x25519_pub"]))' "$TMP/dev2.reg.json")
+WANT=$(python3 -c '
+import json,sys
+for b in json.load(open(sys.argv[1])):
+    print("%d %s" % (b["slot"], b["x25519_pub"]))' "$TMP/dev2.bindings.json")
+[ "$RELAY" = "$WANT" ] && [ -n "$WANT" ] \
+    && ok "注册表 relay 的就是那八把 X25519 公钥原文，槽号也对（逐字节一致，控制器没换钥匙）" \
+    || bad "relay 的关键环对不上：客户端=[$(echo "$WANT" | tr '\n' ';')] 注册表=[$(echo "$RELAY" | tr '\n' ';')]"
+[ "$(echo "$WANT" | awk '{print $1}' | sort -n | uniq | wc -l | tr -d ' ')" = "8" ] \
+    && ok "八把各自占一个槽，槽号不重复" || bad "relay 出来的槽号不足八个不同的：$WANT"
+X2SLOT0=$(echo "$WANT" | awk '$1==0 {print $2}')
+[ -n "$X2" ] && [ "$X2SLOT0" = "$X2" ] \
+    && ok "槽 0 就是磁盘上那把老密钥（沿用原文件名），存量隧道的公钥没变" \
+    || bad "槽 0 换了钥匙：客户端=$X2 注册表槽0=$X2SLOT0"
+# 八把两两不同：同设备对的两条隧道各自撞在不同槽上，VPP 的 peer 池才容得下。
+python3 -c '
+import sys
+pubs=[l.split()[1] for l in sys.stdin if l.strip()]
+if len(set(pubs)) != len(pubs):
+    sys.exit(1)' <<< "$WANT" && ok "八把公钥两两不同（同设备对多条隧道不会撞 -116）" \
+    || bad "有两把公钥相同，槽号等于白分：$WANT"
 
 # ==================================================================
 say "10. 观测回报与归因（覆盖项 12）"

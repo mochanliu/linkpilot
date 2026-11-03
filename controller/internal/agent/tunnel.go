@@ -419,7 +419,8 @@ func (t *TunnelSync) fetchAndApply(ctx context.Context, desired int) (
 	if err != nil {
 		return 0, 0, 0, nil, err
 	}
-	priv := t.id.WGPrivateKey()
+	// 私钥按槽取：一条隧道用哪一把是控制器在规格里点名的（spec.Slot），
+	// 两端各用自己同一号的那把，所以对端公钥才不会撞。
 	ifaces, err := dp.DumpInterfaces(ctx)
 	if err != nil {
 		return 0, 0, 0, nil, fmt.Errorf("读接口表（解析隧道出口）: %w", err)
@@ -446,6 +447,11 @@ func (t *TunnelSync) fetchAndApply(ctx context.Context, desired int) (
 	for _, spec := range b.Tunnels {
 		keep[spec.TunnelID] = true
 		keepInst[spec.Instance] = true
+		priv, err := t.id.WGPrivateKey(int(spec.Slot))
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("隧道 %s: %v", spec.TunnelID, err))
+			continue
+		}
 		if err := t.applySpec(ctx, b, spec, ca, priv, ifaces); err != nil {
 			errs = append(errs, fmt.Sprintf("隧道 %s: %v", spec.TunnelID, err))
 			continue
@@ -512,6 +518,12 @@ func (t *TunnelSync) applySpec(ctx context.Context, b wire.UnderlayBundle,
 	if spec.Instance < wire.UnderlayInstanceBase {
 		return fmt.Errorf("实例号 %d 低于 agent 的起点 %d：不接管（手配的接口归人管）",
 			spec.Instance, wire.UnderlayInstanceBase)
+	}
+	// 本端用槽 n 的私钥，就必须装槽 n 的对端公钥。担保自己写着槽号（签名也盖了它），
+	// 两者不一致只可能是下发层给错了：装上会成一条"永远握不上手"的隧道，
+	// 而它的症状和链路故障一模一样。
+	if spec.PeerBinding != nil && spec.PeerBinding.Slot != spec.Slot {
+		return fmt.Errorf("这条隧道用密钥槽 %d，下发的对端担保写的是槽 %d", spec.Slot, spec.PeerBinding.Slot)
 	}
 	cfg, err := t.linkConfig(ctx, b, spec, ca, priv, ifaces)
 	if err != nil {

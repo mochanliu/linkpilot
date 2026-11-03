@@ -410,8 +410,14 @@ type MappingReport struct {
 	// on the way out. Empty means "no probe ran"; a value that matches no
 	// reported interface is a contradiction the planner must refuse, not smooth
 	// over: it means the probe left through a path the dataplane does not own.
-	ProbeLocal string              `json:"probe_local,omitempty"`
-	Binding    *keybinding.Binding `json:"key_binding,omitempty"`
+	ProbeLocal string `json:"probe_local,omitempty"`
+	// Bindings is the device's whole keyring: one attestation per WG key slot,
+	// index == slot number. It is a list and not one entry because a device holds
+	// keybinding.WGKeySlots keys and a tunnel says which slot its peer uses -- a
+	// peer cannot pick a slot it has never been given a key for. nil/empty means
+	// "this agent does not report bindings at all", which is different from a
+	// list shorter than the slot count (a stale binding set: refuse to build).
+	Bindings []keybinding.Binding `json:"key_bindings,omitempty"`
 
 	// VpnPort / TransitPort are what this node's dataplane REALLY listens on,
 	// which is not necessarily what enrollment pushed: a node that could not
@@ -532,7 +538,14 @@ type TunnelSpec struct {
 	// Peer identity: the certificate and the attested key binding travel with
 	// the tunnel so the device authenticates the peer itself instead of
 	// trusting the controller's word (see agent.Link.authenticate).
+	//
+	// Slot is which of the peer's keybinding.WGKeySlots keys THIS tunnel uses,
+	// and PeerBinding is that one slot's attestation -- not the peer's whole
+	// keyring. The two must agree (binding.Slot == Slot) or the device would
+	// install a key the signature never covered. A device picks its own key for
+	// the same slot number, so the pair's n-th tunnel is n-th key on both ends.
 	PeerCertPEM string              `json:"peer_cert_pem"`
+	Slot        uint8               `json:"slot"`
 	PeerBinding *keybinding.Binding `json:"peer_binding,omitempty"`
 
 	// Relays is the relay chain, in traversal order: Relays[0] is the FIRST box
@@ -605,10 +618,10 @@ type TunnelState struct {
 // mapping again because a NAT rebinding must be able to travel on the
 // heartbeat path alone (no separate re-registration round trip).
 type HeartbeatRequest struct {
-	NodeID     uint16              `json:"node_id"`
-	UDPMapping string              `json:"udp_mapping"`
-	Uptime     int64               `json:"uptime_sec"`
-	Binding    *keybinding.Binding `json:"key_binding,omitempty"`
+	NodeID     uint16               `json:"node_id"`
+	UDPMapping string               `json:"udp_mapping"`
+	Uptime     int64                `json:"uptime_sec"`
+	Bindings   []keybinding.Binding `json:"key_bindings,omitempty"`
 	// Config is what this device runs right now. nil means "this agent does not
 	// implement the config channel" (an older binary), which the controller must
 	// not confuse with Capable=false ("newer binary, started without -apply").
@@ -681,7 +694,7 @@ type HeartbeatResponse struct {
 
 // PeerInfo is one entry of the endpoint table, as seen by one tenant.
 //
-// CertPEM and Binding are relayed so the RECEIVER can authenticate them itself.
+// CertPEM and Bindings are relayed so the RECEIVER can authenticate them itself.
 // The controller authenticates the binding too (it would otherwise relay
 // garbage), but that check is a convenience, not the guarantee: the guarantee
 // is that the relying party verifies against the CA it has pinned, and can do
@@ -716,17 +729,19 @@ type PeerInfo struct {
 	ObservedAgeSec   uint64 `json:"observed_age_sec,omitempty"`
 	ObservedVerified bool   `json:"observed_verified,omitempty"`
 	// Reachability verdict: "unknown" | "punching" | "ready" | "relay"
-	Reach       string              `json:"reach"`
-	LastSeen    int64               `json:"last_seen_unix"`
-	AgentVer    string              `json:"agent_version"`
-	IsSelf      bool                `json:"is_self"`
-	Stale       bool                `json:"stale"`
-	SymmetricNA bool                `json:"symmetric_nat"`
-	CertPEM     string              `json:"cert_pem,omitempty"`
-	Binding     *keybinding.Binding `json:"key_binding,omitempty"`
-	// KeyGen lets a receiver tell a rotation from a replay without parsing the
-	// binding, and makes key generation visible in the registry view.
-	KeyGen uint32 `json:"key_gen,omitempty"`
+	Reach       string               `json:"reach"`
+	LastSeen    int64                `json:"last_seen_unix"`
+	AgentVer    string               `json:"agent_version"`
+	IsSelf      bool                 `json:"is_self"`
+	Stale       bool                 `json:"stale"`
+	SymmetricNA bool                 `json:"symmetric_nat"`
+	CertPEM     string               `json:"cert_pem,omitempty"`
+	Bindings    []keybinding.Binding `json:"key_bindings,omitempty"`
+	// Bindings is the peer's whole keyring, index == slot number: a reader that
+	// wants to talk to this peer has to be told every key it might meet, because
+	// which slot a tunnel uses is decided per tunnel pair, not per peer. Each
+	// entry carries its own key_gen, so a receiver tells a rotation from a replay
+	// without a separate counter list.
 }
 
 // WatchEvent is one line of the push stream. Types:

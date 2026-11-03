@@ -124,13 +124,19 @@ type NodeRecord struct {
 	// node declared for the link between them.
 	Tunnels []wire.TunnelEndpoint `json:"tunnels,omitempty"`
 
-	// Binding is the device's attested X25519 key (verified before storage --
-	// see applyBinding), and per the wire contract that key IS the node's
-	// WireGuard static public key. The controller stores and relays it; it can
-	// check it but can never produce one, because it does not hold the device's
-	// identity key.
-	Binding *keybinding.Binding `json:"key_binding,omitempty"`
-	KeyGen  uint32              `json:"key_gen,omitempty"`
+	// Bindings is the device's keyring: one attested X25519 key per WG key slot,
+	// stored at its slot index (verified before storage -- see applyBindings),
+	// and per the wire contract each key IS that tunnel's WireGuard static public
+	// key. The controller stores and relays them; it can check them but can never
+	// produce one, because it does not hold the device's identity key. A nil entry
+	// means that slot has never been reported, and a tunnel whose slot is empty
+	// cannot be delivered.
+	//
+	// Old state.json files carry a single key_binding whose signature was made
+	// over the v1 message (no slot byte). It cannot verify under v2, so the
+	// migration drops it instead of relaying an attestation the relying party
+	// would reject: the agent re-reports the whole keyring within one heartbeat.
+	Bindings []*keybinding.Binding `json:"key_bindings,omitempty"`
 
 	// Config is the device's own report of the customer-side configuration it
 	// runs (see wire.ConfigState). It is PERSISTED, unlike telemetry: "this box
@@ -1254,13 +1260,15 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		rec.UDPMapping = req.UDPMapping
 	}
 	var bindingErr string
-	keyChanged, err := s.applyBinding(rec, req.Binding)
+	keyChanged, err := s.applyBindings(rec, req.Bindings)
 	if err != nil {
 		// NON-FATAL on purpose: the node is still a valid rendezvous endpoint,
 		// and dropping it would turn "your key material was rejected" into
-		// "you vanished". The agent gets a named reason and surfaces it.
+		// "you vanished". The agent gets a named reason and surfaces it. A slot
+		// that fails verification leaves the other slots stored; a report that
+		// fails as a whole (wrong length, unusable device key) changes nothing.
 		bindingErr = err.Error()
-		log.Printf("binding REJECTED tenant=%s node=%d: %v", tenant, nodeID, err)
+		log.Printf("binding rejected tenant=%s node=%d: %v", tenant, nodeID, err)
 	}
 	// The device's account of what it runs. Stored as reported: the controller
 	// does not infer "applied" from "published", and an absent Config (an older
@@ -1423,16 +1431,18 @@ func (s *server) handleMapping(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var bindingErr string
-	keyChanged, err := s.applyBinding(rec, rep.Binding)
+	keyChanged, err := s.applyBindings(rec, rep.Bindings)
 	if err != nil {
 		bindingErr = err.Error()
-		log.Printf("binding REJECTED tenant=%s node=%d: %v", tenant, nodeID, err)
-	} else if keyChanged {
-		// A new binding is itself a reason to push. Peers must install the new
-		// WireGuard key BEFORE they try to talk; discovering it by packet loss
-		// would make a rotation look like a link failure.
+		log.Printf("binding rejected tenant=%s node=%d: %v", tenant, nodeID, err)
+	}
+	// Not an else-branch: applyBindings stores per slot, so a report with one
+	// bad attestation can still have rotated another. Peers must install the new
+	// WireGuard key BEFORE they try to talk; discovering it by packet loss would
+	// make a rotation look like a link failure.
+	if keyChanged {
 		changed = true
-		log.Printf("pushing new key binding for %s/%d to peers", tenant, nodeID)
+		log.Printf("pushing new key bindings for %s/%d to peers", tenant, nodeID)
 	}
 	s.save()
 
@@ -1984,7 +1994,7 @@ func (s *server) tenantKeyRing(tenant string) []wire.PKey {
 	return ring
 }
 
-// applyBinding authenticates and stores a node's X25519 key binding.
+// applyBindings authenticates and stores a node's whole X25519 keyring.
 //
 // The controller verifies too, even though the relying party verifies again.
 // Two different jobs: this one stops the controller from RELAYING garbage (and
@@ -1994,41 +2004,103 @@ func (s *server) tenantKeyRing(tenant string) []wire.PKey {
 // mapping is still useful for rendezvous) but is reported back to the agent so
 // it can surface it.
 //
-// Returns whether the stored binding actually changed, so the caller knows when
+// Per slot, not all-or-nothing. One bad attestation must not cost the device
+// the other seven: a tunnel whose slot is stored refuses to deliver with a
+// named reason, which is strictly better than every tunnel on the box going
+// dark because one key rotated wrong.
+//
+// Returns whether any stored binding actually changed, so the caller knows when
 // peers need to be told. A silent key change would leave every peer holding an
 // O-key that no longer matches, and the only symptom would be "packets arrive
 // but do not decrypt".
 //
 // Must be called with s.mu held.
-func (s *server) applyBinding(rec *NodeRecord, b *keybinding.Binding) (changed bool, err error) {
-	if b == nil {
+func (s *server) applyBindings(rec *NodeRecord, bs []keybinding.Binding) (changed bool, err error) {
+	if len(bs) == 0 {
 		return false, nil
+	}
+	// A keyring that is not the full eight is a device reporting a stale or
+	// partial set. Accepting it would silently retire slots the tunnels in the
+	// registry still point at.
+	if len(bs) != keybinding.WGKeySlots {
+		return false, fmt.Errorf("keyring has %d entries, a device reports %d",
+			len(bs), keybinding.WGKeySlots)
 	}
 	pub, err := base64.StdEncoding.DecodeString(rec.PublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return false, fmt.Errorf("stored device key is unusable")
 	}
-	if _, err := b.Verify(rec.TenantID, rec.NodeID, ed25519.PublicKey(pub)); err != nil {
-		return false, err
+	id := ed25519.PublicKey(pub)
+	if rec.Bindings == nil {
+		rec.Bindings = make([]*keybinding.Binding, keybinding.WGKeySlots)
 	}
-	// Going BACKWARDS in key generation is a replay of an old binding, and is
-	// refused. Going forward is a rotation, which is legitimate and must be
-	// announced.
-	if rec.KeyGen != 0 && b.KeyGen < rec.KeyGen {
-		return false, fmt.Errorf("key_gen went backwards (%d -> %d): stale binding replay", rec.KeyGen, b.KeyGen)
+	var firstErr error
+	for i := range bs {
+		b := bs[i]
+		if int(b.Slot) != i {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("slot %d arrived at position %d in the keyring", b.Slot, i)
+			}
+			continue
+		}
+		if _, err := b.Verify(rec.TenantID, rec.NodeID, id); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("slot %d: %w", b.Slot, err)
+			}
+			continue
+		}
+		cur := rec.Bindings[i]
+		// Going BACKWARDS in key generation is a replay of an old binding, and is
+		// refused. Going forward is a rotation, which is legitimate and must be
+		// announced.
+		if cur != nil && b.KeyGen < cur.KeyGen {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("slot %d: key_gen went backwards (%d -> %d): stale binding replay",
+					i, cur.KeyGen, b.KeyGen)
+			}
+			continue
+		}
+		if cur != nil && cur.X25519Pub == b.X25519Pub && cur.KeyGen == b.KeyGen {
+			continue // unchanged; the common case on every heartbeat
+		}
+		rotated := cur != nil
+		cp := b
+		rec.Bindings[i] = &cp
+		if rotated {
+			log.Printf("node %s/%d: x25519 key ROTATED in slot %d to generation %d",
+				rec.TenantID, rec.NodeID, i, b.KeyGen)
+		} else {
+			log.Printf("node %s/%d: x25519 binding accepted in slot %d (gen %d)",
+				rec.TenantID, rec.NodeID, i, b.KeyGen)
+		}
+		changed = true
 	}
-	if rec.Binding != nil && rec.Binding.X25519Pub == b.X25519Pub && rec.Binding.KeyGen == b.KeyGen {
-		return false, nil // unchanged; the common case on every heartbeat
+	return changed, firstErr
+}
+
+// storedBindings turns the record's per-slot pointers into the list a reader
+// gets. A slot that was never reported is absent rather than a zero-value
+// binding: an empty attestation in the list would claim "a key covered by
+// nothing", which is a different statement from "I have not heard it yet".
+func storedBindings(list []*keybinding.Binding) []keybinding.Binding {
+	out := make([]keybinding.Binding, 0, len(list))
+	for _, b := range list {
+		if b == nil {
+			continue
+		}
+		out = append(out, *b)
 	}
-	rotated := rec.KeyGen != 0
-	rec.Binding = b
-	rec.KeyGen = b.KeyGen
-	if rotated {
-		log.Printf("node %s/%d: x25519 key ROTATED to generation %d", rec.TenantID, rec.NodeID, b.KeyGen)
-	} else {
-		log.Printf("node %s/%d: x25519 binding accepted (gen %d)", rec.TenantID, rec.NodeID, b.KeyGen)
+	return out
+}
+
+// bindingAt picks the attestation for one key slot out of the stored keyring.
+// nil means that slot has never been reported -- which is not the same thing as
+// a slot reported with key_gen 0.
+func bindingAt(list []*keybinding.Binding, slot uint8) *keybinding.Binding {
+	if int(slot) >= len(list) {
+		return nil
 	}
-	return true, nil
+	return list[slot]
 }
 
 // toPeerInfoLocked renders one registry row AS SEEN BY A READER.
@@ -2054,8 +2126,7 @@ func (s *server) toPeerInfoLocked(rec *NodeRecord, reader uint16) wire.PeerInfo 
 		Stale:       rec.Stale,
 		SymmetricNA: rec.Symmetric,
 		CertPEM:     rec.CertPEM,
-		Binding:     rec.Binding,
-		KeyGen:      rec.KeyGen,
+		Bindings:    storedBindings(rec.Bindings),
 	}
 	if o := s.obs[key(rec.TenantID, reader)][rec.NodeID]; o != nil {
 		pi.ObservedMapping = o.mapping

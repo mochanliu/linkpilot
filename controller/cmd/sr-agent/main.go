@@ -268,7 +268,7 @@ func main() {
 	if *once {
 		hbctx, hbcancel := context.WithTimeout(ctx, 15*time.Second)
 		req := wire.HeartbeatRequest{Uptime: 0}
-		req.Binding = signedBinding(id, log.Printf)
+		req.Bindings = signedBindings(id, log.Printf)
 		req.Config = st.configReport()
 		req.Tunnel = st.tunnelReport()
 		req.Ifaces = readInventory(ctx, inv)
@@ -325,7 +325,7 @@ func main() {
 	for {
 		hbctx, hbcancel := context.WithTimeout(ctx, 10*time.Second)
 		req := wire.HeartbeatRequest{Uptime: int64(time.Since(processStart).Seconds())}
-		req.Binding = signedBinding(id, log.Printf)
+		req.Bindings = signedBindings(id, log.Printf)
 		req.Config = st.configReport()
 		req.Tunnel = st.tunnelReport()
 		req.Ifaces = readInventory(ctx, inv)
@@ -438,17 +438,19 @@ func readInventory(ctx context.Context, inv *agent.InventoryReporter) *[]wire.If
 	return inv.Report(ictx)
 }
 
-// signedBinding is the WG-key attestation carried by every heartbeat: a
-// statement signed with the device identity key, not a derived value. It can
-// only fail before enrollment, which main refuses earlier, so a nil here means
-// the controller must treat this box as unbound rather than trust the key.
-func signedBinding(id *agent.Identity, logf func(string, ...any)) *keybinding.Binding {
-	b, err := id.Binding()
+// signedBindings is the WG keyring carried by every heartbeat: one attestation
+// per key slot, each signed with the device identity key rather than derived.
+// Eight separate signatures because a tunnel names a slot, and the controller
+// can only relay an attestation it was given. It can only fail before enrollment,
+// which main refuses earlier, so a nil here means the controller must treat this
+// box as unbound rather than trust the key.
+func signedBindings(id *agent.Identity, logf func(string, ...any)) []keybinding.Binding {
+	bs, err := id.Bindings()
 	if err != nil {
 		logf("key binding: %v", err)
 		return nil
 	}
-	return &b
+	return bs
 }
 
 // ctrlBase normalises --ctrl into an https URL. Bare host:port is the common
