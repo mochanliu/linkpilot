@@ -1,10 +1,13 @@
 /*
  * sr_path.c - 路径表管理实现
  *
- * 采用紧凑存储：paths[0..count-1] 为有效条目。
- *   - add: path_id 已存在则覆盖，否则追加到 paths[count++]
- *   - del: 找到后将末尾条目搬到被删槽位，count--
- *   - lookup: 线性查找（表规模 <= 64，足够快）
+ * 存储紧凑、定位 O(1)：
+ *   - paths[0..count-1] 为有效条目（保持紧凑，遍历照旧走 count）
+ *   - index[path_id] = 槽位 + 1，0 = 不存在（path_id 是 16 位，表定长）
+ *   - add: path_id 已存在则原地覆盖，否则追加到 paths[count++] 并登记索引
+ *   - del: 末尾条目搬到被删槽位（搬完要改它的索引），count--
+ *   - lookup: 一次数组访问 —— encap 热路径每个出站包都要查一次，
+ *             4096 条容量下线性扫描不能接受
  */
 #include "sr_path.h"
 
@@ -19,15 +22,26 @@ int sr_path_table_init(sr_path_table_t *t)
     return 0;
 }
 
-/* 内部：按 path_id 查找槽位下标，未找到返回 -1 */
-static int sr_path_find_index(const sr_path_table_t *t, uint16_t path_id)
+/*
+ * 内部：按 path_id 定位槽位下标，未找到返回 -1。
+ *
+ * 索引是加速用的，不是唯一事实来源：回读 paths[slot].path_id 自校验，
+ * 一旦两者不一致就当作"没有这条路"，不能让一条写坏的索引继续参与选路。
+ */
+static int sr_path_slot(const sr_path_table_t *t, uint16_t path_id)
 {
-    int i;
-    for (i = 0; i < t->count; i++) {
-        if (t->paths[i].path_id == path_id)
-            return i;
-    }
-    return -1;
+    uint16_t v = t->index[path_id];
+    int slot;
+
+    if (v == 0)
+        return -1;
+
+    slot = (int)v - 1;
+    if (slot < 0 || slot >= t->count)
+        return -1;
+    if (t->paths[slot].path_id != path_id)
+        return -1;
+    return slot;
 }
 
 int sr_path_add(sr_path_table_t *t, const sr_path_config_t *cfg)
@@ -35,23 +49,24 @@ int sr_path_add(sr_path_table_t *t, const sr_path_config_t *cfg)
     int idx;
 
     if (!t || !cfg)
-        return -1;
+        return SR_PATH_ERR_PARAM;
     if (cfg->seg_count == 0 || cfg->seg_count > SR_MAX_SEGS)
-        return -1;
+        return SR_PATH_ERR_PARAM;
 
-    idx = sr_path_find_index(t, cfg->path_id);
+    idx = sr_path_slot(t, cfg->path_id);
     if (idx >= 0) {
-        /* 覆盖已有路径 */
+        /* 覆盖已有路径：槽位不变，索引照旧有效 */
         t->paths[idx] = *cfg;
-        return 0;
+        return SR_PATH_OK;
     }
 
     if (t->count >= SR_MAX_PATHS)
-        return -1;  /* 表已满 */
+        return SR_PATH_ERR_FULL;
 
     t->paths[t->count] = *cfg;
+    t->index[cfg->path_id] = (uint16_t)(t->count + 1);
     t->count++;
-    return 0;
+    return SR_PATH_OK;
 }
 
 int sr_path_del(sr_path_table_t *t, uint16_t path_id)
@@ -59,19 +74,24 @@ int sr_path_del(sr_path_table_t *t, uint16_t path_id)
     int idx;
 
     if (!t)
-        return -1;
+        return SR_PATH_ERR_PARAM;
 
-    idx = sr_path_find_index(t, path_id);
+    idx = sr_path_slot(t, path_id);
     if (idx < 0)
-        return -1;
+        return SR_PATH_ERR_PARAM;
 
-    /* 将末尾条目搬到被删槽位，保持紧凑 */
-    if (idx != t->count - 1)
+    /* 本条目的索引先注销 */
+    t->index[path_id] = 0;
+
+    /* 将末尾条目搬到被删槽位，保持紧凑（搬过来的条目槽位变了，索引要跟着改） */
+    if (idx != t->count - 1) {
         t->paths[idx] = t->paths[t->count - 1];
+        t->index[t->paths[idx].path_id] = (uint16_t)(idx + 1);
+    }
 
     memset(&t->paths[t->count - 1], 0, sizeof(sr_path_config_t));
     t->count--;
-    return 0;
+    return SR_PATH_OK;
 }
 
 sr_path_config_t *sr_path_lookup(sr_path_table_t *t, uint16_t path_id)
@@ -81,7 +101,7 @@ sr_path_config_t *sr_path_lookup(sr_path_table_t *t, uint16_t path_id)
     if (!t)
         return NULL;
 
-    idx = sr_path_find_index(t, path_id);
+    idx = sr_path_slot(t, path_id);
     if (idx < 0)
         return NULL;
     return &t->paths[idx];

@@ -111,8 +111,15 @@ vl_api_sr_wg_path_add_del_t_handler (vl_api_sr_wg_path_add_del_t *mp)
       clib_memcpy_fast (cfg.pkey, key->key, SR_PKEY_LEN);
 
       rv = sr_path_add (&sm->path_table, &cfg);
-      if (rv != 0)
-        rv = VNET_API_ERROR_NO_SUCH_TABLE;
+      if (rv == SR_PATH_ERR_FULL)
+        /*
+         * 表已满（4096 条路径 = 这台盒子上的隧道数到顶）。
+         * 不能和参数错误共用一个码：控制器看到"装不下了"应该报容量告警，
+         * 看到"值非法"应该报错配置本身，混在一起就只能人工查。
+         */
+        rv = VNET_API_ERROR_LIMIT_EXCEEDED;
+      else if (rv != 0)
+        rv = VNET_API_ERROR_INVALID_VALUE;
     }
   else
     {
@@ -537,8 +544,8 @@ vl_api_sr_wg_config_dump_t_handler (vl_api_sr_wg_config_dump_t *mp)
     sr_wg_port_count (sm, SR_WG_PORT_TRANSIT));
   rmp->transit_enabled = sm->transit_enabled;
   rmp->encap_fib_index = clib_host_to_net_u32 (sm->encap_fib_index);
-  rmp->path_count = sm->path_table.count;
-  rmp->key_count = sm->key_count;
+  rmp->path_count = clib_host_to_net_u32 (sm->path_table.count);
+  rmp->key_count = clib_host_to_net_u32 (sm->key_count);
 
   /* *INDENT-OFF* */
   hash_foreach (key, val, sm->encap_enabled_ifs, ({

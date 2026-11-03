@@ -2,7 +2,8 @@
  * test_sr_path.c - 路径表管理（sr_path.c）单元测试
  *
  * 覆盖：初始化、添加、覆盖、删除、删除不存在、fill_header 生成、
- *       表满溢出、hmac_id 引用计数、密钥轮换刷新路径副本。
+ *       表满溢出、hmac_id 引用计数、密钥轮换刷新路径副本、
+ *       4096 容量下的定位索引一致性（删除搬移后槽位归属）。
  */
 #include "test_framework.h"
 #include "sr_header.h"
@@ -44,7 +45,7 @@ static void make_path_cfg(sr_path_config_t *cfg, uint16_t path_id,
 /* ------------------------------------------------------------------ */
 static void test_path_table_init(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
     TEST_ASSERT_EQ(t.count, 0, "初始化后 count 应为 0");
     TEST_ASSERT_EQ(sr_path_table_init(NULL), -1, "t=NULL 应返回 -1");
@@ -55,7 +56,7 @@ static void test_path_table_init(void)
 /* ------------------------------------------------------------------ */
 static void test_path_add(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     sr_path_config_t cfg;
     sr_path_config_t *found;
 
@@ -87,7 +88,7 @@ static void test_path_add(void)
 /* ------------------------------------------------------------------ */
 static void test_path_add_overwrite(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     sr_path_config_t cfg;
     sr_path_config_t *found;
 
@@ -112,7 +113,7 @@ static void test_path_add_overwrite(void)
 /* ------------------------------------------------------------------ */
 static void test_path_del(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     sr_path_config_t cfg;
 
     TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
@@ -138,7 +139,7 @@ static void test_path_del(void)
 /* ------------------------------------------------------------------ */
 static void test_path_del_nonexist(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     sr_path_config_t cfg;
 
     TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
@@ -204,11 +205,14 @@ static void test_path_fill_header(void)
 /* ------------------------------------------------------------------ */
 static void test_path_table_full(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     sr_path_config_t cfg;
     int i;
 
     TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
+
+    /* 容量就是"一台盒子的隧道数"，至少要到 4096（运营口径 3000 条/盒） */
+    TEST_ASSERT(SR_MAX_PATHS >= 4096, "SR_MAX_PATHS 不得低于 4096");
 
     /* 填满 SR_MAX_PATHS 条（path_id 各不相同） */
     for (i = 0; i < SR_MAX_PATHS; i++) {
@@ -216,16 +220,112 @@ static void test_path_table_full(void)
         TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "填满过程中 add 应成功");
     }
     TEST_ASSERT_EQ(t.count, SR_MAX_PATHS, "填满后 count 应为 SR_MAX_PATHS");
+    /* 每一条都要能查到 —— 容量不等于可达，索引表错了就是"配了但选不到路" */
+    for (i = 0; i < SR_MAX_PATHS; i += 511) {
+        make_path_cfg(&cfg, (uint16_t)(0x1000 + i), 1);
+        TEST_ASSERT_NOT_NULL(sr_path_lookup(&t, cfg.path_id), "满表应逐条可查");
+    }
 
-    /* 第 SR_MAX_PATHS+1 条（新 path_id）应失败 */
+    /* 第 SR_MAX_PATHS+1 条（新 path_id）应失败，且必须是"表已满"这个码 */
     make_path_cfg(&cfg, 0x9999, 1);
-    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), -1, "表满后添加新路径应失败");
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), SR_PATH_ERR_FULL,
+                   "表满后添加新路径应返回 SR_PATH_ERR_FULL");
     TEST_ASSERT_EQ(t.count, SR_MAX_PATHS, "表满后 count 不应增加");
 
     /* 覆盖已有 path_id 仍应成功（不新增槽位） */
     make_path_cfg(&cfg, 0x1000, 2);
     TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "表满时覆盖已有路径应成功");
     TEST_ASSERT_EQ(t.count, SR_MAX_PATHS, "覆盖后 count 不应变化");
+
+    /* 腾出槽位后必须能再加 —— 删一条就够一条，说明索引注销了 */
+    TEST_ASSERT_EQ(sr_path_del(&t, 0x1000), 0, "删除应成功");
+    make_path_cfg(&cfg, 0x9999, 1);
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "腾槽后添加新路径应成功");
+    TEST_ASSERT_EQ(t.count, SR_MAX_PATHS, "腾槽后 count 应回到满值");
+    TEST_ASSERT_NOT_NULL(sr_path_lookup(&t, 0x9999), "新路径应可查");
+}
+
+/* ------------------------------------------------------------------ */
+/* test_path_index_compact：删除的末位搬移必须同步改搬家的条目索引        */
+/* ------------------------------------------------------------------ */
+static void test_path_index_compact(void)
+{
+    static sr_path_table_t t;
+    sr_path_config_t cfg;
+    sr_path_config_t *f;
+
+    TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
+
+    make_path_cfg(&cfg, 0x00A1, 1);   /* slot 0 */
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "add A1 应成功");
+    make_path_cfg(&cfg, 0x00A2, 2);   /* slot 1 */
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "add A2 应成功");
+    make_path_cfg(&cfg, 0x00A3, 3);   /* slot 2 */
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "add A3 应成功");
+
+    /* 删中间/头部条目，末尾条目会搬到被删槽位；索引必须跟着改，
+     * 否则 A3 搬到 slot0 后按 0x00A3 查会落到别处或查不到。 */
+    TEST_ASSERT_EQ(sr_path_del(&t, 0x00A1), 0, "删除 A1 应成功");
+    TEST_ASSERT_NULL(sr_path_lookup(&t, 0x00A1), "A1 删除后应查不到");
+    f = sr_path_lookup(&t, 0x00A3);
+    TEST_ASSERT_NOT_NULL(f, "A3 搬家后仍应查到");
+    TEST_ASSERT_EQ(f, &t.paths[0], "A3 应落在 slot 0");
+    TEST_ASSERT_EQ(f->seg_count, 3, "A3 搬家后内容不应错");
+    TEST_ASSERT_EQ(t.paths[2].path_id, 0, "腾空槽位应清零");
+
+    /* 覆盖式 add 不能改变槽位（索引仍要成立） */
+    make_path_cfg(&cfg, 0x00A3, 5);
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "覆盖 A3 应成功");
+    f = sr_path_lookup(&t, 0x00A3);
+    TEST_ASSERT_EQ(f, &t.paths[0], "覆盖不应搬动槽位");
+    TEST_ASSERT_EQ(f->seg_count, 5, "覆盖后 seg_count 应为新值");
+
+    /* 删末尾槽位上的条目：前面的条目不该被搬动 */
+    TEST_ASSERT_EQ(sr_path_del(&t, 0x00A2), 0, "删除 A2（末尾槽位）应成功");
+    f = sr_path_lookup(&t, 0x00A3);
+    TEST_ASSERT_NOT_NULL(f, "A3 应仍在原位");
+    TEST_ASSERT_EQ(f, &t.paths[0], "A3 槽位不应被改动");
+    TEST_ASSERT_EQ(t.count, 1, "count 应为 1");
+    TEST_ASSERT_EQ(sr_path_del(&t, 0x00A3), 0, "删除 A3 应成功");
+    TEST_ASSERT_EQ(t.count, 0, "全删后 count 应为 0");
+    TEST_ASSERT_NULL(sr_path_lookup(&t, 0x00A2), "空表应查不到");
+    TEST_ASSERT_NULL(sr_path_lookup(&t, 0x00A3), "空表应查不到");
+
+    /* 反复增删：索引不得残留，同 path_id 不得占两个槽 */
+    for (int k = 0; k < 200; k++) {
+        make_path_cfg(&cfg, (uint16_t)(0x2000 + k), 1);
+        TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "循环 add 应成功");
+        TEST_ASSERT_EQ(sr_path_del(&t, (uint16_t)(0x2000 + k)), 0,
+                       "循环 del 应成功");
+    }
+    TEST_ASSERT_EQ(t.count, 0, "循环增删后 count 应回到 0");
+    make_path_cfg(&cfg, 0x2000, 1);
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "循环后仍可添加");
+    TEST_ASSERT_EQ(sr_path_del(&t, 0x2000), 0, "循环后仍可删除");
+}
+
+/* ------------------------------------------------------------------ */
+/* test_path_id_bounds：path_id 的两端都可用                             */
+/* ------------------------------------------------------------------ */
+static void test_path_id_bounds(void)
+{
+    static sr_path_table_t t;
+    sr_path_config_t cfg;
+
+    TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
+
+    /* 0 是合法 path_id，不能当"空"用（API 的"全量"哨兵是 0xffff） */
+    make_path_cfg(&cfg, 0x0000, 1);
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "path_id=0 应可添加");
+    TEST_ASSERT_NOT_NULL(sr_path_lookup(&t, 0x0000), "path_id=0 应可查到");
+
+    /* 0xffff 是 dump 的"全量"哨兵，控制面不会下发它；数据面仍要能存 */
+    make_path_cfg(&cfg, 0xffff, 1);
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "path_id=0xffff 应可添加");
+    TEST_ASSERT_NOT_NULL(sr_path_lookup(&t, 0xffff), "path_id=0xffff 应可查到");
+
+    /* 索引表按 path_id 定长，越界不存在 —— 这里只保证两端都落位 */
+    TEST_ASSERT_EQ(t.count, 2, "两条都应占槽");
 }
 
 /* ------------------------------------------------------------------ */
@@ -233,7 +333,7 @@ static void test_path_table_full(void)
 /* ------------------------------------------------------------------ */
 static void test_path_count_using_hmac_id(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     sr_path_config_t cfg;
 
     TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
@@ -267,7 +367,7 @@ static void test_path_count_using_hmac_id(void)
  */
 static void test_key_rotation(void)
 {
-    sr_path_table_t t;
+    static sr_path_table_t t;
     sr_path_config_t cfg;
     sr_path_config_t *p1, *p7;
     sr_header_t h;
@@ -324,6 +424,8 @@ void test_suite_sr_path(void)
     RUN_TEST(test_path_del_nonexist);
     RUN_TEST(test_path_fill_header);
     RUN_TEST(test_path_table_full);
+    RUN_TEST(test_path_index_compact);
+    RUN_TEST(test_path_id_bounds);
     RUN_TEST(test_path_count_using_hmac_id);
     RUN_TEST(test_key_rotation);
     TEST_SUITE_END();

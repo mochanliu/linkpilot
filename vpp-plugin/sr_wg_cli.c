@@ -69,7 +69,8 @@ sr_wg_show_paths_command_fn (vlib_main_t *vm, unformat_input_t *input,
   sr_wg_main_t *sm = &sr_wg_main;
   int i;
 
-  vlib_cli_output (vm, "%d path(s) configured:", sm->path_table.count);
+  vlib_cli_output (vm, "%d path(s) configured (容量 %d，一条隧道一条路径):",
+                   sm->path_table.count, SR_MAX_PATHS);
 
   for (i = 0; i < sm->path_table.count; i++)
     {
@@ -498,6 +499,11 @@ sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
   }
 
   rv = sr_path_add (&sm->path_table, &cfg);
+  if (rv == SR_PATH_ERR_FULL)
+    return clib_error_return (
+      0, "路径表已满（%d 条）—— 一台盒子的隧道数到顶了；"
+         "先 `sr-wg path del` 腾槽位，或扩 SR_MAX_PATHS",
+      SR_MAX_PATHS);
   if (rv != 0)
     return clib_error_return (0, "sr_path_add failed (rv=%d)", rv);
 

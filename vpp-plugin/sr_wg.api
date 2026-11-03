@@ -320,8 +320,12 @@ define sr_wg_config_details
   u32 encap_fib_index;
   u32 n_enabled_ifs;              /* 下面数组的有效长度，最多 32 */
   u32 enabled_ifs[32];            /* 已启用 sr-wg4-encap 的 underlay 接口 */
-  u8  path_count;
-  u8  key_count;
+  /*
+   * 计数用 u32：路径表容量已经是 4096（一条隧道一条路径），u8 会在 256 条
+   * 之后回绕 —— 而"回绕成小数"在对账时看起来像"路径被删了"。
+   */
+  u32 path_count;
+  u32 key_count;
   u32 obs_count;                  /* 观测表当前条目数 */
   u64 obs_records;                /* 累计记录次数（含命中已有槽位） */
   u64 obs_evictions;              /* 槽冲突挤掉旧条目次数：上涨=有人在灌假源 */
