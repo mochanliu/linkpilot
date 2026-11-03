@@ -3,7 +3,8 @@
  *
  * 覆盖：初始化、添加、覆盖、删除、删除不存在、fill_header 生成、
  *       表满溢出、hmac_id 引用计数、密钥轮换刷新路径副本、
- *       4096 容量下的定位索引一致性（删除搬移后槽位归属）。
+ *       4096 容量下的定位索引一致性（删除搬移后槽位归属）、
+ *       终点段取自报文（A 方案：路径只存中转跳，endpoint 由调用方传入）。
  */
 #include "test_framework.h"
 #include "sr_header.h"
@@ -19,25 +20,35 @@ static const uint8_t g_pkey[SR_PKEY_LEN] = {
 };
 
 /*
- * 构造一条 seg_count 段的路径配置。
- * 段 i 的 IP = 10.0.0.(i+1)，端口 = SR_PORT_TRANSIT，均为网络序。
+ * 构造一条 relay_count 跳的路径配置（只有中转跳，没有终点）。
+ * 中转跳 i 的 IP = 10.0.0.(i+1)，端口 = SR_PORT_TRANSIT，均为网络序。
  */
 static void make_path_cfg(sr_path_config_t *cfg, uint16_t path_id,
-                          uint8_t seg_count)
+                          uint8_t relay_count)
 {
     int i;
     memset(cfg, 0, sizeof(*cfg));
-    cfg->path_id   = path_id;
-    cfg->hmac_id   = 0x0007;
-    cfg->seg_count = seg_count;
-    cfg->active    = 1;
+    cfg->path_id      = path_id;
+    cfg->hmac_id      = 0x0007;
+    cfg->relay_count  = relay_count;
+    cfg->active       = 1;
     memcpy(cfg->pkey, g_pkey, SR_PKEY_LEN);
-    for (i = 0; i < seg_count; i++) {
+    for (i = 0; i < relay_count; i++) {
         uint32_t ip = htonl(0x0A000001u + (uint32_t)i);
         uint16_t pt = htons(SR_PORT_TRANSIT);
-        memcpy(cfg->segments[i].ip, &ip, 4);
-        memcpy(cfg->segments[i].port, &pt, 2);
+        memcpy(cfg->relays[i].ip, &ip, 4);
+        memcpy(cfg->relays[i].port, &pt, 2);
     }
+}
+
+/* 终点段：ip/port 传主机序，本函数换成网络序（与 encap 从报文取到的形状一致） */
+static void make_endpoint(sr_segment_t *ep, uint32_t ip_host, uint16_t port_host)
+{
+    uint32_t ip_net = htonl(ip_host);
+    uint16_t pt_net = htons(port_host);
+    memset(ep, 0, sizeof(*ep));
+    memcpy(ep->ip, &ip_net, 4);
+    memcpy(ep->port, &pt_net, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -69,7 +80,7 @@ static void test_path_add(void)
     found = sr_path_lookup(&t, 0x1001);
     TEST_ASSERT_NOT_NULL(found, "lookup 应能找到刚添加的路径");
     TEST_ASSERT_EQ(found->path_id, 0x1001, "找到路径的 path_id 应匹配");
-    TEST_ASSERT_EQ(found->seg_count, 3, "找到路径的 seg_count 应为 3");
+    TEST_ASSERT_EQ(found->relay_count, 3, "找到路径的 relay_count 应为 3");
 
     /* 未添加的 path_id 应查不到 */
     TEST_ASSERT_NULL(sr_path_lookup(&t, 0x2002), "不存在的 path_id 应返回 NULL");
@@ -77,10 +88,13 @@ static void test_path_add(void)
     /* 非法参数 */
     TEST_ASSERT_EQ(sr_path_add(NULL, &cfg), -1, "t=NULL add 应失败");
     TEST_ASSERT_EQ(sr_path_add(&t, NULL), -1, "cfg=NULL add 应失败");
-    /* seg_count == 0 非法 */
-    make_path_cfg(&cfg, 0x1002, 1);
-    cfg.seg_count = 0;
-    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), -1, "seg_count=0 add 应失败");
+    /* relay_count = 0 合法：无中转跳的隧道仍要能带 SR 头（verified 观测的凭证） */
+    make_path_cfg(&cfg, 0x1002, 0);
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "relay_count=0 add 应成功");
+    TEST_ASSERT_NOT_NULL(sr_path_lookup(&t, 0x1002), "零中转跳路径应可查到");
+    /* 越界：线格式要留一位给终点段，所以上限是 SR_MAX_RELAYS */
+    make_path_cfg(&cfg, 0x1003, SR_MAX_RELAYS + 1);
+    TEST_ASSERT_EQ(sr_path_add(&t, &cfg), -1, "relay_count 越界 add 应失败");
 }
 
 /* ------------------------------------------------------------------ */
@@ -98,14 +112,14 @@ static void test_path_add_overwrite(void)
     TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "首次 add 应成功");
     TEST_ASSERT_EQ(t.count, 1, "首次 add 后 count 应为 1");
 
-    /* 同 path_id，改为 4 段再添加 → 应覆盖，count 不增 */
+    /* 同 path_id，改为 4 跳再添加 → 应覆盖，count 不增 */
     make_path_cfg(&cfg, 0x1001, 4);
     TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "覆盖 add 应成功");
     TEST_ASSERT_EQ(t.count, 1, "覆盖后 count 仍应为 1");
 
     found = sr_path_lookup(&t, 0x1001);
     TEST_ASSERT_NOT_NULL(found, "覆盖后 lookup 应找到");
-    TEST_ASSERT_EQ(found->seg_count, 4, "覆盖后 seg_count 应为新值 4");
+    TEST_ASSERT_EQ(found->relay_count, 4, "覆盖后 relay_count 应为新值 4");
 }
 
 /* ------------------------------------------------------------------ */
@@ -158,19 +172,21 @@ static void test_path_fill_header(void)
 {
     sr_path_config_t cfg;
     sr_header_t h;
+    sr_segment_t ep;
     uint32_t ts = 0x61000000u;
     int i;
 
-    make_path_cfg(&cfg, 0x1234, 3);
+    make_path_cfg(&cfg, 0x1234, 2);           /* 2 跳中转 */
     cfg.hmac_id = 0x00AA;
+    make_endpoint(&ep, 0x0A0A0103u, SR_PORT_VPN);
 
-    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h, ts), 0, "fill_header 应成功");
+    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h, ts, &ep), 0, "fill_header 应成功");
 
-    /* 固定字段 */
+    /* 固定字段：线格式段数 = 中转跳 + 终点那一位 */
     TEST_ASSERT_EQ(h.magic, SR_MAGIC, "magic 应为 0x53");
     TEST_ASSERT_EQ(h.ver_flags, SR_VER_FLAGS, "ver_flags 应正确");
-    TEST_ASSERT_EQ(h.seg_count, 3, "seg_count 应为 3");
-    TEST_ASSERT_EQ(h.seg_left, 3, "seg_left 应等于 seg_count");
+    TEST_ASSERT_EQ(h.seg_count, 3, "seg_count 应为 relay_count+1 = 3");
+    TEST_ASSERT_EQ(h.seg_left, 3, "fill_header 后 seg_left 应等于 seg_count");
     TEST_ASSERT_EQ(h.hdr_len, SR_HDR_LEN(3), "hdr_len 应为 42");
     TEST_ASSERT_EQ(h.action, SR_ACTION_FORWARD, "action 应为 FORWARD");
 
@@ -179,12 +195,14 @@ static void test_path_fill_header(void)
     TEST_ASSERT_EQ(sr_hdr_get_hmac_id(&h), 0x00AA, "hmac_id 应正确");
     TEST_ASSERT_EQ(sr_hdr_get_timestamp(&h), ts, "timestamp 应正确");
 
-    /* 段列表：应与配置一致（网络序字节） */
-    for (i = 0; i < 3; i++) {
-        TEST_ASSERT_MEM_EQ(h.segments[i].ip, cfg.segments[i].ip, 4,
-                           "段 IP 应与配置一致");
-        TEST_ASSERT_MEM_EQ(h.segments[i].port, cfg.segments[i].port, 2,
-                           "段 Port 应与配置一致");
+    /* segments[0] 来自报文（endpoint），segments[1+i] 来自路径表的中转跳 */
+    TEST_ASSERT_MEM_EQ(h.segments[0].ip, ep.ip, 4, "终点段 IP 应等于传入的 endpoint");
+    TEST_ASSERT_MEM_EQ(h.segments[0].port, ep.port, 2, "终点段端口应等于 endpoint");
+    for (i = 0; i < cfg.relay_count; i++) {
+        TEST_ASSERT_MEM_EQ(h.segments[1 + i].ip, cfg.relays[i].ip, 4,
+                           "中转段 IP 应与配置一致");
+        TEST_ASSERT_MEM_EQ(h.segments[1 + i].port, cfg.relays[i].port, 2,
+                           "中转段端口应与配置一致");
     }
 
     /* 基础验证通过 */
@@ -194,10 +212,64 @@ static void test_path_fill_header(void)
     TEST_ASSERT_EQ(sr_hmac_verify(&h, cfg.pkey), 0, "fill_header 后 HMAC 验证应成功");
 
     /* 非法参数 */
-    TEST_ASSERT_EQ(sr_path_fill_header(NULL, &h, ts), -1, "cfg=NULL 应失败");
-    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, NULL, ts), -1, "h=NULL 应失败");
-    cfg.seg_count = 0;
-    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h, ts), -1, "seg_count=0 应失败");
+    TEST_ASSERT_EQ(sr_path_fill_header(NULL, &h, ts, &ep), -1, "cfg=NULL 应失败");
+    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, NULL, ts, &ep), -1, "h=NULL 应失败");
+    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h, ts, NULL), -1, "endpoint=NULL 应失败");
+    cfg.relay_count = SR_MAX_RELAYS + 1;
+    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h, ts, &ep), -1,
+                   "relay_count 越界应失败");
+}
+
+/* ------------------------------------------------------------------ */
+/* test_fill_header_relay_less：零中转跳 = 只有终点段的一跳路径          */
+/* ------------------------------------------------------------------ */
+static void test_fill_header_relay_less(void)
+{
+    sr_path_config_t cfg;
+    sr_header_t h;
+    sr_segment_t ep;
+
+    make_path_cfg(&cfg, 0x1300, 0);
+    make_endpoint(&ep, 0x0A0A0103u, SR_PORT_VPN);
+
+    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h, 0x61000001u, &ep), 0,
+                   "零中转跳应能签出头（这是 endpoint 为空时对端地址的唯一来源）");
+    TEST_ASSERT_EQ(h.seg_count, 1, "seg_count 应为 1");
+    TEST_ASSERT_MEM_EQ(h.segments[0].ip, ep.ip, 4, "唯一一段就是终点");
+    TEST_ASSERT_EQ(sr_hmac_verify(&h, cfg.pkey), 0, "零中转跳的头应验签通过");
+}
+
+/* ------------------------------------------------------------------ */
+/* test_fill_header_endpoint_drift：endpoint 变了不必重建路径，签名照旧   */
+/*                                                                   */
+/* 这正是 A 方案要买到的性质：路径表里不存终点，所以 NAT 学到新地址、     */
+/* 对端换端口都不需要重新下发路径。反证也要拿到 —— endpoint 在 HMAC       */
+/* 覆盖范围内，签完再偷偷改它必须验签失败（否则"改写外层"就成了伪造通道）。 */
+/* ------------------------------------------------------------------ */
+static void test_fill_header_endpoint_drift(void)
+{
+    sr_path_config_t cfg;
+    sr_header_t h1, h2;
+    sr_segment_t ep_a, ep_b;
+
+    make_path_cfg(&cfg, 0x1400, 1);
+    make_endpoint(&ep_a, 0x0A0A0103u, SR_PORT_VPN);
+    make_endpoint(&ep_b, 0xC0000222u, 20001u);   /* 换了地址，也换了端口 */
+
+    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h1, 0x61000002u, &ep_a), 0,
+                   "endpoint A 签名应成功");
+    TEST_ASSERT_EQ(sr_path_fill_header(&cfg, &h2, 0x61000002u, &ep_b), 0,
+                   "同一路径、endpoint B 签名应成功（路径不用重建）");
+    TEST_ASSERT_EQ(sr_hmac_verify(&h2, cfg.pkey), 0, "endpoint B 的头应验签通过");
+    TEST_ASSERT(memcmp(h2.segments[0].ip, h1.segments[0].ip, 4) != 0,
+                "终点段应随报文变化，不是路径表里的老地址");
+
+    /* 反证：签名之后再改终点段 = 篡改，必须验签失败 */
+    make_endpoint(&ep_b, 0xC0000222u, 20002u);
+    memcpy(h1.segments[0].ip, ep_b.ip, 4);
+    memcpy(h1.segments[0].port, ep_b.port, 2);
+    TEST_ASSERT_NEQ(sr_hmac_verify(&h1, cfg.pkey), 0,
+                    "签完后改写终点段应验签失败（终点在 HMAC 覆盖范围内）");
 }
 
 /* ------------------------------------------------------------------ */
@@ -270,7 +342,7 @@ static void test_path_index_compact(void)
     f = sr_path_lookup(&t, 0x00A3);
     TEST_ASSERT_NOT_NULL(f, "A3 搬家后仍应查到");
     TEST_ASSERT_EQ(f, &t.paths[0], "A3 应落在 slot 0");
-    TEST_ASSERT_EQ(f->seg_count, 3, "A3 搬家后内容不应错");
+    TEST_ASSERT_EQ(f->relay_count, 3, "A3 搬家后内容不应错");
     TEST_ASSERT_EQ(t.paths[2].path_id, 0, "腾空槽位应清零");
 
     /* 覆盖式 add 不能改变槽位（索引仍要成立） */
@@ -278,7 +350,7 @@ static void test_path_index_compact(void)
     TEST_ASSERT_EQ(sr_path_add(&t, &cfg), 0, "覆盖 A3 应成功");
     f = sr_path_lookup(&t, 0x00A3);
     TEST_ASSERT_EQ(f, &t.paths[0], "覆盖不应搬动槽位");
-    TEST_ASSERT_EQ(f->seg_count, 5, "覆盖后 seg_count 应为新值");
+    TEST_ASSERT_EQ(f->relay_count, 5, "覆盖后 relay_count 应为新值");
 
     /* 删末尾槽位上的条目：前面的条目不该被搬动 */
     TEST_ASSERT_EQ(sr_path_del(&t, 0x00A2), 0, "删除 A2（末尾槽位）应成功");
@@ -371,11 +443,13 @@ static void test_key_rotation(void)
     sr_path_config_t cfg;
     sr_path_config_t *p1, *p7;
     sr_header_t h;
+    sr_segment_t ep;
     uint8_t newkey[SR_PKEY_LEN];
     int i;
 
     for (i = 0; i < SR_PKEY_LEN; i++)
         newkey[i] = (uint8_t)(0x5cu + i);
+    make_endpoint(&ep, 0x0A0A0103u, SR_PORT_VPN);
 
     TEST_ASSERT_EQ(sr_path_table_init(&t), 0, "table_init 应成功");
 
@@ -397,12 +471,14 @@ static void test_key_rotation(void)
                        "其他 hmac_id 的路径副本不应被改");
 
     /* 新密钥签出的头：新密钥验通过，旧密钥验失败 */
-    TEST_ASSERT_EQ(sr_path_fill_header(p1, &h, 0x62000001u), 0, "fill_header 应成功");
+    TEST_ASSERT_EQ(sr_path_fill_header(p1, &h, 0x62000001u, &ep), 0,
+                   "fill_header 应成功");
     TEST_ASSERT_EQ(sr_hmac_verify(&h, newkey), 0, "新密钥应验证通过");
     TEST_ASSERT_NEQ(sr_hmac_verify(&h, g_pkey), 0, "旧密钥不应验证通过");
 
     /* 旧路径（未刷新）用旧密钥仍有效 → 说明「不刷新」确实会导致断链 */
-    TEST_ASSERT_EQ(sr_path_fill_header(p7, &h, 0x62000002u), 0, "fill_header 应成功");
+    TEST_ASSERT_EQ(sr_path_fill_header(p7, &h, 0x62000002u, &ep), 0,
+                   "fill_header 应成功");
     TEST_ASSERT_EQ(sr_hmac_verify(&h, g_pkey), 0, "未轮换的路径仍用旧密钥签名");
 
     /* 参数非法 */
@@ -423,6 +499,8 @@ void test_suite_sr_path(void)
     RUN_TEST(test_path_del);
     RUN_TEST(test_path_del_nonexist);
     RUN_TEST(test_path_fill_header);
+    RUN_TEST(test_fill_header_relay_less);
+    RUN_TEST(test_fill_header_endpoint_drift);
     RUN_TEST(test_path_table_full);
     RUN_TEST(test_path_index_compact);
     RUN_TEST(test_path_id_bounds);

@@ -50,14 +50,14 @@ var requiredVersions = map[string]string{
 	"wireguard_peer_remove_reply":      "e8d4e804",
 	"wireguard_peers_dump":             "3b74607a",
 	"wireguard_peers_details":          "6a9f6bc3",
-	"sr_wg_path_add_del":               "f1579105",
+	"sr_wg_path_add_del":               "2283ed13",
 	"sr_wg_path_add_del_reply":         "e8d4e804",
 	"sr_wg_path_dump":                  "e7177ea0",
-	"sr_wg_path_details":               "e4624a51",
-	"sr_wg_tunnel_set_path":            "75d015ec",
+	"sr_wg_path_details":               "37b63647",
+	"sr_wg_tunnel_set_path":            "b8d00711",
 	"sr_wg_tunnel_set_path_reply":      "e8d4e804",
 	"sr_wg_tunnel_dump":                "529cb13f",
-	"sr_wg_tunnel_details":             "dbfc98ee",
+	"sr_wg_tunnel_details":             "bd5a39d9",
 	"sr_wg_port_add_del":               "5495c953",
 	"sr_wg_port_add_del_reply":         "e8d4e804",
 	"sr_wg_port_dump":                  "51077d14",
@@ -177,11 +177,13 @@ type InterfaceParams struct {
 type PeerParams struct {
 	PublicKey  []byte // wgKeyLen 字节 X25519 公钥
 	EndpointIP net.IP
-	// Port 是**封装前**那个 WG 包的外层目的端口，也就是包最终要送到的那个端口。
-	// encap 节点就是拿它当隧道身份的一半去查绑定的（vpp-plugin/sr_wg4_encap.c 的
-	// Step 4：sr_wg_bind_key(endpoint, udp->dst_port)），所以 TunnelBinding.DstPort
-	// 必须填同一个值；两处对不上时包不会被加 SR 头，计数器上是 encap_bypass ——
-	// 不报错，但源路由没了。
+	// Port 是**封装前**那个 WG 包的外层目的端口，也就是包最终要送到的那个端口：
+	// 只能是"对端的隧道端口"（两端各用各的端口是 WG 的正常形态）。
+	//
+	// 它同时是 SR 头里的**终点段**：encap 节点在改写外层之前，从这个包现取
+	// (dst IP, dst 端口) 写进 segments[0]（vpp-plugin/sr_wg4_encap.c 的 Step 2 之后）。
+	// 所以这里改端口 = 终点段跟着改，路径表里不需要任何对应改动 —— 隧道身份本身
+	// 不靠它，靠的是本端源端口（见 TunnelBinding.SrcPort）。
 	Port       uint16
 	Keepalive  uint16
 	TableID    uint32
@@ -513,21 +515,25 @@ func (c *Client) RemovePeer(ctx context.Context, peerIndex uint32) error {
 // ==================== SR 路径 / 隧道绑定 / 挂点 ====================
 
 // 段的字节数：vl_api_sr_wg_segment_t = ip4(4) + port(2)，且数组是**固定 8 项**
-// 的 segments[8]，不是变长。少写了未用那几项的填充，请求就短于 VPP 注册的结构，
+// 的 relays[8]，不是变长。少写了未用那几项的填充，请求就短于 VPP 注册的结构，
 // 而 VPP 对短请求只留一行 Truncated message 便丢弃。
 const (
-	segmentLen    = 6
-	maxSegments   = 8
+	segmentLen  = 6
+	maxSegments = 8
+	// maxRelays 是路径里能存的**中转跳**上限：线格式的 8 个段位要留一位给终点段
+	// （vpp-plugin/sr_header.h 的 SR_MAX_SEGS，路径表里的 SR_MAX_RELAYS）。
+	// 中转跳可以是 0 个（直连隧道仍要带 SR 头做"持有 P-Key"的证明）。
+	maxRelays     = maxSegments - 1
 	pathBodyLen   = 1 + 2 + 2 + 1 + 1 + segmentLen*maxSegments // 55
 	pathDetailLen = 2 + 4 + 2 + 2 + 1 + 1 + segmentLen*maxSegments
 )
 
-// Segment 是 SR 路径上的一跳外层地址。
+// Segment 是 SR 路径上的一跳**中转**外层地址（不含终点 —— 终点由报文自己提供）。
 //
-// 段的顺序照数据面的约定（vpp-plugin/sr_wg4_encap.c 头部注释）：
+// 顺序照数据面的约定（vpp-plugin/sr_wg4_encap.c 头部注释）：
 //
-//	Segments[0]      = 最终目的节点（打它的 VPN 端口 51820）
-//	Segments[n-1]    = 第一跳中转（"首跳免费"，由外层 IP/UDP 承载）
+//	Relays[0]            = 离终点最近的中转
+//	Relays[n-1]          = 第一跳中转（"首跳免费"，由改写后的外层 IP/端口承载）
 //
 // 也就是**倒序**，与 sr-wg CLI 的 `via` 顺序一致。写反了不会报错：包照样发出去，
 // 只是发往错误的第一跳，症状是"路径配上了但隧道不通"。
@@ -539,42 +545,47 @@ type Segment struct {
 // PathParams 是一条 SR 路径。HmacID 引用的 P-Key **必须已经装进密钥表**，
 // 否则 VPP 回 NO_SUCH_ENTRY —— 路径存的是密钥副本，缺钥匙时若用全零密钥建路径，
 // 包能正常发出去但对端一律验签失败，控制器完全看不出来。
+//
+// Relays 只装中转跳，**终点不在里面**：encap 节点封装前从即将发出的那个包现取
+// 外层 (dst IP, UDP 目的端口) 当 segments[0]。所以对端的 IP/端口怎么变（NAT 重绑、
+// 换映射端口）都不需要动路径 —— 反过来，把终点塞进路径表就是存了一个会漂移、
+// 而且参与 HMAC 的值，改它必须重签。
 type PathParams struct {
-	PathID   uint16
-	HmacID   uint16
-	Active   bool
-	Segments []Segment
+	PathID uint16
+	HmacID uint16
+	Active bool
+	Relays []Segment
 }
 
 // PathInfo 是 sr_wg_path_dump 回来的一条路径。
 type PathInfo struct {
-	PathID   uint16
-	HmacID   uint16
-	Active   bool
-	Segments []Segment
+	PathID uint16
+	HmacID uint16
+	Active bool
+	Relays []Segment
 }
 
 // AddPath 新增或按 PathID 覆盖一条路径（is_add=1）。
 func (c *Client) AddPath(ctx context.Context, p PathParams) error {
-	if len(p.Segments) == 0 || len(p.Segments) > maxSegments {
-		return fmt.Errorf("vppapi: 路径段数必须 1..%d，给了 %d", maxSegments, len(p.Segments))
+	if len(p.Relays) > maxRelays {
+		return fmt.Errorf("vppapi: 中转跳数必须 0..%d，给了 %d", maxRelays, len(p.Relays))
 	}
-	for i, s := range p.Segments {
+	for i, s := range p.Relays {
 		if s.IP.To4() == nil {
-			return fmt.Errorf("vppapi: segments[%d] 地址 %v 不是 IPv4，SR 段只支持 IPv4", i, s.IP)
+			return fmt.Errorf("vppapi: relays[%d] 地址 %v 不是 IPv4，SR 段只支持 IPv4", i, s.IP)
 		}
 	}
 	body := make([]byte, 0, pathBodyLen)
 	body = append(body, 1) // is_add
 	body = appendU16(body, p.PathID)
 	body = appendU16(body, p.HmacID)
-	body = append(body, byte(len(p.Segments)))
+	body = append(body, byte(len(p.Relays)))
 	if p.Active {
 		body = append(body, 1)
 	} else {
 		body = append(body, 0)
 	}
-	body = appendSegments(body, p.Segments)
+	body = appendSegments(body, p.Relays)
 	frame, err := c.call(ctx, "sr_wg_path_add_del", "sr_wg_path_add_del_reply", body)
 	if err != nil {
 		return err
@@ -608,10 +619,10 @@ func (c *Client) Paths(ctx context.Context, pathID uint16) ([]PathInfo, error) {
 			return nil, fmt.Errorf("vppapi: sr_wg_path_details 太短 (%d B)，插件结构变了", len(f))
 		}
 		out = append(out, PathInfo{
-			PathID:   binary.BigEndian.Uint16(f[6:8]),
-			HmacID:   binary.BigEndian.Uint16(f[8:10]),
-			Active:   f[11] != 0,
-			Segments: readSegments(f[12:], f[10]),
+			PathID: binary.BigEndian.Uint16(f[6:8]),
+			HmacID: binary.BigEndian.Uint16(f[8:10]),
+			Active: f[11] != 0,
+			Relays: readSegments(f[12:], f[10]),
 		})
 	}
 	return out, nil
@@ -619,52 +630,53 @@ func (c *Client) Paths(ctx context.Context, pathID uint16) ([]PathInfo, error) {
 
 // TunnelBinding 把一条 WG 隧道接口绑到一条 SR 路径上。
 //
-// EndpointIP 是 WG peer 的**外层** IPv4：encap 挂点挂在 underlay 出口接口上，
-// 数据面按外层目的地址查绑定，所以漏了它这条绑定永远不会命中 —— 而"没命中"在
-// 计数器上表现为 encap_bypass，看起来像"配置根本没生效"。
-// DstPort 是**封装前**那个 WG 包的外层 UDP 目的端口 —— 包发出去时的那个值，
-// 即 PeerParams.Port（对端的隧道端口）。一对 CPE 可以开多条隧道（定案 2：每隧道
-// 一个端口），此时 endpoint IP 相同、只有端口能区分"哪条隧道"，所以绑定身份是
-// (EndpointIP, DstPort)。填 0 表示端口通配 = 该 IP 上所有隧道共用这一条路径，
-// 只在单隧道时才是安全写法；多隧道下是静默串线，调用方不该写 0。
+// SrcPort 是**本端**这条隧道的外层 UDP 源端口 —— 也就是这条隧道自己的监听端口
+// （InterfaceParams.ListenPort：实测 VPP 的 WG 发包源端口 = 接口监听端口）。
+// encap 节点拿 `udp->src_port` 查这张绑定表，源端口就是"这一包属于哪条隧道"的
+// 身份（定案 2：每隧道一个端口）。所以填错（填成对端端口、填 0）不会报错，
+// 只会永远查不中 → 计数器上的 encap_bypass = 配了路径但源路由静默没生效。
+//
+// 0 是"永不命中"而不是通配：绑定还在表里、show 里能看见，但一个包也套不上头。
+// 每台 CPE 的监听端口由控制器的 underlay 分配器给，agent 手里一定有，不该传 0。
+//
+// 一对 CPE 之间是点对点隧道，不防"两张接口填了同一个 SrcPort"——那是同一件事
+// 的两种写法，后写的赢（见 sr_wg.api 的 tunnel_set_path 注释）。
 type TunnelBinding struct {
-	SWIfIndex  uint32
-	PathID     uint16
-	EndpointIP net.IP
-	DstPort    uint16
+	SWIfIndex uint32
+	PathID    uint16
+	SrcPort   uint16
 }
 
 // TunnelInfo 是 sr_wg_tunnel_dump 回来的一条绑定。Effective=false 意味着
-// endpoint 配了但 underlay 上没启用 sr-wg4-encap：包会静默旁路 SR 头。
-// DstPort=0 是通配绑定（见 TunnelBinding）。
+// src_port 没填，或本机的 underlay 上没有任何接口启用了 sr-wg4-encap：
+// 包会静默旁路 SR 头。
 type TunnelInfo struct {
-	SWIfIndex  uint32
-	PathID     uint16
-	EndpointIP net.IP
-	DstPort    uint16
-	Effective  bool
+	SWIfIndex uint32
+	PathID    uint16
+	SrcPort   uint16
+	Effective bool
 }
 
 // tunnelBodyLen 是 sr_wg_tunnel_set_path 的请求体长度：
-// is_add(1) sw_if_index(4) path_id(2) dst_port(2) endpoint_ip(4)。
-const tunnelBodyLen = 1 + 4 + 2 + 2 + 4
+// is_add(1) sw_if_index(4) path_id(2) src_port(2)。
+// tunnelDetailLen 是一条 sr_wg_tunnel_details 的**整帧**长度：
+// msg_id(2) context(4) sw_if_index(4) path_id(2) src_port(2) is_effective(1)。
+const (
+	tunnelBodyLen   = 1 + 4 + 2 + 2
+	tunnelDetailLen = 2 + 4 + 4 + 2 + 2 + 1
+)
 
 // SetTunnel 绑定隧道到路径（is_add=1）。它**不会**自动启用 feature，
 // 那是 EnableEncap 的活儿；两步都做完才是"这条隧道走 SR"。
 //
-// 同一个 (endpoint, dst_port) 身份已被别的接口占用时 VPP 回 ENTRY_ALREADY_EXISTS
-// 而不是覆盖：两条绑定抢同一个包，"哪条隧道走哪条路径"就变成非确定的，
-// 调用方必须把它当错误处理。
+// 同一个接口上已经有一条绑定时是原地更新（SrcPort 变了会先把旧键摘掉），
+// 所以改端口不需要先 ClearTunnel。
 func (c *Client) SetTunnel(ctx context.Context, b TunnelBinding) error {
-	if b.EndpointIP.To4() == nil {
-		return fmt.Errorf("vppapi: 隧道绑定的 endpoint %v 不是 IPv4", b.EndpointIP)
-	}
 	body := make([]byte, 0, tunnelBodyLen)
 	body = append(body, 1)
 	body = appendU32(body, b.SWIfIndex)
 	body = appendU16(body, b.PathID)
-	body = appendU16(body, b.DstPort)
-	body = appendIP4(body, b.EndpointIP)
+	body = appendU16(body, b.SrcPort)
 	frame, err := c.call(ctx, "sr_wg_tunnel_set_path", "sr_wg_tunnel_set_path_reply", body)
 	if err != nil {
 		return err
@@ -691,16 +703,15 @@ func (c *Client) Tunnels(ctx context.Context, swIfIndex uint32) ([]TunnelInfo, e
 	}
 	out := make([]TunnelInfo, 0, len(frames))
 	for _, f := range frames {
-		// msg_id(2) context(4) sw_if_index(4) path_id(2) dst_port(2) endpoint_ip(4) is_effective(1)
-		if len(f) < 19 {
+		// msg_id(2) context(4) sw_if_index(4) path_id(2) src_port(2) is_effective(1)
+		if len(f) < tunnelDetailLen {
 			return nil, fmt.Errorf("vppapi: sr_wg_tunnel_details 太短 (%d B)，插件结构变了", len(f))
 		}
 		out = append(out, TunnelInfo{
-			SWIfIndex:  binary.BigEndian.Uint32(f[6:10]),
-			PathID:     binary.BigEndian.Uint16(f[10:12]),
-			DstPort:    binary.BigEndian.Uint16(f[12:14]),
-			EndpointIP: net.IP(append([]byte(nil), f[14:18]...)),
-			Effective:  f[18] != 0,
+			SWIfIndex: binary.BigEndian.Uint32(f[6:10]),
+			PathID:    binary.BigEndian.Uint16(f[10:12]),
+			SrcPort:   binary.BigEndian.Uint16(f[12:14]),
+			Effective: f[14] != 0,
 		})
 	}
 	return out, nil
@@ -1116,7 +1127,8 @@ func (c *Client) MSSClamp(ctx context.Context, swIfIndex uint32) (MSSClampInfo, 
 	}
 }
 
-// appendSegments 写满定长数组 segments[8]：未用的槽位补零。
+// appendSegments 写满定长数组 relays[8]：未用的槽位补零。
+// 参数是**中转跳**列表（不含终点），长度已由调用方按 maxRelays 验过。
 func appendSegments(b []byte, segs []Segment) []byte {
 	for _, s := range segs {
 		b = appendIP4(b, s.IP)

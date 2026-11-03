@@ -144,7 +144,7 @@ hub-spoke 的 spoke 间隧道共用一个自动生成的路径模板（`经 <设
 
 **UDP 端口（VPN 池、中转池各自独立）**
 
-- 取池内**最小空闲**端口；释放立即回池，不做冷却。端口不携带身份，隧道的身份是 WG 密钥与绑定表的 `(peer endpoint, peer dst_port)`，旧会话的残留包过不了新 peer 的校验。
+- 取池内**最小空闲**端口；释放立即回池，不做冷却。端口号不携带**跨设备**身份（隧道身份是 WG 密钥与对端公钥，旧会话的残留包过不了新 peer 的校验），但它在**本机**就是数据面的绑定键：`set sr-wg tunnel <idx> path <p> src-port <本端监听端口>`，encap 按外层 UDP 源端口查这张表，同一台盒子上两条隧道不能填同一个本端端口。
 - 中转端口：发布全局配置时给每台已入网设备取池内第一个值（租户内尽量一致），被本机别的监听占用就顺延；发布之后入网的设备在入网时按同一条规则取号。设备侧绑定失败时把 `(设备, 端口)` 记为不可用再顺延，不回收这个判断。
 - 一台设备的中转端口一旦分配就固定；同一台设备再出新的中转隧道，复用同一个端口（数据面按 SR 头转发，与端口无关）。
 - VPN 端口在创建隧道时分配；没有已发布的全局配置就没有中转端口，因此也建不了隧道。
@@ -179,7 +179,7 @@ hub-spoke 的 spoke 间隧道共用一个自动生成的路径模板（`经 <设
 2. `skipped` 里的隧道**保持现状继续跑**：观测地址短暂过期不是拆掉一条正在过流量的链路的理由。
 3. `user_instance >= wire.UnderlayInstanceBase` 且快照里不再出现（`tunnels` 和 `skipped` 都没有）的接口，才删除——在 agent 停机期间做的删除也能落到设备上。这条孤儿清理只碰自己管的实例号段，人手工配的接口不动。
 
-落地顺序按 VPP 的约束：ip table add → (地址已存在先 del) → set interface ip table → add overlay /32 → admin up → mpls enable → 最后加 peer；随后 `ip route add table 250 <peer_overlay>/32 via <if>`；有多跳中转时 `AddPath`（`segments[0]` = 隧道终点 ip:port，其后把 `relays[]` **倒序**追加，所以最后一段才是第一跳——顺序反了包会先弹到错的盒子上）+ `BindTunnel` + `EnableEncap`。MSS 按隧道 MTU 自动钳制，MTU 只核对不覆盖。
+落地顺序按 VPP 的约束：ip table add → (地址已存在先 del) → set interface ip table → add overlay /32 → admin up → mpls enable → 最后加 peer；随后 `ip route add table 250 <peer_overlay>/32 via <if>`；有多跳中转时 `AddPath`（表里**只写 `relays[]`**，agent 侧 `relays[0]` 是第一跳，进 vppapi 时**倒序**，所以数组最后一格才是第一跳——顺序反了包会先弹到错的盒子上；隧道终点不在表里，encap 从报文外层 dst 现取）+ `BindTunnel`（键 = 本端监听端口，`src_port`）+ `EnableEncap`。MSS 按隧道 MTU 自动钳制，MTU 只核对不覆盖。
 
 **VPP 重启**：vppapi 客户端没有自动重连，socket 死了就是 `ErrClosed`。`TunnelSync` 会把坏连接丢掉，并在下一次 reconcile 时用 `vppapi.Dial` 重新连（快照里对不上就重建）。观测回报与 applier 共用这一条连接：重连后回报也跟着新连接走，不会抱着一个已经消失的 socket。心跳里的 `tunnel` 为 `null` 表示这台设备根本没有数据面（`-tunnels` 和 `-vpp-api` 都没开），`capable:false` 表示"有这个通道但被关掉了"（只开了 `-vpp-api`）——控制台按这两种情况分别写文案，不把"没有这功能"和"没装上"混成一句。
 
@@ -238,6 +238,9 @@ MTU 边界包（DF / frag-needed，见 §2 与既有 MTU 缺口任务）、自�
 cpe1  path_id=1003 seg_count=2   seg[0]: 10.88.1.12:20000   seg[1]: 10.88.1.3:15000
 cpe2  path_id=1002 seg_count=2   seg[0]: 10.88.1.11:20000   seg[1]: 10.88.1.3:15000
 ```
+
+> 同 §15：这是当时的原始输出。现在（D-2）这张表读成 `relay_count=1` + `relay[0] (第一跳): 10.88.1.3:15000`，
+> `seg[0]` 那一格不再进表，由 encap 从报文外层 dst 现取。
 
 overlay ping 双向各 4/4、0% loss；中转盒 `show sr-wg stats` 的 `Transit: ok` 恰好 +16（两个方向各 4 个请求 + 4 个应答）、`hmac_fail:0` —— 路径头的签名用装在它身上的密钥环验过了，验完弹一段再改外层目的地址。
 
@@ -303,6 +306,10 @@ cpe1  path_id=1002 seg_count=3
 cpe2  path_id=1001 seg_count=3
       seg[0]: 10.88.1.11:20000   seg[1]: 10.88.1.3:15000   seg[2]: 10.88.1.13:15000
 ```
+
+> 上面是**当时**的原始输出。2026-11-03 起路径表只存中转跳（D-2 / A 方案），同一份配置现在读成
+> `relay_count=2` + `relay[0]: 10.88.1.3:15000` + `relay[1] (第一跳): 10.88.1.13:15000`：终点段
+> 不在表里，由 encap 从报文外层 dst 现取。段数与顺序的结论不变。
 
 绑定都在 `wg1006`（实例号 = 1000 + 隧道序号）且 `usable`。overlay ping 双向各 4/4、0% loss（cpe1→cpe2 0.67–0.77 ms，cpe2→cpe1 0.54–0.85 ms）。
 

@@ -27,12 +27,16 @@
 #
 #   overlay: node1 wg0 = 192.168.99.1/24   <->   node2 wg0 = 192.168.99.2/24
 #
-# SR 路径（node1 视角，段列表顺序 = 「最终目的 → 第一跳」）:
-#   segments[0] = 10.10.2.2:51820   (node2，最终目的)
-#   segments[1] = 10.10.1.3:51821   (transit，第一跳，"首跳免费"由外层承载)
-#   encap  -> 外层 dst 改写为 10.10.1.3:51821，seg_left = seg_count-1 = 1
+# SR 路径（node1 视角，2026-11-03 定案的 A 方案：表里只存中转跳）:
+#   relays[0] = 10.10.1.3:51821   (transit，第一跳，"首跳免费"由外层承载)
+#   终点段 10.10.2.2:51820 **不在表里** —— encap 封装前从即将发出的那个包现取
+#   （外层 dst IP + UDP 目的端口），所以对端换 IP / 换映射端口都不用重配 SR。
+#   encap  -> segments[0]=报文终点、seg_left=relay_count=1，外层 dst 改写为第一跳
 #   transit-> next_hop = segments[0] = 10.10.2.2:51820，seg_left 1 -> 0
 #   node2  -> sr-wg4-input 见 seg_left==0，剥 SR 头后交给 wg4-input 解密
+#
+# 隧道绑定的查表键 = **本端**外层 UDP 源端口（实测 VPP 的 WG 发包源端口 = 接口
+# 监听端口）：一条隧道一个监听端口，这个端口就是它的身份。
 #
 # ==================== 手工等价配置（想自己敲 vppctl 复现时照抄） ====================
 # 前提：容器已由 test/docker/docker-compose.yml 起好，VPP 由
@@ -73,8 +77,10 @@
 #       内层超了隧道 MTU，VPP 在 WG 出口切片，每片再背一份 SR/WG 头。
 #   vppctl set sr-wg rebind-ports        # 必须在 wg-create 之后：建 WG 接口会
 #                                        # 把 51820 重新注册给 wg4-input
-#   vppctl sr-wg path add 1 via 10.10.2.2:51820 via 10.10.1.3:51821 hmac-id 1
-#   vppctl set sr-wg tunnel 2 path 1 endpoint 10.10.2.2   # 2 = wg0 的 sw_if_index
+#   vppctl sr-wg path add 1 via 10.10.1.3:51821 hmac-id 1   # 只写中转跳，终点不写
+#   vppctl set sr-wg tunnel 2 path 1 src-port 51820   # 2 = wg0 的 sw_if_index
+#       src-port = **本端**这条隧道的监听端口（实测 WG 发包源端口就是它）。
+#       不给 src-port 也能配上，但那条绑定永远命中不了。
 #   vppctl set sr-wg encap enable 1                         # 1 = host-eth1
 #   # ↑ SR 三件套必须排在 peer add 之前：peer 一加 wireguard 立刻发
 #   # handshake-init，encap 还没挂上时这个包会走 docker 网桥被 SNAT，
@@ -147,12 +153,11 @@ TUNNEL_MTU=${TUNNEL_MTU:-1360}
 UNDERLAY_MTU=${UNDERLAY_MTU:-}
 
 
-# 绑定键的第二半（封装前的外层目的端口）。空=通配，沿用单隧道配法。
-TUN_DST_PORT=${TUN_DST_PORT:-}
-
 # **对端**的监听端口。空 = 与本机 VPN_PORT 相同（对称配法，历史默认）。
-# 两端监听端口不同时（WG 原生就允许），必须给 TUN_DST_PORT：它同时是
-# 绑定的目的端口、peer 的 dst-port、SR 路径最终目的段的端口。
+TUN_DST_PORT=${TUN_DST_PORT:-}
+# 两端监听端口不同时（WG 原生就允许），必须给 TUN_DST_PORT：它是 WG peer 的
+# dst-port，也就是本条流封装前那个外层目的端口 —— 现在它就是 SR 终点段的值，
+# 隧道绑定的键不看它（绑定键是本端源端口 VPN_PORT）。
 PEER_VPN_PORT=${TUN_DST_PORT:-${VPN_PORT}}
 
 log() { echo "[setup:${ROLE}] $*" >&2; }
@@ -506,22 +511,31 @@ cmd_peer() {
     if [ "${no_sr}" = "nosr" ]; then
         log "nosr mode: skip SR path setup (WG direct endpoint)"
     else
-        # SR 路径：segments[0]=最终目的(peer:PEER_VPN_PORT)，segments[1]=第一跳(transit)
-        vppctl sr-wg path add "${SR_PATH_ID}" \
-               via "${PEER_UNDERLAY}:${PEER_VPN_PORT}" \
-               via "${FIRST_HOP}:${TRANSIT_PORT}" \
-               hmac-id "${SR_HMAC_ID}" || die "sr-wg path add failed"
+        # SR 路径：只存中转跳（第一跳 transit）。终点段不在这张表里 —— encap
+        # 封装前从即将发出的那个包现取外层 (dst IP, 目的端口)，也就是下面 peer
+        # 填的那个 endpoint，所以对端换地址/换映射端口都不用回来改这条路径。
+        if [ -n "${FIRST_HOP}" ]; then
+            vppctl sr-wg path add "${SR_PATH_ID}" \
+                   via "${FIRST_HOP}:${TRANSIT_PORT}" \
+                   hmac-id "${SR_HMAC_ID}" || die "sr-wg path add failed"
+            relay_desc="via ${FIRST_HOP}:${TRANSIT_PORT}"
+        else
+            # 零中转跳是合法配置：那条隧道照样要带 SR 头，它是收端把外层源
+            # 记成 verified 观测的唯一凭证。CLI 不许默默建空路径，得显式写 no-relay。
+            vppctl sr-wg path add "${SR_PATH_ID}" no-relay \
+                   hmac-id "${SR_HMAC_ID}" || die "sr-wg path add failed"
+            relay_desc="no-relay"
+        fi
 
-        local swidx dst_port_args=""
+        local swidx
         swidx=$(sw_if_index_of "${WG_IF}")
         [ -n "${swidx}" ] || die "cannot resolve sw_if_index of ${WG_IF}"
-        # TUN_DST_PORT 非空时按 (endpoint, dst_port) 精确绑定。同对端开第二条
-        # 隧道必须给：留空就是通配，会把另一条隧道的包也拽进这条路径。
-        [ -z "${TUN_DST_PORT}" ] || dst_port_args="dst-port ${TUN_DST_PORT}"
+        # 绑定键 = 本端这条隧道的外层源端口 = 本机监听端口（VPN_PORT）。
+        # 对端端口不参与选路，它只决定终点段的值，而终点段取自报文。
         vppctl set sr-wg tunnel "${swidx}" path "${SR_PATH_ID}" \
-               endpoint "${PEER_UNDERLAY}" ${dst_port_args} \
+               src-port "${VPN_PORT}" \
             || die "set sr-wg tunnel failed"
-        log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID} endpoint=${PEER_UNDERLAY}${TUN_DST_PORT:+:${TUN_DST_PORT}}"
+        log "bound ${WG_IF}(sw_if_index=${swidx}) -> path ${SR_PATH_ID} (${relay_desc}) src-port=${VPN_PORT}"
 
         # encap 的挂点是 **underlay 出口接口**，不是 wg0：VPP 26.06 的
         # wg4-output-tun 把 next 硬编码为 adj-midchain-tx，从不走 feature 链，

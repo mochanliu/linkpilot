@@ -1,8 +1,8 @@
 /*
  * sr_path.h - 路径管理数据结构（控制面 -> 数据面）
  *
- * 路径表最多 SR_MAX_PATHS 条，每条路径包含完整的段列表、
- * 独立的 P-Key，以及 active 标志。
+ * 路径表最多 SR_MAX_PATHS 条，每条路径存的是**中间转发跳**、该路径签名用的
+ * P-Key 与 active 标志。终点不在这里：见下面"路径 = 只有中间跳"。
  */
 #ifndef SR_PATH_H
 #define SR_PATH_H
@@ -14,12 +14,29 @@
 extern "C" {
 #endif
 
-/* 路径配置（控制面下发给数据面） */
+/*
+ * 路径配置（控制面下发给数据面）。
+ *
+ * 路径 = 只有中间跳。
+ *
+ * SR 负责的是"这一条隧道要经过哪几台中转"，对端终点是谁由 WG 自己决定：
+ * encap 时终点段直接取自**即将发出的那个包**的外层 dst（IP + 端口），再和
+ * 中转跳拼成线格式里的段列表。所以 endpoint 的地址与端口怎么变（NAT 重绑、
+ * 动态学习、对端换端口）都不用改 SR 路径 —— 那正是把终点写进路径表会留下的
+ * 缺陷：地址一变，路径表里就存着一个没人再听的老地址。
+ *
+ * 顺序沿用 sr_header.h 的约定（segments[0] = 最终目的，末位 = 第一跳），
+ * 只是把终点那一位交给报文：relays[0] = 离终点最近的那台中转，
+ * relays[relay_count-1] = 第一跳。encap 填出来的线格式是
+ *   header.segments[0]      = 报文里的外层 dst（终点）
+ *   header.segments[1 + i]  = relays[i]
+ * 手敲时 `via` 的书写顺序不变，只是不再写对端那一段。
+ */
 typedef struct sr_path_config {
     uint16_t     path_id;                   /* 路径标识 */
     uint16_t     hmac_id;                   /* HMAC 密钥标识 */
-    uint8_t      seg_count;                 /* 段数 (1..SR_MAX_SEGS) */
-    sr_segment_t segments[SR_MAX_SEGS];     /* 段列表（网络序） */
+    uint8_t      relay_count;               /* 中转跳数 (0..SR_MAX_RELAYS) */
+    sr_segment_t relays[SR_MAX_SEGS];       /* 中转跳列表（网络序） */
     uint8_t      pkey[SR_PKEY_LEN];         /* 该路径使用的 P-Key */
     uint8_t      active;                    /* 是否激活 */
 } sr_path_config_t;
@@ -33,12 +50,21 @@ typedef struct sr_path_config {
  */
 #define SR_MAX_PATHS  4096
 
+/*
+ * 一条路径最多几台中转。
+ *
+ * 线格式里的段总数上限是 SR_MAX_SEGS（头部长度字段只有 8 位，且 hdr_len
+ * 要能装下），而终点那一段永远要占掉一位（它来自报文，不是来自配置），
+ * 所以能配置的只有 SR_MAX_SEGS - 1 跳。
+ */
+#define SR_MAX_RELAYS  (SR_MAX_SEGS - 1)
+
 /* path_id 是 16 位，所以定位表可以定长：一次数组访问就能拿到槽位。 */
 #define SR_PATH_ID_SPAN  65536
 
 /* sr_path_add / sr_path_del 的返回值 */
 #define SR_PATH_OK          0
-#define SR_PATH_ERR_PARAM  (-1)   /* 参数非法（NULL / seg_count 越界 / 不存在） */
+#define SR_PATH_ERR_PARAM  (-1)   /* 参数非法（NULL / relay_count 越界 / 不存在） */
 #define SR_PATH_ERR_FULL   (-2)   /* 表已满，装不下新 path_id（覆盖已有条目不受影响） */
 
 typedef struct sr_path_table {
@@ -95,11 +121,18 @@ int sr_path_replace_pkey(sr_path_table_t *t, uint16_t hmac_id,
 
 /*
  * 根据路径配置填充 SR Header（初始化 + 设置各字段 + HMAC 签名）。
- * timestamp 为主机序秒级时间戳。
- * 返回 0 成功，-1 失败。
+ *
+ * endpoint 是**终点段**，由调用方从当前报文的外层 dst 取来（IP 与端口都必须是
+ * 网络序，路径表里的中转跳同样是网络序）。它不是可选参数：终点段参与 HMAC
+ * 覆盖范围，必须在签名**之前**就位，签完再改就是必然验签失败。
+ *
+ * 线格式的段总数 = relay_count + 1（终点那一位），所以
+ * seg_left 由调用方覆盖为 relay_count（"首跳免费"那条规则不变）。
+ *
+ * timestamp 为主机序秒级时间戳。返回 0 成功，-1 失败。
  */
 int sr_path_fill_header(const sr_path_config_t *cfg, sr_header_t *h,
-                        uint32_t timestamp);
+                        uint32_t timestamp, const sr_segment_t *endpoint);
 
 #ifdef __cplusplus
 }

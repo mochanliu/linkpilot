@@ -10,7 +10,7 @@
  *   show sr-wg observed
  *   clear sr-wg stats
  *   clear sr-wg observed
- *   sr-wg path add <path_id> via <ip>:<port> [via <ip>:<port> ...]
+ *   sr-wg path add <path_id> [via <ip>:<port> ...] [no-relay]
  *                  [hmac-id <n>] [inactive]
  *   sr-wg path del <path_id>
  *   sr-wg key set <hmac_id> <hex32>
@@ -18,8 +18,7 @@
  *   set sr-wg port add|del vpn|transit <port>
  *   set sr-wg transit enable port <port>
  *   set sr-wg transit disable
- *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>]
- *                   [dst-port <port>] [del]
+ *   set sr-wg tunnel <sw_if_index> path <path_id> [src-port <port>] [del]
  *   set sr-wg encap enable <underlay sw_if_index|name> | disable <…>
  *                   | fib-index <n>
  *   set sr-wg rebind-ports        （建 WG 接口后必做，见 sr_wg.c）
@@ -77,19 +76,21 @@ sr_wg_show_paths_command_fn (vlib_main_t *vm, unformat_input_t *input,
       sr_path_config_t *cfg = &sm->path_table.paths[i];
       int j;
 
-      vlib_cli_output (vm, "  [%d] path_id=%u hmac_id=%u seg_count=%u "
+      vlib_cli_output (vm, "  [%d] path_id=%u hmac_id=%u relay_count=%u "
                            "active=%u",
-                       i, cfg->path_id, cfg->hmac_id, cfg->seg_count,
+                       i, cfg->path_id, cfg->hmac_id, cfg->relay_count,
                        cfg->active);
 
-      for (j = 0; j < cfg->seg_count; j++)
+      /* 只有中转跳：终点段不在这张表里，encap 从报文外层 dst 现取 */
+      for (j = 0; j < cfg->relay_count; j++)
         {
           ip4_address_t ip;
           u16 port;
-          clib_memcpy_fast (&ip, cfg->segments[j].ip, 4);
-          clib_memcpy_fast (&port, cfg->segments[j].port, 2);
+          clib_memcpy_fast (&ip, cfg->relays[j].ip, 4);
+          clib_memcpy_fast (&port, cfg->relays[j].port, 2);
           port = clib_net_to_host_u16 (port);
-          vlib_cli_output (vm, "      seg[%d]: %U:%u", j,
+          vlib_cli_output (vm, "      relay[%d]%s: %U:%u", j,
+                           j == cfg->relay_count - 1 ? " (第一跳)" : "",
                            format_ip4_address, &ip, port);
         }
     }
@@ -146,8 +147,8 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
   /*
    * 挂点在 underlay 出口接口（不是 wg0），所以绑定能不能生效取决于两件事：
    *   (1) 至少一个 underlay 接口启用了 sr-wg4-encap feature
-   *   (2) 该绑定带 endpoint —— underlay 挂点上 tx_sw_if_index 是物理口，
-   *       只有 endpoint_path 能命中 wg0 维度的绑定
+   *   (2) 该绑定带本端源端口 —— 数据面按外层 UDP 源端口选路（每隧道一个监听
+   *       端口，定案 2），src_port=0 的绑定查不到
    * 任一条不满足，流量都会静默旁路直发 peer，破坏源路由语义，必须显式提示。
    */
   vlib_cli_output (vm, "encap fib-index=%u, encap enabled on %u interface(s):",
@@ -180,17 +181,13 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
       bind = pool_elt_at_index (sm->binds, bi);
 
-      if (bind->endpoint.as_u32 != 0)
+      if (bind->src_port)
         {
-          /*
-           * 端口通配（dst_port==0）也能命中，但它把这个 IP 上的**所有**隧道
-           * 都拽进同一条路径 —— 多隧道场景下这是配漏了 dst-port，标出来。
-           */
-          state = bind->dst_port ? "usable" : "usable, !! 端口通配";
+          state = "usable";
           n_usable++;
         }
       else
-        state = "!! NO ENDPOINT, never matches";
+        state = "!! NO SRC PORT, never matches";
 
       /*
        * 26.06 的 vnet_sw_interface_t 已无 name 字段，必须用格式化函数取名。
@@ -204,18 +201,16 @@ sr_wg_show_tunnels_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (vnet_get_sw_interface_or_null (vnm, bind->sw_if_index))
         vlib_cli_output (vm,
                          "  [%u] sw_if_index=%u (%U) path_id=%u "
-                         "endpoint=%U:%u %s",
+                         "src_port=%u %s",
                          bi, bind->sw_if_index, format_vnet_sw_if_index_name,
                          vnm, bind->sw_if_index, (u32) bind->path_id,
-                         format_ip4_address, &bind->endpoint,
-                         (u32) bind->dst_port, state);
+                         (u32) bind->src_port, state);
       else
         vlib_cli_output (vm,
                          "  [%u] sw_if_index=%u (<deleted>) path_id=%u "
-                         "endpoint=%U:%u %s",
+                         "src_port=%u %s",
                          bi, bind->sw_if_index, (u32) bind->path_id,
-                         format_ip4_address, &bind->endpoint,
-                         (u32) bind->dst_port, state);
+                         (u32) bind->src_port, state);
       n++;
     }
 
@@ -407,17 +402,21 @@ VLIB_CLI_COMMAND (sr_wg_clear_observed_command, static) = {
  * 一条纯 CLI 通道，这里补上（与 vl_api_sr_wg_path_add_del_t_handler /
  * vl_api_sr_wg_key_set_t_handler 语义完全一致）。
  *
- *   sr-wg path add <path_id> via <ip>:<port> [via <ip>:<port> ...]
+ *   sr-wg path add <path_id> [via <ip>:<port> [via <ip>:<port> ...]]
  *                  [hmac-id <n>] [inactive]
  *   sr-wg path del <path_id>
  *
- * 段列表顺序遵循 sr_header.h 约定：
- *   segments[0]           = 最终目的（对端 CPE，port 51820）
- *   segments[seg_count-1] = 第一跳（transit，port 51821）
- * 因此 via 的书写顺序是「从最终目的到第一跳」。encap 取
- * segments[seg_count-1] 作为外层 dst（"首跳免费"），并把 seg_left
- * 置为 seg_count-1；此后每经过一个 transit 执行一次
- * sr_hdr_pop_segment()（next = segments[seg_left-1]，然后 seg_left--）。
+ * `via` 只写**中转跳**，从离终点最近的那台写到第一跳；终点不写 —— 它是
+ * 报文自己的外层 dst，encap 发包时现取（所以 peer 的地址/端口怎么变都不用
+ * 重建路径，也不用知道）。一条 via 都不给 = 没有中转跳，仍然合法：那种隧道
+ * 照样带 SR 头，用来让对端把外层源记成 verified 观测。
+ *
+ * 填进线格式后的段序（sr_header.h 约定）：
+ *   segments[0]           = 报文外层 dst（最终目的 = 对端 CPE）
+ *   segments[seg_count-1] = 第一条 via = 第一跳（transit，port 51821）
+ * encap 取它作为改写后的外层 dst（"首跳免费"），并把 seg_left 置为
+ * relay_count；此后每经过一个 transit 执行一次 sr_hdr_pop_segment()
+ * （next = segments[seg_left-1]，然后 seg_left--）。
  */
 static clib_error_t *
 sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -427,7 +426,7 @@ sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
   sr_path_config_t cfg;
   ip4_address_t ip;
   u32 path_id = 0, hmac_id = 0, port = 0;
-  u8 add = 0, del = 0, inactive = 0;
+  u8 add = 0, del = 0, inactive = 0, no_relay = 0;
   int rv;
 
   clib_memset (&cfg, 0, sizeof (cfg));
@@ -445,20 +444,22 @@ sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
         ;
       else if (unformat (input, "inactive"))
         inactive = 1;
+      else if (unformat (input, "no-relay"))
+        no_relay = 1;
       else if (unformat (input, "via %U:%u", unformat_ip4_address, &ip, &port))
         {
           u16 port_net;
 
-          if (cfg.seg_count >= SR_MAX_SEGS)
-            return clib_error_return (0, "too many segments (max %d)",
-                                      SR_MAX_SEGS);
+          if (cfg.relay_count >= SR_MAX_RELAYS)
+            return clib_error_return (0, "too many relay hops (max %d)",
+                                      SR_MAX_RELAYS);
           if (port == 0 || port > 65535)
-            return clib_error_return (0, "bad port %u in segment %u", port,
-                                      cfg.seg_count);
-          clib_memcpy_fast (cfg.segments[cfg.seg_count].ip, &ip, 4);
+            return clib_error_return (0, "bad port %u in relay hop %u", port,
+                                      cfg.relay_count);
+          clib_memcpy_fast (cfg.relays[cfg.relay_count].ip, &ip, 4);
           port_net = clib_host_to_net_u16 ((u16) port);
-          clib_memcpy_fast (cfg.segments[cfg.seg_count].port, &port_net, 2);
-          cfg.seg_count++;
+          clib_memcpy_fast (cfg.relays[cfg.relay_count].port, &port_net, 2);
+          cfg.relay_count++;
         }
       else
         break;
@@ -481,8 +482,15 @@ sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (!add)
     return clib_error_return (0, "specify 'add <path_id>' or 'del <path_id>'");
-  if (cfg.seg_count == 0)
-    return clib_error_return (0, "at least one 'via <ip>:<port>' required");
+  /*
+   * 没有 via 时不许默默建一条零中转跳的路径：`via` 拼错会被 unformat 静默
+   * 停在 else break，后果是"路径建成功了、流量直发对端"，正是本改动要消灭的
+   * 那类故障。确实要零中转跳（只为了让包带 SR 头）请显式写 `no-relay`。
+   */
+  if (cfg.relay_count == 0 && !no_relay)
+    return clib_error_return (
+      0, "no 'via <ip>:<port>' parsed; 直连隧道不需要 SR 路径。"
+         "若确实要建零中转跳的路径，加 `no-relay`");
 
   cfg.path_id = (u16) path_id;
   cfg.hmac_id = (u16) hmac_id;
@@ -508,16 +516,16 @@ sr_wg_path_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (rv != 0)
     return clib_error_return (0, "sr_path_add failed (rv=%d)", rv);
 
-  vlib_cli_output (vm, "SR-WG path %u set: hmac_id=%u seg_count=%u active=%u",
-                   path_id, cfg.hmac_id, cfg.seg_count, cfg.active);
+  vlib_cli_output (vm, "SR-WG path %u set: hmac_id=%u relay_count=%u active=%u",
+                   path_id, cfg.hmac_id, cfg.relay_count, cfg.active);
   return 0;
 }
 
 VLIB_CLI_COMMAND (sr_wg_path_command, static) = {
   .path = "sr-wg path",
-  .short_help = "sr-wg path add <path_id> via <ip>:<port> "
-                "[via <ip>:<port> ...] [hmac-id <n>] [inactive] | "
-                "sr-wg path del <path_id>",
+  .short_help = "sr-wg path add <path_id> [via <ip>:<port> ...] "
+                "(中转跳，离终点近的写前面；终点不写) [no-relay] "
+                "[hmac-id <n>] [inactive] | sr-wg path del <path_id>",
   .function = sr_wg_path_command_fn,
 };
 
@@ -769,31 +777,26 @@ VLIB_CLI_COMMAND (sr_wg_set_transit_command, static) = {
 /*
  * 绑定 / 解绑 WG 隧道接口到 SR 路径。
  *
- *   set sr-wg tunnel <sw_if_index> path <path_id> [endpoint <ip>]
- *                  [dst-port <port>] [del]
+ *   set sr-wg tunnel <sw_if_index> path <path_id> [src-port <port>] [del]
  *
  * 本命令**只写绑定表**，不启用 feature。encap 的挂点在 underlay 出口接口
  * （wg4-output-tun 不参与 feature 链，详见 sr_wg.h），必须另外执行
  * `set sr-wg encap enable <underlay sw_if_index>`。
  *
- * underlay 挂点上数据面按外层 (dst IP, 封装前 dst 端口) 查绑定，所以 add 时
- * [endpoint] 实际必填；缺失时这里仍接受配置但立刻告警，避免"配了却没生效"要
- * 抓包才发现。[dst-port] 不给就是通配（该 IP 上不分行数全走本路径）：单隧道
- * 可以用，同对端开多条隧道时必须给，否则第二条会被第一条的路径接管。
+ * 数据面按**本端外层 UDP 源端口**查绑定（每隧道一个监听端口，定案 2），所以
+ * add 时 [src-port] 实际必填 —— 不给就是"配了但永不命中"，这里接受配置并立刻
+ * 告警，避免要靠抓包才发现。它是这条隧道自己的端口，取自建接口时的 listen-port。
  */
 static clib_error_t *
 sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
                              vlib_cli_command_t *cmd)
 {
   sr_wg_main_t *sm = &sr_wg_main;
-  ip4_address_t endpoint;
   u32 sw_if_index = (u32) ~0;
   u32 path_id = 0;
-  u32 dst_port = 0;
-  u8 have_path = 0, is_del = 0, have_endpoint = 0, have_dst_port = 0;
+  u32 src_port = 0;
+  u8 have_path = 0, is_del = 0, have_src_port = 0;
   int rv;
-
-  clib_memset (&endpoint, 0, sizeof (endpoint));
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -801,10 +804,8 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
         ;
       else if (unformat (input, "path %u", &path_id))
         have_path = 1;
-      else if (unformat (input, "endpoint %U", unformat_ip4_address, &endpoint))
-        have_endpoint = 1;
-      else if (unformat (input, "dst-port %u", &dst_port))
-        have_dst_port = 1;
+      else if (unformat (input, "src-port %u", &src_port))
+        have_src_port = 1;
       else if (unformat (input, "del"))
         is_del = 1;
       else if (unformat (input, "delete"))
@@ -817,17 +818,11 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
     return clib_error_return (0, "missing <sw_if_index>");
   if (!is_del && !have_path)
     return clib_error_return (0, "missing 'path <path_id>' (or use 'del')");
+  if (!is_del && have_src_port && (src_port == 0 || src_port > 65535))
+    return clib_error_return (0, "bad src-port %u", src_port);
 
   rv = sr_wg_tunnel_set_path (sm, sw_if_index, (u16) path_id,
-                              have_endpoint ? &endpoint : NULL,
-                              (u16) dst_port, is_del ? 0 : 1);
-  if (rv == VNET_API_ERROR_ENTRY_ALREADY_EXISTS)
-    return clib_error_return (
-      0,
-      "endpoint=%U:%u 已经被另一条隧道的绑定占着 —— 同一对 CPE 的多条隧道"
-      "必须各自一个 dst-port，否则前一条会被静默旁路。全表见 "
-      "`show sr-wg tunnels`。",
-      format_ip4_address, &endpoint, dst_port);
+                              (u16) src_port, is_del ? 0 : 1);
   if (rv != 0)
     return clib_error_return (0, "sr-wg tunnel set path failed (rv=%d)", rv);
 
@@ -837,18 +832,15 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
       return 0;
     }
 
-  if (have_endpoint)
+  if (have_src_port)
     vlib_cli_output (vm,
-                     "SR-WG tunnel %u bound to path_id=%u endpoint=%U:%u%s",
-                     sw_if_index, (u32) (u16) path_id,
-                     format_ip4_address, &endpoint, (u32) dst_port,
-                     have_dst_port ? "" : "  !! 未指定 dst-port：本绑定对端点"
-                     "IP 上的**所有**隧道生效（通配），多隧道场景请补 dst-port");
+                     "SR-WG tunnel %u bound to path_id=%u src_port=%u",
+                     sw_if_index, (u32) (u16) path_id, src_port);
   else
     vlib_cli_output (vm,
                      "SR-WG tunnel %u bound to path_id=%u, "
-                     "!! WARNING: 未指定 endpoint，本绑定在 underlay 挂点上"
-                     "永远不会命中，流量将直发 peer。",
+                     "!! WARNING: 未指定 src-port，本绑定永远不会命中，"
+                     "流量将直发 peer。",
                      sw_if_index, (u32) (u16) path_id);
 
   sr_wg_encap_reconcile (sm);
@@ -863,7 +855,7 @@ sr_wg_set_tunnel_command_fn (vlib_main_t *vm, unformat_input_t *input,
 VLIB_CLI_COMMAND (sr_wg_set_tunnel_command, static) = {
   .path = "set sr-wg tunnel",
   .short_help = "set sr-wg tunnel <sw_if_index> path <path_id> "
-                "[endpoint <ip>] [dst-port <port>] [del]",
+                "[src-port <port>] [del]",
   .function = sr_wg_set_tunnel_command_fn,
 };
 

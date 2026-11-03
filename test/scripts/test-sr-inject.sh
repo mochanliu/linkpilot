@@ -415,11 +415,10 @@ vppctl show interface 2>/dev/null | grep -qw wg0 ||
     vppctl wireguard create listen-port ${VPN_PORT} generate-key src ${N1_UNDERLAY} >/dev/null 2>&1
 vppctl set interface state wg0 up 2>/dev/null
 vppctl sr-wg path add ${SR_PATH_ID} \
-    via ${N2_UNDERLAY}:${VPN_PORT} \
     via ${TRANSIT_A}:${TRANSIT_PORT} \
     hmac-id ${SR_HMAC_ID} >/dev/null 2>&1
 WGIDX=\$(vppctl show interface 2>/dev/null | tr -d '\r' | awk '\$1==\"wg0\"{print \$2; exit}')
-[ -n \"\${WGIDX}\" ] && vppctl set sr-wg tunnel \${WGIDX} path ${SR_PATH_ID} endpoint ${N2_UNDERLAY}
+[ -n \"\${WGIDX}\" ] && vppctl set sr-wg tunnel \${WGIDX} path ${SR_PATH_ID} src-port ${VPN_PORT}
 " 2>&1 | tr -d '\r' | sed 's/^/    /'
 
 WG_FEAT=$(dx "${C_NODE1}" "vppctl show interface features wg0" 2>/dev/null | tr -d '\r' |

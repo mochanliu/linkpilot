@@ -68,8 +68,8 @@
 #   也不是我们的代码。摘掉 SR 绑定跑纯 WG 的洪泛对照（4x400M）：node1 进 VPP
 #   34.2k pps vs 带 SR 的 28.3k，端到端 190 vs 196 Mbit/s（SR 包更大所以比特持平），
 #   即原版 WG 在这台台子上也快不了多少，同一个上限形态。
-#   复现：`vppctl set sr-wg tunnel 2 del` → 测 → `set sr-wg tunnel 2 path 1 endpoint
-#   10.10.2.2` 绑回；无 WG 那一档要把 node1/node2 的 10.20.x/24 路由先 del 再指到
+#   复现：`vppctl set sr-wg tunnel 2 del` → 测 → `set sr-wg tunnel 2 path 1 src-port
+#   51820` 绑回；无 WG 那一档要把 node1/node2 的 10.20.x/24 路由先 del 再指到
 #   underlay 下一跳（VPP 的 ip route add 是**追加路径**，不 del 会变成 ECMP 分半）。
 set -u
 

@@ -25,11 +25,13 @@ import (
 //     （srwg-node1 上两张接口装同一把公钥实测第二次 -116，去重键不含接口）；
 //     0 条 allowed_ip → -7；删不存在的 peer → -6；
 //   - 绑一条不存在的路径 → -6；解绑一条不存在的绑定 → -6；
-//   - 同 path_id 的 AddPath 原地替换；删不存在的路径 → -6；删存在的路径会级联
+//   - 同 path_id 的 AddPath 原地替换**中转链**；删不存在的路径 → -6；删存在的路径会级联
 //     清掉引用它的隧道绑定且 retval=0；
 //   - 建接口之后 sr-wg 的 UDP 挂点丢掉，所以 AddPort + RebindPorts 必须被调用；
-//   - 隧道绑定的**收包侧**键是 (外层 endpoint, 封装前 dst 端口)：两张接口抢同一个
-//     身份 → -116（插件 sr_wg_tunnel_set_path 里的 ENTRY_ALREADY_EXISTS）。
+//   - 隧道绑定：配置侧一接口一槽（第二次写原地更新），收包侧键是**本端 src_port**
+//     （A 方案）。绑定里不再有任何对端地址，所以也没有"两张接口抢同一个身份"这回事
+//     —— 点对点隧道不做重复端口防护（操作员 2026-11-03 明确免除），假数据面照此
+//     不返回 -116。
 //
 // 这些数字全部来自 internal/vppapi 的 live gate（真 VPP 26.06）与插件源码
 // （vpp-plugin/sr_wg_api.c 的 sr_wg_path_del handler、sr_wg4_encap.c 的
@@ -363,18 +365,18 @@ func (f *fakeVPP) Peers(ctx context.Context) ([]vppapi.WgPeer, error) {
 }
 
 func (f *fakeVPP) AddPath(ctx context.Context, p vppapi.PathParams) error {
-	segs := make([]string, 0, len(p.Segments))
-	for _, s := range p.Segments {
-		segs = append(segs, fmt.Sprintf("%s:%d", s.IP, s.Port))
+	relays := make([]string, 0, len(p.Relays))
+	for _, s := range p.Relays {
+		relays = append(relays, fmt.Sprintf("%s:%d", s.IP, s.Port))
 	}
-	f.log("AddPath %d hmac=%d [%s]", p.PathID, p.HmacID, strings.Join(segs, ","))
+	f.log("AddPath %d hmac=%d [%s]", p.PathID, p.HmacID, strings.Join(relays, ","))
 	if _, ok := f.keys[p.HmacID]; !ok {
 		// 真插件就是这么拒的：路径引用了一个没装过的 hmac_id。
 		return fmt.Errorf("vppapi: sr_wg_path_add_del 失败，hmac_id=%d 没装过密钥", p.HmacID)
 	}
 	// 原地替换（实测）
 	f.paths[p.PathID] = vppapi.PathInfo{PathID: p.PathID, HmacID: p.HmacID,
-		Active: p.Active, Segments: append([]vppapi.Segment(nil), p.Segments...)}
+		Active: p.Active, Relays: append([]vppapi.Segment(nil), p.Relays...)}
 	return nil
 }
 
@@ -396,25 +398,18 @@ func (f *fakeVPP) DelPath(ctx context.Context, pathID uint16) error {
 }
 
 func (f *fakeVPP) SetTunnel(ctx context.Context, b vppapi.TunnelBinding) error {
-	f.log("SetTunnel iface=%d path=%d ep=%s:%d", b.SWIfIndex, b.PathID, b.EndpointIP, b.DstPort)
+	f.log("SetTunnel iface=%d path=%d src_port=%d", b.SWIfIndex, b.PathID, b.SrcPort)
 	if _, ok := f.paths[b.PathID]; !ok {
 		// sr_wg4_encap.c 的 sr_wg_tunnel_set_path：绑一条不存在的路径回 NO_SUCH_ENTRY。
 		return vppapi.APIError{Op: "sr_wg_tunnel_set_path", Retval: -6}
 	}
-	// 配置侧的键仍是 sw_if_index：**每个接口只有一条**，第二次写会把第一条覆盖掉。
-	// 这是 ErrSingleBind 那个限制在假数据面上的忠实复刻，不许"顺手"改成多槽。
-	// 收包侧的键是 (endpoint, dst_port)：别的接口已经占着这个身份就 -116，
-	// 同一条 bind 自己改 endpoint/端口不算抢（下面 own 的判据就是这个）。
-	if b.EndpointIP != nil {
-		for sw, t := range f.tunnels {
-			if sw != b.SWIfIndex && t.EndpointIP.Equal(b.EndpointIP) && t.DstPort == b.DstPort {
-				return vppapi.APIError{Op: "sr_wg_tunnel_set_path", Retval: -116}
-			}
-		}
-	}
+	// 配置侧的键是 sw_if_index：**每个接口只有一条**，第二次写是把第一条原地更新掉
+	// （实测；ErrSingleBind 就是这条限制，不许"顺手"改成多槽）。收包侧的键是本端
+	// src_port，两张接口填了同一个端口不报错 —— 点对点隧道不做重复防护（A 方案），
+	// 所以这里也不模拟 -116。
 	f.tunnels[b.SWIfIndex] = vppapi.TunnelInfo{
-		SWIfIndex: b.SWIfIndex, PathID: b.PathID, EndpointIP: b.EndpointIP,
-		DstPort: b.DstPort, Effective: true,
+		SWIfIndex: b.SWIfIndex, PathID: b.PathID,
+		SrcPort: b.SrcPort, Effective: true,
 	}
 	return nil
 }
@@ -1167,7 +1162,7 @@ func TestApplyPeerEndpointPreference(t *testing.T) {
 		name     string
 		observed string
 		verified bool
-		want     string // 期望的 path 段地址；"" 表示期望报错
+		want     string // 期望的 WG peer 外层地址；"" 表示期望报错
 	}{
 		// 定案 1：我自己看到的才是回得去的那条路，反射器的映射只负责第一个包。
 		{"自己的观测优先", "10.10.9.9:41000", true, "10.10.9.9:41000"},
@@ -1194,25 +1189,31 @@ func TestApplyPeerEndpointPreference(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ApplyPeer: %v", err)
 			}
-			got := f.paths[1006]
-			if seg := fmt.Sprintf("%s:%d", got.Segments[0].IP, got.Segments[0].Port); seg != tc.want {
-				t.Errorf("路径段 = %s，期望 %s", seg, tc.want)
+			// 对端地址只进 WG peer 一处：这条测试链路没有中转跳，所以路径表里
+			// 应该是空的（A 方案：终点段由 encap 从将要发出的那个包现取）。
+			if got := f.paths[1006]; len(got.Relays) != 0 {
+				t.Errorf("零跳链路的路径里读到了中转: %+v", got.Relays)
 			}
-			if tun := f.tunnels[l.SWIfIndex()]; !tun.EndpointIP.Equal(net.ParseIP(strings.Split(tc.want, ":")[0])) {
-				t.Errorf("隧道绑定没跟上路径: %+v", tun)
+			p := f.peers[0]
+			if at := fmt.Sprintf("%s:%d", p.EndpointIP, p.Port); at != tc.want {
+				t.Errorf("peer 外层地址 = %s，期望 %s", at, tc.want)
+			}
+			if bind := f.tunnels[l.SWIfIndex()]; bind.PathID != 1006 || bind.SrcPort != 51820 {
+				t.Errorf("隧道绑定没跟上: %+v（期望 path=1006 src_port=51820，本机监听端口）", bind)
 			}
 		})
 	}
 }
 
-// 隧道身份在三个地方必须是同一个端口：WG peer 的目的地端口（包出去的样子）、
-// 绑定键（encap 拿包的目的端口查表）、路径终点段（relay 链最后一跳改写成的端口）。
-// 那个端口是对端的隧道端口（这里是 42000），**不是**本机监听端口 51820。
+// "对端隧道端口"在定案 1 之后只出现在一处：WG peer 的目的地端口，也就是包发出去
+// 时带的那个 dst 端口（这里是 42000）。隧道在数据面里的身份是**本端**监听端口
+// （A 方案：sr_wg4_encap.c 的 Step 4 拿 udp->src_port 查绑定表），SR 路径里既没有
+// 对端 IP 也没有对端端口 —— 终点段由 encap 封装前从将要发出的那个包现取。
 //
-// 填本机端口的后果全是静默的：两端端口相同时只是碰巧对；不同时拼出来的包带着
-// 51820 出去，绑定键也是 51820，而 relay/对端在 42000 上听 —— 结果是握手都完不成
-// （#140 的 lab 现场：.11:20001→.3:20000 直发、node3 Transit.ok 恒为 2）。
-func TestApplyPeerUsesPeerPortForDialBindAndSegment(t *testing.T) {
+// 两处填反了都是静默的：peer 填本机端口，两端端口不同时包发往对端没人在听的地方，
+// 握手都完不成（#140 的 lab 现场：.11:20001→.3:20000 直发、node3 Transit.ok 恒为 2）；
+// 绑定填对端端口，本机发出的包永远查不到自己的绑定，encap 静默旁路成普通 WG。
+func TestApplyPeerDialsPeerPortAndBindsOwnPort(t *testing.T) {
 	f := newFakeVPP()
 	l, pki := newTestLink(t, f)
 	openLink(t, l)
@@ -1221,8 +1222,8 @@ func TestApplyPeerUsesPeerPortForDialBindAndSegment(t *testing.T) {
 	if _, err := l.ApplyPeer(context.Background(), pt); err != nil {
 		t.Fatal(err)
 	}
-	if seg := f.paths[1003].Segments[0]; seg.Port != 42000 || !seg.IP.Equal(net.IPv4(10, 10, 7, 7)) {
-		t.Errorf("SR 段应当带对端端口 42000: %+v", seg)
+	if relays := f.paths[1003].Relays; len(relays) != 0 {
+		t.Errorf("这条链路没有中转跳，路径里却读到了 %+v —— 对端地址不该进路径表", relays)
 	}
 	if p := f.peers[0]; p.Port != 42000 {
 		t.Errorf("WG peer 端口 = %d，期望对端端口 42000（填本机端口的话包发不到对端）", p.Port)
@@ -1230,14 +1231,14 @@ func TestApplyPeerUsesPeerPortForDialBindAndSegment(t *testing.T) {
 	if p := f.peers[0]; !p.EndpointIP.Equal(net.IPv4(10, 10, 7, 7)) {
 		t.Errorf("peer 外层地址应仍是观测到的 IP: %+v", p)
 	}
-	if bind := f.tunnels[l.SWIfIndex()]; bind.DstPort != 42000 || !bind.EndpointIP.Equal(net.IPv4(10, 10, 7, 7)) {
-		t.Errorf("绑定键 = (%v, %d)，期望 (10.10.7.7, 42000)：绑的是本机端口就永远键不中，encap 静默旁路",
-			bind.EndpointIP, bind.DstPort)
+	if bind := f.tunnels[l.SWIfIndex()]; bind.SrcPort != 51820 || bind.PathID != 1003 {
+		t.Errorf("绑定键 = %+v，期望 src_port=51820（本机监听端口）path=1003：填对端端口就永远键不中，encap 静默旁路",
+			bind)
 	}
 }
 
-// 对端端口读不出来时宁可拒配：绑定表里端口 0 是通配，写进去等于"这个对端 IP 上
-// 所有隧道共用这一条路径"，同 IP 的第二条隧道会被静默拽进来。
+// 对端端口读不出来时宁可拒配：这个端口既是 WG peer 的目的地，也就是 SR 终点段的值
+// （encap 从将要发出的那个包现取），填 0 等于"没填" —— 包发往 0 端口，握手都起不来。
 func TestApplyPeerRefusesZeroPeerPort(t *testing.T) {
 	for _, tc := range []struct{ name, observed, reflector string }{
 		{"观测端口为 0", "10.10.7.7:0", ""},
@@ -1250,7 +1251,7 @@ func TestApplyPeerRefusesZeroPeerPort(t *testing.T) {
 			cert, b, _ := peerMaterial(t, pki, "t1", 3)
 			_, err := l.ApplyPeer(context.Background(), target(3, cert, b, tc.observed, true, tc.reflector))
 			if err == nil {
-				t.Fatal("端口 0 是通配身份，必须拒绝")
+				t.Fatal("对端端口 0 等于没填，必须拒绝")
 			}
 			if len(f.tunnels) != 0 || len(f.peers) != 0 {
 				t.Errorf("被拒之后数据面不该留下绑定/peer: tunnels=%v peers=%v", f.tunnels, f.peers)
@@ -1314,9 +1315,9 @@ func isWildcardPair(ps []vppapi.Prefix) bool {
 }
 
 // 插件的绑定表**配置侧**按 sw_if_index 一槽（sr_wg4_encap.c 的
-// sr_wg_tunnel_set_path：命中同接口即复用那条 bind，并把旧的 (endpoint, 端口) 键
-// 从 endpoint_path 摘掉）。第二个 peer 会**静默**把第一个人的外层
-// 地址换掉，所以这里必须在写之前拒绝，而不是等日志里去猜。
+// sr_wg_tunnel_set_path：命中同接口即复用那条 bind，src_port 变了就把旧键摘掉）。
+// 同一条链路上第二个 peer 会**静默**把第一个人的路径换掉，所以这里必须在写之前
+// 拒绝，而不是等日志里去猜。
 func TestApplyPeerRefusesSecondPeerOnSingleBind(t *testing.T) {
 	f := newFakeVPP()
 	l, pki := newTestLink(t, f)
@@ -1336,7 +1337,7 @@ func TestApplyPeerRefusesSecondPeerOnSingleBind(t *testing.T) {
 	}
 	// 关键：拒绝必须是**干净**的 —— 第一个人的路径与绑定一个字都不能动。
 	if got := f.tunnels[l.SWIfIndex()]; got.PathID != firstTun.PathID ||
-		!got.EndpointIP.Equal(firstTun.EndpointIP) {
+		got.SrcPort != firstTun.SrcPort {
 		t.Errorf("第二个 peer 被拒之后第一条绑定却被改了: %+v（原本 %+v）", got, firstTun)
 	}
 	if len(f.peers) != 1 {
@@ -1349,9 +1350,10 @@ func TestApplyPeerRefusesSecondPeerOnSingleBind(t *testing.T) {
 }
 
 // 两条隧道 = 两个 WG 接口 + 两个监听端口（定案 2：UDP 端口既分功能也分隧道）。
-// 这里把两个对端放在**同一个 NAT** 后面，因为外层 IP 相同之后，只有端口能说出
-// "这一包属于哪条隧道" —— 那正是绑定键加上 dst_port 才成立的事：改之前第二条
-// 绑定会抢走第一条的同 IP 键，前一条隧道静默退化成普通 WG。
+// A 方案之后，分隧道的是**本端**源端口：encap Step 4 拿 udp->src_port 查绑定表，
+// 所以两张接口天然两个键，不再依赖对端地址。这里把两个对端仍放在同一个外层 IP
+// 后面，是因为旧版绑定按 endpoint 建键时，第二条会把第一条静默拽进自己的路径
+// （改之前的回归现场）；现在这条只剩"两个本端端口各绑各的"。
 func TestTwoTunnelInterfacesEachOwnTheirPort(t *testing.T) {
 	f := newFakeVPP()
 	a, pki := newTestLink(t, f)
@@ -1372,10 +1374,10 @@ func TestTwoTunnelInterfacesEachOwnTheirPort(t *testing.T) {
 	}
 	cert4, b4, _ := peerMaterial(t, pki, "t1", 4)
 	if _, err := b.ApplyPeer(ctx, target(4, cert4, b4, "10.10.9.9:41001", true, "")); err != nil {
-		t.Fatalf("第二条隧道（端口 51830）配不上: %v", err)
+		t.Fatalf("第二条隧道（本端端口 51830）配不上: %v", err)
 	}
 
-	// 1) 两个端口都必须在 vpn 集合里：少一个就等于那条隧道没人给它加 SR 头。
+	// 1) 两个本端端口都必须在 vpn 集合里：少一个就等于那条隧道没人给它加 SR 头。
 	for _, port := range []uint16{51820, 51830} {
 		var found bool
 		for _, p := range f.ports {
@@ -1388,23 +1390,24 @@ func TestTwoTunnelInterfacesEachOwnTheirPort(t *testing.T) {
 		}
 	}
 
-	// 2) 两条绑定都得活着，各自带**对端**端口 —— 同 IP 下就是这两个数字把流分开。
+	// 2) 两条绑定都得活着，各自带**本端**监听端口 —— 收包侧就靠这两个数字分隧道。
 	bindA, bindB := f.tunnels[a.SWIfIndex()], f.tunnels[b.SWIfIndex()]
-	if bindA.PathID != 1003 || bindA.DstPort != 41000 {
-		t.Errorf("第一条隧道绑定被改了: %+v（期望 path 1003 / 对端端口 41000）", bindA)
+	if bindA.PathID != 1003 || bindA.SrcPort != 51820 {
+		t.Errorf("第一条隧道绑定被改了: %+v（期望 path 1003 / 本端端口 51820）", bindA)
 	}
-	if bindB.PathID != 2004 || bindB.DstPort != 41001 {
-		t.Errorf("第二条隧道绑定不对: %+v（期望 path 2004 / 对端端口 41001）", bindB)
+	if bindB.PathID != 2004 || bindB.SrcPort != 51830 {
+		t.Errorf("第二条隧道绑定不对: %+v（期望 path 2004 / 本端端口 51830）", bindB)
 	}
 
-	// 3) peer、绑定、SR 段用的是同一个端口：对端的隧道端口。
+	// 3) 对端端口只出现在 WG peer 一处（= 将要发出的那一包的 dst 端口，
+	//    也就是 encap 现取来写进终点段的那个值）；路径表里没有任何对端地址。
 	for _, tc := range []struct {
-		iface             uint32
-		peerPort, segPort uint16
-		path              uint16
+		iface    uint32
+		peerPort uint16
+		path     uint16
 	}{
-		{a.SWIfIndex(), 41000, 41000, 1003},
-		{b.SWIfIndex(), 41001, 41001, 2004},
+		{a.SWIfIndex(), 41000, 1003},
+		{b.SWIfIndex(), 41001, 2004},
 	} {
 		var found *vppapi.WgPeer
 		for i := range f.peers {
@@ -1419,43 +1422,61 @@ func TestTwoTunnelInterfacesEachOwnTheirPort(t *testing.T) {
 			t.Errorf("接口 %d 的 peer 端口 = %d，期望对端端口 %d",
 				tc.iface, found.Port, tc.peerPort)
 		}
-		if seg := f.paths[tc.path].Segments[0]; seg.Port != tc.segPort {
-			t.Errorf("path %d 的段端口 = %d，期望对端端口 %d", tc.path, seg.Port, tc.segPort)
+		if relays := f.paths[tc.path].Relays; len(relays) != 0 {
+			t.Errorf("path %d 里出现了中转 %+v —— 这两条链路都没配过 relay", tc.path, relays)
 		}
 	}
 }
 
-// 两条隧道用了同一个监听端口（第二个 agent 配置抄错、或控制器把同一个 vpn_port
-// 发给了两条隧道）：绑定身份 (endpoint, 端口) 撞车，插件直接 -116。错误必须点名
-// "身份被别的接口占了"，不能让人以为是并发问题去重试。
-func TestSecondTunnelOnSamePortIsRefused(t *testing.T) {
+// 一条配了两跳中转的链路：路径表里必须只有那两个中转，顺序是
+// [0]=离终点最近、[n-1]=第一跳（= cfg.Relays 倒序，与实验室手敲的
+// `sr-wg path add P via H2:tport via H1:tport` 逐字对应）。终点段不在表里。
+func TestApplyPeerPathCarriesOnlyRelaysInOrder(t *testing.T) {
 	f := newFakeVPP()
-	a, pki := newTestLink(t, f)
-	openLink(t, a)
-	b := restartLinkWith(t, a, func(c *LinkConfig) {
-		c.Instance = 8
-		c.PathIDBase = 2000
-		c.PrivateKey = mustWGKey(t)
-	}) // 端口**故意**没改，仍是 51820
-	openLink(t, b)
-	ctx := context.Background()
-
-	cert3, b3, _ := peerMaterial(t, pki, "t1", 3)
-	if _, err := a.ApplyPeer(ctx, target(3, cert3, b3, "10.10.2.3:51820", true, "")); err != nil {
+	pki := newTestPKI(t)
+	cfg := testConfig(t, f, pki)
+	// 两跳中转，按行走顺序填：先碰 10.10.5.1，再碰 10.10.5.2，然后到对端。
+	cfg.Relays = []RelayHop{
+		{IP: net.IPv4(10, 10, 5, 1), Port: 51821}, // Relays[0] = 第一跳
+		{IP: net.IPv4(10, 10, 5, 2), Port: 51822}, // 离终点最近
+	}
+	l, err := NewLink(cfg)
+	if err != nil {
+		t.Fatalf("NewLink: %v", err)
+	}
+	openLink(t, l)
+	cert, b, _ := peerMaterial(t, pki, "t1", 3)
+	if _, err := l.ApplyPeer(context.Background(),
+		target(3, cert, b, "10.10.7.7:42000", true, "")); err != nil {
 		t.Fatal(err)
 	}
-	first := f.tunnels[a.SWIfIndex()]
 
-	cert4, b4, _ := peerMaterial(t, pki, "t1", 4)
-	_, err := b.ApplyPeer(ctx, target(4, cert4, b4, "10.10.2.3:51820", true, ""))
-	if err == nil {
-		t.Fatal("两条隧道抢同一个 (外层 IP, 端口) 身份，插件会回 -116，这里不该当成功")
+	want := []vppapi.Segment{
+		{IP: net.IPv4(10, 10, 5, 2), Port: 51822}, // [0] 离终点最近的中转
+		{IP: net.IPv4(10, 10, 5, 1), Port: 51821}, // [n-1] 第一跳
 	}
-	if !strings.Contains(err.Error(), "隧道身份") {
-		t.Errorf("错误要说清是身份撞车: %v", err)
+	got := f.paths[1003].Relays
+	if len(got) != len(want) {
+		t.Fatalf("中转跳数 = %d，期望 %d: %+v", len(got), len(want), got)
 	}
-	if got := f.tunnels[a.SWIfIndex()]; got.PathID != first.PathID || got.DstPort != first.DstPort {
-		t.Errorf("被拒之后第一条隧道绑定却被改了: %+v（原本 %+v）", got, first)
+	for i := range want {
+		if !got[i].IP.Equal(want[i].IP) || got[i].Port != want[i].Port {
+			t.Errorf("Relays[%d] = %v:%d，期望 %v:%d（倒序抄反不会报错，只会隧道配上了但不通）",
+				i, got[i].IP, got[i].Port, want[i].IP, want[i].Port)
+		}
+	}
+	// 对端地址一个字节都不许进路径表：终点段由 encap 从将要发出的那个包现取。
+	for _, s := range got {
+		if s.IP.Equal(net.IPv4(10, 10, 7, 7)) {
+			t.Errorf("对端地址漏进了路径表: %+v", got)
+		}
+	}
+	// 对端地址唯一的落点是 WG peer（= 那一包的 dst），绑定键是本端监听端口。
+	if p := f.peers[0]; !p.EndpointIP.Equal(net.IPv4(10, 10, 7, 7)) || p.Port != 42000 {
+		t.Errorf("peer 外层 = %v:%d，期望 10.10.7.7:42000", p.EndpointIP, p.Port)
+	}
+	if bind := f.tunnels[l.SWIfIndex()]; bind.SrcPort != 51820 || bind.PathID != 1003 {
+		t.Errorf("绑定 = %+v，期望 path=1003 src_port=51820（本端监听端口）", bind)
 	}
 }
 
@@ -1517,12 +1538,13 @@ func TestApplyPeerInstallsThenIdempotentThenReplaces(t *testing.T) {
 	if removed < 0 || added < 0 || removed > added {
 		t.Errorf("没有先删后加: %v", f.calls)
 	}
-	// 换地址时路径与隧道必须**成对**跟上（实测：绑定的 endpoint 不跟着段走）
-	if seg := f.paths[1003].Segments[0]; !seg.IP.Equal(net.IPv4(10, 10, 7, 7)) || seg.Port != 42000 {
-		t.Errorf("路径没跟着换: %+v", seg)
+	// A 方案：换对端地址只动 WG peer 一处。路径表里没有对端地址（这条链路零中转跳），
+	// 绑定键是本端监听端口 —— 两边都不该因为对端换了地址而变。
+	if relays := f.paths[1003].Relays; len(relays) != 0 {
+		t.Errorf("这条链路没配过中转，路径里却有 %+v", relays)
 	}
-	if tun := f.tunnels[l.SWIfIndex()]; !tun.EndpointIP.Equal(net.IPv4(10, 10, 7, 7)) {
-		t.Errorf("隧道绑定没跟着换: %+v", tun)
+	if tun := f.tunnels[l.SWIfIndex()]; tun.PathID != 1003 || tun.SrcPort != 51820 {
+		t.Errorf("隧道绑定不该跟着对端地址变: %+v", tun)
 	}
 }
 
@@ -1724,7 +1746,7 @@ func TestDropPeerKeepsPathCitedByOtherInterface(t *testing.T) {
 	}
 	// 操作员把另一张接口（sw_if_index 9）也绑到了这条路径上。
 	f.tunnels[9] = vppapi.TunnelInfo{SWIfIndex: 9, PathID: 1003,
-		EndpointIP: net.IPv4(10, 10, 2, 3), Effective: true}
+		SrcPort: 51830, Effective: true}
 
 	if err := l.DropPeer(ctx, pt); err != nil {
 		t.Fatal(err)

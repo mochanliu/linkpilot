@@ -15,13 +15,21 @@ typedef sr_wg_segment
   u16 port;
 };
 
+/*
+ * 一条 SR 路径 = **只有中间跳**。终点那一段不在这里：它由 encap 从即将发出的
+ * 那个报文的外层 dst 现取（见 sr_wg_tunnel_set_path 与 sr_wg4_encap.c）。
+ * 把终点写进表里就是存下一个会漂移、且参与 HMAC 的值。
+ *
+ * relays[0] 是离终点最近的中转，relays[relay_count-1] 是第一跳（"首跳免费"，
+ * 由改写后的外层 IP/UDP 承载），与 sr_header.h 的段序约定一致。
+ */
 typedef sr_wg_path
 {
   u16 path_id;
   u16 hmac_id;
-  u8 seg_count;
+  u8 relay_count;
   u8 active;
-  vl_api_sr_wg_segment_t segments[8];
+  vl_api_sr_wg_segment_t relays[8];
 };
 
 /* ==================== Service 定义 ==================== */
@@ -59,6 +67,13 @@ service {
                          否则本请求返回 NO_SUCH_ENTRY：路径存的是密钥副本，
                          缺钥匙时若用全零密钥建路径，包能正常发出去但对端
                          一律验签失败，控制器完全看不出来。
+    @param relay_count - 中转跳数，0..7（上限见 SR_MAX_RELAYS）。允许 0：
+                         没有中转跳的隧道仍带 SR 头，那个头证明"发端持有这把
+                         P-Key"，是收端把外层源记成 verified 观测的唯一凭证。
+    @param relays      - 前 relay_count 项有效：relays[0] 离终点最近，
+                         relays[relay_count-1] 是第一跳。**不含终点**，终点段
+                         由 encap 从报文外层 dst 现取，因此对端地址/端口怎么变
+                         都不需要重建路径。
     @note              - is_add=0 时，指向该路径的隧道绑定会被一并摘除
                          （悬空绑定只会在收包时按 encap_no_path 静默丢包）
 */
@@ -69,9 +84,9 @@ autoreply define sr_wg_path_add_del
   u8 is_add;               /* 1=add/update, 0=delete */
   u16 path_id;
   u16 hmac_id;
-  u8 seg_count;
+  u8 relay_count;
   u8 active;
-  vl_api_sr_wg_segment_t segments[8];
+  vl_api_sr_wg_segment_t relays[8];
 };
 
 define sr_wg_path_dump
@@ -86,9 +101,9 @@ define sr_wg_path_details
   u32 context;
   u16 path_id;
   u16 hmac_id;
-  u8 seg_count;
+  u8 relay_count;
   u8 active;
-  vl_api_sr_wg_segment_t segments[8];
+  vl_api_sr_wg_segment_t relays[8];
 };
 
 /* ==================== Key API ==================== */
@@ -152,15 +167,16 @@ autoreply define sr_wg_transit_disable
 /* ==================== Encap API ==================== */
 
 /** \brief 绑定 / 解绑 WG 隧道接口到 SR 路径
-    @param sw_if_index - WG 隧道接口的 sw_if_index
+    @param sw_if_index - WG 隧道接口的 sw_if_index（一接口一绑定，配置侧靠它定位）
     @param path_id     - 路径标识（必须已存在于路径表）
-    @param endpoint_ip - WG peer 的外层 endpoint IPv4。encap 挂点在 underlay
-                         出口接口，数据面按外层 dst 查绑定，故 underlay 形态
-                         下这是必填项；不传则本绑定永远不会命中
-    @param dst_port    - **封装前**的外层 UDP 目的端口 = 该隧道 peer 的 vpn_port。
-                         同一对 CPE 开多条隧道时，(endpoint_ip, dst_port) 才是
-                         "哪条隧道"的完整身份；传 0 = 通配（该 IP 上不分行数全走
-                         本路径），只适合单隧道。两个接口抢同一个身份直接拒绝。
+    @param src_port    - **本端**的外层 UDP 源端口 = 这条隧道的监听端口。
+                         encap 数据面就按它选路：本数据面每隧道一个监听端口
+                         （定案 2），WG 发包时把它写进外层源端口，所以本机发出
+                         的包自带隧道身份。传 0 = 还没给出可用的键，本绑定只出现在
+                         dump 里、数据面永不命中（`show sr-wg tunnels` 标未生效）。
+                         对端地址不再是键：它可能学自 NAT、会变、也可能压根没配。
+                         两张接口填同一个 src_port 时后写的赢 —— 本数据面是点对点
+                         隧道，不做端口重复防护。
     @param is_add      - 1 = 绑定，0 = 解绑
                          注意：不会自动启用 feature，需另发
                          sr_wg_encap_enable 到 underlay 接口
@@ -172,8 +188,7 @@ autoreply define sr_wg_tunnel_set_path
   u8 is_add;
   u32 sw_if_index;
   u16 path_id;
-  u16 dst_port;
-  vl_api_ip4_address_t endpoint_ip;
+  u16 src_port;
 };
 
 define sr_wg_tunnel_dump
@@ -188,9 +203,8 @@ define sr_wg_tunnel_details
   u32 context;
   u32 sw_if_index;
   u16 path_id;
-  u16 dst_port;             /* 0 = 端口通配 */
-  vl_api_ip4_address_t endpoint_ip;
-  u8 is_effective;          /* endpoint 已配 且 至少一个 underlay 接口
+  u16 src_port;             /* 本端外层源端口；0 = 数据面永不命中 */
+  u8 is_effective;          /* src_port 已填 且 至少一个 underlay 接口
                                启用了 sr-wg4-encap；0 = 会静默旁路 */
 };
 

@@ -375,31 +375,31 @@ func ifDetailBytes(i int) []byte {
 	return b
 }
 
-// vl_api_sr_wg_path_details_t 净体 = path_id(2) hmac_id(2) seg_count(1) active(1)
-// segments[8](48)。段的顺序是数据面那套倒序：[0]=终点 VPN 口，[n-1]=首跳中转口。
+// vl_api_sr_wg_path_details_t 净体 = path_id(2) hmac_id(2) relay_count(1) active(1)
+// relays[8](48)。relay_count 只数**中转跳**（终点段不在表里，由 encap 从报文现取），
+// 顺序照数据面：[0]=离终点最近的中转，[n-1]=第一跳中转。
 func pathDetailBytes(i int) []byte {
 	b := make([]byte, 54)
 	binary.BigEndian.PutUint16(b[0:2], uint16(1+i))
 	binary.BigEndian.PutUint16(b[2:4], 1) // hmac_id
-	b[4] = 2                              // seg_count
+	b[4] = 2                              // relay_count
 	b[5] = 1                              // active
 	copy(b[6:10], []byte{10, 10, 2, 2})
-	binary.BigEndian.PutUint16(b[10:12], 51820)
+	binary.BigEndian.PutUint16(b[10:12], 51822)
 	copy(b[12:16], []byte{10, 10, 1, 3})
 	binary.BigEndian.PutUint16(b[16:18], 51821)
 	return b
 }
 
-// vl_api_sr_wg_tunnel_details_t 净体 = sw_if_index(4) path_id(2) dst_port(2)
-// endpoint_ip(4) is_effective(1)。is_effective=0 是"绑了但 underlay 没启 encap"的
-// 静默旁路态；dst_port=0 表示端口通配（该 IP 上不分隧道全走这条路径）。
+// vl_api_sr_wg_tunnel_details_t 净体 = sw_if_index(4) path_id(2) src_port(2)
+// is_effective(1)。is_effective=0 是"绑了但 underlay 没启 encap"的静默旁路态；
+// src_port=0 是"绑定永远不会命中"（本端源端口没填），不是通配。
 func tunDetailBytes(i int) []byte {
-	b := make([]byte, 13)
+	b := make([]byte, 9)
 	binary.BigEndian.PutUint32(b[0:4], uint32(2+i))
 	binary.BigEndian.PutUint16(b[4:6], uint16(1+i))
 	binary.BigEndian.PutUint16(b[6:8], uint16(51820+i))
-	copy(b[8:12], []byte{10, 10, 2, 2})
-	b[12] = 1
+	b[8] = 1
 	return b
 }
 
@@ -845,8 +845,8 @@ func TestAddPathEncoding(t *testing.T) {
 	c := f.dial(t)
 	err := c.AddPath(context.Background(), PathParams{
 		PathID: 1, HmacID: 7, Active: true,
-		Segments: []Segment{
-			{IP: net.IPv4(10, 10, 2, 2), Port: 51820}, // [0] = 终点，打 VPN 口
+		Relays: []Segment{
+			{IP: net.IPv4(10, 10, 2, 2), Port: 51821}, // [0] = 离终点最近的中转
 			{IP: net.IPv4(10, 10, 1, 3), Port: 51821}, // [n-1] = 首跳，打中转口
 		},
 	})
@@ -854,7 +854,7 @@ func TestAddPathEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := f.lastRequest(t)
-	// 体长必须是 55：段数组是定长 8 项。写"实际有几段发几段"会得到一个短请求，
+	// 体长必须是 55：中转数组是定长 8 项。写"实际有几跳发几跳"会得到一个短请求，
 	// VPP 只在日志留一行 Truncated message 就丢掉，运行期表现为莫名超时。
 	if len(r.body) != pathBodyLen {
 		t.Fatalf("path_add_del 体长 = %d，期望 %d", len(r.body), pathBodyLen)
@@ -869,22 +869,32 @@ func TestAddPathEncoding(t *testing.T) {
 		t.Errorf("hmac_id = %d", got)
 	}
 	if r.body[5] != 2 {
-		t.Errorf("seg_count = %d，期望 2", r.body[5])
+		t.Errorf("relay_count = %d，期望 2", r.body[5])
 	}
 	if r.body[6] != 1 {
 		t.Errorf("active = %d，期望 1", r.body[6])
 	}
-	// 段的起点在 is_add(1)+path_id(2)+hmac_id(2)+seg_count(1)+active(1) = 7。
-	if !equalBytes(r.body[7:11], []byte{10, 10, 2, 2}) || binary.BigEndian.Uint16(r.body[11:13]) != 51820 {
-		t.Errorf("segments[0] 不对: %x（数据面约定 [0]=终点）", r.body[7:13])
+	// 中转的起点在 is_add(1)+path_id(2)+hmac_id(2)+relay_count(1)+active(1) = 7。
+	if !equalBytes(r.body[7:11], []byte{10, 10, 2, 2}) || binary.BigEndian.Uint16(r.body[11:13]) != 51821 {
+		t.Errorf("relays[0] 不对: %x（数据面约定 [0]=离终点最近的中转）", r.body[7:13])
 	}
 	if !equalBytes(r.body[13:17], []byte{10, 10, 1, 3}) || binary.BigEndian.Uint16(r.body[17:19]) != 51821 {
-		t.Errorf("segments[1] 不对: %x", r.body[13:19])
+		t.Errorf("relays[1] 不对: %x", r.body[13:19])
 	}
 	for i := 19; i < len(r.body); i++ {
 		if r.body[i] != 0 {
-			t.Fatalf("未用的段槽位没补零（offset %d = %d）", i, r.body[i])
+			t.Fatalf("未用的中转槽位没补零（offset %d = %d）", i, r.body[i])
 		}
+	}
+	// 零跳中转是合法路径（直连隧道的 SR 头仍要签，见 sr_path.c）：段数校验
+	// 只能挡"跳数越界"，不能挡"没有中转"。
+	if err := c.AddPath(context.Background(), PathParams{
+		PathID: 2, HmacID: 7, Active: true,
+	}); err != nil {
+		t.Errorf("零中转跳应能下发: %v", err)
+	}
+	if r = f.lastRequest(t); r.body[5] != 0 {
+		t.Errorf("零跳时 relay_count = %d，期望 0", r.body[5])
 	}
 }
 
@@ -892,17 +902,17 @@ func TestAddPathRejectsBadSegmentsBeforeSend(t *testing.T) {
 	f := newFake(t)
 	c := f.dial(t)
 	cases := []struct {
-		why  string
-		segs []Segment
+		why    string
+		relays []Segment
 	}{
-		{"零段路径", nil},
-		{"超过 8 段", make([]Segment, maxSegments+1)},
+		// 8 个段位要留一位给终点段，所以中转最多 7 跳。
+		{"超过 7 跳中转", make([]Segment, maxRelays+1)},
 		// SR 段是 vl_api_ip4_address_t（4 字节），IPv6 不是"另一种写法"，编不出来。
-		{"IPv6 段", []Segment{{IP: net.ParseIP("2001:db8::1"), Port: 51820}}},
-		{"空地址段", []Segment{{Port: 51820}}},
+		{"IPv6 中转", []Segment{{IP: net.ParseIP("2001:db8::1"), Port: 51820}}},
+		{"空地址中转", []Segment{{Port: 51820}}},
 	}
 	for _, tc := range cases {
-		if err := c.AddPath(context.Background(), PathParams{Segments: tc.segs}); err == nil {
+		if err := c.AddPath(context.Background(), PathParams{Relays: tc.relays}); err == nil {
 			t.Errorf("%s 必须在发出前报错", tc.why)
 		}
 	}
@@ -935,7 +945,7 @@ func TestAddPathPropagatesNoSuchEntry(t *testing.T) {
 	f.retvals["sr_wg_path_add_del"] = -8 // VNET_API_ERROR_NO_SUCH_ENTRY
 	c := f.dial(t)
 	err := c.AddPath(context.Background(), PathParams{
-		PathID: 1, HmacID: 99, Segments: []Segment{{IP: net.IPv4(10, 10, 2, 2), Port: 51820}},
+		PathID: 1, HmacID: 99, Relays: []Segment{{IP: net.IPv4(10, 10, 2, 2), Port: 51821}},
 	})
 	var apiErr APIError
 	if !errors.As(err, &apiErr) || apiErr.Retval != -8 {
@@ -958,10 +968,10 @@ func TestPathsParsesDetails(t *testing.T) {
 	if p.PathID != 1 || p.HmacID != 1 || !p.Active {
 		t.Errorf("头部字段不对: %+v", p)
 	}
-	if len(p.Segments) != 2 ||
-		!equalBytes(p.Segments[0].IP, net.IPv4(10, 10, 2, 2).To4()) || p.Segments[0].Port != 51820 ||
-		p.Segments[1].Port != 51821 {
-		t.Errorf("段解析不对: %+v", p.Segments)
+	if len(p.Relays) != 2 ||
+		!equalBytes(p.Relays[0].IP, net.IPv4(10, 10, 2, 2).To4()) || p.Relays[0].Port != 51822 ||
+		p.Relays[1].Port != 51821 {
+		t.Errorf("中转解析不对: %+v", p.Relays)
 	}
 	// 全量查询的哨兵值要真的发出去：0 是合法 path_id，不能用 0 表示"全部"。
 	r := f.lastRequest(t)
@@ -974,7 +984,7 @@ func TestSetTunnelEncoding(t *testing.T) {
 	f := newFake(t)
 	c := f.dial(t)
 	err := c.SetTunnel(context.Background(), TunnelBinding{
-		SWIfIndex: 2, PathID: 1, EndpointIP: net.IPv4(10, 10, 2, 2), DstPort: 51830,
+		SWIfIndex: 2, PathID: 1, SrcPort: 51830,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -992,19 +1002,21 @@ func TestSetTunnelEncoding(t *testing.T) {
 	if got := binary.BigEndian.Uint16(r.body[5:7]); got != 1 {
 		t.Errorf("path_id = %d", got)
 	}
-	// dst_port 是绑定身份的另一半：同一对 CPE 开第二条隧道时只有端口能说出
-	// "这一包属于哪条隧道"，漏了它两条隧道会抢同一条路径。
+	// src_port 就是绑定身份的全部：encap 拿本端外层源端口查这张表。
+	// 请求里**没有** endpoint —— 终点由报文自己给，写进表反而是个会漂移的副本。
 	if got := binary.BigEndian.Uint16(r.body[7:9]); got != 51830 {
-		t.Errorf("dst_port = %d，期望 51830", got)
-	}
-	// endpoint 是数据面查绑定的唯一线索：漏了它这条绑定永远不命中，
-	// 而计数器只会显示 encap_bypass。
-	if !equalBytes(r.body[9:13], net.IPv4(10, 10, 2, 2).To4()) {
-		t.Errorf("endpoint_ip = %x，期望按裸 4 字节写", r.body[9:13])
+		t.Errorf("src_port = %d，期望 51830", got)
 	}
 
-	if err := c.SetTunnel(context.Background(), TunnelBinding{SWIfIndex: 2}); err == nil {
-		t.Error("endpoint 为空也必须先拦住")
+	// 0 是"永不命中"而不是错误：客户端照发，判据留给 show/对账。
+	// （旧写法在这里拦 endpoint 为空，那个字段已经不存在了。）
+	if err := c.SetTunnel(context.Background(), TunnelBinding{SWIfIndex: 2}); err != nil {
+		t.Errorf("src_port=0 应照发: %v", err)
+	}
+	r = f.lastRequest(t)
+	if r.name != "sr_wg_tunnel_set_path" || len(r.body) != tunnelBodyLen ||
+		binary.BigEndian.Uint16(r.body[7:9]) != 0 {
+		t.Errorf("src_port=0 那条请求不对: %s %x", r.name, r.body)
 	}
 	if err := c.ClearTunnel(context.Background(), 5); err != nil {
 		t.Fatal(err)
@@ -1082,13 +1094,10 @@ func TestTunnelsParsesEffective(t *testing.T) {
 	if tn.SWIfIndex != 2 || tn.PathID != 1 || !tn.Effective {
 		t.Errorf("绑定解析不对: %+v", tn)
 	}
-	// dst_port 读不回来就没法判断这条绑定是"某条隧道的"还是"通配"的，
-	// 而通配绑定正是多条隧道互相抢路径的那个坑。
-	if tn.DstPort != 51820 {
-		t.Errorf("dst_port = %d，期望 51820", tn.DstPort)
-	}
-	if !equalBytes(tn.EndpointIP, net.IPv4(10, 10, 2, 2).To4()) {
-		t.Errorf("endpoint = %v", tn.EndpointIP)
+	// src_port 读不回来就没法判断这条绑定认的是哪条隧道 —— 而 0 意味着
+	// "绑了但永远不会命中"，是 show 与对账要能分辨的一种静默旁路。
+	if tn.SrcPort != 51820 {
+		t.Errorf("src_port = %d，期望 51820", tn.SrcPort)
 	}
 }
 

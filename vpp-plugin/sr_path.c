@@ -50,7 +50,12 @@ int sr_path_add(sr_path_table_t *t, const sr_path_config_t *cfg)
 
     if (!t || !cfg)
         return SR_PATH_ERR_PARAM;
-    if (cfg->seg_count == 0 || cfg->seg_count > SR_MAX_SEGS)
+    /*
+     * relay_count 允许 0：一条没有中转跳的隧道仍然可以带 SR 头 ——
+     * 那个头证明"发端持有这把 P-Key"，收端据此把外层源记成 verified 观测，
+     * 这正是 endpoint 为空时对端地址的唯一来源。
+     */
+    if (cfg->relay_count > SR_MAX_RELAYS)
         return SR_PATH_ERR_PARAM;
 
     idx = sr_path_slot(t, cfg->path_id);
@@ -138,18 +143,28 @@ int sr_path_replace_pkey(sr_path_table_t *t, uint16_t hmac_id,
     return n;
 }
 
+/*
+ * 组线格式：segments[0] 是报文带来的终点，segments[1+i] 是配置里的第 i 台中转。
+ *
+ * 顺序照 sr_header.h 的约定（0 = 最终目的，末位 = 第一跳），所以"终点段来自报文"
+ * 只是把 0 这一位的来源从路径表换成了当前包，中转跳的相对顺序一个字没变，
+ * transit 的弹段规则（next = segments[seg_left-1]）也就完全不用改。
+ */
 int sr_path_fill_header(const sr_path_config_t *cfg, sr_header_t *h,
-                        uint32_t timestamp)
+                        uint32_t timestamp, const sr_segment_t *endpoint)
 {
+    uint8_t seg_count;
     int i;
 
-    if (!cfg || !h)
+    if (!cfg || !h || !endpoint)
         return -1;
-    if (cfg->seg_count == 0 || cfg->seg_count > SR_MAX_SEGS)
+    if (cfg->relay_count > SR_MAX_RELAYS)
         return -1;
 
+    seg_count = (uint8_t) (cfg->relay_count + 1);
+
     /* 初始化固定字段（magic/ver_flags/hdr_len/seg_left/seg_count/action） */
-    if (sr_hdr_init(h, cfg->seg_count) != 0)
+    if (sr_hdr_init(h, seg_count) != 0)
         return -1;
 
     /* 可扩展部分 */
@@ -157,11 +172,15 @@ int sr_path_fill_header(const sr_path_config_t *cfg, sr_header_t *h,
     sr_hdr_set_path_id(h, cfg->path_id);
     sr_hdr_set_timestamp(h, timestamp);
 
-    /* 段列表：cfg 中已为网络序，直接拷贝字节 */
-    for (i = 0; i < cfg->seg_count; i++)
-        h->segments[i] = cfg->segments[i];
+    /* 段列表：终点在前（来自网络序的报文外层 dst），中转按配置顺序跟在后 */
+    h->segments[0] = *endpoint;
+    for (i = 0; i < cfg->relay_count; i++)
+        h->segments[1 + i] = cfg->relays[i];
 
-    /* HMAC 签名（依赖上面所有字段已就位） */
+    /*
+     * HMAC 签名（依赖上面所有字段已就位 —— 含终点段，它就在覆盖范围里；
+     * seg_left 不在覆盖范围内，调用方随后覆盖成 seg_count-1 无需重签）。
+     */
     if (sr_hmac_sign(h, cfg->pkey) != 0)
         return -1;
 

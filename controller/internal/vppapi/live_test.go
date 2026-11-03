@@ -56,12 +56,13 @@ const (
 //     逐字节等于装进去的那把，公钥等于本地用 crypto/ecdh 推算的那把；
 //  3. 观测表为空时返回空切片而不是报错（VPP 的 dump 对空结果一帧都不发）；
 //  4. SR 路径/隧道绑定/encap 挂点这一整套能配进真数据面，且 API 读回与
-//     `vppctl show sr-wg` 读到的是同一张表、同一段序（[0]=终点、[n-1]=首跳）；
+//     `vppctl show sr-wg` 读到的是同一张表、同一段序（relay[0]=离终点最近的中转、
+//     relay[n-1]=第一跳；终点段不在这张表里，由 encap 从报文外层现取）；
 //  5. peer 与路径的**重复下发语义**（agent 重启与 NAT 重绑全靠它）：同公钥
 //     重复 add peer 回 -116 且**跨接口也回 -116**（去重键不含接口，换 endpoint
 //     也救不回来）、0 条 allowed_ip 回 -7、删不存在的 peer 回 -6、
-//     同 path_id 再 AddPath 是原地替换、但绑定的 endpoint 不会跟着段走、
-//     DelPath 会静默级联解掉引用它的绑定；
+//     同 path_id 再 AddPath 是原地替换中转链、同接口再 SetTunnel 也是原地更新
+//     （旧的本端源端口键会被摘走）、DelPath 会静默级联解掉引用它的绑定；
 //  6. core 的 sw_interface_set_mtu（MTU 唯一的写入口，实测三件事）：新建的 WG 接口
 //     带着 0/0/0/0 出生（所以"不写"不等于"有默认值"）；写 1360 得到 1360/0/0/0
 //     —— IP4 槽回落 L3，与 CLI `packet N` 同一形态；VPP 对值**毫不校验**（0 照收并
@@ -344,12 +345,17 @@ func TestLiveAgainstVPP(t *testing.T) {
 
 		// 先建路径再建接口：路径要求 hmac_id 已在密钥表里（否则 NO_SUCH_ENTRY），
 		// 这条约束本身就是要验的东西之一。
-		segments := []Segment{
-			{IP: net.IPv4(192, 0, 2, 1), Port: 51820}, // [0] = 终点，打 VPN 口
-			{IP: net.IPv4(192, 0, 2, 2), Port: 51821}, // [n-1] = 首跳，打中转口
+		//
+		// 这张表里只有**中转跳**：终点段不进来，是 encap 在封装前从即将发出的那个
+		// 包的外层 dst IP + UDP 目的端口现取的（A 方案）。所以这里没有、也不该有
+		// 对端地址可对。顺序约定 relay[0]=离终点最近的中转、relay[n-1]=第一跳，
+		// 抄反了不会报错，只会让隧道"配上了但不通"，因此必须原样读回来核对。
+		relays := []Segment{
+			{IP: net.IPv4(192, 0, 2, 3), Port: 51822}, // [0] 离终点最近的中转
+			{IP: net.IPv4(192, 0, 2, 2), Port: 51821}, // [n-1] 第一跳
 		}
 		if err := c.AddPath(ctx, PathParams{
-			PathID: livePathID, HmacID: liveHmacID, Active: true, Segments: segments,
+			PathID: livePathID, HmacID: liveHmacID, Active: true, Relays: relays,
 		}); err != nil {
 			t.Fatalf("AddPath(%d): %v", livePathID, err)
 		}
@@ -366,10 +372,34 @@ func TestLiveAgainstVPP(t *testing.T) {
 		// 缺钥匙的路径必须被拒：这是"包发得出去但对端一律验签失败"的唯一防线。
 		if err := c.AddPath(ctx, PathParams{
 			PathID: livePathID + 1, HmacID: liveHmacID + 1,
-			Segments: segments,
+			Relays: relays,
 		}); err == nil {
 			t.Error("引用不存在的 hmac_id 却建成了路径 —— 数据面回 NO_SUCH_ENTRY 才算对")
 			_ = c.DelPath(ctx, livePathID+1)
+		}
+
+		// 零中转跳必须能建：直连隧道也走 SR，为的是这条头证明"发端持有这把 P-Key"
+		// —— 收端把外层源记成 verified 观测的唯一凭证。真机要证的正是 handler
+		// 没把它当 INVALID_VALUE 拒掉（桩测只锁得住我们这边的编码）。
+		if err := c.AddPath(ctx, PathParams{
+			PathID: livePathID + 2, HmacID: liveHmacID, Active: true,
+		}); err != nil {
+			t.Errorf("零中转跳的路径建不上: %v", err)
+		} else {
+			t.Cleanup(func() {
+				cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := c.DelPath(cctx, livePathID+2); err != nil {
+					t.Errorf("清理路径 %d: %v", livePathID+2, err)
+				}
+			})
+			ps, err := c.Paths(ctx, livePathID+2)
+			if err != nil || len(ps) != 1 {
+				t.Fatalf("Paths(%d) = %v, %v", livePathID+2, ps, err)
+			}
+			if len(ps[0].Relays) != 0 {
+				t.Errorf("零中转跳读回了 %d 跳: %+v", len(ps[0].Relays), ps[0].Relays)
+			}
 		}
 
 		idx, err := c.CreateInterface(ctx, InterfaceParams{
@@ -392,8 +422,10 @@ func TestLiveAgainstVPP(t *testing.T) {
 			}
 		})
 
+		// src_port 填的是**本端**这条隧道的监听端口：收包侧就靠它认隧道身份
+		// （实测 VPP WG 发包的 UDP 源端口 = 接口监听端口）。绑定里没有对端地址。
 		if err := c.SetTunnel(ctx, TunnelBinding{
-			SWIfIndex: idx, PathID: livePathID, EndpointIP: net.IPv4(192, 0, 2, 1),
+			SWIfIndex: idx, PathID: livePathID, SrcPort: livePort2,
 		}); err != nil {
 			t.Fatalf("SetTunnel: %v", err)
 		}
@@ -414,15 +446,14 @@ func TestLiveAgainstVPP(t *testing.T) {
 		if got.HmacID != liveHmacID || !got.Active {
 			t.Errorf("路径头部字段不对: %+v", got)
 		}
-		// 段序原样回来才算对上数据面的约定：[0]=终点、[n-1]=首跳。
-		// 抄反了不会报错，只会让隧道"配上了但不通"。
-		if len(got.Segments) != len(segments) {
-			t.Fatalf("段数 = %d，期望 %d", len(got.Segments), len(segments))
+		// 中转链原样回来才算对上数据面的约定：[0]=离终点最近、[n-1]=第一跳。
+		if len(got.Relays) != len(relays) {
+			t.Fatalf("中转跳数 = %d，期望 %d", len(got.Relays), len(relays))
 		}
-		for i := range segments {
-			if !got.Segments[i].IP.Equal(segments[i].IP) || got.Segments[i].Port != segments[i].Port {
-				t.Errorf("segments[%d] = %v:%d，期望 %v:%d",
-					i, got.Segments[i].IP, got.Segments[i].Port, segments[i].IP, segments[i].Port)
+		for i := range relays {
+			if !got.Relays[i].IP.Equal(relays[i].IP) || got.Relays[i].Port != relays[i].Port {
+				t.Errorf("relays[%d] = %v:%d，期望 %v:%d",
+					i, got.Relays[i].IP, got.Relays[i].Port, relays[i].IP, relays[i].Port)
 			}
 		}
 
@@ -439,22 +470,26 @@ func TestLiveAgainstVPP(t *testing.T) {
 		if bound == nil {
 			t.Fatalf("刚绑的隧道没被 dump 回来（共 %d 条）", len(tuns))
 		}
-		if bound.PathID != livePathID || !bound.EndpointIP.Equal(segments[0].IP) {
-			t.Errorf("绑定不对: %+v", bound)
+		if bound.PathID != livePathID || bound.SrcPort != livePort2 {
+			t.Errorf("绑定不对: %+v（期望 path=%d src_port=%d）", bound, livePathID, livePort2)
 		}
 		// is_effective 取决于本机有没有 underlay 启用了 sr-wg4-encap。这里只报状态
 		// 不改它：实验室的节点可能正被别的会话跑端到端，关掉挂点会把他们的隧道打断。
-		t.Logf("隧道绑定 idx=%d path=%d endpoint=%v effective=%v",
-			idx, bound.PathID, bound.EndpointIP, bound.Effective)
+		t.Logf("隧道绑定 idx=%d path=%d src_port=%d effective=%v",
+			idx, bound.PathID, bound.SrcPort, bound.Effective)
 
 		// CLI 交叉核对：同一张表，第二个读者。串取自 sr_wg_cli.c 的
-		// "  [%d] path_id=%u hmac_id=%u seg_count=%u active=%u" 与
-		// "      seg[%d]: <ip>:<port>"。
+		// "  [%d] path_id=%u hmac_id=%u relay_count=%u active=%u" 与
+		// "      relay[%d]%s: <ip>:<port>"（最后一条带 " (第一跳)"）。
 		if out, err := vppctl(ctx, "show", "sr-wg", "paths"); err == nil {
-			checks := []string{fmt.Sprintf("path_id=%d hmac_id=%d seg_count=%d active=1",
-				livePathID, liveHmacID, len(segments))}
-			for i, s := range segments {
-				checks = append(checks, fmt.Sprintf("seg[%d]: %v:%d", i, s.IP, s.Port))
+			checks := []string{fmt.Sprintf("path_id=%d hmac_id=%d relay_count=%d active=1",
+				livePathID, liveHmacID, len(relays))}
+			for i, s := range relays {
+				tag := ""
+				if i == len(relays)-1 {
+					tag = " (第一跳)"
+				}
+				checks = append(checks, fmt.Sprintf("relay[%d]%s: %v:%d", i, tag, s.IP, s.Port))
 			}
 			for _, want := range checks {
 				if !strings.Contains(out, want) {
@@ -467,7 +502,7 @@ func TestLiveAgainstVPP(t *testing.T) {
 		if out, err := vppctl(ctx, "show", "sr-wg", "tunnels"); err == nil {
 			// 必须落在**同一行**：只看整段输出会读到别的会话留下的绑定。
 			line := cliLine(out, fmt.Sprintf("sw_if_index=%d ", idx))
-			want := fmt.Sprintf("path_id=%d endpoint=%v", livePathID, segments[0].IP)
+			want := fmt.Sprintf("path_id=%d src_port=%d usable", livePathID, livePort2)
 			if line == "" || !strings.Contains(line, want) {
 				t.Errorf("`show sr-wg tunnels` 里 idx=%d 那行没有 %q，实际 %q\n%s",
 					idx, want, line, out)
@@ -490,10 +525,11 @@ func TestLiveAgainstVPP(t *testing.T) {
 
 	t.Run("path_replace_and_binding_cascade", func(t *testing.T) {
 		// 这一段钉的是 agent 的 reconcile 算法能不能这么写，全部是真机测出来的：
-		//   a) 同 path_id 再 AddPath 是**原地替换**段列表，不报错 —— 所以换地址
+		//   a) 同 path_id 再 AddPath 是**原地替换**中转链，不报错 —— 所以换中转
 		//      不需要先删路径（先删反而会把隧道绑定一起带走，见 d）；
-		//   b) 替换段之后，隧道绑定**还在**，但它记的 endpoint 仍是旧的 —— 这正
-		//      是"隧道起来了但不通"的形态，所以改路径必须 path 与 tunnel 成对重设；
+		//   b) 替换中转链之后隧道绑定**还在、且不需要跟着改**：绑定只认本端源端口，
+		//      终点段又是从报文现取的，所以"改对端地址"在数据面只剩 WG peer 一处
+		//      —— A 方案之前那条"改路径必须 path+tunnel 成对下发"的不变量已经不成立；
 		//   c) encap 挂点开关幂等，agent 每次启动都可以无条件调用；
 		//   d) DelPath 一条被隧道引用的路径会**级联解绑**且 retval=0 —— 静默。
 		key := mustRand(t, pKeyLen)
@@ -523,23 +559,20 @@ func TestLiveAgainstVPP(t *testing.T) {
 			}
 		})
 
-		add := func(ip string) {
-			if err := c.AddPath(ctx, PathParams{PathID: livePathID, HmacID: liveHmacID, Active: true,
-				Segments: []Segment{{IP: net.ParseIP(ip).To4(), Port: 51820}}}); err != nil {
-				t.Fatalf("AddPath(%s): %v", ip, err)
+		add := func(relays ...Segment) {
+			if err := c.AddPath(ctx, PathParams{PathID: livePathID, HmacID: liveHmacID,
+				Active: true, Relays: relays}); err != nil {
+				t.Fatalf("AddPath(%d 跳中转): %v", len(relays), err)
 			}
 		}
-		pathSeg := func() net.IP {
+		pathRelays := func() []Segment {
 			ps, err := c.Paths(ctx, livePathID)
-			if err != nil || len(ps) == 0 {
+			if err != nil || len(ps) != 1 {
 				t.Fatalf("Paths(%d) = %v, %v", livePathID, ps, err)
 			}
-			if len(ps) != 1 {
-				t.Fatalf("按 path_id 过滤应该只剩 1 条，实际 %d 条", len(ps))
-			}
-			return ps[0].Segments[0].IP
+			return ps[0].Relays
 		}
-		boundEP := func() (net.IP, bool) {
+		bound := func() (*TunnelInfo, bool) {
 			ts, err := c.Tunnels(ctx, idx)
 			if err != nil {
 				t.Fatalf("Tunnels: %v", err)
@@ -550,37 +583,51 @@ func TestLiveAgainstVPP(t *testing.T) {
 			if len(ts) != 1 {
 				t.Fatalf("我这个接口上应该只有一条绑定，实际 %d 条", len(ts))
 			}
-			return ts[0].EndpointIP, true
+			return &ts[0], true
 		}
 
-		old := net.ParseIP("192.0.2.10")
-		fresh := net.ParseIP("192.0.2.11")
-		add(old.String())
-		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idx, PathID: livePathID, EndpointIP: old.To4()}); err != nil {
+		// 一跳起步，随后换成两跳：hop2 离终点更近，hop1 是第一跳（顺序约定）。
+		hop1 := Segment{IP: net.ParseIP("192.0.2.10").To4(), Port: 51821}
+		hop2 := Segment{IP: net.ParseIP("192.0.2.11").To4(), Port: 51822}
+		add(hop1)
+		if err := c.SetTunnel(ctx, TunnelBinding{
+			SWIfIndex: idx, PathID: livePathID, SrcPort: livePort,
+		}); err != nil {
 			t.Fatalf("SetTunnel: %v", err)
 		}
-		if got, ok := boundEP(); !ok || !got.Equal(old.To4()) {
-			t.Fatalf("绑定初值不对: %v %v", got, ok)
+		if b, ok := bound(); !ok || b.PathID != livePathID || b.SrcPort != livePort {
+			t.Fatalf("绑定初值不对: %+v %v", b, ok)
 		}
 
-		// a) 原地替换
-		add(fresh.String())
-		if got := pathSeg(); !got.Equal(fresh.To4()) {
-			t.Errorf("同 path_id 再 AddPath 没替换段：dump 回来 %v，期望 %v", got, fresh)
+		// a) 原地替换中转链
+		add(hop2, hop1)
+		if got := pathRelays(); len(got) != 2 ||
+			!got[0].IP.Equal(hop2.IP) || got[0].Port != hop2.Port ||
+			!got[1].IP.Equal(hop1.IP) || got[1].Port != hop1.Port {
+			t.Errorf("同 path_id 再 AddPath 没替换中转链：dump 回来 %+v，期望 [%v %v]",
+				got, hop2, hop1)
 		}
-		// b) 绑定还在，但 endpoint 停在旧值 —— agent 必须成对重设
-		if got, ok := boundEP(); !ok {
-			t.Error("替换段之后绑定消失了：DelPath 才该解绑，AddPath 不该")
-		} else if !got.Equal(old.To4()) {
-			t.Errorf("绑定 endpoint 被替换成了 %v（数据面不会自己跟着段走，agent 得重设）", got)
+		// b) 绑定原样还在，且没有任何"对端地址"字段要跟着改。
+		if b, ok := bound(); !ok {
+			t.Error("替换中转链之后绑定消失了：DelPath 才该解绑，AddPath 不该")
+		} else if b.PathID != livePathID || b.SrcPort != livePort {
+			t.Errorf("换中转链把绑定也改了: %+v", b)
 		} else {
-			t.Logf("实测：替换段后绑定仍指向旧 endpoint=%v，新段=%v —— 改地址必须 path+tunnel 成对下发", got, fresh)
+			t.Logf("实测：换中转链后绑定仍是 path=%d src_port=%d —— 改对端地址只剩 WG peer 一处",
+				b.PathID, b.SrcPort)
 		}
-		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idx, PathID: livePathID, EndpointIP: fresh.To4()}); err != nil {
-			t.Fatalf("SetTunnel(新): %v", err)
+		// 同接口重复 SetTunnel 必须是原地更新（agent 每次下发都无条件调它，
+		// 不能靠"先解绑再绑"，那中间有一条窗口会把包旁路成无 SR 的普通 WG）。
+		// 换本端端口时旧键会被摘掉（sr_wg4_encap.c 的 old_port 分支），但那一步
+		// 只在数据面生效、配置面 dump 不出来，这里不声称实测到了。
+		if err := c.SetTunnel(ctx, TunnelBinding{
+			SWIfIndex: idx, PathID: livePathID, SrcPort: livePort2,
+		}); err != nil {
+			t.Fatalf("SetTunnel(换本端端口): %v", err)
 		}
-		if got, _ := boundEP(); !got.Equal(fresh.To4()) {
-			t.Errorf("重设之后绑定 = %v，期望 %v", got, fresh)
+		if b, ok := bound(); !ok || b.SrcPort != livePort2 {
+			t.Errorf("同接口重复 SetTunnel 没原地更新: %+v %v（期望 src_port=%d）",
+				b, ok, livePort2)
 		}
 
 		// c) encap 幂等：无条件重复调用不能报错，也不能出现 FEATURE_ALREADY_* 那种
@@ -603,32 +650,31 @@ func TestLiveAgainstVPP(t *testing.T) {
 		if err := c.DelPath(ctx, livePathID); err != nil {
 			t.Fatalf("DelPath: %v", err)
 		}
-		if _, ok := boundEP(); ok {
+		if _, ok := bound(); ok {
 			t.Error("删掉被引用的路径之后，隧道绑定居然还在 —— 数据面应当级联清掉")
 		}
 		t.Log("实测：DelPath 会连带清掉引用它的隧道绑定，且不报错")
 	})
 
 	// 每隧道一个监听端口（定案 2：UDP 端口既分功能也分隧道）。这里钉的是 agent 的
-	// claimListenPort 与 ApplyPeer 直接依赖的四件真机行为：
+	// claimListenPort 与 ApplyPeer 直接依赖的三件真机行为：
 	//   a) AddPort 幂等、每次都把端口挂回 sr-wg 节点；Ports 原样读回两种 kind；
 	//      DelPort 也幂等（不在集合里删除不是错误）；
-	//   b) 同一个外层 IP 上的**两条**隧道（端口不同）各有各的绑定，互不覆盖 ——
-	//      改之前绑定只按 IP 建键，第二条会把第一条拽进自己的路径；
-	//   c) 别的接口来抢同一个 (endpoint, 端口) 身份时回 -116，而不是静默抢走；
-	//   d) 被拒的那次一个字都没改（前一条绑定仍是原样）。
+	//   b) 同一个外层 IP 上的**两条**隧道（本端监听端口不同）各有各的绑定，互不
+	//      覆盖 —— 隧道身份就是本端源端口（A 方案），配置面一接口一槽；
+	//   c) 两张接口填了**同一个** src_port 不报错：点对点隧道不做重复防护（操作员
+	//      2026-11-03 明确免除），本条只钉住"回 0、两条都还在 dump 里"这个事实。
 	t.Run("per_tunnel_ports_and_bind_identity", func(t *testing.T) {
 		const (
-			instA   = uint32(9003)
-			instB   = uint32(9004)
-			portA   = uint16(51995)
-			portB   = uint16(51994)
-			pathA   = uint16(9011)
-			pathB   = uint16(9012)
-			probe   = uint16(51993)
-			shared  = "192.0.2.20"
-			hmacID  = uint16(9011)
-			bindIP1 = 9013 // 抢身份那一次用的 path_id
+			instA  = uint32(9003)
+			instB  = uint32(9004)
+			portA  = uint16(51995)
+			portB  = uint16(51994)
+			pathA  = uint16(9011)
+			pathB  = uint16(9012)
+			pathC  = uint16(9013) // 撞端口那一次用的 path_id
+			probe  = uint16(51993)
+			hmacID = uint16(9011)
 		)
 		// a) 端口集合。
 		for i := 0; i < 2; i++ {
@@ -677,14 +723,13 @@ func TestLiveAgainstVPP(t *testing.T) {
 			t.Errorf("DelPort 之后 %d 还在集合里: %v", probe, got)
 		}
 
-		// b)/c)/d) 两条隧道打在同一个外层 IP 上。
+		// b)/c) 两条隧道打在同一个外层 IP 上，靠各自的本端监听端口分身份。
 		if err := c.SetPKey(ctx, hmacID, mustRand(t, pKeyLen)); err != nil {
 			t.Fatalf("SetPKey: %v", err)
 		}
-		ep := net.ParseIP(shared).To4()
-		mkPath := func(pathID uint16) {
+		mkPath := func(pathID uint16, hop string) {
 			if err := c.AddPath(ctx, PathParams{PathID: pathID, HmacID: hmacID, Active: true,
-				Segments: []Segment{{IP: ep, Port: portA}}}); err != nil {
+				Relays: []Segment{{IP: net.ParseIP(hop).To4(), Port: 51821}}}); err != nil {
 				t.Fatalf("AddPath(%d): %v", pathID, err)
 			}
 		}
@@ -708,13 +753,13 @@ func TestLiveAgainstVPP(t *testing.T) {
 			})
 			return idx
 		}
-		mkPath(pathA)
-		mkPath(pathB)
-		mkPath(bindIP1)
+		mkPath(pathA, "192.0.2.21")
+		mkPath(pathB, "192.0.2.22")
+		mkPath(pathC, "192.0.2.23")
 		t.Cleanup(func() {
 			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			for _, id := range []uint16{pathA, pathB, bindIP1} {
+			for _, id := range []uint16{pathA, pathB, pathC} {
 				if err := c.DelPath(cctx, id); err != nil {
 					t.Errorf("清理路径 %d: %v", id, err)
 				}
@@ -725,11 +770,11 @@ func TestLiveAgainstVPP(t *testing.T) {
 		})
 		idxA, idxB := mkIface(instA, portA), mkIface(instB, portB)
 
-		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxA, PathID: pathA, EndpointIP: ep, DstPort: portA}); err != nil {
+		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxA, PathID: pathA, SrcPort: portA}); err != nil {
 			t.Fatalf("SetTunnel(A): %v", err)
 		}
-		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxB, PathID: pathB, EndpointIP: ep, DstPort: portB}); err != nil {
-			t.Fatalf("第二条隧道（同 IP、不同端口）配不上: %v", err)
+		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxB, PathID: pathB, SrcPort: portB}); err != nil {
+			t.Fatalf("第二条隧道（同 IP、不同本端端口）配不上: %v", err)
 		}
 		tuns, err := c.Tunnels(ctx, ^uint32(0))
 		if err != nil {
@@ -744,32 +789,38 @@ func TestLiveAgainstVPP(t *testing.T) {
 			return nil
 		}
 		// 只比本会话自己那两条：这台节点和别的会话共用，全表断言会读到别人的现场。
-		if b := bindOf(idxA); b == nil || b.PathID != pathA || b.DstPort != portA || !b.EndpointIP.Equal(ep) {
-			t.Errorf("第一条绑定被第二条改了: %+v（期望 path=%d port=%d）", b, pathA, portA)
+		if b := bindOf(idxA); b == nil || b.PathID != pathA || b.SrcPort != portA {
+			t.Errorf("第一条绑定被第二条改了: %+v（期望 path=%d src_port=%d）", b, pathA, portA)
 		}
-		if b := bindOf(idxB); b == nil || b.PathID != pathB || b.DstPort != portB || !b.EndpointIP.Equal(ep) {
-			t.Errorf("第二条绑定不对: %+v（期望 path=%d port=%d）", b, pathB, portB)
+		if b := bindOf(idxB); b == nil || b.PathID != pathB || b.SrcPort != portB {
+			t.Errorf("第二条绑定不对: %+v（期望 path=%d src_port=%d）", b, pathB, portB)
 		}
 
-		// c) 抢身份：把 (shared, portA) 再绑一次到接口 B 上，必须被拒。
-		steal := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxB, PathID: bindIP1, EndpointIP: ep, DstPort: portA})
-		var apiErr APIError
-		if steal == nil || !errors.As(steal, &apiErr) || apiErr.Retval != -116 {
-			t.Errorf("抢同一个 (endpoint, 端口) 身份应当回 -116，got: %v", steal)
-		} else {
-			t.Logf("实测：抢身份被拒（%v）", steal)
+		// c) 两张接口填同一个 src_port：不报错（点对点隧道不做重复防护，操作员明确
+		//    免除）。这里的实测口径只是"两条绑定都在"；数据面这个键只会指向后写的那
+		//    一条（sr_wg_bind_set_port 用 hash_set 直接覆盖），先写的那条从此在收包侧
+		//    命中不到 —— 配置面看不出来。保证不撞端口是 agent 的事：每个隧道的本端
+		//    端口由 claimListenPort 独占分配。
+		if err := c.SetTunnel(ctx, TunnelBinding{SWIfIndex: idxB, PathID: pathC, SrcPort: portA}); err != nil {
+			var apiErr APIError
+			if errors.As(err, &apiErr) && apiErr.Retval == -116 {
+				t.Errorf("数据面又返回了重复端口保护（-116）：这套语义已按 A 方案删掉，" +
+					"点对点隧道不该有这条拦截")
+			}
+			t.Fatalf("同 src_port 重复下发应当成功，got: %v", err)
 		}
-		// d) 被拒之后 A 的绑定、以及 B 自己的绑定都还是原样。
 		tuns, err = c.Tunnels(ctx, ^uint32(0))
 		if err != nil {
 			t.Fatalf("Tunnels(复核): %v", err)
 		}
-		if b := bindOf(idxA); b == nil || b.PathID != pathA || b.DstPort != portA {
-			t.Errorf("被拒的那次动了一条绑定: %+v", b)
+		if b := bindOf(idxA); b == nil || b.PathID != pathA || b.SrcPort != portA {
+			t.Errorf("重复 src_port 把第一条接口自己的绑定改了: %+v", b)
 		}
-		if b := bindOf(idxB); b == nil || b.PathID != pathB || b.DstPort != portB {
-			t.Errorf("被拒的那次把 B 自己的绑定也改了: %+v", b)
+		if b := bindOf(idxB); b == nil || b.PathID != pathC || b.SrcPort != portA {
+			t.Errorf("重复 src_port 之后第二条接口没原地更新: %+v（期望 path=%d src_port=%d）",
+				b, pathC, portA)
 		}
+		t.Log("实测：同 src_port 跨接口重复 = 回 0 且两条绑定都在，端口键归后写那条（免除防护）")
 	})
 
 	// WG peer 的去重键**不含接口**：同一把公钥装到第二张接口上，VPP 回 -116。

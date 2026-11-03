@@ -384,7 +384,10 @@ info "ASSERT: sr-wg4-input 的 trace 解码必须等于路径表里的真值（#
 P_TBL=$(dx "${C_NODE1}" 'vppctl "show sr-wg paths"' 2>/dev/null | head -4)
 R_PID=$(echo "${P_TBL}" | sed -n 's/.*path_id=\([0-9][0-9]*\).*/\1/p'  | head -1)
 R_HID=$(echo "${P_TBL}" | sed -n 's/.*hmac_id=\([0-9][0-9]*\).*/\1/p'   | head -1)
-R_SEG=$(echo "${P_TBL}" | sed -n 's/.*seg_count=\([0-9][0-9]*\).*/\1/p'  | head -1)
+R_REL=$(echo "${P_TBL}" | sed -n 's/.*relay_count=\([0-9][0-9]*\).*/\1/p' | head -1)
+# 表里只有中转跳；线上段数 = relay_count + 1。终点段不进表（encap 从报文外层 dst
+# 现取），但它在 SR 头里照样占一格，trace 的 seg_left=0/<seg_count> 用的是这个数。
+[ -n "${R_REL}" ] && R_SEG=$((R_REL + 1))
 TR_HIT=$(grep -c "SR-WG-INPUT: hmac_id=${R_HID} path_id=${R_PID} seg_left=0/${R_SEG} err=0" \
          /tmp/srwg-trace-node2.txt 2>/dev/null)
 if [ -z "${R_PID}" ] || [ -z "${R_HID}" ] || [ -z "${R_SEG}" ]; then

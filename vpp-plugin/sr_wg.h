@@ -81,18 +81,21 @@ typedef struct {
  *
  * 单独用结构体是为了让 CLI / API dump 可以遍历展示。
  *
- * 挂点在 underlay 出口接口，所以数据面真正生效的键是 **(外层 dst IP,
- * 封装前的外层 dst 端口)**：同一对 CPE 之间可以开多条 WG 隧道（每隧道一个
- * 监听端口，定案 2），只按 IP 会把第二条隧道也拽进第一条的路径。
- * dst_port = 0 表示"这个 IP 上不分行数全部走本路径"（通配），只为兼容
- * 单隧道配法保留，热路径先查精确键、查不到再查通配键。
- * sw_if_index 只在"把 underlay 接口整体绑到一条路径"这种场景下才命中，
- * 保留它是为了兼容旧的按隧道配置。
+ * 数据面生效的键是**本端的外层 UDP 源端口**：这个数据面每条隧道占一个自己的
+ * 监听端口（定案 2），WG 发包时把它写进外层源端口，所以"这一包属于哪条隧道"
+ * 在本机是端口说了算 —— 而不是对端地址说了算。
+ *
+ * 对端地址不再参与选路，这是有意的：endpoint 可能是 NAT 学来的、会变，也可能
+ * 压根没配（WG 允许一端不配 endpoint）。把它当键，等于让"路径"依赖一个本端
+ * 不掌握、还会漂移的值。src_port = 0 表示这条绑定还没给出可用的键，
+ * 数据面永远不会命中它。
+ *
+ * sw_if_index 是隧道接口号：一条隧道一张 WG 接口，配置侧靠它定位要改/删哪条
+ * 绑定（一接口一绑定），不参与收包判定。
  */
 typedef struct {
-  u32 sw_if_index;        /* WG 隧道接口 sw_if_index（tunnel_path 表用） */
-  ip4_address_t endpoint; /* WG peer endpoint IPv4（endpoint_path 表用，必配） */
-  u16 dst_port;           /* 封装前的外层 UDP 目的端口；0 = 通配 */
+  u32 sw_if_index;        /* WG 隧道接口 sw_if_index（配置侧定位用） */
+  u16 src_port;           /* 本端外层 UDP 源端口 = 这条隧道的监听端口 */
   u16 path_id;
 } sr_wg_tunnel_bind_t;
 
@@ -128,9 +131,9 @@ typedef struct {
    *   vpn_ports     -> sr-wg4-input   （解封装；magic != 0x53 旁路给 wg4-input）
    *   transit_ports -> sr-wg4-transit （验签 + 弹一段，不解密）
    *
-   * 集合只用于**收包**分发表。encap 不再按端口判成员（发往对端的包目的端口是
-   * 对端的监听端口，与本机集合无关），隧道身份由绑定表的
-   * (peer endpoint, 对端 dst_port) 精确决定。
+   * 集合只用于**收包**分发表。encap 不看这些集合：它是发送侧，判据是绑定表里
+   * 的本端外层 UDP 源端口（= 这条隧道的监听端口），与"本机在听哪些端口"无关。
+   * 发往对端的那个目的端口是对端的监听端口，本机集合里没有它，也不需要。
    *
    * 用 clib_bitmap（≤64K 位，按需增长）而不是向量：UDP 分发表按目的端口
    * 查成员，bitmap 取值是 O(1)；用向量就得每个包线性扫一遍。
@@ -147,17 +150,16 @@ typedef struct {
 
   /*
    * 隧道-路径绑定表（两种索引，指向同一份 sr_wg_tunnel_bind_t 池）：
-   *   endpoint_path : key = (外层 dst IPv4 << 16) | 封装前的外层 dst 端口，
-   *                   **underlay 挂点下真正生效的索引**，优先级最高；
-   *                   端口 0 = 通配，精确键查不到才落到它
-   *   tunnel_path   : key = sw_if_index。挂点看到的是 underlay 接口，
-   *                   故它是"整张网卡一条默认路径"的粗粒度配法，
-   *                   仅在 endpoint 未命中时兜底；绑定 wg0 的条目
-   *                   在此挂点下不会命中（历史遗留，兼容用）
+   *   src_port_path : key = 本端外层 UDP 源端口。**数据面唯一用的索引** ——
+   *                   每条隧道一个监听端口（定案 2），WG 把它写进外层源端口，
+   *                   所以本机发出去的那个包自带隧道身份。
+   *   tunnel_path   : key = WG 隧道接口 sw_if_index。不参与收包判定，只用于
+   *                   配置侧定位"改/删这张接口的绑定"（一接口一绑定）以及
+   *                   删路径时回收指向它的绑定。
    * value 均为 bind 池索引 + 1（0 = 无绑定）。
    */
   uword *tunnel_path;
-  uword *endpoint_path;
+  uword *src_port_path;
   sr_wg_tunnel_bind_t *binds;   /* pool */
 
   /*
@@ -233,21 +235,20 @@ void sr_wg_encap_init(sr_wg_main_t *sm);
 
 /*
  * 绑定 / 解绑 WG 隧道接口到 SR 路径。
- *   is_add   : 1 = 绑定（path_id 必须存在于路径表）
- *              0 = 解绑
- *              注意：**不会**自动启用 feature。挂点在 underlay 出口接口，
- *              与本函数的 sw_if_index 无关，必须由 `set sr-wg encap enable
- *              <underlay>`（或对应 API）单独打开。
- *   endpoint : WG peer 的外层地址。underlay 挂点下这是唯一能命中绑定的键，
- *              不传则该绑定永远不会生效（CLI 会给出警告）。
- *   dst_port : **封装前**的外层 UDP 目的端口 = 该隧道 peer 的 vpn_port。
- *              同一个 endpoint 上多条隧道就靠它区分；传 0 = 通配（该 IP 不分行数
- *              全走本路径，单隧道的旧配法）。
+ *   is_add    : 1 = 绑定（path_id 必须存在于路径表）
+ *               0 = 解绑
+ *               注意：**不会**自动启用 feature。挂点在 underlay 出口接口，
+ *               与本函数的 sw_if_index 无关，必须由 `set sr-wg encap enable
+ *               <underlay>`（或对应 API）单独打开。
+ *   src_port  : 本端外层 UDP 源端口 = 这条隧道的监听端口，数据面唯一的键。
+ *               0 = 还没给出可用键，这条绑定永远不会命中（CLI/API 会报出来）。
+ *               两张接口填同一个 src_port 时后写的赢：本数据面是点对点隧道，
+ *               一个端口只会对应一条隧道，配重了属于控制面 bug，
+ *               `show sr-wg tunnels` 全表可查，插件不做额外防护。
  * 返回 0 成功，非 0 为 VNET_API_ERROR_* 错误码。
  */
 int sr_wg_tunnel_set_path(sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
-                          const ip4_address_t *endpoint, u16 dst_port,
-                          int is_add);
+                          u16 src_port, int is_add);
 
 /*
  * 在 ip4-output arc 上为指定 **underlay 出口接口** 启用 / 禁用
@@ -275,12 +276,10 @@ int sr_wg_encap_is_enabled(sr_wg_main_t *sm, u32 sw_if_index);
 void sr_wg_encap_reconcile(sr_wg_main_t *sm);
 
 /*
- * 查找绑定条目；未绑定返回 NULL。数据面热路径使用。
- * dst_port 是**封装前**的外层目的端口（主机序）：先查 (dst, port) 精确键，
- * 查不到再落到 (dst, 0) 通配键，最后按 sw_if_index 兜底。
+ * 按本端外层 UDP 源端口（主机序）查绑定条目；未绑定返回 NULL。
+ * 数据面热路径使用：encap 每个出站包一次，命中即"这一包属于这条隧道"。
  */
-sr_wg_tunnel_bind_t *sr_wg_bind_lookup(sr_wg_main_t *sm, u32 sw_if_index,
-                                       ip4_address_t dst, u16 dst_port);
+sr_wg_tunnel_bind_t *sr_wg_bind_lookup(sr_wg_main_t *sm, u16 src_port);
 
 /*
  * 删除路径时清理仍指向它的隧道绑定，返回清理条数。

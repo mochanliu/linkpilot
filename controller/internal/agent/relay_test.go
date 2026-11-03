@@ -11,26 +11,30 @@ import (
 )
 
 // 中转链的顺序是路径本身：3→5 与 5→3 是两条不同的路。这里把它锁在**最靠近数据面
-// 的那一层** —— 真机上的 `sr-wg path add P via PEER via H2 via H1` 就是这个顺序，
-// 而段列表一旦写反，包会先绕到另一个跳上去，控制台看上去仍然是"这条隧道经 3 和 5"。
-func TestRelayChainGoesToSegmentsDestinationFirst(t *testing.T) {
+// 的那一层** —— 真机上的 `sr-wg path add P via H2 via H1` 就是这个顺序（离终点近的
+// 写在前面），而中转一旦写反，包会先绕到另一个跳上去，控制台看上去仍然是"这条隧道
+// 经 3 和 5"。
+//
+// 终点（对端外层 ip:port）**不在路径里**：encap 封装前从即将发出的那个包现取
+// （2026-11-03 定案的 A 方案）。所以期望列表里只有中转跳，直连隧道是一条空的链。
+func TestRelayChainGoesToPathRelaysDestinationFirst(t *testing.T) {
 	const peerNode = uint16(3)
 	cases := []struct {
 		name   string
 		relays []string // 按行走顺序，和控制器下发的一致
-		want   []string // segments[]，终点在前
+		want   []string // 路径里的中转跳，离终点近的在前
 	}{
-		{"直连", nil, []string{"10.10.1.3:51820"}},
+		{"直连", nil, nil},
 		{"一跳", []string{"10.10.9.1:15001"},
-			[]string{"10.10.1.3:51820", "10.10.9.1:15001"}},
+			[]string{"10.10.9.1:15001"}},
 		{"两跳", []string{"10.10.9.1:15001", "10.10.9.2:15002"},
-			[]string{"10.10.1.3:51820", "10.10.9.2:15002", "10.10.9.1:15001"}},
+			[]string{"10.10.9.2:15002", "10.10.9.1:15001"}},
 		{"三跳", []string{"10.10.9.1:15001", "10.10.9.2:15002", "10.10.9.3:15003"},
-			[]string{"10.10.1.3:51820", "10.10.9.3:15003", "10.10.9.2:15002", "10.10.9.1:15001"}},
-		// 同两台设备、相反的顺序：段列表必须跟着反过来。如果这一条也"通过"，
+			[]string{"10.10.9.3:15003", "10.10.9.2:15002", "10.10.9.1:15001"}},
+		// 同两台设备、相反的顺序：中转链必须跟着反过来。如果这一条也"通过"，
 		// 说明中间某处按 node_id 排了序。
 		{"两跳换序", []string{"10.10.9.2:15002", "10.10.9.1:15001"},
-			[]string{"10.10.1.3:51820", "10.10.9.1:15001", "10.10.9.2:15002"}},
+			[]string{"10.10.9.1:15001", "10.10.9.2:15002"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,22 +50,28 @@ func TestRelayChainGoesToSegmentsDestinationFirst(t *testing.T) {
 			if err := ts.Sync(context.Background(), b.Version); err != nil {
 				t.Fatalf("Sync: %v", err)
 			}
-			got := segmentsOf(t, f, wire.UnderlayPathIDBase+peerNode)
+			got := relaysOf(t, f, wire.UnderlayPathIDBase+peerNode)
 			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
-				t.Fatalf("段列表 = %v，期望 %v（终点必须在第一段，中转按行走顺序倒着挂）", got, tc.want)
+				t.Fatalf("中转链 = %v，期望 %v（终点不在这张表里，中转按离终点近的在前）", got, tc.want)
+			}
+			for _, s := range got {
+				if s == "10.10.1.3:51820" {
+					t.Fatalf("对端地址 %s 被塞进了路径表：终点段必须由报文自己提供，"+
+						"存在表里就是一个会漂移、还参与 HMAC 的值", s)
+				}
 			}
 		})
 	}
 }
 
-func segmentsOf(t *testing.T, f *fakeVPP, pathID uint16) []string {
+func relaysOf(t *testing.T, f *fakeVPP, pathID uint16) []string {
 	t.Helper()
 	p, ok := f.paths[pathID]
 	if !ok {
 		t.Fatalf("path_id %d 没下发过：全部调用 %v", pathID, f.calls)
 	}
-	out := make([]string, 0, len(p.Segments))
-	for _, s := range p.Segments {
+	out := make([]string, 0, len(p.Relays))
+	for _, s := range p.Relays {
 		out = append(out, fmt.Sprintf("%s:%d", s.IP, s.Port))
 	}
 	return out

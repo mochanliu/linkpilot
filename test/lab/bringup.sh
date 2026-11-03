@@ -653,22 +653,23 @@ stage_dataplane() {
         note "$c: vpn 端口集合 = $(vpp "$c" show sr-wg ports | awk '/^vpn/{i=index($0,": "); s=substr($0,i+2); sub(/ .*/,"",s); print s}')"
     done
 
-    # SR path / 按 (endpoint,dst-port) 的绑定 / underlay 出口的 encap 挂点。
+    # SR 路径（**只存中转跳**，终点段由 encap 从报文外层 dst 现取）/ 按本端监听
+    # 端口的隧道绑定 / underlay 出口的 encap 挂点。
     while read -r a b aif aport aov bif bport bov pa pb tport; do
         local ca=lab-cpe$a cb=lab-cpe$b sw
         vpp "$ca" sr-wg path del "$pa" >/dev/null 2>&1
-        vpp "$ca" sr-wg path add "$pa" via "${WAN_IP[$b]}:$bport" via "${TRANSIT_WAN}:$tport" hmac-id 1 >/dev/null ||
+        vpp "$ca" sr-wg path add "$pa" via "${TRANSIT_WAN}:$tport" hmac-id 1 >/dev/null ||
             die "$ca: path $pa 下发失败"
         sw=$(vpp_swidx "$ca" "$aif")
         [ -n "$sw" ] || die "$ca: 取不到 $aif 的 sw_if_index"
-        vpp "$ca" set sr-wg tunnel "$sw" path "$pa" endpoint "${WAN_IP[$b]}" dst-port "$bport" >/dev/null ||
+        vpp "$ca" set sr-wg tunnel "$sw" path "$pa" src-port "$aport" >/dev/null ||
             die "$ca: 绑定 $aif 失败"
         vpp "$cb" sr-wg path del "$pb" >/dev/null 2>&1
-        vpp "$cb" sr-wg path add "$pb" via "${WAN_IP[$a]}:$aport" via "${TRANSIT_WAN}:$tport" hmac-id 1 >/dev/null ||
+        vpp "$cb" sr-wg path add "$pb" via "${TRANSIT_WAN}:$tport" hmac-id 1 >/dev/null ||
             die "$cb: path $pb 下发失败"
         sw=$(vpp_swidx "$cb" "$bif")
         [ -n "$sw" ] || die "$cb: 取不到 $bif 的 sw_if_index"
-        vpp "$cb" set sr-wg tunnel "$sw" path "$pb" endpoint "${WAN_IP[$a]}" dst-port "$aport" >/dev/null ||
+        vpp "$cb" set sr-wg tunnel "$sw" path "$pb" src-port "$bport" >/dev/null ||
             die "$cb: 绑定 $bif 失败"
     done < <(tunnel_rows)
     for n in 1 2 3; do

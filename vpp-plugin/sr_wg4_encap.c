@@ -57,22 +57,39 @@
  *
  * ==================== 段列表 / seg_left 语义 ====================
  *
- * 与 sr_header.h、docs/sr-header-format.md 一致：
- *   segments[0]            = 最终目的节点（VPN 端口 51820）
+ * 与 sr_header.h、docs/sr-header-format.md 一致的位序约定：
+ *   segments[0]            = 最终目的节点
  *   segments[seg_count-1]  = 第一跳中转（"首跳免费"，由外层 IP/UDP 承载）
  *   sr_hdr_get_next_hop()  = &segments[seg_left - 1]
  *   sr_hdr_pop_segment()   = 取走 segments[seg_left-1] 后 seg_left--
  *
+ * 但**终点那一段不来自路径表，来自这个包本身**：路径表里只存中间跳
+ * （relay_count 个），终点段在封装前从报文的外层 dst / UDP 目的端口现取。
+ * 所以路径表字段叫 relays[]/relay_count，线格式仍然是
+ *   seg_count            = relay_count + 1
+ *   segments[0]          = 本包封装前的 (外层 dst IP, 外层 UDP 目的端口)
+ *   segments[1 + i]      = path->relays[i]      （i = 0..relay_count-1）
+ *   segments[seg_count-1]= path->relays[relay_count-1] = 第一跳
+ *
  * 故 encap 必须：
  *   外层 IP4 dst      = segments[seg_count-1].ip
  *   外层 UDP dst_port = segments[seg_count-1].port
- *   seg_left          = seg_count - 1     （首跳已在外层，剩余待处理段数）
+ *   seg_left          = seg_count - 1 = relay_count（首跳已在外层）
  *
  * 注意 sr_hdr_init()/sr_path_fill_header() 把 seg_left 初始化为 seg_count，
- * 必须在其之后覆盖为 seg_count-1；seg_left 不在 HMAC 覆盖范围内，
+ * 必须在其之后覆盖为 relay_count；seg_left 不在 HMAC 覆盖范围内，
  * 覆盖后无需重新签名。
  *
- * 验证（seg_count=2: segments[0]=node2:51820, segments[1]=transit:51821）：
+ * relay_count = 0（隧道没有中转跳）时 seg_count=1、seg_left=0，"第一跳"就是
+ * 终点自己：Step 11 把外层 dst 改写成它当前的值，是无害的自我改写。这一条
+ * 必须留着 —— 那个 SR 头证明"发端持有这把 P-Key"，是收端把外层源记成
+ * verified 观测的唯一凭证（endpoint 未配的对端地址全靠它上报）。
+ *
+ * 为什么终点不写进路径表：路径表存的是"中间怎么走"，终点地址是 WG 的事，
+ * 可能学自 NAT、会变、也可能压根没配。把会漂移的值写进表里，地址一变表里
+ * 就留着一个没人再听的老地址，而 SR 头的 HMAC 覆盖终点段，改它就得重签。
+ *
+ * 验证（relay_count=1: segments[0]=node2:51820, segments[1]=transit:51821）：
  *   encap   → seg_left=1，外层 dst=transit:51821
  *   transit → next_hop=segments[0]=node2:51820，seg_left 1→0，改写外层
  *   node2   → sr-wg4-input 见 seg_left==0 → 剥 SR 头 → wg4-input 解密
@@ -93,8 +110,9 @@ typedef struct {
   u8  seg_left;
   u16 sr_len;
   u8  l2_len;              /* 入口时嗅到的 L2 头长度（0=无 L2） */
-  ip4_address_t orig_dst;      /* 原外层 dst（WG peer endpoint） */
-  u16 in_port;                 /* 封装前的外层 UDP 目的端口 = 隧道身份的另一半 */
+  u16 src_port;            /* 外层 UDP 源端口 = 本端隧道监听端口 = 绑定表的键 */
+  ip4_address_t orig_dst;      /* 原外层 dst：终点段就是从它取的 */
+  u16 orig_dport;          /* 封装前的外层 UDP 目的端口（终点段的端口） */
   ip4_address_t first_hop_ip;  /* 改写后的外层 dst */
   u16 first_hop_port;
   i16 current_data;            /* 封装后 current_data，用于观测 headroom */
@@ -110,20 +128,20 @@ format_sr_wg4_encap_trace (u8 *s, va_list *args)
   sr_wg4_encap_trace_t *t = va_arg (*args, sr_wg4_encap_trace_t *);
 
   /*
-   * 两条分支都带 in_port：同一对 CPE 开多条隧道时 (orig_dst, in_port) 才是
-   * "这条流属于哪条隧道"的完整身份，只看 dst IP 会把它错认成一条。
+   * 两条分支都带 src_port：它是"这一包属于哪条隧道"的唯一判据，未命中的包
+   * 最需要看的恰好就是它的源端口是多少（对不上任何绑定 = 旁路的根因）。
    */
   if (t->bypass)
-    s = format (s, "SR-WG-ENCAP: bypass sw_if_index=%u orig_dst=%U:%u "
-                   "err=%u next=%u",
-                t->tx_sw_if_index, format_ip4_address, &t->orig_dst,
-                t->in_port, t->error, t->next_index);
+    s = format (s, "SR-WG-ENCAP: bypass sw_if_index=%u src_port=%u "
+                   "endpoint=%U:%u err=%u next=%u",
+                t->tx_sw_if_index, t->src_port, format_ip4_address,
+                &t->orig_dst, t->orig_dport, t->error, t->next_index);
   else
     s = format (s, "SR-WG-ENCAP: path_id=%u seg_count=%u seg_left=%u "
-                   "sr_len=%u l2_len=%u orig_dst=%U:%u -> first_hop=%U:%u "
-                   "cd=%d err=%u next=%u",
+                   "sr_len=%u l2_len=%u src_port=%u endpoint=%U:%u "
+                   "-> first_hop=%U:%u cd=%d err=%u next=%u",
                 t->path_id, t->seg_count, t->seg_left, t->sr_len, t->l2_len,
-                format_ip4_address, &t->orig_dst, t->in_port,
+                t->src_port, format_ip4_address, &t->orig_dst, t->orig_dport,
                 format_ip4_address, &t->first_hop_ip, t->first_hop_port,
                 t->current_data, t->error, t->next_index);
   return s;
@@ -233,18 +251,22 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
        * 覆盖 72 - sr_len 字节的 WG 载荷。构建完再按实际 sr_len 拷贝。
        */
       sr_header_t srh;
+      /* 终点段：封装前的 (外层 dst, 外层 UDP 目的端口)，两者都保持网络序 */
+      sr_segment_t endpoint;
       ip4_address_t orig_dst;
       u8 *p;
       u32 tx_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_TX];
       u32 next_index = SR_WG4_ENCAP_NEXT_DROP;
       u32 ip4_len = 0, outer_len = 0, sr_len = 0, l2_len = 0;
-      u16 in_port = 0;   /* 封装前的外层 UDP 目的端口（隧道身份的一半） */
+      u16 src_port = 0;  /* 本端外层源端口 = 绑定表的键 */
+      u16 orig_dport = 0;
       u16 path_id = 0;
       u8 seg_count = 0, seg_left = 0;
       u8 error = SR_WG4_ENCAP_ERROR_NONE;
       u8 bypass = 1;   /* 缺省直通：保证 WG 直连模式不受影响 */
 
       clib_memset (&orig_dst, 0, sizeof (orig_dst));
+      clib_memset (&endpoint, 0, sizeof (endpoint));
       clib_memset (&srh, 0, sizeof (srh));
 
       cur = vlib_buffer_get_current (b);
@@ -291,7 +313,16 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       udp = (udp_header_t *) ((u8 *) ip4 + ip4_len);
       payload = (u8 *) udp + sizeof (udp_header_t);
+
+      /*
+       * 终点段在这里捕获：ip4->dst_address 与 udp->dst_port 都还是网络序，
+       * 直接进 sr_segment_t 不用换序。必须在 Step 11 改写外层 dst 之前取，
+       * 改写之后外层就是第一跳了，终点信息只剩在这一对局部变量里。
+       */
       orig_dst = ip4->dst_address;
+      orig_dport = clib_net_to_host_u16 (udp->dst_port);
+      clib_memcpy_fast (endpoint.ip, &ip4->dst_address, 4);
+      clib_memcpy_fast (endpoint.port, &udp->dst_port, 2);
 
       /*
        * Step 3: 环路守卫。载荷首字节已是 SR_MAGIC 说明本包已经封装过
@@ -305,27 +336,23 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
         goto done;
 
       /*
-       * Step 4: 查绑定（外层 (dst IP, 封装前 dst 端口)）。
+       * Step 4: 查绑定（键 = 本端外层 UDP 源端口）。
        *
-       * 这里**不能**再拿 udp->dst_port 去查本机 vpn_ports：挂点在 underlay
-       * 出口，发往对端的 WG 包目的端口是**对端**的监听端口，与本机监听端口
-       * 没有必然关系（两端各用各的端口是 WG 的正常形态）。旧规则要求两端
-       * 同端口，代价是发送侧判据永远不成立、SR 封装被静默直通。
+       * 本数据面每隧道一个监听端口（定案 2），WG 把那个端口写进外层源端口，
+       * 所以"这一包属于哪条隧道"在本机是**源端口**说了算。它是本机自己选的、
+       * 发出去之前一定正确的值，因此不需要别的信息来佐证。
        *
-       * 绑定表本身就是精确判据：(peer endpoint, 对端端口) 命中才封装，
-       * 未命中即普通 WG / 非 WG 流量，直通；封装后第二遍的外层 dst 是
-       * transit 地址与 transit 端口，不存在对应绑定（且 Step 3 已拦 magic），
-       * 不会二次封装。
+       * 判据不能是外层 dst：那是**对端**的监听端口 + 对端地址，本机既不能保证
+       * 对端改了配置后立刻知道，也不能保证它经过 NAT 后还是那个值（我们的前提
+       * 是"源端口经 NAT 不变"，对端地址从来不是这个前提的一部分）。旧规则把
+       * (对端 IP, 对端端口) 当键，代价是 endpoint 一旦漂移或压根没配，绑定就
+       * 静默旁路 —— 隧道仍然通、SR 路径悄悄失效，是最难查的那类故障。
        *
-       * 挂点在 underlay 接口，tx_sw_if_index 是物理/宿主接口而不是 wg0，
-       * 所以实际生效的是 endpoint_path（外层 dst = WG peer endpoint）。
-       * 端口是这个键的另一半：同一对 CPE 开多条隧道时，只有端口能把
-       * "这条流属于哪条隧道"分清楚。绑定时必须下发 endpoint，否则本步查不到
-       * → 静默直通 → 流量绕过 SR 路径直发 peer。`show sr-wg tunnels` 会把
-       * 这种配错显式标出来。
+       * 未命中即普通 WG / 非 WG 流量，直通。封装后第二遍经过本节点时源端口
+       * 不变、仍会命中同一条绑定，但 Step 3 的 magic 判据已先拦住，不会二次封装。
        */
-      in_port = clib_net_to_host_u16 (udp->dst_port);
-      bind = sr_wg_bind_lookup (sm, tx_sw_if_index, orig_dst, in_port);
+      src_port = clib_net_to_host_u16 (udp->src_port);
+      bind = sr_wg_bind_lookup (sm, src_port);
       if (PREDICT_FALSE (bind == NULL))
         goto done;   /* 未绑定 → 普通 WG 隧道，直通 */
 
@@ -341,10 +368,14 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           goto done;
         }
       path_id = path->path_id;
-      seg_count = path->seg_count;
+      seg_count = (u8) (path->relay_count + 1);
 
-      /* Step 6: 构造 SR Header（含 HMAC 签名） */
-      if (PREDICT_FALSE (sr_path_fill_header (path, &srh, now) != 0))
+      /*
+       * Step 6: 构造 SR Header（含 HMAC 签名）。
+       * 终点段由 &endpoint 传入 —— 路径表里只有中转跳，终点必须**签名前**
+       * 就位（它在 HMAC 覆盖范围内），所以不能等签完再往包里补。
+       */
+      if (PREDICT_FALSE (sr_path_fill_header (path, &srh, now, &endpoint) != 0))
         {
           error = SR_WG4_ENCAP_ERROR_HMAC_FAIL;
           bypass = 0;
@@ -353,8 +384,8 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           goto done;
         }
 
-      /* Step 7: 首跳免费——seg_left 覆盖为 seg_count-1（不在 HMAC 覆盖内） */
-      seg_left = (u8) (seg_count - 1);
+      /* Step 7: 首跳免费——seg_left 覆盖为 relay_count（不在 HMAC 覆盖内） */
+      seg_left = path->relay_count;
       srh.seg_left = seg_left;
 
       first_hop = &srh.segments[seg_count - 1];
@@ -397,7 +428,9 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       /* Step 10: 写入 SR Header（仅 sr_len 字节，不越界覆盖 WG 载荷） */
       clib_memcpy_fast (p + outer_len, &srh, sr_len);
 
-      /* Step 11: 改写外层 IP4 dst / UDP dst_port 为第一跳 */
+      /* Step 11: 改写外层 IP4 dst / UDP dst_port 为第一跳。
+       * relay_count=0 时第一跳就是终点自己（segments[0]，即 Step 2 之后捕获的
+       * 那对原值），这两次写是等值自写，包内容不变。 */
       clib_memcpy_fast (&ip4->dst_address, first_hop->ip, 4);
       clib_memcpy_fast (&udp->dst_port, first_hop->port, 2);
 
@@ -465,8 +498,9 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           tr->seg_left = seg_left;
           tr->sr_len = (u16) sr_len;
           tr->l2_len = (u8) l2_len;
+          tr->src_port = src_port;
           tr->orig_dst = orig_dst;
-          tr->in_port = in_port;
+          tr->orig_dport = orig_dport;
           tr->current_data = b->current_data;
           tr->error = error;
           tr->bypass = bypass;
@@ -500,85 +534,55 @@ sr_wg_encap_init (sr_wg_main_t *sm)
 {
   if (!sm->tunnel_path)
     sm->tunnel_path = hash_create (0, sizeof (uword));
-  if (!sm->endpoint_path)
-    sm->endpoint_path = hash_create (0, sizeof (uword));
+  if (!sm->src_port_path)
+    sm->src_port_path = hash_create (0, sizeof (uword));
   if (!sm->encap_enabled_ifs)
     sm->encap_enabled_ifs = hash_create (0, sizeof (uword));
+  /* 一台盒子的绑定数与路径数同阶（一隧道一路径），共用 SR_MAX_PATHS 容量 */
   if (!sm->binds)
-    pool_alloc (sm->binds, 64);
+    pool_alloc (sm->binds, SR_MAX_PATHS);
 }
 
 /*
- * endpoint_path 的键：外层 dst IP + **封装前**的外层 UDP 目的端口。
- * 端口是键的另一半，因为同一对 CPE 可以开多条 WG 隧道（每隧道一个监听端口，
- * 定案 2），只按 IP 会把第二条隧道也拽进第一条的路径。
- * dst_port = 0 是通配键：命中"这个 IP 上不分行数全走本路径"的旧配法。
+ * 内部：登记/摘除 bind 在 src_port_path 里的键。
+ *
+ * src_port = 0 表示这条绑定还没给出可用的键（控制面还没把这台盒子的监听端口
+ * 填进来），此时它只存在于 tunnel_path 里 —— 数据面永远查不到它，
+ * `show sr-wg tunnels` 会把它标成未生效而不是假装命中。
  */
-static uword
-sr_wg_bind_key (ip4_address_t endpoint, u16 dst_port)
+static void
+sr_wg_bind_set_port (sr_wg_main_t *sm, const sr_wg_tunnel_bind_t *bind, u32 bi)
 {
-  return ((uword) clib_net_to_host_u32 (endpoint.as_u32) << 16) |
-         (uword) dst_port;
+  if (bind->src_port)
+    hash_set (sm->src_port_path, (uword) bind->src_port, bi + 1);
+}
+
+static void
+sr_wg_bind_unset_port (sr_wg_main_t *sm, const sr_wg_tunnel_bind_t *bind)
+{
+  if (bind->src_port)
+    hash_unset (sm->src_port_path, (uword) bind->src_port);
 }
 
 sr_wg_tunnel_bind_t *
-sr_wg_bind_lookup (sr_wg_main_t *sm, u32 sw_if_index, ip4_address_t dst,
-                   u16 dst_port)
+sr_wg_bind_lookup (sr_wg_main_t *sm, u16 src_port)
 {
   uword *p;
 
-  /*
-   * 精确键 (dst, port) 最优先，其次 (dst, 0) 通配，最后 sw_if_index。
-   * 挂点在 underlay 接口，sw_if_index 命中的只能是"整张 underlay 网卡
-   * 一条默认路径"这种粗粒度配法，所以更具体的 endpoint 必须优先，
-   * 否则一张 underlay 网卡上的所有 WG 隧道会被默认路径全部接管。
-   */
-  p = hash_get (sm->endpoint_path, sr_wg_bind_key (dst, dst_port));
-  if (p && p[0] != 0)
-    return pool_elt_at_index (sm->binds, p[0] - 1);
-
-  if (dst_port != 0)
-    {
-      p = hash_get (sm->endpoint_path, sr_wg_bind_key (dst, 0));
-      if (p && p[0] != 0)
-        return pool_elt_at_index (sm->binds, p[0] - 1);
-    }
-
-  p = hash_get (sm->tunnel_path, (uword) sw_if_index);
+  p = hash_get (sm->src_port_path, (uword) src_port);
   if (p && p[0] != 0)
     return pool_elt_at_index (sm->binds, p[0] - 1);
 
   return NULL;
 }
 
-/* 内部：把 bind 池索引 bi+1 登记到 endpoint hash（endpoint 非 0 时） */
-static void
-sr_wg_bind_set_endpoint (sr_wg_main_t *sm, sr_wg_tunnel_bind_t *bind, u32 bi)
-{
-  if (bind->endpoint.as_u32 != 0)
-    hash_set (sm->endpoint_path,
-              sr_wg_bind_key (bind->endpoint, bind->dst_port), bi + 1);
-}
-
-/* 内部：按 bind 自己的 (endpoint, dst_port) 从 endpoint hash 摘除 */
-static void
-sr_wg_bind_unset_endpoint (sr_wg_main_t *sm, const sr_wg_tunnel_bind_t *bind)
-{
-  if (bind->endpoint.as_u32 != 0)
-    hash_unset (sm->endpoint_path,
-                sr_wg_bind_key (bind->endpoint, bind->dst_port));
-}
-
 int
 sr_wg_tunnel_set_path (sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
-                       const ip4_address_t *endpoint, u16 dst_port,
-                       int is_add)
+                       u16 src_port, int is_add)
 {
   vnet_main_t *vnm = vnet_get_main ();
   sr_wg_tunnel_bind_t *bind;
-  ip4_address_t new_endpoint;
-  uword old_key = 0, new_key;
-  u8 have_old = 0;
+  u16 old_port;
   uword *p;
   u32 bi;
 
@@ -597,7 +601,7 @@ sr_wg_tunnel_set_path (sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
       bi = p[0] - 1;
       bind = pool_elt_at_index (sm->binds, bi);
 
-      sr_wg_bind_unset_endpoint (sm, bind);
+      sr_wg_bind_unset_port (sm, bind);
       hash_unset (sm->tunnel_path, (uword) sw_if_index);
       pool_put_index (sm->binds, bi);
       /*
@@ -611,53 +615,33 @@ sr_wg_tunnel_set_path (sr_wg_main_t *sm, u32 sw_if_index, u16 path_id,
   if (!sr_path_lookup (&sm->path_table, path_id))
     return VNET_API_ERROR_NO_SUCH_ENTRY;
 
-  clib_memset (&new_endpoint, 0, sizeof (new_endpoint));
-  if (endpoint)
-    new_endpoint = *endpoint;
-
   p = hash_get (sm->tunnel_path, (uword) sw_if_index);
   if (p && p[0] != 0)
-    bi = p[0] - 1;    /* 已存在 → 原地更新 */
-  else
-    bi = (u32) ~0;    /* 新建 */
-
-  /*
-   * (endpoint, dst_port) 就是"哪条隧道"的身份：同一对 CPE 开多条 WG 隧道时
-   * 只有端口能把它们分开。两张接口抢同一个身份一定是配错了，而后果是前一条
-   * 隧道静默旁路（encap_bypass 上涨、隧道仍是通的），所以这里显式拒绝，
-   * 让控制面看见 —— 具体是谁占的，`show sr-wg tunnels` 全表可查。
-   */
-  new_key = sr_wg_bind_key (new_endpoint, dst_port);
-  if (new_endpoint.as_u32 != 0)
     {
-      uword *owner = hash_get (sm->endpoint_path, new_key);
-      if (owner && owner[0] != 0 && (bi == (u32) ~0 || owner[0] != bi + 1))
-        return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
+      bi = p[0] - 1;
+      bind = pool_elt_at_index (sm->binds, bi);
     }
-
-  if (bi == (u32) ~0)
+  else
     {
       pool_get_zero (sm->binds, bind);
       bi = bind - sm->binds;
       hash_set (sm->tunnel_path, (uword) sw_if_index, bi + 1);
     }
-  else
-    bind = pool_elt_at_index (sm->binds, bi);
 
-  old_key = sr_wg_bind_key (bind->endpoint, bind->dst_port);
-  have_old = bind->endpoint.as_u32 != 0;
+  /*
+   * 改了本端源端口 = 这条隧道换了身份，旧键必须摘掉：留着就是一条僵尸键，
+   * 会把"还在用旧端口发"的那条流的包拽进这条路径（旧端口此后归属谁未定）。
+   */
+  old_port = bind->src_port;
 
   bind->sw_if_index = sw_if_index;
   bind->path_id = path_id;
-  bind->endpoint = new_endpoint;
-  bind->dst_port = dst_port;
+  bind->src_port = src_port;
 
-  /* endpoint 或端口变了要摘掉旧键，否则留下一条指向本 bind 的僵尸键，
-   * 会把别的隧道的流量拽进这条路径。 */
-  if (have_old && old_key != new_key)
-    hash_unset (sm->endpoint_path, old_key);
+  if (old_port && old_port != src_port)
+    hash_unset (sm->src_port_path, (uword) old_port);
 
-  sr_wg_bind_set_endpoint (sm, bind, bi);
+  sr_wg_bind_set_port (sm, bind, bi);
 
   return 0;
 }
@@ -687,8 +671,8 @@ sr_wg_binds_drop_for_path (sr_wg_main_t *sm, u16 path_id)
       if (bind->path_id != path_id)
         continue;
 
-      /* 新签名的 unset：摘的是 (endpoint, dst_port) 组合键，传整个 bind */
-      sr_wg_bind_unset_endpoint (sm, bind);
+      /* 摘掉本端源端口键：不摘就留一条指向已回收 bind 的僵尸键 */
+      sr_wg_bind_unset_port (sm, bind);
       p = hash_get (sm->tunnel_path, (uword) bind->sw_if_index);
       if (p && p[0] == bi + 1)
         hash_unset (sm->tunnel_path, (uword) bind->sw_if_index);

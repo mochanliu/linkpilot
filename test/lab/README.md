@@ -77,9 +77,9 @@ lab-custN 10.99.0.2N        BGP router-id
 | T13 | cpe1 wg1 51840 / 192.168.100.1 | cpe3 wg0 51840 / 192.168.100.2 | 51841 |
 | T23 | cpe2 wg1 51860 / 192.168.101.1 | cpe3 wg1 51860 / 192.168.101.2 | 51861 |
 
-两端端口不必相同：encap 的隧道身份来自绑定表 `(对端 endpoint, 对端 dst_port)`，
-与**本机** vpn_ports 无关（vpn_ports 只决定收包进 `sr-wg4-input` 还是
-`wg4-input`）。本 lab 用同号只是排版方便；非对称端口的回归在
+两端端口不必相同：encap 的隧道身份就是**本端外层源端口**（绑定表的键，
+= 这条 WG 接口的监听端口），与对端端口、与**本机** vpn_ports 集合都无关
+（vpn_ports 只决定收包进 `sr-wg4-input` 还是 `wg4-input`）。本 lab 用同号只是排版方便；非对称端口的回归在
 `test/scripts/test-multitunnel.sh`（node1 51830 / node2 51840）。
 
 路由链路：

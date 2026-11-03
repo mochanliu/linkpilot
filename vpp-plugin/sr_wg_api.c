@@ -75,25 +75,27 @@ vl_api_sr_wg_path_add_del_t_handler (vl_api_sr_wg_path_add_del_t *mp)
       clib_memset (&cfg, 0, sizeof (cfg));
       cfg.path_id = clib_net_to_host_u16 (mp->path_id);
       cfg.hmac_id = clib_net_to_host_u16 (mp->hmac_id);
-      cfg.seg_count = mp->seg_count;
+      cfg.relay_count = mp->relay_count;
       cfg.active = mp->active;
 
-      if (cfg.seg_count == 0 || cfg.seg_count > SR_MAX_SEGS)
+      /* relay_count = 0 是合法的（无中转跳的隧道仍带 SR 头，见 sr_path.h）。
+       * 上限用 SR_MAX_RELAYS 而不是 SR_MAX_SEGS：线格式还要留一位给终点段。 */
+      if (cfg.relay_count > SR_MAX_RELAYS)
         {
           rv = VNET_API_ERROR_INVALID_VALUE;
           goto reply;
         }
 
-      /* 拷贝段列表 */
-      for (i = 0; i < cfg.seg_count; i++)
+      /* 拷贝中转跳列表 */
+      for (i = 0; i < cfg.relay_count; i++)
         {
-          clib_memcpy_fast (cfg.segments[i].ip, mp->segments[i].ip, 4);
+          clib_memcpy_fast (cfg.relays[i].ip, mp->relays[i].ip, 4);
           /*
            * 消息里 port 两字节按网络序来，路径表按网络序存 —— 直通即可。
            * （旧写法是 host_to_net(net_to_host(x))，两次 swap 互为恒等，
            * 结果一样但读起来像在漏一次字节序转换。）
            */
-          clib_memcpy_fast (cfg.segments[i].port, &mp->segments[i].port, 2);
+          clib_memcpy_fast (cfg.relays[i].port, &mp->relays[i].port, 2);
         }
 
       /* 从密钥表查找 P-Key 并填入路径配置 */
@@ -167,22 +169,22 @@ vl_api_sr_wg_path_dump_t_handler (vl_api_sr_wg_path_dump_t *mp)
       rmp->context = mp->context;
       rmp->path_id = clib_host_to_net_u16 (cfg->path_id);
       rmp->hmac_id = clib_host_to_net_u16 (cfg->hmac_id);
-      rmp->seg_count = cfg->seg_count;
+      rmp->relay_count = cfg->relay_count;
       rmp->active = cfg->active;
 
-      for (j = 0; j < cfg->seg_count; j++)
+      for (j = 0; j < cfg->relay_count; j++)
         {
           /*
-           * 段里的 ip 与 port 在路径表中**本来就是网络序**，所以两字节原样搬进
-           * 消息即符合 VPP 的 API 约定（消息字段一律网络序）。
+           * 中转跳里的 ip 与 port 在路径表中**本来就是网络序**，所以两字节原样
+           * 搬进消息即符合 VPP 的 API 约定（消息字段一律网络序）。
            *
            * 这里原先写的是 `rmp->segments[j].port = clib_net_to_host_u16 (…)`：
            * 对已经是网络序的值又 swap 一次，x86 上以小端落进消息 —— 同一个端口在
            * path_add_del（请求，大端）和 path_details（应答，小端）里字节序不一致。
            * Go 客户端实测：装进 51820，dump 回 27850 (= 0x6CCA)。
            */
-          clib_memcpy_fast (rmp->segments[j].ip, cfg->segments[j].ip, 4);
-          clib_memcpy_fast (&rmp->segments[j].port, cfg->segments[j].port, 2);
+          clib_memcpy_fast (rmp->relays[j].ip, cfg->relays[j].ip, 4);
+          clib_memcpy_fast (&rmp->relays[j].port, cfg->relays[j].port, 2);
         }
 
       vl_api_send_msg (reg, (u8 *) rmp);
@@ -305,16 +307,12 @@ vl_api_sr_wg_tunnel_set_path_t_handler (vl_api_sr_wg_tunnel_set_path_t *mp)
 {
   vl_api_sr_wg_tunnel_set_path_reply_t *rmp;
   sr_wg_main_t *sm = &sr_wg_main;
-  ip4_address_t endpoint;
   u32 sw_if_index = clib_net_to_host_u32 (mp->sw_if_index);
   u16 path_id = clib_net_to_host_u16 (mp->path_id);
+  u16 src_port = clib_net_to_host_u16 (mp->src_port);
   int rv;
 
-  clib_memcpy_fast (&endpoint, mp->endpoint_ip, 4);
-
-  rv = sr_wg_tunnel_set_path (sm, sw_if_index, path_id,
-                              endpoint.as_u32 ? &endpoint : NULL,
-                              clib_net_to_host_u16 (mp->dst_port),
+  rv = sr_wg_tunnel_set_path (sm, sw_if_index, path_id, src_port,
                               mp->is_add ? 1 : 0);
 
   REPLY_MACRO (VL_API_SR_WG_TUNNEL_SET_PATH_REPLY);
@@ -356,14 +354,13 @@ vl_api_sr_wg_tunnel_dump_t_handler (vl_api_sr_wg_tunnel_dump_t *mp)
       rmp->context = mp->context;
       rmp->sw_if_index = clib_host_to_net_u32 (bind->sw_if_index);
       rmp->path_id = clib_host_to_net_u16 (bind->path_id);
-      rmp->dst_port = clib_host_to_net_u16 (bind->dst_port);
-      clib_memcpy_fast (rmp->endpoint_ip, &bind->endpoint, 4);
+      rmp->src_port = clib_host_to_net_u16 (bind->src_port);
       /*
-       * underlay 挂点上只有 endpoint_path 能命中 wg0 维度的绑定，且必须
-       * 至少有一个 underlay 接口启用了 sr-wg4-encap，否则流量静默旁路。
+       * 生效 = 数据面查得到这条绑定（src_port 非 0）+ 至少有一个 underlay
+       * 接口启用了 sr-wg4-encap。两者缺一个都是"隧道通着、SR 静默旁路"。
        */
       rmp->is_effective =
-        (bind->endpoint.as_u32 != 0 && sm->encap_enabled_count > 0) ? 1 : 0;
+        (bind->src_port != 0 && sm->encap_enabled_count > 0) ? 1 : 0;
 
       vl_api_send_msg (reg, (u8 *) rmp);
     }

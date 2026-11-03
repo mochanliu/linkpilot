@@ -186,9 +186,12 @@ if [ "${MTU_LIVE}" != "${EXPECT_TUNNEL_MTU}" ]; then
     info "注意：${IF1} 实际记着 ${MTU_LIVE}，与期望 ${EXPECT_TUNNEL_MTU} 不同（断言 B 会失败，其余按实际值算）"
 fi
 
-SEGS=$(vpp "${C_NODE1}" "show sr-wg paths" |
-    awk -v p="${PATH1}" '$0 ~ ("path_id=" p " ") {match($0, /seg_count=[0-9]+/); print substr($0, RSTART+10, RLENGTH-10); exit}')
-[ -n "${SEGS}" ] || die "读不到 path ${PATH1} 的 seg_count"
+# 表里只有中转跳（relay_count），实际段数 = relay_count + 1：终点段由 encap 从
+# 报文外层 dst 现取、不进表，但它那一格 MPLS 标签照样占 6 字节。
+RELAYS=$(vpp "${C_NODE1}" "show sr-wg paths" |
+    awk -v p="${PATH1}" '$0 ~ ("path_id=" p " ") {match($0, /relay_count=[0-9]+/); print substr($0, RSTART+12, RLENGTH-12); exit}')
+[ -n "${RELAYS}" ] || die "读不到 path ${PATH1} 的 relay_count"
+SEGS=$((RELAYS + 1))
 UNDERLAY_IF=$(encap_if_of "${C_NODE1}")
 [ -n "${UNDERLAY_IF}" ] || die "node1 上没查到 encap 启用的接口：e2e 的 SR 三件套没配全"
 UNDERLAY_LIVE=$(l3_of "${C_NODE1}" "${UNDERLAY_IF}")

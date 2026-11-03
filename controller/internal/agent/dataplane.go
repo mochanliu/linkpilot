@@ -28,15 +28,18 @@ import (
 //  1. **声明式，且每次读真值**。VPP 才是事实来源，本层不缓存 peer/path 状态，
 //     每个动作前先 dump 一遍。缓存换来的那点性能，代价是"agent 以为自己配过了"
 //     —— 那种故障的表现是隧道不通而日志干净。
-//  2. **下发必须成对**。真机验过：同 path_id 再 AddPath 是原地替换段列表，但隧道
-//     绑定记的 endpoint 不会跟着段走（internal/vppapi 的 live gate 锁住了这条）。
-//     所以换地址=AddPath+SetTunnel 一起做，少做一个就是"配上了但不通"。
+//  2. **路径与隧道绑定都不含对端地址**（2026-11-03 定案的 A 方案）。路径只存中转跳，
+//     终点段由 encap 在封装前从即将发出的那个包现取；绑定只认本端外层源端口。
+//     所以对端换 IP / 换映射端口只重放 WG peer 一处就够了 —— 旧写法里"绑定记的
+//     endpoint 不跟段列表走，必须 AddPath+SetTunnel 成对下发"的那条约束已经不存在，
+//     少做一半会静默发往旧地址的窗口也随之消失。
+//     顺序仍然有硬约束：SetTunnel 在路径不存在时回 NO_SUCH_ENTRY，所以先 AddPath。
 //  3. **绝不先删路径**。DelPath 一条被隧道引用的路径会级联把绑定一起清掉，而且
 //     retval=0 完全静默。所以 reconcile 用 AddPath 的原地替换，不用"删了重建"；
 //     删路径时还得先看有没有**别人**在引用它。
 //  4. **动手前先确认这张绑定表装得下**。插件的绑定表按 sw_if_index 建索引、
 //     每个接口只有一条（见 ErrSingleBind），所以并发的 reconcile 与"第二个 peer"
-//     都必须显式处理，否则会静默覆盖前一个人的外层地址。
+//     都必须显式处理，否则会静默覆盖前一个人的路径。
 //  5. **一条隧道一个监听端口，端口是集合不是标量**（定案 2）。所以建接口之后
 //     必须先把这个端口 AddPort 进 vpn 集合，再 RebindPorts —— 插件的集合里
 //     默认只有 51820，51830 那条隧道不登记就永远没人给它加 SR 头。
@@ -227,7 +230,8 @@ type LinkConfig struct {
 	// OverlayTable 里，给 BFD/探针和排障用；转发下一跳仍由控制面显式下发。
 	PeerOverlay netip.Prefix
 	// Relays 是中转链，按行走顺序：Relays[0] 是包碰到的第一台盒子，direct 隧道留空。
-	// 它们进段列表时要**倒序**追加（segments[0] 是终点，最后一段才是第一跳），
+	// 空是合法值：没有中转跳的隧道照样带 SR 头，那个头是收端把它记成 verified 观测
+	// 的唯一凭证。进路径时要**倒序**（终点段不在里面，由 encap 从报文现取），
 	// 见 ApplyPeer 里的段序注释。
 	Relays []RelayHop
 }
@@ -347,7 +351,7 @@ func NewLink(cfg LinkConfig) (*Link, error) {
 		return nil, fmt.Errorf("agent: 本机与对端的 overlay 地址相同（%s）", cfg.LocalOverlay)
 	}
 	// 中转跳：地址与端口是一体的，半个中转比没有中转更难查（路径会指向 0 端口）。
-	// 段数上限不在这里判：AddPath 会按 vppapi 的固定段数组拒绝。
+	// 跳数上限不在这里判：AddPath 会按 vppapi 的 0..7 跳（8 个段位要留一位给终点）拒绝。
 	for i, r := range cfg.Relays {
 		switch {
 		case r.IP == nil || r.Port == 0:
@@ -933,16 +937,15 @@ const (
 
 // ErrSingleBind：插件的隧道绑定表**每个 sw_if_index 只有一条**，装不下第二个 peer。
 //
-// 收包侧确实是按外层目的地址优先查的（sr_wg4_encap.c 的 sr_wg_bind_lookup：先查
-// endpoint_path，再退回 tunnel_path），可**配置侧不是**：sr_wg_tunnel_set_path
-// 先按 sw_if_index 查 tunnel_path，命中就走"更新"分支 —— 改的是同一条 bind 的
-// path_id 与 endpoint，并把它的旧 (endpoint, dst_port) 键从 endpoint_path 里
-// hash_unset 掉。所以一张 WG 接口上的第二个 peer 不是"多一条绑定"，而是把第一个
-// 人的外层地址整条删掉再换上自己的：症状是"配了 B，A 突然不通"，而且 retval=0。
+// 收包侧的查表键是本端外层源端口（sr_wg4_encap.c 的 sr_wg_bind_lookup(src_port)），
+// 可**配置侧不是**：sr_wg_tunnel_set_path 先按 sw_if_index 查 tunnel_path，命中就走
+// "更新"分支 —— 改的是同一条 bind 的 path_id 与 src_port，并把它的旧端口键从
+// src_port_path 里 hash_unset 掉。所以一张 WG 接口上的第二个 peer 不是"多一条绑定"，
+// 而是把前一个人的路径整条换掉：症状是"配了 B，A 突然不走中转"，而且 retval=0。
 //
-// 这里选择**在动手写之前**就报错，而不是写下去再靠日志猜。多 peer 要能用，得先
-// 改插件让配置侧也按 (endpoint, dst_port) 建槽 —— 收包侧已经是这个键了，配置侧
-// 仍是一接口一槽。那是数据面的活儿，不该由 agent 假装修好了。
+// 这里选择**在动手写之前**就报错，而不是写下去再靠日志猜。一条接口多 peer 要能用，
+// 得先改插件让配置侧也按源端口建槽 —— 收包侧已经是这个键了，配置侧仍是一接口一槽。
+// 那是数据面的活儿，不该由 agent 假装修好了。
 var ErrSingleBind = errors.New("agent: 这台 CPE 的隧道绑定表每个接口只有一条，装不下第二个 peer")
 
 // ApplyPeer 配好一个对端：验身份 → 选地址 → 建路径 → 绑隧道 → 装 WG peer。
@@ -979,52 +982,41 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 		return "", fmt.Errorf("agent: 节点 %d: %w", p.NodeID, err)
 	}
 
-	// 路径与隧道成对下发：绑定条目里的 endpoint 是绑定自己那份拷贝，不会跟着
-	// 路径的段列表走（真机验过），所以只 AddPath 会让包发往旧地址。
+	// 路径与隧道各下发一次，但**两者都不含对端地址**（2026-11-03 的 A 方案）：
+	// 路径只装中转跳，终点段由 encap 从即将发出的那个包现取；绑定只认本端源端口。
+	// 所以"对端换了 IP 或映射端口"这件事只动 WG peer 一处 —— 换地址不再需要
+	// AddPath+SetTunnel 成对重放，也就没有"改了一半、包发往旧地址"的窗口。
 	//
-	// 段序：segments[0] 是**终点**（对端的外层 ip:port），最后一段是第一个跳。
-	// 中转链就是按行走顺序**倒着**挂到末尾：Relays[0]（第一跳）落在最后一段，
-	// 和实验室手敲的
-	// `sr-wg path add P via PEER:port via H2:tport via H1:tport` 逐字对应。
-	segments := []vppapi.Segment{{IP: ep.IP, Port: ep.Port}}
+	// 段序：segments[0] 是终点（encap 现填），Relays 倒序跟在后面，
+	// Relays[0]（第一跳）落在最后一段，和实验室手敲的
+	// `sr-wg path add P no-relay` / `... via H2:tport via H1:tport` 逐字对应。
+	relays := make([]vppapi.Segment, 0, len(l.cfg.Relays))
 	for i := len(l.cfg.Relays) - 1; i >= 0; i-- {
-		segments = append(segments, vppapi.Segment{
+		relays = append(relays, vppapi.Segment{
 			IP: l.cfg.Relays[i].IP, Port: l.cfg.Relays[i].Port,
 		})
 	}
 	if err := l.dp.AddPath(ctx, vppapi.PathParams{
-		PathID:   pathID,
-		HmacID:   l.hmacID,
-		Active:   true,
-		Segments: segments,
+		PathID: pathID,
+		HmacID: l.hmacID,
+		Active: true,
+		Relays: relays,
 	}); err != nil {
-		return "", fmt.Errorf("agent: 节点 %d 的路径（path_id=%d → %s）: %w", p.NodeID, pathID, ep, err)
+		return "", fmt.Errorf("agent: 节点 %d 的路径（path_id=%d，%d 跳中转）: %w",
+			p.NodeID, pathID, len(relays), err)
 	}
 	if err := l.dp.SetTunnel(ctx, vppapi.TunnelBinding{
-		SWIfIndex:  l.swIfIndex,
-		PathID:     pathID,
-		EndpointIP: ep.IP,
-		// 绑定身份是 (外层 dst IP, 封装前的 dst 端口)，而 encap 节点看到的是**发出去
-		// 那一包**的目的端口，也就是下面 WG peer 填的那个端口 —— 对端的隧道端口，
-		// 不是本机监听端口（vpp-plugin/sr_wg4_encap.c 的 Step 4：拿 udp->dst_port
-		// 查 sr_wg_bind_key(endpoint, dst_port)）。同一对 CPE 开第二条隧道时两条流
-		// 的目的 IP 相同，只有端口能分清"这一包属于哪条隧道"；填本机端口在两端
-		// 端口相同时只是碰巧对，端口不同就永远键不中 —— 静默的 encap_bypass。
-		//
-		// 0 在这个键里是通配（该 IP 上所有隧道共用这条路径），对端端口读不出来时
-		// chooseEndpoint/parseAddr 已经先报错，不会走到这里写进 0。
-		DstPort: ep.Port,
+		SWIfIndex: l.swIfIndex,
+		PathID:    pathID,
+		// 隧道身份 = **本端**这条隧道的外层 UDP 源端口。实测 VPP 的 WG 发包
+		// 源端口 = 接口监听端口，所以它就是 Open 时传给 VPP 的那个 ListenPort
+		// （vpp-plugin/sr_wg4_encap.c 的 Step 4：拿 udp->src_port 查绑定表）。
+		// 对端端口不参与选路 —— 它只决定终点段的值，而终点段取自报文。
+		// 两端可以各用各的监听端口，这里也就不用关心对端用了哪个。
+		SrcPort: l.cfg.ListenPort,
 	}); err != nil {
-		// -116：同一个 (外层 IP, 对端端口) 已经被另一张接口占了。两张接口抢一个
-		// 身份意味着"这个包到底走哪条路径"要看谁后写，插件选择直接拒绝，所以这里
-		// 不能重试，只能由人看出是哪一张（show sr-wg tunnels 全表可查）。
-		if hasRetval(err, -116) {
-			return "", fmt.Errorf("agent: 节点 %d：到 %s 的端口 %d 这个隧道身份已被别的接口占着：%w；"+
-				"本接口 %d 不能再抢，请用 show sr-wg tunnels 查出占着它的是哪一条",
-				p.NodeID, ep.IP, ep.Port, err, l.swIfIndex)
-		}
-		return "", fmt.Errorf("agent: 节点 %d 的隧道绑定（interface %d → path %d, 端口 %d）: %w",
-			p.NodeID, l.swIfIndex, pathID, ep.Port, err)
+		return "", fmt.Errorf("agent: 节点 %d 的隧道绑定（interface %d → path %d, 本端口 %d）: %w",
+			p.NodeID, l.swIfIndex, pathID, l.cfg.ListenPort, err)
 	}
 
 	want := vppapi.PeerParams{
@@ -1033,8 +1025,9 @@ func (l *Link) ApplyPeer(ctx context.Context, p PeerTarget) (PeerChange, error) 
 		// 这是**发出去那一包**的外层 dst 端口，所以只能是"对端的隧道端口"（ep 来自
 		// 控制器给出的对端地址，端口就是它的监听端口/操作者显式写的端口），不能
 		// 填本机监听端口：两端端口不同时后者把包发到对端没人在听的地方，握手都完不成。
-		// 它同时是隧道绑定键的另一半（见上面的 SetTunnel），两处必须是同一个值 ——
-		// encap 节点就是拿这一包的 dst 端口去查绑定的。
+		// 它同时就是 SR 头里终点段的值 —— encap 封装前从这一包的
+		// (dst IP, dst 端口) 现取（vpp-plugin/sr_wg4_encap.c Step 2 之后），
+		// 所以这一处改了，路径与绑定都不需要跟着改。
 		Port:       ep.Port,
 		Keepalive:  l.keepalive,
 		SWIfIndex:  l.swIfIndex,
@@ -1148,10 +1141,10 @@ func findPeer(peers []vppapi.WgPeer, swIfIndex uint32, pub []byte) *vppapi.WgPee
 
 // checkSingleBind 确认本机接口上那条绑定要么没有、要么已经是这个人的。
 //
-// 只比 path_id：插件的绑定身份 (外层 endpoint, 对端端口) 只是**收包侧**的查表键，
+// 只比 path_id：插件的绑定身份是本端外层源端口，那只是**收包侧**的查表键，
 // 配置侧是每接口一槽，谁占着这槽要看 path_id —— 它由 node_id 唯一决定（PathID）。
-// 所以"等于本次的 path_id"就是"这条绑定本来就属于他"，更新（包括改端口）是安全的；
-// 不等就是别人的，写下去会把他的外层地址整条换掉。
+// 所以"等于本次的 path_id"就是"这条绑定本来就属于他"，更新（包括改本端端口）是安全的；
+// 不等就是别人的，写下去会把他的路径整条换掉。
 func (l *Link) checkSingleBind(ctx context.Context, nodeID, pathID uint16) error {
 	binds, err := l.dp.Tunnels(ctx, l.swIfIndex)
 	if err != nil {
@@ -1162,8 +1155,8 @@ func (l *Link) checkSingleBind(ctx context.Context, nodeID, pathID uint16) error
 			continue
 		}
 		return fmt.Errorf("%w：接口 %d 当前绑的是 path_id=%d（本次要给节点 %d 用 path_id=%d）。"+
-			"插件的绑定表配置侧按 sw_if_index 一槽，后写的人会覆盖前一个人的外层地址；"+
-			"要么先把那条绑定清掉，要么等配置侧也改成按 (endpoint, 端口) 建槽",
+			"插件的绑定表配置侧按 sw_if_index 一槽，后写的人会覆盖前一个人的路径；"+
+			"要么先把那条绑定清掉，要么等配置侧也改成按本端源端口建槽",
 			ErrSingleBind, l.swIfIndex, b.PathID, nodeID, pathID)
 	}
 	return nil

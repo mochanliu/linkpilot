@@ -6,12 +6,13 @@
 # "第二条静默旁路"这种最难查的故障：
 #   (1) 隧道自己的 vpn 端口要进插件的 vpn 端口集合，否则没人给它加 SR 头；
 #   (2) 中转侧要有它自己的 transit 端口，否则中转不认它；
-#   (3) 绑定键要带 dst-port，否则两条隧道的 (endpoint) 撞在同一个身份上。
+#   (3) 每条隧道的绑定要带**自己的本端监听端口**（src-port），否则数据面查不到
+#       它 —— src_port=0 不是通配，是"永不命中"。
 #
 # 隧道 2 故意用**两端不同**的监听端口（node1 51830 / node2 51840）：
-# 发往对端的 WG 包目的端口是**对端**的监听端口，encap 若拿它去查本机 vpn 集合，
-# 就会在这里静默旁路（ping 仍通、Decap bypass 上涨）。这条断言钉住
-# "encap 的隧道身份只看绑定 (endpoint, dst_port)，与两端端口是否相同无关"。
+# 发往对端的 WG 包目的端口是**对端**的监听端口。encap 若拿目的端口去查本机 vpn
+# 集合，就会在这里静默旁路（ping 仍通、Decap bypass 上涨）。这条断言钉住
+# "encap 的隧道身份只看**本端外层源端口**，与两端端口是否相同无关"。
 #
 # 前置：**必须先跑过 test-e2e.sh --keep**（单隧道 wg0@51820 已通、三个容器在跑、
 # 插件是最新的）。本脚本只往上加第二条隧道，跑完自己拆干净，把环境还原成
@@ -26,13 +27,14 @@
 #
 # 覆盖的断言：
 #   A  隧道 1 本来就通（环境前置）
-#   B  隧道 1 的绑定从"端口通配"收紧成显式 51820
+#   B  隧道 1 的绑定带上自己的本端源端口 ${VPN_PORT}（state=usable，不再是 src_port=0）
 #   C  两个 vpn 端口 + 两个 transit 端口都在插件集合里（show sr-wg ports）
-#   D  两条绑定在同一 endpoint 上共存，各自一个 dst-port，都不再是通配
+#   D  两条绑定共存，各自一个 src-port；路径表里只有中转跳，终点不在表里
 #   E  两条隧道各自都通
 #   F  每条隧道真的带着自己的 SR 头：收包侧 Decap ok/bypass + 外层端口对 + 中转端口
 #   G  抽掉隧道 2 的 transit 端口：只有隧道 2 断，隧道 1 不受影响；加回来即恢复
-#   H  抢同一个隧道身份 (endpoint, dst-port) 必须被拒，且现有绑定不受损
+#   H  同一个 src-port 被两条绑定登记：插件**接受、不去重**；配置面读不出命中归属，
+#      拆掉冲突之后还得把受影响那条的键重下一遍
 #   I  清理后环境回到交给我之前的样子（1 条绑定、vpn 只有 51820、无 wg1、隧道 1 仍通）
 set -u
 
@@ -174,9 +176,10 @@ teardown() {   # $1=force 时无视 --keep（用来收拾上一轮的残留）
     vpp "${C_TRANSIT}" "set sr-wg port del transit ${TRANSIT2_PORT}" >/dev/null 2>&1
     vpp "${C_NODE1}" "wireguard delete ${IF2}"            >/dev/null 2>&1
     vpp "${C_NODE2}" "wireguard delete ${IF2}"            >/dev/null 2>&1
-    # 隧道 1 恢复成 e2e 留下的样子（通配绑定），下一个跑 e2e 的人看到同样的表
+    # 隧道 1 恢复成 e2e 交出来的样子：绑定带本端源端口。排在拆 ${IF2} 之后是有意的
+    # —— 上面若发生过 H 的同端口撞车，这一步会把 wg0 的键重新写回表里。
     [ -n "${TUN1_SWIDX:-}" ] &&
-        vpp "${C_NODE1}" "set sr-wg tunnel ${TUN1_SWIDX} path ${PATH1} endpoint ${N2_UNDERLAY}" >/dev/null 2>&1
+        vpp "${C_NODE1}" "set sr-wg tunnel ${TUN1_SWIDX} path ${PATH1} src-port ${VPN_PORT}" >/dev/null 2>&1
     for c in ${ALL_CONTAINERS}; do vpp "${c}" "set sr-wg rebind-ports" >/dev/null 2>&1; done
 }
 
@@ -209,19 +212,22 @@ ping_ok "${C_NODE1}" "${OVERLAY_N2}" wg0 &&
     die "隧道 1 不通 —— 本脚本的前提不成立，请先跑通 e2e 再来"
 
 # ==================================================================
-info "ASSERT B: 隧道 1 的绑定从『端口通配』收紧成显式 ${VPN_PORT}"
+info "ASSERT B: 隧道 1 的绑定带本端源端口 ${VPN_PORT}，原地重写幂等"
 # ==================================================================
-# 通配键 (endpoint,0) 命中"这个 IP 上不分行数全走本路径"，第二条隧道来了就
-# 会被它一起拽走（精确键优先级更高，所以隧道 2 不受影响，但表里留个通配项迟早
-# 踩坑）。这里显式收紧，顺便验证"原地改端口"不会留下指向老键的僵尸项。
-vpp "${C_NODE1}" "set sr-wg tunnel ${TUN1_SWIDX} path ${PATH1} endpoint ${N2_UNDERLAY} dst-port ${VPN_PORT}" |
+# e2e 交出来的现状就该是这样：cmd_peer 把 wg0 的监听端口当成这条隧道的身份写进
+# 绑定表（src_port=${VPN_PORT}、state=usable）。这里原样重写一遍，验两件事：
+#   (1) 幂等 —— 同接口同端口不会在表里多出一条僵尸绑定；
+#   (2) 不掉键 —— old_port == src_port 时插件不走 hash_unset 那条分支。
+# 命中归属不在这里判（配置面读不出来），由 ASSERT F 的 Decap bypass=0 收口。
+vpp "${C_NODE1}" "set sr-wg tunnel ${TUN1_SWIDX} path ${PATH1} src-port ${VPN_PORT}" |
     sed 's/^/    /'
 TUNNELS=$(vpp "${C_NODE1}" "show sr-wg tunnels")
-echo "${TUNNELS}" | grep -q "endpoint=${N2_UNDERLAY}:${VPN_PORT}" &&
-    ok "隧道 1 绑定已带显式端口 ${VPN_PORT}" ||
-    bad "隧道 1 绑定没带端口：$(bind_lines "${C_NODE1}" | grep "sw_if_index=${TUN1_SWIDX}")"
-echo "${TUNNELS}" | grep -q "端口通配" &&
-    bad "表里仍有端口通配的绑定" || ok "已无端口通配绑定"
+bind_lines "${C_NODE1}" | grep "sw_if_index=${TUN1_SWIDX}" | grep -q "src_port=${VPN_PORT} usable" &&
+    ok "隧道 1 绑定带本端源端口 ${VPN_PORT} 且 usable" ||
+    bad "隧道 1 绑定不对：$(bind_lines "${C_NODE1}" | grep "sw_if_index=${TUN1_SWIDX}")"
+[ "$(bind_lines "${C_NODE1}" | grep -c "src_port=${VPN_PORT} ")" = "1" ] &&
+    ok "原地重写没留下第二条同 src_port 的绑定" ||
+    bad "重写后表里同端口不止一条：$(bind_lines "${C_NODE1}")"
 
 # ==================================================================
 info "ASSERT C: 端口注册（node1 vpn ${VPN2_PORT} / node2 vpn ${VPN3_PORT}、transit ${TRANSIT2_PORT}）"
@@ -270,17 +276,26 @@ echo "${TUNNELS}" | sed 's/^/    /'
 NBIND=$(bind_lines "${C_NODE1}" | wc -l | tr -d ' ')
 [ "${NBIND}" = "2" ] && ok "同一对 CPE 上两条绑定共存" ||
     bad "绑定数=${NBIND}，期望 2"
-echo "${TUNNELS}" | grep -q "endpoint=${N2_UNDERLAY}:${VPN_PORT}"   &&
-    echo "${TUNNELS}" | grep -q "endpoint=${N2_UNDERLAY}:${VPN3_PORT}" &&
-    ok "两条绑定各占一个显式 dst-port（${VPN_PORT} / ${VPN3_PORT}）" ||
-    bad "绑定表里没看到两个不同的 dst-port"
-echo "${TUNNELS}" | grep -q "端口通配" && bad "表里又出现端口通配" || ok "无通配绑定"
+# 两条隧道的身份就是两个**本端**监听端口（51820 / 51830）；对端端口 ${VPN3_PORT}
+# 不参与选路，它只在 WG peer 的 dst-port 和封装出来的终点段里。
+bind_lines "${C_NODE1}" | grep "sw_if_index=${TUN1_SWIDX}" | grep -q "src_port=${VPN_PORT} usable" &&
+    bind_lines "${C_NODE1}" | grep "sw_if_index=$(swidx_of "${C_NODE1}" ${IF2})" |
+        grep -q "src_port=${VPN2_PORT} usable" &&
+    ok "两条绑定各占一个本端源端口（${VPN_PORT} / ${VPN2_PORT}）" ||
+    bad "绑定表里没看到两个不同的 src_port：$(bind_lines "${C_NODE1}" | tr '\n' ' ')"
+echo "${TUNNELS}" | grep -q "NO SRC PORT" &&
+    bad "表里有 src_port=0 的绑定（永不命中，等于没配）" || ok "无未生效绑定"
 PATHS=$(vpp "${C_NODE1}" "show sr-wg paths")
 echo "${PATHS}" | grep -qE "path_id=${PATH2} " &&
     ok "path ${PATH2} 已下发" || bad "path ${PATH2} 没下发：$(echo "${PATHS}" | grep path_id)"
-echo "${PATHS}" | grep -q "seg\[1\]: ${TRANSIT_A}:${TRANSIT2_PORT}" &&
-    ok "path ${PATH2} 的第一跳是隧道 2 自己的中转端口 ${TRANSIT2_PORT}" ||
-    bad "path ${PATH2} 的段列表不对：$(echo "${PATHS}" | sed -n '/path_id=2/,+3p' | tr '\n' ' ')"
+echo "${PATHS}" | grep -q "relay\[0\] (第一跳): ${TRANSIT_A}:${TRANSIT2_PORT}" &&
+    ok "path ${PATH2} 的中转跳是它自己的 ${TRANSIT_A}:${TRANSIT2_PORT}" ||
+    bad "path ${PATH2} 的中转跳不对：$(echo "${PATHS}" | sed -n '/path_id=2/,+2p' | tr '\n' ' ')"
+# A 方案的核心：路径表里**没有**终点。终点段是 encap 从报文外层 dst 现取的，
+# 写进表就成了一个会漂移、还参与 HMAC 的副本（对端换端口/换 IP 都不用重下路径）。
+echo "${PATHS}" | grep -q "${N2_UNDERLAY}" &&
+    bad "路径表里出现了对端 underlay 地址 ${N2_UNDERLAY}：终点段又存回表里了" ||
+    ok "路径表里只有中转跳，不含对端地址（终点由报文自己提供）"
 
 # ==================================================================
 info "ASSERT E: 两条隧道各自都通"
@@ -301,7 +316,7 @@ info "ASSERT F: 每条隧道真的带着自己的 SR 头，且外层端口对是
 #     Decap bypass 保持 0 → 证明"没有任何包是裸 WG 直发过来的"。
 #   - 剥头前的外层 UDP 端口对就是隧道身份：隧道 1 是 51820->51820，隧道 2 是
 #     51830->51840（两端不同端口）。**收端 Decap ok 增长** 才证明发送侧的 encap
-#     没有因为"目的端口不在本机 vpn 集合里"而静默旁路。
+#     没有因为"本端源端口查不到绑定"而静默旁路（源端口是选路唯一的键）。
 stat_of() {   # <container> <Section>_<name> -> 计数
     setup_node "$(role_of "$1")" -- stats 2>/dev/null |
         awk -F= -v k="$2" '$1==k {print $2; f=1} END{if(!f) print 0}'
@@ -361,22 +376,45 @@ ping_ok "${C_NODE1}" "${OVERLAY2_N2}" ${IF2} &&
     ok "端口加回来，隧道 2 恢复" || bad "端口加回来后隧道 2 没恢复"
 
 # ==================================================================
-info "ASSERT H: 抢同一个隧道身份 (endpoint, dst-port) 必须被拒"
+info "ASSERT H: 两条绑定登记同一个 src-port：插件接受、不去重"
 # ==================================================================
-# 这是"两条隧道同端口"最真实的误配：让 ${IF2} 去绑隧道 1 的身份。真抢成功的话
-# 隧道 1 的下一跳会被换成隧道 2 的路径，而**没有任何报错**（前一条只是悄悄旁路），
-# 所以数据面必须把这种覆盖挡下来。
+# 定案是**这一层不做重复端口防护**：本数据面是点对点隧道，同端口撞车只有"手工
+# 误配"一种来源，代价由运维承担（后写的赢）。所以这里不期望被拒，期望三件可观测
+# 的事：
+#   (1) 命令成功，配置面出现两条同 src_port 的绑定 —— 键只有一个、表里有两条，
+#       **命中归属从配置面读不出来**。本组断言不声称实测到"生效的是哪一条"。
+#   (2) 把 ${IF2} 换回自己的端口时，插件按"换身份就摘旧键"的规则 hash_unset 了
+#       ${VPN_PORT} —— 那把键原本记在 wg0 的绑定上，此刻表里没了：隧道 1 的包
+#       从此裸发（ping 照通、收端 Decap bypass 上涨、源路由静默消失）。这是不
+#       去重的真实代价，要量出来，不能假设它不存在。
+#   (3) 原样重下受影响那条的绑定即可恢复（old == new 不走摘键分支）。
 SW2=$(swidx_of "${C_NODE1}" ${IF2})
-STEAL=$(vpp "${C_NODE1}" "set sr-wg tunnel ${SW2} path ${PATH1} endpoint ${N2_UNDERLAY} dst-port ${VPN_PORT}")
+STEAL=$(vpp "${C_NODE1}" "set sr-wg tunnel ${SW2} path ${PATH1} src-port ${VPN_PORT}")
 echo "    ${STEAL}"
-echo "${STEAL}" | grep -q "已经被另一条隧道的绑定占着" &&
-    ok "抢身份被拒绝，且把原因和排查命令说清楚了" ||
-    bad "抢身份没被拒（这是回归）：${STEAL}"
-TUNNELS=$(vpp "${C_NODE1}" "show sr-wg tunnels")
-bind_lines "${C_NODE1}" | grep "sw_if_index=${SW2}" | grep -q "path_id=${PATH2}" &&
-    ok "被拒之后 ${IF2} 的绑定没被动过（仍是 path_id=${PATH2}）" ||
-    bad "${IF2} 的绑定被改写了：$(bind_lines "${C_NODE1}" | grep "sw_if_index=${SW2}")"
-ping_ok "${C_NODE1}" "${OVERLAY_N2}" wg0 && ok "拒绝之后隧道 1 仍通" || bad "拒绝之后隧道 1 不通了"
+echo "${STEAL}" | grep -q "bound to path_id=${PATH1} src_port=${VPN_PORT}" &&
+    ok "重复 src-port 被接受（不去重）" || bad "重复 src-port 被拒了（与定案不符）：${STEAL}"
+[ "$(bind_lines "${C_NODE1}" | grep -c "src_port=${VPN_PORT} ")" = "2" ] &&
+    ok "配置面确有两条同 src_port 的绑定（不判命中归属）" ||
+    bad "没看到两条同端口绑定：$(bind_lines "${C_NODE1}" | tr '\n' ' ')"
+
+vpp "${C_NODE1}" "set sr-wg tunnel ${SW2} path ${PATH2} src-port ${VPN2_PORT}" | sed 's/^/    /'
+setup_node node2 -- clear-stats >/dev/null 2>&1
+dx "${C_NODE1}" "vppctl ping ${OVERLAY_N2} source wg0 repeat 6 >/dev/null 2>&1"
+by=$(stat_of "${C_NODE2}" Decap_bypass)
+[ "${by}" != "0" ] &&
+    ok "实测到代价：wg0 的键被摘走，${by} 个包裸发（ping 仍通但源路由没了）" ||
+    bad "预期 wg0 的键被摘走、Decap bypass 上涨，实测 0 —— 与 sr_wg_tunnel_set_path 的摘键规则不符"
+
+vpp "${C_NODE1}" "set sr-wg tunnel ${TUN1_SWIDX} path ${PATH1} src-port ${VPN_PORT}" | sed 's/^/    /'
+setup_node node2 -- clear-stats >/dev/null 2>&1
+dx "${C_NODE1}" "vppctl ping ${OVERLAY_N2} source wg0 repeat 6 >/dev/null 2>&1"
+ok_n=$(stat_of "${C_NODE2}" Decap_ok)
+by=$(stat_of "${C_NODE2}" Decap_bypass)
+[ "${ok_n}" -ge 4 ] && [ "${by}" = "0" ] &&
+    ok "重下之后隧道 1 又全程带 SR 头（Decap ok=${ok_n} bypass=0）" ||
+    bad "重下之后隧道 1 没恢复（Decap ok=${ok_n} bypass=${by}）"
+ping_ok "${C_NODE1}" "${OVERLAY2_N2}" ${IF2} &&
+    ok "恢复之后隧道 2 仍通" || bad "恢复之后隧道 2 不通了"
 
 # ==================================================================
 info "ASSERT I: 清理后环境回到交给我之前的样子"
