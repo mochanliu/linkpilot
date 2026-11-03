@@ -138,6 +138,10 @@
   `vppapi.Peers()` 读回，[messages.go:432-475](../controller/internal/vppapi/messages.go)）
   作为"事实"单列展示，标"设备学到"，不冒充控制器观测。
 - 设备没上报的字段仍显示"未上报"，不填 0（AGENTS §2）。
+- **`given_up` 是一条保存下来的隧道，不是一次失败记录**（P-6）：它出现在隧道列表里、
+  可以选中、可以编辑，编辑面板里对端的地址与端口两个框**放开手工填写**（阶梯期间这两个框
+  由控制器按观测填，人改过之后阶梯不再自动改它 —— 一旦人填过就退化成 §5 上面那条"手工的
+  地址是意图"）。页面上把"没通"写成一个状态，不写成错误弹窗，也不因为没通就不保存。
 
 ## 6. 编排回路（控制器要新增的机制）
 
@@ -154,25 +158,24 @@
 (b) 同一条隧道上另一端看到的现象与时长。测量方式：干净重建 lab、打流窗口
 （注意打流窗口在管道子 shell 里会假绿 0ms 这条已知坑）。
 
-## 7. 待拍（每条都是"选了会怎样"，不是术语）
+## 7. 拍板结果（2026-11-03 用户定，本节不再是待拍）
 
-- **P-1 判据**：阶梯每步"通了没"用什么判。
-  甲：只看 BFD up（300ms 级检测，`Up` 字段现成）。
-  乙：BFD up 且探针窗口有回包（多一个"能双向"的证据，但要多等一个窗口）。
-  硬前置：`TunnelMetrics` 现在只有 `PeerNodeID` 没有 `TunnelID`
-  （[wire.go:919-924](../controller/internal/wire/wire.go)），同一对设备开第二条隧道时
-  归属会撞车 ⇒ 必须给 metrics 行加 `TunnelID`（agent 侧 `spec.TunnelID` 现成）。我建议 P-1 选甲 + 加 TunnelID。
-- **P-2 每步等多久算失败**（绝对时间，因为这是"下发往返 + WG 握手 + BFD 起来"三件事之和，
-  不是数据面一个数决定的）：甲 10s（整条阶梯最多 40s，失败得快但可能误判慢链路）／
-  乙 30s（最坏 2 分钟一条，我建议）／丙 60s（最坏 4 分钟，跨大洲链路稳）。
-  期间不阻塞其他隧道，也不许阻塞心跳与遥测。
-- **P-3 手工隧道跑不跑阶梯**：甲 只跑第 1 步，失败就如实报错，不自动把人手填的地址降级成
-  "只监听"（我建议：人显式配的地址是意图，控制器不擅自改掉它）；乙 手工也跑完整阶梯。
-- **P-4 字段命名**：`PeerEndpointOmitted`（Go）/ 页面上的勾选文案
-  "本端不拨对端，只监听（等对方打进来）"。要不要换名字/文案，听你的。
-- **P-5 SR**：~~甲／乙~~ **已拍乙并已落地**（见 §4 末尾）。剩下的待拍是 P-1…P-4、P-6。
-- **P-6 放弃之后**：甲 库里保留隧道、状态 `given_up` 并列出每步失败原因（我建议，
-  删掉就是看不见的地洞）；乙 直接删。
+- **P-1 判据：甲 + 加 `TunnelID`。** 阶梯每步只看 BFD `Up` 算通（300ms 级）；
+  同时 `TunnelMetrics` 行必须带 `TunnelID`，理由见 §9 的 M-4：它不是阶梯的可选项，
+  而是"同对端第二条隧道进来后，遥测行还能不能说清是哪条"的硬前置。
+- **P-2 每步超时：甲，10 秒。** 整条阶梯最多 40s。慢链路误判的代价由"第 4 步放弃后
+  仍可手工改地址重试"承担（§5、P-6），不靠拉长超时换。
+- **P-3 手工隧道：完全不跑阶梯。** 人手填的地址就是意图，控制器不擅自降级成"只监听"，
+  一次失败就如实报错，保持现状。阶梯只服务于控制器自己按观测建出来的隧道。
+- **P-4 命名：不改。** Go 侧 `PeerEndpointOmitted`，页面勾选文案
+  "本端不拨对端，只监听（等对方打进来）"。
+- **P-5 SR**：~~甲／乙~~ **已拍乙并已落地**（见 §4 末尾）。
+- **P-6 放弃之后：保存隧道。** 库里保留这条隧道，状态 `given_up`，语义 =
+  "手动配了一个配置没通"，列出每步失败原因与时间；**并允许手工编辑地址和端口号**
+  （形状见 §5）。不静默删——删掉就是看不见的地洞。
+
+阶梯的实现排在 §9 的 M-4 之后（判据要用 `TunnelID`）；M-1/M-2/M-3 是同对端多条隧道
+自身的缺陷（D-3），阶梯不会顺带解决它们。
 
 ## 8. 这一版明确不做
 
@@ -180,3 +183,107 @@
 - 不做中转兜底、不做颜色、不做非公网线路（mpls/专线）。
 - 不动 `plan.go:119-137` 里"观测过期不建"的闸门（阶梯的前提是有公网地址可拨）。
 - 不动 lab：本方案落地前不跑任何 lab/harness 矩阵。
+
+## 9. D-3：两台 CPE 之间多条隧道，代码里还不支持的地方（2026-11-03 全量审计）
+
+背景是产品要求（每台盒子目标 3000 条隧道、软件层 4096；8 个颜色 ⇒ 同对端最多 8 条）。
+下面每一条都我自己读到过那一行，不是转述。**修它们一律用新搭的一次性私有环境**（用户
+2026-11-03 规则：修缺陷期间不许动现有 lab），改完再由我按最新代码重搭 lab。
+
+### 9.1 硬错：第二条根本建不出来
+
+1. **控制器上游门禁**：[internal/underlay/tunnel.go:100-103](../controller/internal/underlay/tunnel.go)
+   在 `create()` 最前面按**无序设备对**查 `pairTunnel`（[:313-326](../controller/internal/underlay/tunnel.go)），
+   命中就回 `ErrPairTaken`（[state.go:20-24](../controller/internal/underlay/state.go)，API 层转 409）。
+   判据里没有颜色。错误文案自己把原因说清了：「每台设备只有一把 WireGuard 静态密钥，
+   VPP 的 peer 表按公钥跨接口去重，第二条会被数据面以 -116 拒掉」。
+2. **根因：一条设备一把 WG keypair**。私钥只有一把
+   （[internal/agent/identity.go:177-192](../controller/internal/agent/identity.go)），
+   对账时 `priv := t.id.WGPrivateKey()` 一次取出、传给**每一条** Link
+   （[internal/agent/tunnel.go:422](../controller/internal/agent/tunnel.go) → `PrivateKey: priv` :612）。
+   于是同一对端的第二条隧道要装**同一把对端公钥**，撞上 VPP 跨接口去重：
+   [internal/agent/dataplane.go:1094-1112](../controller/internal/agent/dataplane.go) 那段 -116 分支
+   就是这个（注释写"真机实测"）。
+   ⇒ 这条不是"放宽判据"能绕开的。要做的是**每隧道一把 keypair**，牵连三处：
+   设备身份要持有多把（identity 现在只存一把）、
+   密钥担保的主语要扩（[internal/keybinding/binding.go:115-195](../controller/internal/keybinding/binding.go)
+   的 `Message/Verify` 只签 `(tenant, node_id, key_gen, x25519_pub)`，没有隧道维度）、
+   控制器存的 `prec.Binding` 是按设备存的（[cmd/sr-ctrl/underlay_delivery.go:113-117](../controller/cmd/sr-ctrl/underlay_delivery.go)）。
+3. **批量与扇出按设备对折叠**：`plan.go` 的自动批：[:105-108](../controller/internal/underlay/plan.go)
+   命中 `HasPair` 就 `Skip{"这对设备之间已经有隧道，跳过"}`，`HasPair`
+   同样只比设备对（[:311-321](../controller/internal/underlay/plan.go)）；
+   `Fan` 一批一个颜色、每个对端一条（[:41-96](../controller/internal/underlay/fan.go)，
+   单条 create 被拒就变成一条 `FanSkip`）。
+   症状比硬错更难查：full-mesh / hub-spoke 永远补不出第 2..8 色，拓扑上留下没人解释的洞。
+
+### 9.2 静默覆盖：会改到在线转发行为，且 retval 全 0
+
+4. **path_id 没有隧道身份**：[cmd/sr-ctrl/underlay_delivery.go:131](../controller/cmd/sr-ctrl/underlay_delivery.go)
+   恒发 `PathIDBase: wire.UnderlayPathIDBase`（常量 1000，
+   [internal/wire/wire.go:470-474](../controller/internal/wire/wire.go) 的注释自己写着
+   "one device pair carries one tunnel"），设备侧 `PathID(nodeID) = base + PeerNodeID`
+   （[internal/agent/dataplane.go:1433-1438](../controller/internal/agent/dataplane.go)）。
+   两条到同一个人的隧道 ⇒ **同一个 path_id** ⇒ 后写的把前一条的段列表整条换掉，
+   接口各自绑着同一个 path，两边都"配置成功"。
+   这个要求代码里已经写明了却没实现：
+   [dataplane.go:212-215](../controller/internal/agent/dataplane.go) 的注释就是
+   「同一台 CPE 上的**每条隧道都要一个自己的 base**……症状是『第一条隧道忽然不中转了』」。
+   附带要改的自我陈述：[dataplane.go:1142-1146](../controller/internal/agent/dataplane.go)
+   的 `checkSingleBind` 注释写"path_id 由 node_id 唯一决定"——它描述的是今天这个错的事实，
+   不是设计。
+   注：D-2 之后**收包侧不受这条影响**（decap 按本端外层源端口查路，端口每隧道唯一，
+   见 [vpp-plugin/sr_wg4_input.c:228-242](../vpp-plugin/sr_wg4_input.c) 里 wg4-input 按 UDP 目的端口
+   定位本端接口）；坏的是发侧 接口→path_id→段列表。
+
+### 9.3 归属说不出：污染操作员所见
+
+5. **遥测行没有隧道身份（= P-1）**：[internal/wire/wire.go:916-919](../controller/internal/wire/wire.go)
+   `TunnelMetrics` 只有 `SwIfIndex` + `PeerNodeID` + `PeerIP`；控制器落库按 `sw_if_index`
+   去重（[cmd/sr-ctrl/telemetry.go:69-83](../controller/cmd/sr-ctrl/telemetry.go)）；
+   控制台显示 `peer_ip` + `sw_if_index`（[console.html:1268-1271](../controller/cmd/sr-ctrl/console.html)）。
+   ⇒ 同对端 8 条并排时说不出是哪条隧道/哪个颜色，且 VPP 重启后 index 漂移会让历史串台。
+6. **`ReachReport` 同样只有 `PeerNodeID`**（[internal/wire/wire.go:756-760](../controller/internal/wire/wire.go)）。
+   它现在没有调用者（#183 那一类"接了没人调"的同一形状）⇒ 加 `TunnelID` 或直接删，别留半个字段。
+
+### 9.4 我核过之后**不是**缺陷的（子代理报过、我逐行自证后剔除）
+
+7. **遥测/BFD 的键**：[internal/agent/telemetry.go:251-264](../controller/internal/agent/telemetry.go)
+   的 `byPeer`/`swIfOfPeer` 只按对端 IP，`hasBFDSession`(:379-392) 按 (local, peer)，
+   [internal/fib/reach.go:20-46](../controller/internal/fib/reach.go) 的 `down` 只按对端地址。
+   今天不会塌，因为 **overlay /32 是全局唯一发的**：`allocOverlay` 每个隧道端取一个新地址
+   （[internal/underlay/state.go:410-440](../controller/internal/underlay/state.go)，
+   一次 create 里 A/B 两端各取一个并互相 reserved，:149-160），
+   所以"对端 /32"本身就是隧道身份。**风险是隐式的**：哪天允许两条隧道复用同一个对端 /32，
+   这三处同时塌。收紧成 (local, peer) 顺手就能和 M-4 一起做。
+8. **路由面已经支持并行隧道**：`route.Tunnel{Peer, NextHop}` 无 tunnel_id
+   （[internal/route/proto.go:135-138](../controller/internal/route/proto.go)），
+   但规范序是 (peer, next_hop) **严格升序**（:183-189），两条隧道 /32 不同 ⇒ 合法共存；
+   第 4 段渲染遍历 `SortedTunnels()` 全量、每隧道一行
+   （[cmd/sr-ctrl/overlay.go:728-752](../controller/cmd/sr-ctrl/overlay.go)）；
+   `reachableLocked` 是"到源设备有没有隧道"的粗闸门
+   （[internal/route/client.go:981-983](../controller/internal/route/client.go)），
+   逐隧道摘除发生在 FIB 侧的 `down[nh]`（[internal/fib/fib.go:303-307](../controller/internal/fib/fib.go)）——
+   问"隧道 #2 掉了会不会连带撤另一条的路径"，答案是**不会**。
+9. **MPLS 标签只含 VPN 是对的**：`LabelFor(vrf) = LabelBase + vrf`
+   （[internal/fib/fib.go:60-65](../controller/internal/fib/fib.go)）——标签是远端语义
+   （对端弹栈后查自己那张表），与隧道无关。"per-tunnel 标签"是我的推测，删掉。
+10. **存储/端口/实例号/配置盘上都已按隧道**：`Tunnels` map 键是 `t.id`
+    （[state.go:207](../controller/internal/underlay/state.go)）、`portsOn`/`allocPort` 每设备端口唯一(:296-339)、
+    WG `instance` 由隧道 ID 派生（[underlay_delivery.go:272-286](../controller/cmd/sr-ctrl/underlay_delivery.go)）、
+    设备侧 keep 集合按 `TunnelID`（[agent/tunnel.go:444-466](../controller/internal/agent/tunnel.go)）、
+    apply 整表替换（[apply/route.go:198-259](../controller/internal/apply/route.go)）。
+11. **控制台**：对端下拉不排除已有隧道的对，硬错原文进 `undErrNote`（可接受）；
+    拓扑边折叠成 `firstRelayed || tunnels[0]` + "N 条"标签是刻意的，但边明细缺"颜色"列。
+12. **lab 脚本**：[test/lab/loop-console.py:328-333,354-358](../test/lab/loop-console.py)
+    用 `frozenset(设备对)` 做集合等值断言，隐含"一对一条"；属 lab，重搭 lab 时随最新代码改。
+
+### 9.5 修复次序（每条都要先出方案、点头后再写码）
+
+| 序 | 内容 | 为什么这个位置 | 阶梯 #222 是否等它 |
+|---|---|---|---|
+| M-4 | 遥测行加 `TunnelID`（+`ReachReport` 加或删） | P-1 判据要用它，是阶梯的硬前置；改动面小、只到 wire/agent/控制器/控制台 | **是** |
+| M-1 | path_id 每隧道唯一（`PathIDBase` 不再恒 1000） | 唯一会**静默改在线转发**的一条；纯编号派生，不动密钥 | 否（阶梯改的是同一条隧道的 peer） |
+| M-2 | 每隧道一把 WG keypair（identity 多把 + keybinding 主语 + 控制器按 (node,tunnel) 存 + agent 装 peer 用隧道私钥） | 9.1 的根因，工作量最大（密钥生命周期、担保、轮换） | 否 |
+| M-3 | 放宽 pair 门禁为 (a,b,color)，批量/扇出带颜色，同色重复仍拒 | 必须排在 M-2 之后：门禁放宽到没有数据面支撑 = 把硬错换成静默失败 | 否 |
+| M-5 | 把 9.7 那三处判据显式收紧成 (local, peer) | 去掉对"/32 全局唯一"的隐式依赖，和 M-4 一批做几乎免费 | 否 |
+| M-6 | 拓扑边明细补颜色列；lab 断言键改 (pair,color) | 展示与测试脚本，最后 | 否 |
