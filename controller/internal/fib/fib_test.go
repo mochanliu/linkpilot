@@ -208,25 +208,27 @@ func TestPlanFrom(t *testing.T) {
 	if len(plan.Labels) != 2 || plan.Labels[0] != (Label{1100, 100}) || plan.Labels[1] != (Label{1101, 101}) {
 		t.Fatalf("labels = %+v, want [{1100 100} {1101 101}]", plan.Labels)
 	}
-	// 本机两张 VPN 主表 + 真被装进路由的那一张颜色表（§4.2：不是 8×256 全开）。
-	wantTables := []uint32{100, 101, colorTable(t, 0, 100)}
+	// 本机两张 VPN 主表就是全部的表（§4.2 更正）：颜色 0 的落点 = 主表本身，
+	// 不再另建一张副本表。这条断言钉的就是"颜色 0 不产生第二张表"。
+	wantTables := []uint32{100, 101}
 	if len(plan.Tables) != len(wantTables) {
-		t.Fatalf("tables = %v, want %v", plan.Tables, wantTables)
+		t.Fatalf("tables = %v, want %v（颜色 0 不许再多出一张表）", plan.Tables, wantTables)
 	}
 	for i, w := range wantTables {
 		if plan.Tables[i] != w {
 			t.Fatalf("tables = %v, want %v", plan.Tables, wantTables)
 		}
 	}
-	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100, Preference: PrefBase}
-	for _, table := range []uint32{100, colorTable(t, 0, 100)} {
-		r := mustRoute(t, plan, table, "10.1.0.0/24")
-		if len(r.Paths) != 1 || r.Paths[0] != want {
-			t.Errorf("表 %d paths = %+v, want [%+v]", table, r.Paths, want)
-		}
+	if got := colorTable(t, 0, 100); got != 100 {
+		t.Fatalf("ColorTable(0,100) = %d, want 100 —— 颜色 0 必须折回主表", got)
 	}
-	if len(plan.Routes) != 2 {
-		t.Fatalf("routes = %+v, want 2 条（主表 + 颜色 0 的表，同前缀已合并）", plan.Routes)
+	want := Path{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100, Preference: PrefBase}
+	r := mustRoute(t, plan, 100, "10.1.0.0/24")
+	if len(r.Paths) != 1 || r.Paths[0] != want {
+		t.Errorf("主表 100 paths = %+v, want [%+v]（颜色和主表是同一个桶，两份候选必须并成一条）", r.Paths, want)
+	}
+	if len(plan.Routes) != 1 {
+		t.Fatalf("routes = %+v, want 1 条（颜色 0 就是主表，不重复装一遍）", plan.Routes)
 	}
 	if len(plan.Warnings) != 0 {
 		t.Errorf("warnings = %v, want 空", plan.Warnings)
@@ -326,14 +328,16 @@ func TestApplyFirstThenIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 表 2 张（VPN 主表 + 颜色 0 的表）、路由 2 条：§4.3 第 5 步两张表各装一份。
-	if res.TablesAdded != 2 || res.LabelsSet != 1 || res.RoutesSet != 2 || !res.MPLSChanged {
-		t.Errorf("first apply = %+v, want {2 1 0 2 0 true}", res)
+	// 表 1 张、路由 1 条：这条隧道的颜色是 0，而 §4.2 更正后颜色 0 的落点就是
+	// 主表本身 —— 不再像过去那样在主表之外另建一张 10000+100 装同一份路径。
+	if res.TablesAdded != 1 || res.LabelsSet != 1 || res.RoutesSet != 1 || !res.MPLSChanged {
+		t.Errorf("first apply = %+v, want {1 1 0 1 0 true}", res)
 	}
-	for _, id := range []uint32{100, colorTable(t, 0, 100)} {
-		if !dp.tables[id] {
-			t.Errorf("表 %d 没建", id)
-		}
+	if !dp.tables[100] {
+		t.Errorf("表 100 没建")
+	}
+	if len(dp.tables) != 1 {
+		t.Errorf("建出来的表 = %v, want 只有 100（颜色 0 不该再多一张）", dp.tables)
 	}
 	if dp.labels[1100] != 100 {
 		t.Errorf("label 1100 → %d, want 表 100", dp.labels[1100])
@@ -384,14 +388,13 @@ func TestApplyConvergesToNewPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Result{TablesAdded: 2, LabelsSet: 1, LabelsRemoved: 1, RoutesSet: 2, RoutesRemoved: 2, MPLSChanged: true}
+	want := Result{TablesAdded: 1, LabelsSet: 1, LabelsRemoved: 1, RoutesSet: 1, RoutesRemoved: 1, MPLSChanged: true}
 	if res != want {
 		t.Errorf("res = %+v, want %+v", res, want)
 	}
-	for _, k := range []string{"100|10.1.0.0/24", fmt.Sprintf("%d|10.1.0.0/24", colorTable(t, 0, 100))} {
-		if _, ok := dp.routes[k]; ok {
-			t.Errorf("%s 没撤", k)
-		}
+	// 旧计划只有一条路由（颜色 0 就在主表里），撤它就是撤这一条。
+	if _, ok := dp.routes["100|10.1.0.0/24"]; ok {
+		t.Errorf("100|10.1.0.0/24 没撤")
 	}
 	if dp.routes["101|172.16.0.0/16"][0].SWIfIndex != 11 {
 		t.Error("新路由没指到 wg1")
@@ -430,14 +433,12 @@ func TestApplyReplacesChangedPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.TablesAdded != 0 || res.LabelsSet != 0 || res.RoutesSet != 2 || res.RoutesRemoved != 0 {
-		t.Errorf("res = %+v, want 只重下发两张表里这条路由", res)
+	if res.TablesAdded != 0 || res.LabelsSet != 0 || res.RoutesSet != 1 || res.RoutesRemoved != 0 {
+		t.Errorf("res = %+v, want 只重下发这一张表里这条路由（颜色 0 与主表同一张）", res)
 	}
-	for _, table := range []uint32{100, colorTable(t, 0, 100)} {
-		paths := dp.routes[fmt.Sprintf("%d|10.1.0.0/24", table)]
-		if len(paths) != 1 || paths[0].SWIfIndex != 11 || paths[0].Labels[0] != 1100 {
-			t.Errorf("表 %d path = %+v, want wg1 压 1100（整条替换，不是追加）", table, paths)
-		}
+	paths := dp.routes["100|10.1.0.0/24"]
+	if len(paths) != 1 || paths[0].SWIfIndex != 11 || paths[0].Labels[0] != 1100 {
+		t.Errorf("表 100 path = %+v, want wg1 压 1100（整条替换，不是追加）", paths)
 	}
 }
 
@@ -474,8 +475,8 @@ func TestApplyFailureDoesNotAdvancePrev(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.TablesAdded != 2 || res.LabelsSet != 1 || res.RoutesSet != 2 {
-		t.Errorf("重试 res = %+v, want 从空基线重写全部", res)
+	if res.TablesAdded != 1 || res.LabelsSet != 1 || res.RoutesSet != 1 {
+		t.Errorf("重试 res = %+v, want 从空基线重写全部（一张表、一条路由）", res)
 	}
 	if len(dp.routes["100|10.1.0.0/24"]) != 1 {
 		t.Error("重试后路由缺失")
@@ -499,8 +500,8 @@ func TestPlanFromSkipsBFDDownPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Routes) != 2 { // 10.1.0.0/24 的主表 + 颜色表
-		t.Fatalf("routes = %+v, want 只有还有活路径的 10.1.0.0/24（两张表）", plan.Routes)
+	if len(plan.Routes) != 1 { // 只有 10.1.0.0/24，而且颜色 0 就落在主表里
+		t.Fatalf("routes = %+v, want 只有还有活路径的 10.1.0.0/24（一条）", plan.Routes)
 	}
 	main := mustRoute(t, plan, 100, "10.1.0.0/24")
 	if paths := main.Paths; len(paths) != 1 || paths[0].Interface != "wg0" {
@@ -548,8 +549,8 @@ func TestApplyBFDDownRemovesPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RoutesSet != 2 || res.RoutesRemoved != 0 || res.LabelsSet != 0 {
-		t.Errorf("res = %+v, want 只重下发这条路由（两张表；标签/表不动）", res)
+	if res.RoutesSet != 1 || res.RoutesRemoved != 0 || res.LabelsSet != 0 {
+		t.Errorf("res = %+v, want 只重下发这张表里这条路由（颜色 0 与主表同一张；标签/表不动）", res)
 	}
 	paths := dp.routes["100|10.1.0.0/24"]
 	if len(paths) != 1 || paths[0].SWIfIndex != 10 {
@@ -569,8 +570,10 @@ func TestApplyEmptyPlanOnFreshApplier(t *testing.T) {
 	}
 }
 
-// VPN 0 的主表就是 global 表：登记标签、不建表，但它的颜色表照建（§4.2 公式对
-// 主表号 0 同样成立 —— 10000 这张表只归 sr-fib 管，不碰 underlay）。
+// VPN 0 的主表就是 global 表：登记标签、往它里面装路由，但**不建表**。
+// §4.2 更正后颜色 0 的落点就是主表，所以"VPN 0 + 颜色 0"一张表都不该建 ——
+// global 表本来就存在，建不得也删不得（删了会把 underlay 一起带走）。
+// 非 0 颜色照建自己的表：那是 7000，与 0 号表无关。
 func TestApplyVPN0UsesGlobalTable(t *testing.T) {
 	dp := newFakeDP()
 	a := NewApplier(dp)
@@ -588,13 +591,33 @@ func TestApplyVPN0UsesGlobalTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.TablesAdded != 1 || !dp.tables[colorTable(t, 0, 0)] || dp.tables[0] {
-		t.Errorf("res = %+v tables = %v, want 只建颜色表、global 表建不得", res, dp.tables)
+	if res.TablesAdded != 0 || len(dp.tables) != 0 {
+		t.Errorf("res = %+v tables = %v, want 一张表都不建（VPN 0 的颜色 0 就是 global 主表）", res, dp.tables)
 	}
 	remote := dp.routes["0|10.68.2.0/24"]
 	if len(remote) != 1 || remote[0].SWIfIndex != 10 ||
 		len(remote[0].Labels) != 1 || remote[0].Labels[0] != 1000 {
 		t.Errorf("remote = %+v, want 压 1000 走 wg0(10)", remote)
+	}
+
+	dp7 := newFakeDP()
+	a7 := NewApplier(dp7)
+	plan7, err := PlanFrom([]uint8{0},
+		[]RIBRoute{ribOne(0, "10.68.2.0/24", "192.168.99.2")},
+		[]Tunnel{{NextHop: "192.168.99.2", Interface: "wg0", Color: 7}},
+		nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res7, err := a7.Apply(context.Background(), plan7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res7.TablesAdded != 1 || !dp7.tables[7000] {
+		t.Errorf("res = %+v tables = %v, want 只建 7000（VPN 0 的颜色 7 表）", res7, dp7.tables)
+	}
+	if _, bad := dp7.tables[0]; bad {
+		t.Errorf("给 global 主表 0 建了表，VPP 会把 underlay 一起算进来")
 	}
 }
 
@@ -618,12 +641,10 @@ func TestPlanFromColorPreference(t *testing.T) {
 	if len(c7.Paths) != 1 || c7.Paths[0].Interface != "wg1" || c7.Paths[0].Preference != PrefBase+7 {
 		t.Errorf("颜色 7 表 paths = %+v, want 只有 wg1（pref PrefBase+7）", c7.Paths)
 	}
-	c0 := mustRoute(t, plan, colorTable(t, 0, 100), "10.1.0.0/24")
-	if len(c0.Paths) != 1 || c0.Paths[0].Interface != "wg0" {
-		t.Errorf("颜色 0 表 paths = %+v, want 只有 wg0", c0.Paths)
-	}
-	if len(plan.Routes) != 3 {
-		t.Errorf("routes = %+v, want 3（主表 + 颜色 0 + 颜色 7）", plan.Routes)
+	// 颜色 0 没有自己的一张表了：它的落点就是上面那张主表（§4.2 更正），
+	// 所以这里钉的是"主表里 wg0 只有一条、没有第二条副本"。
+	if len(plan.Routes) != 2 {
+		t.Errorf("routes = %+v, want 2（主表=颜色 0 的落点 + 颜色 7 表）", plan.Routes)
 	}
 }
 
@@ -664,8 +685,9 @@ func TestPlanFromEscapePutsAllColorsInMainTable(t *testing.T) {
 			t.Errorf("主表缺 %s（pref %d）: %+v", want.iface, want.pref, main.Paths)
 		}
 	}
-	// 颜色表与开关无关：把关掉时那两张表原样比一遍。
-	for _, ct := range []uint32{colorTable(t, 0, 100), colorTable(t, 7, 100)} {
+	// 非 0 颜色的表与开关无关：把关掉时那张表原样比一遍。
+	// 颜色 0 不在这里比 —— 它的落点就是主表，而主表正是这个开关唯一改动的地方。
+	for _, ct := range []uint32{colorTable(t, 7, 100)} {
 		offR, onR := mustRoute(t, off, ct, "10.1.0.0/24"), mustRoute(t, on, ct, "10.1.0.0/24")
 		if len(offR.Paths) != len(onR.Paths) || offR.Paths[0] != onR.Paths[0] {
 			t.Errorf("颜色表 %d 被开关改动了: 关 %+v 开 %+v", ct, offR.Paths, onR.Paths)
@@ -685,7 +707,7 @@ func TestPlanFromEscapePutsAllColorsInMainTable(t *testing.T) {
 
 // 开关最尖锐的差别在"只剩昂贵颜色"时（§5 口径）：关 ⇒ 这条前缀在主表里**不存在**，
 // 打流直接丢，不回落给昂贵颜色买单；开 ⇒ 主表用那条颜色 7 兜住，pref 仍是 PrefBase+色。
-// 两种情况下颜色表 17100 都照写 —— 它是 policy 阶段的落点，不是开关的替身。
+// 两种情况下颜色表 7100 都照写 —— 它是 policy 阶段的落点，不是开关的替身。
 func TestPlanFromEscapeDecidesWhetherExpensiveColorSurvives(t *testing.T) {
 	vrfs := []uint8{100}
 	routes := []RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.3")}
@@ -789,9 +811,15 @@ func TestPlanFromColorZeroDownWithEscape(t *testing.T) {
 	if len(wantPref) != 0 {
 		t.Errorf("主表缺路径 %v（现有 %+v）", wantPref, main.Paths)
 	}
-	// 颜色 0 表也一起空掉：那条路径已经跳过，桶里没东西就不会建这张表的路由。
-	if _, ok := routeAt(t, on, colorTable(t, 0, 100), "10.1.0.0/24"); ok {
-		t.Errorf("逃生开：颜色 0 表里仍有路径，want 没有（唯一的下一跳已 down）")
+	// down 掉的那条路径（wg0，颜色 0）在整份计划里一次都不该出现。这里不能问
+	// "颜色 0 那张表空不空"：§4.2 更正后颜色 0 的落点**就是主表**，主表里本来
+	// 就带着别的颜色的路径（逃生开着）；能问的是这条路径本身。
+	for _, r := range on.Routes {
+		for _, p := range r.Paths {
+			if p.Interface == "wg0" {
+				t.Errorf("逃生开：表 %d 里仍给 down 掉的 wg0 下发路径 %+v", r.Table, p)
+			}
+		}
 	}
 
 	off, err := PlanFrom(vrfs, routes, tunnels, down, false)
@@ -892,8 +920,8 @@ func TestApplyAddRemovePathNoExtraDelete(t *testing.T) {
 	if res.RoutesRemoved != 0 {
 		t.Errorf("path-set changed should not trigger delete-then-add, got RoutesRemoved=%d", res.RoutesRemoved)
 	}
-	if res.RoutesSet != 2 {
-		t.Errorf("RoutesSet = %d, want 2（主表 + 颜色 0 表各替换一次）", res.RoutesSet)
+	if res.RoutesSet != 1 {
+		t.Errorf("RoutesSet = %d, want 1（颜色 0 就在主表里，只替换这一条）", res.RoutesSet)
 	}
 	if res.TablesAdded != 0 || res.LabelsSet != 0 {
 		t.Errorf("res = %+v, want 表与标签都不动（颜色和主表都没变）", res)
@@ -906,15 +934,19 @@ func TestApplyAddRemovePathNoExtraDelete(t *testing.T) {
 // ---- O3：表号公式、跨 VPN 导通、同标签 ECMP、按 RD 择一 ----
 
 func TestColorTableFormula(t *testing.T) {
-	// §4.2：颜色 0 → 10000..10255，颜色 7 → 17000..17255，色段之间不重叠。
+	// §4.2（2026-11-03 更正）：表号 = 颜色*1000 + 主表号，段落在 0..7255。
+	// 颜色 0 折出来**就是主表**，所以 c=0 那一步不是"另一张表"而是同一张。
 	for c := uint8(0); c <= 7; c++ {
-		want := uint32(c)*1000 + 10000 + 100
+		want := uint32(c)*1000 + 100
 		if got := colorTable(t, c, 100); got != want {
 			t.Errorf("ColorTable(%d,100) = %d, want %d", c, got, want)
 		}
 	}
-	if got := colorTable(t, 0, 0); got != 10000 {
-		t.Errorf("ColorTable(0,0) = %d, want 10000", got)
+	if got := colorTable(t, 0, 0); got != 0 {
+		t.Errorf("ColorTable(0,0) = %d, want 0 —— VPN 0 的颜色 0 落点就是 global 主表", got)
+	}
+	if got := colorTable(t, 1, 0); got != 1000 {
+		t.Errorf("ColorTable(1,0) = %d, want 1000 —— 段基址去掉后颜色 1 才第一次偏移", got)
 	}
 	if colorTable(t, 1, 255) <= colorTable(t, 0, 255) {
 		t.Error("色段没有按颜色递增")
@@ -949,11 +981,14 @@ func TestPlanFromCrossVPNInstall(t *testing.T) {
 	if len(plan.Labels) != 1 || plan.Labels[0] != (Label{1020, 20}) {
 		t.Errorf("labels = %+v, want 只登记本机 VPN 20 的 1020", plan.Labels)
 	}
-	for _, table := range []uint32{20, colorTable(t, 0, 20)} {
-		r := mustRoute(t, plan, table, "10.10.1.0/24")
-		if len(r.Paths) != 1 || r.Paths[0].Label != 1010 {
-			t.Errorf("表 %d paths = %+v, want 一条压 1010（来源 VPN 的标签）", table, r.Paths)
-		}
+	// 这条导通路由只有颜色 0，落点就是主表 20 本身（§4.2 更正 ⇒ 没有 10000+20
+	// 那份副本了）。标签取**来源** VPN，与装进哪张表无关。
+	r := mustRoute(t, plan, 20, "10.10.1.0/24")
+	if len(r.Paths) != 1 || r.Paths[0].Label != 1010 {
+		t.Errorf("表 20 paths = %+v, want 一条压 1010（来源 VPN 的标签）", r.Paths)
+	}
+	if len(plan.Routes) != 1 {
+		t.Errorf("routes = %+v, want 1（颜色 0 就是主表，不再重复装一张）", plan.Routes)
 	}
 	if len(plan.Warnings) != 0 {
 		t.Errorf("warnings = %v, want 空", plan.Warnings)
@@ -1009,17 +1044,17 @@ func TestPlanFromDifferentLabelsTieBreakByRD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []uint32{20, colorTable(t, 0, 20)} {
-		r := mustRoute(t, plan, table, "10.10.1.0/24")
-		if len(r.Paths) != 1 || r.Paths[0].Label != 1011 || r.Paths[0].Interface != "wg1" {
-			t.Errorf("表 %d paths = %+v, want 只剩 wg1 压 1011（RD 1/11 胜）", table, r.Paths)
-		}
+	// 只有一个桶：颜色 0 的落点就是主表 20，两个桶键相同 ⇒ 合并。
+	r := mustRoute(t, plan, 20, "10.10.1.0/24")
+	if len(r.Paths) != 1 || r.Paths[0].Label != 1011 || r.Paths[0].Interface != "wg1" {
+		t.Errorf("表 20 paths = %+v, want 只剩 wg1 压 1011（RD 1/11 胜）", r.Paths)
 	}
-	if len(plan.Routes) != 2 {
-		t.Fatalf("routes = %+v, want 2（每个桶一条）", plan.Routes)
+	if len(plan.Routes) != 1 {
+		t.Fatalf("routes = %+v, want 1（主表就是颜色 0 的落点，只有一个桶）", plan.Routes)
 	}
-	if len(plan.Warnings) != 2 {
-		t.Fatalf("warnings = %v, want 每个桶一条择一警告", plan.Warnings)
+	// 一条而不是两条：pickWinner 的 losers 按 RD 去重，桶合并后同一个败者 RD 只计一次。
+	if len(plan.Warnings) != 1 {
+		t.Fatalf("warnings = %v, want 1（那个桶一条择一警告）", plan.Warnings)
 	}
 	for _, w := range plan.Warnings {
 		if !strings.Contains(w, "择一") || !strings.Contains(w, "5/10") {
@@ -1042,8 +1077,8 @@ func TestPlanFromMergesDuplicatedReflection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Routes) != 2 {
-		t.Fatalf("routes = %+v, want 2（主表 + 颜色 0 表）", plan.Routes)
+	if len(plan.Routes) != 1 {
+		t.Fatalf("routes = %+v, want 1（主表就是颜色 0 的落点，只有一个桶）", plan.Routes)
 	}
 	if paths := mustRoute(t, plan, 10, "10.10.1.0/24").Paths; len(paths) != 1 {
 		t.Errorf("paths = %+v, want 1（重复反射已去重）", paths)
@@ -1070,12 +1105,10 @@ func TestPlanFromTablesAreSeededPlusUsed(t *testing.T) {
 			t.Fatalf("tables = %v, want %v", plan.Tables, want)
 		}
 	}
-	// 颜色 3 的路径不进主表 20（逃生关）：主表和它的颜色 0 表都没有这条前缀。
+	// 颜色 3 的路径不进主表 20（逃生关）。这里不用再单独查一次"颜色 0 表"：
+	// 颜色 0 的落点就是主表 20，同一个断言已经覆盖了。
 	if _, ok := routeAt(t, plan, 20, "10.10.1.0/24"); ok {
 		t.Error("主表 20 收了颜色 3 的路径，逃生开关是关的")
-	}
-	if _, ok := routeAt(t, plan, colorTable(t, 0, 20), "10.10.1.0/24"); ok {
-		t.Error("颜色 0 表收了颜色 3 的路径")
 	}
 	if len(plan.Routes) != 1 {
 		t.Errorf("routes = %+v, want 只有颜色 3 表那一条", plan.Routes)

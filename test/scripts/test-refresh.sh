@@ -62,7 +62,7 @@ VRF_SRC=${VRF_SRC:-51}                         # node2 的 VPN
 LBL_DST=$((1000 + VRF_DST))                    # 1050
 LBL_SRC=$((1000 + VRF_SRC))                    # 1051
 LBL_LEAK=$((1000 + VRF_LEAK))                  # 1053
-CT_DST=$((10000 + VRF_DST))                    # ColorTable(0, 50) = 10050
+LEGACY_CT=$((10000 + VRF_DST))                 # 改之前的颜色 0 落点（旧 ColorTable(0,50)=10050）；现在必须始终没有这条前缀
 
 PFX_DST=${PFX_DST:-10.50.0.0/16}               # node1 在 VPN 50 里宣告
 PFX_LEAK=${PFX_LEAK:-10.53.0.0/16}             # node1 在 VPN 53 里宣告（阶段 F）
@@ -590,7 +590,9 @@ info "(D) sr-fib 下一次轮询把它装进 VPP，两个 tap 终端真的 ping"
 wait_fn "表 $VRF_DST 里出现 $PFX_SRC" 15 route_in "$N1" "$VRF_DST" "$PFX_SRC"
 wait_fn "它压 $LBL_SRC（= 1000 + 来源 VPN $VRF_SRC）经 $WG_IF 发往 $OVERLAY_N2" 10 \
     labeled_via "$N1" "$VRF_DST" "$PFX_SRC" "$LBL_SRC" "$OVERLAY_N2"
-wait_fn "颜色表 $CT_DST 里也有它（色*10000+主表的双写）" 15 route_in "$N1" "$CT_DST" "$PFX_SRC"
+no_route_in "$N1" "$LEGACY_CT" "$PFX_SRC" &&
+    ok "负向：表 $LEGACY_CT 里没有它 ⇒ 颜色 0 折回主表 $VRF_DST，不产生 10000+主表 副本（§4.2 公式 2026-11-03 更正）" ||
+    bad "表 $LEGACY_CT 里还有 $PFX_SRC：+10000 段基址已经退役"
 label_in "$N1" "$LBL_DST" &&
     ok "node1 登记了自己的本地标签 $LBL_DST（node2 送进来的流量弹栈后查表 $VRF_DST）" ||
     bad "node1 没登记本地标签 $LBL_DST"

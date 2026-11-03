@@ -54,7 +54,10 @@ func Reset(ctx context.Context, dp DP, vrfs []uint8) (ResetResult, error) {
 		res.TablesRemoved++
 
 		// 颜色表（§4.2）也要撤：sr-fib 会为真被装进路由的 (色,主表) 组合建表，
-		// 只清主表就把带标签的路由留在 10000+t 里，下一轮测试对不上账。
+		// 只清主表就把带标签的路由留在 颜色*1000+t 里，下一轮测试对不上账。
+		// 从颜色 1 起循环：颜色 0 折出来就是主表本身，上面已经连表带路由撤过一遍，
+		// 再撤一次会把同一张表的引用计数减两回 —— 下面那条 len==0 闸门挡不住它，
+		// 因为"表还在但没人装路由"并不返回空。
 		// 这里**不猜哪张表存在**，靠 dump 的空非空来判 —— 实测这两件事：
 		//   - 表不存在：ip_route_dump 一帧都不回，retval 0，不报错；
 		//   - 表存在但没人装路由：也**不是空的**，VPP 自动带 5 条 special
@@ -63,7 +66,7 @@ func Reset(ctx context.Context, dp DP, vrfs []uint8) (ResetResult, error) {
 		// 所以 len(routes)==0 就是"没这张表"，可靠；把"没这张表"和"真失败"混进
 		// retval 反而更难查。留下的空表是惰性的：没有标签进它、policy 阶段之前
 		// 没人引流，下一轮 IPTableAddDel(add) 对已存在的表也只是引用计数加一。
-		for c := uint8(0); c <= MaxColor; c++ {
+		for c := uint8(1); c <= MaxColor; c++ {
 			ct, err := ColorTable(c, table)
 			if err != nil {
 				return res, fmt.Errorf("fib: reset 算颜色表（色 %d 主表 %d）: %w", c, table, err)

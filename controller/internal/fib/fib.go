@@ -19,8 +19,9 @@
 //
 // 表布局：VPN 表号 = VPN ID（0, 1, ...），250 留给 overlay（wg 接口与对外下一跳
 // 空间），underlay 在 table 0 —— 所以 VPN 0 与 underlay 共用 table 0；颜色表用
-// ColorTable() 那个公式（10000..17255），与上面几段实测不撞。MPLS 标签不分表：
-// VPP 收包后的标签查表恒为全局 MPLS 表（实测与接口所在 IP 表无关）。
+// ColorTable() 那个公式（颜色*1000+主表号 ⇒ 0..7255），**颜色 0 的落点就是主表
+// 本身**。MPLS 标签不分表：VPP 收包后的标签查表恒为全局 MPLS 表（实测与接口所在
+// IP 表无关）。
 //
 // 本包只装 overlay 学到的前缀。客户侧/本机前缀归盒内 FRR：FRR 把路由装进内核
 // FIB，VPP 的 linux-nl 插件再按 netlink 同步进同一张 VPP 表。两个写者不碰同一
@@ -64,20 +65,21 @@ const MaxColor uint8 = 7
 // 收端登记时参数是本机配置的 VPN。两边用同一个函数，不需要在协议里多带字段。
 func LabelFor(vrf uint8) uint32 { return LabelBase + uint32(vrf) }
 
-// 颜色表的表号公式（草案 §4.2）：
+// 颜色表的表号公式（草案 §4.2，2026-11-03 更正）：
 //
-//	表号 = 颜色*ColorTableStride + ColorTableBase + 主表号      主表号 ∈ 0..255
+//	表号 = 颜色*ColorTableStride + 主表号      主表号 ∈ 0..255
 //
-// 色段之间留 1000 的空隙（> 主表号上限 255）⇒ 8 个颜色互不重叠；数值落在
-// 10000..17255，实测与 lab 现用的 0/10/99/250/1250 都不撞。标签空间 1000+vpn
-// 是**另一个命名空间**（MPLS 20 位标签），形似但无交叉。
-const (
-	ColorTableBase   uint32 = 10000
-	ColorTableStride uint32 = 1000
-)
+// 色段之间留 1000 的空隙（> 主表号上限 255）⇒ 8 个颜色互不重叠，整体落在
+// 0..7255。**没有额外的段基址**：VPN 表号恒等于 VPN ID（最大 255），所以颜色 0
+// 折出来就是主表本身，与 §4.3"主表默认只收颜色 0"是同一张表，不是它的副本。
+// 早先那个 +10000 是为了避开当时 FRR 占用的 table 1250；那条接缝已在 L-3 退役
+// （sr-frr 改 netlink 注入 K 路由），留着就多出一张与主表内容重复的 10000+t。
+//
+// 标签空间 1000+vpn 是**另一个命名空间**（MPLS 20 位标签），形似但无交叉。
+const ColorTableStride uint32 = 1000
 
 // ColorTable 把（颜色, 主表）折成一个 VPP 表号。policy 阶段用策略路由把流引到
-// 指定颜色的表；O3 只负责把这些表建出来并装好路径。
+// 指定颜色的表；O3 只负责把这些表建出来并装好路径。颜色 0 ⇒ 就是主表。
 func ColorTable(color uint8, main uint32) (uint32, error) {
 	if color > MaxColor {
 		return 0, fmt.Errorf("fib: 颜色 %d 超出上限（PrefBase %d + 颜色 ≤ 255 ⇒ 最大 %d）", color, PrefBase, MaxColor)
@@ -85,7 +87,7 @@ func ColorTable(color uint8, main uint32) (uint32, error) {
 	if main > uint32(MaxVRFID) {
 		return 0, fmt.Errorf("fib: 主表号 %d 超出 0..%d，会和下一个颜色的表段重叠", main, MaxVRFID)
 	}
-	return uint32(color)*ColorTableStride + ColorTableBase + main, nil
+	return uint32(color)*ColorTableStride + main, nil
 }
 
 // RIBRoute 是喂给本包的最小路由形状（由 cmd/sr-fib 从 sr-route /status 转换）。
@@ -315,7 +317,8 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 				k := key{table: uint32(r.Table), prefix: prefix}
 				grouped[k] = append(grouped[k], c)
 			}
-			// 颜色表 t_c 只收颜色 c（policy 阶段的引流落点）。
+			// 颜色表 t_c 只收颜色 c（policy 阶段的引流落点）。颜色 0 的落点就是
+			// 上面那张主表：同一个桶收到两份同一路径，最后的去重把它们并回去。
 			ct, err := ColorTable(t.Color, uint32(r.Table))
 			if err != nil {
 				return p, err

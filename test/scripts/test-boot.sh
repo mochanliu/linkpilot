@@ -80,7 +80,7 @@ VRF_1=${VRF_1:-56}
 VRF_2=${VRF_2:-57}
 LBL_1=$((1000 + VRF_1))             # 1056
 LBL_2=$((1000 + VRF_2))             # 1057
-CT_1=$((10000 + VRF_1))             # ColorTable(0, 56) = 10056
+LEGACY_CT_1=$((10000 + VRF_1))          # 改之前的颜色 0 落点（旧 ColorTable(0,56)=10056）；现在必须始终没有这条前缀
 PFX_1=${PFX_1:-10.56.0.0/16}
 PFX_2=${PFX_2:-10.57.0.0/16}
 MK_1=$((1900 + VRF_1))              # bundle 的 MPLS 记号表：1956
@@ -588,7 +588,9 @@ wait_json "$N2" "$S2" "d['rib_routes'] == 1 and d['rib']['$VRF_2'][0]['prefix'] 
     "node2 那边学到 $PFX_1：清单跑完的是**两台**盒子" 30
 wait_fn "node1 VPP 表 $VRF_1 里 $PFX_2 压 $LBL_2 经 $WG_IF" 25 \
     labeled_via "$N1" "$VRF_1" "$PFX_2" "$LBL_2" "$OVERLAY_N2"
-wait_fn "颜色表 $CT_1 里也有它" 25 route_in "$N1" "$CT_1" "$PFX_2"
+no_route_in "$N1" "$LEGACY_CT_1" "$PFX_2" &&
+    ok "开机重放没建出表 $LEGACY_CT_1：颜色 0 折回主表 $VRF_1（§4.2 公式 2026-11-03 更正，不再有 10000+主表 副本）" ||
+    bad "表 $LEGACY_CT_1 里出现了 $PFX_2：重放装的是老表号"
 status_json "$N1" "$AS" | python3 -m json.tool >/dev/null 2>&1 &&
     ok "node1：sr-agent 由清单拉起，$AS 的状态口在回话" || bad "node1：sr-agent 的状态口没回话"
 wait_json "$N1" "$AS" "d['last_ok_unix'] == 0 and d['last_err']" \

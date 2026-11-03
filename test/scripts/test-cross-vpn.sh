@@ -8,9 +8,9 @@
 #       **1041**（= 1000 + 来源 VPN）。反例很自然：装在 40 却压 1040 —— 那等于
 #       把"我的 VPN"写进了别人的收端语义里，对端弹栈后查的是它自己的 1040，
 #       而 1040 在对端根本没登记。§4.3 第 3 步说的就是这件事。
-#   (2) 颜色 0 的那条路径同时存在于**主表 40** 与**颜色表 10040**（§4.2 公式
-#       色*1000+10000+主表）。颜色表用的表号是"目标主表 + 颜色"，标签仍然是
-#       来源 VPN 的 1041 —— 表号跟目标走这条规则在颜色表里也得成立。
+#   (2) 颜色 0 的那条路径**只存在于主表 40**：§4.2 的公式在 2026-11-03 更正为
+#       表号 = 色*1000+主表，颜色 0 折出来就是主表本身。负向钉的是老表号 10040
+#       全程为空 —— 改之前那次 lab 观察到的"10000+主表 副本表"不能再出现。
 #   (3) **负向（§2.4 静默投递的回归）**：同一个前缀由 node2 的两个 VPN（41 与
 #       42）分别送进来 ⇒ 两个标签 ⇒ 不能同桶。断言主表 40 里该前缀只有
 #       1 条路径（buckets:1）、标签是 RD 更小的那个源（2/41）、并且 fib.log 里
@@ -53,7 +53,7 @@ VRF_SRC2=${VRF_SRC2:-42}                      # node2 的第二个来源 VPN
 LBL_DST=$((1000 + VRF_DST))                   # 1040：node1 自己登记的本地标签
 LBL_SRC=$((1000 + VRF_SRC))                   # 1041
 LBL_SRC2=$((1000 + VRF_SRC2))                 # 1042
-CT_DST=$((10000 + VRF_DST))                   # ColorTable(0, 40) = 10040
+LEGACY_CT=$((10000 + VRF_DST))                # 改之前的颜色 0 落点（旧 ColorTable(0,40)=10040）；现在必须全程为空
 
 PFX_DST=${PFX_DST:-10.40.0.0/16}              # node1 在 VPN 40 里宣告
 PFX_SRC=${PFX_SRC:-10.41.0.0/16}              # node2 在 VPN 41 里宣告（单源）
@@ -446,12 +446,17 @@ label_in "$N1" "$LBL_DST" &&
     ok "node1 只登记自己那个 VPN 的本地标签 $LBL_DST" ||
     bad "node1 没登记本地标签 $LBL_DST（收端弹栈后查不到表）"
 
-info "(2) 颜色 0 双写：主表 $VRF_DST 与颜色表 $CT_DST 各有一份"
-wait_fn "颜色表 $CT_DST 里也有 $PFX_SRC" 10 route_in "$N1" "$CT_DST" "$PFX_SRC"
-wait_fn "颜色表里同样压 $LBL_SRC 走 $WG_IF" 10 \
-    labeled_via "$N1" "$CT_DST" "$PFX_SRC" "$LBL_SRC" "$OVERLAY_N2"
+info "(2) 颜色 0 的落点就是主表 $VRF_DST（表号 = 色*1000+主表，2026-11-03 更正）：只有一份，不再有 10000+主表 副本"
+[ "$(buckets_of "$N1" "$VRF_DST" "$PFX_SRC")" = "1" ] &&
+    ok "主表 $VRF_DST 里这条前缀只有 1 个 bucket（单隧道、单份路径）" ||
+    bad "主表 $VRF_DST 里 $PFX_SRC 的 bucket 数不是 1：$(buckets_of "$N1" "$VRF_DST" "$PFX_SRC")"
+if route_in "$N1" "$LEGACY_CT" "$PFX_SRC"; then
+    bad "表 $LEGACY_CT 里出现了 $PFX_SRC：颜色 0 不该再产生 10000+主表 的副本表"
+else
+    ok "负向：表 $LEGACY_CT 是空的（lab 里那张 10040 副本不再出现）"
+fi
 info "     主表读回：$(dump_of "$N1" "$VRF_DST" "$PFX_SRC" | tr '\n' ' ')"
-info "     颜色表读回：$(dump_of "$N1" "$CT_DST" "$PFX_SRC" | tr '\n' ' ')"
+info "     老落点 $LEGACY_CT 读回：$(dump_of "$N1" "$LEGACY_CT" "$PFX_SRC" | tr '\n' ' ')"
 
 info "反向：node2 的表 $VRF_SRC 里装 node1 的 $PFX_DST，压 $LBL_DST"
 dx "$N2" "bash $WORK/start-fib.sh" || die "node2 sr-fib 启动失败"

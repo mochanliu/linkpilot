@@ -7,13 +7,33 @@ import (
 )
 
 func TestResetRemovesManagedState(t *testing.T) {
+	// 一份计划里同时有颜色 0 和颜色 3 的路径，reset 的两条撤除路径才都覆盖到：
+	//   颜色 0 ⇒ 只落主表 100（颜色 0 的落点就是主表，不产生第二张表）；
+	//   颜色 3 ⇒ 落 3*1000+100 = 3100，只能靠颜色表循环撤干净。
+	// 表数 2 而不是 3 钉的就是"颜色 0 不建表"；主表只撤一遍钉的是 reset 的
+	// 循环从颜色 1 起（从 0 起会把主表引用计数减两回）。
 	dp := newFakeDP()
 	a := NewApplier(dp)
-	if _, err := a.Apply(context.Background(), plan1()); err != nil {
+	plan, err := planFrom(
+		[]uint8{100},
+		[]RIBRoute{
+			ribOne(100, "10.1.0.0/24", "10.255.0.2"),
+			ribOne(100, "10.1.9.0/24", "10.255.0.3"),
+		},
+		[]Tunnel{
+			{NextHop: "10.255.0.2", Interface: "wg0"},
+			{NextHop: "10.255.0.3", Interface: "wg1", Color: 3},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Apply(context.Background(), plan); err != nil {
 		t.Fatal(err)
 	}
 	if len(dp.routes) != 2 || len(dp.labels) != 1 || len(dp.tables) != 2 {
-		t.Fatal("前置状态没装上（主表 + 颜色 0 的表）")
+		t.Fatalf("前置状态没装上: routes=%v labels=%v tables=%v, want 2/1/2（主表 100 + 颜色 3 表 3100）",
+			dp.routes, dp.labels, dp.tables)
 	}
 
 	res, err := Reset(context.Background(), dp, []uint8{100})

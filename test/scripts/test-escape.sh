@@ -160,7 +160,8 @@ mpls_count() {   # <container> <iface> —— 该口经过的 MPLS 包计数（�
     # 没有 mpls 行时打印 0 而不是空：空值进到 $(( )) 就是 "syntax error: operand expected"。
     vpp "$1" "show interface $2" | awk '$1=="mpls" {print $2; f=1; exit} END {if (!f) print 0}'
 }
-color_table() { echo $(( $1 * 1000 + 10000 + $2 )); }   # <color> <main>（§4.2 公式，脚本侧独立算）
+color_table() { echo $(( $1 * 1000 + $2 )); }   # <color> <main>（§4.2 公式，脚本侧独立算；2026-11-03 去掉 +10000 段基址）
+LEGACY_COLOR0=$((10000 + VRF))                 # 改之前的颜色 0 落点，现在必须一直是空的
 
 wait_fn() {   # <label> <timeout_s> <fn> [args...]
     local label=$1 limit=$2 i=0
@@ -359,7 +360,7 @@ ok "两条隧道都在、都通，四条（2 端 x 2 口）收端 MPLS 都真的
 
 CT0=$(color_table 0 "$VRF")
 CT2=$(color_table "$COLOR2" "$VRF")
-info "   表号按 §4.2 公式：主表 $VRF，颜色 0 → $CT0，颜色 $COLOR2 → $CT2；本地标签 $LABEL"
+info "   表号按 §4.2 公式（2026-11-03 更正：颜色*1000+主表号）：主表 $VRF，颜色 0 → $CT0（=主表），颜色 $COLOR2 → $CT2；本地标签 $LABEL"
 
 # ---------------------------------------------------------------- 1 配置
 
@@ -572,7 +573,11 @@ if dump_table "$N1" "$VRF" "$REMOTE_PFX" | grep -qF "via $OVERLAY2_N2 "; then
 else
     ok "负向：开关关 ⇒ 颜色 $COLOR2 不在主表（§4.3 第 5 步）"
 fi
-wait_fn "颜色表 $CT0 有颜色 0 那条（双写）" 15 has_path "$N1" "$CT0" "$REMOTE_PFX" "$OVERLAY_N2" 230
+if has_prefix "$N1" "$LEGACY_COLOR0" "$REMOTE_PFX"; then
+    bad "表 $LEGACY_COLOR0 里出现了 $REMOTE_PFX：+10000 段基址已退役，颜色 0 不该再产生副本表"
+else
+    ok "负向：表 $LEGACY_COLOR0 是空的 ⇒ 颜色 0 只在主表 $VRF 里有一份（不再双写）"
+fi
 wait_fn "颜色表 $CT2 有颜色 $COLOR2 那条 pref $((230 + COLOR2))" 15 has_path "$N1" "$CT2" "$REMOTE_PFX" "$OVERLAY2_N2" $((230 + COLOR2))
 info "   两端 tap 终端，把这条路由真的用起来"
 wait_fn "node2 的 VRF 里出现 $LOCAL_PFX" 20 has_prefix "$N2" "$VRF" "$LOCAL_PFX"
@@ -600,10 +605,13 @@ if has_prefix "$N1" "$CT2" "$REMOTE_PFX"; then
 else
     bad "颜色表 $CT2 里这条前缀没了：开关不该动颜色表"
 fi
-if has_prefix "$N1" "$CT0" "$REMOTE_PFX"; then
-    bad "颜色表 $CT0 里还留着路径：它的唯一下一跳已 Down，计划里不该有它"
+# 这里原来断言"颜色 0 那张颜色表也空了"（双写时代要两份各删一次）。表号公式去掉
+# +10000 之后 $CT0 就是主表 $VRF，再判一次等于把上面的 ABSENT 重说一遍；换成钉
+# 老落点：路径被剔出计划时，不该有一副本表躲在后面没撤。
+if has_prefix "$N1" "$LEGACY_COLOR0" "$REMOTE_PFX"; then
+    bad "表 $LEGACY_COLOR0 里还留着 $REMOTE_PFX：颜色 0 早就不该产生副本表"
 else
-    ok "负向：颜色 0 那张颜色表也空了（路径被剔出计划，不是只改主表）"
+    ok "负向：颜色 0 的路径只从主表 $VRF 撤走（表 $LEGACY_COLOR0 全程是空的）"
 fi
 wait_no_ping "$DST" "开关关：主表没这条前缀 ⇒ 打流断，不回落到昂贵颜色 $COLOR2（§5 语义）"
 num "开关关的这一段 fib.log 尾部："

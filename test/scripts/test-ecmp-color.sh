@@ -18,8 +18,10 @@
 # 第 (5) 件事是 O3-b 的判据，也是"逃生开关关着"（定案）那条规则的实证：
 #       把 wg1 改成颜色 3 再重启 sr-fib，**不是**"主表里那条路径的 preference
 #       变了"，而是**搬表** —— 主表 $VRF 只留颜色 0 的那条（buckets 回 1），
-#       改色的那条只存在于 ColorTable(3,$VRF)=3*1000+10000+$VRF（§4.2 公式）。
-#       同时颜色 0 那条在主表和 ColorTable(0,$VRF) 里各有一份（双写是定案）。
+#       改色的那条只存在于 ColorTable(3,$VRF)=3*1000+$VRF（§4.2 公式，2026-11-03 更正）。
+#       颜色 0 那条只有一份，就落在主表 $VRF —— ColorTable(0,$VRF)==$VRF，不再有
+#       "主表 + 10000+$VRF 双写"。段基址 +10000 当年是为了避开 FRR 占用的 table 1250，
+#       L-3 已经把那条接缝退役，留着只是多一张与主表内容重复的表。
 #       反例长这样：两条路径都留在主表、只差 preference —— 那是逃生开关**打开**
 #       时的形态，归 O4，不是现在这份代码该产出的。
 #
@@ -155,7 +157,9 @@ path_count() {
 
 # §4.2 的表号公式在脚本侧独立算一遍：这一步要断言的正是"sr-fib 落的是不是
 # 这张表"，复用它的输出就成了自己给自己判卷。
-color_table() { echo $(( $1 * 1000 + 10000 + $2 )); }   # <color> <main>
+# 2026-11-03 更正：段基址 +10000 已去掉 ⇒ 颜色 0 的落点就是主表本身。
+color_table() { echo $(( $1 * 1000 + $2 )); }   # <color> <main>
+LEGACY_COLOR0=$((10000 + VRF))                  # 改之前的颜色 0 落点，现在必须是空的
 table_has() {   # <table> <prefix>
     [ -n "$(dump_table "$1" "$2")" ]
 }
@@ -541,9 +545,18 @@ if dump_table "$CT2" "$REMOTE_PFX" | grep -qF "via $OVERLAY_N2 "; then
 else
     ok "颜色表 $CT2 里只有颜色 $COLOR2 那条（颜色 0 没串进来）"
 fi
-table_path "$CT0" "$OVERLAY_N2" 230 &&
-    ok "颜色 0 是双写：主表 $VRF 与颜色表 $CT0 各有一份同一条路径" ||
-    bad "颜色表 $CT0 里没有颜色 0 那条（§4.3 第 5 步要求颜色 0 也建自己的表）"
+if [ "$CT0" != "$VRF" ]; then
+    bad "公式算错：颜色 0 的落点应等于主表 $VRF，脚本算出 $CT0"
+elif table_path "$CT0" "$OVERLAY_N2" 230; then
+    ok "颜色 0 的落点就是主表 $VRF（同一条路径只有一份，不再双写）"
+else
+    bad "主表 $VRF 里没有颜色 0 那条（pref 230）"
+fi
+if table_has "$LEGACY_COLOR0" "$REMOTE_PFX"; then
+    bad "表 $LEGACY_COLOR0 里还有 $REMOTE_PFX：+10000 段基址已退役，颜色 0 不该再产生副本表"
+else
+    ok "负向：表 $LEGACY_COLOR0 是空的（2026-11-03 之前那次 lab 观察到的 10000+$VRF 副本不再出现）"
+fi
 wait_ping "$N1" "${TAP_N2_HOST%/*}" "改色搬表之后仍然可转发（主表还剩一条颜色 0）" 20
 
 info "8. (5) 反向：颜色改回 0 再重启，主表自己回到 2 个 bucket"
@@ -555,7 +568,7 @@ wait_fn "主表 $VRF 又回到 2 个 bucket" 15 have_buckets 2 "$N1" "$REMOTE_PF
 path_pref "$OVERLAY2_N2" 230 &&
     ok "$WG2_IF 那条回到 230：新进程的原地 add（整条替换）把颜色写回了 VPP" ||
     bad "$WG2_IF 那条没回到 230（原地 add 没换掉 VPP 存的 preference）"
-# 颜色表 13xxx 里的旧条目**不会**被这次重启删掉：新进程的上一份计划是空的，
+# 改色那轮的颜色表里的旧条目**不会**被这次重启删掉：新进程的上一份计划是空的，
 # Apply 的删除轮只能删它自己装过的东西。这不是缺陷，是 -reset 的职责边界，
 # 打个数留给读日志的人（真要清干净由收尾的 sr-fib -reset 扫颜色表）。
 info "     （已知行为）颜色表 $CT2 里改色那轮的旧路径仍在：$(dump_table "$CT2" "$REMOTE_PFX" | grep -c '  via ') 条；新进程删不到没装过的表"
