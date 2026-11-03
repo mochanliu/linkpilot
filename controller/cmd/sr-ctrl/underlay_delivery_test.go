@@ -122,7 +122,7 @@ func TestBundleSkipsAPeerWithNoBinding(t *testing.T) {
 	if len(b.Tunnels) != 0 {
 		t.Fatalf("对端没有担保时不该下发隧道规格: %+v", b.Tunnels)
 	}
-	if len(b.Skipped) != 1 || !strings.Contains(b.Skipped[0].Reason, "公钥担保") {
+	if len(b.Skipped) != 1 || !strings.Contains(b.Skipped[0].Reason, "尚未上报该隧道的密钥") {
 		t.Fatalf("node 1 应看到对端缺担保的跳过项，实际 %+v", b.Skipped)
 	}
 }

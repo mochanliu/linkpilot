@@ -23,16 +23,27 @@ type ResetResult struct {
 // 对 API 源安装的条目无效（retval 仍是 0，条目原样留着），只有 API 删得掉。
 func Reset(ctx context.Context, dp DP, vrfs []uint8) (ResetResult, error) {
 	var res ResetResult
+	// 先把整份清单验完，再动手删。这几条检查原来写在删除循环里，于是 {100, 250}
+	// 会先把 VPN 100 连表带路由撤掉、再在 250 上报错：一次"拒绝"留下半删的状态，
+	// 报错点还跟着清单顺序变。reset 是显式的破坏性操作，要么一条都不删，要么按清单删。
 	seen := map[uint8]bool{}
 	for _, vrf := range vrfs {
 		if vrf == 0 {
 			return res, fmt.Errorf("fib: VRF 0 是 global 表（underlay 也在这张表里），reset 会连它一起删，拒绝")
 		}
+		// -reset 读的是磁盘上的 cfg.VRFs，不经过 PlanFrom，所以配置页和 PlanFrom 那两道
+		// 250 闸门在这里都挡不到它：漏进来就会把隧道所在的 overlay 表连表带路由删掉，
+		// 顺带撤走颜色段的 1250/2250… —— 客户流量当场断。
+		if vrf == OverlayTable {
+			return res, fmt.Errorf("fib: VRF %d 是 overlay 保留表（隧道与对外下一跳），不是 VPN，reset 拒绝", vrf)
+		}
 		if seen[vrf] {
 			return res, fmt.Errorf("fib: VRF %d 配了两次", vrf)
 		}
 		seen[vrf] = true
+	}
 
+	for _, vrf := range vrfs {
 		table := uint32(vrf)
 		routes, err := dp.FIBRoutes(ctx, table)
 		if err != nil {

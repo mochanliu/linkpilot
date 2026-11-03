@@ -113,12 +113,12 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	// The tunnel's key slot, not the peer's whole keyring: this end installs
 	// exactly the one attestation that covers the key its peer will hold for this
 	// tunnel. A slot the peer has never reported is the same "nothing to install"
-	// hole a missing key always was -- and saying which slot failed is what makes
-	// a half-upgraded device diagnosable instead of mysterious.
+	// hole a missing key always was. The slot number stays out of the text -- this
+	// reason is rendered to the tenant, and the skip record already carries both
+	// TunnelID and PeerNodeID, so the slot is one lookup away when we debug it.
 	peerBinding := bindingAt(prec.Bindings, t.Slot)
 	if peerBinding == nil {
-		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 的密钥槽 %d 还没有上报 WireGuard 公钥担保（key binding）",
-			peer.NodeID, t.Slot)
+		return wire.TunnelSpec{}, fmt.Errorf("对端设备 %d 尚未上报该隧道的密钥", peer.NodeID)
 	}
 
 	instance, err := tunnelInstance(t.ID)

@@ -70,10 +70,42 @@ func TestResetRejectsBadVRFs(t *testing.T) {
 		want string
 	}{
 		{[]uint8{0}, "VRF 0"},
+		{[]uint8{250}, "overlay 保留表"},
 		{[]uint8{100, 100}, "配了两次"},
 	} {
 		if _, err := Reset(context.Background(), dp, c.vrfs); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("vrfs=%v: err = %v, want 包含 %q", c.vrfs, err, c.want)
 		}
+		if dp.writes != 0 {
+			t.Errorf("vrfs=%v: 被拒绝的清单却写了 %d 次 —— reset 必须在动手删之前就把清单验完", c.vrfs, dp.writes)
+		}
+	}
+}
+
+func TestResetRejectsOverlayVrfWithoutTouchingOthers(t *testing.T) {
+	// 清单里既有真 VPN 又有 250 时的症状：拒绝，但一张表都不许动。
+	// 检查写在删除循环里时，{100, 250} 会先撤掉 VPN 100（连标签带表）再报错，
+	// 于是"这次 reset 失败了"实际留下一个被清空的 VPN —— 客户前缀直接消失。
+	dp := newFakeDP()
+	plan, err := planFrom([]uint8{100},
+		[]RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2")},
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewApplier(dp).Apply(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	before := dp.writes
+
+	if _, err := Reset(context.Background(), dp, []uint8{100, OverlayTable}); err == nil ||
+		!strings.Contains(err.Error(), "overlay 保留表") {
+		t.Fatalf("err = %v, want 拒绝 VPN 250", err)
+	}
+	if dp.writes != before {
+		t.Errorf("被拒绝的清单产生了 %d 次写入（want 0）", dp.writes-before)
+	}
+	if len(dp.routes) != 1 || len(dp.labels) != 1 || len(dp.tables) != 1 {
+		t.Errorf("VPN 100 的状态被动过: routes=%v labels=%v tables=%v", dp.routes, dp.labels, dp.tables)
 	}
 }

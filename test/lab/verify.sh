@@ -364,14 +364,15 @@ for n in 1 2 3; do
         && bad "$c: overlay 表里混进了客户前缀" \
         || ok "$c: overlay 表只有隧道/overlay，没有客户前缀"
     # K 路由的出口是 lo：linux-nl 不镜像这类路由，所以 VPP 里不该再出现
-    # "只用于再分发"的影子条目（旧的 1250 停车场已退役）。
-    # 表号判据在 2026-11-03 换了口径：公式改成 颜色*1000+主表号 之后，overlay
-    # VPN 250 的颜色 1 落点正好是 1250 ⇒ "这张表不存在"不再是退役的证据。改成判
-    # 内容：表可以存在（它是 sr-fib 的颜色表），但里面不许有 zebra 那批
-    # unreachable/blackhole 条目。
-    vppc "$c" show ip fib table 1250 | grep -qE "unreachable|blackhole" \
-        && bad "$c: VPP table 1250 里还有停车场条目（ZAPI 导出没退干净）" \
-        || ok "$c: VPP table 1250 里没有 zebra 的 blackhole 条目（表号本身已归 sr-fib 颜色表用）"
+    # "只用于再分发"的影子表（旧的 1250 停车场已退役）。
+    # 2026-11-04 把口径改回"这张表必须不存在"（更强的判据）。理由：公式是
+    # 颜色*1000+主表号，1250 唯一的合法来源是"VPN 250 配了颜色 1"，而 250 是我们的
+    # overlay 传输域、客户不能用，三处闸门都拒绝它当 VPN（配置页 config_check、
+    # sr-fib 的 PlanFrom、sr-fib -reset 的 Reset）⇒ 真 VPP 里就不该有 1250。
+    # 一旦它出现，只有两种解释：有人绕开闸门装了 VPN 250，或者 ZAPI 停车场没退干净。
+    vppc "$c" show ip fib table 1250 | grep -q "fib_index" \
+        && bad "$c: VPP table 1250 还在（退役的 FRR 停车场没退干净，或 VPN 250 绕过了闸门被当 VPN 用了）" \
+        || ok "$c: VPP table 1250 不存在（导出不再镜像进 VPP，250 也确实没被当成 VPN 用）"
     for m in 1 2 3; do
         [ "$m" = "$n" ] && continue
         retry 20 fib_prefix_not_drop "$c" "${LAN_PFX[$m]}"
