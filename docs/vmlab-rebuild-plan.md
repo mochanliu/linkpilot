@@ -448,18 +448,18 @@ S4-C-2 是带着我上一轮给的修法复测的：两个口的 `ExecStartPre=+
 两枪复现、位置相同，掉的那一口 `vmlab-tap-*` 门超时后 `failed` 且**没有任何人再管它**，
 S4-C-2 客户侧因此断 374.9 秒。⇒ **把接管写进 VPP 的 `unix{exec}` 这条路不幂等**，
 也不是"先把链路拉起来"能修好的（运行期同一条命令在两枪里都成功）。
-修法方向和我已经点过头的姿势、以及你真机 `vpp-tap-config` 的层次都一致：
-接管不放在 VPP `exec` 里，改成"vpp.service 起来之后的一份常驻/后置单元 + 有界重试 + 复检形状"，
-失败就如实报失败，不给 restart 兜底。这个形状 S4-D 已经跑通过一遍（代价 13.6 秒，可再压）。
+修法已定并落地（不再等点头）：**接管不放在 VPP `exec` 里，改成 vpp.service 起来之后的后置单元**
+`vmlab-underlay.service`（oneshot + `RemainAfterExit` + `After=vpp.service`，故意不写 `Requires`），
+由 `vpp.service` 的 `ExecStartPost=+systemctl --no-block restart vmlab-underlay.service` 每次 VPP 起来后拉起；
+清单 `/root/vmlab/underlay.list`（TSV：物理口/TAP/MAC/CIDR/网关）交给 `underlay.sh` → `takeover-if.sh`
+有界重试（40 拍 × 0.5 秒），再搬地址并复检；失败就如实非 0 退出，不给 restart 兜底。
+这个形状 S4-D 已经跑通过一遍（代价 13.6 秒），S4-E 复测压到 0.8～2.4 秒，数字在 §5.7。
 
-待你点头的两条，你选之前我不动手：
-
-- **甲（低风险，我推荐）**：先把仪器修对再打一枪 —— 标志位改成读 `/sys/class/net/<口>/flags` 的 0 号位
-  （不 fork iproute2，也没有逗号问题），和 monitor 同时跑，把"旧实例退出 → 谁在何时置 DOWN/UP →
-  失败那次 create 在哪一刻 bind"钉进同一条毫秒时间线；这一枪本身就是"后置重试接管"这个修法的复测。
-- **乙（会把管理通道置于风险，要你明确批准）**：交换 `startup-s3.conf` 里两条 `exec` 的顺序再打一枪，
-  用来判"每次输的是**第一条**"还是"每次输的都是 **`enp0s8`**"。现有数据分不开这两个假设，
-  分开它只有这一种办法；代价是多一次 restart 的实测中断（管理口 ≈3.4 秒，客户口取决于兜底密度）。
+甲/乙那两条**作废**：你 2026-11-04 的话定了调子——「这虚拟机就在本机上，就算网断了你都能管理」，
+逐毫秒钉根因属于浪费。乙（换 exec 顺序再打一枪）本来只为分开"输第一条"还是"输 `enp0s8`"，
+而两条假设的修法同一个（都不许写在 `exec` 里），分开它对铺 lab 没有增量，所以不打这一枪。
+甲的那半个改动是有效的仪器修正，已经并进 `takeover-if.sh` 的 `netdev_up()`：
+标志位读 `/sys/class/net/<口>/flags` 的 0 号位（IFF_UP），不用 `ip -o link` 的 `state`（那是 IFLA_OPERSTATE，载波态）。
 
 **(6) 我这几枪里自己造成的缺陷（记账，免得下次当成事实引用）**
 
@@ -470,6 +470,98 @@ S4-C-2 客户侧因此断 374.9 秒。⇒ **把接管写进 VPP 的 `unix{exec}`
   读数必须以每行的绝对时间戳为准，不能拿 `MAXT` 当秒数。
 - S4-C 第一枪的 `old pid` 是在 restart 之后才取的（S3-e 遗留），导致"换新 pid"这条判据永不触发；
   S4-C-2 已修，读数是 +0.332s。
+- **S4-E 的采样循环是坏的**：四个"直到成功才退出"的探针在 restart **之前**就已经命中，
+  于是把发射前的稳态记成了功能时间戳（`addr.done` 那条读数是 `+−1.998s`，负号就是它露馅的）。
+  这一枪的功能读数因此改用两条独立打流（缺号数换算），下一条仪器要改成**固定窗口 + 每拍记 ok/no**。
+
+### 5.7 S4-E 实测：接管改成后置单元后，判据③ 过了（2026-11-04，CPE4）
+
+场景同 S4-C：一次 `systemctl restart vpp`，两个口都在清单里。前后同一口径。
+
+| 项 | 旧形状（写进 VPP `exec`） | 新形状（`vmlab-underlay.service` 后置 + 有界重试） |
+|---|---|---|
+| 2 条 `itf-pair` 回来 | 稳定丢第一条，客户侧 374.9 秒（靠原型自愈压到 13.6 秒） | **+1.886 秒** |
+| `lcp-x0`（客户口）地址回来 | 没回来 | **+1.777 秒** |
+| `vpp0`（管理口）地址回来 | +2 秒级 | **+2.584 秒** |
+| 物理口全局地址 | 被 networkd 补回 ⇒ 双应答 | 全程 **0** 个 |
+| 客户侧可见中断 | 374.9 秒 / 13.6 秒 | **≈0.8 秒**（0.2 秒间隔缺 4 包） |
+| 管理侧可见中断 | ≈3.4 秒 | **≈2.4 秒**（0.1 秒间隔缺 24 包） |
+| 重复应答（DUP） | 1065 条 | **0** |
+
+journal 里能看见是 `ExecStartPost` 把 underlay 拉起来的，重试真的在干活：`enp0s8` 用了 3 拍、
+`enp0s9` 用了 2 拍（一拍 0.5 秒）。顺带否证了 §5.6(5) 里"每次必输第一条 exec"那个假设——
+新形状下清单顺序里的 `enp0s8` 反而先回来，所以那条实验（乙）连做都不用做。
+
+幂等性也量了：形状已经在位时 `underlay.sh` **0.384 秒**短路返回，不碰任何在跑的连接和地址。
+⇒ 这一条是"后置单元"能被反复触发的依据，不是"跑一次就作废"的一次性脚本。
+
+`check-selfheal.sh` 因此从 11 条涨到 **13 条**（C7 换成查新单元 + 查 `ExecStartPost` + 查 `startup` 里不许有 `exec` 行），
+CPE4 两个口 restart 前后各跑一遍：13 PASS / 0 FAIL。
+
+### 5.8 S4-F 实测：照新形状铺 CPE1/2/3，装包与收口各踩了一条（2026-11-04）
+
+三台都走 `test/lab/vmlab/bringup-mac.sh` → 盒内 `vm-bringup.sh` 的 A(装包)→B(落产物)→C(管理通道)→D(netplan 收口)，
+每台末尾双口闸门 **13 PASS / 0 FAIL**，WAN 侧 `ping` 通 192.168.1.1、客户侧 `ping` 通各自对端。
+两条只在"第二台、第三台"才暴露出来的缺陷，都已修进脚本：
+
+1. **装包会把盒子饿死（CPE1）**。`vm-bringup.sh` 原来是「先装 VPP，再写 `vm.nr_hugepages=0`」。
+   vpp 包的 postinst 会把 `vpp.service` 拉起来，这时发行版 `80-vpp.conf` 已经抢下 **818 页 = 1636MB**，
+   1967MB 的盒子只剩 6MB `available`，apt 的 Post-Invoke 钩子 `apt-check` 直接僵住（1 分 44 秒没进展），
+   `apt-get install` 永不返回。改成**装 VPP 之前**就写清单 + `systemctl stop vpp` + `sysctl -w vm.nr_hugepages=0`。
+2. **netplan 收口只做了一半（CPE1、CPE3 各一种表现）**。
+   - CPE1：只改磁盘 yaml + `systemctl restart systemd-networkd` 不算数。networkd 读的是
+     `/run/systemd/network/10-netplan-<口>.network` 这份**生成物**，restart 不会重新生成它，
+     旧文件里的 `Address=192.168.1.101/24` 被原封不动再配一遍 ⇒ 阶段 D 的判据 FAIL。
+     修法：写 yaml 后 **`netplan generate`** 先断言生成物里 `Address=` 为 0 条，再 restart networkd，
+     然后连续观察 20 秒（networkd 补地址不是立刻发生，会跟着接管产生的链路事件再来一次）。
+   - CPE3：阶段 C 的闸门在 `enp0s9` 报「物理口还有地址 + 3 秒内新增 1 条 l3 mac mismatch」。
+     这不是形状坏，是**判据放错了阶段**：那一刻 networkd 还握着旧地址，underlay 刚 flush 完它就补回来。
+     地址归属这条判据只有在阶段 D 收口之后才可判 ⇒ 双口闸门从 C 挪到 D 末尾（D4）。
+
+`vm-bringup.sh` 的判停也修了三处（都是"失败了但没停下来"那类）：
+`vpp.service.d` 目录不存在时要先 `mkdir -p`（新盒子没有这个目录，第一次跑 C 直接写空）；
+`systemctl restart vpp` 返回时 pid 和 `cli.sock` 都还没就绪（`vppctl` 报 `connect: Connection refused`），
+所以 pid 和 CLI 两步都改成有界等待，等不到就打印 journal 并停手；
+`vppctl show lcp` 不认 `lcp` = `linux_cp` 没加载 = drop-in 没生效，现在直接判停而不是往下跑出一片连带 FAIL。
+
+### 5.9 S4 形状收口实测：CPE4 补齐 ⇒ 四台形状一致，外加一条必须点名的性质（2026-11-04）
+
+CPE4 是 S3 的打样盒，形状是从手工实验一路改出来的，所以这一枪让它回到和另外三台同一条流水线上：
+`bringup-mac.sh CPE4 A/B/C/D` 全走脚本，末尾双口闸门 **13 PASS / 0 FAIL**。四台再逐台复扫一遍
+（不是拿各自装机时的旧结论交差）：
+
+| 盒子 | vpp pid | enp0s9→vpp0（WAN） | enp0s8→lcp-x0（CUST） |
+|---|---|---|---|
+| CPE1 | 12575 | 13 PASS / 0 FAIL | 13 PASS / 0 FAIL |
+| CPE2 | 5925 | 13 PASS / 0 FAIL | 13 PASS / 0 FAIL |
+| CPE3 | 6103 | 13 PASS / 0 FAIL | 13 PASS / 0 FAIL |
+| CPE4 | 66098 | 13 PASS / 0 FAIL | 13 PASS / 0 FAIL |
+
+这一枪踩到的两条：
+
+1. **钥匙块的 bash 优先级把 CPE4 卡在装包第一步**。原来写成
+   `[ -f 钥匙 ] || curl … && { 转成 keyring; } || fail "拿不到钥匙"`，
+   bash 解析成 `((A || B) && C) || D` —— 钥匙**已经存在**时 A 为真、B 不跑，但 C 照样跑，
+   而 C 里那句 `curl …/gpg` 是 404 的旧 URL，于是整块落到 D 报"拿不到 fdio/release 的 GPG 钥匙"。
+   CPE1/2/3 是空钥匙所以没暴露。改成显式 `if [ ! -f 钥匙 ]; then … fi`，每步单独判停。
+   （同一个 bug 的另一半：CPE4 磁盘只剩 115M 时 `apt-get` 会僵，脚本 A0 先清 `/var/lib/apt/lists`
+   与 cache，实测腾到 549M，装完 frr 10.7.1-0~ubuntu24.04.1 仍剩 464M。）
+2. **接管后的管理口批量吞吐崩塌，这条要当性质记住，不是当 bug 修**。
+   同一个 45MB 产物包：接管前走内核路径 **3.16 秒**（≈14MB/s），管理口被 VPP 接管后
+   `ssh cat > /dev/null` **超过 400 秒**（<25KB/s），差约 500 倍。
+   心跳、JSON、ssh 交互这类小包不受影响（四台的 ssh 一直稳），受影响的只有**批量传输**。
+   后果是 `bringup-mac.sh` 原来每个 phase 无条件重推 45MB ⇒ phase C 之后的每一枪都会卡在传输上
+   （实测跑到 10 分钟被我停掉）。改成先 `sha256sum` 盒子上的产物、只对不上的才推
+   （`test/lab/vmlab/bringup-mac.sh:51-71`），复跑 D 用 **51 秒**、显示"产物新推 0 份"、闸门仍 13/0。
+   停 scp 之后逐份核过哈希，8 份产物与 Mac 侧全等，没留半截文件。
+   真机也是这个形状，所以以后要给接管后的盒子传大件，只有两条路：先解管再传，或在接管前传完。
+
+判据本身也收了一处口径：`check-selfheal.sh` 的 C7 原来硬编码
+`/root/vmlab/startup-vmlab.conf /root/vmlab/startup-s3.conf` 两个文件名去 grep `exec` 行，
+而 VPP 实际跑哪份是 `vpp.service.d/50-vmlab.conf` 的 `ExecStart=-c` 决定的；CPE4 上还躺着
+S3 时代的 `startup-s3.conf` 和 5 个 `.bak-*` 死文件。现在 C7 从 `systemctl cat vpp.service`
+取出在跑的那份再判，死文件移进 `CPE4:/root/vmlab/retired-s3/`（盒子上的 mv，没进仓库）。
+改完四台 8 次复扫仍全 PASS。
 
 ## 6. 装包与产物
 
@@ -544,9 +636,13 @@ plugin-core 25,045 / libvppinfra 648 / frr 40,317 / frr-pythontools 242。
 第三件的"必须 restart networkd 才算数"在管理口上又量实一遍，代价是 1065 个重复应答（§5.6(2)）。
 **但判据③ 没过**：一次 `systemctl restart vpp` 稳定丢掉 startup 里第一条 exec 的接管，
 我给的 `ExecStartPre` 修法复测被否证；原型自愈器能把客户侧从 374.9 秒压到 13.6 秒（§5.6(3)(4)）。
-⇒ **铺 CPE1/2/3 之前先等你在 §5.6(5) 的甲/乙之间点头**，因为"接管写进 VPP `exec`"这条开机重放路径
-现在已知不幂等，照它铺三台等于把同一个缺陷乘三。
-`check-selfheal.sh` 现在是 **11 条**判据（S4-C-2  restart 前后各跑一遍，`base-*` / `after-*` 四份全 PASS）。
+→ 2026-11-04 这条已经收掉：接管从 VPP `exec` 挪进后置单元 `vmlab-underlay.service`
+（由 `vpp.service` 的 `ExecStartPost` 每次拉起），判据③ 过，数字在 §5.7；§5.6(5) 的甲/乙**作废**。
+→ 同一天照新形状铺完 CPE1/2/3（§5.8）并把打样盒 CPE4 拉回同一条流水线，
+四台逐台复扫 **8 次（每台双口）全 PASS**，形状一致（§5.9）。
+`check-selfheal.sh` 现在是 **13 条**判据（§5.7：C7 拆成「查新单元在位」+「查 `ExecStartPost`」
++「查 startup 里不许有 `exec` 行」；本次再把第三查的口径从硬编码文件名改成读实际在跑的那份）。
+**S4 只剩最后一件**：四台入网（预授权 → enroll → 心跳），然后 `start.sh` 清单起满、冷开复现一次并记秒表。
 
 **S5　客户侧**：3 台 cust 装 FRR 10.7.1；**把 cust12 改到 `172.31.12.13/24` 并删掉那三条手工
 `scope link` 静态路由**；客户 IP 一律用 loopback 播（你拍的第 5 条）。

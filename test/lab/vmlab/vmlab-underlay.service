@@ -1,0 +1,14 @@
+[Unit]
+Description=VM lab：VPP 起来之后把物理口接管进 VPP 并搬地址（有界重试，失败如实报错）
+# 只排顺序、不写 Requires：这个单元由 vpp.service 的 ExecStartPost 以 --no-block 拉起。
+# 若这里写 Requires=vpp.service，vpp 的 start job 和它的 job 会互相排队；若把接管写进
+# VPP 的 unix{exec}，一次 restart 会稳定丢掉第一条接管的创建（docs §5.6(3) 实测）。
+After=vpp.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/root/vmlab/underlay.sh
+
+[Install]
+WantedBy=multi-user.target
