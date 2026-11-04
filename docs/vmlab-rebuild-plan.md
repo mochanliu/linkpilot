@@ -451,7 +451,8 @@ S4-C-2 客户侧因此断 374.9 秒。⇒ **把接管写进 VPP 的 `unix{exec}`
 修法已定并落地（不再等点头）：**接管不放在 VPP `exec` 里，改成 vpp.service 起来之后的后置单元**
 `vmlab-underlay.service`（oneshot + `RemainAfterExit` + `After=vpp.service`，故意不写 `Requires`），
 由 `vpp.service` 的 `ExecStartPost=+systemctl --no-block restart vmlab-underlay.service` 每次 VPP 起来后拉起；
-清单 `/root/vmlab/underlay.list`（TSV：物理口/TAP/MAC/CIDR/网关）交给 `underlay.sh` → `takeover-if.sh`
+清单 `/root/vmlab/underlay.list`（TSV 6 列：物理口 / TAP / netdev 真实 MAC / CIDR / 网关(可空) / 真实 MTU，
+第 6 列与 `sync_mtu()` 见 §5.10）交给 `underlay.sh` → `takeover-if.sh`
 有界重试（40 拍 × 0.5 秒），再搬地址并复检；失败就如实非 0 退出，不给 restart 兜底。
 这个形状 S4-D 已经跑通过一遍（代价 13.6 秒），S4-E 复测压到 0.8～2.4 秒，数字在 §5.7。
 
@@ -562,6 +563,38 @@ CPE4 是 S3 的打样盒，形状是从手工实验一路改出来的，所以�
 S3 时代的 `startup-s3.conf` 和 5 个 `.bak-*` 死文件。现在 C7 从 `systemctl cat vpp.service`
 取出在跑的那份再判，死文件移进 `CPE4:/root/vmlab/retired-s3/`（盒子上的 mv，没进仓库）。
 改完四台 8 次复扫仍全 PASS。
+
+### 5.10 S4 尾巴三件实测：MTU 压回、MPLS 默认表、G 段开机清单（2026-11-04，提交 474ab69）
+
+- **MTU 压回**：af-packet 口在 VPP 里出生记 9000，内核 netdev 真实是 1500。控制器
+  `tunnelMTU()` 按设备上报那格算预算 ⇒ 算出假的 8868，agent 按真实链路
+  （1500−8−124=1368）硬拒装。这个数只能显式传：VPP 起来后 `set interface mtu packet 1500`
+  会把内核 netdev 反写成 **1544**，从活口读就读到脏值 ⇒ 清单加第 6 列"出生 MTU"，
+  `underlay.sh` 的 `sync_mtu()` 在每条口搬完地址后压回真实值，失败只置 rc 不 continue
+  （管理口是唯一能登进去的路）。判据 C3b 读数是 VPP `host-enp0s9`=1500 = 清单期望，
+  内核那侧 1544 是 VPP 反写的、不参与判定。
+- **MPLS 默认表**：`sw_interface_set_mpls_enable` 的 `retval=-3` 在源码里含义唯一 ——
+  VPP 26.06 `src/vnet/mpls/interface.c` 第一步 `fib_table_find(FIB_PROTOCOL_MPLS,
+  MPLS_FIB_DEFAULT_TABLE_ID)` 找不到就回 `VNET_API_ERROR_NO_SUCH_FIB`，什么都不动；
+  VPP 不自动建这张表。容器台一直是 lab 脚本补的（`setup-node.sh`/`bringup.sh`/
+  `loop-bringup.sh` 的 P-3），VM 台按 S7 把配置退回控制台后没有这一笔，所以踩穿。
+  前后数字：CPE1 基线 3 次"只装上一部分 … retval=-3"、agent 退避 40 秒到第 4 次才收敛，
+  且收敛那一刻表 locks 里是 `CLI:1`（我手工建的那张，属路径上的手工补丁）；
+  CPE2/3/4 走脚本后首次 apply **0 次 -3**、与 agent 启动同秒收敛。
+  现在四台 wg 口都是 `1368/0/0/0`、`show interface features` 的 mpls-input 段全是
+  none configured、`show mpls fib` 每台数到 1 张 `MPLS-VRF:0`。
+- **G 段（开机清单）**：单台 16.1 秒装完并 enable，装的是产品那份
+  `controller/deploy/sr-box/{start.sh,sr-box.service,sr-box-watch.service,sr-box-watch.timer}`，
+  不是 lab 自己写的第六套启动逻辑。装完四台 `start.sh check` 一致：vpp/agent/frr/fib 有、
+  tunnels 2/2/3/3 条、route 与 bridge 是"配置在，进程没跑"（那时 rrs 还没发、
+  sr-frr 的两个键还空）。闸门：四台 × 双口共 8 次 `check-selfheal.sh` 全 PASS
+  （每台 12 条判据、0 FAIL），C5 功能 8 个口各打 20 包 0% loss，
+  WAN rtt 最差 25.357ms、CUST 最差 37.123ms（VM 跑在 Mac 宿主上的形状）。
+- **留下的产品缺口（那时没动 Go 代码）**：`controller/internal/vppapi/messages.go` 没注册
+  `mpls_table_add_del`、`sr-box/start.sh` 不建 MPLS 默认表 ⇒ 任何全新真机盒子第一次装隧道
+  都会吃同样的 -3，只能靠 agent 退避重试 + 外部建表。
+
+S5 与 S6 的实测数字、以及这一轮新抓到的三条缺陷在 **§9**。
 
 ## 6. 装包与产物
 
