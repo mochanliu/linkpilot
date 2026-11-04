@@ -671,3 +671,86 @@ plugin-core 25,045 / libvppinfra 648 / frr 40,317 / frr-pythontools 242。
 - **别人的现场**（`srwg-*` / `lp-*` / `osc-*` / `sr-lab-vcpe` / `lcp-probe` / `vpplab`）不碰、
   不重启它们的 VPP；**容器回收由你统一做**，我不 `docker rm`。
 - **真机 192.168.1.100**：这一轮只读，不改它任何配置（`vpp-tap-config` 那套是抄的，不是动的）。
+
+## 9. S5 / S6 实测与三条未收口的缺陷（2026-11-05 凌晨）
+
+### 9.1 S5 客户侧：三台都到位
+
+装包走 `test/lab/vmlab/cust-nat-install.sh`（Mac 侧）+ `cust-frr.sh`（VM 侧）：三台 cust 只挂
+intnet、天生无出网，临时插一块 NAT 网卡装 `frr=10.7.1-0~ubuntu24.04.1` + `frr-pythontools`，
+装完拔回。VirtualBox 7.2.22 不能热改禁用槽，所以整条路是两次停机。实测（cust3）：
+apt 86.33s、ACPI 关机 3.96s、开机到 ssh 回来 37.37s；三台收尾复核都只剩 enp0s8 一张网卡、
+静态地址、默认路由 0 条、FRR 版本一致。
+
+第一份配置走 `cust-config.sh`（逐条抄 `loop-bringup.sh:300-347`，数值同 `:93-98`），
+差量热更、不 restart。改后复核（2026-11-05 07:1x 那一轮）：
+
+| 台 | `frr-reload.py --test` 差量 | pid（zebra/ospfd/bgpd） | loopback 进路由表 | 邻居 |
+| --- | --- | --- | --- | --- |
+| cust12 | 0 行 | 823 / 850 / 843 | `172.16.12.1/32` | 见 §9.3，当时卡 Init |
+| cust3  | 0 行 | 836 / 855 / 841 | `172.16.3.1/32` | `172.31.3.1 AS 65103` **Established**，PfxRcd 1 / PfxSnt 2 |
+| cust4  | 0 行 | 822 / 849 / 842 | `172.16.4.1/32` | `172.31.4.1 AS 65104` **Established**，PfxRcd 1 / PfxSnt 2 |
+
+按你拍的三条：一条 `ip route` 都没写、LAN 前缀不播（只播 loopback）、不发 VRRP。
+口径修掉一处假绿：`frr-reload.py --test` 的节内是裸行、没有 `+`/`-` 前缀，
+`grep '^[+-]'` 恒等于 0；改成和产品 `internal/apply/apply.go` 的 `frrDelta()` 同口径解析
+两节，并加"改前差量必须 > 0"硬闸（故意多写一段 `router bgp 65099` 自检得 5 行）。
+
+### 9.2 缺陷①：`sr-box-watch.service` 每 60 秒把刚起的进程杀掉
+
+场景：四台盒子的 overlay 面（sr-route + sr-frr）永远起不来，控制台的 v3 一直"未确认"。
+代码走到哪：`controller/deploy/sr-box/sr-box-watch.service` 是 `Type=oneshot`、
+**没有** `RemainAfterExit=yes`、也没写 `KillMode`（默认 `control-group`）；
+`start.sh:144` 的 `launch()` 用 `nohup ... &` 把 sr-route/sr-frr 起在这个 unit 的 cgroup 里。
+为什么这么写：oneshot 的语义是"跑完就结束"，主进程一退 systemd 就把这个 unit 置为
+非活动并收割整个 cgroup —— `nohup` 只挡 SIGHUP，挡不住 cgroup 级的 SIGKILL。
+症状（CPE1，2026-11-04 23:08 那一轮，journal + `/var/log/sr-box/*.log` 同秒对齐）：
+`23:08:28 sr-route: status on 127.0.0.1:19001` → `23:08:30 sr-route: stopped`；
+`23:08:29 sr-frr: 反向导入已开：1 个 VPN` → `23:08:30 sr-frr: 停止`；
+`23:08:30.264 systemd: sr-box-watch.service: Deactivated successfully`。
+0.5s 采样的 `/proc` 口径：sr-route 只活在 47.0–49.1s（约 2.1s）、sr-frr 只活在 48.6–49.1s
+（≤1s），两者的 cgroup 都是 `/system.slice/sr-box-watch.service`；同一轮里从 ssh 会话
+（`session-320.scope`）起的 sr-agent / sr-fib 活满 71.6s。`/run/sr-box/{bridge,route}.pid`
+留下的是已经死了的 pid（43460 / 43437）。
+要动什么：unit 加 `KillMode=process`（只杀主进程、不连坐 cgroup）。
+**不加 `RemainAfterExit=yes`** —— 那样 unit 会一直是 active，timer 下一分钟的 start job
+不再重跑 `ExecStart`，看门狗直接失效。备选（形状更正但改动大）：sr-route/sr-frr 各给一个
+`Type=simple` 单元，看门狗退成检查器；容器 lab 没有 systemd，会多出一套并行的启动形状。
+
+### 9.3 缺陷②：网卡多播过滤让盒内 FRR 收不到 OSPF hello（容器台被 veth 掩盖）
+
+场景：cust12 能看到 CPE1/CPE2 两个邻居、永远停在 `Init/DROther`（9 分钟不动）；
+CPE1 侧 `show ip ospf interface` 的 `Neighbor Count is 0`，即盒子完全听不到客户侧。
+取证：`tcpdump -i lcp-x0 proto ospf` 24 秒只抓到盒子里外发的两条 hello，
+`lcp-x0` 的 `rx_packets` 增量 **0** —— 内核一个从客户 LAN 来的包都没收到；
+单播正常（cust12↔172.31.12.1/.2 各 3 发 3 收 0% 丢包）；
+VPP `trace add af-packet-input` 20 秒里没有一条 `224.0.0.5` 的包，说明 hello 连网卡的
+RX 过滤都没过。`ip -d link show enp0s8`：`allmulti 0`、mc list 里只有 `224.0.0.1` 和 IPv6 那几个
+—— FRR 的组播订阅是加在 lcp TAP（`lcp-x0`）上的，物理 netdev `enp0s8` 根本不知道要收
+`01:00:5e:00:00:05`，e1000 的硬件多播过滤直接丢帧。
+反证（一条命令，不动任何进程/配置）：CPE1 `ip link set dev enp0s8 allmulticast on` 之后，
+盒内 `show ip ospf neighbor` 在 18 秒内变成 `172.31.12.13 … Full/Backup`（cust12 是 DR）。
+> 这是**手工补丁，不是产品修复**，目前只在 CPE1 上留着当证据；CPE2/3/4 没动。
+> 环路测试在产品修法落地前不许跑（含手工补丁的路径不算数）。
+为什么容器台没暴露：容器版客户口是 veth，没有硬件多播过滤。
+VPP 26.10 的 `create host-interface` 没有 `promisc`/多播相关选项（`show commands` 里
+grep `promisc|mcast|multicast|maddr` 零条），所以修法只能在 netdev 侧：接管这个口的时候
+一并 `allmulticast on`。同一条路会挡住 VRRP（224.0.0.18），这一轮没发 VRRP 配置、
+所以那条只是预测、没测。
+
+### 9.4 缺陷③：全新盒子第一次 apply 必失败在第 5 段（sr-frr 热更）
+
+代码走到哪：`internal/apply/srfrr.go:113` 的 `if push` 先 `pushSrfrr()`（PUT unix socket），
+失败就 `return "sr-frr 热更失败（%s 未改动，活进程还是旧表）"`，于是 `:128` 的
+`writeFileSync` 根本不执行；而 `cmd/sr-frr/main.go:699` 在 `export_vrfs` 与 `import_rules`
+都为空时 `log.Fatal` 拒绝启动。两个凑在一起 = 盘上的两键要进程活着才能写、进程要这两键非空
+才肯起。容器台是靠 `bringup.sh` 手工先写死非空值绕过的；VM 台按 S7 定案把配置退回控制台，
+于是空值起步。
+现状：四台的 `/etc/sr-frr.json` 已经由看门狗那轮 `sr-apply boot` 重放补齐
+（`export_vrfs=[0]`、`import_rules` 1 条），四台 `127.0.0.1:8089/status` 都报
+`config{version:3, source:"apply", error:"sr-frr 热更失败…dial unix /run/sr-frr/control.sock…"}`
+—— 因为 sr-frr 被缺陷①每分钟杀一次，socket 永远不在。agent 侧重试退避是 5s～5min
+（`internal/agent/tunnel.go:92`），所以缺陷①修完后不需要重启任何东西，≤5 分钟自己收敛。
+要动什么（待拍，涉及 §5.3 的"先 PUT 后落盘"次序）：`applySrfrr` 在"进程本来就没跑"时
+按开机重放那条路走（`push=false`，只落盘，交给清单起进程）—— 这是首次启动、不是重启，
+没有"活进程还是旧表"可骗；其余情况维持现在的硬失败。
