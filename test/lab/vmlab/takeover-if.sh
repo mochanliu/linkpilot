@@ -7,6 +7,13 @@
 # 用法：takeover-if.sh <物理口> <TAP 名> <该口 netdev 的真实 MAC> [重试拍数] [每拍间隔秒]
 # MAC 只许从 VBoxManage showvminfo / 真机烧录值传进来，不许从活口读：
 # 上一次接管失败时活口 MAC 可能已被反向写脏（docs §5.4 的 S3-h/S3-j）。
+#
+# 这个脚本只管"接管 + 配对"这一件事，MTU 不在这里做 —— 结构原因：underlay.sh 对本脚本
+# 非 0 退出是 `continue`，也就是"这条口的搬地址整段跳过"。管理地址是唯一一条能登录进去的
+# 路，任何非致命校验（MTU 就是这样）都不许挂在这条路上；MTU 改到搬完之后再做，见 underlay.sh 的 sync_mtu。
+# （2026-11-04 CPE2 那次失联的最初归因是错的：journal 里 vmlab-underlay 每一次都 Finished、
+# 地址都落到了 TAP 上。真实原因是我以前台 ssh 串了三台跑 phase C —— phase C 会重启 VPP，
+# 管理地址在 VPP 建的 TAP 上，重启窗口里连接没有回程，ssh 卡住不报错；随后我又 reset 了 VM。）
 set -u
 IF=${1:?物理口}
 TAP=${2:?TAP 名}

@@ -1,9 +1,15 @@
 #!/bin/bash
-# VM lab 一台 CPE 盒子的装包 + 落产物 + 管理通道形状。在盒子里以 root 跑，参数从 /root/vmlab/box.conf 读。
-# 阶段可单跑（--phase A|B|C|D|all），顺序是有讲究的：
-#   A 装包  B 落产物  C 管理通道形状（此时物理口地址还在，SSH 不会丢）  D 才把 netplan 里的地址注释掉。
+# VM lab 一台 CPE 盒子的装包 + 落产物 + 管理通道形状 + 入网 + 盒内管道 bootstrap。在盒子里以 root 跑，参数从 /root/vmlab/box.conf 读。
+# 阶段可单跑（--phase A|B|C|D|E|F|G|all），顺序是有讲究的：
+#   A 装包  B 落产物  C 管理通道形状（此时物理口地址还在，SSH 不会丢）  D 才把 netplan 里的地址注释掉
+#   E 入网（身份 + 心跳 + 接口清单）  F 盒内三份管道配置 + FRR 空壳  G 装产品那份 sr-box 开机清单。
 # D 放最后：C 一跑，underlay.sh 就把地址搬到 TAP 上了；先注释 netplan 再装 VPP，
 # 中途 VPP 起不来就成了没有地址、只能从虚拟机控制台进去的盒子。
+# E/F 只做 loop-bringup.sh 的 P-5/P-6 那两段（产品没有对应下发路径的本地管道字段 + FRR 起进程）。
+# 隧道、每隧道端口、overlay /32、VRF/RT、导通组、RR 绑定、路由泄露、客户口地址、OSPF/BGP、VRRP、MTU
+# 全部退回控制台 —— 这一枪里一条都不配，配了就是绕控制台。
+# F 里那次 restart frr 是点名的中断：只在 running-config 还是空壳时允许（脚本里有闸门），
+# 客户配置上线之后要改 daemons 只能走 frr-reload.py，本阶段不许重跑。
 set -u
 CONF=${BOX_CONF:-/root/vmlab/box.conf}
 [ -r "$CONF" ] || { echo "FAIL 缺 $CONF（由 Mac 侧 bringup-mac.sh 生成）"; exit 1; }
@@ -13,12 +19,15 @@ PHASE=all
 while [ $# -gt 0 ]; do
     case "$1" in
         --phase) PHASE=$2; shift 2;;
-        *) echo "用法：vm-bringup.sh [--phase all|A|B|C|D]"; exit 1;;
+        *) echo "用法：vm-bringup.sh [--phase all|A|B|C|D|E|F|G]"; exit 1;;
     esac
 done
 
 VPP_VER=${BOX_VPP_VER:-26.06-release}
 FRR_VER=${BOX_FRR_VER:-10.7.1-0~ubuntu24.04.1}
+# agent 的身份目录：入网写 device key / 证书 / state.json 的地方，也是 F 阶段那份 route.json
+# 里 identity_dir 指的地方。两者必须同一个目录 —— sr-route 从这里读证书，指错就报「没有证书」。
+IDENT=${IDENT:-/etc/sdwan/identity}
 WANT_SR_SHA=${BOX_SR_SHA:?box.conf 里要有 sr_wg_plugin.so 的 sha256}
 WANT_CRYPTO_SHA=${BOX_CRYPTO_SHA:?box.conf 里要有 crypto_openssl_plugin.so 的 sha256}
 PLUGDIR=/usr/lib/x86_64-linux-gnu/vpp_plugins
@@ -27,6 +36,9 @@ KEYDIR=/etc/apt/keyrings
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 disk() { df -h / | tail -1 | awk '{print "已用 "$3"/"$2" 剩 "$4}'; }
 fail() { echo "FAIL $*"; exit 1; }
+# 身份目录里那份 state.json 是 sr-agent 写的（E 阶段的产物），F 阶段拿它拼管道配置。
+node_of()   { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("node_id",""))'    "$IDENT/state.json" 2>/dev/null; }
+tenant_of() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("tenant_id",""))'  "$IDENT/state.json" 2>/dev/null; }
 
 # ---------------------------------------------------------------- A 装包
 if [ "$PHASE" = all ] || [ "$PHASE" = A ]; then
@@ -135,8 +147,11 @@ install -m 0644 /root/vmlab/vmlab-underlay.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable vpp.service vmlab-underlay.service > /dev/null 2>&1
 
-printf '%s\t%s\t%s\t%s\t%s\n' "$IF_CUST" "$TAP_CUST" "$MAC_CUST" "$CIDR_CUST" "" > /root/vmlab/underlay.list
-printf '%s\t%s\t%s\t%s\t%s\n' "$IF_WAN" "$TAP_WAN" "$MAC_WAN" "$CIDR_WAN" "$GW" >> /root/vmlab/underlay.list
+# 第 6 列是真实 MTU（VBox 网卡的出生值，接管前在盒子里量到的）。af-packet 口在 VPP 里
+# 出生记 9000，控制器拿上报值算隧道 MTU ⇒ 9000 会配出 8868 的隧道口，而 agent 按真实链路
+# 算预算会拒装。所以接管时必须把 VPP 那份压回真实值，且只能显式传（见 takeover-if.sh 的 fix_mtu）。
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$IF_CUST" "$TAP_CUST" "$MAC_CUST" "$CIDR_CUST" "-" "${MTU_CUST:?box.conf 里要有 MTU_CUST}" > /root/vmlab/underlay.list
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$IF_WAN" "$TAP_WAN" "$MAC_WAN" "$CIDR_WAN" "$GW" "${MTU_WAN:?box.conf 里要有 MTU_WAN}" >> /root/vmlab/underlay.list
 
 chmod +x /root/vmlab/takeover-if.sh /root/vmlab/underlay.sh /root/vmlab/check-selfheal.sh
 systemctl restart vpp.service
@@ -231,6 +246,192 @@ for spec in "$IF_CUST|$CIDR_CUST|$TAP_CUST|$PEER_CUST" "$IF_WAN|$CIDR_WAN|$TAP_W
         say "D4 $i1 闸门 FAIL："; grep -E 'FAIL' "/tmp/gate-$i1.log"; fail "$i1 的形状没过闸门"
     fi
 done
+fi
+
+# ---------------------------------------------------------------- E 入网（身份 + 心跳 + 接口清单）
+if [ "$PHASE" = all ] || [ "$PHASE" = E ]; then
+CTRL=${CTRL_ADDR:?box.conf 里要有 CTRL_ADDR}:${CTRL_PORT:?box.conf 里要有 CTRL_PORT}
+[ -s /root/vmlab/ca.pem ] || fail "缺 /root/vmlab/ca.pem：Mac 侧没把控制器 CA 推上来（bringup-mac.sh）"
+mkdir -p "$IDENT" && chmod 700 "$IDENT"
+# 0600：这是这台盒子用来担保控制器的唯一一份根证书，进不了别人的写权限。
+install -m 0600 /root/vmlab/ca.pem "$IDENT/pinned_ca.pem"
+
+# 起 agent：setsid + 重定向，让它脱离这次 ssh 会话活下来（容器版用 docker exec -d，这里是同一形状）。
+# 入网码走 --claim 的位置参数，不写进 box.conf、不进任何日志文件；它会出现在 agent 自己的 argv 里
+# （loop-bringup 同一口径），所以这台盒子上任何打印 argv 的调试都不许做。
+start_agent() {
+    local claim=${1:-}
+    local argv=(/usr/local/bin/sr-agent
+        --ctrl "$CTRL"
+        --ca "$IDENT/pinned_ca.pem"
+        --id "$IDENT" --serial "$HOST_LABEL"
+        --preauth "$HOST_LABEL"
+        --status 127.0.0.1:8089
+        --vpp-api /run/vpp/api.sock)
+    [ -n "$claim" ] && argv+=(--claim "$(cat "$claim")")
+    setsid nohup "${argv[@]}" >>/var/log/sr-agent.log 2>&1 </dev/null &
+}
+
+before=$(node_of)
+say "E0 入网前：node_id=[${before:-无}] sr-agent=[$(pgrep -x sr-agent | tr '\n' ' ')]"
+if [ -n "$before" ]; then
+    # 已有身份：这一枪只保证 agent 在跑（比如刚冷开、 systemd 单元还没装起来的场合），不再带码入网。
+    if pgrep -x sr-agent >/dev/null; then
+        say "E1 已有身份 node_id=$before，agent 在跑 —— 不动它"
+    else
+        say "E1 已有身份 node_id=$before，agent 没在跑 —— 不带码重新起"
+        start_agent
+    fi
+else
+    [ -s /root/vmlab/claim.txt ] || fail "缺 /root/vmlab/claim.txt（Mac 侧先跑 vm-console.py code，再由 bringup-mac.sh 推上来）"
+    start_agent /root/vmlab/claim.txt
+    # 判据不是 sr-agent 的退出码（它就不该退出），是「身份文件里出 node_id」——有界等待，等到为止。
+    i=0
+    while [ $i -lt 60 ]; do
+        before=$(node_of)
+        [ -n "$before" ] && break
+        pgrep -x sr-agent >/dev/null || { tail -20 /var/log/sr-agent.log | sed 's/^/       /'; fail "sr-agent 已经退出且没有 node_id（日志在上面）"; }
+        i=$((i + 1)); sleep 0.5
+    done
+    [ -n "$before" ] || { tail -20 /var/log/sr-agent.log | sed 's/^/       /'; fail "30 秒内 $IDENT/state.json 里没有 node_id"; }
+    # 码是一次性名额（这张 4 次），用完就从盒子上删掉；Mac 侧那份仍留在 ~/srvmlab/state/claim.txt。
+    rm -f /root/vmlab/claim.txt
+    say "E1 入网拿到 node_id=$before（$i 拍 × 0.5 秒），盒子侧入网码已删"
+fi
+
+# 心跳：控制器侧「看到这台」的本地旁证是 agent 状态口的 heartbeats 计数（AGENTS.md §2 的前后对比）。
+i=0; hb=""
+while [ $i -lt 30 ]; do
+    hb=$(curl -s --max-time 2 http://127.0.0.1:8089/status |
+         python3 -c 'import json,sys;print(json.load(sys.stdin).get("heartbeats",""))' 2>/dev/null)
+    case "$hb" in ''|*[!0-9]*) ;; *) [ "$hb" -ge 1 ] && break;; esac
+    pgrep -x sr-agent >/dev/null || { tail -20 /var/log/sr-agent.log | sed 's/^/       /'; fail "等心跳时 sr-agent 退出了"; }
+    i=$((i + 1)); sleep 1
+done
+case "$hb" in ''|*[!0-9]*) tail -20 /var/log/sr-agent.log | sed 's/^/       /'; fail "30 秒内 127.0.0.1:8089 没有 heartbeats≥1（控制器 $CTRL 连不上？）";; esac
+say "E2 心跳 $hb 次（$i 秒），node_id=$(node_of) tenant=$(tenant_of) 序列号=$HOST_LABEL"
+say "E3 身份目录：$(ls -1 "$IDENT" | tr '\n' ' ')"
+fi
+
+# ---------------------------------------------------------------- F 盒内管道 bootstrap（P-5 + P-6）
+if [ "$PHASE" = all ] || [ "$PHASE" = F ]; then
+NODE=$(node_of); TENANT=$(tenant_of)
+[ -n "$NODE" ] && [ -n "$TENANT" ] || fail "先跑 --phase E：身份目录里没有 node_id/tenant_id"
+
+# 三份本地管道配置：我是谁 / 状态口 / socket 路径。**rrs、tunnels、vrfs 一律留空是故意的**
+# —— 这三个键归控制台的第 4 段，脚本里配上去就等于绕过控制台（loop-bringup 的 P-5 同口径）。
+mkdir -p /etc/sdwan /var/lib/sdwan /var/lib/sr-frr /var/log/frr
+cat > /etc/sdwan/route.json <<EOF
+{
+  "tenant": "${TENANT}",
+  "device_id": ${NODE},
+  "identity_dir": "${IDENT}",
+  "serial": "${HOST_LABEL}",
+  "hold_sec": 12,
+  "tls_server_name": "${RR_ADDR:?box.conf 里要有 RR_ADDR}",
+  "rrs": [],
+  "tunnels": [],
+  "vrfs": [],
+  "status_addr": "127.0.0.1:19001"
+}
+EOF
+cat > /etc/sdwan/fib.json <<EOF
+{
+  "status_url": "http://127.0.0.1:19001/status",
+  "status_addr": "127.0.0.1:19011",
+  "vpp_socket": "/run/vpp/api.sock",
+  "poll_sec": 1,
+  "vrfs": [0],
+  "tunnels": []
+}
+EOF
+cat > /etc/sr-frr.json <<EOF
+{
+  "status_url": "http://127.0.0.1:19001/status",
+  "zserv_socket": "/run/frr/zserv.api",
+  "state_file": "/var/lib/sr-frr/state.json",
+  "poll_sec": 1,
+  "export_vrfs": [],
+  "import_rules": []
+}
+EOF
+say "F1 管道三份就位：node=$NODE tenant=$TENANT serial=$HOST_LABEL（rrs/tunnels/vrfs 留空，等控制台）"
+
+# P-6：FRR 起进程、配置是空壳。真配置由控制台的第 1 段经 frr-reload.py 差量下发。
+# 这道闸门必须有：FRR 一旦带上客户配置（客户口地址 + router 段），重启就是断客户流量的操作，
+# AGENTS.md §1 第 1 条禁止；那时候要改 daemons 只能走 frr-reload，不许再跑这一枪。
+RUNNING=$(vtysh -c 'show running-config' 2>/dev/null | grep -cE '^(interface|router|ip route|ipv6 route) ')
+[ "${RUNNING:-x}" = 0 ] || fail "盒内 FRR 已经有 $RUNNING 行配置（不是空壳）—— 这一步只许在控制台发布之前跑一次"
+sed -i 's/^zebra=no/zebra=yes/; s/^bgpd=no/bgpd=yes/; s/^ospfd=no/ospfd=yes/; s/^staticd=no/staticd=yes/' /etc/frr/daemons
+printf 'frr defaults traditional\nhostname %s\nlog file /var/log/frr/frr.log\nservice integrated-vtysh-config\n!\n' "$HOST_LABEL" > /etc/frr/frr.conf
+touch /etc/frr/vtysh.conf
+chown -R frr:frr /etc/frr
+# 点名中断：下面这一次 restart frr 会让 zebra/bgpd/ospfd/staticd 全部换 pid。
+# 此刻盒子里既没有客户配置（上面那道闸门刚证明 running-config 是空壳）也没有隧道，
+# 客户可见影响 = 0；真配置上线之后这条路径归 frr-reload.py，本阶段不再重跑。
+before_pids=$(pgrep -x zebra; pgrep -x bgpd; pgrep -x ospfd; pgrep -x staticd)
+systemctl restart frr || { journalctl -u frr -n 20 --no-pager | tail -20; fail "systemctl restart frr 失败"; }
+i=0
+while [ $i -lt 40 ]; do
+    vtysh -c 'show version' >/dev/null 2>&1 && break
+    i=$((i + 1)); sleep 0.5
+done
+vtysh -c 'show version' >/dev/null 2>&1 || fail "vtysh 20 秒内没响应"
+vtysh -c 'show running-config' | grep -q "^hostname $HOST_LABEL" || fail "空壳配置没应用（running-config 里没有 hostname $HOST_LABEL）"
+after_pids=$(pgrep -x zebra; pgrep -x bgpd; pgrep -x ospfd; pgrep -x staticd)
+say "F2 FRR 空壳已起：pid 前[$(echo $before_pids | tr '\n' ' ')] 后[$(echo $after_pids | tr '\n' ' ')]，$(vtysh -c 'show running-config' | grep -cE '^(interface|router|ip route|ipv6 route) ') 条业务配置行（应为 0）"
+[ -S /run/frr/zserv.api ] && say "F3 zebra 的 ZAPI socket 在位：/run/frr/zserv.api" || fail "/run/frr/zserv.api 不在（sr-frr 起不来）"
+systemctl enable frr > /dev/null 2>&1 && say "F4 frr.service enabled（冷开重放靠它）" || fail "frr.service enable 失败"
+fi
+
+# ---------------------------------------------------------------- G sr-box 开机清单（用产品那一份，不在 lab 里另写一套）
+if [ "$PHASE" = all ] || [ "$PHASE" = G ]; then
+SB=/usr/local/lib/sr-box
+[ -s /root/vmlab/sr-box/start.sh ] || fail "Mac 侧没把 controller/deploy/sr-box/ 推上来（bringup-mac.sh 的推送清单）"
+[ -n "$(node_of)" ] || fail "先跑 --phase E：身份目录里没有 node_id"
+[ -s /etc/sdwan/route.json ] || fail "先跑 --phase F：/etc/sdwan/route.json 不在"
+
+install -d -m 0755 "$SB"
+install -m 0755 /root/vmlab/sr-box/start.sh "$SB/start.sh"
+install -m 0644 /root/vmlab/sr-box/sr-box.service /root/vmlab/sr-box/sr-box-watch.service \
+                /root/vmlab/sr-box/sr-box-watch.timer /etc/systemd/system/
+mkdir -p /etc/sr-box
+# 只写这台盒子与真盒子不一样的那几项：控制面在 Mac（box.conf 的 CTRL_ADDR:CTRL_PORT）、
+# store 根在 /var/lib/sdwan/store（与 loop 台同口径）、VPP 由 vpp.service 管所以清单只等不启。
+# 入网码和 pinned CA 都不进这里 —— 码是一次性的，CA 已经在身份目录里了。
+cat > /etc/sr-box/sr-box.conf <<EOF
+SR_BOX_AGENT_CTRL=${CTRL_ADDR:?}:${CTRL_PORT:?}
+SR_BOX_AGENT_APPLY=1
+SR_BOX_AGENT_TUNNELS=1
+SR_BOX_APPLY_ROOT=/var/lib/sdwan/store
+SR_BOX_VPP_START=no
+EOF
+say "G1 清单装好：$SB/start.sh + 3 份薄壳单元 + /etc/sr-box/sr-box.conf（隧道/配置从此走控制台）"
+
+# 换 agent 的参数必须由人停一次：清单的规矩是"已在跑的进程绝不重启"（start.sh 头部第 2 条），
+# 它见到 sr-agent 在跑就直接报 running 过去，不会把 E 阶段那次不带 -apply/-tunnels 的替换掉。
+# 点名中断：这一次停 + 起实测约 2 秒，客户可见影响 0 —— 此刻隧道 0 条、配置 0 版（还没发布过），
+# 数据面没有任何一个包经过 sr-agent；断的只是控制器这一侧的心跳一拍。
+pkill -x sr-agent 2>/dev/null
+i=0
+while pgrep -x sr-agent >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -gt 20 ] && fail "sr-agent 停了 10 秒还在（不做强杀第二遍，先手工查）"
+    sleep 0.5
+done
+say "G2 E 阶段那次不带 -apply/-tunnels 的 agent 已停（$i 拍 × 0.5 秒）"
+
+# 第一遍 up：agent 会以 -apply -tunnels 起来；route/fib/bridge 现在起不来是**预期**的，
+# 因为 /etc/sdwan/route.json 里的 rrs 还是空的（那份要等控制台发布、agent 落第 4 段）。
+# 所以上面那行 g_rc 允许非 0，非 0 的那几步由 sr-box-watch.timer 每 60 秒补齐。
+say "G3 第一遍 up（此刻 rrs 未落盘，route/fib/bridge 报 SKIP/FAIL 是预期的）"
+"$SB/start.sh" up
+say "G3 up 跑完（清单自己的退出码见上面每一步的结论行）"
+systemctl daemon-reload
+systemctl enable sr-box.service sr-box-watch.timer >/dev/null 2>&1 || fail "sr-box 单元 enable 失败"
+systemctl start sr-box-watch.timer || fail "sr-box-watch.timer 起不来"
+say "G4 常驻：sr-box.service enabled（开机跑一遍）+ sr-box-watch.timer 在跑（每 60 秒补哪步缺哪步）"
+say "G5 现状 check：$("$SB/start.sh" check | tr '\n' '|' | sed 's/|$//')"
 fi
 
 say "完成（phase=$PHASE）磁盘 $(disk)"

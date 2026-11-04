@@ -45,6 +45,21 @@ echo "C3 LCP 配对在位"
 LCP=$(vc show lcp | grep -m1 "host-$IF" | tr -s ' ' | cut -d' ' -f3-5)
 [ -n "$LCP" ] && ok "itf-pair: $LCP" || bad "show lcp 里没有 host-$IF"
 
+# af-packet 口在 VPP 里出生记 9000（2026-11-05 实测），控制器拿设备上报的 MTU 算隧道预算
+# ⇒ 上报 9000 就配出 8868 的隧道口，而 agent 按真实链路算预算会拒装。接管必须把它压回真实值。
+# 期望值取清单第 6 列；内核 $IF 那个数不参与判定 —— set interface mtu 会把它反写成 1544。
+echo "C3b VPP 里这口的 MTU 是真实值（不是 af-packet 出生那格 9000）"
+EXP_MTU=$(awk -F'\t' -v n="$IF" '$1 == n {print $6}' /root/vmlab/underlay.list 2>/dev/null)
+VPP_MTU=$(vc show interface "host-$IF" | awk -v n="host-$IF" '$1 == n {split($4, m, "/"); print m[1]}')
+case "$EXP_MTU" in
+    ''|0) bad "清单里 $IF 的第 6 列（真实 MTU）是空/0：underlay.list 是旧版，重跑阶段 C 生成" ;;
+    *)  if [ "$VPP_MTU" = "$EXP_MTU" ]; then
+            ok "VPP host-$IF=$VPP_MTU = 清单期望 $EXP_MTU（内核 $IF=$(cat "/sys/class/net/$IF/mtu" 2>/dev/null)、$TAP=$(cat "/sys/class/net/$TAP/mtu" 2>/dev/null)）"
+        else
+            bad "VPP host-$IF=[$VPP_MTU] ≠ 清单期望 [$EXP_MTU]"
+        fi ;;
+esac
+
 echo "C4 VPP 收得进本机 IP（判据① 口径：dpo-receive + 计数在涨）"
 fibc() { vc show ip fib | grep -A3 -E "^${IP}/32$" | grep -m1 -oE 'to:\[[0-9]+:[0-9]+\]'; }
 cnt() { echo "$1" | sed -E 's/to:\[([0-9]+):([0-9]+)\]/\1 \2/'; }
