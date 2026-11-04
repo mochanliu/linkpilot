@@ -165,8 +165,13 @@ ip route replace default via 192.168.1.1 dev vpp0 metric 20
    改成建口时给 `hw-addr`，整条路径不再出现这条命令，也就没有可被反写的那一步。
 3. **被接管的那个口，netplan 里不许再留它的地址**（`addresses:` 那一行注释掉）。
    留着的话 networkd 会在链路事件时把地址补回物理口——S3-e 就补了一次（+2.793s）。
-   它没有把功能抢坏（VPP 侧照样应答），但形状是脏的，而且补地址那一下本身多了一个
-   "内核和 VPP 同时认为自己持有这个地址"的窗口，不要留。
+   **S4-A 把这条的代价量准了**：补回去的那一刻起，同一个 IP 有**两个应答者**（VPP 经 `lcp-sync`
+   答一次、内核经物理口答一次），对端 `ping` 从下一个包开始**每个 echo 收到两条应答**
+   （324 个 seq 全是 `DUP!`），直到把物理口地址手工 flush 掉才停。所以这条不是"形状脏、不影响功能"，
+   是**客户可见的重复应答**，见 §5.5。
+   ⚠️ 还有一层：注释只改磁盘上的 yaml，**networkd 手里那份是开机时读进内存的旧配置**，
+   `networkctl reconfigure <口>` 实测清不掉，`systemctl restart systemd-networkd` 才真的换掉
+   （改完 netplan 必须做这一步，否则下一次链路事件照样补地址）。
 
 客户口同形状但用途不同：`create host-interface name enp0s8 hw-addr <enp0s8 真实 MAC>` +
 `lcp create host-enp0s8 host-if lcp-x0`（**这个名字不改** —— 控制器渲染的配置包里写死了它，
@@ -175,7 +180,8 @@ ip route replace default via 192.168.1.1 dev vpp0 metric 20
 ⇒ 每台 CPE 有两条 TAP：`vpp0`（管理/underlay，真机口径）和 `lcp-x0`（客户侧给 FRR 用，容器 lab 口径）。
 
 > S3 打样时为了保住 SSH，**实际接管的是客户口 `enp0s8`，但 TAP 名字临时叫 `vpp0`**。
-> 管理口 `enp0s9` 的接管（含 `ip route replace default` 那一下会不会把 SSH 掉一下）**还没做过**，
+> 2026-11-04 S4-A 已经把它改成 `lcp-x0`，`vpp0` 这个名字现在是空的、留给管理口（数字与取证见 §5.5）。
+> 管理口 `enp0s9` 的接管（含 `ip addr flush dev enp0s9` 那一下会不会把 SSH 掉一下）**还没做过**，
 > 挂在 S4 第一台头上，见 §5.4 末尾的"S4 必须补的三件事"。
 
 ### 5.3 S3 的三个判据（过不去就不许往下铺）
@@ -269,6 +275,69 @@ VM 内核直通 ~0.3ms 级；VPP 接管后 `min/avg/max/mdev = 0.804/13.935/140.
    真机能跑靠的是一致性。所以我们不抄那五个值，抄的是"三处一致"这个不变量。
 3. **客户口 TAP 名改成 `lcp-x0`**（产品代码写死了它），S3 打样用的 `vpp0` 是临时名。
    这条落在 S4 的装包脚本里，不是落在文档里。
+   → **2026-11-04 S4-A 已做完**，装包脚本就是按口参数化的 `s4-gen-takeover.sh`，数字见 §5.5。
+
+### 5.5 S4-A 实测：客户口 TAP 改名 `lcp-x0`，顺带把"物理口被补地址"量准（2026-11-04）
+
+为什么要先做这一步：`vpp0` 这个名字是管理口的（真机口径），而 S3 打样时它被客户口临时占着；
+管理口接管（判据② 的那一下）必须在 `vpp0` 空出来之后做。产物按口分开：
+`s4-gen-takeover.sh <物理口> <CIDR> <TAP> <netdev 真实 MAC> [网关]` 一台可以装两个口，
+写的是 `/root/vmlab/setup-<口>.vpp` 和 `/etc/systemd/system/vmlab-tap-<TAP>.service`；
+S3 那份单口产物（`setup-s3.vpp` + `vmlab-tap-config.service`）已退役到 `/root/vmlab/retired-s3/`。
+
+**改名窗口本身（窗口 A，`out/s4a.205025/bringup.log` + `cust4:/root/s4a_ping.log`）**
+
+新单元是刚创建的、从没跑过，因此不在 `systemctl restart vpp` 的事务传播集合里 —— 这一轮的地址是
+我 `systemctl start vmlab-tap-lcp-x0` 手工起起来的，所以**窗口 A 的耗时不算自愈判据**，只算改名窗口：
+TAP 重现 +2.745s、地址落到 `lcp-x0` +2.913s、本机打通对端 +3.572s；旧名 `vpp0` 确认消失，
+三处 MAC 仍全等 `08:00:27:65:45:1d`。客户侧同一时刻的 `ping -i 0.2`：`icmp_seq` **248–257 共 10 个包
+无应答**（按这一段实测节奏 0.318s/包 ≈ 3.2 秒），零条 `Destination Host Unreachable`。
+
+**改名的副产品才是这一轮最值钱的读数：那个"脏形状"会让客户看到重复应答**
+
+改名窗口之后，`172.31.4.1` 被补回了物理口 `enp0s8`（和 S3-e 同一次现象）。这一次我把它对客户的
+影响量出来了：从 `icmp_seq` 259 起，**每个 echo 收到两条应答**（`DUP!`，324 个 seq 全是），
+一直持续到我手工 `ip addr flush dev enp0s8`（seq 582 处立刻停止）。
+⇒ §5.2 硬约束 3 原来的写法（"没有把功能抢坏，只是形状脏"）**不成立**，已就地改成"同 IP 两个应答者"。
+机制：`lcp-sync` 让 VPP 侧 `host-enp0s8` 也持有这个地址并应答一次，内核拿着物理口上那份又应答一次。
+
+**补地址到底是谁干的：是 networkd 手里的陈旧内存配置，不是磁盘上的 netplan**
+
+逐步排除，每步都有读数：
+
+- `/run/systemd/network/10-netplan-enp0s8.network` 里**已经没有 `Address=` 行**（netplan 早前生成过一轮），
+  可 `networkctl status enp0s8` 仍显示 `State: routable (configuring)` + `Address: 172.31.4.1`。
+- `networkctl reconfigure enp0s8`：rc=0，**地址没被清掉**（试过，读数在上面那段里）。
+- 手工 `ip addr flush dev enp0s8` 之后连续观察 15 秒：**没有任何东西补回来** —— 说明它只在链路事件
+  （VPP 抢占/释放导致的 `Link DOWN → Gained carrier`，journal 里每次 VPP 重启各一组）时才补。
+- `systemctl restart systemd-networkd` 之后：`enp0s8` 无全局地址、`lcp-x0` 保住 `172.31.4.1/24`、
+  `enp0s9` 的 `192.168.1.104/24` 与默认路由原样（`ss` 里我这条 `192.168.1.4:64287` 会话还活着）。
+
+**窗口 B —— 判据③ 在产品命名下复测（`out/s4b.205501/restart.log` + `cust4:/root/s4b_ping.log`）**
+
+单元已经是 `active(exited)`，这一轮我没有手工干预，`systemctl restart vpp` 之后它自己再跑了一次
+（`ExecMainStartTimestamp` 12:50:29 → 12:55:04）。实测：
+
+| 时刻 | 发生了什么 |
+| --- | --- |
+| +2.866s | `lcp-x0` 在内核里重新出现 |
+| +3.280s | `172.31.4.1` 回到 `lcp-x0`（真机形状） |
+| +3.306s | `ping -I lcp-x0 172.31.4.2` 通 ⇒ 设计形状下通道恢复 **3.306 秒** |
+| —— | **"地址回 enp0s8" 这一项：90 秒内没发生**；"回退态打通"同样没发生 |
+
+客户侧：440 个包里 `icmp_seq` **104–109 共 6 个无应答**（≈1.7 秒），**`DUP!` 行数 0**。
+比 S3-e 的 6.094 秒快，差别就来自上面那条修复——地址不再被补回物理口，门不用再等一轮。
+`check-selfheal.sh` 七条全 PASS（C7 的口径也改了：按 TAP 找 `vmlab-tap-*.service`，
+再用固定单元名 `vmlab-tap-config` 会误报 FAIL）。
+
+**这一轮要带到 S4 后面的两条**
+
+1. **改完 netplan 必须 `systemctl restart systemd-networkd`**（或冷开），只注释 yaml 文件不算数。
+   装包脚本目前只改文件、不 apply，所以这一步得显式做在流程里；做之前先确认它不会把还在内核手里的
+   管理口抖坏（这次实测 `enp0s9` 地址与默认路由不变、SSH 存活，但那是"重启 networkd"，
+   不是 `netplan apply`）。
+2. **判据要用客户侧的"有没有重复应答"，不只是本机能不能通。** 本轮如果没有那条 `DUP!` 计数，
+   `ping` 统计里 1.67% 丢包 + 324 duplicates 很容易被当成"抖动"糊过去。
 
 
 ## 6. 装包与产物
@@ -337,6 +406,9 @@ plugin-core 25,045 / libvppinfra 648 / frr 40,317 / frr-pythontools 242。
 中断：每台停机一次（时长本步骤实测）。
 **S4 还欠着 §5.4 那三件事**：管理口 `enp0s9` 接管（含判据② 那一下的 SSH 存活实测，detached 脚本 +
 `VBoxManage` 兜底）、TAP 名落成真机/产品口径的 `vpp0` 与 `lcp-x0`、netplan 里被接管口的地址必须注释掉。
+→ 2026-11-04 进度：**第二件做完**（客户口已改 `lcp-x0`，`vpp0` 空出来了，数字在 §5.5）；
+第三件只做了"改文件"，**还必须补 `systemctl restart systemd-networkd`** 才算数（§5.5 那条要带到 S4 的
+两条之一）；第一件（管理口接管）是 S4 剩下的第一件事，用户已点头用"带自动回滚 + 先 CPE4"的姿势做。
 
 **S5　客户侧**：3 台 cust 装 FRR 10.7.1；**把 cust12 改到 `172.31.12.13/24` 并删掉那三条手工
 `scope link` 静态路由**；客户 IP 一律用 loopback 播（你拍的第 5 条）。
