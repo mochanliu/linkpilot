@@ -1302,6 +1302,19 @@ timer=active`，并把看门狗最近一次退出码与时刻打出来（实测�
     bash test/lab/vmlab/vm-verify.sh    # 判红绿（退出码 0 = 无 FAIL）；台账缺失会先要 vm-ledger.py
     bash test/lab/vmlab/vm-status.sh    # 十段只读快照，数字与 vm-verify 同源
 
+#### 现役产物是哪一份（别看错版本）
+
+口径写在他本机的 `~/srvmlab/MANIFEST.md`（不进仓库，避免和提交历史混在一起）。2026-11-05 夜刷新的那一版里三件事要点名：
+
+1. 在跑的只有三件新产物：`sr_wg_plugin.so`（`9267d28d…`）、`sr-agent`（`d2ad8519…`）在四台盒上，
+   `sr-ctrl`（`35493b63…`）在 Mac 上。这三件的源内容 = `a5ee41a` + `d949434`。
+2. `sr-route` / `sr-fib` / `sr-frr` / `sr-apply` / `sr-rr` **新编了一份但没铺**，四台盒上跑的仍是 11-04 那代
+   （`5789c2c0…` / `41c04d57…` / `9114bdff…`），`sr-apply` 是 11-05 早上那份（`d17f40be…`）。
+   不铺是决定不是遗漏 —— 今晚四个修复不需要它们，而换 `sr-route`/`sr-fib` 要重启这两个进程，
+   一重启就抢 RR 会话，就是 §9.15 缺陷⑧ 那个机制。
+3. 盒上的回滚件（`.pre-tel` / `.pre-fix4`）逐台列了哈希；CPE4 缺缺陷④之前的那份底，
+   且"缺陷④那晚实际铺上去的 agent"（`29ce6114…`）在 Mac 侧没留底，要复原得从 `de156c0` 重编。
+
 #### 断电/Mac 重启之后
 
 1. 拉起七台虚拟机：`for v in CPE1 CPE2 CPE3 CPE4 cust12 cust3 cust4; do VBoxManage startvm "$v" --type headless; done`。
@@ -1850,6 +1863,9 @@ agent: 建 BFD 会话 sw_if=5: vppapi: bfd_udp_add 失败，VPP retval=-101`，�
   唯一需要重启 VPP 的是**换插件**这个部署动作本身（缺陷 B），它撞的是缺陷⑦（#268）的形状，
   已单独记录，没被塞进"修丢包"里顺手做。**补一条：这次 VPP 重启还在 CPE2 上引出了缺陷⑧（§9.15），
   那一处中断当时没写出来，现在写在这里。**
+- 代码落点（分支 `feat/vbond-control-plane`，已推 gitee）：`a5ee41a` = 问题 1，
+  `d949434` = 问题 2/3/4，`1eaf93c` = 本节的文档。产物对应关系与"编了没铺"的那五件写在
+  `~/srvmlab/MANIFEST.md`（见 §9.11 的"现役产物是哪一份"）。
 - 新增待拍（不自己决定）：BFD 定时旋钮改不动活会话（本节③末）、
   `overlay_pending` 文案未提隧道改动（问题 1 末）、缺陷⑥ #262、缺陷⑦ #268、缺陷⑧（§9.15）。
   另有 #267（绑核对照）待做。
