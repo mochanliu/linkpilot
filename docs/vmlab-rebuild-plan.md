@@ -1260,10 +1260,10 @@ timer=active`，并把看门狗最近一次退出码与时刻打出来（实测�
    属于产品该保证的，不是 lab 自己配的）。
 2. 没有独立终端机（容器台的 lab-termN）：客户视角用 cust 的 loopback 代打，链路里少一跳。
 3. 站点 12 没配 VRRP（S6 拍板这轮不发），主备切换不在判据里。
-4. 缺陷④（#260）、缺陷⑥（#262）都还没动代码。④的**显示口径**在 verify 里封住了
-   （`vm-verify.sh:370-377`：回执 `ok=true` 必须和 §3 实测的口名/绑定计数同时成立，两个口径并排打出来），
-   但触发场景（单独重启 VPP 后 agent 不重建 wg 口）不在判据里。⑥这一轮抓到 3 条 WARN，
-   就是它在客户视角的复现，方案（抑制窗口 / 检测时间与轮询周期的约束关系）还等他拍。
+4. 缺陷④（#260）已在 §9.12 收口（VM 台三段实测），缺陷⑥（#262）还没动代码。④的**显示口径**
+   在 verify 里封住了（`vm-verify.sh:370-377`：回执 `ok=true` 必须和 §3 实测的口名/绑定计数同时成立，
+   两个口径并排打出来），触发场景（单独重启 VPP 后 agent 不重建 wg 口）现在也有判据外的实测数字。
+   ⑥这一轮抓到 3 条 WARN，就是它在客户视角的复现，方案（抑制窗口 / 检测时间与轮询周期的约束关系）还等他拍。
 
 ### 9.11 S8 把手：lab 现在怎么自己复核、怎么登进去、断电之后怎么拉起来（2026-11-05）
 
@@ -1316,9 +1316,215 @@ timer=active`，并把看门狗最近一次退出码与时刻打出来（实测�
    这一条按 AGENTS.md §1 第 3 条（重连不许让数据面抖动）当作要求记着，但没有这轮的实测数字，
    要用之前先照 §9.10 的口径补一次前后对比。
 
-#### 等拍的四件（这一轮没有替我决定任何东西）
+#### 等拍的（这一轮没有替我决定任何东西；缺陷④ 已于 §9.12 收口）
 
 1. 缺陷⑥（#262）：摘路要不要抑制窗口 / 连续确认，BFD 检测时间与 sr-fib 轮询周期要不要有约束关系。
-2. 缺陷④（#260）：VPP 重启后 agent 不重建 wg 隧道但仍报 `ok=true`。
+2. ~~缺陷④（#260）~~ —— 已修并实测，见 §9.12。它留下两条**新的**待拍，写在 §9.12 末尾：
+   sr-fib 要不要补 VPP API 重连、缺口 G-2（隧道表的归属）由产品接管还是让 lab 把手常驻。
 3. `arp_ignore=1` 要不要像容器台那样进 VM 台判据（§9.10 未覆盖第 1 条）。
 4. 七台 VM 的 VBox 自启要不要打开。
+
+### 9.12 缺陷④（#260）收口：VPP 单独重启后，agent 现在自己否掉旧回执、换掉死句柄、第一轮重建（2026-11-05，A→D 四段实测）
+
+#### 缺陷长什么样（场景）
+
+CPE4 上跑着三条隧道（wg1003 / wg1004 / wg1007）、BFD 三条全 Up、六个方向的业务 ping 0% 丢包。
+这时候只重启 VPP 一个进程（`systemctl restart vpp`）。VPP 的配置只在内存（§5.10「隧道层磁盘恢复
+不了」），所以它一起来，三个 wg 口连同 BFD 会话一起没了。管理通道由 `vmlab-underlay.service`
+补接管（S4-C 实测 6.094s 自愈），所以 ssh 还进得去 —— 但客户流量已经全断。
+
+按 §9.10 的口径读一遍盒子：
+
+```
+pid=202309 wg=0 names=none bfd=0 bfd_up=0
+"tunnel":{"capable":true,"applying_version":8,"applied_at_unix":1793860776,"ok":true,"tunnels":3}
+```
+
+控制器上看到的是「v8 装上、3 条隧道、ok=true」，数据面上是 0 个 wg 口。这就是 #260 的原句：
+**不重建，还报成功**。
+
+#### 代码一步步走到哪（为什么它会报成功）
+
+1. `TunnelSync` 的结论存在 `t.state` 里（`internal/agent/tunnel.go` 的 `State()`），它是**上一次
+   成功收敛那份回执的拷贝**。`applied_at_unix` 是上一次成功的时间，不是"现在还成立"的断言。
+2. 心跳把这份 state 附到回执上（`cmd/sr-agent/main.go:335` 一带：`req.Tunnel = st.tunnelReport()`），
+   控制器照它显示。
+3. 重建的唯一触发点是隧道对账循环 `Sync()`（`tunnel.go:409`），它被 Kick 唤醒后先看闸：
+   `version == desired && OK` 就直接 return —— VPP 重启没有带来新版本号，控制器那边的期望还是 v8，
+   而 state 自己不会变。**于是现成的自愈那段代码（清句柄 → 重连 → 按快照从头收敛）一步都走不到。**
+4. 也就是说这个洞没有"到期"的时候：state 永远说 v8 装好了，直到有人改隧道配置或重启 sr-agent 进程。
+   阶段 A 实测到 1065 秒（约 18 分钟）它还是 `ok=true tunnels=3 / wg=0`，客户 ping 93.33% 丢包。
+
+#### 第一半：让心跳那份接口清单来否掉回执（已提交的那次改动）
+
+盒子上的心跳本来就带一份数据面接口清单（`wire.HeartbeatRequest.Ifaces`，由
+`agent.NewInventoryReporter` 读，`cmd/sr-agent/main.go:205`），不用新读一次数据面。
+`TunnelSync.VerifyDataplane`（`tunnel.go:288`，实现 `verifyDataplaneWith` `:306`）拿这份读数去核对
+上一次回执声称装好的口名，按**接口名**（`wg<user_instance>`）而不是 sw_if_index 判，因为重建后
+index 会变而名字是产品口径。`ifs == nil` 是"这次没上报"，不判；空清单是一次真实读数，判。
+
+阶段 C 装的就是这一半（sr-agent md5 `4031aab871da0c0a695615290cae55a4`）。它生效了 —— 心跳一到就把
+结论否掉（`/var/log/sr-agent.log`，盒子钟 07:03:46）：
+
+```
+隧道回执被数据面否掉：数据面里没有回执声称装好的 3 条隧道口（wg1003、wg1004、wg1007）：VPP 重启过？下一次收敛从头来
+```
+
+**但否掉之后盒子并没有好。** 同一个窗口里接着是 13 次一模一样的失败，退避一路涨到上限：
+
+```
+07:03:46 隧道配置 v8 没装上（连续 1 次，5s 后重试）: 读接口表（解析隧道出口）: write unix @->/run/vpp/api.sock: write: broken pipe
+07:03:56 连续 2 次，10s 后重试
+07:04:06 连续 3 次，20s 后重试
+07:04:26 连续 4 次，40s 后重试
+07:05:06 连续 5 次，1m20s 后重试
+07:06:27 连续 6 次，2m40s 后重试
+07:09:10 连续 7 次，5m0s 后重试   ← 从这里开始封顶
+07:39:25 连续 13 次，5m0s 后重试   ← 25 分钟后还在撞同一句话
+```
+
+阶段 C 的 170 秒采样窗口里，`wg` 一直是 0、`bfd_up` 一直是 0（采 146 行，状态形状只变过两次）。
+所以这一半只把"骗控制器"治住了，没把"重建"治住。
+
+#### 第二半的根因：对端关掉的连接，vppapi 没归一成 ErrClosed
+
+重建路径其实一直在等一个信号。`Sync()` 每轮完都会调 `dropDeadConnection(err)`
+（`tunnel.go:416`），它的门是（`tunnel.go:266-269`）：
+
+```go
+if err == nil || !errors.Is(err, vppapi.ErrClosed) {
+    return
+}
+```
+
+这道闸的注释（`:259-265`）写的正是这件事：不动就会"拿着一条死句柄每轮撞同一个错，盒子停在
+配好了但没在跑"。它当时没触发，原因在 `vppapi` 的写路径：
+
+- `sendErr()`（改前）只在 `case <-c.closed:` 那一个分支里把错误包成 `ErrClosed`。`c.closed`
+  只有在**我们自己调过 `Client.Close()`** 时才会关（`Close()` 在 `:131-139`）。
+- VPP 重启是**对端**把 API 连接拆了。这时 `c.closed` 没关，`writeFrame` 写回来的是一个裸 errno，
+  文本就是日志里那句 `write unix @->/run/vpp/api.sock: write: broken pipe`。
+- 读循环 `readLoop()`（`:239`）确实把断开原因记进了 `c.err`（`:260` 的 `c.err.Store(&e)`），
+  但它从不关 `c.closed`，所以那条信息在 `sendErr` 里根本没人看。
+
+`errors.Is(裸 EPIPE, ErrClosed)` 恒为 false ⇒ `dropDeadConnection` 恒为 no-op ⇒ 句柄永远是那条死的。
+同一条客户端还被观测表回报复用（`cmd/sr-agent/report.go:107`），所以那一分钟里日志全是同一句话的复读。
+对照组很说明问题：只读那份接口清单的 `InventoryReporter` **本来就有**重连纪律
+（`internal/agent/inventory.go:80-88`：读失败就 `Close()` 并置 nil，下次心跳重新注册），
+所以同一次故障里它只报了一句"这次心跳不带清单"就恢复了 —— 缺口只在隧道这条写路径上没有归一。
+
+#### 动了什么（只动一处）
+
+`controller/internal/vppapi/vppapi.go:513` 的 `sendErr` 现在两条路都归一：自己关过的（`c.closed`）
+和**对端**关掉的（`c.err` 里有读循环记的原因，或 errno 本身就是传输层的死法）。新增的判据
+`connGone()` 在 `:528`，只列传输层：`net.ErrClosed` / `io.EOF` / `io.ErrClosedPipe` /
+`EPIPE` / `ENOTCONN` / `ECONNRESET` / `ECONNABORTED` / `ESHUTDOWN`。
+`APIError{Op,Retval}`（`:95`）、"消息表里没有这个请求"、`context.DeadlineExceeded` 这些
+"连接好好的、请求本身有问题"的错误**不**在里面 —— 那些必须原样抛出去，否则调用方会拿配置错误去重连。
+
+`tunnel.go` 一行没改：它的自愈段本来就写好了，只是从来没被允许执行。
+
+单测（`controller/internal/vppapi/vppapi_test.go`）：
+- `TestPeerCloseReportsErrClosed`（`:1598`）——假 VPP 从**服务端**关掉那条连接
+  （`fakeVPP.connCh` + `killConn()` `:534`，复现 VPP 重启的真实次序：没人调 `Client.Close`，先死的是对端），
+  然后一次 `SetPKey` 必须是 `errors.Is(err, ErrClosed)` 且在 2 秒内返回。
+- `TestConnGoneOnlyMatchesTransportDeath`（`:1618`）——把上面两组错误逐条钉住，防止以后有人图省事写成
+  "凡是错误都算断连"。
+
+变异测试（诚实起见记下覆盖边界）：把新条件短路成 `if false` 重跑，
+`TestPeerCloseReportsErrClosed` 失败并打出生产里那句原文
+`write unix @->/tmp/.../api.sock: write: broken pipe`（说明这条端到端测试真的抓得住缺陷）；
+`TestConnGoneOnlyMatchesTransportDeath` 仍然过 —— 它直接测判据本身，不经过那段短路，
+所以"能抓住回归"这句话只对第一条测试成立。改完恢复文件，md5 与留档一致
+（`7e8cb250a707f0757c07bdf7a1732b2a`）。
+
+容器 `fix4-test`（srwg-dev / go1.22.5 / `--privileged`）里：`go build ./...` 通过，
+`go test ./...` 15 个包全 ok，无失败。
+
+#### VM 台四段数字（同一台 CPE4，同一口径，注入的都是 `systemctl restart vpp`）
+
+采样口径 `/root/fix4-sample2.sh` 每 0.5s 一次：VPP pid / wg 口数与口名 / `show bfd sessions`
+的会话数与其中 Up 的条数 / agent 自己的 `/status` 隧道回执。打流口径：cust4 上
+`ping -i 1 -W1 -D -I 172.16.4.1 172.16.12.1`（源是本站 loopback，§9 口径；用 LAN 地址打源会被设计
+性地黑洞，那种数不作证据 —— 我在这条上栽过一次，写在这儿防重犯）。断流分析用 cust4 自己的钟，
+不跨主机对齐（盒子钟比 Mac 慢约 2.4 分钟，跨源归因一律按 `grep -n` 行序）。
+
+| 段 | 装的是 | 回执被否掉 | 重建 | 窗口结束时 | 客户 ping |
+| --- | --- | --- | --- | --- | --- |
+| A | 修复前的 agent | 从不（`ok=true tunnels=3` 而 wg=0） | 无 | ≥1065s 仍未重建 | 93.33% 丢包 |
+| C | 只有第一半（`4031aab…`） | 一拍内（07:03:46） | **不**：13 次撞同一 errno，退避 5s→10→20→40→80→160→300s 封顶 | 170s 窗口内 wg=0/bfd=0 | 回包停在 seq 10，之后全断 |
+| D | 两半都在（`3dba22f2d66c2fb56f80c34d4f50f5ae`） | 一拍内（盒子钟 07:46:16，同一轮里就报了"连接断了"） | **是**：连续 1 次失败后按 5s 退避重试，那一次重连成功 | 三次采样形状：`wg=3/3up` → `wg=0/0up` → `wg=3/3up` | 见下 |
+
+D 段的完整自愈弧（`/var/log/sr-box/agent.log` 第 697-705 行，按行序就是时间序）：
+
+```
+07:46:16 隧道回执被数据面否掉：数据面里没有回执声称装好的 3 条隧道口（wg1003、wg1004、wg1007）：VPP 重启过？下一次收敛从头来
+07:46:16 VPP api 连接断了（读接口表（解析隧道出口）: vppapi: 连接已关闭: write unix @->/run/vpp/api.sock: write: broken pipe）：下一次重连，按快照从头收敛
+07:46:16 隧道配置 v8 没装上（连续 1 次，5s 后重试）: ...
+07:46:21 隧道 t3 → node 1（192.168.1.101:20001）：peer installed
+07:46:21 隧道 t4 → node 3（192.168.1.103:20001）：peer installed
+07:46:21 隧道 t7 → node 2（192.168.1.102:20001）：peer installed
+07:46:21 隧道配置 v8 已收敛
+```
+
+和阶段 C 那 13 次比：**一次失败、5 秒、然后收敛**。注意那句错误文本变了 ——
+`vppapi: 连接已关闭: write ... broken pipe`，前缀就是这次归一的产物，也是闸能开门的凭证。
+
+采样侧的数（Mac 钟）：重启命令发出 1793864911.320 → 1793864914.086 首次看到 `wg=0`
+→ 1793864923.009 回执变成 `{"capable":true,"applying_version":8,"error":"读接口表（解析隧道出口）:vppapi:连接已关闭:…broken pipe","tunnels":3}`，
+`version` 和 `ok` 两个字段都不再出现（`TunnelState` 上是 `omitempty`，被否掉的回执由 `verifyDataplaneWith`
+把 `OK` 清成 false、`Version` 清成 0 —— `tunnel.go:329-332`）。要读准的是：**`tunnels:3` 是上一次收敛的
+遗留计数，它现在必须和 `ok=false` + 那句 error 一起看**，这正是 §9.10 里 `vm-verify.sh:370-377`
+把两个口径并排打出来的原因 —— 单看条数会误读成"还有 3 条"
+→ 1793864928.142 `wg=3 names=wg1003,wg1004,wg1007 bfd=3/3up agent ok=true v8 tunnels=3`。
+**从发出重启到隧道层整体回来 17 秒，其中前 ~11 秒是 VPP 自己起进程 + underlay 补接管（§5.9 的 6.094s 那一档）；
+agent 从"发现不一致"到"重建完成"是 5 秒、一次重试。**
+
+重建出来的是真能转发的口，不是记账：三条隧道各打一次隧道层 ping
+（`vppctl ping <对端 overlay> source <载着本机 /32 的那个 wg 口>`）——
+`10.250.0.3 via wg1003`、`10.250.0.5 via wg1004`、`10.250.0.9 via wg1007` 各自 **5 sent, 5 received, 0% loss**。
+BFD 是收敛时按隧道口建的（`tunnel.go:641` 的 `tel.Ensure`），所以它跟着一起回来了（3/3 Up），不用单独自愈。
+
+#### 顺手补上的那条欠账：控制面进程重启不让数据面抖动（这次有数字了）
+
+§9.11 结尾写着"控制器整个重启一遍没有实测数字"。这轮量的不是控制器，是**盒子上的 sr-agent 进程重启**
+（就是我这次部署动作本身，所以必须点名）：CPE4 健康态下 `pkill -x sr-agent` + `systemctl start
+sr-box-watch.service`（盒子自己的清单单元，幂等），cust4 的 1pps 打流跨整个过程：
+
+```
+REPLIES=40 first_seq=1 last_seq=40 MISSING_SEQS=0
+TOP_GAPS=1.02s(seq17→18) | 1.02s | 1.01s | 1.02s | 1.01s
+40 packets transmitted, 40 received, 0% packet loss
+```
+
+1.02 秒就是 1pps 的节拍本身（打流口径的相邻两包天然差 1 秒），不是断流。进程侧：
+`sr-agent 218033 → 219051`，而 `sr-route=94739 sr-fib=218389 sr-frr=94763 vpp=202309` 四个 pid 一个没动，
+overlay 前缀数 3 → 3。**结论：升级 sr-agent 这个动作对客户流量是 0 丢包**（数据面没有任何一个包经过 sr-agent）。
+"整个控制面（sr-ctrl + RR）重启一遍"仍然没有数字，仍然是欠账。
+
+#### 没覆盖的边界，点名（这是两条待拍，不是这次修复的漏洞）
+
+D 段隧道层自愈之后，业务 ping **没有**自己回来。原因不在这条路径上，是另外两件事：
+
+1. **sr-fib 不重连 VPP API。** `cmd/sr-fib/main.go:383` 只 Dial 一次，整个进程里没有第二处拨号；
+   VPP 重启后它每秒报一行，`/var/log/sr-box/fib.log` 从注入起一直刷到我看的时候：
+   `本轮收敛失败（保留上次成功的计划）: 读 BFD 会话: write unix @->/run/vpp/api.sock: write: broken pipe`。
+   同一个 broken pipe，同一个根因（`sendErr` 的归一）在 sr-fib 里也是死的 —— 但 sr-fib **没有**
+   sr-agent 那条 `dropDeadConnection` + `redial` 的纪律，所以就算句柄报对了"连接已关闭"，
+   也没有人拿着它去重连。要不要照 agent 的样子给它补一条（含补完的前后测量），这是拍板。
+2. **缺口 G-2 仍然在**（§9.6）：sr-fib 的活隧道表不落盘、也不由产品维护
+   （`/etc/sdwan/fib.json` 里 `"tunnels": []`）。所以重启 sr-fib 之后还要有人把表再推一次。
+
+这轮把盒子恢复回基线用的就是这两步人工把手（顺序固定）：
+
+```
+pkill -x sr-fib && systemctl start sr-box-watch.service   # 让 sr-fib 重新 Dial
+bash test/lab/vmlab/vm-fib-sync.sh 4                       # 推活隧道表 → converged=True routes_set=2
+```
+
+前后同一口径：注入后六个方向 100% 丢包（`cust12→172.16.4.1` 20/0，`cust4→172.16.12.1` 20/0），
+做完这两步后 **六个方向 20/20、0% packet loss**，CPE4 的 `show ip fib table 0` 里 overlay 前缀 3 条、
+BFD 会话 3 条。盒子现在留在这个状态（隧道 v8 三条、BFD 3/3 Up、六向 0% loss）。
+
+**所以这次修复的边界要说清楚：VPP 单独重启后，隧道层 + BFD 会自己回来（5s / 一次重试），
+业务流量不会 —— 业务流量还堵在 sr-fib 那两条上，那两条等他拍。**

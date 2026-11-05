@@ -31,9 +31,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -496,15 +498,48 @@ func (c *Client) closedErr() error {
 	return ErrClosed
 }
 
-// sendErr 把写失败归一成 ErrClosed：连接已经关掉时，调用方该看到的是"连接没了"，
+// sendErr 把写失败归一成 ErrClosed：连接已经没了时，调用方该看到的是"连接没了"，
 // 而不是 runtime 的 "use of closed network connection"（那种文本没法用 errors.Is 判）。
+//
+// "连接没了"有两条路，两条都必须归一：
+//
+//   - 我们自己调过 Close() —— 这条看得见 c.closed；
+//   - **对端**（VPP 重启）关掉了 API 连接 —— c.closed 没关，写回来的是裸 errno
+//     （实测 `write unix @->/run/vpp/api.sock: write: broken pipe`）。
+//
+// 第二条以前原样抛出去，于是 agent 的自愈判定（errors.Is(err, ErrClosed)）永远不成立：
+// 它拿着一条死句柄每轮撞同一个 errno，退避从 5s 一路涨到 5min，盒子七轮都没重建隧道
+// （2026-11-05 VM 台阶段 C 实测）。读循环这条路会把原因记进 c.err，一并算数。
 func (c *Client) sendErr(err error) error {
 	select {
 	case <-c.closed:
 		return fmt.Errorf("%w: %v", ErrClosed, err)
 	default:
-		return err
 	}
+	if c.err.Load() != nil || connGone(err) {
+		return fmt.Errorf("%w: %v", ErrClosed, err)
+	}
+	return err
+}
+
+// connGone 判断一次 IO 错误是不是"这条连接已经不在了"。只列传输层的死法，
+// 不把 retval 非 0、消息表缺项这类"连接好好的、请求本身有问题"算进来 ——
+// 那些必须原样留着，否则调用方会把配置错误当成断连去重连。
+func connGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	for _, no := range []syscall.Errno{
+		syscall.EPIPE, syscall.ENOTCONN, syscall.ECONNRESET, syscall.ECONNABORTED, syscall.ESHUTDOWN,
+	} {
+		if errors.Is(err, no) {
+			return true
+		}
+	}
+	return false
 }
 
 // retval 取出应答里的 i32 错误码；非 0 转成 APIError。

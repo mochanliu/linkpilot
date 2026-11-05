@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -25,6 +26,10 @@ type fakeVPP struct {
 	versions map[string]string
 	ids      map[string]uint16
 	names    map[uint16]string
+
+	// connCh 把 serve 接到的那条连接交给测试：killConn 用它**从对端**关掉连接，
+	// 复现 VPP 重启的真实次序（没人调 Client.Close，先死的是服务端）。
+	connCh chan net.Conn
 
 	// 行为开关
 	badReplyFor string           // 这个名字的应答故意写错 msg_id（复现修掉的插件 bug）
@@ -69,6 +74,7 @@ const fakeClientIndex = 0x80000002
 func newFake(t *testing.T) *fakeVPP {
 	f := &fakeVPP{
 		requests: make(chan request, 64),
+		connCh:   make(chan net.Conn, 1),
 		versions: map[string]string{},
 		retvals:  map[string]int32{},
 		ipAddrs:  map[uint32][]fakeAddr{},
@@ -129,6 +135,10 @@ func (f *fakeVPP) serve() {
 		return
 	}
 	defer conn.Close()
+	select {
+	case f.connCh <- conn:
+	default:
+	}
 
 	for {
 		frame, err := readFrame(conn)
@@ -517,6 +527,18 @@ func (f *fakeVPP) dial(t *testing.T) *Client {
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+// killConn 从**服务端**关掉连接，等 VPP 重启时 API  socket 被对端拆掉的那件事。
+// Dial 已经跑完一轮注册往返，所以这里一定能取到连接。
+func (f *fakeVPP) killConn(t *testing.T) {
+	t.Helper()
+	select {
+	case c := <-f.connCh:
+		c.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("假 VPP 没接到连接，无法模拟对端断开")
+	}
 }
 
 func (f *fakeVPP) lastRequest(t *testing.T) request {
@@ -1564,6 +1586,63 @@ func TestConnectionCloseFailsCalls(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Errorf("等了 %s，连接断开应当立刻暴露", time.Since(start))
+	}
+}
+
+// VPP 重启时先死的是**对端**：它把 API 连接拆了，客户端这边没人调过 Close。
+// 这条路上写回来的是裸 errno（2026-11-05 VM 台实测：`write unix @->/run/vpp/api.sock:
+// write: broken pipe`），读循环拿到 EOF。两种都必须归一成 ErrClosed —— sr-agent 的
+// 自愈判定只认 ErrClosed（internal/agent/tunnel.go 的 dropDeadConnection），判不中
+// 它就抱着一条死句柄每轮撞同一个 errno：实测连撞 7 轮、退避从 5s 涨到 5min，盒子始终
+// 零条隧道，客户流量的黑洞盖不住。
+func TestPeerCloseReportsErrClosed(t *testing.T) {
+	f := newFake(t)
+	c := f.dial(t)
+	f.killConn(t)
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := c.SetPKey(ctx, 1, make([]byte, 16))
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("对端断开后期望 ErrClosed，got: %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("等了 %s，连接断开应当立刻暴露，不许挂到超时", time.Since(start))
+	}
+}
+
+// connGone 只认传输层的死法。retval 非 0、消息表缺项、上下文超时这些"连接好好的、
+// 请求本身有问题"的错误必须原样抛出去 —— 否则调用方会拿一次配置错误去重连，
+// 把真正要报的东西盖掉。
+func TestConnGoneOnlyMatchesTransportDeath(t *testing.T) {
+	dead := []error{
+		syscall.EPIPE,
+		syscall.ENOTCONN,
+		syscall.ECONNRESET,
+		syscall.ECONNABORTED,
+		fmt.Errorf("write unix @->/run/vpp/api.sock: write: %w", syscall.EPIPE),
+		&net.OpError{Op: "write", Err: syscall.EPIPE},
+		net.ErrClosed,
+		io.EOF,
+		io.ErrClosedPipe,
+	}
+	for _, e := range dead {
+		if !connGone(e) {
+			t.Errorf("%v 应当判为连接已断", e)
+		}
+	}
+	alive := []error{
+		nil,
+		APIError{Op: "ip_add_route", Retval: -2},
+		errors.New("vppapi: VPP 消息表里没有 vl_api_foo_t（插件与本客户端版本不匹配）"),
+		context.DeadlineExceeded,
+		context.Canceled,
+	}
+	for _, e := range alive {
+		if connGone(e) {
+			t.Errorf("%v 不是连接断了的错误，不许归一成 ErrClosed", e)
+		}
 	}
 }
 

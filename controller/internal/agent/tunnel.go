@@ -280,6 +280,60 @@ func (t *TunnelSync) dropDeadConnection(err error) {
 	t.logf("VPP api 连接断了（%v）：下一次重连，按快照从头收敛", err)
 }
 
+// VerifyDataplane 让心跳已经读到的那份接口清单复核上一次收敛的结论。
+//
+// ifs 是心跳字段 wire.HeartbeatRequest.Ifaces 的同一个指针，不额外读数据面：
+// nil = 这次没上报清单，什么都不判断；非 nil（含空清单）= 一次真实读数。
+// 返回被否掉的隧道口条数（0 = 结论没有被推翻）。
+func (t *TunnelSync) VerifyDataplane(ifs *[]wire.IfaceInfo) int {
+	if ifs == nil {
+		return 0
+	}
+	return t.verifyDataplaneWith(*ifs)
+}
+
+// verifyDataplaneWith 拿一份"数据面上现在有哪些口"的读数去否掉上一次收敛的结论。
+//
+// 没有这一步，VPP 单独重启就是一个永不自愈的洞：state 是上一次成功收敛的拷贝，
+// 而 VPP 的配置只在内存里，重启把 agent 装的隧道口全带走了 —— state 自己不会变，
+// 于是 Kick 每次都停在「version == desired && OK」那道闸上直接 return，
+// 后面那段现成的自愈（dropDeadConnection 清句柄 + dial 重连 + 按快照从头收敛）
+// 永远轮不到执行。盒子实际上一条隧道都没有，心跳还在报 ok=true，
+// 页面上写的是"已下发/已确认"。
+//
+// 传进来的空清单是真实读数"数据面一张口都没有"，与"没上报"（nil，见
+// VerifyDataplane）不是一回事 —— 只有前者才允许推翻结论。
+func (t *TunnelSync) verifyDataplaneWith(ifs []wire.IfaceInfo) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.state.OK || t.state.Version < 1 || len(t.links) == 0 {
+		return 0
+	}
+	have := make(map[string]bool, len(ifs))
+	for _, i := range ifs {
+		have[i.Name] = true
+	}
+	// VPP 按 user_instance 命名 WG 口（lab 实测：与对端 node 3/2 的两条隧道是
+	// wg1003/wg1002；fake 数据面同一形状）。用名字而不是 sw_if_index 判定，
+	// 因为重启之后别的口会顶用空出来的号，名字不会。
+	var missing []string
+	for _, l := range t.links {
+		if name := fmt.Sprintf("wg%d", l.cfg.Instance); !have[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return 0
+	}
+	sort.Strings(missing)
+	t.state.OK = false
+	t.state.Version = 0
+	t.state.Error = fmt.Sprintf("数据面里没有回执声称装好的 %d 条隧道口（%s）：VPP 重启过？下一次收敛从头来",
+		len(missing), strings.Join(missing, "、"))
+	t.logf("隧道回执被数据面否掉：%s", t.state.Error)
+	return len(missing)
+}
+
 // Kick starts a reconcile in the background when the desired version is not the
 // one running and the last failure is out of its backoff window. It never blocks
 // the heartbeat: a reconcile creates WG interfaces and pushes peers, and a

@@ -327,8 +327,14 @@ func main() {
 		req := wire.HeartbeatRequest{Uptime: int64(time.Since(processStart).Seconds())}
 		req.Bindings = signedBindings(id, log.Printf)
 		req.Config = st.configReport()
-		req.Tunnel = st.tunnelReport()
+		// 清单在这一次心跳里只读一次，而且先于隧道回执：数据面已经把上次装的口
+		// 带走了（VPP 单独重启）时，那次收敛的结论要当场被否掉，否则心跳一直报
+		// ok=true、下面那道 Kick 的闸永不放行，盒子空转不自愈（缺陷④）。
 		req.Ifaces = readInventory(ctx, inv)
+		if tun != nil {
+			tun.VerifyDataplane(req.Ifaces)
+		}
+		req.Tunnel = st.tunnelReport()
 		resp, err := client.Heartbeat(hbctx, req)
 		hbcancel()
 		if err != nil {

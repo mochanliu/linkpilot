@@ -473,6 +473,77 @@ func TestTunnelSyncRedialsAfterDeadConnection(t *testing.T) {
 	}
 }
 
+func TestTunnelSyncVerifyDataplaneRejectsStaleOK(t *testing.T) {
+	// 缺陷④：VPP 单独重启把 agent 装好的隧道口一起带走了（配置只在内存里），
+	// 但 state 是上一次成功收敛的拷贝、自己不会变 —— Kick 每次都停在
+	// 「version == desired && OK」那道闸上 return，现成的自愈（重连 + 从头收敛）
+	// 永远轮不到，盒子一条隧道没有而心跳还在报 ok=true。
+	//
+	// 修法不引入新的数据面流量：心跳本来每轮就读一份接口清单（InventoryReporter），
+	// 拿那份读数来复核上一次的收敛结论。
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	b := testBundle(spec)
+	ts, _ := newTunnelSync(t, f, pki, b)
+	ctx := context.Background()
+	if err := ts.Sync(ctx, b.Version); err != nil {
+		t.Fatal(err)
+	}
+	if st := ts.State(); !st.OK || st.Version != 3 {
+		t.Fatalf("前置条件：先收敛成功，实际 %+v", st)
+	}
+
+	// ① 清单没上报（nil）= 这次没读到（VPP 正在重启、读失败、没开 -vpp-api）。
+	//    控制台的口径是"未上报"不是"没有"，所以不据此翻转结论。
+	if n := ts.VerifyDataplane(nil); n != 0 {
+		t.Errorf("未上报不该判断，返回 %d", n)
+	}
+	if st := ts.State(); !st.OK || st.Version != 3 {
+		t.Errorf("未上报之后结论被改了: %+v", st)
+	}
+
+	// ② 清单里 wg1001 在位（VPP 按 user_instance 命名，fake 与真机同一形状）：
+	//    读数支持结论，一切照旧。
+	inplace := []wire.IfaceInfo{{Name: "host-enp0s9"}, {Name: "wg1001"}}
+	if n := ts.VerifyDataplane(&inplace); n != 0 {
+		t.Errorf("口都在位不该判断，返回 %d", n)
+	}
+	if st := ts.State(); !st.OK || st.Version != 3 {
+		t.Errorf("清单对得上之后结论被改了: %+v", st)
+	}
+
+	// ③ 空清单不是 nil：那是"数据面一张口都没有"的真实读数，回执直接被否掉。
+	empty := []wire.IfaceInfo{}
+	if n := ts.VerifyDataplane(&empty); n != 1 {
+		t.Fatalf("该否掉 1 条，实际 %d", n)
+	}
+	st := ts.State()
+	if st.OK || st.Version != 0 || !strings.Contains(st.Error, "wg1001") {
+		t.Errorf("否掉之后的回报不对: %+v", st)
+	}
+
+	// ④ 翻转之后 Kick 的闸必须放行，否则自愈还是轮不到。这里 fake 数据面一直
+	//    好好放着那条口，所以重跑只证明"又收敛了一次"，不产生删了重建。
+	var fetches atomic.Int32
+	ts.fetch = func(context.Context) (wire.UnderlayBundle, error) {
+		fetches.Add(1)
+		return b, nil
+	}
+	ts.Kick(ctx, b.Version)
+	waitFor(t, "否掉之后 Kick 重新收敛", func() bool {
+		s := ts.State()
+		return s.OK && s.Version == b.Version && !s.Applying
+	})
+	if n := fetches.Load(); n != 1 {
+		t.Errorf("重新收敛应当拉一次配置，实际 %d", n)
+	}
+	if n := len(f.callWith("CreateInterface")); n != 1 {
+		t.Errorf("数据面明明还是那条口，重收敛不该又建一次（共 %d 次）", n)
+	}
+}
+
 func TestTunnelSyncKickIgnoresUnpublishedVersion(t *testing.T) {
 	f := newFakeVPP()
 	var calls atomic.Int32
