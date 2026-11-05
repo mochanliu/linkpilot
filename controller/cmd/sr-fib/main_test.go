@@ -109,6 +109,8 @@ func TestLoadConfigEscapeSwitch(t *testing.T) {
 // 都用假 VPP 的前后状态比对；不靠退出码，也不靠"进程有没有重启"。
 
 // fakeDP 是内存里的 VPP：表、标签、路由三本账，写失败可注入。
+// dead=true 表示 VPP 进程重启后这条 api 连接的状态：所有读写一律 ErrClosed，
+// 内存里那三本账也随旧进程一起没了（新建 fakeDP 就是空账）。
 type fakeDP struct {
 	mu     sync.Mutex
 	ifs    []vppapi.SwInterface
@@ -117,6 +119,8 @@ type fakeDP struct {
 	labels map[uint32]uint32
 	routes map[string]int
 	fail   error
+	dead   bool
+	closes int
 }
 
 func newFakeDP() *fakeDP {
@@ -128,9 +132,15 @@ func newFakeDP() *fakeDP {
 	}
 }
 
+// errVPPRestarted 是"VPP 重启把连接关掉"的等价错误：sr-fib 只认这个才重连。
+var errVPPRestarted = vppapi.ErrClosed
+
 func (d *fakeDP) failErr() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.dead {
+		return errVPPRestarted
+	}
 	return d.fail
 }
 
@@ -138,6 +148,13 @@ func (d *fakeDP) setFail(err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.fail = err
+}
+
+// setDead 模拟 VPP 进程重启：这只句柄永久断开，账本换新的一份空内存。
+func (d *fakeDP) setDead() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dead = true
 }
 
 func (d *fakeDP) IPTableAddDel(_ context.Context, id uint32, add bool) error {
@@ -194,12 +211,45 @@ func (d *fakeDP) MPLSLabelDel(_ context.Context, label uint32) error {
 }
 
 func (d *fakeDP) DumpInterfaces(context.Context) ([]vppapi.SwInterface, error) {
+	if err := d.deadErr(); err != nil {
+		return nil, err
+	}
 	return d.ifs, nil
 }
 
 func (d *fakeDP) FIBRoutes(context.Context, uint32) ([]vppapi.IPRoute, error) { return nil, nil }
 func (d *fakeDP) CLI(context.Context, string) (string, error)                 { return "", nil }
-func (d *fakeDP) BFDSessions(context.Context) ([]vppapi.BFDSession, error)    { return d.bfd, nil }
+
+func (d *fakeDP) BFDSessions(context.Context) ([]vppapi.BFDSession, error) {
+	if err := d.deadErr(); err != nil {
+		return nil, err
+	}
+	return d.bfd, nil
+}
+
+// deadErr 只在连接真死时报错；普通写失败（fail）不影响这两条只读接口。
+func (d *fakeDP) deadErr() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.dead {
+		return errVPPRestarted
+	}
+	return nil
+}
+
+// Close 记账：扔死句柄要真的关一次，否则每重启一回就漏一条 socket。
+func (d *fakeDP) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closes++
+	return nil
+}
+
+func (d *fakeDP) closeCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.closes
+}
 
 func tableKey(table uint32, pfx netip.Prefix) string {
 	return netip.PrefixFrom(pfx.Addr(), pfx.Bits()).String() + "@" + strconv.FormatUint(uint64(table), 10)
@@ -374,5 +424,129 @@ func TestPutConfigAcceptedButUnconverged(t *testing.T) {
 	}
 	if _, ok := labelsOf(dp)[1100]; !ok {
 		t.Fatal("恢复后 VPN 100 的标签没补上")
+	}
+}
+
+// ---------------------------------------------------------------- 缺陷⑦：VPP 重启
+//
+// 现场读数（VM 台，2026-11-05）：CPE1 的 VPP 10:39:06 起来，fib.log 从 10:39:08
+// 起每秒一行 broken pipe，一直到 10:42:30 —— 那 203 行里 sr-fib 的进程 pid 没变过，
+// 是人工 pkill 之后才恢复的。也就是说"动态更新路由表"这件事机制上没问题（每轮重算
+// 整份计划再差分），出问题的是那条 api 连接：VPP 一重启就把所有客户端连接关掉，
+// sr-fib 手里那只句柄永久是死的。
+//
+// 光重连还不够：VPP 的表/标签/路由只在内存里，重启后是空的，而 Applier 的 prev
+// 还记着"上次已经下发成功"。所以下面这条测试钉两件事 —— 死句柄要被扔掉、
+// 重连后要按整份计划从头写一遍。
+
+const ribWithVPN100 = `{"rib":{"100":[{"device_id":2,"vrf_id":100,"prefix":"10.100.2.0/24","next_hops":["10.255.0.2"]}]}}`
+
+func snapshotOf(d *fakeDP) (labels map[uint32]uint32, tables map[uint32]bool, routes map[string]int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ls := map[uint32]uint32{}
+	for k, v := range d.labels {
+		ls[k] = v
+	}
+	ts := map[uint32]bool{}
+	for k, v := range d.tables {
+		ts[k] = v
+	}
+	rs := map[string]int{}
+	for k, v := range d.routes {
+		rs[k] = v
+	}
+	return ls, ts, rs
+}
+
+func convergeOnce(f *fiber) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.converge(context.Background())
+}
+
+func TestVPPRestartSelfHealsOnNextRound(t *testing.T) {
+	f, dp1, stub := newFiberForTest(t)
+	stub.body.Store(ribWithVPN100)
+	body := `{"vrfs":[0,100],"tunnels":[{"next_hop":"10.255.0.2","interface":"wg0"}]}`
+	if rec, _ := putConfig(t, f, body); rec.Code != http.StatusOK {
+		t.Fatalf("前置 PUT = %d: %s", rec.Code, rec.Body.String())
+	}
+	wantL, wantT, wantR := snapshotOf(dp1)
+	if wantL[1100] != 100 || !wantT[100] || wantR["10.100.2.0/24@100"] != 1 {
+		t.Fatalf("前置状态就不齐：labels=%v tables=%v routes=%v", wantL, wantT, wantR)
+	}
+
+	dp2 := newFakeDP() // VPP 重启后的新进程：内存账本全空
+	dials := 0
+	f.dial = func(context.Context) (bfdDP, error) {
+		dials++
+		return dp2, nil
+	}
+	dp1.setDead()
+
+	if err := convergeOnce(f); !errors.Is(err, vppapi.ErrClosed) {
+		t.Fatalf("VPP 重启后第一轮 = %v, want 报 ErrClosed 而不是悄悄成功", err)
+	}
+	if dials != 0 {
+		t.Fatalf("还没确认连接死了就连了（dials=%d）", dials)
+	}
+	f.mu.Lock()
+	held, applier := f.dp, f.applier
+	f.mu.Unlock()
+	if held != nil || applier != nil {
+		t.Fatal("死句柄没扔掉：下一轮还会往它写")
+	}
+
+	if err := convergeOnce(f); err != nil {
+		t.Fatalf("第二轮应自己重连并收敛成功: %v", err)
+	}
+	if dials != 1 {
+		t.Fatalf("重连次数 = %d, want 1（连接活了以后不该再连）", dials)
+	}
+	gotL, gotT, gotR := snapshotOf(dp2)
+	if gotL[1000] != wantL[1000] || gotL[1100] != wantL[1100] {
+		t.Fatalf("重连后标签 = %v, want 与重启前同一份 %v（差分基线没重置就会一条都不写）", gotL, wantL)
+	}
+	if !gotT[100] {
+		t.Fatalf("重连后 table 100 没建出来：%v", gotT)
+	}
+	if gotR["10.100.2.0/24@100"] != 1 {
+		t.Fatalf("重连后客户前缀没装回 FIB：%v（want 10.100.2.0/24@100=1）", gotR)
+	}
+
+	// 再走一轮：连接是活的，不该有新连接，也不该有多余的写入。
+	if err := convergeOnce(f); err != nil {
+		t.Fatalf("重连后的稳定轮收敛失败: %v", err)
+	}
+	if dials != 1 {
+		t.Fatalf("活连接被反复重连（dials=%d）", dials)
+	}
+	if st := getStatus(t, f); st.Last == nil || !st.Last.Converged {
+		t.Fatalf("/status 没如实说恢复成功: %+v", st.Last)
+	}
+}
+
+// 普通写失败（VPP 忙、sr-route 没起来）不是连接死了：那种时候扔掉句柄只会多一次
+// 无谓的重连，把"这一轮为什么没成"糊过去。
+func TestOrdinaryFailureKeepsConnection(t *testing.T) {
+	f, dp, _ := newFiberForTest(t)
+	dials := 0
+	f.dial = func(context.Context) (bfdDP, error) {
+		dials++
+		return newFakeDP(), nil
+	}
+	dp.setFail(errors.New("vpp 正忙"))
+	if err := convergeOnce(f); err == nil || errors.Is(err, vppapi.ErrClosed) {
+		t.Fatalf("注入的是普通失败，得到 %v", err)
+	}
+	if dials != 0 {
+		t.Fatalf("普通失败触发了重连（dials=%d）", dials)
+	}
+	f.mu.Lock()
+	held := f.dp
+	f.mu.Unlock()
+	if held == nil {
+		t.Fatal("普通失败把好的连接扔了")
 	}
 }

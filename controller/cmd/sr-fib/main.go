@@ -210,11 +210,13 @@ type statusDoc struct {
 	Last      *lastApply `json:"last,omitempty"`
 }
 
-// bfdDP 是收敛要用到的那一小块 VPP 面：fib.DP 加上本机 BFD 会话。测试用内存
-// 假端替换它，收敛逻辑本身不依赖 VPP。
+// bfdDP 是收敛器要的数据面接缝：fib.DP 加上本机 BFD 会话，再加上能把自己关掉。
+// Close 写在接口里，是因为重连时收敛器要知道手里的句柄怎么扔（*vppapi.Conn 本来就有）。
+// 测试用内存假端替换它，收敛逻辑本身不依赖 VPP。
 type bfdDP interface {
 	fib.DP
 	BFDSessions(ctx context.Context) ([]vppapi.BFDSession, error)
+	Close() error
 }
 
 // fiber 是收敛器。cur 与 last 是原子的（状态口随时可读，不被一轮收敛堵住），
@@ -227,8 +229,44 @@ type fiber struct {
 	lastWarn  string // 只在 mu 内读写
 	dp        bfdDP
 	applier   *fib.Applier
+	dial      func(context.Context) (bfdDP, error)
 	hc        *http.Client
 	statusURL string
+}
+
+// conn 保证这一轮手里有一条活的数据面连接；没有就现连一份。
+//
+// 重连一定要连着换 Applier：它的 prev 记的是"上一次下发成功的那份计划"，而 VPP
+// 的表/标签/路由只在内存里，VPP 重启就把它们带走了。沿用旧 Applier 时，下一轮
+// 差分算出来是"和上次一样、什么都不用写"，于是 FIB 永久空着 —— 光重连不重置基线
+// 修不好这个缺陷。
+func (f *fiber) conn(ctx context.Context) error {
+	if f.dp != nil {
+		return nil
+	}
+	if f.dial == nil {
+		return errors.New("sr-fib: 没有 VPP 连接可用（重连未配置）")
+	}
+	ndp, err := f.dial(ctx)
+	if err != nil {
+		return fmt.Errorf("重连 VPP api.sock: %w", err)
+	}
+	f.dp = ndp
+	f.applier = fib.NewApplier(ndp)
+	log.Printf("sr-fib: 已连上 VPP api.sock，按整份计划从头收敛")
+	return nil
+}
+
+// dropDead 只在连接确认死了的时候扔句柄（与 sr-agent 的 dropDeadConnection 同形）。
+// 超时、sr-route 没起来这类错误不能进来：那条连接还是好的，扔了反而制造一次重连。
+func (f *fiber) dropDead(err error) {
+	if err == nil || !errors.Is(err, vppapi.ErrClosed) || f.dp == nil {
+		return
+	}
+	_ = f.dp.Close()
+	f.dp = nil
+	f.applier = nil
+	log.Printf("sr-fib: VPP api 连接断了（%v）：下一次重连，按整份计划从头收敛", err)
 }
 
 // converge 按当前配置重算整份计划并下发。调用者必须持有 mu。
@@ -237,10 +275,14 @@ func (f *fiber) converge(ctx context.Context) error {
 	if err != nil {
 		return f.note(fib.Result{}, fmt.Errorf("读 RIB: %w", err))
 	}
+	if err := f.conn(ctx); err != nil {
+		return f.note(fib.Result{}, err)
+	}
 	// 可达性只认本机 VPP 里的 BFD 会话：它就是这个 CPE 眼里"隧道通不通"
 	// 的权威答案，不用绕到北向去拿一份更旧的。
 	sessions, err := f.dp.BFDSessions(ctx)
 	if err != nil {
+		f.dropDead(err)
 		return f.note(fib.Result{}, fmt.Errorf("读 BFD 会话: %w", err))
 	}
 	cfg := *f.cur.Load()
@@ -258,6 +300,7 @@ func (f *fiber) converge(ctx context.Context) error {
 	res, err := f.applier.Apply(ctx, plan)
 	f.last.Store(reportOf(res, plan.Warnings, err))
 	if err != nil {
+		f.dropDead(err)
 		return err
 	}
 	if res.Changed() || res.MPLSChanged {
@@ -380,7 +423,16 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	vc, err := vppapi.Dial(ctx, cfg.VPPSocket, "sr-fib")
+	// 一只 dial 闭包，启动时用一次、连接死了以后每轮再用一次：VPP 重启会关掉所有
+	// api 连接，而客户端不会自己活过来（与 sr-agent 缺陷④ 同一个根因）。
+	dial := func(ctx context.Context) (bfdDP, error) {
+		c, err := vppapi.Dial(ctx, cfg.VPPSocket, "sr-fib")
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	vc, err := dial(ctx)
 	if err != nil {
 		log.Fatalf("vpp: %v", err)
 	}
@@ -399,6 +451,7 @@ func main() {
 	f := &fiber{
 		dp:        vc,
 		applier:   fib.NewApplier(vc),
+		dial:      dial,
 		hc:        &http.Client{Timeout: 5 * time.Second},
 		statusURL: cfg.StatusURL,
 	}
@@ -423,7 +476,12 @@ func main() {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
-		if err := f.converge(ctx); err != nil {
+		// dp/applier 现在会在轮与轮之间被换掉（重连），必须和 PUT /config 那条
+		// 路径共用一把锁 —— Applier 只允许单线程调用。
+		f.mu.Lock()
+		err := f.converge(ctx)
+		f.mu.Unlock()
+		if err != nil {
 			// 失败不退出：sr-route 可能还没起来，VPP 也偶尔在重启。已下发成功的
 			// 那份计划仍是基线，下一轮按同一目标重试。
 			log.Printf("sr-fib: 本轮收敛失败（保留上次成功的计划）: %v", err)
