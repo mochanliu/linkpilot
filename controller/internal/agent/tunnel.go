@@ -638,11 +638,19 @@ func (t *TunnelSync) applySpec(ctx context.Context, b wire.UnderlayBundle,
 	// 可达性/质量跟着隧道一起装：BFD 会话的两端就是这条隧道的 overlay /32，
 	// 探针绑在隧道接口上。放在最后一步，前面任何一步失败都不会留下悬空的会话；
 	// 隧道要重建时旧的先撤（见 teardownLink）。
+	//
+	// 计时参数取自 bundle 里的租户策略：控制台的"全局配置"页改的就是这几个数，
+	// 不带上它们的话，改完还是 50/50/x3 + 300ms，页面说的和设备做的两回事。
+	// 策略为空（旧控制器）时留 0，由 Ensure 落回 wire 里的默认值。
 	if err := t.tel.Ensure(ctx, wire.TunnelTelemetry{
-		SwIfIndex:  l.SWIfIndex(),
-		PeerNodeID: spec.PeerNodeID,
-		LocalIP:    cfg.LocalOverlay.Addr().String(),
-		PeerIP:     cfg.PeerOverlay.Addr().String(),
+		SwIfIndex:     l.SWIfIndex(),
+		PeerNodeID:    spec.PeerNodeID,
+		LocalIP:       cfg.LocalOverlay.Addr().String(),
+		PeerIP:        cfg.PeerOverlay.Addr().String(),
+		IntervalMS:    b.Telemetry.ProbeIntervalMS,
+		BFDMinTxUS:    b.Telemetry.BFDMinTxUS,
+		BFDMinRxUS:    b.Telemetry.BFDMinRxUS,
+		BFDDetectMult: b.Telemetry.BFDDetectMult,
 	}); err != nil {
 		return fmt.Errorf("隧道内 BFD/探针: %w", err)
 	}

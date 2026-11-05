@@ -1229,10 +1229,29 @@
     return '<span class="tag ' + cls + '">' + esc(s) + "</span>";
   }
 
+  // 判 down 的窗口与探针节奏取自控制器下发的那份策略，页面不写死数字：租户改了
+  // 「检测倍数」而这里还印 150 ms，就是页面在造数据。没有下发过配置时也不猜
+  // 内置默认值——设备根本没收到过定时器，说什么都是编的。
+  function telemetryRuleHint(t) {
+    var quality = "时延、抖动、丢包全部来自隧道内的探针：VPP 的 BFD 会话本身不产出任何质量数字。" +
+      "丢包取的是探针滑动窗口（最近 128 个采样）里的比例，所以它不会超过 100%，没丢就是 0.0%。";
+    if (!t || !t.bfd_min_rx_us || !t.bfd_detect_mult) {
+      return "可达性看 BFD：判 down 的规则是「检测倍数 × 最小接收间隔」内没收到包。" +
+        "这个租户还没有发布 underlay 配置，所以数据面里的定时器未知。" + quality;
+    }
+    var rx = t.bfd_min_rx_us / 1000;
+    var s = "可达性看 BFD：判 down 的规则是「检测倍数 × 最小接收间隔」内没收到包，当前下发 " +
+      t.bfd_detect_mult + " × " + rx + " ms = " + (rx * t.bfd_detect_mult) + " ms 静默。";
+    if (t.probe_interval_ms) {
+      s += "探针每 " + t.probe_interval_ms + " ms 发一次（超时按 3 倍间隔算）。";
+    }
+    return s + quality;
+  }
+
   function emptyTelemetryText(n) {
     if (n.status === "stale") return "设备已失联：最后一帧窗口随失联一起作废，等它重新心跳。";
     if (n.status === "pending") return "设备已入网但还没有心跳，自然也没有遥测。";
-    return "设备在线，但还没有上报过隧道内遥测。数据由设备数据面的 BFD 与探针产生；当前 agent 还不采集（节点计划未下发，设备上通常也还没有隧道），所以控制器没有可展示的行。";
+    return "设备在线，但这一帧没有上报任何隧道内遥测。遥测由设备数据面的 BFD 与探针产生，按采样窗口上报；这台设备上没有可报的隧道（控制器还没下发隧道，或下发后设备没建起来）。";
   }
 
   // One block per node, and within it one row per tunnel END. The two ends of
@@ -1259,11 +1278,20 @@
       "<th>时延 当前 / min / avg / max</th><th>抖动</th><th>丢包</th>" +
       "<th>探针 tx / rx（丢 / 晚）</th><th>采样</th></tr></thead><tbody>";
     n.tunnels.forEach(function (row) {
+      // 质量三项（时延/抖动/丢包）只来自隧道内探针，所以「有没有探针会话」
+      // 是唯一的门禁，不是「这一窗口发过几个包」：探针配好但一次没回的隧道，
+      // 丢包是 100.0%，不是「—」；反过来设备里根本没有探针会话，就必须写
+      // 「未上报」，不能摆一个 0.0% 让人以为链路很干净。
+      var probed = row.has_probe === true;
+      var none = '<span class="tag pending">未上报</span>';
       var rx = Number(row.probe_rx) || 0;
-      var rtt = (rx || row.rtt_ms > 0)
-        ? fmtMs(row.rtt_ms) + ' <span class="muted">/ ' + fmtMs(row.min_rtt_ms) + " / " +
-          fmtMs(row.avg_rtt_ms) + " / " + fmtMs(row.max_rtt_ms) + "</span>"
-        : "—";
+      var replied = rx > 0 || Number(row.rtt_ms) > 0;
+      var rtt = probed
+        ? (replied
+          ? fmtMs(row.rtt_ms) + ' <span class="muted">/ ' + fmtMs(row.min_rtt_ms) + " / " +
+            fmtMs(row.avg_rtt_ms) + " / " + fmtMs(row.max_rtt_ms) + "</span>"
+          : '<span class="muted">无回包</span>')
+        : none;
       var peer = row.peer_node_id
         ? '<span class="mono">node-' + esc(row.peer_node_id) + '</span> <span class="mono muted">' + esc(row.peer_ip) + "</span>"
         : '<span class="mono">' + esc(row.peer_ip) + "</span>";
@@ -1272,12 +1300,14 @@
         "<td>" + peer + "</td>" +
         "<td>" + bfdTag(row) + "</td>" +
         '<td class="num">' + rtt + "</td>" +
-        '<td class="num">' + (rx ? fmtMs(row.jitter_ms) : "—") + "</td>" +
-        '<td class="num">' + (Number(row.probe_tx) ? fmtPct(row.loss_permille) : "—") + "</td>" +
-        '<td class="num muted">' + esc(row.probe_tx) + " / " + esc(row.probe_rx) +
-          "（丢 " + esc(row.probe_lost) + " · 晚 " + esc(row.probe_late) + "）</td>" +
+        '<td class="num">' + (probed && replied ? fmtMs(row.jitter_ms) : (probed ? '<span class="muted">无回包</span>' : none)) + "</td>" +
+        '<td class="num">' + (probed ? fmtPct(row.loss_permille) : none) + "</td>" +
+        '<td class="num muted">' + (probed
+          ? esc(row.probe_tx) + " / " + esc(row.probe_rx) +
+            "（丢 " + esc(row.probe_lost) + " · 晚 " + esc(row.probe_late) + "）"
+          : none) + "</td>" +
         '<td class="muted num">' + (row.interval_ms ? esc(row.interval_ms) + " ms" : "—") +
-          (row.window_sec ? " · " + esc(row.window_sec) + " s" : "") + "</td>" +
+          (probed ? (row.window_sec ? " · " + esc(row.window_sec) + " s" : " · 累计") : "") + "</td>" +
         "</tr>";
     });
     return h + "</tbody></table></div>";
@@ -1332,7 +1362,8 @@
 
     h += '<section class="panel"><header><h2>隧道内遥测</h2></header>' +
       '<div class="hint">每一行是某一端自己上报的采样窗口，两端不合并：一端说丢包、另一端说 down，这个分歧本身就是诊断信息。窗口 ' +
-      (m.metrics_ttl_sec || 30) + " 秒没有刷新就会从视图里消失（设备失联时旧窗口同样作废）。</div>";
+      (m.metrics_ttl_sec || 30) + " 秒没有刷新就会从视图里消失（设备失联时旧窗口同样作废）。</div>" +
+      '<div class="hint">' + telemetryRuleHint(m.telemetry) + '</div>';
     if (!nodes.length) {
       h += '<div class="empty">没有设备，就没有遥测。</div>';
     } else {

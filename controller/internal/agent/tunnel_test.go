@@ -949,3 +949,84 @@ func TestLinkRebindsLocal0WhenDrifted(t *testing.T) {
 		t.Errorf("local0 漂回 table 0 后没重绑: %v", f.ifTable)
 	}
 }
+
+// 租户在「全局配置」里改的探针间隔与 BFD 定时器要真的落到数据面。
+//
+// 这四个旋钮以前只在控制器侧校验、存盘，bundle 里没有它们，agent 于是永远按
+// wire 里的默认值建会话：操作员把检测倍数从 3 改成 5，看到的还是 3×50ms=150ms
+// 的判定窗口 —— 页面写了、存了、下发了，唯独没人用它。这条测的是整条链：
+// bundle.Telemetry → TunnelTelemetry → SetProbe/bfd_udp_add，并且第二次 Sync
+// 改定时器时必须重建会话（不改就不生效）。
+func TestTunnelSyncInstallsTenantTelemetryPolicy(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.0/32", "10.250.0.1/32", "10.10.1.3:51820")
+	b := testBundle(spec)
+	b.Telemetry = wire.TelemetryPolicy{
+		ProbeIntervalMS: 200, BFDMinTxUS: 60000, BFDMinRxUS: 60000, BFDDetectMult: 5,
+	}
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	ctx := context.Background()
+	if err := ts.Sync(ctx, b.Version); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.ifaces) != 1 {
+		t.Fatalf("隧道接口 %d 个，期望 1", len(f.ifaces))
+	}
+	swIf := f.ifaces[0].SWIfIndex
+	if len(f.probes) != 1 {
+		t.Fatalf("探针会话 %d 条，期望 1", len(f.probes))
+	}
+	for _, p := range f.probes {
+		if p.IntervalMS != 200 {
+			t.Errorf("探针间隔 = %d ms，期望租户配的 200（默认值是 %d，说明 bundle 里的策略没走到数据面）",
+				p.IntervalMS, wire.DefaultProbeIntervalMS)
+		}
+	}
+	sess := bfdByPeer(f, "10.250.0.1")
+	if sess == nil {
+		t.Fatalf("没有多跳 BFD 会话: %+v", f.bfds)
+	}
+	if sess.DesiredMinTxUS != 60000 || sess.RequiredMinRxUS != 60000 || sess.DetectMult != 5 {
+		t.Errorf("BFD 定时器 = tx %d / rx %d / ×%d，期望 60000/60000/5",
+			sess.DesiredMinTxUS, sess.RequiredMinRxUS, sess.DetectMult)
+	}
+
+	// 再改一次：隧道不重建（定时器不是接口身份），但会话必须按新值重下。
+	b2 := b
+	b2.Version = 4
+	b2.Telemetry.BFDMinTxUS, b2.Telemetry.BFDDetectMult = 100000, 2
+	b2.Telemetry.ProbeIntervalMS = 400
+	ts.fetch = func(context.Context) (wire.UnderlayBundle, error) { return b2, nil }
+	if err := ts.Sync(ctx, b2.Version); err != nil {
+		t.Fatalf("Sync(改定时器): %v", err)
+	}
+	if sess = bfdByPeer(f, "10.250.0.1"); sess == nil {
+		t.Fatal("改定时器后 BFD 会话没了")
+	}
+	if sess.DesiredMinTxUS != 100000 || sess.DetectMult != 2 {
+		t.Errorf("改后的 BFD 定时器 = tx %d / ×%d，期望 100000/2", sess.DesiredMinTxUS, sess.DetectMult)
+	}
+	for _, p := range f.probes {
+		if p.IntervalMS != 400 {
+			t.Errorf("改后的探针间隔 = %d ms，期望 400", p.IntervalMS)
+		}
+	}
+	// 定时器不是接口身份：改它不该把隧道拆了重建（重建会连带撤掉转发路径，
+	// 而调一个测量节奏不该让客户流量掉一下）。
+	if len(f.ifaces) != 1 || f.ifaces[0].SWIfIndex != swIf {
+		t.Errorf("改定时器导致隧道重建（接口 %+v，原 %d），它只该重下会话", f.ifaces, swIf)
+	}
+}
+
+func bfdByPeer(f *fakeVPP, peer string) *vppapi.BFDSession {
+	for _, s := range f.bfds {
+		if s.PeerIP.String() == peer {
+			got := s
+			return &got
+		}
+	}
+	return nil
+}

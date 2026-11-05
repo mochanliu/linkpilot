@@ -349,24 +349,31 @@ sr_probe_send_one (vlib_main_t *vm, sr_probe_session_t *s, f64 now)
   ph->t3_ns = 0;
 
   /*
-   * 交给 ip4-lookup 做**普通** FIB 查询：探针的内层目的地址是 peer 的
-   * overlay /32，路由（由控制面下发）把流量指向隧道接口，于是探针与业务
-   * 共用同一条转发路径（含 SR 封装）。
-   *
-   * TX 字段就是 FIB index（0 = main table）。26.06 的 ip4-lookup 对这两个
-   * 字段的约定见 sr_wg.h 里 encap_fib_index 的注释（同一套语义，已由
-   * encap 实测验证）。
-   *
    * RX **必须填一个真实存在的接口**，不能用 ~0：隧道被 admin down 时
    * 这个包会走到 interface-output 的下行分支，再进 interface-drop，而
    * interface_drop_punt 拿 vnet_buffer(b)->sw_if_index[VLIB_RX] 直接当
-   * 数组下标去加每接口计数器 —— ~0 就是越界。2026-10-24 实测过一次：
-   * `set interface state wg0 down` 后 VPP 立刻 SIGSEGV 在
-   * interface_drop_fn_x86_64_v4。填探针自己的隧道口，既真实（探针就是
-   * 从这张口发起的），也让丢包计数落在有意义的地方。
+   * 数组下标去加每接口计数器 —— ~0 就是越界。26.06 的 ip4-lookup 只用
+   * RX 找 FIB、不会把 ~0 写回 RX，所以只有这一侧有这个约束（2026-10-24
+   * 实测过一次：`set interface state wg0 down` 后 VPP 立刻 SIGSEGV
+   * 在 interface_drop_fn_x86_64_v4）。填探针自己的隧道口，既真实（探针
+   * 就是从这张口发起的），也让丢包计数落在有意义的地方。
+   *
+   * TX = ~0 是让 ip4-lookup 去查 **RX 那张接口所在的表**。隧道接口由 agent
+   * 显式挪进 overlay 表（`set interface ip table <if> 250`），所以这一下
+   * 命中的就是 overlay 表里的对端 /32，探针和业务走同一条封装路径。
+   *
+   * 这里不能填 0。26.06 的约定是 TX 存的是 **fib_index**（0、1、…），既不是
+   * sw_if_index 也不是 VRF id（ip4_forward.c 开头那段 buffer 约定写得很明
+   * 白）；填 0 等于点名查 main table。overlay /32 在 main table 里也可能存在
+   * （指向 WAN 网关），于是探针从 table 0 走、**不下隧道**：2026-11-05 实测
+   * CPE1 上 table 0 那条 10.250.0.2/32 的计数器按探针速率增长（11s 里
+   * 37 包 / 3344 字节，对上 probe_tx +43 × 76B），两端 echoed 恒 0、丢包
+   * 钉在 100% —— 探针明文漏到了 LAN 上。~0 之外没有第二个能表达"跟着这张
+   * 隧道的表走"的写法，插件里拿不到 overlay 表的 fib_index，硬编码 1 会在
+   * 表顺序变化时静默查错表。
    */
   vnet_buffer (b)->sw_if_index[VLIB_RX] = s->sw_if_index;
-  vnet_buffer (b)->sw_if_index[VLIB_TX] = 0;
+  vnet_buffer (b)->sw_if_index[VLIB_TX] = ~0;
 
   f = vlib_get_frame_to_node (vm, ip4_lookup_node.index);
   to_next = vlib_frame_vector_args (f);

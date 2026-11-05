@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"sdwan/controller/internal/keybinding"
+	"sdwan/controller/internal/underlay"
 	"sdwan/controller/internal/wire"
 )
 
@@ -314,5 +315,54 @@ func TestBundleFollowsAReorderedTemplate(t *testing.T) {
 	if len(relays) != 2 || relays[0].NodeID != 4 || relays[1].NodeID != 3 ||
 		relays[0].Endpoint != "198.51.100.14:15000" || relays[1].Endpoint != "198.51.100.13:15000" {
 		t.Fatalf("模板换序后下发的中转链没跟着换: %+v", relays)
+	}
+}
+
+// 租户在「全局配置」里填的探针间隔与 BFD 定时器要出现在下发包里。
+//
+// 这四个旋钮过去只存在于控制器侧：PUT 校验通过、写进 state.json、页面上看得见，
+// 但 bundle 里没有它们，于是 agent 永远按 wire 的默认值建会话 —— 操作员以为把
+// 检测倍数改成了 5，设备上跑的仍是 3。bundle 从**已发布**的 state 渲染，所以
+// 这条也顺手钉住"只存草稿不发布，设备视图不动"。
+func TestBundleCarriesTenantTelemetryPolicy(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	if rec := createTunnel(t, s, ten, manualTunnel(1, 2, "wan0")); rec.Code != http.StatusCreated {
+		t.Fatalf("create tunnel = %d (%s)", rec.Code, rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2)
+
+	base := bundleOf(t, s, "t", 1).Telemetry
+	if base.ProbeIntervalMS != wire.DefaultProbeIntervalMS ||
+		base.BFDMinTxUS != wire.DefaultBFDMinTxUS ||
+		base.BFDMinRxUS != wire.DefaultBFDMinRxUS ||
+		base.BFDDetectMult != wire.DefaultBFDDetectMult {
+		t.Fatalf("默认策略没进 bundle: %+v", base)
+	}
+
+	body := settingsBody(t, func(set *underlay.Settings) {
+		set.ProbeIntervalMS = 200
+		set.BFDMinTxMS = 100
+		set.BFDMinRxMS = 50
+		set.BFDDetectMult = 5
+	})
+	if rec := saveUnderlaySettings(t, s, ten, body); rec.Code != http.StatusOK {
+		t.Fatalf("save settings = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := bundleOf(t, s, "t", 1).Telemetry; got != base {
+		t.Errorf("只存草稿就改了设备视图：bundle 从已发布状态渲染，%+v != %+v", got, base)
+	}
+
+	if rec := publishUnderlay(t, s, ten); rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d (%s)", rec.Code, rec.Body.String())
+	}
+	got := bundleOf(t, s, "t", 1).Telemetry
+	// 页面说毫秒、VPP 说微秒，换算只发生在出口这一处。
+	if got.ProbeIntervalMS != 200 || got.BFDMinTxUS != 100_000 ||
+		got.BFDMinRxUS != 50_000 || got.BFDDetectMult != 5 {
+		t.Errorf("发布后的策略 = %+v，期望 200ms / 100000us / 50000us / ×5", got)
+	}
+	if other := bundleOf(t, s, "t", 2).Telemetry; other != got {
+		t.Errorf("同一租户两端策略不一致: %+v vs %+v", other, got)
 	}
 }

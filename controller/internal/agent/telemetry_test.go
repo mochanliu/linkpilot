@@ -206,10 +206,12 @@ func TestTelemetrySampleWindowDeltas(t *testing.T) {
 		t.Errorf("首窗口丢包率 = %d，期望 100", m.LossPermille)
 	}
 
-	// 第二个窗口：2 秒后，新增 8 发 7 收 1 丢。
+	// 第二个窗口：2 秒后，新增 8 发 7 收 1 丢。丢包率不跟着这几个增量重算 ——
+	// 它是插件滑窗里的当前值，这里换成了 90‰ 来证明取的是插件那份。
 	tel.now = func() time.Time { return base.Add(2 * time.Second) }
 	dp.probes[0].Tx, dp.probes[0].Rx, dp.probes[0].Lost = 18, 16, 2
 	dp.probes[0].LastRTTus = 4000
+	dp.probes[0].LossPermille = 90
 	second, err := tel.Sample(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -218,11 +220,57 @@ func TestTelemetrySampleWindowDeltas(t *testing.T) {
 	if m.ProbeTx != 8 || m.ProbeRx != 7 || m.ProbeLost != 1 || m.WindowSec != 2 {
 		t.Errorf("窗口增量错: %+v", m)
 	}
-	if m.LossPermille != 125 { // 1/8 = 125‰
-		t.Errorf("窗口丢包率 = %d，期望 125", m.LossPermille)
+	if m.LossPermille != 90 { // 插件滑窗的当前值，不是 lost_delta/tx_delta
+		t.Errorf("窗口丢包率 = %d，期望插件的 90", m.LossPermille)
 	}
 	if m.RTTms != 4 {
 		t.Errorf("last RTT = %v，期望 4", m.RTTms)
+	}
+}
+
+// 丢包率的口径必须是「率」：没丢 = 0，最多 100%。
+//
+// 这条测的是曾经的错误：agent 拿两次采样的差值再算一遍 lost/tx。一条探针在这
+// 个窗口发出、要 3×间隔（900ms）后才被判丢，于是它只进下一窗口的分子；那个
+// 窗口里 lost_delta 能大于 tx_delta，页面按百分比读出来就是 103%、下一帧又
+// 变成 97%。现在分子分母都取自插件同一个 128 槽窗口：会话刚建立时是 0，全丢
+// 时是 1000‰，落在什么区间由插件的窗口决定，不会因为采样边界而越界。
+func TestTelemetryLossIsABoundedRate(t *testing.T) {
+	dp := &fakeTelemetryPlane{probes: []vppapi.ProbeStats{{
+		SwIfIndex: 5, PeerIP: net.IPv4(192, 168, 99, 2), LocalIP: net.IPv4(192, 168, 99, 1),
+		IntervalMS: 300, Enabled: true,
+		Tx: 33, Rx: 0, Lost: 0, LossPermille: 0,
+	}}}
+	tel := NewTelemetry(dp)
+	base := time.Unix(1_700_000_000, 0)
+	tel.now = func() time.Time { return base }
+
+	rows, err := tel.Sample(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].LossPermille != 0 {
+		t.Errorf("刚建会话就该是 0‰，实到 %d", rows[0].LossPermille)
+	}
+	if !rows[0].HasProbe {
+		t.Error("有探针会话的行必须标 has_probe，页面据此区分「0 丢包」和「未上报」")
+	}
+
+	// 下一窗口：这 33 发全部超时判丢、窗口内只新发了一包。旧的差值口径在这里
+	// 算出 33/1，页面显示 3300%；插件的滑窗给的是 1000‰（全丢），这才是「率」。
+	tel.now = func() time.Time { return base.Add(time.Second) }
+	dp.probes[0].Tx, dp.probes[0].Rx, dp.probes[0].Lost = 34, 0, 33
+	dp.probes[0].LossPermille = 1000
+	rows, err = tel.Sample(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := rows[0]
+	if m.LossPermille != 1000 {
+		t.Errorf("全丢应当是 1000‰，实到 %d", m.LossPermille)
+	}
+	if m.ProbeTx != 1 || m.ProbeLost != 33 {
+		t.Errorf("计数增量照旧要报出来（ %+v ）", m)
 	}
 }
 
@@ -274,6 +322,9 @@ func TestTelemetrySampleIncludesBFDOnlyTunnel(t *testing.T) {
 	}
 	if !rows[0].Up || rows[0].BFDState != "up" || rows[0].PeerIP != "192.168.99.3" {
 		t.Errorf("BFD-only 行 = %+v", rows[0])
+	}
+	if rows[0].HasProbe {
+		t.Error("没有探针会话的行不能标 has_probe：页面要靠它把时延/抖动/丢包写成「未上报」，而不是 0")
 	}
 	if rows[0].PeerNodeID != 11 {
 		t.Errorf("BFD-only 行的 PeerNodeID = %d，期望从配置里补上 11", rows[0].PeerNodeID)

@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"sdwan/controller/internal/underlay"
 	"sdwan/controller/internal/wire"
 )
 
@@ -168,6 +169,51 @@ func TestConsoleMetricsStaleNodeIsListedButLosesItsWindow(t *testing.T) {
 	}
 	if n.TelemetrySeenAt != 0 || len(n.Tunnels) != 0 {
 		t.Errorf("stale node still exposes a window: %+v", n)
+	}
+}
+
+// The page quotes the verdict window in its own hint line, so the number has to
+// come from what the controller delivered -- not from DefaultSettings(), which
+// is a value the devices may never have received. An unpublished tenant gets
+// nil, and the page then says the timers are unknown instead of printing 150ms.
+func TestConsoleMetricsCarriesTheDeliveredTelemetryPolicy(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	delivered := wire.TelemetryPolicy{ProbeIntervalMS: 300, BFDMinTxUS: 50000, BFDMinRxUS: 50000, BFDDetectMult: 3}
+
+	_, out := consoleMetricsReq(t, s, ten, http.MethodGet, "")
+	if out.Telemetry != nil {
+		t.Fatalf("a tenant that never published reports a policy: %+v", *out.Telemetry)
+	}
+
+	publishDefault(t, s, ten)
+	_, out = consoleMetricsReq(t, s, ten, http.MethodGet, "")
+	if out.Telemetry == nil {
+		t.Fatal("published tenant has no policy in the metrics document")
+	}
+	if *out.Telemetry != delivered {
+		t.Errorf("delivered policy = %+v, want %+v", *out.Telemetry, delivered)
+	}
+
+	// A draft is a form, not a setting: the window the page quotes must not
+	// move until the tenant publishes.
+	body := settingsBody(t, func(p *underlay.Settings) {
+		p.ProbeIntervalMS, p.BFDMinTxMS, p.BFDMinRxMS, p.BFDDetectMult = 200, 100, 50, 5
+	})
+	if rec := saveUnderlaySettings(t, s, ten, body); rec.Code != http.StatusOK {
+		t.Fatalf("save = %d (%s)", rec.Code, rec.Body.String())
+	}
+	_, out = consoleMetricsReq(t, s, ten, http.MethodGet, "")
+	if *out.Telemetry != delivered {
+		t.Errorf("unpublished draft changed the page: %+v, want %+v", *out.Telemetry, delivered)
+	}
+
+	if rec := publishUnderlay(t, s, ten); rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d (%s)", rec.Code, rec.Body.String())
+	}
+	_, out = consoleMetricsReq(t, s, ten, http.MethodGet, "")
+	want := wire.TelemetryPolicy{ProbeIntervalMS: 200, BFDMinTxUS: 100000, BFDMinRxUS: 50000, BFDDetectMult: 5}
+	if *out.Telemetry != want {
+		t.Errorf("delivered policy = %+v, want %+v", *out.Telemetry, want)
 	}
 }
 

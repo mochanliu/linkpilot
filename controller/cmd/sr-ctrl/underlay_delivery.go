@@ -68,6 +68,7 @@ func (s *server) underlayBundleLocked(tenant string, nodeID uint16) (wire.Underl
 		Version: st.Gen, GeneratedAt: now,
 		OverlayTable: wire.OverlayRouteTable,
 		TransitPort:  st.TransitPorts[nodeID],
+		Telemetry:    st.Settings.TelemetryPolicy(),
 		PKeys:        s.tenantKeyRing(tenant),
 		Tunnels:      []wire.TunnelSpec{},
 		Skipped:      []wire.TunnelSkip{},

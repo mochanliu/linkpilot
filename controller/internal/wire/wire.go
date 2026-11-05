@@ -597,9 +597,28 @@ type UnderlayBundle struct {
 	// TransitPort is this device's relay port; 0 = it relays nothing today.
 	TransitPort uint16 `json:"transit_port,omitempty"`
 
+	// Telemetry is the tenant's measurement policy for every tunnel it runs,
+	// copied out of the published underlay settings. It travels with the bundle
+	// because these are the numbers the console shows and edits: without them the
+	// agent has nothing to program and falls back to the defaults below, which is
+	// how a tenant's edit ended up changing nothing on the box.
+	Telemetry TelemetryPolicy `json:"telemetry"`
+
 	PKeys   []PKey       `json:"p_keys"`
 	Tunnels []TunnelSpec `json:"tunnels"`
 	Skipped []TunnelSkip `json:"skipped"`
+}
+
+// TelemetryPolicy is the per-tenant part of the telemetry configuration: the
+// probe interval and the BFD timers, in the units the console uses (ms) for the
+// probe and VPP's native unit (us) for BFD. Zero means "use the default next to
+// each field in TunnelTelemetry", so an older controller that renders no policy
+// still gets the same sessions the defaults describe.
+type TelemetryPolicy struct {
+	ProbeIntervalMS uint32 `json:"probe_interval_ms,omitempty"`
+	BFDMinTxUS      uint32 `json:"bfd_min_tx_us,omitempty"`
+	BFDMinRxUS      uint32 `json:"bfd_min_rx_us,omitempty"`
+	BFDDetectMult   uint8  `json:"bfd_detect_mult,omitempty"`
 }
 
 // TunnelState is the DEVICE's account of the tunnel configuration it runs, the
@@ -857,10 +876,16 @@ type ObserveResponse struct {
 // The telemetry split (settled 2026-10-18) exists because the two dataplane
 // mechanisms answer different questions and only one of them has numbers:
 //
-//   - Reachability comes from VPP's own BFD. It detects a dead tunnel in about
-//     a second at the lab's 50 ms interval, but exposes NO quality metrics at
-//     all -- neither bfd_udp_session_details nor the session struct carries rtt,
-//     jitter or loss (measured 2026-10-24).
+//   - Reachability comes from VPP's own BFD. Its verdict is a timer rule, not a
+//     measurement: a session goes down after detect_mult × the negotiated
+//     receive interval of silence —— 50 ms × 3 = 150 ms once both ends are Up.
+//     The wall clock is coarser: while a session is Init/Down VPP sends at about
+//     1 s (measured 2026-11-05, CPE1 `show bfd sessions` printed Transmit
+//     1000000), which is what turned the 150 ms rule into the ~1.5 s a dead
+//     interface actually took to be reported (measured 2026-10-24).
+//     BFD exposes NO quality metrics at all -- neither
+//     bfd_udp_session_details nor the session struct carries rtt, jitter or loss
+//     (measured 2026-10-24).
 //   - Quality comes from the plugin's own probe (sr_wg_probe, UDP 51829): one
 //     packet type, echoed by the peer, giving RTT, RFC3550 jitter and a sliding
 //     window loss ratio. There is deliberately no bidirectional STAMP.
@@ -882,8 +907,9 @@ const (
 	DefaultProbeIntervalMS uint32 = 300
 	// ProbeTimeoutMult is the plugin's rule for TimeoutMS=0: three intervals.
 	ProbeTimeoutMult uint32 = 3
-	// BFD defaults match the lab session that detected a dead WG interface in
-	// 1.5 s (2026-10-24). Detection time is detect_mult * max(tx, rx).
+	// BFD defaults are the timers of the lab session measured 2026-10-24, whose
+	// rule (detect_mult × max(tx, rx) = 150 ms) plus VPP's ~1 s Init/Down period
+	// reported a dead WG interface about 1.5 s after it went.
 	DefaultBFDMinTxUS    uint32 = 50000
 	DefaultBFDMinRxUS    uint32 = 50000
 	DefaultBFDDetectMult uint8  = 3
@@ -928,6 +954,12 @@ type TunnelTelemetry struct {
 // reset (session re-created) from real traffic. Window failures are therefore
 // computed by the only party that samples both ends of the window.
 //
+// The exception is the first frame after the agent starts sampling a tunnel:
+// there is no earlier sample to subtract, so WindowSec is 0 and those four
+// numbers are the device's counters since the probe session was created. The
+// consumer has to know, because a windowless delta read as a delta makes the
+// dashboard count one tunnel's whole life into a single second.
+//
 // RTT/jitter values are snapshots, not window aggregates: min/avg/max are the
 // probe session's lifetime scope (the plugin tracks them that way) and jitter is
 // its current RFC3550 EWMA. That difference is stated in the field comments
@@ -945,13 +977,23 @@ type TunnelMetrics struct {
 	IntervalMS uint32 `json:"interval_ms"`
 	WindowSec  uint32 `json:"window_sec"`
 
+	// HasProbe says whether this device has a probe session for the tunnel at
+	// all. Reachability-only rows (BFD present, probe never installed -- a half
+	// applied tunnel, a plugin that refused the set) must display quality as
+	// "未上报", not as 0% loss and 0 ms: a zero is a measurement, absence is not.
+	HasProbe bool `json:"has_probe,omitempty"`
+
 	ProbeTx   uint64 `json:"probe_tx"`
 	ProbeRx   uint64 `json:"probe_rx"`
 	ProbeLost uint64 `json:"probe_lost"`
 	ProbeLate uint64 `json:"probe_late"`
-	// LossPermille is the window loss ratio (probe_lost / probe_tx * 1000).
-	// When no probe was sent in the window it falls back to the plugin's
-	// sliding-window value, which still describes the recent past.
+	// LossPermille is the plugin's sliding-window loss rate (lost / (replied +
+	// lost) over the last SR_PROBE_WINDOW samples), so it is bounded by
+	// construction and "nothing lost" is exactly 0. It is NOT
+	// probe_lost / probe_tx of this report's window: a probe sent near the end of
+	// a window is declared lost in a later one (timeout = 3 intervals), so that
+	// ratio only has a numerator in the window where it counts, and it can exceed
+	// 100%.
 	LossPermille uint32 `json:"loss_permille"`
 
 	RTTms    float64 `json:"rtt_ms"`     // most recent reply

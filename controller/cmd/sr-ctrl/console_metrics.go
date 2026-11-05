@@ -28,8 +28,14 @@ type consoleMetrics struct {
 	NowUnix    int64             `json:"now_unix"`
 	// MetricsTTLSec is the read-side window policy (--metrics-ttl). The page
 	// states it instead of hardcoding a number that could drift from the flag.
-	MetricsTTLSec int                  `json:"metrics_ttl_sec"`
-	Nodes         []consoleNodeMetrics `json:"nodes"`
+	MetricsTTLSec int `json:"metrics_ttl_sec"`
+	// Telemetry is the BFD/probe policy that goes out in the bundle, so it is
+	// what is installed on the devices right now -- not what a draft form on
+	// the settings page says. It is a pointer because a tenant with no
+	// published underlay has no policy at all: the page must then say the
+	// verdict window is unknown, not quote the built-in defaults.
+	Telemetry *wire.TelemetryPolicy `json:"telemetry"`
+	Nodes     []consoleNodeMetrics  `json:"nodes"`
 }
 
 type consoleNodeMetrics struct {
@@ -84,6 +90,13 @@ func (s *server) handleAdminMetrics(w http.ResponseWriter, r *http.Request) {
 		TLSAddrs:     append([]string{}, s.tlsAddrs...),
 		HeartbeatSec: s.hbSec,
 		Epoch:        s.state.Epoch,
+	}
+	// Same gate as the bundle: an underlay that was never published has no
+	// policy to show, and quoting DefaultSettings() here would be inventing a
+	// number the devices never received.
+	if uc := s.state.Underlays[id.TenantID]; uc != nil && uc.State != nil && uc.State.Configured() {
+		p := uc.State.Settings.TelemetryPolicy()
+		out.Telemetry = &p
 	}
 	for _, n := range s.state.Nodes {
 		if n.TenantID != id.TenantID {

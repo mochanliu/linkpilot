@@ -316,10 +316,19 @@ func (t *Telemetry) row(p vppapi.ProbeStats, bfd vppapi.BFDSession, hasBFD bool,
 		return m
 	}
 
+	m.HasProbe = true
 	m.PeerIP = p.PeerIP.String()
 	if m.IntervalMS == 0 && w != nil {
 		m.IntervalMS = w.cfg.IntervalMS
 	}
+	// 丢包率只有一个来源：插件自己那个 128 槽滑动窗口里的 lost/(replied+lost)。
+	// 分子分母都在同一张窗口里数，天然落在 0-1000‰，而且"没丢"就是 0。
+	//
+	// 之前这里在 agent 侧用两次采样的**差值**再算一遍（lost_delta/tx_delta），那
+	// 是个没有上界的比值：一条探针在窗口 k 发出去、超时（3×间隔）之后在窗口 k+1
+	// 才被判丢，它就只进 k+1 的分子、不进 k+1 的分母；迟到回包又只加 late、不加
+	// rx。于是"丢包率"会在 97% 和 103% 之间抖 —— 监控页显示的是百分比，读者按
+	// 0-100% 理解它，抖出 103% 就是口径错了，不是抖动。
 	m.LossPermille = p.LossPermille
 	m.RTTms = usToMs(p.LastRTTus)
 	m.MinRTTms = usToMs(p.MinRTTus)
@@ -339,15 +348,12 @@ func (t *Telemetry) row(p vppapi.ProbeStats, bfd vppapi.BFDSession, hasBFD bool,
 		m.ProbeLost = counterDelta(p.Lost, w.lost)
 		m.ProbeLate = counterDelta(p.LateReplies, w.late)
 		m.WindowSec = uint32(now.Sub(w.at) / time.Second)
-		if m.ProbeTx > 0 {
-			m.LossPermille = uint32((m.ProbeLost*1000 + m.ProbeTx/2) / m.ProbeTx)
-		}
 	} else {
+		// 第一个采样窗口：没有可比的前一帧，WindowSec 保持 0，报的是设备从会话
+		// 建立到现在的累计值。这四个数因此不能当"这一窗口的量"读，页面按
+		// window_sec==0 标成累计。丢包率不受影响 —— 它来自插件的窗口。
 		m.ProbeTx, m.ProbeRx = p.Tx, p.Rx
 		m.ProbeLost, m.ProbeLate = p.Lost, p.LateReplies
-		if m.ProbeTx > 0 {
-			m.LossPermille = uint32((m.ProbeLost*1000 + m.ProbeTx/2) / m.ProbeTx)
-		}
 	}
 	w.tx, w.rx, w.lost, w.late = p.Tx, p.Rx, p.Lost, p.LateReplies
 	w.at = now
