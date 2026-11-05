@@ -155,7 +155,7 @@ func TestApplySrfrrPushesBeforeWriting(t *testing.T) {
 
 	inst := Installed{Srfrr: `{"export_vrfs":[0,100],"import_rules":[
 		{"vpn":100,"sources":["bgp","ospf"],"prefixes":[]}]}`}
-	if err := newSrfrrApplier(t, conf, sock).applySrfrr(context.Background(), inst, Installed{}, true); err != nil {
+	if _, err := newSrfrrApplier(t, conf, sock).applySrfrr(context.Background(), inst, Installed{}, true); err != nil {
 		t.Fatalf("applySrfrr: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestApplySrfrrRefusesMismatchedHashAndKeepsFile(t *testing.T) {
 	})
 
 	inst := Installed{Srfrr: `{"export_vrfs":[0,100],"import_rules":[]}`}
-	err := newSrfrrApplier(t, conf, sock).applySrfrr(context.Background(), inst, Installed{}, true)
+	_, err := newSrfrrApplier(t, conf, sock).applySrfrr(context.Background(), inst, Installed{}, true)
 	if err == nil || !strings.Contains(err.Error(), "hash") {
 		t.Fatalf("hash mismatch = %v, want an error", err)
 	}
@@ -207,9 +207,61 @@ func TestApplySrfrrRefusesFailedPutAndKeepsFile(t *testing.T) {
 	})
 
 	inst := Installed{Srfrr: `{"export_vrfs":[],"import_rules":[]}`}
-	err := newSrfrrApplier(t, conf, sock).applySrfrr(context.Background(), inst, Installed{}, true)
+	_, err := newSrfrrApplier(t, conf, sock).applySrfrr(context.Background(), inst, Installed{}, true)
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("failed PUT = %v, want an error carrying the status", err)
+	}
+	if now, _ := os.ReadFile(conf); string(now) != string(orig) {
+		t.Fatalf("file changed despite a failed push:\n%s", now)
+	}
+}
+
+// The brand-new box: nobody listens AND no sr-frr process exists. §5.3's
+// "PUT before write" has no live table to protect here, so the 5th segment takes
+// the boot path and the apply succeeds with a note -- otherwise the file only
+// sr-frr needs to start would need a running sr-frr to be written.
+func TestApplySrfrrNoProcessWritesWithNote(t *testing.T) {
+	conf := filepath.Join(t.TempDir(), "sr-frr.json")
+	writeSrfrrBase(t, conf, `{"status_url":"http://x","export_vrfs":[0],"import_rules":[]}`)
+	a := newSrfrrApplier(t, conf, filepath.Join(t.TempDir(), "absent.sock"))
+	a.SrfrrRunning = func() bool { return false }
+
+	inst := Installed{Srfrr: `{"export_vrfs":[0],"import_rules":[{"vpn":0,"sources":["ospf"],"prefixes":[]}]}`}
+	note, err := a.applySrfrr(context.Background(), inst, Installed{}, true)
+	if err != nil {
+		t.Fatalf("first-boot apply = %v, want the boot path", err)
+	}
+	if !strings.Contains(note, "未热更") || !strings.Contains(note, "清单") {
+		t.Errorf("note = %q, want 已落盘、未热更 + who starts sr-frr", note)
+	}
+	var onBox map[string]json.RawMessage
+	raw, _ := os.ReadFile(conf)
+	_ = json.Unmarshal(raw, &onBox)
+	if string(onBox["import_rules"]) == "" {
+		t.Fatalf("nothing written:\n%s", raw)
+	}
+	if !strings.Contains(string(onBox["import_rules"]), "ospf") {
+		t.Errorf("5th segment not on disk: %s", raw)
+	}
+}
+
+// The half that keeps the exemption honest: a socket nobody answers on is only
+// "no sr-frr" when there is also no sr-frr process. If the process is running,
+// the socket we were pointed at is the wrong one -- that is §5.3's hard failure,
+// not a note.
+func TestApplySrfrrAliveProcessWithUnreachableSocketStillFails(t *testing.T) {
+	conf := filepath.Join(t.TempDir(), "sr-frr.json")
+	orig := writeSrfrrBase(t, conf, `{"status_url":"http://x","export_vrfs":[0],"import_rules":[]}`)
+	a := newSrfrrApplier(t, conf, filepath.Join(t.TempDir(), "absent.sock"))
+	a.SrfrrRunning = func() bool { return true }
+
+	inst := Installed{Srfrr: `{"export_vrfs":[0],"import_rules":[]}`}
+	note, err := a.applySrfrr(context.Background(), inst, Installed{}, true)
+	if err == nil || !strings.Contains(err.Error(), "活进程还是旧表") {
+		t.Fatalf("= note %q, err %v; want the §5.3 hard failure", note, err)
+	}
+	if note != "" {
+		t.Errorf("note = %q, want none on a failed apply", note)
 	}
 	if now, _ := os.ReadFile(conf); string(now) != string(orig) {
 		t.Fatalf("file changed despite a failed push:\n%s", now)
@@ -221,9 +273,13 @@ func TestApplySrfrrBootWritesWithoutPush(t *testing.T) {
 	writeSrfrrBase(t, conf, `{"status_url":"http://x","export_vrfs":[],"import_rules":[]}`)
 	// Nothing listening: a boot replay that pushed would fail here.
 	inst := Installed{Srfrr: `{"export_vrfs":[0],"import_rules":[]}`}
-	if err := newSrfrrApplier(t, conf, filepath.Join(t.TempDir(), "absent.sock")).
-		applySrfrr(context.Background(), inst, inst, false); err != nil {
+	note, err := newSrfrrApplier(t, conf, filepath.Join(t.TempDir(), "absent.sock")).
+		applySrfrr(context.Background(), inst, inst, false)
+	if err != nil {
 		t.Fatalf("boot replay pushed: %v", err)
+	}
+	if note != "" {
+		t.Errorf("note = %q, want none: boot never claims a hot reload", note)
 	}
 	var onBox map[string]json.RawMessage
 	raw, _ := os.ReadFile(conf)
@@ -237,7 +293,7 @@ func TestApplySrfrrBootWritesWithoutPush(t *testing.T) {
 func TestApplySrfrrMissingBaseFile(t *testing.T) {
 	conf := filepath.Join(t.TempDir(), "sr-frr.json")
 	inst := Installed{Srfrr: `{"export_vrfs":[],"import_rules":[]}`}
-	err := newSrfrrApplier(t, conf, "").applySrfrr(context.Background(), inst, Installed{}, false)
+	_, err := newSrfrrApplier(t, conf, "").applySrfrr(context.Background(), inst, Installed{}, false)
 	if err == nil || !strings.Contains(err.Error(), "status_url") {
 		t.Fatalf("missing base file = %v, want the box-key explanation", err)
 	}

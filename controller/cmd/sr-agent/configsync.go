@@ -84,6 +84,7 @@ func (c *configSync) readState() wire.ConfigState {
 	st.AppliedAt = s.AppliedAt
 	st.Source = s.Source
 	st.Error = s.Error
+	st.Notes = s.Notes
 	return st
 }
 

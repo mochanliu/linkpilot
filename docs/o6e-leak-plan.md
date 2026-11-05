@@ -258,6 +258,12 @@ router bgp 65101
   sr-apply 的顺序固定为：**先 FRR，再 sr-frr**。先让 `redistribute kernel` 在位，再让 K 路由出现，
   zebra 才会在路由新增时触发再分发。`PUT` 成功且 hash 对上后才原子落盘；`PUT` 失败则这次 apply
   失败、盘上保留旧文件、不重启任何进程。
+  **唯一的豁免（2026-11-05 拍定并实测，见 `vmlab-rebuild-plan.md` §9.4）**：当且仅当
+  这次 PUT 失败是"socket 上没人监听"（`ENOENT` / `ECONNREFUSED`）**并且**盒子上没有 sr-frr
+  进程时，按开机重放那条路走 —— 只落盘、不热更，并附一条"已落盘、未热更"的备注一路报到控制台
+  （`internal/apply/srfrr.go:127`）。这条情况下没有"活进程还是旧表"可骗：那个进程根本不在，
+  起来读的就是这份盘。进程活着但 socket 连不上（它正在启动、控制口被删）仍然硬失败，
+  因为那种时候落盘造出的正是本节要防的那个不一致。
 - **touch**：如果某个 VPN 本来就在导出，只是新加了一个协议，K 路由已经存在，`redistribute kernel`
   不会重算。sr-apply 对比上一版已安装的 srfrr 片段，把"协议集合变了的 VPN"用
   `PUT /config` 里的 `refresh_vrfs` 带过去；sr-frr 对这些 VPN 的现有前缀做一次

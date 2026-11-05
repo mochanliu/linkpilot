@@ -8,11 +8,17 @@
 //
 // Two differences from the route overlay:
 //
-//   - The push is mandatory. §5.3: PUT first, verify the hash sr-frr reports,
-//     and only then write the file. A PUT that fails fails the apply; there is
-//     no "已落盘、未热更" note here, because sr-frr is the only process that
-//     turns these keys into kernel routes and saying "done" while it still runs
-//     the old table would be a lie.
+//   - The push is mandatory -- when there is someone to push to. §5.3: PUT
+//     first, verify the hash sr-frr reports, and only then write the file. A
+//     PUT that fails fails the apply; sr-frr is the only process that turns
+//     these keys into kernel routes and saying "done" while it still runs the
+//     old table would be a lie. The one case that is not a lie is the box where
+//     no sr-frr is running at all (first boot: start.sh replays apply BEFORE it
+//     launches the bridge step) -- there is no live table to disagree with, so
+//     that PUT failure takes the boot path: write the file, say so in a note,
+//     and let the checklist start sr-frr on it. Without that exemption the two
+//     halves deadlock: the file's two keys exist only after a successful push,
+//     and sr-frr (§5.5) refuses to start while both keys are empty.
 //   - The old schema keys (vrfs/import/distance/metric) are deleted on merge.
 //     This is the one-time migration away from the ZAPI/1250 exporter (§5.5); a
 //     file still holding them is exactly what makes sr-frr run with both
@@ -23,6 +29,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -31,6 +38,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"sdwan/controller/internal/frr"
 )
@@ -84,14 +92,16 @@ func decodeSrfrr(seg string) (srfrrSegment, error) {
 // -- hands it to the running sr-frr. prev is the version installed before this
 // one; its FRR artifact says which VPNs gained a redistribute instance and
 // therefore need one delete+add of their existing K routes (§5.3 touch).
-func (a *Applier) applySrfrr(ctx context.Context, inst, prev Installed, push bool) error {
+// The returned note is the disk-vs-live disagreement the page must show: an
+// empty note with a nil error means the live sr-frr has exactly these keys.
+func (a *Applier) applySrfrr(ctx context.Context, inst, prev Installed, push bool) (string, error) {
 	if inst.Srfrr == "" {
 		a.Logf("sr-frr: 这份配置包没有第 5 段，%s 未改动", a.SrfrrConf)
-		return nil
+		return "", nil
 	}
 	seg, err := decodeSrfrr(inst.Srfrr)
 	if err != nil {
-		return err
+		return "", err
 	}
 	for k := range seg.doc {
 		if !srfrrKeys[k] {
@@ -100,22 +110,29 @@ func (a *Applier) applySrfrr(ctx context.Context, inst, prev Installed, push boo
 	}
 	base, err := readSrfrrFile(a.SrfrrConf)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if a.DryRun {
 		a.Logf("would merge 第 5 段 into %s and push PUT /config", a.SrfrrConf)
-		return nil
+		return "", nil
 	}
 	sock := a.SrfrrSock
 	if sock == "" {
 		sock = srfrrSocketOf(base)
 	}
+	note := ""
 	if push {
 		refresh := refreshVRFs(prev.FRR, inst.FRR, seg.exportRaw)
 		if err := a.pushSrfrr(ctx, sock, seg, refresh); err != nil {
-			return fmt.Errorf("sr-frr 热更失败（%s 未改动，活进程还是旧表）: %w", a.SrfrrConf, err)
-		}
-		if len(refresh) > 0 {
+			if !srfrrAbsent(err) || a.SrfrrRunning() {
+				return "", fmt.Errorf("sr-frr 热更失败（%s 未改动，活进程还是旧表）: %w", a.SrfrrConf, err)
+			}
+			// 这台盒子上没有 sr-frr 在跑（首次开机、或它已经退出）。走开机重放
+			// 那条路：只落盘，进程由清单起，起来读的就是这份。
+			note = fmt.Sprintf("已落盘 %s、未热更：%s 上没有人监听且盒子上没有 sr-frr 进程"+
+				"（首次开机或它已退出），由开机清单起它，起来就是这张表", a.SrfrrConf, sock)
+			a.Logf("sr-frr: %s", note)
+		} else if len(refresh) > 0 {
 			a.Logf("sr-frr: 已热更 %s，并 touch vpn%v（协议集合变化，触发再分发重算）", sock, refresh)
 		} else {
 			a.Logf("sr-frr: 已热更 %s", sock)
@@ -123,15 +140,23 @@ func (a *Applier) applySrfrr(ctx context.Context, inst, prev Installed, push boo
 	}
 	merged, err := mergeSrfrr(base, seg)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := writeFileSync(a.SrfrrConf, merged, 0o644); err != nil {
-		return fmt.Errorf("写 %s: %w", a.SrfrrConf, err)
+		return "", fmt.Errorf("写 %s: %w", a.SrfrrConf, err)
 	}
 	if !push {
 		a.Logf("sr-frr: 已落盘 %s（开机重放不热更，sr-frr 起来就是这张表）", a.SrfrrConf)
 	}
-	return nil
+	return note, nil
+}
+
+// srfrrAbsent reports "nobody is serving that socket" -- the socket file is not
+// there, or nothing accepts on it. Both say the control plane is not up; every
+// other failure (a 5xx, a bad reply, a hash that does not match) means an
+// sr-frr IS answering, and §5.3 keeps that one a hard error.
+func srfrrAbsent(err error) bool {
+	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func readSrfrrFile(path string) (map[string]json.RawMessage, error) {

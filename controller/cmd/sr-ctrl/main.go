@@ -54,6 +54,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -1275,7 +1276,8 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// agent) must not be turned into capable=false here -- that would accuse a
 	// device of ignoring a channel it does not implement.
 	configChanged := false
-	if req.Config != nil && (rec.Config == nil || *rec.Config != *req.Config) {
+	// DeepEqual rather than !=: Notes made ConfigState a non-comparable struct.
+	if req.Config != nil && (rec.Config == nil || !reflect.DeepEqual(*rec.Config, *req.Config)) {
 		st := *req.Config
 		rec.Config = &st
 		configChanged = true

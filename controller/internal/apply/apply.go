@@ -412,6 +412,12 @@ type Applier struct {
 	SrfrrSock string
 	// NoSrfrrPush suppresses the hot PUT to sr-frr (boot replay only).
 	NoSrfrrPush bool
+	// SrfrrRunning answers "is there an sr-frr process on this box". §5.3 only
+	// forbids saying "done" while a LIVE sr-frr still holds the old table; when no
+	// process exists there is no table to lie about, and the 5th segment takes the
+	// same path the boot replay takes (write the file, the checklist starts it).
+	// A test seam; the default reads /proc like start.sh's own `alive` check.
+	SrfrrRunning func() bool
 	// VPPAPI is the box's VPP api.sock. Only the 6th segment needs it: vrrp has no
 	// CLI on this build, so its reconciliation goes through the binary API while
 	// everything above still goes through vppctl. Empty means no VR can be
@@ -448,6 +454,7 @@ func New(store Store) *Applier {
 		Exec:      execRunner{},
 		Sleep:     time.Sleep,
 		TAPExists: func(name string) bool { _, err := os.Stat("/sys/class/net/" + name); return err == nil },
+		SrfrrRunning: func() bool { return procExists("sr-frr") },
 		Logf:      func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
 		Now:       time.Now,
 		HTTP:      &http.Client{Timeout: routePushTimeout},
@@ -486,12 +493,41 @@ func (a *Applier) setDefaults() {
 	if a.TAPExists == nil {
 		a.TAPExists = def.TAPExists
 	}
+	if a.SrfrrRunning == nil {
+		a.SrfrrRunning = def.SrfrrRunning
+	}
 	if a.Logf == nil {
 		a.Logf = def.Logf
 	}
 	if a.Now == nil {
 		a.Now = def.Now
 	}
+}
+
+// procExists is start.sh's `alive` check in Go: it compares /proc/<pid>/comm, so
+// a stale pidfile or a recycled pid cannot make it say "running". The name is
+// start.sh's `name_of` for the bridge step. Without /proc (a dev machine running
+// the unit tests) this answers "running", which keeps §5.3's strict path there.
+func procExists(name string) bool {
+	dir, err := os.Open("/proc")
+	if err != nil {
+		return true
+	}
+	defer dir.Close()
+	entries, err := dir.Readdirnames(-1)
+	if err != nil {
+		return true
+	}
+	for _, e := range entries {
+		if _, convErr := strconv.Atoi(e); convErr != nil {
+			continue
+		}
+		comm, err := os.ReadFile("/proc/" + e + "/comm")
+		if err == nil && strings.TrimSpace(string(comm)) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Apply validates, installs and then applies a bundle. With allowBlocking the
@@ -529,7 +565,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		if _, err := a.applyRoute(ctx, inst, !a.NoRoutePush); err != nil {
 			return err
 		}
-		if err := a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush); err != nil {
+		if _, err := a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush); err != nil {
 			return err
 		}
 		return a.applyVRRP(ctx, inst)
@@ -566,7 +602,12 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 	// sr-frr last, after FRR: `redistribute kernel` has to be in place before the
 	// K routes appear, or zebra never sees the addition it should redistribute.
 	if err == nil {
-		err = a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush)
+		note, serr := a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush)
+		if serr != nil {
+			err = serr
+		} else if note != "" {
+			notes = append(notes, note)
+		}
 	}
 	// VRRP is the very last thing: the VIP is this box's claim to be the site's
 	// first hop, and a box whose remaining segments only half landed must not win
@@ -608,7 +649,12 @@ func (a *Applier) Boot(ctx context.Context, frrDiff bool) error {
 	}
 	// Same for sr-frr: start.sh launches it after apply, so no push.
 	if err == nil {
-		err = a.applySrfrr(ctx, inst, inst, false)
+		note, serr := a.applySrfrr(ctx, inst, inst, false)
+		if serr != nil {
+			err = serr
+		} else if note != "" {
+			notes = append(notes, note)
+		}
 	}
 	// VRRP last here too. The VRs are VPP's own memory -- they are in no file --
 	// so whatever a VPP restart erases, it erases them, and without this replay a

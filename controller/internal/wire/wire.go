@@ -463,6 +463,10 @@ type ConfigState struct {
 	AppliedAt       int64  `json:"applied_at_unix,omitempty"` // when that attempt ran
 	Source          string `json:"source,omitempty"`          // apply | boot
 	Error           string `json:"error,omitempty"`
+	// Notes is the device's own "磁盘对、活的没跟上" list (已落盘、未热更 ...). Without
+	// it a note-only apply would report as plain success, which is the one thing
+	// §5.3 says must never be shown as done.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // ------------------------------------------------------ underlay delivery

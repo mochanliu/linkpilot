@@ -705,7 +705,7 @@ plugin-core 25,045 / libvppinfra 648 / frr 40,317 / frr-pythontools 242。
   不重启它们的 VPP；**容器回收由你统一做**，我不 `docker rm`。
 - **真机 192.168.1.100**：这一轮只读，不改它任何配置（`vpp-tap-config` 那套是抄的，不是动的）。
 
-## 9. S5 / S6 实测与三条未收口的缺陷（2026-11-05 凌晨）
+## 9. S5 / S6 实测与三条缺陷（2026-11-05：①③ 已收口，② 未修）
 
 ### 9.1 S5 客户侧：三台都到位
 
@@ -729,7 +729,7 @@ apt 86.33s、ACPI 关机 3.96s、开机到 ssh 回来 37.37s；三台收尾复�
 `grep '^[+-]'` 恒等于 0；改成和产品 `internal/apply/apply.go` 的 `frrDelta()` 同口径解析
 两节，并加"改前差量必须 > 0"硬闸（故意多写一段 `router bgp 65099` 自检得 5 行）。
 
-### 9.2 缺陷①：`sr-box-watch.service` 每 60 秒把刚起的进程杀掉
+### 9.2 缺陷①：`sr-box-watch.service` 每 60 秒把刚起的进程杀掉（已修，VM 台实测）
 
 场景：四台盒子的 overlay 面（sr-route + sr-frr）永远起不来，控制台的 v3 一直"未确认"。
 代码走到哪：`controller/deploy/sr-box/sr-box-watch.service` 是 `Type=oneshot`、
@@ -749,6 +749,36 @@ apt 86.33s、ACPI 关机 3.96s、开机到 ssh 回来 37.37s；三台收尾复�
 **不加 `RemainAfterExit=yes`** —— 那样 unit 会一直是 active，timer 下一分钟的 start job
 不再重跑 `ExecStart`，看门狗直接失效。备选（形状更正但改动大）：sr-route/sr-frr 各给一个
 `Type=simple` 单元，看门狗退成检查器；容器 lab 没有 systemd，会多出一套并行的启动形状。
+
+已修（unit 里 `KillMode=process` + 上面那段实测注释）。VM 台实测，四台各自独立量过：
+
+| 盒子 | unit 落盘时间 | 修后 sr-route pid | 修后 sr-frr pid | 最近 10 分钟 `remains running` 条数 |
+| --- | --- | --- | --- | --- |
+| CPE1 | 11-04 23:46:59 | 47678（23:08 那轮起就没换过） | 47701 | 18 |
+| CPE2 | 11-04 23:43:19 | 27428 | 27451 | 20 |
+| CPE3 | 11-04 23:43:24 | 34038 | 34061 | 16 |
+| CPE4 | 11-04 23:44:09 | 94739 | 94763 | 16 |
+
+`remains running` 是 systemd 在 ExecStart 退出时对每个还活着的子进程明说的一句话；
+一轮 timer 出两条（sr-route + sr-frr），10 分钟就是 ~18 条 —— 也就是说看门狗每分钟照样重跑
+清单，但**不再收这两个进程**。对比修之前同一台 CPE1：sr-route 只活 2.1s、sr-frr 只活 ≤1s。
+
+顺带纠正本节早先写的一句预测：缺陷① 修完，控制台上那条陈旧错误**不是** ≤5 分钟自己消失，
+是等 agent 的下一次重试。退避从 5s 起每失败一次翻倍、到 5min 封顶
+（`cmd/sr-agent/configsync.go:191`），CPE1 的 agent 日志最后四条全是 5m0s：
+
+```
+23:31:44 config v3 failed (12 in a row, next try in 5m0s): sr-frr 热更失败（…活进程还是旧表）…
+23:46:50 config v3 failed (15 in a row, next try in 5m0s): sr-frr 热更失败（…活进程还是旧表）…
+23:51:52 config v3 applied
+```
+
+实测四台各自 `config v3 applied` 的时刻（盒子 UTC）：CPE4 23:23:54（缺陷① 之前就已经好了）、
+CPE2 23:48:19、CPE3 23:48:30、CPE1 23:51:52。CPE1 从 23:46:59 装好 unit 到 23:51:52 是
+4 分 53 秒 —— 正好是它下一次退避到期的时间。也就是说"≤5 分钟"这个量级碰巧对，
+但机制是"设备重试"，不是"控制器改口"；慢的根源是那 5min 的退避上限。
+
+
 
 ### 9.3 缺陷②：网卡多播过滤让盒内 FRR 收不到 OSPF hello（容器台被 veth 掩盖）
 
@@ -771,19 +801,78 @@ grep `promisc|mcast|multicast|maddr` 零条），所以修法只能在 netdev �
 一并 `allmulticast on`。同一条路会挡住 VRRP（224.0.0.18），这一轮没发 VRRP 配置、
 所以那条只是预测、没测。
 
-### 9.4 缺陷③：全新盒子第一次 apply 必失败在第 5 段（sr-frr 热更）
+### 9.4 缺陷③：全新盒子第一次 apply 必失败在第 5 段（sr-frr 热更）—— 已修，VM 台实测
 
-代码走到哪：`internal/apply/srfrr.go:113` 的 `if push` 先 `pushSrfrr()`（PUT unix socket），
-失败就 `return "sr-frr 热更失败（%s 未改动，活进程还是旧表）"`，于是 `:128` 的
-`writeFileSync` 根本不执行；而 `cmd/sr-frr/main.go:699` 在 `export_vrfs` 与 `import_rules`
-都为空时 `log.Fatal` 拒绝启动。两个凑在一起 = 盘上的两键要进程活着才能写、进程要这两键非空
-才肯起。容器台是靠 `bringup.sh` 手工先写死非空值绕过的；VM 台按 S7 定案把配置退回控制台，
-于是空值起步。
-现状：四台的 `/etc/sr-frr.json` 已经由看门狗那轮 `sr-apply boot` 重放补齐
-（`export_vrfs=[0]`、`import_rules` 1 条），四台 `127.0.0.1:8089/status` 都报
-`config{version:3, source:"apply", error:"sr-frr 热更失败…dial unix /run/sr-frr/control.sock…"}`
-—— 因为 sr-frr 被缺陷①每分钟杀一次，socket 永远不在。agent 侧重试退避是 5s～5min
-（`internal/agent/tunnel.go:92`），所以缺陷①修完后不需要重启任何东西，≤5 分钟自己收敛。
-要动什么（待拍，涉及 §5.3 的"先 PUT 后落盘"次序）：`applySrfrr` 在"进程本来就没跑"时
-按开机重放那条路走（`push=false`，只落盘，交给清单起进程）—— 这是首次启动、不是重启，
-没有"活进程还是旧表"可骗；其余情况维持现在的硬失败。
+场景：一台盒子从没装过配置，控制台第一次点「发布到设备」。这一次 apply 落在第 5 段
+（sr-frr 那张表）就死掉，而且**永远**死在这里：盘上的配置写不进去，进程又起不来。
+
+代码走到哪：`internal/apply/srfrr.go` 的 `applySrfrr` 按 `docs/o6e-leak-plan.md` §5.3
+定的次序先 `pushSrfrr()`（PUT `/run/sr-frr/control.sock`），PUT 不成功就直接 return 错误、
+后面的 `writeFileSync` 一行都不执行；`cmd/sr-frr/main.go:699` 又在 `export_vrfs` 与
+`import_rules` 都为空时 `log.Fatal` 拒绝启动。两句凑在一起是个死锁：盘上那两键要进程活着才写得进去，
+进程要那两键非空才肯起来。容器台从来没暴露过它，因为 `bringup.sh` 手工先把非空值写死了；
+VM 台按 S7 定案把配置退回控制台、空值起步，锁就出现了。
+
+为什么"先 PUT 后落盘"这个次序本身是对的（不能反过来）：反过来写，热更失败时盘上是新表、
+活进程是旧表，而设备报给控制器的是"这个版本装好了"—— 控制台就会把没生效的东西显示成生效了。
+所以失败必须硬失败、保留上一份，这条不动。
+
+要动什么（已拍并已落地）：只在"这台盒子上 sr-frr 本来就没在跑"时豁免 ——
+判据是两条**同时**成立：socket 上没人监听（`ENOENT` 或 `ECONNREFUSED`，`srfrrAbsent()`，
+`internal/apply/srfrr.go:158`）**并且**盒子上没有 sr-frr 进程（`SrfrrRunning()`，
+`internal/apply/apply.go:420`，默认实现 `procExists("sr-frr")`）。成立就按开机重放那条路走：
+只落盘、不热更，并附一条备注交给上报链；其余情况（进程活着但 socket 连不上，
+例如它正在启动、或者控制口被人删了）维持原样硬失败 —— 那种时候落盘会造出一个
+"活进程是旧表、盘上是新表"的盒子，正是 `o6e-leak-plan.md` §5.3 要防的。
+
+备注一路走到控制台，中间没有汇总也没有改写：
+`applySrfrr` 的 note → `apply.Status.Notes`（`internal/apply/apply.go:334`、
+`:670` 写进 status.json）→ `wire.ConfigState.Notes`（`internal/wire/wire.go:469`）→
+agent 的 `readState()` 每次上报前重读盘（`cmd/sr-agent/configsync.go:87`）→ 心跳 →
+控制台的「设备备注」行 + 「设备已装 vN（有未热更）」标签。
+
+改完的判据（CPE1 / node 1，2026-11-05 00:34–00:57 UTC，脚本 `/tmp/gate3.sh A|B|C|D|E`，
+取证留在 `/tmp/gate3-state/`）：
+
+| 阶段 | 动作 | 盘上 `/etc/sr-frr.json` | 控制器发布 / 设备回报 | 备注 |
+| --- | --- | --- | --- | --- |
+| B 基线 | sr-frr 活着、`pl2` | sha `7f3108cb6f87` | pub v3 / 设备 v3 `source=boot` | 无 |
+| C 第一段 | `kill -9` sr-frr，改成 `pl1` 并发布 | sha `80bce5f2443f`（**写进去了**） | pub v4 / 设备 v4 `ok=true source=apply` | 「已落盘 /etc/sr-frr.json、未热更…」 |
+| C 反证 | 同一时刻连控制口 | — | — | `FileNotFoundError`（socket 文件确实不在） |
+| D | 等看门狗那一轮把 sr-frr 起起来（00:43:18，pid 55815） | 同上 | 仍 v4、备注**还在** | 起进程不算一次 apply |
+| E | 改回 `pl2` 并发布（此时 sr-frr 活着） | sha 回 `7f3108cb6f87` | pub v5 / 设备 v5 | `notes=null`（正常热更） |
+| 控制台复核 | 再造一次 v6（带备注）→ v7（干净） | — | v6 有备注行 / v7 无 | 见下 |
+
+客户可见路径：整个窗口（杀 sr-frr → 按落盘走 → 清单把 sr-frr 起起来 → 正常热更）里
+CPE1 1 秒一次 ping 客户侧 `172.31.12.13`，**286 个回显、0 丢包**（收尾用了 SIGTERM，
+ping 没打统计行，按 `icmp_seq` 连续性与回显行数复原），时延 min 1.26 / avg 4.79 / max 52.5 ms。
+盒子里外发的包只动了 sr-frr 自己：`sr-route 47678`（11-04 23:47:28 起）、`sr-fib 21441`、
+`zebra 16646`、`ospfd 16658` 三个 pid 从头到尾没换过。cust12 侧看 `192.168.1.101`
+这条邻居，现在 Up Time `1h45m42s`，横跨整个 gate 没有归零。
+
+为什么不加"备注自动过期"：它只被**下一次 apply**替换。D 段那轮看门狗把 sr-frr 起起来了、
+表也确实活了，备注仍然在 —— 这不是漏，是刻意的：`internal/apply/route.go:252` 给 sr-route
+发的是同一类"已落盘、未热更"备注，生命周期就是这样。只给 sr-frr 开一条自我清理的路是我发明的
+机制，不是你的规则；真要让"进程起来了"消掉备注，得两条一起改。
+
+单测（容器 `lp-ctrl`，go1.22.5，`-count=1`）：`internal/apply` / `cmd/sr-agent` /
+`internal/wire` / `cmd/sr-ctrl` 四个包全过；`-run Srfrr -v` 出 9 条 PASS，其中两条是这次的判据
+—— `TestApplySrfrrNoProcessWritesWithNote`（没进程 → 落盘 + 备注）和
+`TestApplySrfrrAliveProcessWithUnreachableSocketStillFails`（有进程但连不上 → 仍然硬失败、
+盘不动）。
+
+铺到四台的口径（`sr-agent` sha `f2e1461226db`、`sr-apply` sha `d17f40beac08`，四台一致）：
+换二进制只 kill `sr-agent`、由 `sr-box-watch.service` 那一轮把它拉回来，其余 daemon 一个都不许动。
+实测 CPE3 `sr-agent` 11844→41595、CPE4 72558→102186，两台的 `sr-route`/`sr-fib`/`sr-frr`/`zebra`/`ospfd`
+pid 全程不变；CPE1 那只换了 `sr-apply` 文件（`03599cca5471`→`d17f40beac08`），五个 pid 一个没动。
+CPE4 的升级窗口里从 Mac 1 秒一次 ping 它的 `vpp0` 地址 `192.168.1.104`（走 VPP 接管口的管理通道）：
+16 发 16 收、0.0% 丢包。CPE3/CPE4 没有"客户可见路径"可量 —— S5 只给站点 1/2 做了客户侧编址，
+这两台盒子上还没有客户 LAN，所以那两台用管理通道 + pid 两条口径代替，不硬凑一个数。
+
+控制台侧（真实浏览器 `http://127.0.0.1:8088`，租户 `vm-tenant`，展开「路由泄露 · CPE-SDWAN」
+的 node-1）：v6 有备注时那一行是 `<tr><th>设备备注</th>…`，取色 `rgb(210,153,34)`（warn 色），
+标签是 `tag stale :: 设备已装 v6（有未热更）`；v7 干净热更后备注行消失、标签变回
+`tag online :: 设备已装 v7`。这次顺手补的是**泄露页**：它原先只给标签不给原因，
+和「基础配置」页不对称，现在两处共用同一个 `cfgNotesRow()`（`console.html:1553`、
+泄露页 `:6591`）。截图没成 —— in-app Browser 面板在后台（`visibilityState=hidden`）时
+拿不到可视表面，DOM 取证是实际页面的内容，不是 mock。

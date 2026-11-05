@@ -1544,6 +1544,18 @@
       '<button class="small" data-act="cfg-note-x">知道了</button></div>';
   }
 
+  // 设备自己报的「磁盘对了、活的没跟上」（已落盘、未热更）。它不是失败，但绝不
+  // 能并进「已装」里：§5.3 说这一类只能如实挂着。
+  function cfgHasNotes(d) {
+    return !!(d && d.notes && d.notes.length);
+  }
+
+  function cfgNotesRow(d) {
+    if (!cfgHasNotes(d)) return "";
+    return '<tr><th>设备备注</th><td style="color:var(--warn)">' +
+      d.notes.map(esc).join("<br>") + "</td></tr>";
+  }
+
   // Two different facts, never merged: what the tenant told the device to run
   // (published_version, held by the controller) and what the device says it is
   // running (device_state, from the device's own heartbeat). A published
@@ -1572,7 +1584,9 @@
     if (pub && !d) tag = '<span class="tag pending">等待设备回报</span>';
     else if (pub && d && !d.capable) tag = '<span class="tag stale">设备未启用 -apply</span>';
     else if (pub && d && d.applying) tag = '<span class="tag plan">设备安装中 v' + esc(d.applying_version) + "</span>";
-    else if (pub && d && d.version === pub && d.ok) tag = '<span class="tag online">设备已装 v' + esc(pub) + "</span>";
+    else if (pub && d && d.version === pub && d.ok && !cfgHasNotes(d)) tag = '<span class="tag online">设备已装 v' + esc(pub) + "</span>";
+    // 装了、但设备上那个进程没跟上：不能报成「已装」，也不是一条失败。
+    else if (pub && d && d.version === pub && d.ok) tag = '<span class="tag stale">设备已装 v' + esc(pub) + "（有未热更）</span>";
     else if (pub && d && d.version > pub) tag = '<span class="tag plan">设备 v' + esc(d.version) + "（比已发布的新）</span>";
     else if (pub && d) tag = '<span class="tag stale">设备仍是 v' + esc(d.version || 0) + "</span>";
 
@@ -1599,6 +1613,7 @@
           " · " + esc(ago(d.applied_at_unix)) + "</td></tr>");
       }
       if (d.error) rows.push('<tr><th>设备错误</th><td style="color:var(--bad)">' + esc(d.error) + "</td></tr>");
+      if (cfgHasNotes(d)) rows.push(cfgNotesRow(d));
 
       if (pub && !d.applying) {
         if (d.version < pub) {
@@ -6555,7 +6570,9 @@
     if (pub && !d) tag = '<span class="tag pending">等待设备回报</span>';
     else if (pub && d && !d.capable) tag = '<span class="tag stale">设备未启用 -apply</span>';
     else if (pub && d && d.applying) tag = '<span class="tag plan">设备安装中 v' + esc(d.applying_version) + "</span>";
-    else if (pub && d && d.version === pub && d.ok) tag = '<span class="tag online">设备已装 v' + esc(pub) + "</span>";
+    else if (pub && d && d.version === pub && d.ok && !cfgHasNotes(d)) tag = '<span class="tag online">设备已装 v' + esc(pub) + "</span>";
+    // 装了、但设备上那个进程没跟上：不能报成「已装」，也不是一条失败。
+    else if (pub && d && d.version === pub && d.ok) tag = '<span class="tag stale">设备已装 v' + esc(pub) + "（有未热更）</span>";
     else if (pub && d && d.version > pub) tag = '<span class="tag plan">设备 v' + esc(d.version) + "（比已发布的新）</span>";
     else if (pub && d) tag = '<span class="tag stale">设备仍是 v' + esc(d.version || 0) + "</span>";
     var got = '<span class="muted">还没有上报配置状态</span>';
@@ -6570,7 +6587,8 @@
     return '<table style="margin-top:8px"><tbody>' +
       "<tr><th>期望版本</th><td>" + (pub ? "v" + esc(pub) : "尚未发布" +
         (n.version ? "（草稿 v" + esc(n.version) + " 在控制器）" : "")) + " · " + tag + "</td></tr>" +
-      "<tr><th>设备已装</th><td>" + got + "</td></tr></tbody></table>";
+      "<tr><th>设备已装</th><td>" + got + "</td></tr>" +
+      cfgNotesRow(d) + "</tbody></table>";
   }
 
   function lkEditState(dir, n, v) {
