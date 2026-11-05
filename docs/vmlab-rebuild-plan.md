@@ -1151,3 +1151,116 @@ CPE4 70 秒，最长连续 6 秒 / 4 秒；单路径前缀被摘的秒数 CPE3 1
 待拍的方案（要他点头才动代码，先不动）：摘路要不要有抑制窗口 / 连续几次确认才算 Down；
 BFD 检测时间和 sr-fib 轮询周期要不要有约束关系（现在 150ms vs 1000ms 完全脱钩）；
 以及"抖动"这件事要不要在控制台上如实显示成设备备注，而不是只涨日志。
+
+### 9.10 S7 收口实测：verify / status 的口径从 docker exec 迁到 ssh（2026-11-05）
+
+场景：容器台的判据脚本 `test/lab/verify.sh` 每一条检查都是 `docker exec lab-cpeN …`。
+VM 台从 S2 起没有容器（控制面跑在 Mac 上，设备是 7 台 VirtualBox 虚拟机），所以 S7 要的
+是同一套口径、但走 ssh 的脚本。这一轮落地的是四个文件：
+
+- `test/lab/vmlab/vm-verify.sh`：判红绿，有退出码。容器台 verify.sh 的孪生。
+- `test/lab/vmlab/vm-status.sh`：只读快照，给人读数字、不判分（十段，四台盒子 + RR + 三台客户机）。
+- `test/lab/vmlab/vm-ledger.py`：期望值台账。隧道 / 端口 / 颜色 / MTU / overlay /32 全部取自
+  控制台 `GET /api/underlay`（S6 之后隧道只在页面上配，脚本里硬抄必然过期）；只有客户侧
+  loopback、cust 虚拟机 ssh 别名、盒内客户口地址是文件顶部的手工表（拍板 5：lab 值手工配）。
+- `test/lab/vmlab/vm-state.py`：把盒子里 sr-route(:19001) / sr-fib(:19011) 和 Mac 上 RR 的
+  `/status` JSON 与台账逐条对账。判据不等的直接 `SystemExit` 打差异；相等时打一行**数字**旁证，
+  `vm-status.sh` 原样打印这一行 —— 所以体检和快照看到的是同一个数。
+
+两份 shell 脚本共用 `VM_LEDGER`（默认 `/tmp/vm-verify-ledger.tsv`，本轮 36 行：node 4 / box 4 /
+tun 10 / rib 8 / local 4 / ping 6）和同一个 `ssh_run`。台账重跑一次 `python3 vm-ledger.py`
+与在用的那份逐行相同，说明期望值里没有当场拍出来的数。
+
+#### 三类假绿（都真实发生过，不是预防性改动）
+
+**类一：不带 `-n` 的 ssh 把循环的 stdin 读走了。**
+`while IFS=$'\t' read -r …; do ssh …; done < <(grep '^box' "$LEDGER")` 这种写法里，
+stdin 就是台账。ssh 自己会消耗 stdin，于是循环只跑第一行就结束 —— 后面的判据**根本没执行过**，
+退出码却照旧是 0。症状实测：§9 的六方向互 ping 只打出来一条。改法是 `ssh_run` 里固定
+`ssh -n`（`vm-verify.sh:85-88`、`vm-status.sh:63-66`）；本脚本没有任何地方靠 stdin 往盒子里喂数据
+（远端的 `<` 在引号里，那是盒子自己读的）。
+
+**类二：`python3 -` 的程序体没落进去，执行的是空程序。**
+§5 那十条 JSON 对账原本是 `python3 - <参数> > note`，程序体本该用 heredoc 从 stdin 灌进来。
+但 heredoc 要占的 stdin 在类一那个循环里就是台账 —— 少程序体的那一版退出码 0、`note` 文件
+0 字节，十条判据全部成立（假绿）。改法是程序体放进 `vm-state.py`，参数走 argv：stdin 不再是
+接口，这类空转没有地方发生。文件头部把这条教训写死了，就是为了下一次别再改回 heredoc。
+
+**类三：ssh 的 known_hosts 警告会混进数据里，而且压不住。**
+第一次连一台盒子会打 `Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.`。
+2026-11-05 实测：这一句**不受 `-o LogLevel=ERROR` 也不受 `LogLevel=quiet` 控制**，照打。
+`ssh_run` 里是 `2>&1`，所以它会进 stdout 的捕获串：第一版快照里 cust 的 `lo：` 那格值前面就粘着
+整行警告（引号里正好是盒子自己的 IP，肉眼很容易当成数据）。到了 §5，同一行会把紧凑 JSON
+打断 —— 解析器报错是**假红**（比假绿好，但同样是噪声）。改法是按行滤掉那一句
+（`grep -v '^Warning: Permanently added'`），同时把 ssh 自己的退出码 `return $rc` 出去，
+两份脚本开头都加了 `set -u -o pipefail`：没有 pipefail，`ssh … | tr -d '\r'` 的退出码是 `tr` 的 0，
+ssh 连不上、远端命令失败都会被当成成功（AGENTS.md §2「不许靠退出码猜状态」的反面）。
+
+#### 快照的十处字段位错读：假数比 0 更危险
+
+`vm-status.sh` 第一版的绝大多数错，都是**没量输出形状就按猜的字段位取数**。每一处都补了实测：
+
+| 打出来的样子 | 根因 | 改法与实测值 |
+| --- | --- | --- |
+| `WG peers 0 个，flags: 2 的 0 个` | 命令名写成 `show wireguard peers`（复数），VPP 里没有这条 ⇒ 空输出被当成 0 | `show wireguard peer`；四台实测 2/2、2/2、3/3、3/3，全部 flags=2 |
+| `linux-cp 配对 0 组` | `grep 'lcp itf'`，`show lcp` 里根本没有这个字串 | `grep 'itf-pair:'`；每台实测 2 组（host-enp0s8→lcp-x0、host-enp0s9→vpp0） |
+| `检测时间 (usec)` | BFD 摘要行取 `$3`，那是单位不是数 | 取 `$NF`；实测 `150000us` = 50ms×3（缺陷⑥ #262 的判定窗口） |
+| `内核 mtu qdisc` | `ip -o link` 的 mtu 在 `$5`，旧版取 `$6` | 实测 1544 |
+| `table 0 有 172.16 前缀 0 条` | 前缀行的正则要求行尾有空格，VPP 输出是裸行 | `^172\.16\.[0-9.]+/[0-9]+$`；实测每台 3 条 |
+| 路径列成 `via[mpls ipv4]` | `awk '/via /{print $2}'` 把标题也当路径，且同一条路径在 path-list 段和转发段各出现一次 | 跳过 `stacked-on` 之后再用 sed 提 `mpls\|ipv4 via <nh> <口>`，加 `!seen[$0]++` 去重 |
+| OSPF 邻居状态是数字 | 状态取 `$2`（那是 priority） | 取 `$3`；实测 `Full/DR`、`Full/DROther`、`Full/Backup` |
+| BGP 邻居多出一行 | `/^Neighbor/{h=1;next} h&&NF` 会把 `Total number of neighbors …` 当成邻居 | 只收 `/^[0-9]+\./` 行，字段取对端 AS/收/发/uptime（实测 `172.31.3.2 AS 65003 收到 1 条 / 播 4 条`） |
+| `异常计数行 4 条` | `grep -ciE 'fail\|error\|drop'` 数的是计数器**标签行**，恒等于标签数 | 只列非零计数项；实测四台 `no_path/hmac_fail/drop_total` 全为 0（`bypass` 单列并注明不是异常） |
+| 报告里混进原始 VM 行 | `awk -F'"'` 写在 `"$( … )"` 里，bash 3.2 报 `awk: syntax error` | `VBoxManage list runningvms \| cut -d'"' -f2`；实测 7 台在跑 |
+| `MTU 1544 = netdev 真实值` | 归因写反了：1544 是 VPP `set interface mtu packet 1500` **反写**给 netdev 的脏值（§5.10 已记） | 快照并列三格：VPP `host-enp0s8` MTU(L3/IP4/IP6/MPLS)=`1500/0/0/0`、期望（`underlay.list` 第 6 列）`1500`、内核 netdev `1544` 并注明不参与判定 |
+
+还有两处是**文案在造假**，不是解析错：`sr-box=inactive` 一开始读起来像服务挂了 —— 实测
+`systemctl status` 后写明它是 oneshot（开机清单跑完就该是 dead），看门狗是 timer 常驻 +
+oneshot 每 60 秒跑一次，快照改成 `常驻 vpp=active / 开机清单 sr-box=…（oneshot，dead 为正常）/
+timer=active`，并把看门狗最近一次退出码与时刻打出来（实测四台 `退出码=0`）；`未上报` 也一度
+用在「合法为空」的地方（没有非零异常计数、客户机没有默认路由），现在分别写成
+`全为 0（no_path/hmac_fail/drop_total 等）` 和 `无（本站靠上面的 /32 明细互通）`，
+`未上报` 只留给真的没数据（AGENTS.md §2：设备没上报就显示未上报，不显示 0 或占位值）。
+
+#### 改完的前后数字（AGENTS.md §2）
+
+- 基线（迁移第一版）：§9 六方向只打出 1 条、§5 十条 JSON 判据的 note 全是 0 字节、快照 11 处
+  字段错读。这些不是"数字难看"，是判据没跑或跑了假的。
+- 改完复跑两次 `bash test/lab/vmlab/vm-verify.sh`（ssh_run 换实现 + `pipefail` 之前、之后各一次）：
+  **PASS=388 FAIL=0 WARN=0**（日志 `/tmp/vm-verify-run.log`）与
+  **PASS=385 FAIL=0 WARN=3，退出码 0**（日志 `/tmp/vm-verify-run2.log`）。
+  两组数只差在 §9 的三条客户 ping：这一轮它们各有 1–4 个包没回来，同一窗口四台 `fib.log`
+  确实记了摘路（`cust12→172.16.3.1` 20%、CPE 侧 1/1/1/2 条；`cust4→172.16.12.1` 20%、2/2/2/4 条；
+  `cust4→172.16.3.1` 5%、3/2/2/4 条）⇒ 按设计算 WARN 不算 FAIL，归因缺陷⑥（#262）。
+  摘不到路的丢包仍然是 FAIL，这一轮 FAIL=0。
+- 改完：`bash test/lab/vmlab/vm-status.sh` → 退出码 0，**277 行 / 十段**全部有实测值，
+  无一处 `未上报` 是解析失败造成的（日志 `/tmp/vm-status-run3.log`）。
+- 缺陷⑥ 的可观测面继续在同口径增长：本轮四台 `fib.log` 摘路 397 / 401 / 515 / 533 条
+  （日志文件 26.5k–28.0k 行），最近一条都在 04:52–05:00 UTC（盒子本地时钟，不与 Mac 对齐）。
+- 宿主仍是超订状态：load 15.75 / 17.11 / 17.43（16 核），Mac 上 12 个 Docker 容器 + 7 台虚拟机
+  同时在跑 —— 这是 §9.8 那条链路抖动的来源，不是 lab 配置问题。
+
+#### 怎么跑（两份脚本都是只读）
+
+    python3 test/lab/vmlab/vm-ledger.py > /tmp/vm-verify-ledger.tsv   # 期望值台账：控制台 GET /api/underlay + 两张手工表
+    bash test/lab/vmlab/vm-verify.sh     # 判红绿，无 FAIL 才退出 0；--quiet 只打结论，--no-shape 跳过 §2（8 次 × ~15s）
+    bash test/lab/vmlab/vm-status.sh     # 十段快照，给人读数字、不判分
+
+`vm-verify.sh` 在台账缺失时直接停下来要你先跑第一条（不自己生成，避免"用的是当场拍出来的期望值"）；
+`vm-status.sh` 会自己调 `vm-ledger.py` 补一份。前提只有两条：Mac 上 sr-ctrl 和双 RR 在跑，
+`~/.ssh/config` 里有 CPE1..CPE4 / cust12 / cust3 / cust4（cust 走 ProxyJump 到自家盒子）。
+两份脚本都不改配置、不重启任何进程（AGENTS.md §1）；唯一副作用是 §2 里 `check-selfheal.sh`
+自己的探测 ping 与 `clear errors`，以及 §9 的 ping 流量。
+
+#### S7 没覆盖的，点名不静默
+
+1. **`arp_ignore` 在 VM 台只是显示，没进判据。** 容器台 `test/lab/verify.sh:217-222` 判
+   `arp_ignore=1`，`vm-verify.sh` 现在只有 `vm-status.sh` §4 打出数值（实测四台都 =1）。
+   要不要照抄成判据，等他点头（控制器渲染路径在 `controller/cmd/sr-ctrl/config_render.go:303`，
+   属于产品该保证的，不是 lab 自己配的）。
+2. 没有独立终端机（容器台的 lab-termN）：客户视角用 cust 的 loopback 代打，链路里少一跳。
+3. 站点 12 没配 VRRP（S6 拍板这轮不发），主备切换不在判据里。
+4. 缺陷④（#260）、缺陷⑥（#262）都还没动代码。④的**显示口径**在 verify 里封住了
+   （`vm-verify.sh:370-377`：回执 `ok=true` 必须和 §3 实测的口名/绑定计数同时成立，两个口径并排打出来），
+   但触发场景（单独重启 VPP 后 agent 不重建 wg 口）不在判据里。⑥这一轮抓到 3 条 WARN，
+   就是它在客户视角的复现，方案（抑制窗口 / 检测时间与轮询周期的约束关系）还等他拍。
