@@ -7,7 +7,7 @@
 # 装在 /etc/systemd/system/，与 sr-box.service 一起 enable：
 #   systemctl enable --now sr-box-watch.timer
 #
-# **未在 lab 实测**（lab 容器里没有 systemd）。
+# 容器 lab 里没有 systemd，这份单元只在 VM 台（有 systemd）实测过：见下面 KillMode 那段。
 
 [Unit]
 Description=sr-box checklist watchdog (idempotent re-run)
@@ -18,3 +18,13 @@ ExecStart=/usr/local/lib/sr-box/start.sh up
 # 上一次没跑完就跳过这一轮，别让等待中的步骤叠成堆。
 # 日志只追加在 start.sh 里，这里不重复落盘。
 Nice=10
+# 必须只杀 start.sh 自己。默认是 control-group：ExecStart 退出时 systemd 把该
+# cgroup 里的**所有**进程一起收掉 —— 而 start.sh 是用 nohup 把 sr-route/sr-frr
+# 后台起来的，它们就落在这个 cgroup 里。于是每 60 秒这一轮都会：起 sr-route →
+# sr-agent 连上它、同步完会话 → start.sh 退出 → sr-route 被 SIGKILL → 下一轮再
+# 起来重来。实测 CPE1（2026-11-04 23:08 UTC）一轮 2 秒：/proc 采样 72 秒里
+# sr-route 只活着 47.0~49.1 秒、sr-frr 只活着 48.6~49.1 秒，两者的 cgroup 都是
+# /system.slice/sr-box-watch.service；同期手工起的 sr-agent/sr-fib（user.slice）
+# 全程 71.6 秒没断。sr-frr 退出时还来不及撤干净反向导入，日志里是
+# "退出时清空本地前缀失败……connection reset by peer"。
+KillMode=process
