@@ -60,6 +60,17 @@ case "$EXP_MTU" in
         fi ;;
 esac
 
+echo "C3c 物理口的多播过滤已放开（缺陷②，docs §9.3）"
+# FRR 的组播订阅是加在 lcp TAP 上的，netdev 的 mc list 里从来没有 01:00:5e:00:00:05，
+# e1000 的硬件多播过滤直接把 OSPF hello 丢在网卡上 —— 内核 rx_packets 不动、VPP trace 里也看不到
+# 224.0.0.5，邻接永远停在 Init。VPP 26.10 的 create host-interface 没有多播选项，只能放开 netdev。
+# 这条判据在容器台上恒真（veth 没有硬件过滤），所以容器台发现不了这个回归。
+if ip link show dev "$IF" 2>/dev/null | grep -q 'ALLMULTI'; then
+    ok "$IF 带 ALLMULTI（组播帧能过网卡 RX 过滤）"
+else
+    bad "$IF 没有 ALLMULTI ⇒ 盒内 FRR 收不到客户侧的 hello；重跑 takeover-if.sh $IF"
+fi
+
 echo "C4 VPP 收得进本机 IP（判据① 口径：dpo-receive + 计数在涨）"
 fibc() { vc show ip fib | grep -A3 -E "^${IP}/32$" | grep -m1 -oE 'to:\[[0-9]+:[0-9]+\]'; }
 cnt() { echo "$1" | sed -E 's/to:\[([0-9]+):([0-9]+)\]/\1 \2/'; }

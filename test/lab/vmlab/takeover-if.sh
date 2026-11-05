@@ -25,11 +25,30 @@ vc() { vppctl "$@" 2>&1 | tr -d '\r'; }
 paired() { vc show lcp | grep -F "host-$IF " | grep -qF "$TAP"; }
 cli_up() { vc show version >/dev/null 2>&1; }
 netdev_up() { [ $(( $(cat "/sys/class/net/$IF/flags" 2>/dev/null || echo 0) & 1 )) -eq 1 ]; }
+allmulti_on() { ip link show dev "$IF" 2>/dev/null | grep -q 'ALLMULTI'; }
+
+# 放开物理口的多播过滤，一次都不能少 —— 所以放在"已经在 VPP 里"那条返回之前：
+# 这条口一旦进了 VPP，接管就"成功"了，但过滤还是关着的，重跑脚本也得把它打开。
+# 为什么必须由产品做：FRR 的组播订阅是加在 lcp TAP 上的，netdev 根本不知道要收
+# 01:00:5e:00:00:05，e1000 的硬件多播过滤直接丢帧 —— 内核 rx_packets 增量 0、
+# VPP trace 里 20 秒没有一条 224.0.0.5。容器台是 veth、没有硬件过滤，所以从来没暴露。
+# 取证与实测见 docs/vmlab-rebuild-plan.md §9.3。VPP 26.10 的 create host-interface
+# 没有任何多播/混杂选项（show commands 里 grep promisc|mcast|maddr 零条），只能走 netdev。
+# 失败不许挂在这条路上：这是管理地址的搬运动作，非致命校验按 MTU 同样的处理 ——
+# 报一行、继续。
+mm_note=''
+if allmulti_on; then
+    mm_note=" allmulti=已开"
+elif ip link set "$IF" allmulticast on 2>/dev/null && allmulti_on; then
+    mm_note=" allmulti=本次打开"
+else
+    mm_note=" allmulti=开不了(非致命)"
+fi
 
 last=''
 for shot in $(seq 1 "$LIMIT"); do
     if paired; then
-        echo "OK($shot) $IF 已在 VPP 里，TAP=$TAP"
+        echo "OK($shot) $IF 已在 VPP 里，TAP=$TAP$mm_note"
         exit 0
     fi
     if [ ! -e /run/vpp/cli.sock ]; then

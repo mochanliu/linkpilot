@@ -705,7 +705,7 @@ plugin-core 25,045 / libvppinfra 648 / frr 40,317 / frr-pythontools 242。
   不重启它们的 VPP；**容器回收由你统一做**，我不 `docker rm`。
 - **真机 192.168.1.100**：这一轮只读，不改它任何配置（`vpp-tap-config` 那套是抄的，不是动的）。
 
-## 9. S5 / S6 实测与三条缺陷（2026-11-05：①③ 已收口，② 未修）
+## 9. S5 / S6 实测与三条缺陷（2026-11-05：①②③ 全部收口）
 
 ### 9.1 S5 客户侧：三台都到位
 
@@ -720,7 +720,7 @@ apt 86.33s、ACPI 关机 3.96s、开机到 ssh 回来 37.37s；三台收尾复�
 
 | 台 | `frr-reload.py --test` 差量 | pid（zebra/ospfd/bgpd） | loopback 进路由表 | 邻居 |
 | --- | --- | --- | --- | --- |
-| cust12 | 0 行 | 823 / 850 / 843 | `172.16.12.1/32` | 见 §9.3，当时卡 Init |
+| cust12 | 0 行 | 823 / 850 / 843 | `172.16.12.1/32` | 那一轮两个邻居都卡 `Init`，成因与收口见 §9.3（现已 `Full`） |
 | cust3  | 0 行 | 836 / 855 / 841 | `172.16.3.1/32` | `172.31.3.1 AS 65103` **Established**，PfxRcd 1 / PfxSnt 2 |
 | cust4  | 0 行 | 822 / 849 / 842 | `172.16.4.1/32` | `172.31.4.1 AS 65104` **Established**，PfxRcd 1 / PfxSnt 2 |
 
@@ -780,26 +780,72 @@ CPE2 23:48:19、CPE3 23:48:30、CPE1 23:51:52。CPE1 从 23:46:59 装好 unit �
 
 
 
-### 9.3 缺陷②：网卡多播过滤让盒内 FRR 收不到 OSPF hello（容器台被 veth 掩盖）
+### 9.3 缺陷②：接管客户口时必须放开网卡多播过滤（已修，VM 台实测）
 
 场景：cust12 能看到 CPE1/CPE2 两个邻居、永远停在 `Init/DROther`（9 分钟不动）；
 CPE1 侧 `show ip ospf interface` 的 `Neighbor Count is 0`，即盒子完全听不到客户侧。
-取证：`tcpdump -i lcp-x0 proto ospf` 24 秒只抓到盒子里外发的两条 hello，
+
+取证（改前）：`tcpdump -i lcp-x0 proto ospf` 24 秒只抓到盒子里外发的两条 hello，
 `lcp-x0` 的 `rx_packets` 增量 **0** —— 内核一个从客户 LAN 来的包都没收到；
 单播正常（cust12↔172.31.12.1/.2 各 3 发 3 收 0% 丢包）；
 VPP `trace add af-packet-input` 20 秒里没有一条 `224.0.0.5` 的包，说明 hello 连网卡的
 RX 过滤都没过。`ip -d link show enp0s8`：`allmulti 0`、mc list 里只有 `224.0.0.1` 和 IPv6 那几个
 —— FRR 的组播订阅是加在 lcp TAP（`lcp-x0`）上的，物理 netdev `enp0s8` 根本不知道要收
 `01:00:5e:00:00:05`，e1000 的硬件多播过滤直接丢帧。
-反证（一条命令，不动任何进程/配置）：CPE1 `ip link set dev enp0s8 allmulticast on` 之后，
-盒内 `show ip ospf neighbor` 在 18 秒内变成 `172.31.12.13 … Full/Backup`（cust12 是 DR）。
-> 这是**手工补丁，不是产品修复**，目前只在 CPE1 上留着当证据；CPE2/3/4 没动。
-> 环路测试在产品修法落地前不许跑（含手工补丁的路径不算数）。
-为什么容器台没暴露：容器版客户口是 veth，没有硬件多播过滤。
-VPP 26.10 的 `create host-interface` 没有 `promisc`/多播相关选项（`show commands` 里
-grep `promisc|mcast|multicast|maddr` 零条），所以修法只能在 netdev 侧：接管这个口的时候
-一并 `allmulticast on`。同一条路会挡住 VRRP（224.0.0.18），这一轮没发 VRRP 配置、
-所以那条只是预测、没测。
+2026-11-05 01:05 在**从没打过补丁**的 CPE2 上再取一次现场，形状完全一致：`enp0s8` 的 flags 只有
+`BROADCAST,MULTICAST,UP,LOWER_UP`，`rx_packets=471`、60 秒内不动，`show ip ospf neighbor` 表体是空的，
+单播 2 发 2 收 0%；cust12 侧看 `192.168.1.102` 停在 `Init/DROther` 已经 `2h01m42s`。
+
+为什么必须在产品这一步做：VPP 26.10 的 `create host-interface` 没有任何多播/混杂选项
+（`show commands` 里 grep `promisc|mcast|multicast|maddr` 零条），所以只能改 netdev 侧的标志；
+而接管这个口的动作本来就在 `takeover-if.sh` 里，放开过滤必须和它同一条路，否则每次重装都会漏。
+容器台没暴露这条缺陷是因为容器版客户口是 veth、没有硬件多播过滤。
+
+改了什么：`test/lab/vmlab/takeover-if.sh:28` 加 `allmulti_on()`，`:30-46` 在四条增量 CLI 之前、
+也在"这条口已经在 VPP 里就直接返回"之前放开过滤 —— 放在返回之前是因为口一进 VPP 接管就算"成功"，
+漏掉的过滤没人再补，重跑脚本必须还能把它打开。三档结果（`已开` / `本次打开` / `开不了(非致命)`）
+都只拼进 `mm_note` 打印一行、不改退出码，理由和 MTU 一样是结构性的：
+`underlay.sh:90` 对本脚本非 0 退出的处理是 `continue`，也就是"这条口整段跳过搬地址"，
+管理地址是唯一一条能登录进去的路，任何非致命校验都不许挂在这条路上。
+
+实测（闸门五组，改前/改后同一口径）：
+
+1. **CPE2 补上过滤就通**：`OK(1) enp0s8 已在 VPP 里，TAP=lcp-x0 allmulti=本次打开`，脚本耗时 0.09 秒；
+   `rx_packets` 从 471 开始涨（01:07 是 518、01:10 是 563）；`show ip ospf neighbor` 两条都 `Full`；
+   cust12 侧 `192.168.1.102` 从 `Init` 两小时不动变成 `Full/DR`；改后 cust12 的 LSDB 里确实有它发的
+   `AS-external-LSA`（Link State ID `172.16.3.1`，`Advertising Router: 192.168.1.102`，seq `8000000a`）
+   和 area 0 里它自己的 router-LSA —— 邻接没起来之前这两条都不可能存在。
+2. **放开过滤之后邻接建立要多久**：在 CPE2 上主动 `clear ip ospf neighbor` 一次（这条链路上只有
+   lab 自己的三条邻居，没有业务压着），两条邻居都在 **12 秒**到 `Full`。
+3. **CPE1 撤掉手工补丁**（原反证里那条 `ip link set dev enp0s8 allmulticast on` 已删，换成产品路径）：
+   关掉过滤后立刻重跑同一条脚本，关窗 **0.095 秒**、报 `allmulti=本次打开`；邻居 uptime
+   `1h55m29s` → `1h55m40s` 连续没归零；`ospfd` pid 16658 与 `15:56:39` 的启动时刻都不变；
+   客户可见打流 1 秒间隔 12 包 **0% 丢包**（rtt min 2.328 / avg 10.307 / max 32.342 ms）。
+4. **VPP 重启会不会把过滤冲掉**：CPE2 `systemctl restart vpp`，0.2 秒一拍采 140 拍（restart 在第 20 拍发出，
+   覆盖整个窗口）—— 140 拍全程 `ALLMULTI` 都在；重启后 `vmlab-underlay` 的接管日志两条口都报
+   `allmulti=已开`，脚本没有重复动它（幂等）。同一次重启里 OSPF 邻接**会**随 TAP 重建而 reset
+   （改前 `2m44s`，改后 `17.475s` / `22.150s`），客户可见 30 包丢 2（6.67%）—— 邻接 reset 和丢包
+   都是 TAP 随 VPP 一起销毁重建的结果，接管路径本来就每次重启都会重跑（S4 把接管从 VPP 的
+   `unix{exec}` 挪成了 `vpp.service` 的 `ExecStartPost`），不是本缺陷引入的新中断。
+5. **铺到四台**：按各台 `underlay.list` 逐条跑脚本，八条被接管的口改后 8/8 都带 `ALLMULTI`
+   （CPE1 `enp0s9`、CPE3 与 CPE4 的两条口各 `本次打开`，其余 `已开`）。
+   判据进了 S3 的形状校验器：`check-selfheal.sh` 新增 **C3c「物理口的多播过滤已放开」**
+   （`test/lab/vmlab/check-selfheal.sh:63-72`，容器台恒真、只有 VM 台会抓到），
+   四台 × 两条口共 8 次跑完是 **8/8 全部 PASS** —— 也就是说今天这些改动没有碰坏 S3/S4 的
+   任何一条形状判据（C1 三处 MAC、C2 地址归属、C3 配对、C3b MTU、C4 dpo-receive、C5 ping、
+   C6 mac mismatch 无新增、C7 自愈单元）。
+
+没测到的，点名：
+
+- CPE3/CPE4 这两条客户链路本轮没有组播说话者 —— 盒内 `ospfd` 起来了但 `OSPF is not enabled in vrf default`，
+  链路上跑的是 cust3/cust4 的 eBGP 单播（§9.1 表里 Established），所以"放开过滤 → 邻接建立"这条因果
+  只在 CPE1/CPE2↔cust12 上量到；那两条口的改动只有 flags 数字，没有业务侧变化。
+- VRRP 用 `224.0.0.18`，同一条硬件过滤一样会挡 —— 这一轮不发 VRRP 配置，所以那条是**预测、没测**。
+- 放开过滤后 VPP 会开始收到客户 LAN 的组播帧，这些帧在 VPP 里走哪条路（punt / 丢弃 / 计数）没测。
+  生产上客户 LAN 一定有 IGMP、mDNS 这类流量，需要单独定性，不能默认它无害。
+- 真机 192.168.1.100 的接管是当年手工敲 CLI 做的、没有对应脚本，物理网卡是不是同一形状没测。
+- 待拍一条：这条规则要不要抬进产品装机清单（`controller/deploy/sr-box/`），还是就留在 VM 台的接管脚本里。
+  抬进去之前先在真机上量一次，避免把 e1000 的结论抄到别的驱动上。
 
 ### 9.4 缺陷③：全新盒子第一次 apply 必失败在第 5 段（sr-frr 热更）—— 已修，VM 台实测
 
