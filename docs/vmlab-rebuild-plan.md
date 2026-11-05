@@ -1628,3 +1628,374 @@ BFD 全 Up，回执 v8 ok=true。
 
 这一节没有引入任何新的待拍：§9.11 那几条（sr-fib 不重连、缺口 G-2 的归属、arp_ignore 进不进判据、
 VBox autostart、缺陷⑥）一条也没变，还是等他点头。
+
+### 9.14 owner 点的五个问题（2026-11-05 晚）：逐条结论、动了哪些代码、量到的数字
+
+他给的原话是五条，我按原话逐条对，不改写成"我认为他真正想问的是"。这一节的口径：
+每条都写「什么场景 → 代码原来一步步走到哪 → 当初为什么这么写 → 症状 → 动了什么 → 改前/改后两组数字」，
+凡是只由我推断、没有第二组数字支撑的地方，明说是推断。
+
+#### 问题 1：overlay 地址要从 `.0` 开始分（`.0/.1`、`.2/.3` 依次类推）
+
+**场景。** 他在控制台看隧道列表，第一对隧道拿到的不是 `10.250.0.0 / 10.250.0.1`，
+而是 `10.250.0.1 / 10.250.0.2`，后面整体错位一格。他的规则是"本端 `.0`、对端 `.1`，再往后 `.2/.3`"。
+
+**代码原来怎么走。** 隧道创建时向分配器要两个 /32：`State.allocOverlay`
+（[controller/internal/underlay/state.go:419](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/underlay/state.go#L419)）
+按 `OverlayNext` 游标去取 `Settings.OverlayHosts()` 这张清单，清单本身是升序的 /32 数组。
+问题在清单的第一格：旧版 `OverlayHosts` 把地址池当成"要住主机的网段"，只要前缀长度 ≤ /30 就
+把偏移量下界设成 1、上界砍掉最后一格（跳过网络地址与广播地址），
+于是 /16 池的第一格是 `10.250.0.1`，`OverlaySize` 也跟着报 `65534`。
+
+**当初为什么这么写。** 这是把"子网可用主机数"的课本习惯直接搬进来了。但这个池子里每一条 /32
+都不是拿来住主机的：它是被当作端点逐条塞进 VPP overlay 表（表 250）和下一跳位置的清单，
+池子里不存在广播域，也就没有"网络地址/广播地址要留出来"这回事。`10.250.0.0` 和 `10.250.0.255`
+在这里和任何其他一格完全等价。
+
+**动了什么。** [controller/internal/underlay/settings.go:212](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/underlay/settings.go#L212)
+的 `OverlayHosts` 现在从偏移 0 开始、发满 `1 << (32-bits)` 格；
+`OverlaySize`（同文件 199 行）不再 `-2`；
+`overlayPrefix` 的报错文案从"65534 个 /32"改成"65536 个 /32"；
+[docs/underlay-design.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/underlay-design.md)
+§6 的分配规则同步改成"整段都发，第一对是 `.0/.1`"。
+`state_test.go` / `settings_test.go` / `plan_test.go` 里断言旧清单的三处一起改掉，
+没有留兼容分支。
+
+**改前/改后的数字（VM 台现场）。** 改前控制器返回的第一格是 `.1`，实测清单为
+`10.250.0.1 … .10`（`/tmp/renum.log` 19:19:24 那一行，`overlay_used=10`）。
+重排以后（19:31 复取 `/api/underlay`）：
+
+| 隧道 | a 端 | b 端 | 颜色 | MTU |
+|---|---|---|---|---|
+| t9  | node-1 `10.250.0.0` | node-3 `10.250.0.1` | 0 | 1368 |
+| t10 | node-1 `10.250.0.2` | node-4 `10.250.0.3` | 0 | 1368 |
+| t11 | node-3 `10.250.0.4` | node-4 `10.250.0.5` | 0 | 1368 |
+| t13 | node-2 `10.250.0.6` | node-3 `10.250.0.7` | 0 | 1368 |
+| t14 | node-2 `10.250.0.8` | node-4 `10.250.0.9` | 0 | 1368 |
+
+usage 报 `overlay_used 10 / overlay_total 65536`，四条 §9 口径打流的目的地全部可达。
+
+**中断点名（规则 1.4，这一条必须写）。** 重排只能"删隧道 → 释放地址 → 重建"，产品没有别的入口
+（游标复位走 `SetSettings`：把释放队列里落在新池外的地址丢掉、并对新池取模，
+[state.go:567-579](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/underlay/state.go#L567)；
+而池子还在被活隧道用的时候改小会被硬拒，报"先删隧道再改池"）。
+删隧道的瞬间本端 overlay /32 撤销、依赖它的下一跳全消失，**这一段客户流量必断**。
+实测断口：流 a `172.16.12.1→172.16.3.1` **335.0 秒**、流 b `→172.16.4.1` **343.9 秒**
+（同一条流、同一台 cust 自己的时钟，比较第一轮最后一个回包与第二轮第一个回包；
+第一轮用"相邻回包间隔"量出来只有 2.0s/1.5s，那是错的口径——整段黑洞里没有相邻回包可言）。
+
+这 335 秒里绝大部分不是这套动作本身的窗口，是我漏了一步在诊断：隧道重建完（19:19:56 四台 agent
+回执 `version 22 / ok=true`，wg 口 `wg1009…wg1014`，探针回声正常）之后，我**没有逐台发布**。
+隧道是活对象、走 `/v1/watch` 立刻生效，但 sr-route 的隧道表来自**冻结的已发布包**
+（bundle 第 4 段由 `overlayRouteArtifactLocked` 渲染，只有"发布这一台"时才写进
+`dc.Published`：[config_push.go:46](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/cmd/sr-ctrl/config_push.go#L46)）。
+所以四台盒子上 sr-route 的下一跳还停在旧地址（CPE1 实测 `peer_device_id 3 → next_hop 10.250.0.2`，
+而新表里 CPE3 那端是 `10.250.0.0`），RIB 里全部 `no_path`，`vm-fib-sync` 逐条报
+"下一跳 … 不在隧道表里，该路径跳过"，主表 via-10.250 条数从 2/2/3/3 掉到 0/0/1/0。
+19:25:05 补 `vm-console.py publish`（node1 v8、node2/3/4 v4）后约 35 秒路由装回。
+
+按现有时间戳拆开看：删除+重建+四台装口 ≈ 18 秒（19:19:38 → 19:19:56），
+发布 → 装表收敛 ≈ 35 秒，动作自带的窗口是这两段加起来的量级；
+中间 19:20:06 → 19:25:05 那约 5 分钟是我的漏步骤与诊断，不该记到这套动作头上。
+正确的次序写死在下面这七步（我也有一份可跑脚本 `/tmp/renum2.sh`，只做了 `bash -n` 语法检查、
+**没有跑过第二遍**，因为它依赖 `/tmp/tel-sample.sh` 与 `/tmp/fix4-gap.py` 两份未入库的采样助手；
+次序以这里为准）：
+
+1. 装前采样四台（agent pid / exe 哈希 / 插件哈希 / wg 口数与名字 / BFD 会话数与 Up 数 /
+   主表 `via 10.250.` 条数 / 探针行 / `/status` 的 tunnel 块），把每台的主表条数存下来当"回到装前"的判据；
+2. 起四条 §9 口径打流（1Hz，300 包，源一律是站点 loopback）；
+3. `DELETE /api/underlay/tunnels?id=<每一条>` 逐条删，读 `usage.overlay_used` 确认归零；
+4. `PUT /api/underlay/settings`（把 `overlay_cidr` 暂时 clamp 成 `10.250.0.0/32`）
+   + `POST /api/underlay/settings/publish`（必须带 `Content-Type: application/json` 和 `-d '{}'`），
+   再 `PUT` 回 `10.250.0.0/16` + 再 publish —— 这一步是产品自己的复位入口：`SetSettings` 丢掉释放队列里
+   落在新池之外的地址、并把游标对新池取模（state.go:567-579）；顺序不能反，池子里还有活隧道时改池会被硬拒；
+5. `vm-console.py tunnels`（批量重建，走 `/api/underlay/auto/plan|apply`）→ **`vm-console.py publish`（逐台发布）**
+   → 等四台 agent 回执 `"ok":true` 且 wg 口数回到 2/2/3/3；
+6. `vm-fib-sync.sh 1..4` 推 sr-fib 的隧道表（缺口 G-2，产品里没有维护者；次序不能反，
+   它认的是 wg 口上绑的那条 /32，而 agent 是"建口→装 peer→最后绑地址"）；
+7. 等四台主表 via-overlay 条数回到第 1 步存的数字，再采一次现场、收打流。
+
+**他没有让我再测，我没有为了拿一个更干净的窗口再切一次；**
+他要的话按上面七步跑一遍，就能拿到这套受支持动作的端到端窗口。
+
+新发现（只登记，不自己改）：控制台的 `overlay_pending` 信号确实会亮
+（[config_api.go:81](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/cmd/sr-ctrl/config_api.go#L81)
+判的是"这一版第 4 段和已发布的那版不一样"），但页面文案只写"导通组改过"，
+没说隧道改动同样需要逐台发布 —— 这次就是被这个盲区坑的。登记为文案待改，属功能之外的诚实信号缺口。
+
+#### 问题 2：丢包显示 100%，还会 97%/103% 抖 —— 是两个独立缺陷叠在一起
+
+他的原话："监控上显示丢包 100%，这个语义不对，丢包一般说的都是丢包率，没丢应该是 0%，
+而且有时候会出现 103% 和 97% 抖动，应该是采样算法有问题。"
+
+**缺陷 A：口径本身没有上界（就是他说的采样算法）。** agent 原先在两次采样之间做差再算比例，
+[controller/internal/agent/telemetry.go](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/agent/telemetry.go)
+旧代码是 `LossPermille = ProbeLost*1000/ProbeTx`（窗口差值）。这个比值天然能超过 1000‰：
+一条探针在第 k 个窗口发出、按超时（3×间隔）要到第 k+1 个窗口才被判丢，它就只进 k+1 的**分子**、
+不进 k+1 的分母；迟到回包又只加 `late` 不加 `rx`。于是同一个会话能报出 97% 与 103% 来回抖。
+现在这段差值计算整个删掉，丢包率只有一个来源——插件自己的滑动窗口：
+[vpp-plugin/sr_wg_probe.c:264-281](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/vpp-plugin/sr_wg_probe.c#L264)
+在最近 `SR_PROBE_WINDOW`（128）个槽里数 `replied` 与 `lost`，返回 `lost*1000/(replied+lost)`，
+两者皆 0 时返回 0。分子分母同窗口 ⇒ 值域钉在 0-100%，"没丢"就是 `0.0%`。
+agent 侧改成直接取 `p.LossPermille`（telemetry.go:332），
+`wire.TunnelMetrics.LossPermille` 的字段注释重写成"不是本窗口 lost/tx"并解释为什么（wire.go）。
+
+**缺陷 B：那个 100% 是真的断了，断在探针自己的发送路径。** 插件发探针时把
+`vnet_buffer(b)->sw_if_index[VLIB_TX]` 填成 `0`。26.06 的约定是这一格存 **fib_index**
+（0、1、…），既不是 sw_if_index 也不是 VRF id，所以 `0` 等于点名查 main table；
+而 overlay /32 在 main table 里也可能有条目（指向 WAN 网关）。结果探针从表 0 走出去、**根本没下隧道**，
+对端 `echoed` 恒 0、`tx=216257 rx=0`、丢包钉死 100%。取证：CPE1 上表 0 那条 `10.250.0.2/32`
+的计数器按探针速率增长（11 秒里 37 包 / 3344 字节，对得上 `probe_tx +43 × 76B`），
+也就是**探针明文漏在 LAN 上**。改为 `~0`，让 ip4-lookup 去查 RX 那张接口所在的表
+（隧道口由 agent 显式 `set interface ip table <if> 250`，于是探针与业务走同一条封装路径），
+见 [sr_wg_probe.c:376](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/vpp-plugin/sr_wg_probe.c#L376)。
+RX 侧仍必须填真实接口，不能也写 `~0`：隧道 admin down 时这个包会进 interface-drop，
+而 `interface_drop_punt` 拿 RX 当数组下标加每接口计数器，2026-10-24 实测过一次直接 SIGSEGV。
+
+**铺开方式。** 插件替换在四台都走 `cp … .new` + `mv -f`（VPP 持有旧 inode，ETXTBSY 时不能原地写），
+重载插件需要重启 VPP —— 这一台的重启会撞上缺陷⑦（#268）的形状，所以是单独一件事，
+不在"修丢包"里顺手做。
+
+**改后数字（19:31 那一帧 `/api/metrics`，四台 10 行）。** 全部 `up=true`、`bfd_state=up`、
+`loss_permille=0`（页面显示"丢包 0.0%"）、`probe_tx` 与 `probe_rx` 相等或差 1、`lost=0`、`late=0`。
+真实浏览器监控页逐行复核过，不是只看接口。`console_metrics_test.go` 覆盖口径。
+
+#### 问题 3：「BFD 的时延和抖动数据监控上都没有」
+
+**先把口径纠正到位，再解释为什么他看不到。** 时延/抖动/丢包这三项**不可能来自 BFD**：
+VPP 的 BFD 会话只回答可达性，`bfd_udp_session_details` 与会话结构体里没有 rtt、没有抖动、没有丢包
+（2026-10-24 实测）。三项质量数字全部来自隧道内探针 `sr_wg_probe`。所以正确的显示门禁是
+"这条隧道上有没有探针会话"，不是"这一窗口发过几个包"。
+
+**页面原来怎么走。** 旧渲染用 `rx > 0` 当门禁：探针装了但一次回包都没有（正是缺陷 B 的形状），
+时延/抖动/丢包三列全显示"—"，看上去就像"监控没这两项"。升级前的 `rtt=0.000ms` 也是同一件事——
+收不到回包，不是页面无数据。
+
+**动了什么。** `wire.TunnelMetrics` 新增 `HasProbe`
+（[wire.go](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/wire/wire.go)
+里字段注释写明"只有 BFD、没有探针的行必须显示未上报，0 是一个测量结果，缺席不是"），
+agent 在真正取到探针行时置位（telemetry.go:319）；
+控制台质量三列改按 `has_probe` 门禁：没有会话 ⇒ **未上报**；有会话但本窗口无回包 ⇒ 明写"无回包"；
+第一个采样窗口（`WindowSec==0`，没有前一帧可减，报的是会话建立以来的累计值）在采样列标"累计"，
+这条口径同时写进 `wire` 的注释，避免下游把无窗口差值当差值用。
+另外在遥测面板加了一段口径说明，判 down 的窗口和探针节奏都取自控制器**下发**的那份策略
+（[console.html:1235](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/cmd/sr-ctrl/console.html#L1235)
+`telemetryRuleHint`），页面不再写死 150 ms；从没发布过 underlay 配置时它说"定时器未知"，
+不猜内置默认值。
+
+**数字（同一帧）。** 10 行全部有值：`rtt` 当前 1.574–21.6 ms，`avg` 8.6–13.0 ms，
+`max` 51.4–166.2 ms，`jitter` 2.7–8.2 ms；盒上 `show sr-wg probe` 与接口同口径一致
+（CPE1 一条会话 avg=8.802 / max=116.399 / jitter=6.056）。抖动是插件里的 RFC3550 EWMA
+（`jitter += (d - jitter)/16`），min/avg/max 是会话生命周期口径、不是窗口聚合——
+这一点在 wire 字段注释里写明，页面上不再混称。
+
+#### 问题 4：「BFD 是 300ms 一次，应该连丢 3 个就判 down，我不知道你是不是这么做的」
+
+拆成三件事回答，第一件是确认，第二、三件才是改动与新缺陷。
+
+**① 判 down 的规则：是"连丢 detect_mult 个"，但用的不是 300 ms。** 盒上 BFD 是 UDP **多跳**会话，
+定时器 50 ms / 50 ms / detect_mult 3，判 down 的规则就是"detect_mult × 协商后的最小接收间隔"
+这么多毫秒内没收到包，即 **3 × 50 = 150 ms 静默**。四台 `show bfd sessions` 实测
+`Detection Time (usec) 150000`。他说的 300 ms 是隧道内**探针**的间隔——两个数字混在同一句话里：
+可达性用 BFD（50 ms 一档），质量用探针（300 ms 一档），探针不参与判 down。
+
+**② 墙钟比规则粗，这一条不是缺陷但是要说清。** 会话还在 Init/Down 阶段时 VPP 大约按 1 秒发一次
+（CPE1 `show bfd sessions` 实测打印 `Transmit 1000000`），所以"接口真的死了"到被报出来实测约 1.5 秒
+（2026-10-24）。规则值与墙钟值都写回 [wire.go](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/wire/wire.go)
+遥测分段的注释里，不留成"未知"。
+
+**③ 他的三个租户旋钮此前根本没到设备（这是真缺陷，已修）。** "全局配置"页能改
+`probe_interval_ms / bfd_min_tx_ms / bfd_min_rx_ms / bfd_detect_mult`，但 `UnderlayBundle` 里没有
+遥测这一段，agent 只会落回内置默认（300/50/50/3）——页面说 500 ms，盒上还是 300 ms，
+属于"控制台不造数据"里最糟的一种：改了但不生效，还不告诉人。
+现在新增 `wire.TelemetryPolicy`（ms 用于探针、us 用于 BFD，`omitempty` 让旧控制器的空策略仍落回默认）、
+控制器在渲染 bundle 时填入（[underlay_delivery.go:71](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/cmd/sr-ctrl/underlay_delivery.go#L71)）、
+agent 每条隧道装 BFD/探针时使用（[tunnel.go:650](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/agent/tunnel.go#L650)），
+ms→us 只在 [settings.go:230](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/underlay/settings.go#L230)
+`TelemetryPolicy()` 一处做；`/api/metrics` 顶层回显这份**已下发**的策略（指针，未发布 ⇒ null ⇒ 页面说未知），
+这样"页面上的数字"和"数据面里的数字"是同一份。
+
+**实测（旋钮实时生效）。** `PUT /api/underlay/settings` + `POST /api/underlay/settings/publish` 把
+探针间隔改成 500 ms 后 25 秒内，盒上 `show sr-wg probe` 从 `interval=300ms timeout=900ms`
+变成 `500ms/1500ms`，`/api/metrics` 的 `interval_ms` 同步变 500；随后改回默认 300/50/50/3，
+四台收敛（隧道版本 v10 ok）。
+
+**新缺陷（登记，没动）：BFD 三个定时旋钮改不动已存在的会话。** 改成 100/100/5 之后四台 agent 全部进
+退避循环，回执文本：`隧道配置 v9 只装上一部分（连续 1..4 次，5s→40s 后重试）: 隧道 t2: 隧道内 BFD/探针:
+agent: 建 BFD 会话 sw_if=5: vppapi: bfd_udp_add 失败，VPP retval=-101`，盒上 BFD 仍是 50000/50000/3。
+根因在收敛路径：agent 只用 `hasBFDSession` 比对定时器，不相等就 `AddBFDSession`，
+而 `AddBFDSession` 只发 `bfd_udp_add`——既没有 `bfd_udp_mod` 也没有先删后加，VPP 对已存在的
+(local, peer) 会话直接回 -101。改回 300/50/50/3 之所以能收敛，是因为新值**恰好等于**现存会话的值，
+`hasBFDSession` 命中、压根没再调 add，不是"改成功了"。要不要补 `bfd_udp_mod`/先删后加，以及
+"BFD 会话改动是否算必然中断"（删会话会让该隧道判 down 一次），等他拍。
+
+#### 问题 5：隧道时延高是不是因为没绑核 —— 这一条没收口，缺受控对照
+
+现在能给的只有单点数字（19:31 帧：avg 8.6–13.0 ms、max 最高 166.2 ms、jitter 2.7–8.2 ms）。
+"高"要相对谁、绑核能不能压下来，没有 A/B 之前我给不出结论，所以不写结论。
+相关的既有测量只有一条：task #67 曾量过把 VPP 主线程钉在 CPU 0 会造成 ~10 ms 收包延迟，
+说明钉法在这套形状上确实影响时延；VM 台四台盒子共享宿主 4 核，有没有 CPU 争抢我还没取过证据。
+他的指令是"先把五个问题修完交把手，然后继续做第 5 项对照"，
+#267 因此保留到交把手之后做，不在这一节里冒充已完成。
+
+#### 这一节的验证口径与遗留
+
+- 单测（Linux 容器 `fix4-test`，带 VPP 头文件）：`go test -count=1`
+  underlay 0.063s / agent 1.906s / wire 0.008s / cmd/sr-ctrl 3.369s，全绿。
+- 控制台：真实浏览器监控页逐行复核（租户 `vm-tenant`），口径文字与每行数字一起看；
+  不是只调 API 就算验证。
+- 四台产物（从 `/proc/<pid>/exe` 读，不信符号链接）：agent exe `d2ad8519648c031f…`、
+  插件 `9267d28d8b76fb54…`；wg 口 2/2/3/3，BFD 全 Up，agent 回执 `"tunnel":{"version":22,"ok":true}`。
+- 规则 1 复核：问题 1/2A/3/4③ 四项修复都不在配置生效路径里重启任何 daemon。
+  唯一需要重启 VPP 的是**换插件**这个部署动作本身（缺陷 B），它撞的是缺陷⑦（#268）的形状，
+  已单独记录，没被塞进"修丢包"里顺手做。**补一条：这次 VPP 重启还在 CPE2 上引出了缺陷⑧（§9.15），
+  那一处中断当时没写出来，现在写在这里。**
+- 新增待拍（不自己决定）：BFD 定时旋钮改不动活会话（本节③末）、
+  `overlay_pending` 文案未提隧道改动（问题 1 末）、缺陷⑥ #262、缺陷⑦ #268、缺陷⑧（§9.15）。
+  另有 #267（绑核对照）待做。
+
+### 9.15 缺陷⑧（新登记，未修）：开机清单与 watch 在同一秒并发，把 sr-route / sr-fib 各起了两个
+
+这一节是当晚 `vm-verify.sh` 那 14 条 FAIL 的根因。先说清楚它的定位：**不是我改的代码引入的**，
+是换插件那一次 VPP 重启把一个一直存在的并发窗口暴露出来了；今晚做的是止损，不是修。
+
+#### 场景：10:42 UTC 我在 CPE2 换 sr_wg 插件
+
+盒子时钟就是 UTC（CPE2 `date` 与 `date -u` 相同），下面统一用它；
+Mac 侧的 RR 日志打在 Mac 本地（CST，UTC+8），引用时会换算。
+
+| 时刻（UTC） | 动作 | 证据 |
+|---|---|---|
+| 10:42:12 | `sr_wg_plugin.so` 落盘（缺陷 B 那份 `~0` 发送口修复） | `ls --time-style=full-iso` = `10:42:12.477`，旧文件留在 `.pre-tel`（11-04 14:45） |
+| 10:42:29 | `systemctl restart vpp`（换插件必须重载） | journal：`vpp[38300]: received SIGTERM from PID 1 UID 0, exiting...` → `Starting vpp.service` |
+| 10:42:29 | `sr-box.service` 跟着 vpp 停 → `start.sh stop` | journal：`start.sh[122341]: stop SIGTERM bridge (pid 27451) / fib (pid 42475) / route (pid 27428) / agent (pid 109920)` |
+| 10:42:29 | vpp 起来后 `sr-box.service` 重新 `Starting` → **A 轮** `start.sh[122377]` | journal |
+| 10:42:31 | **watch timer 那一轮也 `Starting`** → **B 轮** `start.sh[122559]` | journal：`Starting sr-box-watch.service`（同一秒两轮的步骤行交错打印） |
+
+`sr-box.service` 挂 `PartOf=vpp.service`（[sr-box.service:43](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/deploy/sr-box/sr-box.service#L43)），
+所以重启 VPP 一定会把这份清单重跑一遍——这是设计里写明的（同文件 :16-17 那段注释）。
+问题在于 `sr-box-watch.service` 是另一条独立调用点（[sr-box-watch.service:17](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/deploy/sr-box/sr-box-watch.service#L17)
+指向同一个 `start.sh up`），它不带 `PartOf`、也不与 `sr-box.service` 互斥，timer 又在 :31 那一秒正好到点。
+**两条调用点可以在同一秒各跑一轮**，这件事此前只在注释里被默认"清单幂等所以安全"，没有谁保证过一次只跑一轮。
+
+#### 代码逐步走到哪：清单的幂等是 check-then-act，中间没有锁
+
+每一步的形状都在 [start.sh:327-343](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/deploy/sr-box/start.sh#L327)
+（`do_route`，`do_fib` 在 :346-358 同构）：
+
+1. `gate_*`：配置文件在不在；
+2. `alive route`（[:99-114](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/deploy/sr-box/start.sh#L99)）：
+   先看 `$RUN/route.pid`，用 `/proc/<pid>/comm` 核对它确实是这个二进制；pidfile 不可信时退到 `pgrep -x sr-route`；
+3. 都不在 ⇒ `launch`（[:140-157](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/deploy/sr-box/start.sh#L140)）：
+   `nohup … &` → `echo $! > $RUN/route.pid` → `sleep 1` → `kill -0` 确认还活着。
+
+第 2 步和第 3 步之间没有任何互斥。A 轮 `nohup` 已经 fork、但子进程还没 exec、pidfile 也还没写的那几毫秒里，
+B 轮来查：pidfile 是空的（`stop` 刚把旧号 `rm -f` 掉，见 :460-476 那段），`pgrep -x sr-route` 也搜不到还没 exec 的孩子，
+于是 B 轮也 launch。当晚实测就是这个形状：
+
+| 步骤 | A 轮（sr-box.service，start.sh[122377]） | B 轮（sr-box-watch.service，start.sh[122559]） | pidfile 里留下的 |
+|---|---|---|---|
+| agent | 起了 `122480`（:30，journal 里 A 打的是"在跑，…已回话"= launch 之后那句） | `已在跑（pid 122480）` 跳过 | `agent.pid=122480`（mtime :30.706）✅ 与实际一致 |
+| route | 起了 `122631`（:31，抢到 19001） | **也 launch**：起了 `122635` | `route.pid=122635`（mtime :31.794）❌ 端口不在它手上 |
+| fib | 起了 `122663`（:32，抢到 19011） | **也 launch**：起了 `122667` | `fib.pid=122667`（mtime :32.953）❌ 同上 |
+| sr-frr | 起了 `122695`（:33） | `已在跑` 跳过 | `bridge.pid=122695`（mtime :34.081）✅ |
+
+这张表里"谁起了哪一个"是这样定的，不是猜的：journal 在 10:42:32 和 :34 各把 `route 状态口…已回话`、
+`fib 在跑…` 这两句**打印了两遍**（两遍分别是 122377 与 122559 两个 start.sh 打的，journal 带 pid），
+而这两句在脚本里都位于 `launch` 之后 —— 所以 route 与 fib 两步确实各起了两个进程。
+归属到轮次靠 pidfile 的写入时刻（`launch` 是"fork 完立刻写"）：先写的那次落在低 pid 上（122631 / 122663），
+后写的把账本覆盖成 122635 / 122667，mtime :31.794 与 :32.953 就是后写那次的时刻；
+agent 与 sr-frr 各只有一行"launch 后"的消息，且 B 轮明说"已在跑"，所以没被起两次。
+
+`launch` 后写 pidfile 是"后者覆盖"，所以清单的账本记住了 B 轮那两个；
+先起的 A 轮那两个反倒成了**不在账上的孤儿**，但它们手里攥着 19001 / 19011。
+`curl 127.0.0.1:19001/status`（`vm-verify.sh`、`vm-fib-sync.sh`、sr-frr 的 `poll` 全都打这个口）
+看到的永远是那个"清单不认识的"实例。systemd 从 10:43:33 起每一轮都在点名这件事，只是那句话一直被当成噪声：
+`sr-box-watch.service: Found left-over process 122631 (sr-route) in control group while starting unit. Ignoring.`
+和 `Unit process 122667 (sr-fib) remains running after unit stopped.`（谁在哪个 cgroup 我不从这里推断，
+这两句能确定的只是：账本和真实进程已经不一致了。同一族的还有
+[sr-box-watch.service:14-30](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/deploy/sr-box/sr-box-watch.service#L14)
+那段 `KillMode`，即缺陷① #257。）
+
+#### 为什么两个 sr-route 会把控制面点着：RR 一个 node 只留一条会话
+
+这里要说的是 **RR 侧每个 node 只保留一条会话**。
+两个实例都以 `srou://tenant-vm/node/2`（同一份 `/etc/sdwan/route.json`、同一台 192.168.1.102）去拨 rr1 和 rr2，
+新会话一进来就把旧的顶掉，被顶掉的那个按退避重拨 ⇒ 谁都不稳定。测量（RR 日志打在 Mac 本地 CST，
+换算 UTC 减 8 小时）：
+
+- 起风时刻：18:45 CST（10:45 UTC）那一分钟 94 条，随后稳态 **227-228 条/分钟**（rr1+rr2 合计 ≈3.8 次/秒），
+  一直到 20:05 CST（12:05 UTC）我收尾；两份日志里 `node/2` 的"会话结束"记录合计 **18196 条**。
+  风暴期每条会话只活了 **377-560ms**（原文 `session ended after 557ms … use of closed network connection`），
+  这个存活时长就是互顶的节奏。
+- 11-04 22:59-23:xx UTC（日志 11-05 06:59-07:xx CST）那 92 条是**另一件事**：速率 ~1.5 条/分钟、
+  会话存活 2.15-2.22s，等于"每分钟一轮清单把同一个实例顶一次"的形状，不是这次的风暴。
+  我在写 §9.14 时曾拿 06:59 那条说过"抖动早就存在、不是今晚改号引起的"，**归因是错的，这里更正**：
+  双实例生于 10:42:31 UTC，风暴起于 10:45 UTC，而隧道改号那一批动作在 **19:19:38-39 CST = 11:19:38-39 UTC**
+  （`sr-ctrl.log`：`deleted tunnel t2/t3/t4/t6/t7` → `published global config` → `applied auto batch b8 mode=full-mesh (3 added)`
+  + `b12 mode=hub-spoke (2 added)`），比风暴晚 34 分钟 —— 改号不是触发者，**换插件那次 VPP 重启才是**。
+
+#### 放大链：会话一断就摘路，摘路把反环判据翻过来，客户侧真前缀被自己人顶掉
+
+这一段是把 §9.14 里"防环那条是时间相关的"落到具体报文上，每一环都有采样：
+
+1. 会话每次被顶掉，O7-R3 就按来源摘掉该 origin 的路径 ⇒ sr-route 的 Loc-RIB 闪断（不是 BFD，四台
+   `show bfd sessions` 当时全 Up、`Detection Time 150000`）。
+2. RIB 一 Empty，`sr-frr` 那轮的 `exp.reconcile()` 就把自己注入内核的 `dev lo` K 路由删掉
+   （[cmd/sr-frr/main.go:712-760](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/cmd/sr-frr/main.go#L712)
+   一条 poll 里"先导出收敛、后算导入"，所以导出集合的抖动直接进导入的判据）。
+3. K 路由一掉，CPE2 客户域里那条回灌副本（OSPF `via 172.31.12.1`）就不再落进本 VPN 的 `exportedSet`
+   （[internal/frr/import.go:299-358](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/frr/import.go#L299)
+   的反环判据是"当前导出集合"，可逆、不记录历史）⇒ 过滤器放行 ⇒
+   **CPE2 把 `172.16.4.1/32`、`172.16.3.1/32` 当成自己的本地前缀重新宣告**（30 次采样里抓到 8 次）。
+4. CPE4 收到一份 `device_id=2` 的 `172.16.4.1/32`，在它自己看来是"别人的前缀"，于是装上
+   `172.16.4.1 dev lo`；这条一装，反环过滤器立刻把 CPE4 真正的 BGP 导入判成环：
+   `/run/sr-frr/control.sock` 的 `/status` 采样 18 次里有 6 次 `rep=0 loop=1`，
+   `PUT/GET /local-prefixes` 同期 6 次为空。
+5. RR 库因此丢掉真正的主人 ⇒ cust12 / cust3 少了 `172.16.4.1/32`，两条流分别 **15% / 85%** 丢包。
+   `vm-verify.sh` 表现为 14 条 FAIL，集中在 §6（隧道/MPLS）、§7（内核 `dev lo` + zebra `Known via "kernel"`）、
+   §8（每台自己的客户 loopback 必须是唯一本地前缀）三族。
+
+（这里没有引入任何新机制：第 3-4 环就是我们早就登记过的"防环 A+B 过滤规则"那条待拍项，
+本次只是给它补了一个能稳定复现的触发条件。）
+
+#### 止损做了什么（不是修）
+
+只动那两个重复实例，其余进程一个都没重启，lab 配置一行都没手工补：
+
+1. `kill -TERM 122635 122667` —— 杀的是 pidfile 认得、但**手里没有端口**的那两个，
+   保留端口持有者 122631 / 122663。选这一对而不是反过来，是因为 survivor 不需要重新 bind、
+   也不需要任何人重启：动"没抢到口的那个"才是最小中断。
+2. `bash test/lab/vmlab/vm-fib-sync.sh 2` —— sr-fib 的隧道表只在内存（缺口 G-2 #268），
+   幸存者 122663 是 10:42 新起的，那份表是空的，必须补：
+   `node 2: 隧道 2 条（10.250.0.7→wg1013 10.250.0.9→wg1014）vrfs=[0] 逃生=False → converged=True`。
+
+前后对照（同口径，规则 2 要的两组数字）：
+
+| 指标 | 止损前 | 止损后 |
+|---|---|---|
+| RR 侧 `node/2` 会话结束 | 227-228 条/分钟，持续 1 小时 20 分 | sr-route 重连计数 15 秒内 `4549 → 4549`（不再涨） |
+| RR 库（`GET /routes`） | 主人被顶掉，缺 `172.16.4.1/32` | 恰好 4 条：`1→172.16.12.1、2→172.16.12.1、3→172.16.3.1、4→172.16.4.1` |
+| 四台 `/local-prefixes` | CPE2 多宣告、CPE4 为空 | 四台各自正确 |
+| `vm-verify.sh` | PASS=374 **FAIL=14** WARN=0 | **PASS=388 FAIL=0 WARN=0**（`/tmp/vm-verify-run6.log`） |
+| 每台实例数 | CPE2 有 sr-route×2、sr-fib×2 | 12:11 UTC 四台 `ps -eo comm`：sr-agent/sr-route/sr-fib/sr-frr **各 1** |
+
+一条遗留状态，如实写：CPE2 的 `/run/sr-box/route.pid`、`fib.pid` 里现在是被我杀掉的那两个号
+（`/proc/<pid>/comm` = GONE），真正的端口持有者 122631 / 122663 **不在清单账本上**。
+之所以之后每一轮清单（10:43:34 起，每 60 秒一次，一直到 12:1x）都只打印"已在跑"而没再补一个新实例，
+靠的是 `alive()` 里 `pgrep -x` 那条兜底（[:113](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/deploy/sr-box/start.sh#L113)）——
+这不算修好，pidfile 与事实不符这件事还在这台盒子上。
+
+#### 要动什么（只登记，等他拍）
+
+一句话：**同一份 `start.sh up` 需要一把跨调用点的互斥**，让 `sr-box.service` 与 `sr-box-watch.service`
+（以及任何手工/脚本起的第三、第四轮）不能并发；现在的"幂等"只保证了"不重启活着的进程"，
+没保证"不会同时起两个"。具体形态（`flock` 一把锁 / `ExecStartPre` 查重 / 让 `alive()` 与 `launch()` 之间
+用 pidfile 原子占位）涉及要不要新增 lab 侧依赖，也可能把 `systemd` 那层的 `Job` 语义牵进来，
+**我没有动手，也没在 lab 里试任何一条**。
+
+同时要说清的一次中断：换插件必须重启 VPP，这是缺陷 B 部署动作自带的，
+这一晚它的确切代价就是上面这一串（控制面风暴 80 分钟 + 14 条 verify FAIL + 两条流 15%/85% 丢包）。
+这一晚按主任务要求"停止测量"，我没有为这次 VPP 重启再打一轮 160 包窗口，
+所以**没有换插件这一动作自身的丢包率**，只有上面这些计数；
+要那个数字的话，用 §9.13 那四条打流方向、同一口径跑一遍即可。
