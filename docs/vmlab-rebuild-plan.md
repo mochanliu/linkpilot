@@ -1264,3 +1264,61 @@ timer=active`，并把看门狗最近一次退出码与时刻打出来（实测�
    （`vm-verify.sh:370-377`：回执 `ok=true` 必须和 §3 实测的口名/绑定计数同时成立，两个口径并排打出来），
    但触发场景（单独重启 VPP 后 agent 不重建 wg 口）不在判据里。⑥这一轮抓到 3 条 WARN，
    就是它在客户视角的复现，方案（抑制窗口 / 检测时间与轮询周期的约束关系）还等他拍。
+
+### 9.11 S8 把手：lab 现在怎么自己复核、怎么登进去、断电之后怎么拉起来（2026-11-05）
+
+#### 登录（复核用这一个账号就够）
+
+- 控制台 `http://127.0.0.1:8088`（sr-ctrl 只绑 127.0.0.1，与容器台同口径）。
+- 账号 `vm-tenant`，角色**租户**，租户 `tenant-vm`。明文口令不进仓库、不进日志
+  （AGENTS.md §3）；它落在他本机的 `~/srvmlab/state/credentials.json`（0600），
+  要读就 `python3 -c "import json;print(json.load(open('/Users/louis/srvmlab/state/credentials.json')))"`。
+- 这一轮实测过登录本身：`POST /api/login` 返回 `{"ok":true}`（HTTP 200），同一会话
+  `GET /api/state` 打出 4 台设备全 `online`（`sr-agent/0.1 (identity+heartbeat)`，
+  site 名在 `runtime.site_name`），`GET /api/underlay` 打出 5 条隧道（t2/t3/t4/t6/t7，
+  颜色 0、MTU 1368）。页面侧当前会话的租户视图：设备 4/4、在线 4、失联 0、未定位 0。
+- 运营方视角（建租户/授权/RR 库那几页）没有账号，用启动参数 `-admin-token` 那份
+  token 换会话；token 在 `~/srvmlab/state/console-token`（0600），同样不进仓库。
+
+#### ssh 把手（七台，密钥 `~/vm-lab/keys/id_ed25519`，root）
+
+| 别名 | 地址 | 说明 |
+| --- | --- | --- |
+| `CPE1`…`CPE4` | 192.168.1.101–104 | 四台 vCPE 盒子（VPP + FRR + 四个 sr-* 进程） |
+| `cust12` | 172.31.12.13，`ProxyJump CPE1` | 站点 12 的客户机，lo 上播 172.16.12.1，跑 OSPF |
+| `cust3` | 172.31.3.2，`ProxyJump CPE3` | 站点 3 的客户机，lo 播 172.16.3.1，跑 BGP AS 65003 |
+| `cust4` | 172.31.4.2，`ProxyJump CPE4` | 站点 4 的客户机，lo 播 172.16.4.1，跑 BGP AS 65004 |
+
+一条自己就能看到的业务判据（客户视角，源必须是 loopback —— overlay 只承载 172.16/16 的 /32）：
+
+    ssh cust12 "ping -c 5 -I 172.16.12.1 172.16.3.1"
+
+2026-11-05 实测：`5 packets transmitted, 5 received, 0% packet loss`，rtt 11.49/16.69/24.31ms。
+偶尔出现 1–4 个包的丢失不算回归 —— 那就是缺陷⑥（#262）在客户视角，`vm-verify.sh` 会把它
+打成 WARN 并把同窗口的摘路条数一起打出来。
+
+#### 检查这两条，别用手敲的口径
+
+    bash test/lab/vmlab/vm-verify.sh    # 判红绿（退出码 0 = 无 FAIL）；台账缺失会先要 vm-ledger.py
+    bash test/lab/vmlab/vm-status.sh    # 十段只读快照，数字与 vm-verify 同源
+
+#### 断电/Mac 重启之后
+
+1. 拉起七台虚拟机：`for v in CPE1 CPE2 CPE3 CPE4 cust12 cust3 cust4; do VBoxManage startvm "$v" --type headless; done`。
+   实测 `Autostart Enabled: disabled`（七台都是），所以开机不会自己起 —— 要不要打开自启等他拍
+   （代价：每次开 Mac 就同时跑 7 台，现在宿主 load 已经在 15–17/16 核）。
+2. 盒子内部自愈不需要手工：`vpp.service` + `sr-box-watch.timer` 每 60 秒跑一次 start.sh 清单
+   （本轮四台看门狗最近一次 `退出码=0`）。隧道层是磁盘恢复不了的（§5.10 / 配置分层记忆），
+   所以控制面必须先起来。
+3. Mac 侧控制面：`bash ~/srvmlab/restart-ctrl.sh`（幂等：已在跑的 pid 打出来不动它）。
+   起 sr-ctrl（8444 设备口 / 8088 控制台 / STUN 3478+3479）+ 双 sr-rr。
+   设备侧靠 `/v1/watch` 重连并重新拉包。**"控制器整个重启一遍"不在本轮判据里** ——
+   这一条按 AGENTS.md §1 第 3 条（重连不许让数据面抖动）当作要求记着，但没有这轮的实测数字，
+   要用之前先照 §9.10 的口径补一次前后对比。
+
+#### 等拍的四件（这一轮没有替我决定任何东西）
+
+1. 缺陷⑥（#262）：摘路要不要抑制窗口 / 连续确认，BFD 检测时间与 sr-fib 轮询周期要不要有约束关系。
+2. 缺陷④（#260）：VPP 重启后 agent 不重建 wg 隧道但仍报 `ok=true`。
+3. `arp_ignore=1` 要不要像容器台那样进 VM 台判据（§9.10 未覆盖第 1 条）。
+4. 七台 VM 的 VBox 自启要不要打开。
