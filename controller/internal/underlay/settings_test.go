@@ -60,20 +60,30 @@ func TestNormalizeKeepsSubmittedFields(t *testing.T) {
 	}
 }
 
-func TestOverlayHostsSkipsNetworkAndBroadcast(t *testing.T) {
+// The pool is a list of /32 endpoints, not a subnet somebody puts hosts into,
+// so the first entry is the prefix address itself: the first tunnel pair is
+// .0/.1, then .2/.3.
+func TestOverlayHostsHandsOutTheWholePrefix(t *testing.T) {
 	s := DefaultSettings()
 	s.OverlayCIDR = "10.9.0.0/29"
 	hosts, err := s.OverlayHosts()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hosts) != 6 {
-		t.Fatalf("/29 应有 6 个可用 /32，实际 %d", len(hosts))
+	if len(hosts) != 8 {
+		t.Fatalf("/29 应整段发出 8 个 /32，实际 %d", len(hosts))
 	}
-	if got := hosts[0].String(); got != "10.9.0.1" {
-		t.Fatalf("第一个可用地址应是 10.9.0.1，实际 %s", got)
+	if got := hosts[0].String(); got != "10.9.0.0" {
+		t.Fatalf("第一个可发的地址应是 10.9.0.0，实际 %s", got)
 	}
-	if got := hosts[len(hosts)-1].String(); got != "10.9.0.6" {
-		t.Fatalf("最后一个可用地址应是 10.9.0.6，实际 %s", got)
+	if got := hosts[len(hosts)-1].String(); got != "10.9.0.7" {
+		t.Fatalf("最后一个可发的地址应是 10.9.0.7，实际 %s", got)
+	}
+	n, err := s.OverlaySize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(hosts) {
+		t.Fatalf("OverlaySize=%d 和地址清单 %d 条不一致", n, len(hosts))
 	}
 }

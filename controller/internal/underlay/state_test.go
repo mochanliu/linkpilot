@@ -64,36 +64,40 @@ func via(nodes ...uint16) *TunnelPath { return &TunnelPath{Hops: hopList(nodes..
 // still route to a freed /32, and reusing it immediately would hand a stale
 // route to a brand-new tunnel.
 func TestOverlayFIFOReleasesToTheBack(t *testing.T) {
-	s := newTestState(t, "10.9.0.0/29") // .1 .. .6
+	s := newTestState(t, "10.9.0.0/29") // 8 个 /32：.0 .. .7
 	views := testViews(1, 2, 3, 4)
 
 	t1 := mustCreate(t, s, views, 1, 2, nil)
-	if t1.A.Overlay != "10.9.0.1" || t1.B.Overlay != "10.9.0.2" {
-		t.Fatalf("第一条隧道应取 .1/.2，实际 %s/%s", t1.A.Overlay, t1.B.Overlay)
+	if t1.A.Overlay != "10.9.0.0" || t1.B.Overlay != "10.9.0.1" {
+		t.Fatalf("第一条隧道应取 .0/.1，实际 %s/%s", t1.A.Overlay, t1.B.Overlay)
 	}
 	if err := s.Delete(t1.ID); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.OverlayFreed) != 2 || s.OverlayFreed[0] != "10.9.0.1" {
-		t.Fatalf("释放后队尾应是 .1,.2，实际 %v", s.OverlayFreed)
+	if len(s.OverlayFreed) != 2 || s.OverlayFreed[0] != "10.9.0.0" {
+		t.Fatalf("释放后队尾应是 .0,.1，实际 %v", s.OverlayFreed)
 	}
 
 	t2 := mustCreate(t, s, views, 1, 3, nil)
-	if t2.A.Overlay != "10.9.0.3" || t2.B.Overlay != "10.9.0.4" {
+	if t2.A.Overlay != "10.9.0.2" || t2.B.Overlay != "10.9.0.3" {
 		t.Fatalf("释放的地址被立刻复用了：新隧道取了 %s/%s", t2.A.Overlay, t2.B.Overlay)
 	}
 	t3 := mustCreate(t, s, views, 1, 4, nil)
-	if t3.A.Overlay != "10.9.0.5" || t3.B.Overlay != "10.9.0.6" {
-		t.Fatalf("第三条隧道应取 .5/.6，实际 %s/%s", t3.A.Overlay, t3.B.Overlay)
+	if t3.A.Overlay != "10.9.0.4" || t3.B.Overlay != "10.9.0.5" {
+		t.Fatalf("第三条隧道应取 .4/.5，实际 %s/%s", t3.A.Overlay, t3.B.Overlay)
 	}
-	t4 := mustCreate(t, s, views, 1, 2, nil)
-	if t4.A.Overlay != "10.9.0.1" || t4.B.Overlay != "10.9.0.2" {
-		t.Fatalf("未用地址用完后应回到队首的 .1/.2，实际 %s/%s", t4.A.Overlay, t4.B.Overlay)
+	t4 := mustCreate(t, s, views, 2, 3, nil)
+	if t4.A.Overlay != "10.9.0.6" || t4.B.Overlay != "10.9.0.7" {
+		t.Fatalf("第四条隧道应取没用过的 .6/.7，实际 %s/%s", t4.A.Overlay, t4.B.Overlay)
+	}
+	t5 := mustCreate(t, s, views, 1, 2, nil)
+	if t5.A.Overlay != "10.9.0.0" || t5.B.Overlay != "10.9.0.1" {
+		t.Fatalf("未用地址用完后应回到队首的 .0/.1，实际 %s/%s", t5.A.Overlay, t5.B.Overlay)
 	}
 }
 
 func TestOverlayExhaustionIsAnError(t *testing.T) {
-	s := newTestState(t, "10.9.0.0/30") // .1, .2
+	s := newTestState(t, "10.9.0.0/31") // .0, .1
 	views := testViews(1, 2, 3)
 	mustCreate(t, s, views, 1, 2, nil)
 	// A different pair, so what runs out is the address pool -- not the

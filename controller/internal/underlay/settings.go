@@ -56,7 +56,7 @@ const (
 	privilegedPortMax  = 1023
 	ephemeralPortMin   = 32768
 	ephemeralPortMax   = 60999
-	maxOverlayHostBits = 16 // /16 pool = 65534 usable /32s; a /8 would be 16M entries
+	maxOverlayHostBits = 16 // /16 pool = 65536 handable /32s; a /8 would be 16M entries
 )
 
 var ephemeralPorts = PortRange{Min: ephemeralPortMin, Max: ephemeralPortMax}
@@ -187,7 +187,7 @@ func (s Settings) overlayPrefix() (netip.Prefix, error) {
 		return netip.Prefix{}, fmt.Errorf("overlay 地址池 %s 不是可用的单播网段", p)
 	}
 	if p.Bits() < maxOverlayHostBits {
-		return netip.Prefix{}, fmt.Errorf("overlay 地址池 %s 太大：最大 /%d（65534 个 /32）",
+		return netip.Prefix{}, fmt.Errorf("overlay 地址池 %s 太大：最大 /%d（65536 个 /32）",
 			p, maxOverlayHostBits)
 	}
 	return p.Masked(), nil
@@ -201,15 +201,14 @@ func (s Settings) OverlaySize() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	count := uint64(1) << uint(32-p.Bits())
-	if p.Bits() <= 30 {
-		count -= 2
-	}
-	return int(count), nil
+	return int(uint64(1) << uint(32-p.Bits())), nil
 }
 
-// OverlayHosts lists every usable /32 of the pool in ascending order. Network
-// and broadcast are skipped for prefixes that have them.
+// OverlayHosts lists every /32 of the pool in ascending order, **starting with
+// the prefix address itself**. The pool is not a subnet anyone puts hosts in:
+// each entry is handed out as a /32 endpoint inside VPP's overlay table, so the
+// classic "skip network and broadcast" rule does not apply. The first tunnel
+// pair is therefore x.y.0.0 / x.y.0.1, then .0.2 / .0.3 and so on.
 func (s Settings) OverlayHosts() ([]netip.Addr, error) {
 	p, err := s.overlayPrefix()
 	if err != nil {
@@ -218,15 +217,23 @@ func (s Settings) OverlayHosts() ([]netip.Addr, error) {
 	base := p.Masked().Addr().As4()
 	first := be32(base)
 	count := uint64(1) << uint(32-p.Bits())
-	lo, hi := uint64(0), count
-	if p.Bits() <= 30 {
-		lo, hi = 1, count-1
-	}
-	out := make([]netip.Addr, 0, hi-lo)
-	for off := lo; off < hi; off++ {
+	out := make([]netip.Addr, 0, count)
+	for off := uint64(0); off < count; off++ {
 		out = append(out, fromBE32(uint32(uint64(first)+off)))
 	}
 	return out, nil
+}
+
+// TelemetryPolicy is what the tenant's timers become on the wire. The console
+// speaks milliseconds (that is what an operator reasons in) and VPP speaks
+// microseconds, so the conversion happens once, here, on the way out.
+func (s Settings) TelemetryPolicy() wire.TelemetryPolicy {
+	return wire.TelemetryPolicy{
+		ProbeIntervalMS: s.ProbeIntervalMS,
+		BFDMinTxUS:      s.BFDMinTxMS * 1000,
+		BFDMinRxUS:      s.BFDMinRxMS * 1000,
+		BFDDetectMult:   s.BFDDetectMult,
+	}
 }
 
 func be32(a [4]byte) uint32 {

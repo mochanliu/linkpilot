@@ -379,7 +379,7 @@ func TestAutoRejectsBadRequestsWithoutTouchingState(t *testing.T) {
 // operator who selected 20 devices should still get as many tunnels as the
 // configured pools can hold.
 func TestAutoSkipsExhaustedPoolsInsteadOfFailing(t *testing.T) {
-	s := newTestState(t, "10.9.0.0/30") // two overlay addresses
+	s := newTestState(t, "10.9.0.0/31") // two overlay addresses
 	plan, err := s.AutoApply(AutoRequest{Nodes: []uint16{1, 2, 3}, Mode: ModeFullMesh, Now: 1000}, testViews(1, 2, 3))
 	if err != nil {
 		t.Fatalf("池子不足不该让整批失败: %v", err)
