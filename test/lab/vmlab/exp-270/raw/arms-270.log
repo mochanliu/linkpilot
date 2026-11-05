@@ -1,0 +1,262 @@
+########## L166927 :: 臂 A 前置：四台 VPP pid 与自然落点掩码 + WAN 中断亲和性
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+Warning: Permanently added '172.31.4.2' (ED25519) to the list of known hosts.
+cust4 探针已起
+--- 凭证：四台 VPP pid 与当前掩码 ---
+CPE1 pid=167810 mask= 1 irq17_aff=0-1
+CPE2 pid=122372 mask= 1 irq17_aff=0-1
+CPE3 pid=190459 mask= 0 irq17_aff=0-1
+CPE4 pid=308234 mask= 1 irq17_aff=0-1
+
+########## L166932 :: 臂 A（现状）：主机→四台管理口 ping
+A-现状 r1 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.657/7.252/29.072/6.163 ms 
+A-现状 r1 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 0.733/5.672/14.006/3.735 ms 
+A-现状 r1 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.789/1.991/5.470/0.961 ms 
+A-现状 r1 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 1.071/5.745/16.574/3.641 ms 
+A-现状 r2 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.679/5.333/14.866/3.227 ms 
+A-现状 r2 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 1.244/6.122/24.201/5.341 ms 
+A-现状 r2 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.448/2.311/4.634/1.017 ms 
+A-现状 r2 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 1.050/5.304/11.442/2.822 ms 
+A-现状 r3 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.971/5.783/21.593/4.373 ms 
+A-现状 r3 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 0.691/5.900/21.655/4.672 ms 
+A-现状 r3 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.336/2.068/3.809/0.826 ms 
+A-现状 r3 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 1.047/5.287/11.179/2.680 ms
+
+########## L166938 :: 臂 B：只改运行时亲和性（交换落点）时的摆臂读数
+--- 摆臂 B（只改运行时亲和性，不重启、不改配置） ---
+CPE1 -> cpu0 : pid=167810 mask=0
+CPE4 -> cpu0 : pid=308234 mask=0
+CPE3 -> cpu1 : pid=190459 mask=1
+CPE2 (对照，未动) : --- 取样 ---
+B-交换 r1 192.168.1.101 ms
+B-交换 r1 192.168.1.102 ms
+B-交换 r1 192.168.1.103 ms
+B-交换 r1 192.168.1.104 ms
+B-交换 r2 192.168.1.101 ms
+B-交换 r2 192.168.1.102 ms
+B-交换 r2 192.168.1.103 ms
+B-交换 r2 192.168.1.104 ms
+B-交换 r3 192.168.1.101 ms
+B-交换 r3 192.168.1.102 ms
+B-交换 r3 192.168.1.103 ms
+B-交换 r3 192.168.1.104 ms
+
+########## L166943 :: 臂 B（交换后）：主机→四台管理口 ping + CPE2 对照掩码复核
+B-交换 r1 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.688/1.819/3.697/0.790 ms 
+B-交换 r1 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 0.552/8.052/28.012/6.361 ms 
+B-交换 r1 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.887/4.104/15.248/3.353 ms 
+B-交换 r1 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 0.612/2.062/9.064/1.457 ms 
+B-交换 r2 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.730/1.847/4.492/0.903 ms 
+B-交换 r2 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 0.811/6.554/24.639/5.130 ms 
+B-交换 r2 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.737/6.356/17.385/5.001 ms 
+B-交换 r2 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 0.539/1.966/3.679/0.704 ms 
+B-交换 r3 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.559/1.783/3.597/0.769 ms 
+B-交换 r3 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 0.865/6.561/23.293/5.145 ms 
+B-交换 r3 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.839/4.665/17.420/3.981 ms 
+B-交换 r3 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 0.664/1.699/4.038/0.721 ms 
+--- CPE2 复核掩码 ---
+pid=122372 mask= 1
+
+########## L166949 :: 臂 C：只把 CPE2 的 WAN 硬中断挪到 cpu0，VPP 仍在 cpu1
+--- 摆臂 C：只在 CPE2 把 WAN 硬中断挪到 cpu0（VPP 仍在 cpu1） ---
+pid=122372 vpp_mask= 1 irq17_aff=0
+  计前：   irq17 CPU0=523561 CPU1=8582197
+C-CPE2挪中断 r1 192.168.1.102  60 packets transmitted, 60 packets received, 0.0% packet loss 1.148/6.303/30.664/5.263 ms 
+C-CPE2挪中断 r2 192.168.1.102  60 packets transmitted, 60 packets received, 0.0% packet loss 1.180/6.579/23.007/5.330 ms 
+  计后：   irq17 CPU0=526927 CPU1=8582197
+
+########## L166957 :: 排除项：盒内纯 CPU 循环（钉 cpu0 / 钉 cpu1 的 iters）与宿主 VirtualBox 版本、每台 vCPU 数
+--- 盒内纯 CPU 循环：同一台盒子、同一个进程，只换核 ---
+== CPE1 ==
+  cpu0 1624976 iters/2s
+  cpu1 4176454 iters/2s
+== CPE2 ==
+  cpu0 3387430 iters/2s
+  cpu1 2162526 iters/2s
+--- 宿主 VirtualBox 版本与 vCPU 数 ---
+7.2.22r175245
+ls: /Users/louis/VirtualBox VMs/VBoxGlobal.cfg: No such file or directory
+CPE1: cpus=2
+CPE2: cpus=2
+CPE3: cpus=2
+CPE4: cpus=2
+cust12: cpus=2
+cust3: cpus=2
+cust4: cpus=2
+
+########## L166963 :: 排除项：盒内 loopback ping 钉到两核，本地路径看不出核差
+== CPE1（VPP 当前在 0）==
+  loopback 钉 cpu0 : rtt min/avg/max/mdev = 0.021/0.049/0.161/0.025 ms
+  loopback 钉 cpu1 : rtt min/avg/max/mdev = 0.015/0.046/0.149/0.024 ms
+== CPE2（VPP 当前在 1）==
+  loopback 钉 cpu0 : rtt min/avg/max/mdev = 0.019/0.052/0.149/0.027 ms
+  loopback 钉 cpu1 : rtt min/avg/max/mdev = 0.022/0.060/0.211/0.034 ms
+== CPE3（VPP 当前在 1）==
+  loopback 钉 cpu0 : rtt min/avg/max/mdev = 0.021/0.071/0.272/0.053 ms
+  loopback 钉 cpu1 : rtt min/avg/max/mdev = 0.021/0.065/0.508/0.074 ms
+
+########## L166969 :: 臂 F：四台 VPP 全部钉 cpu0（interrupt）
+--- 摆臂 F：四台 VPP 全部钉 cpu0 ---
+CPE1 pid=167810 mask= 0
+CPE2 pid=122372 mask= 0
+CPE3 pid=190459 mask= 0
+CPE4 pid=308234 mask= 0
+F-全cpu0 cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.709/9.703/24.198/3.851 ms
+F-全cpu0 cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.797/11.995/30.905/6.050 ms
+F-全cpu0 cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 7.370/11.216/22.473/3.329 ms
+F-全cpu0 cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.186/12.881/58.246/9.489 ms
+F-全cpu0 cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.167/11.268/27.494/5.180 ms
+F-全cpu0 cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.757/14.981/52.621/8.865 ms
+F-全cpu0 CPE3 探针 n=24 avg=2.44 max=3.91
+F-全cpu0 CPE4 探针 n=24 avg=2.29 max=3.69
+
+########## L166975 :: 臂 G：四台 VPP 全部钉 cpu1（interrupt）+ 同臂管理口复核
+--- 摆臂 G：四台 VPP 全部钉 cpu1 ---
+CPE1 pid=167810 mask= 1
+CPE2 pid=122372 mask= 1
+CPE3 pid=190459 mask= 1
+CPE4 pid=308234 mask= 1
+G-全cpu1 cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 9.340/22.080/37.196/7.275 ms
+G-全cpu1 cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 8.396/22.074/40.446/8.053 ms
+G-全cpu1 cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 6.922/23.690/52.814/8.742 ms
+G-全cpu1 cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 11.506/24.629/53.088/8.655 ms
+G-全cpu1 cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 9.307/30.405/61.615/10.690 ms
+G-全cpu1 cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 8.080/24.058/50.553/9.463 ms
+G-全cpu1 CPE3 探针 n=24 avg=6.71 max=9.77
+G-全cpu1 CPE4 探针 n=24 avg=6.25 max=9.61
+--- 管理 ping 同臂复核（G）---
+G-全cpu1 r1 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.989/6.311/17.125/4.068 ms 
+G-全cpu1 r1 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 0.732/5.940/19.649/4.608 ms 
+G-全cpu1 r1 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.611/4.220/23.207/4.606 ms 
+G-全cpu1 r1 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 1.229/7.277/19.050/3.985 ms 
+G-全cpu1 r2 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.662/6.121/20.344/5.367 ms 
+G-全cpu1 r2 192.168.1.102  40 packets transmitted, 40 packets received, 0.0% packet loss 0.505/7.029/25.989/5.812 ms 
+G-全cpu1 r2 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.563/4.755/22.509/4.289 ms 
+G-全cpu1 r2 192.168.1.104  40 packets transmitted, 40 packets received, 0.0% packet loss 0.735/7.318/18.258/3.816 ms
+
+########## L166981 :: 臂 F2：反序复现，四台回 cpu0 + 同臂管理口复核
+--- 摆臂 F2：回到全部 cpu0（反序复现） ---
+CPE1 mask= 0CPE2 mask= 0CPE3 mask= 0CPE4 mask= 0
+F2-复现全cpu0 cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.492/9.674/29.968/4.692 ms
+F2-复现全cpu0 cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.833/8.845/15.909/2.163 ms
+F2-复现全cpu0 cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.187/8.915/17.311/2.342 ms
+F2-复现全cpu0 cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 4.628/14.196/74.621/13.598 ms
+F2-复现全cpu0 cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.558/10.773/27.812/5.252 ms
+F2-复现全cpu0 cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.206/11.380/35.721/6.800 ms
+F2-复现全cpu0 CPE3 探针 n=24 avg=2.28 max=3.13
+F2-复现全cpu0 CPE4 探针 n=24 avg=1.56 max=1.88
+--- 管理 ping 同臂（F2）---
+F2 r1 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.659/1.719/3.659/0.773 ms 
+F2 r1 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.642/2.282/14.513/2.190 ms 
+F2 r2 192.168.1.101  40 packets transmitted, 40 packets received, 0.0% packet loss 0.561/1.976/23.176/3.437 ms 
+F2 r2 192.168.1.103  40 packets transmitted, 40 packets received, 0.0% packet loss 0.523/2.173/4.760/0.871 ms
+
+########## L166989 :: 臂 H（当时标成 cpu1，见本节「我自己这把尺子上的错」）：四台在 cpu0 + 两口 rx-mode 改 polling
+--- 先记现状 rx-placement（复原要用） ---
+Thread 0 (vpp_main):
+ node tap-input:
+    tap4096 queue 0 (polling)
+    tap4097 queue 0 (polling)
+ node af-packet-input:
+    host-enp0s8 queue 0 (interrupt)
+    host-enp0s9 queue 0 (interrupt)
+--- 摆臂 H：四台仍在 cpu1 + 两口 rx-mode 改 polling ---
+CPE1 host-enp0s8=ok host-enp0s9=ok 
+  host-enp0s8 queuequeue (polling)
+  host-enp0s9 queuequeue (polling)
+CPE2 host-enp0s8=ok host-enp0s9=ok 
+  host-enp0s8 queuequeue (polling)
+  host-enp0s9 queuequeue (polling)
+CPE3 host-enp0s8=ok host-enp0s9=ok 
+  host-enp0s8 queuequeue (polling)
+  host-enp0s9 queuequeue (polling)
+CPE4 host-enp0s8=ok host-enp0s9=ok 
+  host-enp0s8 queuequeue (polling)
+  host-enp0s9 queuequeue (polling)
+H-cpu1+polling cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 4.993/8.435/19.379/3.033 ms
+H-cpu1+polling cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 4.967/8.968/38.752/5.206 ms
+H-cpu1+polling cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.152/10.449/62.579/9.666 ms
+H-cpu1+polling cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 4.935/11.424/46.207/9.283 ms
+H-cpu1+polling cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 3.930/10.396/45.168/8.538 ms
+H-cpu1+polling cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 4.946/8.468/25.675/3.553 ms
+H-cpu1+polling CPE3 探针 n=24 avg=1.52 max=1.96
+H-cpu1+polling CPE4 探针 n=24 avg=3.17 max=7.48
+
+########## L166995 :: 臂 K（实际 cpu0）：rx-mode 收回 interrupt；臂 L：cpu0 + polling
+新探针已起
+--- 摆臂 K：只把 rx-mode 收回 interrupt（仍在 cpu1）—— 反序确认 H ---
+CPE4 host-enp0s8=ok host-enp0s9=ok host-enp0s8=(interrupt) host-enp0s9=(interrupt) 
+CPE3 host-enp0s8=ok host-enp0s9=ok host-enp0s8=(interrupt) host-enp0s9=(interrupt) 
+K-cpu1+interrupt cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.736/9.645/26.121/3.662 ms
+K-cpu1+interrupt cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.339/11.940/47.795/7.024 ms
+K-cpu1+interrupt cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 6.227/10.194/28.772/4.551 ms
+K-cpu1+interrupt cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.374/12.774/29.859/5.626 ms
+K-cpu1+interrupt cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 5.402/14.092/55.161/9.082 ms
+K-cpu1+interrupt cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.102/10.658/40.284/5.382 ms
+K-cpu1+interrupt CPE3 探针 n=24 avg=1.96 max=2.60
+K-cpu1+interrupt CPE4 探针 n=24 avg=1.79 max=3.65
+--- 摆臂 L：再切回 polling + cpu0（候选终形） ---
+CPE1 mask= 0 rx=(polling) (polling) 
+CPE2 mask= 0 rx=(polling) (polling) 
+CPE3 mask= 0 rx=(polling) (polling) 
+CPE4 mask= 0 rx=(polling) (polling) 
+L-cpu0+polling cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.284/8.745/31.740/4.094 ms
+L-cpu0+polling cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.076/7.957/26.010/3.243 ms
+L-cpu0+polling cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 5.291/9.139/21.802/2.803 ms
+L-cpu0+polling cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 5.018/12.173/51.779/9.144 ms
+L-cpu0+polling cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 4.899/11.466/51.519/9.036 ms
+L-cpu0+polling cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 4.800/11.612/60.405/11.099 ms
+L-cpu0+polling CPE3 探针 n=24 avg=2.25 max=2.92
+L-cpu0+polling CPE4 探针 n=24 avg=1.70 max=2.43
+
+########## L167001 :: 臂 M：四台 cpu1 + polling（这一臂开始把掩码和 rx-mode 一起读回）；臂 N：四台 cpu1 + interrupt
+--- 摆臂 M：四台 cpu1 + 两口 polling（显式核验两样都生效） ---
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+  CPE1 mask=1 rx=(polling) (polling) 
+Warning: Permanently added '192.168.1.102' (ED25519) to the list of known hosts.
+  CPE2 mask=1 rx=(polling) (polling) 
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+  CPE3 mask=1 rx=(polling) (polling) 
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+  CPE4 mask=1 rx=(polling) (polling) 
+M-cpu1+polling cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 9.034/22.064/61.508/9.981 ms
+M-cpu1+polling cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 7.568/23.184/43.977/9.831 ms
+M-cpu1+polling cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 10.966/24.055/53.390/10.625 ms
+M-cpu1+polling cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 7.213/23.314/65.569/11.951 ms
+M-cpu1+polling cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 9.684/26.327/71.546/12.332 ms
+M-cpu1+polling cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 8.859/24.449/45.267/9.462 ms
+M-cpu1+polling CPE3 探针 n=24 avg=5.76 max=7.22
+M-cpu1+polling CPE4 探针 n=24 avg=6.33 max=9.26
+--- 摆臂 N：四台 cpu1 + 两口 interrupt（第二次复现 G） ---
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+  CPE1 mask=1 rx=(interrupt) (interrupt) 
+Warning: Permanently added '192.168.1.102' (ED25519) to the list of known hosts.
+  CPE2 mask=1 rx=(interrupt) (interrupt) 
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+  CPE3 mask=1 rx=(interrupt) (interrupt) 
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+  CPE4 mask=1 rx=(interrupt) (interrupt) 
+N-cpu1+interrupt cust4 r1 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 9.645/22.248/52.500/7.468 ms
+N-cpu1+interrupt cust4 r2 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 6.647/23.308/53.281/9.795 ms
+N-cpu1+interrupt cust4 r3 172.16.4.1->172.16.3.1 rtt min/avg/max/mdev = 9.158/23.418/55.846/9.706 ms
+N-cpu1+interrupt cust3 r1 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 12.205/27.429/63.661/11.322 ms
+N-cpu1+interrupt cust3 r2 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 10.931/24.767/62.951/12.263 ms
+N-cpu1+interrupt cust3 r3 172.16.3.1->172.16.4.1 rtt min/avg/max/mdev = 6.227/24.170/50.973/8.691 ms
+N-cpu1+interrupt CPE3 探针 n=24 avg=8.74 max=11.68
+N-cpu1+interrupt CPE4 探针 n=24 avg=5.47 max=7.04
+
+########## L167007 :: 恢复：全部回 cpu0 / interrupt / IRQ 亲和性复原，守门探针（K/L/M/N 切换窗口）0 丢包
+--- 恢复：VPP 全部 cpu0、rx-mode 全部 interrupt、CPE2 的 IRQ17 亲和性放回 0-1（臂 C 是我改的） ---
+CPE1 mask=0 rx=(interrupt) (interrupt)  irq17=0-1
+CPE2 mask=0 rx=(interrupt) (interrupt)  irq17=0
+CPE3 mask=0 rx=(interrupt) (interrupt)  irq17=0-1
+CPE4 mask=0 rx=(interrupt) (interrupt)  irq17=0-1
+CPE2 irq17 现为 0-1
+--- 守门探针（覆盖 K/L/M/N 四臂切换）---
+1793928192.975058938 OK 7.74 ms
+1793928193.006396980 OK 7.48 ms
+1793928193.038231519 OK 13.2 ms
+丢包行数=0 总行数=13966
+1793927726.976770532 OK 14.8 ms
+1793927727.015395572 OK 9.15 ms
+

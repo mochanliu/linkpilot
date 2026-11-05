@@ -216,6 +216,17 @@ for n in $NODES; do
         pid=$(ssh_run "$h" "pidof $d" | awk '{print $1}')
         [ -n "$pid" ] && ok "$h: $d 在跑（pid $pid）" || bad "$h: $d 没在跑"
     done
+    # 问题6（#270，§9.18）：VPP 主线程落哪一核是这台盒子里最大的一根时延开关。
+    # 不写 cpu 段时落点由内核开机随手给（四台里三台拿到 vCPU1，客户 overlay 从 8~12ms
+    # 抬到 22~26ms，主机 ping 管理口从 ~2ms 抬到 5~7ms），所以启动配置里必须钉住，
+    # 而且判据要看 VPP 自报的落点 —— 只看配置等于"我写了所以生效了"（§2 证据规则）。
+    conf=$(ssh_run "$h" "grep -c 'main-core 0' /root/vmlab/startup-vmlab.conf")
+    core=$(vppc "$h" show threads | awk '$2 == "vpp_main" {print $7; exit}')
+    if [ "${conf:-0}" != "0" ] && [ "${core:-x}" = "0" ]; then
+        ok "$h: VPP 主线程在 Core 0（启动配置钉了 main-core 0）"
+    else
+        bad "$h: VPP 主线程 Core=${core:-读不到}（期望 0；配置里 main-core 行数=${conf:-读不到}）"
+    fi
 done
 for c in cust12 cust3 cust4; do
     ssh_run "$c" "hostname" | grep -q "^$c$" && ok "$c: ssh 可达（ProxyJump 走自家盒子）" \

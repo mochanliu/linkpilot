@@ -1,0 +1,34 @@
+1) VPP 主线程落点（#270 的正题）
+  PASS 启动配置里有 cpu 段：cpu { main-core 0 }
+  PASS show threads 自报 Core=0（pid 910）
+  PASS Cpus_allowed_list=0
+  PASS vpp.service 没有 CPUAffinity（钉核不是靠 systemd 覆盖的）
+  drop-in：50-vmlab.conf 52-vmlab-underlay.conf 
+  ExecStart：{ path=/usr/bin/vpp ; argv[]=/usr/bin/vpp -c /root/vmlab/startup-vmlab.conf ; ignore_errors=no ; start_time=[Fri 2026-11-06 02:16:35 UTC] ; stop_time=[n/a] ; pi
+2) 时延（同一口径三把尺子）
+  主机→192.168.1.104 管理口 avg=3.553ms（vCPU1 时代 5.3~7.3ms，钉 0 后 1.7~2.3ms）
+  PASS 管理口 ping <4ms
+  隧道内探针 avg=5.22ms max=11.39ms n=12
+3) underlay 接管与编址（开机自愈）
+  PASS host-enp0s8 在 VPP 里
+  PASS host-enp0s9 在 VPP 里
+    host-enp0s8 (up):
+    host-enp0s9 (up):
+  VPP 侧 MTU（L3/IP4/IP6/MPLS，接管时压回真实值）：host-enp0s8=1500/0/0/0 host-enp0s9=1500/0/0/0 
+  PASS 内核 vpp0 有地址：192.168.1.104/24
+    默认路由：default via 192.168.1.1 dev vpp0 metric 20 
+4) 守护进程与隧道（开机清单）
+  PASS sr-agent 在跑（pid 2520）
+  PASS sr-route 在跑（pid 2535）
+  PASS sr-fib 在跑（pid 2553）
+  PASS sr-frr 在跑（pid 2573）
+  watch 定时器：active
+  盒里 wg 口：3 条
+  PASS agent 重建了 wg 口（缺陷④ 的判据）
+    BFD 会话：3 条，本端 Up 3 条
+  sr-fib 隧道表=3 条、上次收敛 warnings=0 条
+  PASS sr-fib 隧道表非空（3 条）—— 别读成「开机自己就好了」：真开机那一刻这里是 0
+      （G-2：产品里没有进程维护这张表），非空是因为 lab 侧 vm-fib-sync.sh 事后 PUT /config 推过。
+      第一次开机后的原始读回记在 §9.18 与本目录 boot-CPE4-first.log。
+
+判据汇总：PASS=14 FAIL=0

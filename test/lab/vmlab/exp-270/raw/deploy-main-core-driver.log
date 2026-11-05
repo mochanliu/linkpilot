@@ -1,0 +1,87 @@
+== 1. 铺脚本（换件档才铺新二进制）==
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+== 2. 先停 watch 定时器，免得缺陷⑧ 在同一秒把 sr-fib 起两份、把读数搅浑 ==
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+inactive
+1
+== 3. 起客户侧连续探针（cust4↔cust3，loopback 互为源）==
+CPE4 -231
+cust4 28670
+cust3 28682
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+Warning: Permanently added '172.31.4.2' (ED25519) to the list of known hosts.
+cust4 探针已起
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+Warning: Permanently added '172.31.3.2' (ED25519) to the list of known hosts.
+cust3 探针已起
+   探针起势（各 3 行）：
+   cust4 Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+   cust4 Warning: Permanently added '172.31.4.2' (ED25519) to the list of known hosts.
+   cust4 1793928306.337084657 OK 9.96 ms
+   cust4 1793928306.378712295 OK 14.6 ms
+   cust4 1793928306.421392626 OK 11.8 ms
+   cust3 Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+   cust3 Warning: Permanently added '172.31.3.2' (ED25519) to the list of known hosts.
+   cust3 1793928317.808778009 OK 20.7 ms
+   cust3 1793928317.858242757 OK 21.9 ms
+   cust3 1793928317.923625263 OK 11.1 ms
+== 4. 放盒子上的判据脚本脱离 ssh 跑起来 ==
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+已启动 pid=315991
+   等待实验走完（探针 300s）…
+== 5. 判据读数（盒子侧 run.out 的结论三段）==
+[2026-11-05 17:23:31] 第 2s：判据A 通过 —— 新增重连行 2→3，broken pipe 已止住（+2），fib_pid=300421
+[2026-11-05 17:23:44] 第 13s：判据B 通过 —— 装表恢复 r0=2 t250=3 fib_pid=300421 broken_pipe=4992
+[2026-11-05 17:23:44] == 阶段 4：结论 ==
+[2026-11-05 17:23:44] 判据A（VPP 重连，#268 本次修复）：重连用时 = 2 秒；重连后 fib_pid=300421
+[2026-11-05 17:23:44] 判据B（装表齐；本档形状 GATE_PHASE=vpp，隧道表=3 条）：恢复用时 = 13 秒
+[2026-11-05 17:23:45] 判据C（这条路径里没有重启 sr-fib）：阶段 0 pid=300421 → 现在 300421（相同=没靠重启兜底）
+[2026-11-05 17:23:47] DONE
+   中断窗口（时间轴已按 clock.txt 对齐）：
+### gate 相位（已对齐到 Mac 时间轴）
+    11-06 01:27:18  == 阶段 0：改前的现场 ==
+    11-06 01:27:19  == 阶段 1/2 跳过（GATE_PHASE=vpp）：不换件、不动 sr-fib 进程 ==
+    11-06 01:27:19  == 阶段 3：注入缺陷⑦的场景 —— 只重启 VPP，sr-fib / agent 一律不碰 ==
+    11-06 01:27:22  第 2s：判据A 通过 —— 新增重连行 2→3，broken pipe 已止住（+2），fib_pid=300421
+    11-06 01:27:32  第 10s：r0=0 t250=0 fib_pid=300421 broken_pipe=4992(+2) 隧道=3 跳过=0
+    11-06 01:27:35  第 13s：判据B 通过 —— 装表恢复 r0=2 t250=3 fib_pid=300421 broken_pipe=4992
+    11-06 01:27:35  == 阶段 4：结论 ==
+    11-06 01:27:35  判据A（VPP 重连，#268 本次修复）：重连用时 = 2 秒；重连后 fib_pid=300421
+    11-06 01:27:35  判据B（装表齐；本档形状 GATE_PHASE=vpp，隧道表=3 条）：恢复用时 = 13 秒
+    11-06 01:27:36  判据C（这条路径里没有重启 sr-fib）：阶段 0 pid=300421 → 现在 300421（相同=没靠重启兜底）
+
+### cust4→cust3  样本 7595 条，LOSS 15 条（丢包率 0.2%）
+    跨度 11-06 01:27:06 → 11-06 01:32:05
+    通的时候 rtt min/中位/max = 5.12/10.70/79.30 ms
+    >= 0.5s 的中断窗口 1 个（按时长降序，前 8 个）：
+      11-06 01:27:19 → 11-06 01:27:35  中断 15.3s（15 条 LOSS）
+          落在相位：11-06 01:27:18  == 阶段 0：改前的现场 ==
+          落在相位：11-06 01:27:19  == 阶段 1/2 跳过（GATE_PHASE=vpp）：不换件、不动 sr-fib 进程 ==
+          落在相位：11-06 01:27:19  == 阶段 3：注入缺陷⑦的场景 —— 只重启 VPP，sr-fib / agent 一律不碰 ==
+          落在相位：11-06 01:27:22  第 2s：判据A 通过 —— 新增重连行 2→3，broken pipe 已止住（+2），fib_pid=300421
+          落在相位：11-06 01:27:32  第 10s：r0=0 t250=0 fib_pid=300421 broken_pipe=4992(+2) 隧道=3 跳过=0
+          落在相位：11-06 01:27:35  第 13s：判据B 通过 —— 装表恢复 r0=2 t250=3 fib_pid=300421 broken_pipe=4992
+          落在相位：11-06 01:27:35  == 阶段 4：结论 ==
+          落在相位：11-06 01:27:35  判据A（VPP 重连，#268 本次修复）：重连用时 = 2 秒；重连后 fib_pid=300421
+          落在相位：11-06 01:27:35  判据B（装表齐；本档形状 GATE_PHASE=vpp，隧道表=3 条）：恢复用时 = 13 秒
+          落在相位：11-06 01:27:36  判据C（这条路径里没有重启 sr-fib）：阶段 0 pid=300421 → 现在 300421（相同=没靠重启兜底）
+
+### cust3→cust4  样本 7385 条，LOSS 13 条（丢包率 0.2%）
+    跨度 11-06 01:27:05 → 11-06 01:32:04
+    通的时候 rtt min/中位/max = 5.33/10.60/92.20 ms
+    >= 0.5s 的中断窗口 1 个（按时长降序，前 8 个）：
+      11-06 01:27:18 → 11-06 01:27:33  中断 15.3s（13 条 LOSS）
+          落在相位：11-06 01:27:18  == 阶段 0：改前的现场 ==
+          落在相位：11-06 01:27:19  == 阶段 1/2 跳过（GATE_PHASE=vpp）：不换件、不动 sr-fib 进程 ==
+          落在相位：11-06 01:27:19  == 阶段 3：注入缺陷⑦的场景 —— 只重启 VPP，sr-fib / agent 一律不碰 ==
+          落在相位：11-06 01:27:22  第 2s：判据A 通过 —— 新增重连行 2→3，broken pipe 已止住（+2），fib_pid=300421
+          落在相位：11-06 01:27:32  第 10s：r0=0 t250=0 fib_pid=300421 broken_pipe=4992(+2) 隧道=3 跳过=0
+          落在相位：11-06 01:27:35  第 13s：判据B 通过 —— 装表恢复 r0=2 t250=3 fib_pid=300421 broken_pipe=4992
+          落在相位：11-06 01:27:35  == 阶段 4：结论 ==
+          落在相位：11-06 01:27:35  判据A（VPP 重连，#268 本次修复）：重连用时 = 2 秒；重连后 fib_pid=300421
+          落在相位：11-06 01:27:35  判据B（装表齐；本档形状 GATE_PHASE=vpp，隧道表=3 条）：恢复用时 = 13 秒
+          落在相位：11-06 01:27:36  判据C（这条路径里没有重启 sr-fib）：阶段 0 pid=300421 → 现在 300421（相同=没靠重启兜底）
+== 6. 把盒子的 watch 定时器恢复成产品形状（跑之前是为了读数干净才停的）==
+active

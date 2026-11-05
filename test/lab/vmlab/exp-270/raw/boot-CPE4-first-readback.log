@@ -1,0 +1,37 @@
+关掉 CPE4（ACPI 按钮）
+  关机后状态：poweroff（等 breaks）
+开机，等待 ssh 通（上限 180s）
+  ssh 通：35s（从下电到 guest 可登录）
+1) VPP 主线程落点（#270 的正题）
+  PASS 启动配置里有 cpu 段：cpu { main-core 0 }
+  PASS show threads 自报 Core=0（pid 910）
+  PASS Cpus_allowed_list=0
+  PASS vpp.service 没有 CPUAffinity（钉核不是靠 systemd 覆盖的）
+  drop-in：50-vmlab.conf 52-vmlab-underlay.conf 
+  ExecStart：{ path=/usr/bin/vpp ; argv[]=/usr/bin/vpp -c /root/vmlab/startup-vmlab.conf ; ignore_errors=no ; start_time=[Fri 2026-11-06 02:16:35 UTC] ; stop_time=[n/a] ; pi
+2) 时延（同一口径三把尺子）
+  主机→192.168.1.104 管理口 avg=maxms（vCPU1 时代 5.3~7.3ms，钉 0 后 1.7~2.3ms）
+  FAIL 管理口 ping=maxms，>=4ms 说明没落在好核上
+  隧道内探针：无样本
+3) underlay 接管与编址（开机自愈）
+  PASS host-enp0s8 在 VPP 里
+  PASS host-enp0s9 在 VPP 里
+    host-enp0s8 (up):
+    host-enp0s9 (up):
+  VPP 侧 MTU（L3/IP4/IP6/MPLS，接管时压回真实值）：host-enp0s8=1500/0/0/0 host-enp0s9=1500/0/0/0 
+  PASS 内核 vpp0 有地址：192.168.1.104/24
+    默认路由：default via 192.168.1.1 dev vpp0 metric 20 
+4) 守护进程与隧道（开机清单）
+  FAIL sr-agent 没在跑
+  FAIL sr-route 没在跑
+  FAIL sr-fib 没在跑
+  FAIL sr-frr 没在跑
+  watch 定时器：active
+  盒里 wg 口：0 条
+  FAIL wg 口为 0：agent 没按盘上的配置重建隧道
+    BFD 会话：0 条，本端 Up 0 条
+  sr-fib 隧道表= 条、上次收敛 warnings= 条
+  FAIL sr-fib 隧道表=0（G-2：开机没人推这张表，overlay 装不出来；lab 侧靠 vm-fib-sync.sh 兜）
+
+判据汇总：PASS=7 FAIL=7
+（FAIL 非 0 不一定是 #270 的问题，逐条看上面的实际值）

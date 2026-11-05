@@ -970,7 +970,7 @@ CPE4 `wg1003 wg1004 wg1007`）。
 这句在同一台机器上出现 14 次，最后一次是 2026-11-05 01:14:17（在那之后才有下面的脚本）。
 
 代码一步步走到哪：sr-fib 每轮收敛先读 sr-route 的 `/status` 拿 RIB
-（`cmd/sr-fib/main.go:235` 的 `converge()`，`fetchStatus()` 在 `:314`），再读 VPP 的
+（`cmd/sr-fib/main.go:273` 的 `converge()`，`fetchStatus()` 在 `:357`），再读 VPP 的
 BFD 会话表，然后把两样交给 `fib.PlanFrom(...)`。`PlanFrom` 里每条路径要过两道闸：
 第一道是「这个 overlay 下一跳在我自己的隧道表里吗」—— `internal/fib/fib.go:302`，
 不在就打上面那句 `该路径跳过`；第二道才是「它的 BFD 是不是 Up」—— `fib.go:308`。
@@ -980,11 +980,17 @@ BFD 会话表，然后把两样交给 `fib.PlanFrom(...)`。`PlanFrom` 里每条
 `/etc/sdwan/route.json` 给 sr-route 用，谁都没告诉 sr-fib「10.250.0.2 这个下一跳
 是本机的 wg1002、颜色 0」。这个映射只有盒子自己知道，产品里今天没有任何进程维护它。
 
-D3 已经开好了接缝：sr-fib 有 `PUT /config`（`configMux()`，`cmd/sr-fib/main.go:472`），
+D3 已经开好了接缝：sr-fib 有 `PUT /config`（`configMux()`，`cmd/sr-fib/main.go:530`），
 推完立刻按新表收敛，不用重启。所以这一段的**产品缺口是"谁来调这个接缝"**，不是"接缝不存在"。
 按规矩点名：要动的是二选一 —— agent 在收敛完隧道后把这张表推给 sr-fib（它手上已经有
-sw_if_index、颜色和本端 overlay /32），或者 sr-fib 反过来向 agent 要一次。这是"新增一条
-下发路径"的拍板，不是修 bug，本轮不动控制器代码。
+sw_if_index 和本端 overlay /32；**颜色今天不在设备侧契约里**，见下一段），或者 sr-fib 反过来向 agent 要一次。
+这是"新增一条下发路径"的拍板，不是修 bug，本轮不动控制器代码。
+
+> 2026-11-06 更正：上面这句"它手上已经有颜色"是错的。`internal/wire/wire.go` 全文没有 color，
+> `cmd/sr-ctrl/underlay_delivery.go:134` 构造 `wire.TunnelSpec` 时没有抄 `underlay.Tunnel.Color`
+> （`internal/underlay/state.go:145`）。所以 agent 今天不知道自己每条隧道的颜色，
+> 颜色必须先进隧道段这条契约，G-2 才谈得上派生。这一条连同四条拍板写进
+> `docs/g2-tunnel-table-derivation-plan.md`，代码等点头。
 
 lab 侧怎么补（`test/lab/vmlab/vm-fib-sync.sh`，容器台 `test/lab/loop-fib-sync.sh` 的 ssh 孪生）：
 两头都取真数据，脚本不猜任何一个字段。
@@ -2467,3 +2473,194 @@ sr-fib 重连的那一轮是按整份计划重装（`labels+1/-0`），不是靠
 构成是 VPP 数据面清零 + agent 重建 wg 口 + BFD 重新 Up + sr-fib 重装四段，没有一段是缺陷。
 
 
+### 9.18 问题 6 收口（#270）：VM 开机即最优 —— 主线程落点写进启动配置，八臂 2×2 对照 + CPE4 真断电重起（2026-11-06 凌晨）
+
+owner 的原文是「vpp 性能问题还在，我从主机 ping 192.168.1.103 是低延迟，其他都是高延迟。你查一下文档，
+vpp/dpdk 应该怎么调优性能，需要让所有 cpe 在开机时候自动就是最优状态，而不是需要后续调优」，
+随后收窄成一句「不用管真机了，那个真机我没装 vrf 内核模块。你就在 vm 上，把 vm 的性能调优做好，
+保证 vm 开机就是最优状态就行」。
+
+一句话答案：**症状完全复现，根因是 VPP 主线程落在哪个 vCPU 由内核开机随手给（四台里三台拿到 vCPU1，
+那台拿到 vCPU0 的就是 103）；把 `cpu { main-core 0 }` 写进启动配置后，真关机再开机量回来的就是最优状态，
+不需要任何后置调优动作。** 开机路径上唯一还剩的不最优是 sr-fib 的隧道表（=0 条），那一条是缺口 G-2（§9.6），
+不属于 #270，第八、九节把两件事分开写。
+
+#### 一、先把 owner 那把尺子接住：管理口 ping 本身就是有效尺子（臂 A）
+
+盒子的管理 IP `192.168.1.10x` 不在 underlay 物理口上，而在内核 `vpp0` 这个 linux-cp 设备上。
+所以主机 ping 它会走「报文进 VPP → VPP punt 给内核 → 内核回 → VPP 发回」这条路径，
+VPP 主线程在忙什么直接决定这条路径排多久。不必换成别的尺子，先照原样量：
+
+| 台 | VPP 主线程掩码（`taskset -cp` 读回） | 主机→管理口 avg（40 包 ×3 轮） |
+| --- | --- | --- |
+| CPE1 | **1** | 7.252 / 5.333 / 5.783 ms |
+| CPE2 | **1** | 5.672 / 6.122 / 5.900 ms |
+| CPE3 | **0** | **1.991 / 2.311 / 2.068 ms** |
+| CPE4 | **1** | 5.745 / 5.304 / 5.287 ms |
+
+四台的 WAN 硬中断亲和性（`/proc/irq/17/smp_affinity_list`）当时都是 `0-1`，也就是没被谁钉过。
+只有 CPE3 快，因为它的主线程自然落到了 cpu0 —— owner 看到的「只有 103 低延迟」就是这个。
+
+#### 二、快的是跟着核走，不是跟着盒子走（臂 B：只改运行时掩码）
+
+这一步不重启、不改配置，只 `taskset -pc`：CPE1→cpu0、CPE4→cpu0、CPE3→cpu1，
+CPE2 不动作为对照。读数（同一口径）：
+
+| 台 | 臂 A（改前） | 臂 B（换落点后） | 掩码读回 |
+| --- | --- | --- | --- |
+| CPE1（1→0） | 5.333~7.252 | **1.783~1.847** | B 后 =0 |
+| CPE4（1→0） | 5.287~5.745 | **1.699~2.062** | B 后 =0 |
+| CPE3（0→1） | 1.991~2.311 | 4.104~6.356 | B 后 =1 |
+| CPE2（未动） | 5.672~6.122 | 6.554~8.052 | 仍 =1（复核过） |
+
+变快的跟着 cpu0 走、变慢的跟着 cpu1 走，没动的那台维持原样。所以这不是"3 号 VM 天生快"，
+落点是因、盒子是无辜的。
+
+#### 三、三条听起来都像"绑核优化"的路，各自被自己的尺子否掉
+
+1. **把 WAN 硬中断挪开 VPP 所在核**（臂 C）：只把 CPE2 的 IRQ17 钉到 cpu0，VPP 主线程留在 cpu1。
+   结果 6.303 / 6.579 ms —— 和没动一样。这条确实动了：`/proc/irq/17/...` 计数里 CPU0 从 523561
+   涨到 526927、CPU1 一动不动（8582197 → 8582197）。中断落点不是开关。
+2. **vCPU 天生不等价**（盒内纯 CPU 循环 + 盒内 loopback ping）：
+   同一个进程只换核跑 2 秒循环，CPE1 是 cpu0=1,624,976 / cpu1=4,176,454 iters，
+   CPE2 反过来 cpu0=3,387,430 / cpu1=2,162,526 iters —— "哪个核快"在两台之间方向相反；
+   而盒内 loopback ping 钉到两核都是 0.05ms 量级（CPE1 0.049/0.046，CPE2 0.052/0.060）。
+   纯算力和本地路径看不出核差，所以它解释不了客户看到的 4 倍往返差。
+3. **af-packet 的收包模式**（interrupt vs polling）：在两个落点上各测过，见第四节的 2×2 —— 不改变结果。
+
+#### 四、八臂 2×2：唯一站得住的开关是主线程落点
+
+行=VPP 主线程落点，列=af-packet 两口 `rx-mode`；单元格给的是**客户 overlay 往返**（cust4↔cust3 loopback，
+各 3 轮 ×40 包的 avg 区间）和**隧道内探针**（`show sr-wg probe`，n=24）。
+
+| | interrupt | polling |
+| --- | --- | --- |
+| **四台都在 cpu0** | 臂 F：9.70~14.98ms，探针 2.44/2.29<br>臂 F2：8.85~14.20ms，探针 2.28/1.56<br>臂 K：9.65~14.09ms，探针 1.96/1.79 | 臂 H：8.44~11.42ms，探针 1.52/3.17<br>臂 L：7.96~12.17ms，探针 2.25/1.70 |
+| **四台都在 cpu1** | 臂 G：22.07~30.41ms，探针 6.71/6.25<br>臂 N：22.25~27.43ms，探针 8.74/5.47 | 臂 M：22.06~26.33ms，探针 5.76/6.33 |
+
+- 落在 cpu0 的五臂（F/F2/K/H/L）没有一条超过 15ms；落在 cpu1 的三臂（G/M/N）没有一条低于 22ms。
+  两个维度合起来 8 臂、0 个反例（反例的来源是我自己标错臂，见第五节第 1 条）。
+- 反序复现：F→G→F2 连着摆两次，客户往返跟着落点来回摆（14.98 → 30.41 → 14.20），
+  不是"时间往后就漂"。
+- 同臂的管理口 ping 也一起摆：臂 G（cpu1）4.220~7.318ms，臂 F2（cpu0）1.719~2.282ms。
+  owner 最初那把尺子和客户那条尺子在同一个开关上，这点很重要 —— 不是只有 ping 管理口受影响。
+
+#### 五、我自己这把尺子上的两处错（写进文档，因为它们差点把结论写成"有残差"）
+
+1. **臂 H、K 的标签是错的。** 我给它们的描述是「四台仍在 cpu1 + 改 rx-mode」，但摆到 H 之前那一步是臂 F2，
+   F2 已经把四台 `taskset -pc 0` 过去了（读回 `CPE1 mask= 0CPE2 mask= 0...`），H 和 K 的命令里
+   **只有 `set interface rx-mode`，一次都没重新钉核**。所以 H/K 的真实形状是 cpu0+polling、cpu0+interrupt。
+   我是先看见"这两臂的读数和 cpu0 臂一样好，而 G/N 一样坏"，第一反应记成"cpu1 有好有坏 ⇒ 2×2 有残差"，
+   然后才去补了臂 M —— M 把掩码和 rx-mode **一起读回**（`CPE1 mask=1 rx=(polling) (polling)`），
+   才看清是标签错、不是数据有残差。**教训**：摆臂的"当前落点"必须由读回定义，不能由上一臂的意图继承；
+   这正是 §2 证据规则说的"状态对比"，我在这条上自己摔了一次。
+2. **`boot-check.sh` 把管理口 ping 的 avg 抽成了单词 "max"。** 上一版用
+   `grep -E 'round-trip|rtt' | tail -1 | sed 's#.* = ##' | cut -d/ -f2`，在 ping 全丢那一刻
+   抽到的是行内的单词而不是小数，打印成「管理口 avg=maxms」，而判据恰好也判 FAIL —— 假对的读数。
+   现在只认 `min/avg/max` 那串小数（`grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+/[0-9]+\.[0-9]+'`），
+   抽不到就打「无样本」。修完在同一台重跑：3.553ms（`raw/boot-CPE4-rerun-after-fix.log`）。
+
+#### 六、动了什么（只有一处配置，加一条判据）
+
+- `test/lab/vmlab/vm-bringup.sh`：生成的 `/root/vmlab/startup-vmlab.conf` 顶部加
+  `cpu { main-core 0 }`，并把上面的数字和"生效必须重启 VPP"写在同一段注释里
+  （`test/lab/vmlab/vm-bringup.sh:119`）。这一句必须在启动配置里：VPP 只在启动那一刻读 `cpu {}` 段。
+- **没有走 systemd `CPUAffinity=` 覆盖，也没有留任何运行时 taskset 兜底**。那两条都需要有人每次开机再跑一遍，
+  等于把"开机即最优"重新变成"事后调优"，正是 owner 否掉的东西。开机读回里专门验了这一点：
+  `systemctl show vpp -p CPUAffinity --value` 为空。
+- 铺到四台：`exp-270/deploy-main-core.sh`（备份 → 插段 → `systemctl restart vpp` →
+  盒上脱离 ssh 的 60s 看门狗：如果 `vpp_main` 没回来就还原备份并再起一次）。
+  盘上留的备份：CPE4 `startup-vmlab.conf.bak-270`，CPE1/2/3 `startup-vmlab.conf.270.bak`。
+- **按硬规则第 4 条点名这条改动的中断**：它是启动期配置，生效路径必然重启 VPP。
+  CPE4 那一档（隧道表完好、只重启 VPP、不碰 sr-fib/agent）实测客户可见黑洞 **15.3s**（双向各 15.3/15.7s，
+  丢包率各 0.2%，2s 重连上 api.sock、13s 装表齐，全程自愈、sr-fib pid 不变），
+  原始读数在 `exp-270/raw/deploy-main-core-driver.log`。
+  CPE1 那一档实测窗口 1.5s 自愈。**CPE2/CPE3 两档不能干净归因给 #270**：摆这两台的时候缺陷⑨（#271，
+  回灌）正在把 `172.16.3.1` 那条前缀打成黑洞，两份探针样本的尾巴停在 LOSS 里（8.4s / 23.1s 未收尾），
+  把那段说成"重启 VPP 造成 8~23s 中断"是把 #271 的账记到 #270 头上 —— 所以这一节只报能归因的 15.3s。
+- **对照：只改运行时掩码是 0ms**。覆盖 K/L/M/N 四臂切换的守门探针共 13,966 条样本、丢包行数 0
+  （`/tmp/probe270b.out`）。"改配置+重启"与"只改运行时"必须分开报价，否则下一步没人敢动启动配置。
+
+#### 七、判据从"我写了这句配置"升级到"VPP 自报在哪个核"
+
+`vm-verify.sh` §1 新增一条（`test/lab/vmlab/vm-verify.sh:219`）：**同时**要求
+① 启动配置里 `main-core 0` 行数≠0、② `vppctl show threads` 里 `vpp_main` 那行的 Core 列 = 0，
+两者都成立才 PASS，否则把实际 Core 值和配置行数一起打出来。只看配置文件等于"我写了所以生效了"，
+§2 证据规则不收这种验证。
+
+顺带一条读数口径，也是踩过的：`show threads` 的 `vpp_main` 行里 Core 是**第 7 列**
+（`$1`ID `$2`Name `$3`LWP `$4 $5`"other (0)" `$6`lcore `$7`Core `$8`Socket）。第一次按 `$6` 读，
+在没有 DPDK 的这份构建上 lcore 恒等于 0，量什么都"通过"，是个假 PASS。
+
+四台全量 `vm-verify.sh` 在这一次改动之后复跑：**PASS=372 FAIL=21 WARN=0**（日志 `/tmp/verify-270.log`）。
+21 条 FAIL 逐条读过去，全部点名同一个前缀 `172.16.3.1/32`，一条不落在这次的改动上：
+第 5 节 sr-route 的 RIB 与台账对不上（四台各差这一条）、第 6 节这条前缀在 CPE1 没压标签 1000
+且路径里没有 `mpls via 10.250.0.1`、CPE2 那一节 10 秒内 FIB 没收敛、第 7 节正向导出这条不在主表 K/lo
+（可能被回灌）、第 8 节 CPE1/CPE2 内核主表里这条走的是 `via 172.31.12.2 dev lcp-x0 proto ospf`
+而 zebra 里 `Known via "ospf", distance 110`，CPE3 上反过来是本地前缀被压了标签走隧道、
+zebra 里那条 `Known via "kernel", distance 0` 压住了 bgp 那条，第 9 节以这一条为源或为宿的四组客户互 ping
+100% 丢包。这一簇就是缺陷⑨（#271）已经登记的那条：回灌链路把 `172.16.3.1` 从 CPE2 经客户侧 OSPF 灌回 CPE1，
+RR 选中回灌那条路径之后三条客户路径全黑洞 —— 上面那些 zebra/kernel 读数都是它的后果。
+把这一簇和 #270 分开的证据是同一轮里的另三段：#270 自己那条落点判据四台全 PASS，
+第 3 节隧道层（口名 / overlay / 表 250 / BFD 全 Up）全 PASS，第 4 节 overlay 两跳 `10.250.0.x` 十组全通，
+第 9 节里不牵涉 `172.16.3.1` 的两组照旧 0% 丢包（cust12→`172.16.4.1` avg 5.29ms、
+cust4→`172.16.12.1` avg 6.34ms）。
+上一条全绿基线是 **388/0/0**（§9.14 那张表，脚本哈希 `ee083fd…`），这次脚本新增判据后条数变了，
+所以这里只做分项对账、不做减法对账：**#271 拍板并修掉之前，这 21 条不会自己回到 0。**
+
+#### 八、真开机复测（owner 要的"开机就是最优"，CPE4 完整走一遍）
+
+`BOX=CPE4 ./exp-270/boot-check.sh`：ACPI 按钮关机（guest 自己收口；`machinereadable` 里状态字面是
+`poweroff`）→ headless 启动 → ssh 通 **35s** → 按同一口径读回，全程脚本不改任何东西。
+
+| 项 | 读数 |
+| --- | --- |
+| 落点 | `show threads` 自报 **Core=0**（pid 910）、`Cpus_allowed_list=0`、配置里有 `cpu { main-core 0 }` |
+| 没有后置兜底 | `vpp.service` 的 `CPUAffinity` 为空；drop-in 只有 `50-vmlab.conf`/`52-vmlab-underlay.conf`；ExecStart 就是我们生成的那份 conf，start_time=2026-11-06 02:16:35 UTC |
+| 主机→管理口 | avg **2.872ms**（vCPU1 时代 5.3~7.3ms） |
+| 隧道内探针 | avg **4.10ms**、max 11.10ms（n=12） |
+| underlay 自愈 | host-enp0s8/9 都在 VPP 里、MTU 1500/0/0/0；内核 `vpp0` 有 192.168.1.104/24 + 默认路由 via 192.168.1.1 |
+| 守护进程 | sr-agent 2520 / sr-route 2535 / sr-fib 2553 / sr-frr 2573 —— 由 `sr-box-watch.timer` 在开机后约 90s 自己起 |
+| 隧道与 BFD | wg 口 3 条、BFD 会话 3 条全 Up（缺陷④ 的判据在真开机路径上成立） |
+
+两份原始读回都要留着，不能只留全绿的那份：
+- `exp-270/raw/boot-CPE4-first-readback.log`（ssh 通就读，**PASS=7 FAIL=7**）：4 条 FAIL 是"守护进程还没起"
+  （定时器还没跑，时间差不是缺陷），1 条 FAIL 是隧道表=0（见第九节），另 1 条是第五节第 2 条那个坏读数。
+- `exp-270/raw/boot-CPE4-after-fibsync.log`（lab 脚本把隧道表推回去之后，**PASS=14 FAIL=0**）。
+  如果只留这一份，就等于把 G-2 读成"开机自己就好了"。
+
+#### 九、开机路径上唯一剩下的不最优，就是缺口 G-2 的现行现场
+
+真开机那一刻 sr-fib 的 `/status` 里 `tunnels=0`、上次收敛 warnings 非 0，
+日志打的是闸① 那句「下一跳 … 不在隧道表里，该路径跳过」，于是 overlay 客户前缀一条都装不出来
+（`/etc/sdwan/fib.json` 落盘的就是 `"tunnels": []`，产品里到今天没有任何进程维护这张表，§9.6）。
+lab 里现在靠 `vm-fib-sync.sh` 事后 `PUT /config` 推 —— 那正是 owner 说的"lab 上不该有任何非生产的东西"。
+已拍 (a)：agent 自己派生这张表并推给 sr-fib，触发全动态（开机 / 隧道增删 / 检测到 VPP 重启）、不落盘、
+不许假设谁先起来。方案单独出（`docs/g2-tunnel-table-derivation-plan.md`），代码等他点头。
+写方案时读到的一条前提要在这里留一句：**颜色今天根本不在设备侧契约里**
+（`internal/wire/wire.go` 全文没有 color，`cmd/sr-ctrl/underlay_delivery.go:134` 没抄
+`underlay.Tunnel.Color`），所以 §9.6 原先那句"agent 手上已经有颜色"是错的，颜色要先进隧道段。
+**在 G-2 收口之前，"VM 开机即最优"只对到 VPP 落点 / underlay 接管 / 隧道 / BFD 这一层，
+overlay 装表那一层开机仍不最优。**
+
+#### 十、和 §9.16（#267）的关系：不推翻那条，是把那条留的"待拍"落掉
+
+§9.16 的结论是「绑核买到的不是平均值、是可复现性；要真动只有'给 VPP 写死 main-core'一条，
+而那必须重启 VPP，已登记待拍」。那一轮量的是**单台、运行时 taskset**；这一轮量的是**四台同时、
+且把落点写进开机配置**，在客户可见的往返上是 22~30ms 对 8~15ms 的平均值差，不止尾部。
+两轮的口径不同：不能拿 §9.16 那句"绑核不改变平均值"来否掉这一节，
+也不能反过来把 §9.16 那八块数字说成量错了。owner 这次点的"开机就是最优"，等于拍了那条待拍。
+
+#### 十一、怎么重跑
+
+```
+cd test/lab/vmlab/exp-270
+LABEL=G-全cpu1 ./sample.sh                    # 三把尺子（管理口 / 客户 overlay / 隧道内探针）
+BOX=CPE4 SKIP_POWER=1 ./boot-check.sh         # 只读回当前开机状态，不动 VM
+BOX=CPE4 ./boot-check.sh                      # 真关机→开机→读回（会打断 CPE4 上的客户流量 ~15s+）
+CORE=1 ./deploy-main-core.sh CPE4             # 摆配置臂（会 restart vpp，带 60s 看门狗自动还原）
+bash ../vm-verify.sh | tail -30               # 全 lab 判据（含第七节那条新判据）
+```
+
+原始读数在本目录 `raw/`：`arms-270.log`（臂 A/B/C/F/G/F2/H/K/L/M/N 与排除项的逐行输出）、
+两份开机读回、`deploy-main-core-driver.log`（15.3s 那一档）。

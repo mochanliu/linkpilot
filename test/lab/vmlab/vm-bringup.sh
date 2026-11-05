@@ -116,10 +116,21 @@ fi
 
 # ---------------------------------------------------------------- C 管理通道形状
 if [ "$PHASE" = all ] || [ "$PHASE" = C ]; then
+# 问题6（#270）：VPP 主线程落哪一核，是这台盒子里最大的一根时延开关，而它默认没人管 ——
+# 内核开机时随手给，四台里就有三台拿到 vCPU1。2×2 受控对照（八臂，test/lab/vmlab/exp-270/README.md）：
+#   四台全 vCPU1（3 臂）：客户 overlay 往返 avg 22.1~30.4ms，隧道内探针 5.5~8.7ms
+#   四台全 vCPU0（5 臂）：客户 overlay 往返 avg 8.0~15.0ms，隧道内探针 1.5~3.2ms
+#   主机 ping 管理口：vCPU1 4.2~7.3ms → vCPU0 1.7~2.3ms
+# 反序复现过（F→G→F2），落点那一维来回摆两次、读数跟着摆；rx-mode 在两个落点上各测过
+# （interrupt/polling × cpu0 = 臂 K/H/L，× cpu1 = 臂 G/N/M），不改变结果；把 WAN 硬中断挪离 VPP 也不改变结果。
+# 不写这一句就得每次开机碰运气，所以钉死。它是启动期配置 ⇒ 生效必须重启 VPP，
+# 该操作的客户可见中断在 CPE4 实测 15.3s（docs/vmlab-rebuild-plan.md §9.18）。
 cat > /root/vmlab/startup-vmlab.conf <<EOF
 # 由 vm-bringup.sh 生成（$HOST_LABEL）。
 # unix{} 里**没有 exec**：接管放在 vpp.service 起来之后的 vmlab-underlay.service 里做。
 # 写在 exec 里时一次 systemctl restart vpp 会稳定丢掉一条接管的创建（docs/vmlab-rebuild-plan.md §5.6(3)）。
+cpu { main-core 0 }
+
 unix {
   nodaemon
   cli-listen /run/vpp/cli.sock
