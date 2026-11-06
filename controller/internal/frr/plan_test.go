@@ -89,7 +89,7 @@ func TestPlanFrom(t *testing.T) {
 		{VRF: 1, Prefix: "10.9.0.0/16", NextHops: nil},                      // 没有路径，不导出
 		{VRF: 3, Prefix: "10.3.0.0/16", NextHops: []string{"192.168.99.2"}}, // 不在 export_vrfs，跳过
 	}
-	plan, err := PlanFrom([]uint32{2, 0, 1}, routes, oifOf)
+	plan, err := PlanFrom([]uint32{2, 0, 1}, routes, oifOf, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestPlanFrom(t *testing.T) {
 func TestPlanFromEmptyExport(t *testing.T) {
 	plan, err := PlanFrom(nil, []RIBRoute{
 		{VRF: 0, Prefix: "10.0.0.0/24", NextHops: []string{"1.1.1.1"}},
-	}, oifOf)
+	}, oifOf, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestPlanFromRejects(t *testing.T) {
 		},
 	}
 	for name, tc := range cases {
-		if _, err := PlanFrom(tc.vpns, routes, tc.oif); err == nil {
+		if _, err := PlanFrom(tc.vpns, routes, tc.oif, nil); err == nil {
 			t.Errorf("%s: 期望报错", name)
 		}
 	}
@@ -149,9 +149,69 @@ func TestPlanFromRejects(t *testing.T) {
 	for name, pfx := range badPrefix {
 		if _, err := PlanFrom([]uint32{5}, []RIBRoute{
 			{VRF: 5, Prefix: pfx, NextHops: []string{"1.1.1.1"}},
-		}, oifOf); err == nil {
+		}, oifOf, nil); err == nil {
 			t.Errorf("%s: 期望报错", name)
 		}
+	}
+}
+
+// ownedOf 把 "VPN -> 前缀列表" 摊成 PlanFrom 的 owned 输入。
+func ownedOf(t *testing.T, byVPN map[uint8][]string) map[uint8]map[netip.Prefix]struct{} {
+	t.Helper()
+	out := map[uint8]map[netip.Prefix]struct{}{}
+	for vpn, ps := range byVPN {
+		set := map[netip.Prefix]struct{}{}
+		for _, s := range ps {
+			p, err := netip.ParsePrefix(s)
+			if err != nil {
+				t.Fatalf("解析 %s: %v", s, err)
+			}
+			set[p.Masked()] = struct{}{}
+		}
+		out[vpn] = set
+	}
+	return out
+}
+
+// TestPlanWithholdsOwnedPrefix 钉住导出侧的本地闸门：客户侧已经有路由的前缀
+// 一条都不注入，只进 Withheld。注入它会让 zebra 用 distance 0 的 K 压过客户的
+// 真路径，客户协议再 redistribute kernel 自发一条把它顶掉，通知从此停发 ——
+// 本盒再也看不到"这条前缀是我的"（实测 2026-11-06，lab-cpe3）。
+func TestPlanWithholdsOwnedPrefix(t *testing.T) {
+	routes := []RIBRoute{
+		{VRF: 0, Prefix: "172.16.3.1/32", NextHops: []string{"10.250.0.0"}}, // 本盒客户侧已有
+		{VRF: 0, Prefix: "10.0.9.0/24", NextHops: []string{"10.250.0.0"}},   // 纯远端，正常导出
+		{VRF: 1, Prefix: "172.16.3.1/32", NextHops: []string{"10.250.0.0"}}, // 别的 VPN 不算拥有
+	}
+	plan, err := PlanFrom([]uint32{0, 1}, routes, oifOf, ownedOf(t, map[uint8][]string{0: {"172.16.3.1/32"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Routes) != 2 {
+		t.Fatalf("只该挡住 VPN 0 那一条，实际计划 %v", plan.Routes)
+	}
+	for _, r := range plan.Routes {
+		if r.Table == 254 && r.Prefix.String() == "172.16.3.1/32" {
+			t.Errorf("客户侧已有的前缀被注入了: %+v", r)
+		}
+	}
+	if len(plan.Withheld) != 1 || plan.Withheld[0].Table != 254 ||
+		plan.Withheld[0].Prefix.String() != "172.16.3.1/32" {
+		t.Fatalf("Withheld 该只有 VPN 0 的 172.16.3.1/32，实际 %v", plan.Withheld)
+	}
+}
+
+// TestPlanOwnedMatchesMasked 钉住前缀身份的口径：客户侧那条是 /32，通知里
+// 带来的可能是未规范地址，两边都按 Masked 比。
+func TestPlanOwnedMatchesMasked(t *testing.T) {
+	plan, err := PlanFrom([]uint32{0}, []RIBRoute{
+		{VRF: 0, Prefix: "10.7.0.0/24", NextHops: []string{"10.250.0.0"}},
+	}, oifOf, ownedOf(t, map[uint8][]string{0: {"10.7.0.1/24"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Routes) != 0 || len(plan.Withheld) != 1 {
+		t.Fatalf("未规范的同前缀该被挡住，实际 routes=%v withheld=%v", plan.Routes, plan.Withheld)
 	}
 }
 

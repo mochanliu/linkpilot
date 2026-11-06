@@ -1,0 +1,83 @@
+########## CPE2  2026-11-06T00:19:35Z  ##########
+--- [1] sr-frr /status
+  zebra_connected = true
+  export_vrfs = [0]
+  injected = 2
+  reported = 1
+  dropped_loop = 0
+  dropped_unknown_vrf = 0
+  skipped = []
+  subscriptions = ["vpn0/type7@0"]
+  import_rules = [{"prefixes": 1, "sources": ["ospf"], "vpn": 0}]
+  last_error = ""
+  pid = 242164
+  其它字段 = export_frozen,export_frozen_held,local_withheld
+--- [2] sr-frr 账本 state.json（= 已注入内核的那份）
+  [{"prefix": "172.16.3.1/32", "table": 254, "oif": 1}, {"prefix": "172.16.4.1/32", "table": 254, "oif": 1}]
+--- [3] sr-route /status：local / rib / dropped_own_route / pending
+  local(本盒上报) = [{"vrf_id": 0, "prefix": "172.16.12.1/32"}]
+  rib[0] 2 条 = [{"p": "172.16.3.1/32", "nh": ["10.250.0.7"], "dev": 3}, {"p": "172.16.4.1/32", "nh": ["10.250.0.9"], "dev": 4}]
+  dropped_own_route = 14021
+  dropped_no_path = 9203
+  dropped_rt_mismatch = 0
+  dropped_invalid = 0
+  withdrawn = 591
+  imported = 16606
+  received = 25809
+  pending = [{"device_id": 1, "vrf_id": 0, "prefix": "172.16.12.1/32", "rts": ["65000:1000"], "reason": "no_path"}, {"device_id": 1, "vrf_id": 0, "prefix": "172.16.3.1/32", "rts": ["65000:1000"], "reason": "no_path"}]
+--- [4] 内核路由（VPN0 落 main/254）
+  main: default via 192.168.1.1 dev vpp0 metric 20 
+  main: 172.16.3.1 dev lo scope link 
+  main: 172.16.4.1 dev lo scope link 
+  main: 172.16.12.1 nhid 974 via 172.31.12.13 dev lcp-x0 proto ospf metric 20 
+  main: 172.31.12.0/24 dev lcp-x0 proto kernel scope link src 172.31.12.2 
+  main: 192.168.1.0/24 dev vpp0 proto kernel scope link src 192.168.1.102 
+--- [5] zebra 视角：172.16.3.1 装在哪、BGP 表里有没有
+  % Unknown command: show ip route 172.16.3.1 32
+  Default BGP instance not found
+--- [6] VPP FIB：172.16.3.1 与 172.16.4.1
+  172.16.3.1/32
+    unicast-ip4-chain
+    [@0]: dpo-load-balance: [proto:ip4 index:54 buckets:1 uRPF:33 to:[100:8400]]
+      [0] [@14]: mpls-label[@2]:[1000:64:0:eos]
+          [@1]: mpls via 10.250.0.7 wg1013: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6cfc0a80166c0a801674e204e220000000000000000
+  --
+  172.16.4.1/32
+    unicast-ip4-chain
+    [@0]: dpo-load-balance: [proto:ip4 index:39 buckets:1 uRPF:54 to:[2558:214872]]
+      [0] [@14]: mpls-label[@1]:[1000:64:0:eos]
+          [@1]: mpls via 10.250.0.9 wg1014: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6cec0a80166c0a801684e214e220000000000000000
+--- [7] BGP 邻居 uptime + pid
+  % BGP instance not found
+  bgpd pid=843 zebra pid=812 vpp pid=182261
+--- [8] sr-frr 最近 30 行日志
+  2026/11/05 17:34:22 sr-frr: 已订阅 1 组（vpn/来源/ifindex）
+  2026/11/05 17:34:23 sr-frr: 停止，撤掉自己下发的 2 条内核路由
+  2026/11/05 17:35:02 sr-frr: 控制口 /run/sr-frr/control.sock（PUT /config, GET /status）
+  2026/11/05 17:35:02 sr-frr: 每 1s 从 http://127.0.0.1:19001/status 收敛 vpn0→table 254 到内核；FRR 侧用 redistribute kernel
+  2026/11/05 17:35:02 sr-frr: 反向导入已开：1 个 VPN → http://127.0.0.1:19001/local-prefixes
+  2026/11/05 17:35:02 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 17:35:02 sr-frr: 已订阅 1 组（vpn/来源/ifindex）
+  2026/11/05 17:35:03 sr-frr: 重连对账完成：保留 0 条，撤掉 0 条
+  2026/11/05 17:35:03 sr-frr: 客户侧前缀 1 条 → sr-route（1 个 VPN）
+  2026/11/05 18:12:21 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 18:13:49 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/06 00:03:32 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/06 00:09:00 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/06 00:09:02 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/06 00:09:03 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/06 00:09:05 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/06 00:09:06 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/06 00:09:09 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/06 00:13:10 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/06 00:13:12 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/06 00:14:33 sr-frr: 停止，撤掉自己下发的 2 条内核路由
+  2026/11/06 00:14:36 sr-frr: 控制口 /run/sr-frr/control.sock（PUT /config, GET /status）
+  2026/11/06 00:14:36 sr-frr: 每 1s 从 http://127.0.0.1:19001/status 收敛 vpn0→table 254 到内核；FRR 侧用 redistribute kernel
+  2026/11/06 00:14:36 sr-frr: 反向导入已开：1 个 VPN → http://127.0.0.1:19001/local-prefixes
+  2026/11/06 00:14:36 sr-frr: 已订阅 1 组（vpn/来源/ifindex）
+  2026/11/06 00:14:37 sr-frr: 重连对账完成：保留 0 条，撤掉 0 条
+  2026/11/06 00:14:37 sr-frr: 客户侧前缀 1 条 → sr-route（1 个 VPN）
+  2026/11/06 00:14:37 sr-frr: 收敛 routes+2/-0（vpn0→table 254）
+  2026/11/06 00:16:01 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/06 00:16:05 sr-frr: 收敛 routes+1/-0（vpn0→table 254）

@@ -11,6 +11,17 @@
 // /run/sr-frr/control.sock 的 PUT /config；PUT 只换运行时配置，绝不重启进程
 // （退出会把上报的前缀清空一次，等于全网抖一下）。
 //
+// 两个方向的接缝有固定的次序，这个次序是实测出来的（2026-11-06，lab-cpe3）：
+// 每一轮先读完并上报客户侧（导入），再拿这份"客户侧拥有什么"去约束注入（导
+// 出）。反过来会把本盒客户侧的路由用一条 K 路由顶掉，zebra 从此不再发通知，
+// 本地集永久缺这条前缀，远端反射回来的同前缀反被当成远端路由装上隧道 ——
+// 状态锁死。三道闸门：
+//
+//   - 注入闸门：客户侧（白名单之前那份可见集）已有的前缀一条都不写进内核。
+//   - 链路窗口：VPP 重启拆掉 lcp/vpp0 会带走客户 BGP 会话，会话在实测 15s
+//     后才回来。这 30s 内"客户侧拥有"是空的，不许当成"真的没有"。
+//   - 首轮冻结：第一轮对账没落地前只撤不加。
+//
 // 退出与崩溃的账：正常退出逐条撤掉 K 路由再删状态文件；被强杀时状态文件还
 // 在，下次启动先把它当基线做差量 —— 内核不会替我们收尾。
 package main
@@ -69,6 +80,11 @@ const (
 	// 是通过内核的 netlink 组播异步学到的，紧接着用 vtysh 看 `show ip route`
 	// 可能还差一拍。
 	onceSettle = 500 * time.Millisecond
+
+	// onceWindow 是 -once 等第一轮对账落地的上限：重连回放本身有 10s 上限，
+	// 加一拍轮询间隔。超时不是错误 —— 它按"只撤不加"退出，把没读到这件事
+	// 留在日志里，而不是假装注入完成。
+	onceWindow = 20 * time.Second
 )
 
 func loadConfig(path string) (*fileConfig, error) {
@@ -184,14 +200,23 @@ func (m *vpnMapper) lookup(id uint32) (uint8, bool) {
 // exportState owns the netlink client and the K-route reconciler. One mutex
 // covers the poll loop, the control socket's touch, and /status.
 type exportState struct {
-	mu      sync.Mutex
-	dp      *krt.Client
-	ex      *frr.Exporter
-	lastSig string
-	skipSig string
-	plan    []frr.Route
-	skipped []frr.Route
-	lastErr string
+	mu          sync.Mutex
+	dp          *krt.Client
+	ex          *frr.Exporter
+	lastSig     string
+	skipSig     string
+	withholdSig string
+	plan        []frr.Route
+	skipped     []frr.Route
+	// withheld 是本地闸门（frr.PlanFrom 的 owned 输入）压住的条目：RIB 里有、
+	// 客户侧也已经有路由，一条都不写进内核。withholdSig 只管日志去重 —— 压住
+	// 是刻意的，但必须留痕，否则"少了几条"看起来像丢路由。
+	withheld []frr.Route
+	// frozen 是导入侧第一轮对账还没落地的状态：这一轮只允许撤、不允许加，
+	// frozenHeld 记被压住的"加"有几条。
+	frozen     bool
+	frozenHeld int
+	lastErr    string
 }
 
 func planSig(routes []frr.Route) string {
@@ -248,7 +273,10 @@ func (e *exportState) exportedSet(exportVRFs []uint32) map[uint8]map[netip.Prefi
 // the poll loop; the control socket only touches prefixes that already exist.
 // statusURL and stateFile are box keys, not part of the published config, so
 // they come from the file the process was started with.
-func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtimeConfig, statusURL, stateFile string) error {
+//
+// owned 是导入侧看到的"客户侧已经有路由"的集合，frozen 表示第一轮对账还没落地。
+// 两者都是这一轮不许加注入的理由（PlanFrom 的注释里写了实测链条）。
+func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtimeConfig, statusURL, stateFile string, owned map[uint8]map[netip.Prefix]struct{}, frozen bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -261,10 +289,32 @@ func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtim
 			return fmt.Errorf("读 RIB: %w", err)
 		}
 	}
-	plan, err := frr.PlanFrom(cfg.exportVRFs, routes, krt.Index)
+	plan, err := frr.PlanFrom(cfg.exportVRFs, routes, krt.Index, owned)
 	if err != nil {
 		e.lastErr = err.Error()
 		return err
+	}
+	e.withheld = plan.Withheld
+	// 读先于写：客户侧的答复还没落地（首轮对账没完成）时，"这条前缀是不是
+	// 本盒自己的"我们并不知道。这时只放行已经在我们账本里的条目 —— 撤掉 RIB
+	// 里没了的照常做，新的注入压下等下一轮。实测的起点就是那次"第 3 秒就加"：
+	// 链路事件把客户 BGP 会话打断，本地集合法归零，注入却抢先落了地。
+	e.frozen = frozen
+	e.frozenHeld = 0
+	if frozen {
+		known := make(map[string]bool, len(e.plan))
+		for _, r := range e.plan {
+			known[r.Key()] = true
+		}
+		keep := make([]frr.Route, 0, len(plan.Routes))
+		for _, r := range plan.Routes {
+			if known[r.Key()] {
+				keep = append(keep, r)
+				continue
+			}
+			e.frozenHeld++
+		}
+		plan.Routes = keep
 	}
 	// 先落盘再下发：中途被杀时，文件里是"打算写的全部"，最多多删几条不存在
 	// 的路由，不会漏删。计划为空时删文件 —— 状态文件存在就代表我们留了东西。
@@ -301,6 +351,15 @@ func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtim
 		if len(res.Skipped) > 0 {
 			log.Printf("sr-frr: 跳过 %d 条（盒子自己已有同前缀路由或就是它的接口网段，不覆盖）: %s",
 				len(res.Skipped), routeList(res.Skipped))
+		}
+	}
+	// 本地闸门压住的那批同理：一条都不注入是刻意的（注入会把客户侧那条真路径
+	// 顶掉，见 frr.PlanFrom），但它必须留痕。
+	if sig := planSig(e.withheld); sig != e.withholdSig {
+		e.withholdSig = sig
+		if len(e.withheld) > 0 {
+			log.Printf("sr-frr: 本地闸门压住 %d 条（客户侧已经有这些前缀，注入会把它顶掉，一条都不写进内核）: %s",
+				len(e.withheld), routeList(e.withheld))
 		}
 	}
 	return nil
@@ -346,11 +405,18 @@ func (e *exportState) touch(ctx context.Context, vrfs []uint32) (map[uint32]int,
 // 合成一个窗口，避免对同一次变化重放好几遍。
 const linkSettle = 300 * time.Millisecond
 
-// watchLinkEvents 守住「zebra 丢 K 路由视图」这个实测坑：接口 down、删接口、
-// 删地址都会让 zebra 把自己 RIB 里的 K 路由整表清掉，内核里还在、sr-frr 也
-// 以为还注入着，redistribute kernel 于是静默停发，客户侧从此学不到远端前缀。
-// zebra 对重复 add 不发通知，只有 delete+add 能让它重新学到 —— 复用 touch。
-func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore) {
+// watchLinkEvents 守住两个实测坑，一次链路事件同时踩中它们：
+//
+//   - zebra 丢 K 路由视图：接口 down / 删接口 / 删地址会让 zebra 把自己 RIB
+//     里的 K 路由整表清掉，内核里还在、sr-frr 也以为还注入着，redistribute
+//     kernel 于是静默停发，客户侧从此学不到远端前缀。zebra 对重复 add 不发
+//     通知，只有 delete+add 能让它重新学到 —— 复用 touch。
+//   - 客户会话被打断时本地集合法归零：lcp/vpp0 一 down，客户的 BGP 会话跟着
+//     断，通知里全是撤销。这时照直上报就是"本站点没有前缀了"，全网站点跟着
+//     撤；等会话在 15 秒后回来，sr-route 早已把这条前缀当远端路由导出，注入
+//     反过来顶掉客户真路径 —— 从此锁死。所以第一批事件一到就先开导入侧的
+//     乐观窗口（BeginLinkWindow），旧集合维持到回放静默，绝不发布 0 条。
+func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore, imp *frr.Importer) {
 	ch, err := krt.WatchLinks(ctx)
 	if err != nil {
 		log.Printf("sr-frr: 链路事件监听没开（接口一变更、zebra 可能丢 K 路由视图，只能等下一轮路由变化自愈）: %v", err)
@@ -367,6 +433,8 @@ func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore) {
 			}
 			evs = append(evs, ev)
 		}
+		// 第一个事件就到了就开窗，不等整批收齐：撤销通知比事件到得还快。
+		openLinkWindow(imp, rt)
 		timer := time.NewTimer(linkSettle)
 	collect:
 		for {
@@ -398,6 +466,15 @@ func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore) {
 				describeEvents(evs), total)
 		}
 	}
+}
+
+// openLinkWindow 只在确实订了导入规则时开窗：没有反向导入的盒子，本地集
+// 从来不是这里的输入，开窗只会把一次无关的链路事件记进日志。
+func openLinkWindow(imp *frr.Importer, rt *runtimeStore) {
+	if len(rt.snapshot().rules) == 0 {
+		return
+	}
+	imp.BeginLinkWindow()
 }
 
 func describeEvents(evs []krt.LinkEvent) string {
@@ -709,18 +786,16 @@ func main() {
 	hc := &http.Client{Timeout: 5 * time.Second}
 	lastImportSig := ""
 
-	poll := func() {
+	poll := func() bool {
 		rc := rt.snapshot()
 
-		if err := exp.reconcile(ctx, hc, rc, cfg.StatusURL, cfg.StateFile); err != nil {
-			if ctx.Err() == nil {
-				log.Printf("sr-frr: 本轮导出收敛失败（保留上次成功的计划）: %v", err)
-			}
-		}
-
+		// 先读后写：这一轮先问客户侧、先把本地前缀报出去，再决定注入什么。
+		// 顺序反过来会把上一轮的本地集当成本轮的，sr-route 于是晚一拍才知道
+		// "这条前缀是本盒自己的"，多出来的那一拍足够把远端那条装上隧道。
 		subs, vmap, warns := subsFor(rc.rules)
 		mapper.set(vmap)
 		st.setWarn(strings.Join(warns, "；"))
+		exported := exp.exportedSet(rc.exportVRFs)
 		var ierr error
 		if err := ensureImport(ctx, st, imp, cfg.ZServSocket, subs); err != nil {
 			ierr = err
@@ -734,7 +809,7 @@ func main() {
 				log.Printf("sr-frr: %v", zerr)
 			}
 			imp.Tick(time.Now())
-			reps, stats := imp.Report(rc.rules, exp.exportedSet(rc.exportVRFs))
+			reps, stats := imp.Report(rc.rules, exported)
 			if sig := frr.Signature(reps); sig != lastImportSig {
 				if err := pushLocalPrefixes(ctx, hc, importURL, reps); err != nil {
 					ierr = err
@@ -745,18 +820,30 @@ func main() {
 				}
 			}
 			st.setPoll(ierr, stats.Reported, stats.LoopDropped, stats.UnknownVRF, subNames(subs))
-			return
+		} else {
+			if len(rc.rules) == 0 && lastImportSig != "" {
+				// 规则被撤光：把上一份上报清掉，不等 zebra 重新通知。
+				if err := pushLocalPrefixes(ctx, hc, importURL, nil); err != nil {
+					log.Printf("sr-frr: 清空客户侧前缀失败: %v", err)
+				} else {
+					lastImportSig = ""
+					log.Printf("sr-frr: import_rules 为空，已清空上报")
+				}
+			}
+			st.setPoll(ierr, 0, 0, 0, subNames(subs))
 		}
-		if len(rc.rules) == 0 && lastImportSig != "" {
-			// 规则被撤光：把上一份上报清掉，不等 zebra 重新通知。
-			if err := pushLocalPrefixes(ctx, hc, importURL, nil); err != nil {
-				log.Printf("sr-frr: 清空客户侧前缀失败: %v", err)
-			} else {
-				lastImportSig = ""
-				log.Printf("sr-frr: import_rules 为空，已清空上报")
+
+		// 注入闸门用的本地集就是上面刚读到的那份（未经白名单过滤的可见集）：
+		// 客户侧已经有路由的前缀，一条都不往内核里写。
+		owned := imp.OwnedByCustomer()
+		frozen := len(rc.rules) > 0 && !imp.Settled()
+		if err := exp.reconcile(ctx, hc, rc, cfg.StatusURL, cfg.StateFile, owned, frozen); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("sr-frr: 本轮导出收敛失败（保留上次成功的计划）: %v", err)
 			}
 		}
-		st.setPoll(ierr, 0, 0, 0, subNames(subs))
+		// 返回值给 -once 用：false 表示这一轮还处在"读没落地、注入只删不加"的状态。
+		return !frozen
 	}
 
 	if !*once {
@@ -779,12 +866,25 @@ func main() {
 	}
 
 	if *once {
-		poll()
+		// -once 的语义是"收敛一次后退出"，而收敛现在要求先读到客户侧的答复
+		// （读先于写）。所以这里是有界轮询：第一轮对账落地就停，最长等
+		// onceWindow —— 到点还没落地就按"只删不加"收尾，不假装注入成功。
+		deadline := time.Now().Add(onceWindow)
+		for {
+			if poll() {
+				break
+			}
+			if time.Now().After(deadline) {
+				log.Printf("sr-frr: -once 到 %s 仍未完成第一轮对账（zebra 连不上？），这一轮只撤不加", onceWindow)
+				break
+			}
+			time.Sleep(time.Second)
+		}
 		time.Sleep(onceSettle)
 		return
 	}
 
-	go watchLinkEvents(ctx, exp, rt)
+	go watchLinkEvents(ctx, exp, rt, imp)
 
 	interval := time.Duration(cfg.PollSec) * time.Second
 	if len(initial.exportVRFs) > 0 {
@@ -975,6 +1075,11 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			skipped = append(skipped, sr.Prefix.String())
 		}
 		exportErr := exp.lastErr
+		withheld := make([]string, 0, len(exp.withheld))
+		for _, wr := range exp.withheld {
+			withheld = append(withheld, wr.Prefix.String())
+		}
+		frozen, frozenHeld := exp.frozen, exp.frozenHeld
 		exp.mu.Unlock()
 		st.mu.Lock()
 		reported, loop, unknown := st.reported, st.loop, st.unknown
@@ -1005,6 +1110,9 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			"import_rules":        rules,
 			"injected":            injected,
 			"skipped":             skipped,
+			"local_withheld":      withheld,
+			"export_frozen":       frozen,
+			"export_frozen_held":  frozenHeld,
 			"reported":            reported,
 			"dropped_loop":        loop,
 			"dropped_unknown_vrf": unknown,

@@ -49,8 +49,13 @@ type RIBRoute struct {
 }
 
 // Plan 是一轮要保证存在于内核里的完整前缀集合。
+//
+// Withheld 是"RIB 里有、但因为本盒客户侧已经拥有它而不注入"的那些条目。它
+// 不进内核、不进状态文件，只用于日志与 /status —— 没有它，"少了几条"看起来
+// 像丢路由。
 type Plan struct {
-	Routes []Route
+	Routes   []Route
+	Withheld []Route
 }
 
 // PlanFrom 是纯函数：同样的输入永远得到同样的计划。规则：
@@ -60,7 +65,16 @@ type Plan struct {
 //   - RIB 里没有可解析下一跳的前缀不导出。sr-fib 也不会把它装进 FIB；
 //     若仍然发给客户侧，只会把流量吸到这台 CPE 上再黑洞掉。
 //   - 前缀必须是已规范的 IPv4（这条接缝只对 IPv4 负责）。
-func PlanFrom(exportVRFs []uint32, routes []RIBRoute, oif func(uint32) (int, error)) (Plan, error) {
+//   - owned 里（按 VPN）客户侧已经有路由的前缀**一律不注入**，只进 Withheld。
+//     这是与导入侧 LoopDropped 对称的那半边闸门，不注入的理由是实测出来的
+//     （2026-11-06，lab-cpe3，vmlab-rebuild-plan.md §9.19）：K 路由在 zebra 里
+//     是 distance 0，客户的 bgpd/ospfd 又对它做 `redistribute kernel`，于是客户
+//     真路径被我们自己注入的那条顶掉（bgpd 里多出一条 weight 32768 的自源路径，
+//     而 zebra 因为 distance 0 不安装它 —— `show ip bgp 172.16.3.1` 能看到、
+//     `show ip route bgp` 是空的）；顶掉之后 zebra 不再发通知，本盒从此不知道
+//     自己拥有这个前缀，远端反射回来的同前缀路由反被当成正常远端路由装上隧道
+//     —— 状态锁死，只能靠撤掉注入那一条自愈。
+func PlanFrom(exportVRFs []uint32, routes []RIBRoute, oif func(uint32) (int, error), owned map[uint8]map[netip.Prefix]struct{}) (Plan, error) {
 	idx := make(map[uint32]int, len(exportVRFs))
 	for _, v := range exportVRFs {
 		if v > 255 {
@@ -87,6 +101,7 @@ func PlanFrom(exportVRFs []uint32, routes []RIBRoute, oif func(uint32) (int, err
 
 	seen := map[string]bool{}
 	out := []Route{}
+	withheld := []Route{}
 	for _, r := range routes {
 		i, ok := idx[uint32(r.VRF)]
 		if !ok {
@@ -103,6 +118,14 @@ func PlanFrom(exportVRFs []uint32, routes []RIBRoute, oif func(uint32) (int, err
 			return Plan{}, fmt.Errorf("frr: 只导出 IPv4 前缀，收到 %s", r.Prefix)
 		}
 		rt := Route{Table: KernelTable(r.VRF), Prefix: p.Masked(), OIF: i}
+		// 注入闸门：本盒客户侧已经拥有这个前缀时，K 路由只会把它顶掉（见函数
+		// 注释），所以宁可不注入 —— 远端那条路由本来也不该由这台盒子代发。
+		if set := owned[r.VRF]; set != nil {
+			if _, ours := set[rt.Prefix]; ours {
+				withheld = append(withheld, rt)
+				continue
+			}
+		}
 		if seen[rt.key()] {
 			continue
 		}
@@ -110,7 +133,8 @@ func PlanFrom(exportVRFs []uint32, routes []RIBRoute, oif func(uint32) (int, err
 		out = append(out, rt)
 	}
 	sortRoutes(out)
-	return Plan{Routes: out}, nil
+	sortRoutes(withheld)
+	return Plan{Routes: out, Withheld: withheld}, nil
 }
 
 func sortRoutes(routes []Route) {
