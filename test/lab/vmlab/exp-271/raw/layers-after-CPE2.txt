@@ -1,18 +1,0 @@
-########## CPE2 2026-11-06T00:17:19Z ##########
-=== 172.16.12.1/32
-  [内核 main] 172.16.12.1 nhid 974 via 172.31.12.13 dev lcp-x0 proto ospf metric 20  
-  [zebra]      Known via "ospf", distance 110, metric 10, best| Last update 06:42:52 ago|
-  [VPP FIB]   [@0]: ipv4 via 172.31.12.13 host-enp0s8: mtu:1500 next:5 flags:[] 080027461dc30800274cedb70800|[0] [@5]: ipv4 via 172.31.12.13 host-enp0s8: mtu:1500 next:5 flags:[] 080027461dc30800274cedb70800|
-  [sr-route]  rib= [] | local= True
-=== 172.16.3.1/32
-  [内核 main] 172.16.3.1 dev lo scope link  
-  [zebra]      Known via "kernel", distance 0, metric 0| Last update 00:01:15 ago|
-  [VPP FIB]   [@2]: ipv4 via 192.168.1.103 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027a18493080027506cf50800|[@1]: mpls via 10.250.0.7 wg1013: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6cfc0a80166c0a801674e204e220000000000000000|
-  [sr-route]  rib= [{"dev": 3, "nh": ["10.250.0.7"]}] | local= False
-=== 172.16.4.1/32
-  [内核 main] 172.16.4.1 dev lo scope link  
-  [zebra]      Known via "kernel", distance 0, metric 0| Last update 00:02:43 ago|
-  [VPP FIB]   [@2]: ipv4 via 192.168.1.104 host-enp0s9: mtu:1500 next:6 flags:[features ] 0800279cb6b3080027506cf50800|[@1]: mpls via 10.250.0.9 wg1014: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6cec0a80166c0a801684e214e220000000000000000|
-  [sr-route]  rib= [{"dev": 4, "nh": ["10.250.0.9"]}] | local= False
-  [sr-frr 账本] 172.16.3.1/32,172.16.4.1/32
-  [sr-frr 状态] injected=2 reported=1 dropped_loop=0 withheld=[] frozen=False frozen_held=0 zebra=True last_err=''

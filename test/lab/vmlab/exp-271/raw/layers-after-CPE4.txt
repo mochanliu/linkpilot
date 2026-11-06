@@ -1,18 +1,0 @@
-########## CPE4 2026-11-06T08:21:17Z ##########
-=== 172.16.12.1/32
-  [内核 main] 172.16.12.1 dev lo scope link  
-  [zebra]      Known via "kernel", distance 0, metric 0| Last update 00:04:07 ago|
-  [VPP FIB]   [@2]: ipv4 via 192.168.1.101 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027c358580800279cb6b30800|[@2]: ipv4 via 192.168.1.102 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027506cf50800279cb6b30800|
-  [sr-route]  rib= [{"dev": 1, "nh": ["10.250.0.2"]}, {"dev": 2, "nh": ["10.250.0.8"]}] | local= False
-=== 172.16.3.1/32
-  [内核 main] 172.16.3.1 dev lo scope link  
-  [zebra]      Known via "kernel", distance 0, metric 0| Last update 00:04:08 ago|
-  [VPP FIB]   [@2]: ipv4 via 192.168.1.101 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027c358580800279cb6b30800|[@2]: ipv4 via 192.168.1.103 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027a184930800279cb6b30800|
-  [sr-route]  rib= [{"dev": 1, "nh": ["10.250.0.2"]}, {"dev": 3, "nh": ["10.250.0.4"]}] | local= False
-=== 172.16.4.1/32
-  [内核 main] 172.16.4.1 nhid 24 via 172.31.4.2 dev lcp-x0 proto bgp metric 20  
-  [zebra]      Known via "bgp", distance 20, metric 0, best| Last update 00:08:12 ago|
-  [VPP FIB]   [@0]: ipv4 via 172.31.4.2 host-enp0s8: mtu:1500 next:5 flags:[] 0800279a65fe08002765451d0800|[0] [@5]: ipv4 via 172.31.4.2 host-enp0s8: mtu:1500 next:5 flags:[] 0800279a65fe08002765451d0800|
-  [sr-route]  rib= [] | local= True
-  [sr-frr 账本] 172.16.3.1/32,172.16.12.1/32
-  [sr-frr 状态] injected=2 reported=1 dropped_loop=0 withheld=[] frozen=False frozen_held=0 zebra=True last_err=''

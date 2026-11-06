@@ -1,18 +1,0 @@
-########## CPE3 2026-11-05T23:20:11Z ##########
-=== 172.16.12.1/32
-  [内核 main] 172.16.12.1 dev lo scope link  
-  [zebra]      Known via "kernel", distance 0, metric 0, best| Last update 05:47:42 ago|
-  [VPP FIB]   [@2]: ipv4 via 192.168.1.101 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027c35858080027a184930800|[@2]: ipv4 via 192.168.1.102 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027506cf5080027a184930800|
-  [sr-route]  rib= [{"dev": 1, "nh": ["10.250.0.0"]}, {"dev": 2, "nh": ["10.250.0.6"]}] | local= False
-=== 172.16.3.1/32
-  [内核 main] 172.16.3.1 dev lo scope link  
-  [zebra]      Known via "kernel", distance 0, metric 0, best| Last update 05:47:41 ago|
-  [VPP FIB]   [@2]: ipv4 via 192.168.1.101 host-enp0s9: mtu:1500 next:6 flags:[features ] 080027c35858080027a184930800|[@1]: mpls via 10.250.0.0 wg1009: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6d0c0a80167c0a801654e204e200000000000000000|
-  [sr-route]  rib= [{"dev": 1, "nh": ["10.250.0.0"]}] | local= False
-=== 172.16.4.1/32
-  [内核 main] 172.16.4.1 dev lo scope link  
-  [zebra]      Known via "kernel", distance 0, metric 0, best| Last update 05:08:40 ago|
-  [VPP FIB]   [@2]: ipv4 via 192.168.1.104 host-enp0s9: mtu:1500 next:6 flags:[features ] 0800279cb6b3080027a184930800|[@1]: mpls via 10.250.0.5 wg1011: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6cdc0a80167c0a801684e214e210000000000000000|
-  [sr-route]  rib= [{"dev": 4, "nh": ["10.250.0.5"]}] | local= False
-  [sr-frr 账本] 172.16.3.1/32,172.16.4.1/32,172.16.12.1/32
-  [sr-frr 状态] 
