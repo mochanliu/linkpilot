@@ -1,0 +1,28 @@
+== CPE4-cust4-172.16.12.1 2026-11-06T15:14:34Z 探测 cust4: -I 172.16.4.1 -> 172.16.12.1
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+9f28db6c268aa12c
+37535
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+-- 第 6 秒：SIGTERM sr-frr（pid 37535）
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+2026-11-06T23:13:35Z
+新 pid: 102828
+-- 换件后：
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+9f28db6c268aa12c
+102828
+68
+== CPE4-cust4-172.16.12.1 2026-11-06T15:14:34Z 探测 cust4: -I 172.16.4.1 -> 172.16.12.1
+9f28db6c268aa12c
+37535
+-- 第 6 秒：SIGTERM sr-frr（pid 37535）
+2026-11-06T23:13:35Z
+新 pid: 102828
+总探测 2575 发，FAIL 3 发
+断流段（起止秒、长度）：
+  1794006600.340 → 1794006602.366  2.0s
+最长断流 2.0s
+-- 换件后：
+9f28db6c268aa12c
+102828
+68

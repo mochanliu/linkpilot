@@ -1,0 +1,25 @@
+== CPE1-cust12-172.16.4.1 2026-11-06T15:10:35Z 探测 cust12: -I 172.16.12.1 -> 172.16.4.1
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+9f28db6c268aa12c
+293628
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+-- 第 6 秒：SIGTERM sr-frr（pid 293628）
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+2026-11-06T15:19:37Z
+新 pid: 352167
+-- 换件后：
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+9f28db6c268aa12c
+352167
+68
+== CPE1-cust12-172.16.4.1 2026-11-06T15:10:35Z 探测 cust12: -I 172.16.12.1 -> 172.16.4.1
+9f28db6c268aa12c
+293628
+-- 第 6 秒：SIGTERM sr-frr（pid 293628）
+2026-11-06T15:19:37Z
+新 pid: 352167
+总探测 2744 发，FAIL 0 发
+-- 换件后：
+9f28db6c268aa12c
+352167
+68

@@ -1,0 +1,11 @@
+== 回退 2026-11-06T15:33:33Z 探测 cust12: -I 172.16.12.1 -> 172.16.3.1（改动=node1/node2 的 to_sdwan 白名单条目）
+  CPE1 hash=3f8351920e3d pid= 352167 rep= 1
+  CPE2 hash=3f8351920e3d pid= 299468 rep= 1
+-- 第 6 秒：改 pl3 -> {"id":"pl3","name":"本站客户前缀","entries":[{"prefix":"172.16.12.1/32"}]} 并重新发布
+  PUT 结果 ok=True entries=[{"prefix": "172.16.12.1/32"}]
+  发布 blocked=False results=[{"node_id": 1, "published": true, "version": 11}, {"node_id": 2, "published": true, "version": 7}]
+总探测 2711 发，FAIL 0 发
+-- 改动后：
+  CPE1 hash=426e2bf8e7c8 pid= 352167 rep= 1
+  CPE2 hash=426e2bf8e7c8 pid= 299468 rep= 1
+  CPE1 落盘 allow= [{"prefix": "172.16.12.1/32"}]

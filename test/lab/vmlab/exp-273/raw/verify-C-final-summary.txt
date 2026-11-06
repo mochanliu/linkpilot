@@ -1,0 +1,2 @@
+PASS=392  FAIL=0  WARN=0
+vm-verify.sh 全量输出（30KB）留在 /tmp/p273/verify-C-final.txt，这里只存 FAIL 行与总计

@@ -1,0 +1,56 @@
+### 轮 1 2026-11-06T15:26:05Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 2 2026-11-06T15:26:28Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 3 2026-11-06T15:26:52Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 4 2026-11-06T15:27:15Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 5 2026-11-06T15:27:40Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 6 2026-11-06T15:28:03Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 7 2026-11-06T15:28:28Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 8 2026-11-06T15:28:51Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 9 2026-11-06T15:29:15Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 10 2026-11-06T15:29:38Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 轮 11 2026-11-06T15:30:03Z
+  CPE1 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE2 172.16.12.1 zebra=ospf inj=2 rep=1 OK
+  CPE3 172.16.3.1 zebra=bgp inj=2 rep=1 OK
+  CPE4 172.16.4.1 zebra=bgp inj=2 rep=1 OK
+### 巡检结束 共 11 轮

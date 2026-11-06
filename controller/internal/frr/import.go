@@ -365,32 +365,6 @@ func (im *Importer) visibleLocked() map[ImportKey]sourceSet {
 	return visible
 }
 
-// OwnedByCustomer groups the visible set by VPN, before the whitelist and the
-// anti-loop filter. The export side gates injections on it (PlanFrom): a prefix
-// the customer already routes must never get a K route of its own, because that
-// K route would shadow the customer path and stop the very notifications that
-// put it in this answer, and the deadlock is measured (2026-11-06, lab-cpe3).
-//
-// Its blind spot is what ZAPI never told us: a prefix learned from a source we
-// did not subscribe to is invisible here. The frozen first round in main.go
-// covers the boot race; the subscription set has to name every source the
-// customer actually uses.
-func (im *Importer) OwnedByCustomer() map[uint8]map[netip.Prefix]struct{} {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	visible := im.visibleLocked()
-	out := make(map[uint8]map[netip.Prefix]struct{}, len(visible))
-	for k := range visible {
-		set := out[k.VPN]
-		if set == nil {
-			set = map[netip.Prefix]struct{}{}
-			out[k.VPN] = set
-		}
-		set[k.Prefix] = struct{}{}
-	}
-	return out
-}
-
 // Report applies the current rules to the visible set: selected source, the
 // VPN's whitelist, and the anti-loop intersection with what this VPN exports.
 // Everything is computed at read time, so removing a source or a prefix from a

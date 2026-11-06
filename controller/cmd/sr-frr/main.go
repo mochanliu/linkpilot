@@ -11,16 +11,19 @@
 // /run/sr-frr/control.sock 的 PUT /config；PUT 只换运行时配置，绝不重启进程
 // （退出会把上报的前缀清空一次，等于全网抖一下）。
 //
-// 两个方向的接缝有固定的次序，这个次序是实测出来的（2026-11-06，lab-cpe3）：
-// 每一轮先读完并上报客户侧（导入），再拿这份"客户侧拥有什么"去约束注入（导
-// 出）。反过来会把本盒客户侧的路由用一条 K 路由顶掉，zebra 从此不再发通知，
-// 本地集永久缺这条前缀，远端反射回来的同前缀反被当成远端路由装上隧道 ——
-// 状态锁死。三道闸门：
+// 两个方向的接缝有固定的次序：每一轮先把客户侧读完并上报（导入），再对账注入
+// （导出）。这个次序是实测出来的（2026-11-06，lab-cpe3）。两道闸门：
 //
-//   - 注入闸门：客户侧（白名单之前那份可见集）已有的前缀一条都不写进内核。
 //   - 链路窗口：VPP 重启拆掉 lcp/vpp0 会带走客户 BGP 会话，会话在实测 15s
 //     后才回来。这 30s 内"客户侧拥有"是空的，不许当成"真的没有"。
 //   - 首轮冻结：第一轮对账没落地前只撤不加。
+//
+// "本盒客户侧已经拥有的前缀不该被自己的 K 路由顶掉"这一条不在这里挡。K 路由
+// 在 zebra 里是 distance 0，客户的 bgpd/ospfd 又对它做 redistribute kernel，于
+// 是顶掉真路径、zebra 从此不发通知、远端反射回来的同前缀被当成远端路由装上隧
+// 道 —— 这是一条路由环路，环是客户侧通告策略要断的（控制台的 CPE-SDWAN 那一行
+// 只播本站客户侧的前缀），不是注入侧偷偷少注入。取证与配置解法见
+// docs/vmlab-rebuild-plan.md §9.20（同一条链的四层取证在 §9.19）。
 //
 // 退出与崩溃的账：正常退出逐条撤掉 K 路由再删状态文件；被强杀时状态文件还
 // 在，下次启动先把它当基线做差量 —— 内核不会替我们收尾。
@@ -200,18 +203,13 @@ func (m *vpnMapper) lookup(id uint32) (uint8, bool) {
 // exportState owns the netlink client and the K-route reconciler. One mutex
 // covers the poll loop, the control socket's touch, and /status.
 type exportState struct {
-	mu          sync.Mutex
-	dp          *krt.Client
-	ex          *frr.Exporter
-	lastSig     string
-	skipSig     string
-	withholdSig string
-	plan        []frr.Route
-	skipped     []frr.Route
-	// withheld 是本地闸门（frr.PlanFrom 的 owned 输入）压住的条目：RIB 里有、
-	// 客户侧也已经有路由，一条都不写进内核。withholdSig 只管日志去重 —— 压住
-	// 是刻意的，但必须留痕，否则"少了几条"看起来像丢路由。
-	withheld []frr.Route
+	mu      sync.Mutex
+	dp      *krt.Client
+	ex      *frr.Exporter
+	lastSig string
+	skipSig string
+	plan    []frr.Route
+	skipped []frr.Route
 	// frozen 是导入侧第一轮对账还没落地的状态：这一轮只允许撤、不允许加，
 	// frozenHeld 记被压住的"加"有几条。
 	frozen     bool
@@ -274,9 +272,8 @@ func (e *exportState) exportedSet(exportVRFs []uint32) map[uint8]map[netip.Prefi
 // statusURL and stateFile are box keys, not part of the published config, so
 // they come from the file the process was started with.
 //
-// owned 是导入侧看到的"客户侧已经有路由"的集合，frozen 表示第一轮对账还没落地。
-// 两者都是这一轮不许加注入的理由（PlanFrom 的注释里写了实测链条）。
-func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtimeConfig, statusURL, stateFile string, owned map[uint8]map[netip.Prefix]struct{}, frozen bool) error {
+// frozen 表示导入侧第一轮对账还没落地，这一轮只允许撤、不允许加。
+func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtimeConfig, statusURL, stateFile string, frozen bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -289,12 +286,11 @@ func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtim
 			return fmt.Errorf("读 RIB: %w", err)
 		}
 	}
-	plan, err := frr.PlanFrom(cfg.exportVRFs, routes, krt.Index, owned)
+	plan, err := frr.PlanFrom(cfg.exportVRFs, routes, krt.Index)
 	if err != nil {
 		e.lastErr = err.Error()
 		return err
 	}
-	e.withheld = plan.Withheld
 	// 读先于写：客户侧的答复还没落地（首轮对账没完成）时，"这条前缀是不是
 	// 本盒自己的"我们并不知道。这时只放行已经在我们账本里的条目 —— 撤掉 RIB
 	// 里没了的照常做，新的注入压下等下一轮。实测的起点就是那次"第 3 秒就加"：
@@ -351,15 +347,6 @@ func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtim
 		if len(res.Skipped) > 0 {
 			log.Printf("sr-frr: 跳过 %d 条（盒子自己已有同前缀路由或就是它的接口网段，不覆盖）: %s",
 				len(res.Skipped), routeList(res.Skipped))
-		}
-	}
-	// 本地闸门压住的那批同理：一条都不注入是刻意的（注入会把客户侧那条真路径
-	// 顶掉，见 frr.PlanFrom），但它必须留痕。
-	if sig := planSig(e.withheld); sig != e.withholdSig {
-		e.withholdSig = sig
-		if len(e.withheld) > 0 {
-			log.Printf("sr-frr: 本地闸门压住 %d 条（客户侧已经有这些前缀，注入会把它顶掉，一条都不写进内核）: %s",
-				len(e.withheld), routeList(e.withheld))
 		}
 	}
 	return nil
@@ -833,11 +820,9 @@ func main() {
 			st.setPoll(ierr, 0, 0, 0, subNames(subs))
 		}
 
-		// 注入闸门用的本地集就是上面刚读到的那份（未经白名单过滤的可见集）：
-		// 客户侧已经有路由的前缀，一条都不往内核里写。
-		owned := imp.OwnedByCustomer()
+		// 读先于写：导入侧第一轮对账还没落地时，注入只撤不加。
 		frozen := len(rc.rules) > 0 && !imp.Settled()
-		if err := exp.reconcile(ctx, hc, rc, cfg.StatusURL, cfg.StateFile, owned, frozen); err != nil {
+		if err := exp.reconcile(ctx, hc, rc, cfg.StatusURL, cfg.StateFile, frozen); err != nil {
 			if ctx.Err() == nil {
 				log.Printf("sr-frr: 本轮导出收敛失败（保留上次成功的计划）: %v", err)
 			}
@@ -1075,10 +1060,6 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			skipped = append(skipped, sr.Prefix.String())
 		}
 		exportErr := exp.lastErr
-		withheld := make([]string, 0, len(exp.withheld))
-		for _, wr := range exp.withheld {
-			withheld = append(withheld, wr.Prefix.String())
-		}
 		frozen, frozenHeld := exp.frozen, exp.frozenHeld
 		exp.mu.Unlock()
 		st.mu.Lock()
@@ -1110,7 +1091,6 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			"import_rules":        rules,
 			"injected":            injected,
 			"skipped":             skipped,
-			"local_withheld":      withheld,
 			"export_frozen":       frozen,
 			"export_frozen_held":  frozenHeld,
 			"reported":            reported,

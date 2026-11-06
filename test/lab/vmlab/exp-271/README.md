@@ -1,5 +1,10 @@
 # exp-271：本地前缀所有权被自己的注入吃掉（回灌锁死）
 
+> **2026-11-06 更正**：本轮交付的三道闸门里，**A1 注入闸门**（`local_withheld`）已按 owner 的定性撤掉，
+> 改由控制台「路由泄露」`CPE-SDWAN` 那一行只播本站客户侧前缀来断环 —— 见 `../exp-273/` 与 §9.20。
+> A2 链路窗口、A3 读先于写 + 首轮冻结保留，本目录的脚本与原始读数仍然有效；
+> `soak-271.sh` 的断言口径已改为「账本里出现自己的前缀 = 那一行播了别人站点的前缀」（改配置，不改码）。
+
 对应 `docs/vmlab-rebuild-plan.md` §9.19。这一轮只改产品码
 （`controller/internal/frr/{plan,import}.go` + `controller/cmd/sr-frr/main.go`），
 lab 里不打任何手工补丁：不 `ip route`、不改 vtysh 配置、不改隧道。

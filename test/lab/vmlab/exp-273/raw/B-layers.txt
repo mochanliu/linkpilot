@@ -1,0 +1,270 @@
+########## CPE1  2026-11-06T15:18:01Z ##########
+--- sr-frr /status
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+  zebra_connected = true
+  injected = 1
+  reported = 2
+  dropped_loop = 0
+  dropped_unknown_vrf = 0
+  export_frozen = false
+  export_frozen_held = 0
+  subscriptions = ["vpn0/type7@0"]
+  last_error = ""
+  pid = 352167
+  import_rules = [{"prefixes": 1, "sources": ["ospf"], "vpn": 0}]
+--- sr-frr 账本（已注入内核的那份）
+  [{"prefix": "172.16.4.1/32", "table": 254, "oif": 1}]
+--- sr-route local / rib / dropped_own_route
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+  local = [{"vrf_id": 0, "prefix": "172.16.12.1/32"}, {"vrf_id": 0, "prefix": "172.16.3.1/32"}]
+  rib[0] = [{"p": "172.16.3.1/32", "nh": ["10.250.0.1"], "dev": 3}, {"p": "172.16.4.1/32", "nh": ["10.250.0.3"], "dev": 4}]
+  dropped_own_route = 204
+--- 落盘的 sr-frr 配置（第 5 段）
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+  export_vrfs = [0]
+  import vpn0 sources=['ospf'] allow=[{"prefix": "172.16.0.0/16", "le": 32}]
+--- 内核 main 表 + zebra 视角
+Warning: Permanently added '192.168.1.101' (ED25519) to the list of known hosts.
+  main: default via 192.168.1.1 dev vpp0 metric 20 
+  main: 172.16.3.1 dev lo scope link 
+  main: 172.16.4.1 dev lo scope link 
+  main: 172.16.12.1 nhid 995 via 172.31.12.13 dev lcp-x0 proto ospf metric 20 
+  main: 172.31.12.0/24 dev lcp-x0 proto kernel scope link src 172.31.12.1 
+  main: 192.168.1.0/24 dev vpp0 proto kernel scope link src 192.168.1.101 
+  == 172.16.3.1/32
+    Routing entry for 172.16.3.1/32
+      Known via "kernel", distance 0, metric 0, best
+      Last update 00:00:00 ago
+      Flags: Selected 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+    Routing entry for 172.16.3.1/32
+  == 172.16.4.1/32
+    Routing entry for 172.16.4.1/32
+      Known via "kernel", distance 0, metric 0
+      Last update 00:03:18 ago
+      Flags: None 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+    Routing entry for 172.16.4.1/32
+  == 172.16.12.1/32
+    Routing entry for 172.16.12.1/32
+      Known via "ospf", distance 110, metric 10, best
+      Last update 21:45:13 ago
+      Flags: Selected 
+      Status: Installed 
+      * 172.31.12.13, via lcp-x0, weight 1
+    
+  --- redistribute 可见集来源统计
+    Route Source         Routes               FIB  (vrf default)
+    kernel               4                    4                    
+    connected            2                    2                    
+    local                2                    2                    
+    ospf                 3                    1                    
+    ------
+    Totals               11                   9                    
+    
+########## CPE2  2026-11-06T15:18:04Z ##########
+--- sr-frr /status
+Warning: Permanently added '192.168.1.102' (ED25519) to the list of known hosts.
+  zebra_connected = true
+  injected = 1
+  reported = 1
+  dropped_loop = 0
+  dropped_unknown_vrf = 0
+  export_frozen = false
+  export_frozen_held = 0
+  subscriptions = ["vpn0/type7@0"]
+  last_error = ""
+  pid = 299468
+  import_rules = [{"prefixes": 1, "sources": ["ospf"], "vpn": 0}]
+--- sr-frr 账本（已注入内核的那份）
+  [{"prefix": "172.16.3.1/32", "table": 254, "oif": 1}, {"prefix": "172.16.4.1/32", "table": 254, "oif": 1}]
+--- sr-route local / rib / dropped_own_route
+Warning: Permanently added '192.168.1.102' (ED25519) to the list of known hosts.
+  local = [{"vrf_id": 0, "prefix": "172.16.12.1/32"}]
+  rib[0] = [{"p": "172.16.3.1/32", "nh": ["10.250.0.7"], "dev": 3}, {"p": "172.16.4.1/32", "nh": ["10.250.0.9"], "dev": 4}]
+  dropped_own_route = 14023
+--- 落盘的 sr-frr 配置（第 5 段）
+Warning: Permanently added '192.168.1.102' (ED25519) to the list of known hosts.
+  export_vrfs = [0]
+  import vpn0 sources=['ospf'] allow=[{"prefix": "172.16.0.0/16", "le": 32}]
+--- 内核 main 表 + zebra 视角
+Warning: Permanently added '192.168.1.102' (ED25519) to the list of known hosts.
+  main: default via 192.168.1.1 dev vpp0 metric 20 
+  main: 172.16.3.1 dev lo scope link 
+  main: 172.16.4.1 dev lo scope link 
+  main: 172.16.12.1 nhid 974 via 172.31.12.13 dev lcp-x0 proto ospf metric 20 
+  main: 172.31.12.0/24 dev lcp-x0 proto kernel scope link src 172.31.12.2 
+  main: 192.168.1.0/24 dev vpp0 proto kernel scope link src 192.168.1.102 
+  == 172.16.3.1/32
+    Routing entry for 172.16.3.1/32
+      Known via "kernel", distance 0, metric 0
+      Last update 00:00:01 ago
+      Flags: None 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+    Routing entry for 172.16.3.1/32
+  == 172.16.4.1/32
+    Routing entry for 172.16.4.1/32
+      Known via "kernel", distance 0, metric 0
+      Last update 00:03:20 ago
+      Flags: None 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+    Routing entry for 172.16.4.1/32
+  == 172.16.12.1/32
+    Routing entry for 172.16.12.1/32
+      Known via "ospf", distance 110, metric 10, best
+      Last update 21:37:54 ago
+      Flags: Selected 
+      Status: Installed 
+      * 172.31.12.13, via lcp-x0, weight 1
+    
+  --- redistribute 可见集来源统计
+    Route Source         Routes               FIB  (vrf default)
+    kernel               8                    8                    
+    connected            2                    2                    
+    local                2                    2                    
+    ospf                 2                    1                    
+    ------
+    Totals               14                   13                   
+    
+########## CPE3  2026-11-06T15:18:07Z ##########
+--- sr-frr /status
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+  zebra_connected = true
+  injected = 2
+  reported = 0
+  dropped_loop = 0
+  dropped_unknown_vrf = 0
+  export_frozen = false
+  export_frozen_held = 0
+  subscriptions = ["vpn0/type10@0"]
+  last_error = ""
+  pid = 366430
+  import_rules = [{"prefixes": 1, "sources": ["bgp"], "vpn": 0}]
+--- sr-frr 账本（已注入内核的那份）
+  [{"prefix": "172.16.4.1/32", "table": 254, "oif": 1}, {"prefix": "172.16.12.1/32", "table": 254, "oif": 1}]
+--- sr-route local / rib / dropped_own_route
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+  local = [{"vrf_id": 0, "prefix": "172.16.3.1/32"}]
+  rib[0] = [{"p": "172.16.12.1/32", "nh": ["10.250.0.0"], "dev": 1}, {"p": "172.16.12.1/32", "nh": ["10.250.0.6"], "dev": 2}, {"p": "172.16.4.1/32", "nh": ["10.250.0.5"], "dev": 4}]
+  dropped_own_route = 814
+--- 落盘的 sr-frr 配置（第 5 段）
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+  export_vrfs = [0]
+  import vpn0 sources=['bgp'] allow=[{"prefix": "172.16.0.0/16", "le": 32}]
+--- 内核 main 表 + zebra 视角
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+  main: default via 192.168.1.1 dev vpp0 metric 20 
+  main: 172.16.3.1 dev lo scope link 
+  main: 172.16.4.1 dev lo scope link 
+  main: 172.16.12.1 dev lo scope link 
+  main: 172.31.3.0/24 dev lcp-x0 proto kernel scope link src 172.31.3.1 
+  main: 192.168.1.0/24 dev vpp0 proto kernel scope link src 192.168.1.103 
+  == 172.16.3.1/32
+    Routing entry for 172.16.3.1/32
+      Known via "kernel", distance 0, metric 0, best
+      Last update 00:00:00 ago
+      Flags: Selected 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+  == 172.16.4.1/32
+    Routing entry for 172.16.4.1/32
+      Known via "kernel", distance 0, metric 0, best
+      Last update 00:03:23 ago
+      Flags: Selected 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+  == 172.16.12.1/32
+    Routing entry for 172.16.12.1/32
+      Known via "kernel", distance 0, metric 0, best
+      Last update 00:04:44 ago
+      Flags: Selected 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+  --- redistribute 可见集来源统计
+    Route Source         Routes               FIB  (vrf default)
+    kernel               4                    4                    
+    connected            2                    2                    
+    local                2                    2                    
+    ------
+    Totals               8                    8                    
+    
+########## CPE4  2026-11-06T15:18:10Z ##########
+--- sr-frr /status
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+  zebra_connected = true
+  injected = 2
+  reported = 1
+  dropped_loop = 0
+  dropped_unknown_vrf = 0
+  export_frozen = false
+  export_frozen_held = 0
+  subscriptions = ["vpn0/type10@0"]
+  last_error = ""
+  pid = 102828
+  import_rules = [{"prefixes": 1, "sources": ["bgp"], "vpn": 0}]
+--- sr-frr 账本（已注入内核的那份）
+  [{"prefix": "172.16.12.1/32", "table": 254, "oif": 1}]
+--- sr-route local / rib / dropped_own_route
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+  local = [{"vrf_id": 0, "prefix": "172.16.4.1/32"}]
+  rib[0] = [{"p": "172.16.12.1/32", "nh": ["10.250.0.2"], "dev": 1}, {"p": "172.16.12.1/32", "nh": ["10.250.0.8"], "dev": 2}, {"p": "172.16.3.1/32", "nh": ["10.250.0.4"], "dev": 3}]
+  dropped_own_route = 12
+--- 落盘的 sr-frr 配置（第 5 段）
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+  export_vrfs = [0]
+  import vpn0 sources=['bgp'] allow=[{"prefix": "172.16.0.0/16", "le": 32}]
+--- 内核 main 表 + zebra 视角
+Warning: Permanently added '192.168.1.104' (ED25519) to the list of known hosts.
+  main: default via 192.168.1.1 dev vpp0 metric 20 
+  main: 172.16.3.1 dev lo scope link 
+  main: 172.16.4.1 nhid 24 via 172.31.4.2 dev lcp-x0 proto bgp metric 20 
+  main: 172.16.12.1 dev lo scope link 
+  main: 172.31.4.0/24 dev lcp-x0 proto kernel scope link src 172.31.4.1 
+  main: 192.168.1.0/24 dev vpp0 proto kernel scope link src 192.168.1.104 
+  == 172.16.3.1/32
+    Routing entry for 172.16.3.1/32
+      Known via "kernel", distance 0, metric 0
+      Last update 00:00:00 ago
+      Flags: None 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+    Routing entry for 172.16.3.1/32
+  == 172.16.4.1/32
+    Routing entry for 172.16.4.1/32
+      Known via "bgp", distance 20, metric 0, best
+      Last update 15:03:55 ago
+      Flags: Selected 
+      Status: Installed 
+      * 172.31.4.2, via lcp-x0, weight 1
+    
+  == 172.16.12.1/32
+    Routing entry for 172.16.12.1/32
+      Known via "kernel", distance 0, metric 0
+      Last update 00:03:26 ago
+      Flags: None 
+      Status: Installed 
+      * directly connected, lo, weight 1
+    
+    Routing entry for 172.16.12.1/32
+  --- redistribute 可见集来源统计
+    Route Source         Routes               FIB  (vrf default)
+    kernel               9                    9                    
+    connected            2                    2                    
+    local                2                    2                    
+    ebgp                 1                    1                    
+    ibgp                 0                    0                    
+    ------
+    Totals               14                   14                   
+    

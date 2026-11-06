@@ -1,0 +1,29 @@
+== CPE3-cust3-172.16.12.1 2026-11-06T15:13:14Z 探测 cust3: -I 172.16.3.1 -> 172.16.12.1
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+9f28db6c268aa12c
+309270
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+-- 第 6 秒：SIGTERM sr-frr（pid 309270）
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+2026-11-06T15:02:41Z
+新 pid: 366430
+-- 换件后：
+Warning: Permanently added '192.168.1.103' (ED25519) to the list of known hosts.
+9f28db6c268aa12c
+366430
+69
+== CPE3-cust3-172.16.12.1 2026-11-06T15:13:14Z 探测 cust3: -I 172.16.3.1 -> 172.16.12.1
+9f28db6c268aa12c
+309270
+-- 第 6 秒：SIGTERM sr-frr（pid 309270）
+2026-11-06T15:02:41Z
+新 pid: 366430
+总探测 231 发，FAIL 65 发
+断流段（起止秒、长度）：
+  1794006542.584 → 1794006545.856  3.3s
+  1794006548.124 → 1794006611.957  63.8s
+最长断流 63.8s
+-- 换件后：
+9f28db6c268aa12c
+366430
+69

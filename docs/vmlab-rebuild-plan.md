@@ -2679,6 +2679,15 @@ eBGP 学到的 `172.16.3.1` 用一条自己注入的 K 路由（distance 0）顶
 `vtysh` 配置、一个手工脚本补丁都没打过；换件生效走的是产品自己的开机清单，没有任何 daemon 冷启动（第六节
 逐台量了这次操作本身的客户可见时长）。
 
+> **2026-11-06 更正（§9.20）**：owner 把这条重新定性为**客户侧通告策略造成的路由环路**，
+> 因此本节第四节的 **A1 注入闸门**（`plan.go` 的 `owned` 输入与 `Plan.Withheld`、`import.go` 的
+> `OwnedByCustomer()`、`/status` 的 `local_withheld`）**已撤回**，改由控制台「路由泄露」里
+> `CPE-SDWAN`（`to_sdwan`）那一行只播本站客户侧前缀来断环；**A2 链路窗口与 A3 读先于写 + 首轮冻结
+> 原样保留**（那两条修的是"看不见 ≠ 没有"，与这条环路无关）。本节第四节的行号（`main.go:836-840`、
+> `plan.go:61-76`、`import.go:368-392`）随之失效，A2/A3 的新行号见 §9.20 第二节；其余取证读数
+> （第一、二、三、六、七、八节）**一字不改**，它们描述的是同一台 CPE3 在同一个 lab 里的真实形状，
+> §9.20 用三态 A/B/C 把它们和新的修法接上。
+
 #### 一、先把 owner 那把尺子接住：`172.16.3.1` 在 CPE1 的四层落点各是什么
 
 换件后（`layers-after-CPE1.txt`，2026-11-06T00:27:47Z）逐层读回来：
@@ -2893,3 +2902,226 @@ bash ../../vm-verify.sh                           # 全 lab 判据（换件前 2
 `six-before/six-mid/six-after.txt`、`window-*.txt`、`soak-271.txt`、`verify-after271.txt`（PASS=384 FAIL=8）；
 换件前的判据基线在 `/tmp/verify-270.log`（PASS=372 FAIL=21，#270 那一轮）。
 逐发 ping 时间戳 `probe-*.raw`（5 份、每份 ~50KB）留在 Mac 侧 `/tmp/p271/`，可由 `window-271.sh` 重跑生成。
+
+### 9.20 #273：同一条环路的定性更正 —— 注入闸门（A1）撤回，改由控制台那一行配置断环；三态 A/B/C 实测（2026-11-06 晚）
+
+owner 的原文是两句，这一轮的范围完全按这两句划：
+
+> 你把你上一轮的推送 rollback 吧。如果按你说的原因的话，那就是我说的路由环路造成，这个并不该像你现在这样处理。
+> 应该由客户通过配置来解决：在 CPE1 和 CPE2 上设置只对 rr 播自己客户侧的路由。这个环路场景该由配置解决，
+> 而不是代码解决。你先 rollback，然后按我说的把这个配置加上，然后再看是否路由就正常了。
+
+> "一、你点名的那个现象，实际是两件事"我是指把这一条回滚。你修的其他缺陷不用。
+
+所以：**只撤 A1（注入闸门），A2 链路窗口与 A3 读先于写 + 首轮冻结留着**；然后把他说的那条配置加上；
+最后用同一把尺子（六方向 + 四层落点 + `vm-verify.sh`）看路由是否正常。lab 里依旧零手工补丁：
+没有 `ip route`、没有 vtysh 改配置、没有重启任何 daemon。判据脚本与原始读数在
+`test/lab/vmlab/exp-273/`（`raw/` 是三态的同口径快照）。
+
+#### 一、场景：这条环路在哪两个方向上闭合
+
+§9.19 第二节的杀伤链只讲了"一台盒子把自己顶掉"，那是环的内圈。外圈在这一轮才被量出来，它才是一句
+"客户侧通告策略"能落的地方：
+
+1. CPE3 把自己客户侧 eBGP 学到的 `172.16.3.1` 注入成内核 K 路由（distance 0）之后，客户那条真路径不再被
+   zebra 装进 FIB，于是 zebra 不再对这个前缀发 redistribute 通知 —— CPE3 的可见集里没有它了，`reported` 掉到 0。
+2. 同一时刻，CPE1 和 CPE2 的 ospfd 里跑着 `redistribute kernel route-map SDWAN2CPE-vpn0`，而这条 route-map
+   `permit 10` **没有任何 match**（全放）。于是那台注入的 K 路由（或者任何一台注入的 K 路由）被推进客户的
+   OSPF area0，area0 里的每台盒子都会学到它。
+3. CPE1 的客户侧导入白名单当时是 `172.16.0.0/16 le 32`（也全放）。它从 area0 学到 `172.16.3.1`，
+   按"ospf 来源 + 白名单命中"就把它当作**自己客户侧拥有的前缀**上报给 RR。
+4. RR 反射回来给 CPE3 —— 而 CPE3 此刻"看不见"自己拥有 `172.16.3.1`（第 1 步），所以这条反射回来的路由在它
+   眼里是正常远端路由，于是再注入一次 K 路由，回到第 1 步。
+
+**环的闭合点是第 3 步**：CPE1/CPE2 把"别人站点的前缀"当"自己客户侧的"上报。这一步在产品里有一个明确的、
+客户自己拥有的旋钮 —— 控制台「配置 > overlay > 路由泄露」里 `CPE-SDWAN`（`to_sdwan`）那一行的 prefix-list。
+把它从 `172.16.0.0/16 le 32` 收成"只放本站自己客户侧的那条 `/32`"，第 3 步就断，第 4 步没有输入，
+整条环停止供给。**代码不需要知道"这条前缀归谁"** —— 那是客户配置的语义，不是我们能在盒子里推出来的事实。
+这就是 owner 说的"该由配置解决，而不是代码解决"，而 §9.19 的 A1 是在代码里替客户做了一个它没有依据做的判断
+（只能靠"可见集"猜，猜不到就锁死，猜到了又把真实拓扑的形状藏进 `local_withheld` 里）。
+
+#### 二、代码走到哪：撤掉了什么、留下了什么（行号是撤回后的现状）
+
+撤回的部分：
+
+- `internal/frr/plan.go`：`Plan` 结构回到只有 `Routes`（`plan.go:52-54`），`PlanFrom` 的签名回到三个入参
+  `exportVRFs / routes / oif`（`plan.go:72`）。原来那段"本盒客户侧已经拥有的前缀一条都不写进内核"的规则
+  （§9.19 第四节引用的 `plan.go:61-76`、`plan.go:121-128`）连同 `withheld` 切片一起删除；现在的函数注释里
+  明确写了这一条**不在这里判断**，理由是 RIB 里既可能是远端广告、也可能是本盒自己那条被反射回来的，
+  "把它挑出来不注入不是这一层的职责"，并指回本节。
+- `internal/frr/import.go`：`OwnedByCustomer()` 整段删除（原 `import.go:368-392`）。留下的是
+  `linkRecovery = 30 * time.Second`（`import.go:32`）、`BeginLinkWindow()`（`import.go:268`）、
+  `Settled()`（`import.go:294`）、`visibleLocked()`（`import.go:346`）和 `Report(rules, exported)`
+  （`import.go:372`）—— 其中 `Report` 的防环扣减（`LoopDropped`，`import.go:400`）一字未动，
+  它挡的是"我这一轮正在导出的前缀不要又当成客户侧的上报出去"，是本盒自己两个方向之间的账，与跨盒环路无关。
+- `cmd/sr-frr/main.go`：`exportState` 回到 `mu/dp/ex/lastSig/skipSig/plan/skipped/frozen/frozenHeld/lastErr`
+  十个字段（`main.go:205-218`，原来的 `withheld` 计数删掉）；`reconcile` 的参数回到
+  `(ctx, hc, cfg, statusURL, stateFile, frozen)`（`main.go:276`）；`/status`（`main.go:1054`）不再有
+  `local_withheld` 这一项，其余字段（`config_hash / export_vrfs / import_rules / injected / skipped /
+  export_frozen / export_frozen_held / reported / dropped_loop / dropped_unknown_vrf / subscriptions / pid`）
+  原样。轮询里 A3 的判据仍在原位：`frozen := len(rc.rules) > 0 && !imp.Settled()`（`main.go:824`），
+  紧接着 `exp.reconcile(..., frozen)`（`main.go:825`）。
+- 包注释（`main.go:14-26`）从"三道闸门"改成"两道闸门"，并新写一段把这条定性记录下来：K 路由 distance 0 +
+  客户侧 `redistribute kernel` = 路由环路，**环由客户侧通告策略断，不在注入侧偷偷少注入**。
+- `internal/frr/plan_test.go`、`internal/frr/import_gate_test.go`：随闸门删掉两条单测（原
+  `TestPlanFromWithholdsOwnedPrefix`、`TestOwnedByCustomer`），三处 `PlanFrom` 调用改回三个入参。
+  现在这一族剩 6 条，实测全绿：链路窗口 2 条（`SurvivesSessionDrop`、`ClosesAtDeadline`）、
+  首轮 `Settled` 1 条、`PlanFrom` 3 条（`TestPlanFrom` / `EmptyExport` / `Rejects`）。
+- 口径脚本跟着改：`exp-271/frr-status-line.py` 不再打印 `withheld` 列；`exp-271/soak-271.sh` 顶部写明
+  「账本里出现自己的前缀 = 控制台 CPE-SDWAN 那一行播了别人站点的前缀，改配置不改码」—— 断言本身没降级，
+  它现在测的是配置有没有配对。
+
+**没有动**的部分：A2 链路事件乐观窗口、A3 读先于写 + 首轮冻结、`/status` 的 `export_frozen*`、
+控制口的 `PUT /config` 热更语义、`vm-verify.sh` 的任何判据、控制台任何页面。构建与测试在同一口径下复跑：
+容器 `lp-ctrl`（go1.22.5）里 `go build ./...` + `go vet ./internal/frr ./cmd/sr-frr` + `go test ./internal/frr`
+全部通过。
+
+#### 三、为什么这样分：闸门撤掉后必须能"原样复现"，否则配置那一枪证明不了什么
+
+这不是"代码没用所以删掉"，是一次对照实验，缺一半都不成立：
+
+- 如果只加配置、不先撤闸门，那么"配置加上了、路由正常了"可能一直是闸门在兜着，说明不了配置的因果。
+- 如果撤了闸门、加了配置，但中间没有一次"撤了闸门且配置照旧 ⇒ 环路原样复发"的读数，同样说明不了因果。
+
+所以按三态走，每态都用同一份读数（`exp-273/box-layers.sh` 的四层 + §9.7 六方向）：
+
+| 态 | 盒子里的码 | lab 的 `to_sdwan` 白名单 | 六方向 | 关键读数 |
+| --- | --- | --- | --- | --- |
+| **A**（§9.19 交付态） | A1+A2+A3，`8b15abd5…` | 全放 `172.16.0.0/16 le 32` | 6/6 0% | CPE1 `local_withheld=["172.16.3.1/32"]`、`reported=2`；CPE3 `local_withheld=["172.16.3.1/32"]`（`raw/A-before-swap.txt`） |
+| **B** 只撤 A1 | A2+A3，`9f28db6c…` | 同 A，一字未改 | **4/6 100% 丢包** | CPE3 `injected=2 reported=0`，内核里 `172.16.3.1 dev lo scope link`、zebra `Known via "kernel" distance 0 best` 且 `show ip route summary` 里 **bgp 一栏为 0**；CPE1 `reported=2`、`local` 里混进 `172.16.3.1/32`（`raw/B-layers.txt`、`raw/six-B.txt`） |
+| **C** 撤 A1 + 那条配置 | 同 B | node1/node2 收成只 `172.16.12.1/32`（node3/node4 仍是全放，没碰） | **6/6 0%** | 四台 `injected=2 reported=1`；每台 `local` 只有本站前缀；CPE3 内核 `172.16.3.1 nhid 981 via 172.31.3.2 dev lcp-x0 proto bgp metric 20`（`raw/C-final-layers.txt`） |
+
+A→B 是同一条锁死链原样复现（丢包的方向、`reported=0`、zebra 里没有 bgp 路由，和 §9.19 第三节逐项一致），
+B→C 码一字未改、只动配置、pid 全程不变（见第五节）⇒ 环路归配置的因果是被这两步夹出来的，不是"看起来正常了"。
+
+#### 四、症状：B 态的读数就是这条环路的指纹
+
+`raw/B-layers.txt`（2026-11-06T15:16–15:18Z，四台刚从 A 换成 B 的产物、配置一个字节没改）：
+
+- 六方向 `raw/six-B.txt`（15:16:29Z）：`cust12→172.16.3.1`、`cust3→172.16.12.1`、`cust3→172.16.4.1`、
+  `cust4→172.16.3.1` 四条 **100% 丢包**；只有 `cust12→172.16.4.1` 与 `cust4→172.16.12.1` 通（0%，rtt avg
+  12.3 / 10.6ms）。这四条和 §9.19 第三节那四条完全同集合。
+- CPE3：`reported=0`（本盒客户侧拥有的一条都没报上去）、账本里是 `172.16.4.1/32` 与 `172.16.12.1/32`，
+  而内核 main 表里有三条 `dev lo scope link` 的 K 路由（`172.16.3.1`、`172.16.4.1`、`172.16.12.1`），
+  zebra 对 `172.16.3.1` 的答复是 `Known via "kernel", distance 0, metric 0, best`、下一跳 `directly connected, lo`，
+  `show ip route summary` 的四个来源是 kernel 4 / connected 2 / local 2，**bgp 一栏是空的** —— 客户 eBGP 那条路径
+  在这台盒子的 RIB 里根本不存在，所以它既不会被上报，也不会被 redistribute。
+- CPE1：`reported=2`、`local = [172.16.12.1/32, 172.16.3.1/32]`、`dropped_own_route=204` —— 它把 cust3 的
+  loopback 认成了"自己客户侧拥有"，这正是第一节第 3 步。A 态里这条是被 `local_withheld` 挡掉的；闸门一撤，
+  它立刻回到环里当供给方。
+- **一条没归因的分歧（登记，不掩盖）**：B 态 CPE3 内核里 `172.16.3.1` 那条 K 路由**不在 sr-frr 的账本里**
+  （`injected=2`、`state.json` 只有 4.1 与 12.1）。C 态同一台盒子的账本与内核是一致的（2 条对 2 条）。
+  这条"账本比内核少一条"和 §9.19 第八节 CPE2 的"幽灵 K 视图"是同一族（一个方向是内核有、账本没有，
+  另一个是 zebra 有、内核没有），本轮没有定位到代码。
+
+#### 五、要动什么：只动那一行配置，而且必须走产品路径
+
+`exp-273/apply-config.sh` 做的四步，全部是产品自己的入口，没有一步是登录盒子改文件：
+
+1. `POST /api/prefix-lists` 建一条只含 `172.16.12.1/32` 的 prefix-list（名字"本站客户前缀"）。
+2. `PUT /api/leak/rows` 把 node1、node2 的 `direction=to_sdwan`（控制台「路由泄露」的 **CPE-SDWAN** 那一行）
+   指向它；node3/node4 的 `to_sdwan` **没碰**（它们本来就是 `bgp` 来源、播自己站点的 loopback，不在环的供给方位置上）。
+3. `POST /api/leak/republish {prefix_list_id, apply:false}` 预览：两台都 `will_publish`，没有 blocking 检查。
+4. 同接口 `apply:true` 真发布：`blocked=false`，`node1 published version=10`、`node2 published version=6`。
+   之后是 agent 推送 → sr-apply 第 5 段写 `/etc/sr-frr.json` → sr-frr `PUT /config`。
+
+生效证据（AGENTS.md §1 第 2 条：以状态对比判定，不看退出码）：
+
+- 改前 lab 的口径是四台的 `to_sdwan` 全指向同一条 prefix-list `pl2`「客户 loopback」=
+  `172.16.0.0/16 le 32`（`referencing_devices: [1,2,3,4]`），落盘读回来就是第四节 B 态那四行
+  `allow=[{"prefix": "172.16.0.0/16", "le": 32}]`。
+- 改后 node1/node2 落盘变成 `allow=[{"prefix":"172.16.12.1/32"}]`，`import_rules` 每台仍是
+  `prefixes:1`（条目数没变，变的是条目内容 —— 只看条数会漏掉这一枪，所以判据读的是内容）；
+  node3/node4 保持 `172.16.0.0/16 le 32` 原样。
+- 四台 sr-frr 的 pid 在 B（15:18Z）与 C（15:39Z）两次读数里逐台相同：352167 / 299468 / 366430 / 102828
+  —— **配置生效没有重启任何进程**；`/status` 的 `config_hash` 在这一枪之后是 `426e2bf8e7c8`
+  （第六节配置窗口用它做了两次来回核对）。
+
+CPE3 的自愈是这一枪的落点，而且是**在没有重启任何进程的情况下**发生的：15:39:10Z 读数里它的 pid 还是
+B 态那一个（366430），内核 `172.16.3.1` 已经是 `via 172.31.3.2 dev lcp-x0 proto bgp metric 20`，
+zebra 里那条的 `Last update 00:20:25 ago` —— 往前推正好是发布发生的那一刻（15:19Z），此后 20 分钟没有再抖。
+
+> **这一条修正 §9.19 第九节第 1 条的外延。** 那条说"已经锁死的盒子，换新二进制不会自己解开，需要一次优雅
+> 重启"——在"断环靠代码"的路线下它成立，因为闸门只能看可见集，而可见集已经瞎了。配置路线不需要看清：
+> CPE1 停止上报之后，RR 把 `172.16.3.1` 从 CPE3 的 RIB 里摘掉，CPE3 的这一轮对账发现计划里不再有它，
+> 于是撤掉自己注入的那条 K 路由，内核一撤，zebra 立刻重新装上客户的 eBGP 路径并恢复通知 —— **锁死的环
+> 是从外部断供的，不需要盒子恢复视力，也不需要重启**。
+
+收口读数（`raw/C-final-layers.txt`、`raw/six-C.txt`、`raw/C-reset2-six.txt`）：四台 `injected=2`、
+`reported=1`、`subscriptions` 分别是 `vpn0/type7@0`（CPE1/2）与 `vpn0/type10@0`（CPE3/4）、
+`export_frozen=false`、`last_error=""`；每台 `local` 只含本站前缀；六方向 6/6 0%（rtt min 4.4–6.3ms /
+avg 9.3–16.1ms）。全 lab 判据 `vm-verify.sh`（15:44Z）：**PASS=392 FAIL=0 WARN=0** —— 对照 §9.19 第八节
+换件前 21 条 FAIL、换件后 8 条 FAIL：**那 8 条不是被代码修掉的，是被这一行配置断掉的**，而且比 A1 闸门多清掉了
+CPE1 `local 不符` 那条（闸门路线下它只是换了表现形式）。稳定性：`soak-271.sh` 口径改过之后 240s / 11 轮 × 4 台
+= 44 条断言全 OK，`injected/reported` 三轮以上同一组数字。
+
+#### 六、两个窗口的实测（AGENTS.md §1.4 要求点名必然中断）
+
+这一轮只有两枪会碰到运行中的东西，都逐发量了（`timeout 1 ping` 每秒一发，链路通时约 32 发/秒，
+只有一条路由挂着时才降到 1 发/秒 —— 所以"连续 FAIL 一片"是硬断流，不是采样噪声）：
+
+**换件那一枪**（gzip+scp → sha256 核对 → `install -m 0755` → `kill -TERM $(pgrep sr-frr); sleep 2;
+systemctl start sr-box-watch.service`；VPP / FRR / sr-agent / sr-route / sr-fib 的 pid 全程不变）：
+
+| 盒 | 探测方向 | 总探测 | FAIL | 断流 |
+| --- | --- | --- | --- | --- |
+| CPE1 | cust12 `-I 172.16.12.1` → 172.16.4.1 | 2744 | **0** | — |
+| CPE2 | cust12 → 172.16.3.1 | 2624 | **0** | — |
+| CPE3 | cust3 `-I 172.16.3.1` → 172.16.12.1 | 231 | **65** | 3.3s + 63.8s（**探测结束时仍未闭合**） |
+| CPE4 | cust4 `-I 172.16.4.1` → 172.16.12.1 | 2575 | 3 | 最长 2.0s |
+
+CPE3 那一格**不能读成"换件把客户流量打断了 63.8s"**。它是 B 态那条环路正在复现：探测开始前（15:13Z）这台
+已经因为上一台（CPE1）撤闸门而失去了自己的 eBGP 路径，SIGTERM 只是让这条已经断掉的方向被记进窗口。
+CPE4 那 3 发（2.0s 后恢复）是 sr-frr 自己撤 K 路由再落回的正常窗口。**这一枪在 C 态是必要的一次**（要把
+A1 从盒子里拿掉），不是配置路径的要求 —— 第五节那次配置生效一个进程都没碰。
+
+**配置热更那一枪**（改 prefix-list 条目 + `republish apply:true`）：
+
+| 标签 | 动作 | 总探测 | FAIL | `config_hash` | pid |
+| --- | --- | --- | --- | --- | --- |
+| 加条目 | 白名单里加一条 `192.0.2.0/30`（无害前缀） | 2699 | **0** | `426e2bf8e7c8 → 3f8351920e3d` | 两台都不变（352167 / 299468） |
+| 回退 | 收回到只 `172.16.12.1/32`（这就是收口态） | 2711 | **0** | `3f8351920e3d → 426e2bf8e7c8` | 同上 |
+
+**配置这一枪的客户可见时长实测为 0**，两个方向（加与收）都是。发布版本号 `node1 10→11`、`node2 6→7`。
+
+#### 七、尾巴（登记，不掩盖）
+
+1. **RESET 后一次 10% 未归因**：窗口探测 0 FAIL 结束（15:34:48Z）之后约 15s，`raw/C-final-six.txt`
+   （15:35:03Z）里 `cust12→172.16.3.1` 与 `cust12→172.16.4.1` 各 10%（50 发里丢 5，rtt avg 10.5 / 12.4ms）；
+   90s 后 `raw/C-reset2-six.txt` 6/6 0%，随后单方向手工 50 发复测也 0%。它不像配置那一枪（75s 连续探测 0 FAIL），
+   更像 0.2s 间隔连打撞上缺陷⑥（#262：亚秒抖动被 BFD 150ms 判定 + sr-fib 1s 轮询放大成 ≥1s 黑洞）或宿主调度。
+   **本轮没有取证**：下一轮要定位，请在同一秒同时抓 sr-fib 摘路事件、BFD 翻转与 `sr_wg` 探针计数。
+2. **跨盒回灌（#272）没动**：CPE1/CPE2 的 ospfd 仍是 `redistribute kernel route-map SDWAN2CPE-vpn0`，
+   该 route-map 无 match ⇒ 全放。C 态干净的原因是每台只播本站前缀，别盒学回来的都不是"自己的"，
+   所有权不会被吃掉。**但这不是被修的，是被配置绕开的**：任何客户在 `to_sdwan` 那一行播了别人站点的前缀，
+   B 态原样重现，而且现在没有任何代码会兜它（这是定性的代价，明确接受）。要不要在导出侧也收、
+   规则归谁配，仍待拍。
+3. **产品页面上的口径**：环路既然归配置，控制台「路由泄露」页就得让客户看得见"这一行播了什么"。
+   现有页面已经显示 `to_sdwan` 行指向哪个 prefix-list 与条目内容，本轮没改页面；
+   若要加"这一行的白名单覆盖了别的站点"这类提示，属于新需求，等他点。
+4. `make test-frr`（`test/scripts/test-frr-export.sh`）仍是建立在已删除的 ZAPI/1250 导出模型上，本轮不改也不用它当判据（§9.19 第九节第 4 条原样有效）。
+5. CPE2 的 VPP 插件哈希落后（`9d611883…` vs 现产物 `9267d28d…`）本轮没碰，对齐它要重启 VPP，属于必然中断，待拍。
+
+#### 八、怎么重跑
+
+```
+docker exec -w /workspace/controller lp-ctrl go test -count=1 -v -run 'Gate|Window|Frozen|Settled|Plan' ./internal/frr/
+                                                # 6 条单测（A1 的两条随闸门删除）
+WORK=/tmp/p273 BIN=…/sr-frr.gz bash exp-273/push-binary.sh            # 只推产物 + install，不重启
+WORK=/tmp/p273 bash exp-273/window-swap.sh CPE1 cust12 172.16.12.1 172.16.4.1
+CJ=/tmp/p273/cj.txt WORK=/tmp/p273 bash exp-273/apply-config.sh        # 态 C：那一行配置（走产品路径）
+CJ=/tmp/p273/cj.txt WORK=/tmp/p273 bash exp-273/window-cfg.sh 加条目 192.0.2.0/30
+CJ=/tmp/p273/cj.txt WORK=/tmp/p273 bash exp-273/window-cfg.sh 回退 RESET   # 收口必须跑这一步
+for B in CPE1 CPE2 CPE3 CPE4; do bash exp-273/box-layers.sh $B; done
+TAG=final bash exp-273/six.sh
+bash exp-271/soak-271.sh                                                # 口径已改为"配置对不对"，不是"闸门有没有兜住"
+bash test/lab/vmlab/vm-verify.sh                                        # 392 PASS / 0 FAIL / 0 WARN
+```
+
+原始读数在 `test/lab/vmlab/exp-273/raw/`：`A-before-swap.txt`（A 态四层）、`B-layers.txt` + `six-B.txt`
+（撤闸门后原样复现）、`C-final-layers.txt` + `six-C.txt` / `C-final-six.txt` / `C-reset2-six.txt`（配置断环后）、
+`swap-CPE{1..4}.txt`（换件窗口逐发）、`window-cfg-加条目.txt` / `window-cfg-回退.txt`（配置窗口逐发）、
+`soak-C.txt`（11 轮 44 条断言）、`verify-C-final-summary.txt`（PASS=392 FAIL=0 WARN=0，全量 30KB 输出留在
+Mac 侧 `/tmp/p273/verify-C-final.txt`）。逐发 ping 时间戳 `probe-*.raw`（每份 ~50KB）不入库，可由上面两个
+window 脚本重跑生成；会话 cookie 同样不入库。
+
