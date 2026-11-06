@@ -1,0 +1,103 @@
+########## CPE3  2026-11-05T23:12:24Z  ##########
+--- [1] sr-frr /status
+  zebra_connected = true
+  export_vrfs = [0]
+  injected = 3
+  reported = 0
+  dropped_loop = 0
+  dropped_unknown_vrf = 0
+  skipped = []
+  subscriptions = ["vpn0/type10@0"]
+  import_rules = [{"prefixes": 1, "sources": ["bgp"], "vpn": 0}]
+  last_error = ""
+  pid = 34061
+--- [2] sr-frr 账本 state.json（= 已注入内核的那份）
+  [{"prefix": "172.16.3.1/32", "table": 254, "oif": 1}, {"prefix": "172.16.4.1/32", "table": 254, "oif": 1}, {"prefix": "172.16.12.1/32", "table": 254, "oif": 1}]
+--- [3] sr-route /status：local / rib / dropped_own_route / pending
+  local(本盒上报) = []
+  rib[0] 4 条 = [{"p": "172.16.12.1/32", "nh": ["10.250.0.0"], "dev": 1}, {"p": "172.16.3.1/32", "nh": ["10.250.0.0"], "dev": 1}, {"p": "172.16.12.1/32", "nh": ["10.250.0.6"], "dev": 2}, {"p": "172.16.4.1/32", "nh": ["10.250.0.5"], "dev": 4}]
+  dropped_own_route = 620
+  dropped_no_path = 0
+  dropped_rt_mismatch = 0
+  dropped_invalid = 0
+  withdrawn = 7481
+  imported = 29639
+  received = 29639
+  pending = []
+--- [4] 内核路由（VPN0 落 main/254）
+  main: default via 192.168.1.1 dev vpp0 metric 20 
+  main: 172.16.3.1 dev lo scope link 
+  main: 172.16.4.1 dev lo scope link 
+  main: 172.16.12.1 dev lo scope link 
+  main: 172.31.3.0/24 dev lcp-x0 proto kernel scope link src 172.31.3.1 
+  main: 192.168.1.0/24 dev vpp0 proto kernel scope link src 192.168.1.103 
+--- [5] zebra 视角：172.16.3.1 装在哪、BGP 表里有没有
+  % Unknown command: show ip route 172.16.3.1 32
+  BGP routing table entry for 172.16.3.1/32, version 1317
+  Paths: (2 available, best #1, table default)
+    Advertised to peers:
+    172.31.3.2
+    Local
+      0.0.0.0 from 0.0.0.0 (192.168.1.103)
+        Origin incomplete, metric 0, weight 32768, valid, sourced, best (Admin Distance)
+        Last update: Thu Nov  5 17:32:30 2026
+    65003
+      172.31.3.2 from 172.31.3.2 (172.31.3.2)
+        Origin IGP, metric 0, valid, external
+        Last update: Thu Nov  5 22:28:34 2026
+--- [6] VPP FIB：172.16.3.1 与 172.16.4.1
+  172.16.3.1/32
+    unicast-ip4-chain
+    [@0]: dpo-load-balance: [proto:ip4 index:53 buckets:1 uRPF:61 to:[0:0]]
+      [0] [@14]: mpls-label[@4]:[1000:64:0:eos]
+          [@1]: mpls via 10.250.0.0 wg1009: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6d0c0a80167c0a801654e204e200000000000000000
+  --
+  172.16.4.1/32
+    unicast-ip4-chain
+    [@0]: dpo-load-balance: [proto:ip4 index:54 buckets:1 uRPF:57 to:[0:0]]
+      [0] [@14]: mpls-label[@1]:[1000:64:0:eos]
+          [@1]: mpls via 10.250.0.5 wg1011: mtu:1368 next:3 flags:[] 00000000: 45000000000000004011f6cdc0a80167c0a801684e214e210000000000000000
+--- [7] BGP 邻居 uptime + pid
+  
+  IPv4 Unicast Summary:
+  BGP router identifier 192.168.1.103, local AS number 65103 VRF default vrf-id 0
+  BGP table version 1319
+  RIB entries 4, using 640 bytes of memory
+  Peers 1, using 30 KiB of memory
+  
+  Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+  172.31.3.2      4      65003      2134      2727     1319    0    0 05:39:55            1        4 cust3
+  
+  Total number of neighbors 1
+  bgpd pid=9061 zebra pid=9056 vpp pid=256513
+--- [8] sr-frr 最近 30 行日志
+  2026/11/05 12:00:00 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 12:00:01 sr-frr: 客户侧前缀 1 条 → sr-route（1 个 VPN）
+  2026/11/05 12:00:17 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 12:00:17 sr-frr: 客户侧前缀 0 条 → sr-route（0 个 VPN）
+  2026/11/05 12:00:18 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 12:00:19 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 12:00:19 sr-frr: 客户侧前缀 1 条 → sr-route（1 个 VPN）
+  2026/11/05 12:00:20 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 12:00:20 sr-frr: 客户侧前缀 0 条 → sr-route（0 个 VPN）
+  2026/11/05 12:00:21 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 12:00:26 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 12:00:27 sr-frr: 客户侧前缀 1 条 → sr-route（1 个 VPN）
+  2026/11/05 12:00:36 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 12:00:36 sr-frr: 客户侧前缀 0 条 → sr-route（0 个 VPN）
+  2026/11/05 12:00:38 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 12:00:39 sr-frr: 客户侧前缀 1 条 → sr-route（1 个 VPN）
+  2026/11/05 13:45:08 sr-frr: 收敛 routes+0/-2（vpn0→table 254）
+  2026/11/05 15:15:06 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 15:15:08 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 15:44:57 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 15:44:58 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 17:21:30 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 17:21:32 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 17:32:27 sr-frr: 链路事件（down:lcp-x0,addr-del:,del:lcp-x0,down:vpp0,addr-del:,del:vpp0）后重放 2 条 K 路由（zebra 会清掉自己的内核路由视图）
+  2026/11/05 17:32:27 sr-frr: 客户侧前缀 0 条 → sr-route（0 个 VPN）
+  2026/11/05 17:32:28 sr-frr: 链路事件（down:lcp-x0,down:lcp-x0）后重放 2 条 K 路由（zebra 会清掉自己的内核路由视图）
+  2026/11/05 17:32:29 sr-frr: 链路事件（down:vpp0,down:vpp0,down:vpp0,down:vpp0）后重放 2 条 K 路由（zebra 会清掉自己的内核路由视图）
+  2026/11/05 17:32:30 sr-frr: 收敛 routes+1/-0（vpn0→table 254）
+  2026/11/05 18:10:03 sr-frr: 收敛 routes+0/-1（vpn0→table 254）
+  2026/11/05 18:11:31 sr-frr: 收敛 routes+1/-0（vpn0→table 254）

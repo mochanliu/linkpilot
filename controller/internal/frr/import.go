@@ -19,6 +19,17 @@ const (
 	// large RIB, or zebra busy). Past it we adopt what arrived and let the rest
 	// stream in normally.
 	resyncDeadline = 10 * time.Second
+	// linkRecovery is the same window opened for a kernel link event (VPP
+	// restart, lcp/vpp0 down). Measured on lab-cpe3 (2026-11-06): the customer
+	// eBGP session came back 15s after the link event, while sr-frr's poll loop
+	// would have published "0 prefixes" at second 3 -- and that publication is
+	// what let sr-route start exporting the box's own loopback, which bgpd then
+	// re-originated at weight 32768 and shadowed the real customer path (same
+	// measurement chain as PlanFrom, vmlab-rebuild-plan.md §9.19).
+	// 30s is two recovery intervals of margin; it is the price of not telling
+	// the whole network "this site has nothing" while the session is still
+	// re-establishing.
+	linkRecovery = 30 * time.Second
 )
 
 // ImportRule is one (VPN) CPE-SDWAN row after the tenant's prefix-list has been
@@ -152,6 +163,15 @@ type Importer struct {
 	seen    bool // at least one notify arrived on the new connection
 	started time.Time
 	last    time.Time
+	// deadline is how long the open window may run; it depends on what opened
+	// it (a ZAPI reconnect or a kernel link event, see linkRecovery).
+	deadline time.Duration
+	// reason names what opened the window, for the log line at close.
+	reason string
+	// settled records that at least one window has closed, i.e. the answers
+	// below are backed by a replay we watched to completion. Until then the
+	// exporter must not add anything (main.go freezes injection on this).
+	settled bool
 
 	// vpnOf maps a ZAPI header vrf_id (kernel VRF ifindex) to the VPN. Unknown
 	// ids are dropped and counted, never folded into VPN 0.
@@ -236,6 +256,20 @@ func (im *Importer) Handle(ev RouteEvent) {
 // dropped during the window stays visible until the window closes, at most
 // resyncDeadline.
 func (im *Importer) BeginResync() {
+	im.beginWindow(resyncDeadline, "重连")
+}
+
+// BeginLinkWindow opens the same window for a kernel link event (VPP restart
+// tears down lcp/vpp0, which takes the customer's eBGP session with it). The
+// session is gone but the routes it carried are still what this box should
+// claim -- measured recovery is 15s (2026-11-06, lab-cpe3), so publishing the
+// empty set at second 3 both flaps the whole network and permanently shadows
+// the customer path once sr-route starts exporting the prefix itself.
+func (im *Importer) BeginLinkWindow() {
+	im.beginWindow(linkRecovery, "链路事件")
+}
+
+func (im *Importer) beginWindow(deadline time.Duration, reason string) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	if !im.resync {
@@ -248,6 +282,19 @@ func (im *Importer) BeginResync() {
 	im.seen = false
 	im.started = im.Now()
 	im.last = im.started
+	im.deadline = deadline
+	im.reason = reason
+}
+
+// Settled reports whether a window has ever closed, i.e. whether the answers
+// are backed by a replay we watched to completion. The export side refuses to
+// add prefixes before the first one settles (main.go) -- without that, a boot
+// where zebra answers last would inject the box's own prefixes first and
+// shadow them for good.
+func (im *Importer) Settled() bool {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	return im.settled
 }
 
 // Tick closes the window once the replay has been quiet long enough, or the
@@ -259,7 +306,7 @@ func (im *Importer) Tick(now time.Time) {
 	if !im.resync {
 		return
 	}
-	expired := now.Sub(im.started) >= resyncDeadline
+	expired := now.Sub(im.started) >= im.deadline
 	if !expired {
 		// No notify yet is not "the replay was empty": the dump may still be in
 		// flight (a full table takes seconds), and closing on that guess would
@@ -278,26 +325,25 @@ func (im *Importer) Tick(now time.Time) {
 	}
 	im.routes = im.pending
 	im.stale, im.pending, im.resync = nil, nil, false
+	im.settled = true
 	if expired {
 		if !im.seen {
-			im.Logf("sr-frr: 重连后 %s 没收到任何回放，按空集合收尾（撤掉旧前缀 %d 条）", resyncDeadline, dropped)
+			im.Logf("sr-frr: %s后 %s 没收到任何回放，按空集合收尾（撤掉旧前缀 %d 条）", im.reason, im.deadline, dropped)
 			return
 		}
 		// Adopting a half-filled replay here can withdraw prefixes that still
 		// exist. They come back as the replay keeps arriving, one poll later.
-		im.Logf("sr-frr: 重连对账到 %s 上限仍未回放完，按已收到的 %d 条收尾（%d 条旧前缀可能被误撤，回放继续到达时会加回）",
-			resyncDeadline, len(im.routes), dropped)
+		im.Logf("sr-frr: %s对账到 %s 上限仍未回放完，按已收到的 %d 条收尾（%d 条旧前缀可能被误撤，回放继续到达时会加回）",
+			im.reason, im.deadline, len(im.routes), dropped)
 		return
 	}
-	im.Logf("sr-frr: 重连对账完成：保留 %d 条，撤掉 %d 条", kept, dropped)
+	im.Logf("sr-frr: %s对账完成：保留 %d 条，撤掉 %d 条", im.reason, kept, dropped)
 }
 
-// Report applies the current rules to the visible set: selected source, the
-// VPN's whitelist, and the anti-loop intersection with what this VPN exports.
-// Everything is computed at read time, so removing a source or a prefix from a
-// whitelist takes effect on the next poll without waiting for zebra.
-func (im *Importer) Report(rules []ImportRule, exported map[uint8]map[netip.Prefix]struct{}) ([]ReportedPrefix, ReportStats) {
-	im.mu.Lock()
+// visibleLocked is what the customer side is currently believed to hold: the
+// settled set plus, while a window is open, the last good set and the replay.
+// Callers must hold im.mu.
+func (im *Importer) visibleLocked() map[ImportKey]sourceSet {
 	visible := map[ImportKey]sourceSet{}
 	add := func(set map[ImportKey]sourceSet) {
 		for k, src := range set {
@@ -316,6 +362,42 @@ func (im *Importer) Report(rules []ImportRule, exported map[uint8]map[netip.Pref
 		add(im.stale)
 		add(im.pending)
 	}
+	return visible
+}
+
+// OwnedByCustomer groups the visible set by VPN, before the whitelist and the
+// anti-loop filter. The export side gates injections on it (PlanFrom): a prefix
+// the customer already routes must never get a K route of its own, because that
+// K route would shadow the customer path and stop the very notifications that
+// put it in this answer, and the deadlock is measured (2026-11-06, lab-cpe3).
+//
+// Its blind spot is what ZAPI never told us: a prefix learned from a source we
+// did not subscribe to is invisible here. The frozen first round in main.go
+// covers the boot race; the subscription set has to name every source the
+// customer actually uses.
+func (im *Importer) OwnedByCustomer() map[uint8]map[netip.Prefix]struct{} {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	visible := im.visibleLocked()
+	out := make(map[uint8]map[netip.Prefix]struct{}, len(visible))
+	for k := range visible {
+		set := out[k.VPN]
+		if set == nil {
+			set = map[netip.Prefix]struct{}{}
+			out[k.VPN] = set
+		}
+		set[k.Prefix] = struct{}{}
+	}
+	return out
+}
+
+// Report applies the current rules to the visible set: selected source, the
+// VPN's whitelist, and the anti-loop intersection with what this VPN exports.
+// Everything is computed at read time, so removing a source or a prefix from a
+// whitelist takes effect on the next poll without waiting for zebra.
+func (im *Importer) Report(rules []ImportRule, exported map[uint8]map[netip.Prefix]struct{}) ([]ReportedPrefix, ReportStats) {
+	im.mu.Lock()
+	visible := im.visibleLocked()
 	stats := ReportStats{Tracked: len(visible), UnknownVRF: im.badVRF}
 	im.mu.Unlock()
 
