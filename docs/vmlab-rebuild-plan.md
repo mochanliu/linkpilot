@@ -2767,12 +2767,15 @@ CPE1  injected=1  reported=2  local_withheld=['172.16.3.1/32']  export_frozen=fa
   `Withheld` 不进内核、不进状态文件，只进日志和 `/status`（新字段 `local_withheld`），否则"少了几条"看起来像丢路由。
   与它对偶的是导入侧原有的 `LoopDropped`：`Report` 的第二个入参 `exported`（`exportState.exportedSet`，
   `main.go:250-258`）把本 VPN 正在导出的前缀从上报集合里扣掉，防止"我注入的又被我当成客户侧的上报出去"。
-- **A2 链路事件乐观窗口**（`import.go:32`、`import.go:262-287`）。VPP 重启会拆掉 lcp/vpp0，客户 eBGP 会话
+- **A2 链路事件乐观窗口**（`import.go:32`、`import.go:262-287`）。**（#274 已整族撤回，见 §9.21；下面这段留作历史，
+  其中"实测会话 15s 才回来"没有原始读数支撑，已作废 —— 本轮实测的 refill 是 12~19s，那是"zebra 重新收录
+  K 路由 + sr-frr 1s 轮询"的合计时长，不是客户 BGP 会话的恢复时长。）** VPP 重启会拆掉 lcp/vpp0，客户 eBGP 会话
   跟着掉；实测会话 15s 才回来，所以 `BeginLinkWindow()` 开 30s 窗口，窗口内 `visibleLocked()`
   （`import.go:355-366`）把 `stale`（上一份真实集合）并进可见集。这既是 AGENTS.md §1.3 "控制面重连不得让数据面
   抖动"在导出方向的应用 —— 不把"暂时看不见"当成"真的没有"，否则那一拍既会把整网抖动，又正好给 A1 喂进空集合、
   让注入抢先落地。
-- **A3 读先于写 + 首轮冻结**（`main.go:297-318`、`import.go:289-298`）。`frozen = len(rc.rules) > 0 && !imp.Settled()`
+- **A3 读先于写 + 首轮冻结**（`main.go:297-318`、`import.go:289-298`）。**（#274：首轮冻结与 `Settled()` /
+  `export_frozen*` 已删除，"读先于写"的次序本身留着，见 §9.21 第二节。）** `frozen = len(rc.rules) > 0 && !imp.Settled()`
   （`main.go:839`）：只要配了导入规则而第一轮对账还没落地，这一轮**只撤不加** —— 照常撤掉 RIB 里已经没了的，
   新的注入压下计数进 `export_frozen_held`。`Settled()` 的语义是"窗口关闭过至少一次"，即这份答复背后有一次
   我们看着它跑完的回放。没有这条，开机时 zebra 后答的那台盒子会先把自己那条注进去，然后再也看不见它。
@@ -2972,6 +2975,7 @@ owner 的原文是两句，这一轮的范围完全按这两句划：
   它现在测的是配置有没有配对。
 
 **没有动**的部分：A2 链路事件乐观窗口、A3 读先于写 + 首轮冻结、`/status` 的 `export_frozen*`、
+（这三项随后在 #274 整族撤回，见 §9.21；"读先于写"的次序作为 D 留着）
 控制口的 `PUT /config` 热更语义、`vm-verify.sh` 的任何判据、控制台任何页面。构建与测试在同一口径下复跑：
 容器 `lp-ctrl`（go1.22.5）里 `go build ./...` + `go vet ./internal/frr ./cmd/sr-frr` + `go test ./internal/frr`
 全部通过。
@@ -3124,4 +3128,161 @@ bash test/lab/vmlab/vm-verify.sh                                        # 392 PA
 `soak-C.txt`（11 轮 44 条断言）、`verify-C-final-summary.txt`（PASS=392 FAIL=0 WARN=0，全量 30KB 输出留在
 Mac 侧 `/tmp/p273/verify-C-final.txt`）。逐发 ping 时间戳 `probe-*.raw`（每份 ~50KB）不入库，可由上面两个
 window 脚本重跑生成；会话 cookie 同样不入库。
+
+### 9.21 #274：乐观窗口这一族全部撤回（A+B+C+F），第 3 条硬规则改口径；重连一枪的改前/改后实测（2026-11-07 凌晨）
+
+owner 的两句原文，这一轮的范围照这两句划（第三句是他的根因定性，属于 #275）：
+
+> 嗯，这是真正症结，把这个改成检查活动的下一跳隧道，而不只是看配置。所以你之前加的那个"乐观窗口"，
+> 请 rollback 掉。我记得你不止一处加了这个乐观窗口。
+
+> 咱们的路由协议是对收敛速度有要求的，链路状态的变化，要几乎实时的反应在路由上，否则就会有瞬时黑洞。
+> 所以乐观窗口我理解都不应该存在的。
+
+追问后拍定三点：**回滚范围 = A+B+C+F 全清**（不是只删新加的那一个）；**AGENTS.md 第 3 条同步改口径**；
+可达性粒度 = **严格 fail-closed，无 BFD 信息即不可达**（这条属于 #275，本轮不动代码）。
+
+#### 一、这一枪打在哪条接缝上：从"客户前缀是谁的"倒推
+
+`local` 这个读数是 sr-frr 每轮 PUT 给 sr-route 的那份"本盒客户侧拥有的前缀集"，它经 RR 反射给全网，
+也是 sr-fib 判定"这条前缀是本地的、不要装隧道"的依据。所以它短一段，全网就跟着撤一段；它晚一拍回来，
+远端就晚一拍装回隧道 —— 这一段就是瞬时黑洞的入口之一。链路走到底有四站：
+
+1. sr-fib 用 netlink 把远端前缀注成内核 K 路由（distance 0）→ zebra `redistribute kernel` 把它通知给 sr-frr；
+2. sr-frr 的 `Importer` 收到通知，按（VPN，来源，白名单，防环）算出上报集合 → `PUT /local-prefixes`；
+3. 与 zebra 的连接断掉（`restart frr`、VPP 重启拆 lcp/vpp0、FRR 崩）时，第 1 站的通知会先撤销再重建；
+4. **窗口一族全部活在第 3 站和第 2 站之间**：它们的共同主张是"这暂时看不见，多半不是真的没有，先把旧答案报着"。
+
+owner 的判据把这句话否掉了：路由协议对收敛速度的要求高于对这段空窗的容忍 —— 靠一条已经死掉的会话
+继续宣称前缀，本身就是黑洞，不是防黑洞。
+
+#### 二、代码走到哪：删了什么（行号是删完之后的现状）
+
+| 编号 | 原名 | 它在哪一拍维持旧值 | 现在 |
+| --- | --- | --- | --- |
+| A | `BeginResync` + `resyncQuiet=500ms` / `resyncDeadline=10s` | sr-frr 与 zebra 重连后把 `stale ∪ pending` 当可见集 | 删。换成 `Importer.Reset()`（`internal/frr/import.go:214`）：重连即清空，新连接的回说什么就是什么 |
+| B | `BeginLinkWindow` + `linkRecovery=30s` | 内核链路 down/up（VPP 重启拆 lcp/vpp0）那 30s 维持旧集合 | 删。`watchLinkEvents`（`cmd/sr-frr/main.go:368`）不再开窗，只剩 D-11 那段 `touch` 重放 |
+| C | `Settled()` + `export_frozen` / `export_frozen_held` | 首轮对账未落地时注入"只撤不加" | 删（它是 A/B 的闸门，没有窗口就没有"落地"可言）；`/status` 少这两个字段 |
+| F | `onceWindow` / `onceSettle` | `-once` 退出前自己再等 300ms | 删，`-once` 变成"跑一轮就退出" |
+| D | 轮询里"先读完并上报客户侧，再决定注入"的次序 | —— 这是读写次序，不是窗口 | **留** |
+| E | `linkSettle=300ms` 去抖 + `touch` K 路由重放 | —— 这是 D-11（链路删除后 zebra 丢 K 视图、导出静默失效）的修法 | **留** |
+
+具体改动：`Importer` 结构回到 `mu / routes / vpnOf / unknown / badVRF / Logf` 六个字段（`Now`、`stale`、
+`pending`、`resync`、`seen`、`started`、`last`、`deadline`、`reason`、`settled` 全没），`Handle`
+（`import.go:162`）照直写 `routes`，`Report`（`import.go:241`）第一件事是 `snapshotLocked()` 拿当前这份；
+`ensureImport` 里 `imp.BeginResync()` → `imp.Reset()`（`main.go:562`，位置在订阅之前）；
+`poll`（`main.go:726`）返回值从 `bool` 变回 `()`，`imp.Tick` 与 `frozen` 判定整段删除。
+包注释（`main.go` 开头）把"两道闸门"改成"这条接缝上没有任何等一拍的窗口"，并把代价（重连到回放落地之间
+会短报一次）写在 `Importer.Reset` 的注释里，不藏在散文里。
+单测随窗口删掉 7 条：`import_gate_test.go` 整文件 `git rm`（链路窗口 2 条 + `Settled` 1 条 + 假时钟
+`fakeClock` / `newClockImporter`），`import_test.go` 从 16 条减到 12 条 —— 4 条重连窗口
+（`KeepsOldSetUntilReplayQuiet` / `Deadline` / `WaitsForFirstEvent` / `NestedResyncKeepsOriginalStale`）
+换成一条"重连即重置"的判据（重置后必须报 0，回放到达后必须报回 1）。
+容器 `lp-ctrl`（go1.22.5，`/workspace/controller`）里 `go build ./...`、`go vet ./...`、`go test ./...` 全绿。
+
+#### 三、AGENTS.md 第 3 条换了主张（这是口径变更，不是补注）
+
+旧第 3 条写的是"控制面重连不得让数据面抖动 ⇒ 乐观窗口：重连后先维持旧集合，等订阅回放静默 500ms
+（或 10s 上限）后再一次性对账"。现在它反过来：
+
+> **不许用"乐观窗口"掩盖状态缺口。** …… sr-frr 重连即重置本地前缀集，新连接的回说什么就是什么。
+> **Why:** 路由协议对收敛速度有硬要求 —— 链路状态必须几乎实时反映到路由上，否则就是瞬时黑洞。
+> **How to apply:** 数据面不抖靠**可达性信号本身**（下一跳隧道/BFD 的真实状态），不靠延迟对账。
+
+顺带把 §9.19 第四节 A2 里那句"实测会话 15s 才回来"撤下来：它没有原始读数支撑，本轮实测的 refill 是
+12~19s，但那是"zebra 重新收录 K 路由 + 1s 轮询"的合计时长，不是客户 BGP 会话的恢复时长，两件事不能混着引。
+
+#### 四、实测：改前 9.4s / 改后 12.6s 与 15.6s —— 而这一枪里窗口一秒都没买到
+
+故障注入 `systemctl restart frr`（CPE1；这是被测故障，不是配置生效路径，AGENTS.md 第 1 条禁的是用重启让配置生效）。
+口径：盒子本地 200ms 一发读 sr-route 的 `local` 条数与 sr-frr 的 `reported`（基线 1 条 = `172.16.12.1/32`），
+同时 cust12 用自己的 loopback 秒级探测一条当前通的方向。脚本 `test/lab/vmlab/exp-274/reconnect-window.sh`。
+
+| 标签 | 产物 | `local` 掉 0 | 回到 1 | 偏离时长 | 探测 FAIL |
+| --- | --- | --- | --- | --- | --- |
+| `before` | `9f28db6c268aa12c`（A+B+C 都在） | +2.38s | +12.2s | 9.4s（22/160 发） | 2/2037，1 段 1.0s |
+| `after` | `c8e731ddcbca7bd6`（窗口全删） | +2.57s | +15.2s | 12.6s（30/160 发） | 4/1983，2.1s + 一发 |
+| `after-in` | 同上，反向（cust4 → 172.16.12.1） | +2.77s | +18.3s | 15.6s（37/161 发） | 2/2006，1 段 1.0s |
+
+三行读下来的结论不是"代价多大"，是**改前也掉**，而且掉的时刻两边一样（+2.4~2.8s）：
+
+- `before` 那一发的两个读数是 `local=1 frr(reported=0 zebra_connected=True)`，下一发 `local` 才变 0。
+  窗口还开着时可见集是 `stale ∪ pending` = 1 条，`reported` 不可能是 0 —— 唯一能同时解释这两个读数的是
+  **窗口已经按 500ms 安静关上，而那份回放的答复就是 0 条**：zebra 刚起来时自己的 RIB 还没重新收录 sr-fib
+  那两条 K 路由，`redistribute kernel` 的第一份就是空的。连上约 +1.4s、+0.5s 安静、+2.0s 落地，
+  与 +2.03s 这发对上（误差在一个采样间隔内）。
+- 于是窗口在这个场景里买到的东西是 0：`restart frr` 后的空窗长度由 **refill** 决定（zebra 重新收录 K 路由
+  之后、经 sr-frr 1s 轮询上报），改前改后都是十几秒，9.4 → 12.6/15.6s 的差是 refill 时刻的抖动，不是窗口的保护。
+- 改前那份日志自己就把话说完了：`重连后 10s 没收到任何回放，按空集合收尾（撤掉旧前缀 1 条）` ——
+  走到上限的结局同样是"报空"。改后是 `重连，清空本地前缀集（1 条），等新连接的回放重建`。
+
+这同时说明：本轮删掉的东西**没有让这一枪变坏**，而 owner 要的那条真正能改变形状的路径在 #275
+（可达性输入）与 #276（事件驱动收敛，把上面那 12~19s 的 refill 压成瞬时）。
+
+#### 五、生效姿势：换件全程零冷启动
+
+四台 `/usr/local/bin/sr-frr` 从 `9f28db6c268aa12c` 换成 `c8e731ddcbca7bd6`，每台四步，与 §9.19 第五节同一口径
+（比它多一步：`push-binary.sh` 只把产物写到 `/root/vmlab/artifacts/linux/`，**不装**到 `/usr/local/bin`，
+漏掉第 2 步就等于重启了个旧二进制 —— 本轮第一台 CPE2 就是这么"换了没换"的，`sha256sum` 一查才知道）：
+
+1. gzip + `sha256sum` 推到 `/root/vmlab/artifacts/linux/`（`exp-273/push-binary.sh`，只落盘不重启）；
+2. `install -m 0755 /root/vmlab/artifacts/linux/sr-frr /usr/local/bin/sr-frr`，再 `sha256sum` 核一遍；
+3. `kill -TERM $(pgrep sr-frr); sleep 2; systemctl start sr-box-watch.service` —— SIGTERM 走产品自己的收尾
+   （撤掉自己下发的 K 路由），watch 是 Type=oneshot + `KillMode=process`，只补缺失进程；
+4. 判据用状态对比不用退出码：`stat -Lc %i /proc/<pid>/exe == stat -c %i /usr/local/bin/sr-frr`、
+   四台 `local` 条数与 `injected/reported` 与换件前一致、§9.7 六方向 0%、`vm-verify.sh` 全绿。
+
+VPP / sr-agent / sr-route / sr-fib 全程 pid 不变，实测见下表"其它守护进程启动时间"一列 —— 四台的这几个进程
+仍是 11-04~11-06 起的那一批，今天只有 sr-frr 换过。FRR 只在第四节那一枪里被 `restart frr` 打过（那是被测故障），
+换件本身不碰它。
+
+**换件这一枪的客户可见中断（AGENTS.md 第 4 条要求点名 + 给时长）**：`window-swap.sh` 探测机用自己的 loopback
+1 秒一发打 75 秒（链路通时约 32 发/秒），第 6 秒 SIGTERM 该盒 sr-frr。改后（`c8e731ddcbca7bd6`，本轮）与
+改前（`9f28db6c268aa12c`，§9.19/§9.20 那轮同一脚本同一方向）对照：
+
+| 被换的盒 | 探测方向（源→目的） | 改前 总发/FAIL/最长断流 | 改后 总发/FAIL/最长断流 |
+| --- | --- | --- | --- |
+| CPE1 | cust12 `172.16.12.1` → `172.16.4.1` | 2744 / 0 / — | 2331 / 1 / 单发（0.0s） |
+| CPE2 | cust12 `172.16.12.1` → `172.16.3.1` | 2624 / 0 / — | 2324 / 0 / 无 |
+| CPE2 | cust12 `172.16.12.1` → `172.16.4.1` | 未跑该方向 | 2231 / 2 / 1.0s |
+| CPE3 | cust3 `172.16.3.1` → `172.16.12.1` | 231 / 65 / 63.8s（**读数不可用**，见下） | 2252 / 3 / 1.0s |
+| CPE4 | cust4 `172.16.4.1` → `172.16.12.1` | 2575 / 3 / 2.0s | 2335 / 3 / 2.0s |
+
+- CPE3 改前那一行**不能当"改前更差"的证据**：75 秒的窗口只有 231 发（通的时候约 32 发/秒 → 全程 ~2400 发），
+  说明那一发探测期间链路本身就大面积在下，63.8s 的"断流段"里混着别的故障。它只能说明那一轮的基线不干净。
+- 可用读数的一致形状是**最长 1~2 秒、且只在被换的那台的方向上**：SIGTERM 到 watch 补回 sr-frr（`sleep 2` + 启动）
+  之间，这台盒撤掉自己下发的 K 路由；对端站点是 CPE1+CPE2 双播，所以 cust12 侧多数方向被另一台接住（0~1 发）。
+- 换件后四台状态对比（判据不是退出码）：`local=1`、sr-frr `reported=1 injected=2 zebra_connected=True
+  last_error=''`、`ip route show table all` 的 K 路由各 18 条、`stat -Lc %i /proc/<pid>/exe == stat -c %i
+  /usr/local/bin/sr-frr` 全部 yes、`/status` 里 `export_frozen*` 两个字段已消失。
+- 同一批换件后复跑：`exp-273/six.sh` 六方向 0% 丢包（rtt avg 11.0~14.1ms），`vm-verify.sh` **392 PASS / 0 FAIL / 0 WARN**
+  （与 §9.20 那次干净参照同一条数）。
+
+#### 六、台的局限与尾巴（登记，不掩盖）
+
+1. **反向探测体现不出空窗**：`172.16.12.1/32` 由同站点的 CPE1 与 CPE2 都在播，CPE1 那份掉下去时 CPE2 还在，
+   所以 cust4→172.16.12.1 只看到 1.0s 断流。这条方向**不能当"代价小"的证据**，只有本盒 `local` 计数算数。
+2. **没有量 VPP 重启那一枪**：那是窗口原本真正为它设计的一拍（链路 down → zebra 在连接还活着的时候逐条
+   withdraw）。它要把 sr-route / sr-fib / BFD 一起重来，属于 #275 的现场判据；本轮判据只到"重连即重置"这条接缝。
+3. **refill 12~19s 本身是缺口**，归 #276：`zebra 重新收录 K 路由` + `sr-frr 1s 轮询` 两串延时，删窗口不解决它。
+4. 盒子与 Mac 之间没对时（CPE1 的钟比 UTC 快 ~10.7 分钟），所以跨机只报**时长**，注入时刻取自盒子自己的
+   `date +%s.%3N`。
+5. §9.19 第四节 A2/A3 两段留着当历史，但代码已经不在，本节是它们的作废声明；`docs/loop-test-report.md`
+   里 P-3（sr-fib "保留上一份已装 FIB"）已按同一定案标注否决。
+
+#### 七、怎么重跑
+
+```
+docker exec lp-ctrl sh -lc 'cd /workspace/controller && go build ./... && go vet ./... && go test ./...'
+WORK=/tmp/p274 BIN=~/srvmlab/out-274/sr-frr.gz bash exp-273/push-binary.sh CPE1 CPE2 CPE3 CPE4
+ssh <盒> 'install -m 0755 /root/vmlab/artifacts/linux/sr-frr /usr/local/bin/sr-frr'   # push 脚本只落盘不装，漏了这步等于换了个寂寞
+WORK=/tmp/p274 TAG=before bash exp-274/reconnect-window.sh CPE1 cust12 172.16.12.1 172.16.4.1
+WORK=/tmp/p274 TAG=after  bash exp-274/reconnect-window.sh CPE1 cust12 172.16.12.1 172.16.4.1
+WORK=/tmp/p274 bash exp-273/window-swap.sh <盒> cust12 172.16.12.1 172.16.4.1     # 逐台换件中断时长
+TAG=274 bash exp-273/six.sh
+bash test/lab/vmlab/vm-verify.sh
+```
+
+原始读数在 Mac 侧 `/tmp/p274/`（`samples-*.txt` 逐发采样、`probe-*.txt` 逐发 ping、`window-*.txt` 汇总），
+不入库，重跑即生成。
 

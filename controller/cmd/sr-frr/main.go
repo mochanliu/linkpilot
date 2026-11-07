@@ -12,11 +12,11 @@
 // （退出会把上报的前缀清空一次，等于全网抖一下）。
 //
 // 两个方向的接缝有固定的次序：每一轮先把客户侧读完并上报（导入），再对账注入
-// （导出）。这个次序是实测出来的（2026-11-06，lab-cpe3）。两道闸门：
+// （导出）。这个次序是实测出来的（2026-11-06，lab-cpe3）。
 //
-//   - 链路窗口：VPP 重启拆掉 lcp/vpp0 会带走客户 BGP 会话，会话在实测 15s
-//     后才回来。这 30s 内"客户侧拥有"是空的，不许当成"真的没有"。
-//   - 首轮冻结：第一轮对账没落地前只撤不加。
+// 这条接缝上没有任何"等一拍/维持旧值"的窗口（2026-11-07 owner 定案，AGENTS.md
+// 第 3 条）：链路事件、zebra 重连、首轮对账都按当时的真实集合立即上报、立即
+// 对账。代价写在 Importer.Reset 上 —— 重连到回放落地之间会短报一次。
 //
 // "本盒客户侧已经拥有的前缀不该被自己的 K 路由顶掉"这一条不在这里挡。K 路由
 // 在 zebra 里是 distance 0，客户的 bgpd/ospfd 又对它做 redistribute kernel，于
@@ -78,16 +78,6 @@ const (
 	defaultZServSocket   = "/run/frr/zserv.api"
 	defaultStateFile     = "/run/sr-frr/state.json"
 	defaultControlSocket = "/run/sr-frr/control.sock"
-
-	// onceSettle 只在 -once 里等一下：netlink ACK 表示内核已经装好，但 zebra
-	// 是通过内核的 netlink 组播异步学到的，紧接着用 vtysh 看 `show ip route`
-	// 可能还差一拍。
-	onceSettle = 500 * time.Millisecond
-
-	// onceWindow 是 -once 等第一轮对账落地的上限：重连回放本身有 10s 上限，
-	// 加一拍轮询间隔。超时不是错误 —— 它按"只撤不加"退出，把没读到这件事
-	// 留在日志里，而不是假装注入完成。
-	onceWindow = 20 * time.Second
 )
 
 func loadConfig(path string) (*fileConfig, error) {
@@ -210,11 +200,7 @@ type exportState struct {
 	skipSig string
 	plan    []frr.Route
 	skipped []frr.Route
-	// frozen 是导入侧第一轮对账还没落地的状态：这一轮只允许撤、不允许加，
-	// frozenHeld 记被压住的"加"有几条。
-	frozen     bool
-	frozenHeld int
-	lastErr    string
+	lastErr string
 }
 
 func planSig(routes []frr.Route) string {
@@ -271,9 +257,7 @@ func (e *exportState) exportedSet(exportVRFs []uint32) map[uint8]map[netip.Prefi
 // the poll loop; the control socket only touches prefixes that already exist.
 // statusURL and stateFile are box keys, not part of the published config, so
 // they come from the file the process was started with.
-//
-// frozen 表示导入侧第一轮对账还没落地，这一轮只允许撤、不允许加。
-func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtimeConfig, statusURL, stateFile string, frozen bool) error {
+func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtimeConfig, statusURL, stateFile string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -290,27 +274,6 @@ func (e *exportState) reconcile(ctx context.Context, hc *http.Client, cfg runtim
 	if err != nil {
 		e.lastErr = err.Error()
 		return err
-	}
-	// 读先于写：客户侧的答复还没落地（首轮对账没完成）时，"这条前缀是不是
-	// 本盒自己的"我们并不知道。这时只放行已经在我们账本里的条目 —— 撤掉 RIB
-	// 里没了的照常做，新的注入压下等下一轮。实测的起点就是那次"第 3 秒就加"：
-	// 链路事件把客户 BGP 会话打断，本地集合法归零，注入却抢先落了地。
-	e.frozen = frozen
-	e.frozenHeld = 0
-	if frozen {
-		known := make(map[string]bool, len(e.plan))
-		for _, r := range e.plan {
-			known[r.Key()] = true
-		}
-		keep := make([]frr.Route, 0, len(plan.Routes))
-		for _, r := range plan.Routes {
-			if known[r.Key()] {
-				keep = append(keep, r)
-				continue
-			}
-			e.frozenHeld++
-		}
-		plan.Routes = keep
 	}
 	// 先落盘再下发：中途被杀时，文件里是"打算写的全部"，最多多删几条不存在
 	// 的路由，不会漏删。计划为空时删文件 —— 状态文件存在就代表我们留了东西。
@@ -392,18 +355,17 @@ func (e *exportState) touch(ctx context.Context, vrfs []uint32) (map[uint32]int,
 // 合成一个窗口，避免对同一次变化重放好几遍。
 const linkSettle = 300 * time.Millisecond
 
-// watchLinkEvents 守住两个实测坑，一次链路事件同时踩中它们：
+// watchLinkEvents 守住一个实测坑：
 //
 //   - zebra 丢 K 路由视图：接口 down / 删接口 / 删地址会让 zebra 把自己 RIB
 //     里的 K 路由整表清掉，内核里还在、sr-frr 也以为还注入着，redistribute
 //     kernel 于是静默停发，客户侧从此学不到远端前缀。zebra 对重复 add 不发
 //     通知，只有 delete+add 能让它重新学到 —— 复用 touch。
-//   - 客户会话被打断时本地集合法归零：lcp/vpp0 一 down，客户的 BGP 会话跟着
-//     断，通知里全是撤销。这时照直上报就是"本站点没有前缀了"，全网站点跟着
-//     撤；等会话在 15 秒后回来，sr-route 早已把这条前缀当远端路由导出，注入
-//     反过来顶掉客户真路径 —— 从此锁死。所以第一批事件一到就先开导入侧的
-//     乐观窗口（BeginLinkWindow），旧集合维持到回放静默，绝不发布 0 条。
-func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore, imp *frr.Importer) {
+//
+// 这里只重放 K 路由，不在导入侧维持旧集合：链路事件带走客户会话之后，本地集
+// 合由 zebra 的撤销通知直接归零，下一次轮询就把"现在没有"报出去（2026-11-07
+// 定案，见文件头与 AGENTS.md 第 3 条）。
+func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore) {
 	ch, err := krt.WatchLinks(ctx)
 	if err != nil {
 		log.Printf("sr-frr: 链路事件监听没开（接口一变更、zebra 可能丢 K 路由视图，只能等下一轮路由变化自愈）: %v", err)
@@ -420,8 +382,6 @@ func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore, im
 			}
 			evs = append(evs, ev)
 		}
-		// 第一个事件就到了就开窗，不等整批收齐：撤销通知比事件到得还快。
-		openLinkWindow(imp, rt)
 		timer := time.NewTimer(linkSettle)
 	collect:
 		for {
@@ -453,15 +413,6 @@ func watchLinkEvents(ctx context.Context, exp *exportState, rt *runtimeStore, im
 				describeEvents(evs), total)
 		}
 	}
-}
-
-// openLinkWindow 只在确实订了导入规则时开窗：没有反向导入的盒子，本地集
-// 从来不是这里的输入，开窗只会把一次无关的链路事件记进日志。
-func openLinkWindow(imp *frr.Importer, rt *runtimeStore) {
-	if len(rt.snapshot().rules) == 0 {
-		return
-	}
-	imp.BeginLinkWindow()
 }
 
 func describeEvents(evs []krt.LinkEvent) string {
@@ -580,9 +531,8 @@ func subsFor(rules []frr.ImportRule) ([]subSpec, map[uint32]uint8, []string) {
 }
 
 // ensureImport reconnects when zebra died or the subscription set changed. A
-// reconnect opens the optimistic window: the old set stays published while the
-// replay rebuilds it, so a subscription edit cannot make every remote site see
-// "this box has no prefixes" for a moment.
+// reconnect resets the importer: the new connection's dump is what this box has
+// on the customer side, and nothing older than that connection is reported.
 func ensureImport(ctx context.Context, st *importState, imp *frr.Importer, path string, subs []subSpec) error {
 	sig := subsSig(subs)
 	st.mu.Lock()
@@ -609,7 +559,7 @@ func ensureImport(ctx context.Context, st *importState, imp *frr.Importer, path 
 	if err != nil {
 		return err
 	}
-	imp.BeginResync()
+	imp.Reset()
 	c.SetRouteHandler(imp.Handle)
 	for _, s := range subs {
 		if err := c.SubscribeRoutes(ctx, s.VRFID, s.Type); err != nil {
@@ -773,7 +723,7 @@ func main() {
 	hc := &http.Client{Timeout: 5 * time.Second}
 	lastImportSig := ""
 
-	poll := func() bool {
+	poll := func() {
 		rc := rt.snapshot()
 
 		// 先读后写：这一轮先问客户侧、先把本地前缀报出去，再决定注入什么。
@@ -795,7 +745,6 @@ func main() {
 				ierr = zerr
 				log.Printf("sr-frr: %v", zerr)
 			}
-			imp.Tick(time.Now())
 			reps, stats := imp.Report(rc.rules, exported)
 			if sig := frr.Signature(reps); sig != lastImportSig {
 				if err := pushLocalPrefixes(ctx, hc, importURL, reps); err != nil {
@@ -820,15 +769,11 @@ func main() {
 			st.setPoll(ierr, 0, 0, 0, subNames(subs))
 		}
 
-		// 读先于写：导入侧第一轮对账还没落地时，注入只撤不加。
-		frozen := len(rc.rules) > 0 && !imp.Settled()
-		if err := exp.reconcile(ctx, hc, rc, cfg.StatusURL, cfg.StateFile, frozen); err != nil {
+		if err := exp.reconcile(ctx, hc, rc, cfg.StatusURL, cfg.StateFile); err != nil {
 			if ctx.Err() == nil {
 				log.Printf("sr-frr: 本轮导出收敛失败（保留上次成功的计划）: %v", err)
 			}
 		}
-		// 返回值给 -once 用：false 表示这一轮还处在"读没落地、注入只删不加"的状态。
-		return !frozen
 	}
 
 	if !*once {
@@ -851,25 +796,14 @@ func main() {
 	}
 
 	if *once {
-		// -once 的语义是"收敛一次后退出"，而收敛现在要求先读到客户侧的答复
-		// （读先于写）。所以这里是有界轮询：第一轮对账落地就停，最长等
-		// onceWindow —— 到点还没落地就按"只删不加"收尾，不假装注入成功。
-		deadline := time.Now().Add(onceWindow)
-		for {
-			if poll() {
-				break
-			}
-			if time.Now().After(deadline) {
-				log.Printf("sr-frr: -once 到 %s 仍未完成第一轮对账（zebra 连不上？），这一轮只撤不加", onceWindow)
-				break
-			}
-			time.Sleep(time.Second)
-		}
-		time.Sleep(onceSettle)
+		// -once 就是一轮：读客户侧、上报、对账注入，然后退出。不等任何窗口
+		// —— 注入是同步的 netlink 写，退出时内核里已经装好；zebra 通过组播
+		// 自己学到，那是它的事。
+		poll()
 		return
 	}
 
-	go watchLinkEvents(ctx, exp, rt, imp)
+	go watchLinkEvents(ctx, exp, rt)
 
 	interval := time.Duration(cfg.PollSec) * time.Second
 	if len(initial.exportVRFs) > 0 {
@@ -1060,7 +994,6 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			skipped = append(skipped, sr.Prefix.String())
 		}
 		exportErr := exp.lastErr
-		frozen, frozenHeld := exp.frozen, exp.frozenHeld
 		exp.mu.Unlock()
 		st.mu.Lock()
 		reported, loop, unknown := st.reported, st.loop, st.unknown
@@ -1091,8 +1024,6 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			"import_rules":        rules,
 			"injected":            injected,
 			"skipped":             skipped,
-			"export_frozen":       frozen,
-			"export_frozen_held":  frozenHeld,
 			"reported":            reported,
 			"dropped_loop":        loop,
 			"dropped_unknown_vrf": unknown,

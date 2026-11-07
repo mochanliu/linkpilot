@@ -52,8 +52,8 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 }
 
 // Err 返回连接本身的死因（对端关闭、读失败……）。非 nil 后这条连接不能再
-// 用：zebra 重启会丢掉订阅，调用方必须重连并重新订阅（导入侧用乐观窗口
-// 保住旧集合，见 Importer.BeginResync）。
+// 用：zebra 重启会丢掉订阅，调用方必须重连并重新订阅（导入侧不保留旧集合，
+// 重连即重置，见 Importer.Reset）。
 func (c *Client) Err() error {
 	c.errMu.Lock()
 	defer c.errMu.Unlock()

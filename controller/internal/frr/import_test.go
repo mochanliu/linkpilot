@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"net/netip"
 	"testing"
-	"time"
 )
 
 // TestEncodeRedistributeAddGolden 固定订阅报文的字节序列：头里的 vrf_id 是
@@ -167,11 +166,16 @@ func TestImporterSetSemantics(t *testing.T) {
 		t.Fatalf("prefixes = %v, want 0", got)
 	}
 
-	// 重连不再清空：旧集合继续对外可见，直到窗口关闭。
+	// 重连即重置：旧集合不留，新连接的回说什么就是什么（AGENTS.md 第 3 条，
+	// 2026-11-07 定案：不许维持旧集合）。
 	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-	im.BeginResync()
-	if got := reported(t, im, rules); len(got) != 1 {
-		t.Fatalf("重连窗口里 prefixes = %v, want 1（旧集合要留着）", got)
+	im.Reset()
+	if got := reported(t, im, rules); len(got) != 0 {
+		t.Fatalf("重连后 prefixes = %v, want 0（回放到达前不报旧集合）", got)
+	}
+	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
+	if got := reported(t, im, rules); len(got) != 1 || got[0] != p1.String() {
+		t.Fatalf("回放到达后 prefixes = %v, want 只剩 %s", got, p1)
 	}
 }
 
@@ -274,123 +278,6 @@ func TestImporterMultiVRFAndUnknown(t *testing.T) {
 	if stats.UnknownVRF != 2 {
 		t.Fatalf("UnknownVRF = %d, want 2", stats.UnknownVRF)
 	}
-}
-
-// 重连窗口：旧前缀一直可见，直到回放安静下来；回放里没有的才在关门那一刻撤掉。
-func TestImporterResyncKeepsOldSetUntilReplayQuiet(t *testing.T) {
-	im, clock := newClockImporter()
-	rules := []ImportRule{allowAll(0)}
-	p1 := netip.MustParsePrefix("10.68.1.0/24")
-	p2 := netip.MustParsePrefix("172.16.1.0/24")
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p2, Add: true})
-
-	im.BeginResync()
-	if got := reported(t, im, rules); len(got) != 2 {
-		t.Fatalf("窗口刚打开 prefixes = %v, want 2 条旧集合", got)
-	}
-
-	// 回放只带回 p1，p2 客户真的撤了。
-	clock.advance(100 * time.Millisecond)
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-
-	// 回放之后 500ms 内不算完：p2 还在（宁可多留）。
-	clock.advance(300 * time.Millisecond)
-	im.Tick(clock.now())
-	if got := reported(t, im, rules); len(got) != 2 {
-		t.Fatalf("回放未安静 prefixes = %v, want 2 条", got)
-	}
-
-	clock.advance(300 * time.Millisecond) // 距最后一条事件 600ms
-	im.Tick(clock.now())
-	got := reported(t, im, rules)
-	if len(got) != 1 || got[0] != p1.String() {
-		t.Fatalf("关窗后 prefixes = %v, want 只剩 %s", got, p1)
-	}
-	if len(im.stale) != 0 || im.resync {
-		t.Fatalf("窗口没关干净：resync=%v stale=%d", im.resync, len(im.stale))
-	}
-}
-
-// 回放一直不停（大表）时由 10s 上限收尾，而不是无限挂着旧集合。
-func TestImporterResyncDeadline(t *testing.T) {
-	im, clock := newClockImporter()
-	rules := []ImportRule{allowAll(0)}
-	p1 := netip.MustParsePrefix("10.68.1.0/24")
-	p2 := netip.MustParsePrefix("172.16.1.0/24")
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p2, Add: true})
-
-	im.BeginResync()
-	for i := 0; i < 20; i++ {
-		clock.advance(600 * time.Millisecond)
-		im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-		im.Tick(clock.now())
-	}
-	if im.resync {
-		t.Fatal("超过 10s 上限后窗口还开着")
-	}
-	if got := reported(t, im, rules); len(got) != 1 || got[0] != p1.String() {
-		t.Fatalf("上限收尾 prefixes = %v, want 只剩 %s", got, p1)
-	}
-}
-
-// 一条回放都没收到时不能当成"客户没有前缀"：dump 可能还在路上，早关窗等于把
-// 整份前缀撤掉。要等到 10s 上限。
-func TestImporterResyncWaitsForFirstEvent(t *testing.T) {
-	im, clock := newClockImporter()
-	rules := []ImportRule{allowAll(0)}
-	p1 := netip.MustParsePrefix("10.68.1.0/24")
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-
-	im.BeginResync()
-	clock.advance(time.Second)
-	im.Tick(clock.now())
-	if got := reported(t, im, rules); len(got) != 1 {
-		t.Fatalf("还没有回放就把前缀撤了：%v", got)
-	}
-
-	clock.advance(10 * time.Second)
-	im.Tick(clock.now())
-	if got := reported(t, im, rules); len(got) != 0 {
-		t.Fatalf("10s 后仍没有回放，prefixes = %v, want 0", got)
-	}
-}
-
-// 第二次重连发生在第一段回放中间时，stale 必须还是最初那份好集合。
-func TestImporterNestedResyncKeepsOriginalStale(t *testing.T) {
-	im, clock := newClockImporter()
-	rules := []ImportRule{allowAll(0)}
-	p1 := netip.MustParsePrefix("10.68.1.0/24")
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-
-	im.BeginResync()
-	clock.advance(100 * time.Millisecond)
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: netip.MustParsePrefix("10.9.0.0/16"), Add: true})
-	im.BeginResync() // 又断了一次，pending 的半份回放丢掉
-
-	clock.advance(100 * time.Millisecond)
-	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p1, Add: true})
-	clock.advance(600 * time.Millisecond)
-	im.Tick(clock.now())
-
-	got := reported(t, im, rules)
-	if len(got) != 1 || got[0] != p1.String() {
-		t.Fatalf("二次重连 prefixes = %v, want 只剩 %s", got, p1)
-	}
-}
-
-type fakeClock struct{ t time.Time }
-
-func (c *fakeClock) now() time.Time          { return c.t }
-func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
-
-func newClockImporter() (*Importer, *fakeClock) {
-	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	im := NewImporter(nil)
-	im.Now = c.now
-	im.Logf = func(string, ...any) {}
-	return im, c
 }
 
 func TestImporterSorts(t *testing.T) {

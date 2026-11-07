@@ -12,6 +12,9 @@ owner 的原话是这一轮的范围：
 1. **只回滚 A1（注入闸门）** —— `Plan.Withheld` / `Importer.OwnedByCustomer` / `/status` 的 `local_withheld`
    三处删除；**A2 链路事件乐观窗口、A3 读先于写 + 首轮冻结原样留着**（`linkRecovery` / `BeginLinkWindow` /
    `Settled` / `export_frozen` 全在）。单测从 8 条变 6 条（随闸门删掉两条）。
+   > 这一句是 #273 当时的范围。**A2/A3 随后在 #274 整族撤回**（`linkRecovery`/`BeginLinkWindow`/`Settled`/
+   > `export_frozen*` 现在都不在代码里了，只留 D「读先于写」的次序与 E 的 `touch` 重放），
+   > 见 [../exp-274/README.md](../exp-274/README.md) 与 `docs/vmlab-rebuild-plan.md` §9.21。
 2. **走产品路径把那条配置加上** —— 控制台「配置 > overlay > 路由泄露」里 node1/node2 的
    `CPE-SDWAN`（`to_sdwan`）行改指一个只含 `172.16.12.1/32` 的 prefix-list，显式发布、agent 推送、
    sr-apply 第 5 段写 `/etc/sr-frr.json`、sr-frr `PUT /config` 热更。**全程零手工补丁**：不 `ip route`、
