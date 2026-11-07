@@ -3286,3 +3286,86 @@ bash test/lab/vmlab/vm-verify.sh
 原始读数在 Mac 侧 `/tmp/p274/`（`samples-*.txt` 逐发采样、`probe-*.txt` 逐发 ping、`window-*.txt` 汇总），
 不入库，重跑即生成。
 
+---
+
+### 9.22 #277：三只「在跑的产物 ≠ 盘上的产物」收口 —— 盒内复制 `/proc/<pid>/exe`，全程不重启（2026-11-07 上午）
+
+§9.19/§9.20/§9.21 之后，`agent-handover.md` §3 记着当前环境里最贵的一处：缺陷⑦（#268）和缺陷④（#260）
+**代码修了、进程里也跑了修复件，但盘上躺的还是修复前那一份**。它坏在静默 —— 任何一次重启或开机重放就退回旧行为：
+`sr-fib` 退回"VPP 重启后不重连 api.sock、隧道表只在内存 ⇒ 客户流量永久黑洞"，
+`sr-agent` 退回"VPP 重启后不重建 wg 隧道且仍报 `ok=true`"。这一节把它关掉，并记下三条实测方法。
+
+#### 一、为什么这一步不需要重启（这是判据，不是安慰）
+
+盘上那份文件只是"下一次 exec 的内容"，**换文件本身不改任何在跑的进程**：内核按 inode 记账，
+`mv`（同盘 rename）之后旧进程继续持有旧 inode，行为一个字节都不变。所以这一轮：
+
+- 不 kill、不 restart、不 `systemctl start sr-box-watch.service`、不动任何配置发布；
+- 判"有没有打扰客户流量"用状态对比：四台八个 daemon 的 pid + 隧道口条数逐一与改前相同，六方向丢包 6/6 `0%`，`vm-verify.sh` 392/0/0。
+
+顺手排掉一个会把我装的东西吃回去的怀疑：`sr-box-watch.timer` 每 60s 跑一轮 `/usr/local/lib/sr-box/start.sh up`。
+`grep -nE "install |cp -|mv |artifacts" start.sh` **零命中** —— 那份清单只 `nohup` 起进程、从不装二进制，
+而它的幂等前提"在跑的进程绝不重启"是 11-05 实测过的（§9.15 那条 KillMode 的账）。
+
+#### 二、换文件的正确姿势（`install` 直接覆写在用件上是错的）
+
+四台踩点：
+
+1. **覆写正在执行的二进制吃 `ETXTBSY`**；被 mmap 的插件更糟 —— 就地写会把在跑的数据面写坏。
+   所以必须"同目录临时件 + `mv -f`"，`mv` 是 rename，旧 inode 由在跑的进程继续持有。
+2. **临时件要和目标同一个文件系统**，否则 `mv` 退化成"复制 + unlink"，原子性没了。
+3. VPP 那侧 `grep sr_wg_plugin /proc/<vpp pid>/maps` 在 CPE1 上显示 `... sr_wg_plugin.so (deleted)`：
+   在跑的插件**已经没有路径名指向它**。这条同时否掉了"`/usr/local/bin` 的哈希能代表在跑的那一代"这个想法。
+4. CPE1 的 `/usr/local/bin/sr-agent` 是 `32a1b26a…`（来历不明，Mac 产物树里无匹配）。改前它四处无副本，
+   现在按旧件留在 `/usr/local/bin/sr-agent.prerun-20261107`。
+
+#### 三、Mac↔盒子这条链路只有 7KB/s —— 所以别用传输来补齐
+
+实测两路：`gzip -c sr-agent | scp` 的 5,443,837 字节走了 10 分钟没走完（4.18MB 时我停了它）；
+换成**盒子主动** `curl http://192.168.1.4:8799/` 拉 247,432 字节用了 36.29s = 6,817 B/s，两个方向一样慢。
+四件 18MB 走传输要两个多小时，而传输根本没必要：
+
+```bash
+pid=$(pgrep -x sr-agent | head -1)
+sha256sum /proc/$pid/exe | cut -c1-16          # 必须是 d2ad8519648c031f，否则中断不装
+cp /proc/$pid/exe /usr/local/bin/sr-agent.swap # 盒内复制：字节必然等于在跑那一份
+chmod 0755 /usr/local/bin/sr-agent.swap && mv -f /usr/local/bin/sr-agent.swap /usr/local/bin/sr-agent
+```
+
+`/proc/<pid>/exe` 跟着内核打开的那个 inode，所以复制出来的就是"正在跑的这一段码"；
+再用期望哈希当闸门（那两个期望值同时是 Mac 产物树里核对过的 `d2ad8519…` / `bab523ff…`），
+一次网络都不走。插件是唯一必须推的（247KB，盒上没有那份字节）。脚本：`test/lab/vmlab/exp-277/align-disk.sh`。
+
+#### 四、结果与留底
+
+| 台 | `sr-agent` 盘上 | `sr-fib` 盘上 | 插件 盘上 | 在跑的（四台，全程未变） |
+| --- | --- | --- | --- | --- |
+| CPE1 | `32a1b26a…` → `d2ad8519…` | `41c04d57…` → `bab523ff…` | 本来就 `9267d28d…` | agent 241361 / fib 241436 / route 239318 / frr 406663 / vpp 239183 |
+| CPE2 | `f2e14612…` → `d2ad8519…` | `41c04d57…` → `bab523ff…` | `9d611883…` → `9267d28d…` | agent 182805 / fib 182829 / route 122631 / frr 345863 / vpp 182261 |
+| CPE3 | 同 CPE2 | 同 CPE2 | 同 CPE2 | agent 190643 / fib 248325 / route 34038 / frr 410809 / vpp 256513 |
+| CPE4 | 同 CPE2 | 同 CPE2 | 同 CPE2 | agent 2520 / fib 2553 / route 2535 / frr 151532 / vpp 910 |
+
+六方向改前 02:34Z、改后 03:0xZ 都是 6/6 `0%` 丢包（RTT 均值改前 10.4–13.5ms / 改后 9.0–14.8ms，
+改后有两路最大值 72/76ms —— VM 台宿主噪声，判据是丢包，见 §9.16）；`vm-verify.sh` **392/0/0**。
+被换下来的旧件全在盒上 `*.prerun-20261107`，**顺带补上了台账里"`sr-fib` 没有回滚底"那条**：
+`41c04d57…` 那份 11-04 代现在四台都在盒上（#268 那次是 `mv` 换的，盒上没留 `.prev`，Mac 上也没有）。
+
+三条要说白的局限：① "重启不再退回"是**推导**（字节相同 ⇒ exec 出来的就是同一份码），我没为验证而重启任何进程；
+② 插件只对齐了"下一次重启 VPP 载入哪一份"，在跑的数据面未变，判在跑哪一代仍只能用功能探针；
+③ `sr-route` 仍在 11-04 那一代的内容（run 与 disk 都是），抬它要换进程 ⇒ 撞缺陷⑧（#269 未拍），**这是有意留的分叉**。
+
+#### 五、怎么重跑
+
+```bash
+bash test/lab/vmlab/exp-277/align-disk.sh CPE1 CPE2 CPE3 CPE4   # 逐件校哈希；不符就那台中断不装
+# 只读复核（想改前先跑这个）：
+ssh CPE1 'for x in sr-route sr-frr sr-fib sr-agent; do pid=$(pgrep -x $x|head -1);
+  printf "%-9s run=%s disk=%s\n" "$x" "$(sha256sum /proc/$pid/exe|cut -c1-16)" \
+    "$(sha256sum /usr/local/bin/$x|cut -c1-16)"; done'
+TAG=277 bash test/lab/vmlab/exp-273/six.sh
+bash test/lab/vmlab/vm-verify.sh
+```
+
+原始读数在 Mac 侧 `/tmp/p277/`（`baseline.txt` 改前 run/disk+inode+pid+wg 口、`six-before.txt`/`six-after.txt`、`verify-after.txt`），
+不入库，重跑即生成。
+
