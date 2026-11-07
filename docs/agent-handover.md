@@ -24,6 +24,21 @@ owner 的三条协作习惯，违反任何一条都会被退回，这里先说�
   重启进程这类办法把现象压掉（他的原话："也就是说不允许手动方法修复"）。
 - **controller 的每个增量先出方案、他点头后再写码；一次只推进一个缺陷。**
 
+### 0.1 上车先跑这四条（全只读，跑完你就知道本文哪一句过期了）
+
+```bash
+git log --oneline -5 && git status --short                       # HEAD 与别人留下的散工
+VBoxManage list runningvms                                        # 应是 7 台：CPE1-4 cust12 cust3 cust4
+ps -eo pid,etime,command | grep -E "sr-ctrl|sr-rr" | grep -v grep # 控制面在不在 Mac 上（§2.1）
+ssh CPE1 'for x in sr-route sr-frr sr-fib sr-agent; do pid=$(pgrep -x $x|head -1);
+  printf "%-9s run=%s disk=%s\n" "$x" "$(sha256sum /proc/$pid/exe|cut -c1-16)" \
+    "$(sha256sum /usr/local/bin/$x|cut -c1-16)"; done'            # §3 那张表还成立吗
+```
+
+第四条如果哪一行 `run != disk`，说明有人换过件没装盘（或有第二 agent 在铺产物）—— 先问 owner 再动手，
+别直接重启去"对齐"。第二条如果 7 台不全在跑，你的现场是别人的半成品，先声明再说。
+`vm-verify.sh`（约 2 分钟）和 `exp-273/six.sh` 同样随时可跑，但跑的时候确认没人在注入故障（§10）。
+
 ---
 
 ## 1. 这个项目是什么
@@ -87,7 +102,7 @@ VBoxManage list runningvms   →   CPE1 CPE2 CPE3 CPE4 cust12 cust3 cust4
 
 ### 2.3 旧 docker lab 还在跑 —— 这是个陷阱，先认清对象
 
-`docker ps` 现在能看到 `lp-cpe1..4`、`lp-rr`、`lp-cust3/4/12`、`lp-term4`（已 Up 4 天）。
+`docker ps` 现在能看到 `lp-cpe1..4`、`lp-rr`、`lp-cust3/4/12`、`lp-term3/4/12`（全部 Up 4 天，2026-11-07 复核）。
 **被测现场不是这些容器**，它们是 docker 时代遗留的 lab（S8 那步"用户关 docker"至今没做完，任务 #244）。
 现在 docker 只剩一个用途：
 
@@ -275,7 +290,9 @@ git push origin feat/vbond-control-plane
 ```
 
 一次性身份，不动 git config；**只推 `feat/vbond-control-plane`，不推 master，不 force**
-（master 历史里有密钥材料，那条线永远不推）。当前 HEAD = `1dc4ab2`（#274）。
+（master 历史里有密钥材料，那条线永远不推）。HEAD 随手会往前走，别信这里写的：现取
+`git log --oneline -5`（本轮收口时依次是 `fe03988` vppctl 口径更正 → `57591f0` #277 产物收口 →
+`86e4b2d` 这份把手入库 → `1dc4ab2` #274 窗口撤回）。
 `.out/`、`controller/.out-*` 这类散工目录留在未跟踪状态。
 每个验证过的增量都提交推送，并且**结尾给他一份能自己登录复核的把手**（账号/角色；口令值只在对话里给，不进仓库）。
 
@@ -312,10 +329,17 @@ owner 说"sr-frr 轮询是 2s 一次，太慢了"指的是默认值；无论哪�
 3. **并发 `scp` 会静默截断文件**。产物推送一律串行，落地后 `sha256sum` 对一遍再算数。
 4. **打流窗口放在管道子 shell 里会假绿**（"0ms 中断"就是这么来的）。计时要落在真正执行的那一侧。
 5. **trace 只在收侧有意义**；转发到的包在收侧会被 punt，别把 punt 当丢包。
-6. `vppctl` 参数别整体加引号（§4）。
+6. **`vppctl -s /run/vpp/api.sock <CLI 命令>` 不回话也不报错地一直挂着**（§4 有实测）；取证一律 `timeout 15 vppctl …`，
+   跑完 `pgrep -a vppctl` 看一眼有没有留下的孤儿客户端。
 7. **边跑边改被测脚本**会得到不可解释的数；脚本要么跑前定稿，要么重跑。
 8. 原始读数不进仓库，落 `/tmp/<任务号>/`（`samples-*.txt` / `probe-*.txt` / `window-*.txt`），
    文档里只放汇总数字。
+9. **Mac↔盒子这条链路只有 7KB/s 量级**（2026-11-07 实测，两个方向都是；§4 第 4 条有数字）。
+   想"推一份产物过去再装"在这种链路上是几十分钟到几小时，而且中途断了会留下半截文件 ——
+   补齐盘上那份要改成盒内 `cp /proc/<pid>/exe`（#277 的方法），只有盒上没有那份字节时才走网络。
+10. **盒子上的 VPP 进程名是 `vpp_main`，不是 `vpp`** —— `pgrep -x vpp` 在这四台上返回空（今天实测），
+    取 pid 用 `pgrep vpp_main`。`sha256sum /proc//exe` 这种拼出来的空 pid 会静默给你空哈希，
+    看起来像"盘上没有"。
 
 ---
 
@@ -342,16 +366,15 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 | **#276** 收敛改事件驱动 | 待开工，**先出方案** | 目标是把 §6 末尾那个 12~19s 的 refill 压成瞬时：`sr-fib` 与 `sr-frr` 都按 `poll_sec` 轮询（`cmd/sr-fib/main.go:473`、`cmd/sr-frr/main.go:807`；默认 2s、lab 盘上配的是 1s），owner 原话"sr-frr 轮询是 2s 一次，这个太慢了，必须像 frr 重分发那样瞬时" |
 | #272 跨盒回灌 | 待拍 | 注入的 K 路由进了客户 area0 后被别的盒当 `local` 上报 |
 | #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞（BFD 150ms 判定 + sr-fib 1s 轮询直接摘路，无抑制） |
-| #269 缺陷⑧ | 待拍 | 开机清单与 watch 并发，同一秒把 sr-route/sr-fib 各起两个（拟加互斥） |
+| #269 缺陷⑧ | 待拍 | 开机清单与 watch 并发，同一秒把 sr-route/sr-fib 各起两个（拟加互斥）。它现在是"把 `sr-route` 抬到 HEAD 那一代"的**唯一阻塞**（见 §3 末"仍不一致的那一处"） |
 | ~~#268 / #260 产物没装全~~ | **已收口（#277，2026-11-07）** | 四台盘上已换成在跑那一份，`run==disk` 全一致；判据与留底见 §3 和 `exp-277/README.md`。**代码没再动**，这一轮修的是产物一致性 |
-| #269 缺陷⑧ | 待拍 | 同上，且它现在是"把 `sr-route` 抬到 HEAD 那一代"的**唯一阻塞**（见 §3 末"仍不一致的那一处"） |
 | G-2 隧道表落盘 | 只出了方案（`3a09f03`） | 隧道层磁盘恢复不了 ⇒ §2.5 那个 `sr-box` exit 1 |
 | NAT 阶梯 #222 + M-4/M-1/M-3/M-5、#211/#213/#244/S8 | 挂着 | 顺序 M-4→M-1→M-2→M-3 |
 
 历史与决策的权威出处（要引结论去这里引，别信二手转述）：
-[docs/vmlab-rebuild-plan.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/vmlab-rebuild-plan.md)（增量台账，§9.19/§9.20/§9.21 是最近三节，§9.21 作废了前两节里"窗口保留"的说法）、
+[docs/vmlab-rebuild-plan.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/vmlab-rebuild-plan.md)（增量台账，最近四节是 §9.19/§9.20/§9.21/§9.22；§9.21 作废了前两节里"窗口保留"的说法，§9.22 是 #277 产物收口）、
 [docs/loop-test-report.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/loop-test-report.md)（客户侧成环实验，P-3 已标注否决）、
-`test/lab/vmlab/exp-27{1,3,4}/README.md`（实验台本，每个目录的 README 就是那轮的判据与局限）。
+`test/lab/vmlab/exp-27{1,3,4,7}/README.md`（实验台本，每个目录的 README 就是那轮的判据与局限）。
 `/Users/louis/srvmlab/MANIFEST.md` 是产物台账，但它会滞后 —— 它原来那句"在跑的进程就是盘上这一份（inode 已核对）"
 是**判据本身错了**（inode 相同只能证明进程来自那个名字，不能证明没被别人再换过一次；#277 之后更是哈希相同、inode 不同）。
 它 11-07 已改成 run/disk 两列，但**以 §3 为准**，读之前先跑 §3 那条复核命令。
