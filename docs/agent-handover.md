@@ -406,7 +406,7 @@ lab 的当前形状属于 owner，不属于任何一次实验。
 - 设备 API：`0.0.0.0:8444`（TLS）；STUN：`3478`/`3479`；RR：`18446/19446`（rr1）、`18447/19447`（rr2）。
 - 盒内：`ssh CPE1|CPE2|CPE3|CPE4|cust12|cust3|cust4`（走 `~/.ssh/config` 别名，直连 IP 被拒）。
 - 构建：`docker exec lp-ctrl sh -lc 'cd /workspace/controller && go build ./... && go vet ./... && go test ./...'`。
-- 远程仓库：gitee，只推 `feat/vbond-control-plane`；当前 HEAD `1dc4ab2`。
+- 远程仓库：gitee，只推 `feat/vbond-control-plane`；HEAD 现取 `git log --oneline -5`（见 §5.3，别信写死的哈希）。
 
 ---
 
