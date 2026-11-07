@@ -3369,3 +3369,12 @@ bash test/lab/vmlab/vm-verify.sh
 原始读数在 Mac 侧 `/tmp/p277/`（`baseline.txt` 改前 run/disk+inode+pid+wg 口、`six-before.txt`/`six-after.txt`、`verify-after.txt`），
 不入库，重跑即生成。
 
+同一批件收口后又当台复测了一轮插件（四台全跑）：`grep sr_wg_plugin /proc/$(pgrep vpp_main)/maps` 四台都还是
+`sr_wg_plugin.so (deleted)` —— 在跑的仍是换下来那个旧 inode，盘上已是 `9267d28d…`，
+和这一节"只装盘、不换进程"的口径一致；`vppctl show sr-wg probe` 两次采样 `echoed` 四台全在涨
+（2 会话 +14/2s、3 会话 +20/2s）。这轮里踩到一条新口径，记在这里也记进 `agent-handover.md` §4：
+**`vppctl -s /run/vpp/api.sock <CLI 命令>` 不回话也不报错地一直挂着**（`-s` 是二进制 API 口，CLI 命令没有对应消息），
+我第一次复测就因为这个把四台循环卡死在第一台；加不加引号反而都不影响 —— `agent-handover.md` §4 原先那条
+"引号导致 `unknown input`"出自 `86e4b2d`，这里查不到对应实测记录，今天四种组合（带/不带引号 × `show sr-wg probe` /
+`show interface`）全部正常回话，已按不成立删掉。复测一律写成 `timeout 15 vppctl …`，孤儿 vppctl 用 `pgrep -a vppctl` 清掉。
+

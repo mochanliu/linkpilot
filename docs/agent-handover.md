@@ -212,8 +212,18 @@ done'
 
 - 隧道口条数：`vppctl show interface | grep -cE '^wg'`（CPE1=2、CPE3/4=3）。
   `vppctl sr_wg_dump`、`vppctl show table`、`vppctl show wireguard interfaces` **都不是我们的命令**。
-- `vppctl` 的参数**不要整体加引号**：`vppctl "show sr-wg probe"` 会回 `unknown input`，
-  不加引号才通。这个坑今天差点让我写下"四台都跑着遥测前的插件"。
+- **别给 `vppctl` 加 `-s /run/vpp/api.sock`。** `-s` 把 vppctl 切到二进制 API 口，CLI 命令发过去没有对应消息，
+  于是**不回话也不报错地一直挂着**（2026-11-07 实测 CPE1：`vppctl -s /run/vpp/api.sock show interface` 和
+  `… show sr-wg probe` 两条都零输出，靠 `timeout 15` 才收回来）。`vppctl <cli 命令>` 不加 `-s` 才是对的。
+  挂掉的 vppctl 客户端会作为孤儿进程留在盒上（`pgrep -a vppctl` 能看到），不影响 VPP，但会污染下一次取证，
+  用 `timeout N vppctl …` 包一层最省事。
+  这条是我自己今天踩的：#277 收口后复测插件那轮，我第一次加了 `-s`，四个盒子的循环卡死在第一台。
+- **引号不是问题**（更正先前写在这里的说法）。2026-11-07 在 CPE1 四种组合实测：
+  `vppctl "show sr-wg probe"`、`vppctl show sr-wg probe`、`vppctl "show interface"`、`vppctl show interface`
+  **全部正常回话**。被更正的那条出自 `86e4b2d`（昨天写把手时加的），`vmlab-rebuild-plan.md` 里查不到它对应的实测记录，
+  今天在同一套 VM 盒上又复现不出来 ⇒ 按不成立删掉。今天这次卡死可以确定是 `-s` 造成的：同一条命令去掉 `-s` 立刻回话。
+  插件在跑的判据是 `vppctl show sr-wg probe` 两次采样（隔 2s）`echoed` 在涨 —— 四台现在都涨
+  （2 会话的 CPE1/2 约 +14/2s，3 会话的 CPE3/4 约 +20/2s）。
 
 ---
 
