@@ -936,6 +936,171 @@ func TestSetTunnelsRemovesPathAndRouteLeavesTheTable(t *testing.T) {
 	}
 }
 
+// TestSetTunnelStateDropsRouteWhenPeerTunnelGoesDown is the #275 root case:
+// the tunnel is configured (SetTunnels already ran), the route was imported,
+// then the agent says the BFD went down. The route leaves the RIB but stays
+// in the pending list -- a resolvable flip is not a withdrawal, and RR does
+// not see a thing.
+func TestSetTunnelStateDropsRouteWhenPeerTunnelGoesDown(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
+	rr.announce(rt)
+	waitFor(t, "route imported", func() bool { return len(c.RIB(5)) == 1 })
+
+	if err := c.SetTunnelState([]TunnelState{{PeerNodeID: 20, BFDState: "down"}}); err != nil {
+		t.Fatalf("SetTunnelState: %v", err)
+	}
+	if n := len(c.RIB(5)); n != 0 {
+		t.Fatalf("route survived a BFD down: %v", ribPrefixes(c.RIB(5)))
+	}
+	p := c.Pending()
+	if len(p) != 1 || p[0].Reason != PendingNoPath {
+		t.Fatalf("pending = %+v, want one PendingNoPath", p)
+	}
+	if n := rr.sentTunnelFrames(); n != 0 {
+		t.Fatalf("RR received %d frames; tunnel-state is a local-only fact", n)
+	}
+}
+
+// TestSetTunnelStateReimportWhenPeerTunnelComesBack: a resolvable flip back
+// to true re-installs the route without another RR message. Symmetric with
+// the "down" test above.
+func TestSetTunnelStateReimportWhenPeerTunnelComesBack(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
+	rr.announce(rt)
+	waitFor(t, "route imported", func() bool { return len(c.RIB(5)) == 1 })
+
+	if err := c.SetTunnelState([]TunnelState{{PeerNodeID: 20, BFDState: "down"}}); err != nil {
+		t.Fatalf("SetTunnelState(down): %v", err)
+	}
+	if n := len(c.RIB(5)); n != 0 {
+		t.Fatalf("route still installed after down: %v", ribPrefixes(c.RIB(5)))
+	}
+	if err := c.SetTunnelState([]TunnelState{{PeerNodeID: 20, BFDState: "up"}}); err != nil {
+		t.Fatalf("SetTunnelState(up): %v", err)
+	}
+	got := c.RIB(5)
+	if len(got) != 1 || got[0].Prefix != "10.20.0.0/16" {
+		t.Fatalf("route did not come back: %v", ribPrefixes(got))
+	}
+	if n := len(c.Pending()); n != 0 {
+		t.Fatalf("pending = %d, want 0", n)
+	}
+}
+
+// TestSetTunnelStateAbsentLeavesConfigGateInCharge is the reach.go rule:
+// "no BFD session" is not "unreachable", it is "no information". A row of
+// state=absent means the agent looked and had nothing; the route must stay
+// installed exactly as if no tunnel-state had arrived.
+func TestSetTunnelStateAbsentLeavesConfigGateInCharge(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
+	rr.announce(rt)
+	waitFor(t, "route imported", func() bool { return len(c.RIB(5)) == 1 })
+
+	if err := c.SetTunnelState([]TunnelState{{PeerNodeID: 20, BFDState: "absent"}}); err != nil {
+		t.Fatalf("SetTunnelState(absent): %v", err)
+	}
+	if n := len(c.RIB(5)); n != 1 {
+		t.Fatalf("absent BFD black-holed the route: %v", ribPrefixes(c.RIB(5)))
+	}
+	if got := c.TunnelStates(); len(got) != 0 {
+		t.Fatalf("TunnelStates = %+v, want empty for absent-only rows", got)
+	}
+}
+
+// TestSetTunnelStateAnyUpWins is the multi-tunnel rule: same peer, several
+// tunnels, one BFD up and one BFD down. reach.go's convention -- "任意一条
+// Up 就算可达". The peer's routes stay installed.
+func TestSetTunnelStateAnyUpWins(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Tunnels = []Tunnel{
+		{Peer: 20, NextHop: "192.168.99.2"},
+		{Peer: 20, NextHop: "192.168.100.2"},
+	}
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
+	rr.announce(rt)
+	waitFor(t, "route imported", func() bool { return len(c.RIB(5)) == 1 })
+
+	if err := c.SetTunnelState([]TunnelState{
+		{PeerNodeID: 20, BFDState: "up"},
+		{PeerNodeID: 20, BFDState: "down"},
+	}); err != nil {
+		t.Fatalf("SetTunnelState: %v", err)
+	}
+	if n := len(c.RIB(5)); n != 1 {
+		t.Fatalf("one up + one down made the peer unreachable: %v", ribPrefixes(c.RIB(5)))
+	}
+	got := c.TunnelStates()
+	if len(got) != 1 || got[0].PeerNodeID != 20 || got[0].BFDState != "up" {
+		t.Fatalf("TunnelStates = %+v", got)
+	}
+}
+
+// TestSetTunnelStateEmptyBatchClearsEveryPeer: the batch is the whole truth
+// every round. A peer that was previously down but is missing from this
+// batch is no longer down -- it is "no information" and the config gate
+// rules again.
+func TestSetTunnelStateEmptyBatchClearsEveryPeer(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	rt := testRoute(20, 5, "10.20.0.0/16", "65000:6")
+	rr.announce(rt)
+	waitFor(t, "route imported", func() bool { return len(c.RIB(5)) == 1 })
+
+	if err := c.SetTunnelState([]TunnelState{{PeerNodeID: 20, BFDState: "down"}}); err != nil {
+		t.Fatalf("SetTunnelState(down): %v", err)
+	}
+	if n := len(c.RIB(5)); n != 0 {
+		t.Fatalf("route survived a BFD down: %v", ribPrefixes(c.RIB(5)))
+	}
+	// Next sample: agent's VPP connection went away so it sent nothing.
+	if err := c.SetTunnelState(nil); err != nil {
+		t.Fatalf("SetTunnelState(nil): %v", err)
+	}
+	if n := len(c.RIB(5)); n != 1 {
+		t.Fatalf("empty batch kept the peer stuck down: %v", ribPrefixes(c.RIB(5)))
+	}
+}
+
+// TestSetTunnelStateRejectsUnknownState is the "fail loud" side of the
+// design: a peer row with a state string the route package has never heard
+// of is a real defect (an agent/sr-route version mismatch, or a bad manual
+// curl), and silent acceptance would hide it until routes started dropping.
+func TestSetTunnelStateRejectsUnknownState(t *testing.T) {
+	rr := newScriptedRR()
+	cfg := testClientConfig()
+	cfg.Dial = rr.dial
+	c := startClient(t, cfg)
+
+	if err := c.SetTunnelState([]TunnelState{{PeerNodeID: 20, BFDState: "sunny"}}); err == nil {
+		t.Fatal("SetTunnelState accepted an unknown BFD state")
+	}
+	if err := c.SetTunnelState([]TunnelState{{PeerNodeID: 0, BFDState: "up"}}); err == nil {
+		t.Fatal("SetTunnelState accepted peer_node_id 0")
+	}
+}
+
 func TestClientWithNoTunnelsStillHoldsTheSession(t *testing.T) {
 	// A device that has not been given a tunnel yet still has a session and a
 	// whole table: the RR does not care what it can reach, only it does.

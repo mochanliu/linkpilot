@@ -237,8 +237,23 @@ func main() {
 	}
 	// 隧道内遥测有自己的节拍，不挂在心跳上：每次 Sample 报的是"上一次采样以来的
 	// 增量"，心跳退避到 30s 时窗口会被拉长，抖动/丢包就糊掉了。
+	//
+	// 同一份样本还要推给本机 sr-route 的 /tunnel-state（#275）：路由客户端的
+	// resolvable 以前只看配置表，BFD 判 down 之后 RR 会话仍然照宣、sr-fib 照装，
+	// 客户流量走死路。这里把每次采样的隧道状态交给 sr-route，让 resolvable
+	// 同时吃"BFD 说活"这一半。route.json 不存在/没有 status_addr 时 pusher 是
+	// nil，一切照旧（配置门槛 alone）。
 	if tun != nil {
-		go metricsLoop(ctx, tun.Telemetry(), client, log.Printf)
+		pusher, err := agent.NewRouteStatePusher(*routeConf)
+		if err != nil {
+			// Not fatal: a box that never had route.json is still a box that
+			// can send heartbeats; the metrics loop just will not reach
+			// sr-route this round, and the log says why.
+			log.Printf("route-state pusher: %v (BFD 结果不会回灌给本机 sr-route)", err)
+		} else if pusher != nil {
+			log.Printf("route-state pusher on (sr-route %s)", *routeConf)
+		}
+		go metricsLoop(ctx, tun.Telemetry(), client, pusher, log.Printf)
 	}
 
 	var cfg *configSync
@@ -410,7 +425,11 @@ const metricsInterval = 10 * time.Second
 // 一次失败只记日志：窗口是增量（见 agent.Telemetry.row），丢一个窗口不会污染
 // 下一个；而在这里退避或退出，只会让控制器上的数据变成"陈旧"而不是"报错"。
 // 没有隧道时也发一次空表 —— 隧道全撤了还挂着旧行，读数比空表更误导。
-func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client, logf func(string, ...any)) {
+//
+// pusher 是本机 sr-route 的 tunnel-state 客户端（#275）；nil 表示这台没有
+// route.json/status_addr，路由客户端仍按配置门槛走。上报控制器与推给
+// sr-route 各自成功/失败：一份份独立的通路，一条断了不影响另一条。
+func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client, pusher *agent.RouteStatePusher, logf func(string, ...any)) {
 	hadRows := false
 	for {
 		select {
@@ -422,6 +441,11 @@ func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client
 		rows, err := tel.Sample(rctx)
 		if err == nil && (len(rows) > 0 || hadRows) {
 			err = client.ReportMetrics(rctx, wire.MetricsReport{Tunnels: rows})
+		}
+		if err == nil && pusher != nil {
+			// sr-route 一侧走自己的短超时（Push 内部已限 3s），不再复用
+			// 心跳的 5s 上下文：一次 tunnel-state 卡住绝不能把心跳拖走。
+			err = pusher.Push(context.WithoutCancel(rctx), rows)
 		}
 		cancel()
 		if err != nil {

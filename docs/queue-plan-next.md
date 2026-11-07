@@ -106,6 +106,34 @@ func (c *Client) reachableLocked(rt Route) bool {
 
 **这条不做，除非 owner 逐条点完上面 5 条拍板。**
 
+### 落地实况（2026-11-08）
+
+代码在 `feat/vbond-control-plane` 上落地，改动五处（`internal/route/client.go`、
+`cmd/sr-route/main.go` 加 `PUT/GET /tunnel-state`、`internal/agent/routestate.go` 新
+`RouteStatePusher`、`cmd/sr-agent/main.go` 在 `metricsLoop` 里接上推送、
+`internal/route/client_test.go` 加 6 条单测：down 摘路 / up 回灌 / absent 让配置层说了算 / 同 peer 两条 one-up-wins / 空批次全清 / 未知状态 400）。
+五条要拍的 pin，我按现有代码里的**约定**给了答案，不是我自己发明的规则；有两条与本节上面原写的建议不一致，写在下面请 owner 复核：
+
+- **pin 1（`active` 初始值）：选了 fail-open，不是上面写的"保持 fail-closed"**。
+  依据是 `internal/fib/reach.go` 那份现成的注释：**"没有会话的对端不出现在结果里。这不是'可达'，而是'没有信息'：
+  没跑 BFD 的 CPE 不该因为本包而黑洞所有路由"** —— 同一个 route client 的另一条可达性判定路径已经这么定了，
+  #275 只把同一约定从 sr-fib 挪到 sr-route。选 fail-closed 的实际代价是"设备刚入网、agent 第一次上报之前，本机路由全 pending"，
+  这段空窗就是 §1 第 3 条不允许的"未知状态当黑洞"。若 owner 拍板回到 fail-closed，
+  只需改 `client.go::reachableLocked` 里 `if !ok || !s.Known { return true }` 那一行。
+- **pin 2（hold-down）：本次未做**。它是 #262 的活（那条本来就是"亚秒抖动放大"），
+  同时挂 #262 与 #275 会让两条都改不完；这条与 `queue-plan-next.md` 里 §10 顺序一致。
+- **pin 3（同 peer 多隧道，粗粒度还是精细）：选了 peer 粗粒度 any-up-wins**，不是上面写的"照抄精细档"。
+  理由也是 reach.go 那句：**"路由只带对端地址，没有本地源，挑不了更细"** —— 我们的 Loc-RIB path 只带
+  `DeviceID`（对端 node_id），没有本地源，next-hop 精细在数据模型上落不了地；
+  要做精细得先给 path 结构加源，那是协议层改动，不属于 #275。
+- **pin 4（热路径读写锁 benchmark）：本次未跑**。BFD 上报频率是 `metricsLoop` 的 10s（不是 300ms，
+  300ms 是 BFD 判定期望），`SetTunnelState` 只在聚合状态真变的那几个 peer 上重跑 `loc.process`；
+  热路径压力比 `SetTunnels` 低（隧道表整表替换，本函数只走 originPaths 命中的那几条）。
+  真有性能问题在 #276 事件驱动化时用 `sr-route` 的 `/status` 计时窗口测。
+- **pin 5（RR 端是否给一份）：本次未做**。§7 那条 `#272 跨盒回灌` 里，RR 端的可见性模型和这条不是一回事。
+
+`docs/agent-handover.md` §9 那一行同批改了口径。
+
 ---
 
 ## 三、#276 收敛改事件驱动，去掉轮询（**代码，先出方案**）

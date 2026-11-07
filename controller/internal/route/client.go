@@ -234,6 +234,12 @@ type Client struct {
 	skipped  []LocalSkip // the same inputs that could not become routes
 	tunnels  []Tunnel
 	nextHops map[uint16][]string // peer -> ascending next hops of its tunnels
+	// peerBFD is the reachability view reported by the agent for the peer's
+	// tunnels as a whole. Config (nextHops) says "this box has a tunnel to N";
+	// peerBFD says whether that tunnel is still carrying anything. Nil / absent
+	// for a peer = no information, so reachableLocked falls back to config --
+	// same "no session = do not filter" rule as internal/fib.UnreachablePeers.
+	peerBFD map[uint16]peerBFDState
 
 	mu       sync.Mutex
 	sessions []*clientSession // wanted ones first, in configured order, then the retired ones
@@ -333,6 +339,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg:     cfg,
 		hold:    hold,
 		dynamic: map[localKey]LocalPrefix{},
+		peerBFD: map[uint16]peerBFDState{},
 		loc:     newLocRib(),
 	}
 	vrfs, ids, exports, err := buildVRFs(cfg.VRFs)
@@ -625,6 +632,95 @@ func changedOrigins(before, after map[uint16][]string) map[uint16]struct{} {
 	return changed
 }
 
+// TunnelState is one row of the agent's per-tunnel BFD verdict. It is the
+// input to SetTunnelState, aggregated per peer on arrival.
+//
+// BFDState follows wire.TunnelMetrics's vocabulary: "up" | "init" | "down" |
+// "admin-down" | "absent". "absent" means "no BFD session for this tunnel" --
+// reachability is unknown, not negative.
+type TunnelState struct {
+	PeerNodeID uint16 `json:"peer_node_id"`
+	BFDState   string `json:"bfd_state"`
+}
+
+// peerBFDState is the compiled view for one peer.
+//
+// Known says the agent said anything at all about this peer (at least one
+// non-absent row). Active says at least one of those rows is BFD up. When
+// Known is false, reachableLocked falls back to the config gate -- exactly the
+// rule internal/fib.UnreachablePeers uses for "no session = no information".
+type peerBFDState struct {
+	Known  bool
+	Active bool
+}
+
+// SetTunnelState replaces the reachability view with the agent's latest
+// sample. Only peers whose aggregated state changes re-enter the Loc-RIB,
+// the same shape as SetTunnels: no session is touched, nothing is re-sent
+// to the RR, prefixes held pending resolve in place.
+//
+// The batch is complete: any peer not mentioned (or mentioned only with
+// "absent") becomes Known=false, so a tunnel with no BFD installed still
+// passes the config gate. That is on purpose -- a half-applied tunnel must
+// not be more reachable than a fully-applied one, and one that never had
+// BFD must not black-hole all its prefixes just because the agent doesn't
+// know to say "up".
+func (c *Client) SetTunnelState(states []TunnelState) error {
+	fresh, err := aggregatePeerBFD(states)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	before := c.peerBFD
+	c.peerBFD = fresh
+	for id, neu := range fresh {
+		old, had := before[id]
+		if had && old == neu {
+			continue
+		}
+		for _, p := range c.loc.originPaths(id) {
+			c.loc.process(p.route, p.source, c.reachableLocked(p.route))
+		}
+	}
+	for id := range before {
+		if _, still := fresh[id]; still {
+			continue
+		}
+		for _, p := range c.loc.originPaths(id) {
+			c.loc.process(p.route, p.source, c.reachableLocked(p.route))
+		}
+	}
+	return nil
+}
+
+// aggregatePeerBFD compiles one peer's rows: any up wins; a down / init /
+// admin-down row makes the peer "known not up"; only absent rows (or an
+// unmentioned peer) means "no information".
+func aggregatePeerBFD(states []TunnelState) (map[uint16]peerBFDState, error) {
+	out := make(map[uint16]peerBFDState, len(states))
+	for _, s := range states {
+		if s.PeerNodeID == 0 {
+			return nil, errors.New("route client: tunnel state row has peer_node_id 0")
+		}
+		pe := out[s.PeerNodeID]
+		switch s.BFDState {
+		case "up":
+			pe.Known = true
+			pe.Active = true
+		case "init", "down", "admin-down":
+			pe.Known = true
+		case "absent", "":
+			// no information from this row -- leave Known whatever an earlier
+			// row for the same peer set.
+		default:
+			return nil, fmt.Errorf("route client: peer %d has unknown bfd_state %q", s.PeerNodeID, s.BFDState)
+		}
+		out[s.PeerNodeID] = pe
+	}
+	return out, nil
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -876,6 +972,29 @@ func (c *Client) Tunnels() []Tunnel {
 	return copyTunnels(c.tunnels)
 }
 
+// TunnelStates returns the compiled per-peer view: only peers the last batch
+// had anything to say about, one row each. "up" means any tunnel was BFD up,
+// "down" means every reported tunnel is down / init / admin-down. A peer not
+// in the output has no BFD information here -- its routes still pass the
+// config gate.
+func (c *Client) TunnelStates() []TunnelState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]TunnelState, 0, len(c.peerBFD))
+	for id, s := range c.peerBFD {
+		if !s.Known {
+			continue
+		}
+		st := "down"
+		if s.Active {
+			st = "up"
+		}
+		out = append(out, TunnelState{PeerNodeID: id, BFDState: st})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerNodeID < out[j].PeerNodeID })
+	return out
+}
+
 // VRFs returns the local VRF table in force, sorted by id. RTs come back
 // canonicalised and sorted, so a reader sees the same strings the routes carry
 // rather than the order they were configured in -- and an empty list is empty,
@@ -974,12 +1093,26 @@ func (c *Client) admitLocked(rt Route) (reachable bool, reason string) {
 	return true, ""
 }
 
-// reachableLocked is the tunnel gate: does this device have any tunnel to the
-// route's origin right now. This is the only thing path.resolvable is set from.
+// reachableLocked is the tunnel gate: does this device have a tunnel to the
+// route's origin, and does anything we know say that tunnel is still up. The
+// config half is `nextHops` (SetTunnels); the reachability half is `peerBFD`
+// (SetTunnelState). This is the only thing path.resolvable is set from.
+//
+// "no BFD information" does not mean "reachable" -- it means we cannot say,
+// and the config gate is the last word. Same rule as
+// internal/fib.UnreachablePeers's "没有会话的对端不出现在结果里": a box that
+// never installed BFD must not black-hole every route through it.
 //
 // Must be called with c.mu held.
 func (c *Client) reachableLocked(rt Route) bool {
-	return len(c.nextHops[rt.DeviceID]) > 0
+	if len(c.nextHops[rt.DeviceID]) == 0 {
+		return false
+	}
+	s, ok := c.peerBFD[rt.DeviceID]
+	if !ok || !s.Known {
+		return true
+	}
+	return s.Active
 }
 
 // importablePathLocked is GoBGP's per-VRF view at the global level: the first

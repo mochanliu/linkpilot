@@ -330,6 +330,14 @@ type tunnelsDoc struct {
 	Tunnels []tunnelConfig `json:"tunnels"`
 }
 
+// tunnelStatesDoc is the GET/PUT /tunnel-state body: the agent's per-tunnel
+// BFD verdict, compiled by sr-agent from a metricsLoop sample. It replaces
+// the whole view: peers not in the batch become "no information", matching
+// what a fresh agent right after boot sees -- the config gate alone.
+type tunnelStatesDoc struct {
+	Peers []route.TunnelState `json:"peers"`
+}
+
 type vrfsDoc struct {
 	VRFs []vrfConfig `json:"vrfs"`
 }
@@ -445,6 +453,30 @@ func statusMux(c *route.Client) *http.ServeMux {
 			}
 			log.Printf("sr-route: 隧道表 = %d 条（待决 %d 条）", len(c.Tunnels()), len(c.Pending()))
 			writeJSON(w, tunnelsDoc{Tunnels: tunnelsOf(c)})
+		default:
+			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
+		}
+	})
+	// PUT replaces the per-peer reachability view. The agent samples BFD every
+	// 10s and pushes the compiled verdict here; sr-route re-enters only the
+	// Loc-RIB paths whose peer state changed (GoBGP Nexthop Tracking shape).
+	// An empty batch is a legitimate answer: "we have nothing to say", so every
+	// peer falls back to the config gate.
+	mux.HandleFunc("/tunnel-state", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, tunnelStatesDoc{Peers: c.TunnelStates()})
+		case http.MethodPut:
+			var doc tunnelStatesDoc
+			if !decodeJSON(w, r, &doc) {
+				return
+			}
+			if err := c.SetTunnelState(doc.Peers); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			log.Printf("sr-route: 隧道可达性 = %d 条（覆盖 %d 台对端）", len(doc.Peers), len(c.TunnelStates()))
+			writeJSON(w, tunnelStatesDoc{Peers: c.TunnelStates()})
 		default:
 			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 		}

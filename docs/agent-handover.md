@@ -365,7 +365,7 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 
 | 任务 | 状态 | 一句话现状 |
 | --- | --- | --- |
-| **#275** `resolvable` 改吃活动隧道 | **方案已出**（`docs/queue-plan-next.md` §二），等 owner 逐条点完 5 条拍板再动代码 | 现在的门是配置的：`reachableLocked()` 只看隧道表 `controller/internal/route/client.go:981`，隧道实际死了也算可达 ⇒ 这才是根因。可达性粒度已拍**严格 fail-closed：无 BFD 信息即不可达**；接 GoBGP Nexthop Tracking 的形状，hold-down 先行（建议默认 5s 起，owner 拍） |
+| **#275** `resolvable` 改吃活动隧道 | **已落地（2026-11-08）**，单测 6 条绿；e2e 判据待跑（要注入 BFD down，属于会动 lab 现状的动作，需 owner 声明窗口） | 门换成"配置 && 活着"：`reachableLocked()` 先看 `nextHops`（配置层，未配置=不可达，同旧），再看 `peerBFD[peer]`（活动层）。活动层是 agent 每次 `metricsLoop` 上报的 BFD 结果经 sr-route 新端点 `PUT /tunnel-state` 灌进来的；`sr-agent` 端接线在 `internal/agent/routestate.go`，`RouteStatePusher` 读 `route.json` 里的 `status_addr` 定位到本机 sr-route，把原始 `wire.TunnelMetrics` 行透传过去，聚合逻辑（同 peer 多隧道 any-up-wins、absent=没有信息）全在 `internal/route` 里。细则见 `docs/queue-plan-next.md` §二 落地实况。**四条 pin 的实际选择**：pin1 采用**内部/fib/reach.go 的 fail-open 口径**（"没跑 BFD 的 CPE 不该因为本包而黑洞所有路由"），与 §二 原方案里"严格 fail-closed"那条相反 —— 若 owner 拍要改回 fail-closed，只需调 `reachableLocked` 里 `!s.Known` 那行，代价是刚入网的前几秒（agent 第一次上报之前）本机路由会全部 pending；pin3 按 **peer 粗粒度 any-up-wins**（照 reach.go 的注释"路由只带对端地址，没有本地源，挑不了更细"），不是 §二 建议的 next-hop 精细；pin2 hold-down **本次未做**，交给 #262（那条本来就管"亚秒抖动放大"）；pin5 RR 侧本次未做，交给 #272 |
 | **#276** 收敛改事件驱动 | **方案已出**（`docs/queue-plan-next.md` §三），等 owner 点完 3 条拍板再动代码 | 目标是把 §6 末尾那个 12~19s 的 refill 压成瞬时：`sr-fib` 与 `sr-frr` 都按 `poll_sec` 轮询（`cmd/sr-fib/main.go:473`、`cmd/sr-frr/main.go:807`；默认 2s、lab 盘上配的是 1s），owner 原话"sr-frr 轮询是 2s 一次，这个太慢了，必须像 frr 重分发那样瞬时"。transport 建议 SSE，断线兜底立即全量重放 |
 | #272 跨盒回灌 | 待拍 | 注入的 K 路由进了客户 area0 后被别的盒当 `local` 上报 |
 | #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞（BFD 150ms 判定 + sr-fib 1s 轮询直接摘路，无抑制） |
