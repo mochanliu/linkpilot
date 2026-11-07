@@ -365,8 +365,8 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 
 | 任务 | 状态 | 一句话现状 |
 | --- | --- | --- |
-| **#275** `resolvable` 改吃活动隧道 | 待开工，**先出方案** | 现在的门是配置的：`reachableLocked()` 只看隧道表 `controller/internal/route/client.go:981`，隧道实际死了也算可达 ⇒ 这才是根因。可达性粒度已拍**严格 fail-closed：无 BFD 信息即不可达**；接 GoBGP Nexthop Tracking 的形状，hold-down 先行 |
-| **#276** 收敛改事件驱动 | 待开工，**先出方案** | 目标是把 §6 末尾那个 12~19s 的 refill 压成瞬时：`sr-fib` 与 `sr-frr` 都按 `poll_sec` 轮询（`cmd/sr-fib/main.go:473`、`cmd/sr-frr/main.go:807`；默认 2s、lab 盘上配的是 1s），owner 原话"sr-frr 轮询是 2s 一次，这个太慢了，必须像 frr 重分发那样瞬时" |
+| **#275** `resolvable` 改吃活动隧道 | **方案已出**（`docs/queue-plan-next.md` §二），等 owner 逐条点完 5 条拍板再动代码 | 现在的门是配置的：`reachableLocked()` 只看隧道表 `controller/internal/route/client.go:981`，隧道实际死了也算可达 ⇒ 这才是根因。可达性粒度已拍**严格 fail-closed：无 BFD 信息即不可达**；接 GoBGP Nexthop Tracking 的形状，hold-down 先行（建议默认 5s 起，owner 拍） |
+| **#276** 收敛改事件驱动 | **方案已出**（`docs/queue-plan-next.md` §三），等 owner 点完 3 条拍板再动代码 | 目标是把 §6 末尾那个 12~19s 的 refill 压成瞬时：`sr-fib` 与 `sr-frr` 都按 `poll_sec` 轮询（`cmd/sr-fib/main.go:473`、`cmd/sr-frr/main.go:807`；默认 2s、lab 盘上配的是 1s），owner 原话"sr-frr 轮询是 2s 一次，这个太慢了，必须像 frr 重分发那样瞬时"。transport 建议 SSE，断线兜底立即全量重放 |
 | #272 跨盒回灌 | 待拍 | 注入的 K 路由进了客户 area0 后被别的盒当 `local` 上报 |
 | #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞（BFD 150ms 判定 + sr-fib 1s 轮询直接摘路，无抑制） |
 | ~~#269 缺陷⑧~~ | **已修（2026-11-07）** | `controller/deploy/sr-box/start.sh` 加了一把 `flock`（`LOCK=${SR_BOX_LOCK:-$RUN/.lock}`）：`run_up`/`run_stop` 都先抢它，非阻塞拿不到就 SKIP；`launch()`/`do_vpp`/`do_apply`/`do_frr` 每个后台子进程带 `9>&-` 关掉锁 fd，否则被 systemd `TimeoutStartSec` 杀掉时锁攥在守护进程手里永不释放。沙盒 5 路并发实测：`sr-agent`/`sr-route`/`sr-fib`/`sr-frr` 各起 1 份，4 份 SKIP 退出 0。**VM 台的物理复测没跑**（要 `systemctl restart vpp` 撞那一秒，属于会影响 lab 现状的动作，等 owner 点头再做）。抬 `sr-route` 到 HEAD 的**并发抢起阻塞已解**，剩下的只是重启本身的 RR 会话抖动 |
@@ -398,6 +398,10 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 
 一条底线：**不许为了让自己的测量好看去改 lab 现状**（比如临时加条路由把现象压掉）。
 lab 的当前形状属于 owner，不属于任何一次实验。
+
+具体如何拉起第二个会话（工作区挂载、任务切分、告示牌锁的落地形式、出事怎么退回干净态）见
+[`docs/second-agent-onboarding.md`](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/second-agent-onboarding.md)。
+那一节是"怎么加入"的操作步骤；本节是"加入后不许踩什么"的硬约束。
 
 ---
 
