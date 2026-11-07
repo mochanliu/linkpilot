@@ -26,13 +26,18 @@
 #   frrbridge sr-frr：一头连 FRR 的 zserv，一头往 sr-route 的 /local-prefixes 送。
 #          两边都要活着，所以放最后。
 #
-# 三条规矩，都是这条清单存在的理由：
+# 四条规矩，都是这条清单存在的理由：
 #   1. **门控**：一步缺什么就明说缺什么并跳过。中转-only 盒子没有 route.json，未入网的
 #      盒子没有身份 —— 它们应当"跳过"，不应当"失败"，也不应当被假装成已经就绪。
 #   2. **幂等**：已经在跑的进程绝不重启。跑第二遍 up 是"补上没起来的那几步"，不是
 #      "把整套再来一遍"。O5 之后配置变更走 PUT / 发布，进程不需要重启，这条清单
 #      也不该成为重启进程的手段（那是人为操作，不是开机）。
 #   3. **失败要说清在哪一步**：每步一行结论，退出码只要有任何一步 FAIL 就非 0。
+#   4. **同一时刻只跑一份**：开机清单（sr-box.service，PartOf=vpp）与 60 秒一次的
+#      watch（sr-box-watch.service）撞在一起时，两遍都会先过 alive()，然后都把
+#      sr-route / sr-fib 各起一份 —— 两个实例抢同一条 RR 会话。用一把 flock 串
+#      行化整段清单，见下面 LOCK；拿到锁以后原来的 alive() 会看见对面已经拉起来
+#      的东西，第二个进入者自然变成 no-op。
 #
 # 用法（在盒子里以 root 执行）：
 #   start.sh up      # 从上电状态把清单走一遍（幂等）
@@ -55,6 +60,14 @@ CONF=${SR_BOX_CONF:-/etc/sr-box/sr-box.conf}
 [ -r "$CONF" ] && . "$CONF"
 
 RUN=${SR_BOX_RUN:-/run/sr-box}
+# 一把锁：开机（sr-box.service）与每 60 秒的 watch（sr-box-watch.service）撞在
+# 一起时，两遍都会先过 alive()、然后都把 sr-route / sr-fib 各起一份，两个实例
+# 抢同一条 RR 会话（CPE2 实测 2026-11-05：systemctl restart vpp 那一刻起了
+# pid 122631+122635 / 122663+122667，两天后 RR 上 18196 条 node/2 会话被对端结
+# 束）。run_up 与 run_stop 都要先抢这把锁；拿到锁以后原来的 alive() 检查会看
+# 见对面已经拉起来了，第二个进入者自然变成 no-op。锁 fd 不能被子进程继承：见
+# launch() 与 do_vpp() 里那些 9>&- —— 否则后台的守护进程会把锁攥一辈子。
+LOCK=${SR_BOX_LOCK:-$RUN/.lock}
 LOG=${SR_BOX_LOG:-/var/log/sr-box}
 SR_BIN=${SR_BOX_BIN:-/usr/local/bin}
 
@@ -141,7 +154,9 @@ launch() {   # <step> <name> <argv...> —— 后台起一个常驻进程，日�
     local step=$1 name=$2
     shift 2
     mkdir -p "$RUN" "$LOG"
-    nohup "$@" >>"$LOG/$step.log" 2>&1 &
+    # 9>&-：把上面那把锁的 fd 关掉再起来，别让后台的守护进程继承它 —— 否则
+    # 守护进程会替我们把锁攥一辈子，下一轮 watch 就永远进不来。
+    nohup "$@" >>"$LOG/$step.log" 2>&1 9>&- &
     local pid=$!
     echo "$pid" >"$RUN/$step.pid"
     # 配置读错（DisallowUnknownFields、缺证书、口被占）会立刻退出，等一秒就能看见，
@@ -255,9 +270,10 @@ do_vpp() {
     fi
     # VPP 必须以伪终端方式启动：无 PTY 的后台启动会在 exec 会话回收后静默退出
     # （start-node.sh 里记着实测）。所以是 exec 启动器而不是 nohup 二进制。
+    # 9>&-：同 launch()，别让后台的 VPP 把锁攥一辈子。
     say vpp "拉起 VPP（$VPP_LAUNCHER，conf=$VPP_CONF，日志 $VPP_LOG）"
     mkdir -p "$(dirname "$VPP_LOG")"
-    setsid nohup "$VPP_LAUNCHER" sr-box >>"$VPP_LOG" 2>&1 &
+    setsid nohup "$VPP_LAUNCHER" sr-box >>"$VPP_LOG" 2>&1 9>&- &
     echo $! >"$RUN/vpp.pid"
     if wait_vpp; then
         say vpp "起来了（插件 $(vppctl show plugins 2>/dev/null | grep -c sr_wg_plugin.so) 份 sr_wg）"
@@ -275,8 +291,9 @@ do_apply() {
     local args=(boot --root "$APPLY_ROOT" --route-conf "$ROUTE_CONF")
     # vrrp 段只认 api.sock 这条通路（这一版 VPP 没有 vrrp CLI，实测 2026-11-02）。
     # 没配路径时不塞空值：装了虚拟路由器的盒子会在 boot 里显式失败，而不是"没重放"。
+    # 9>&-：关掉锁 fd 不让 sr-apply 及其可能的子进程继承，同 launch()。
     [ -n "$AGENT_VPP_API" ] && args+=(--vpp-api "$AGENT_VPP_API")
-    if "$SR_BIN/sr-apply" "${args[@]}" >>"$LOG/apply.log" 2>&1; then
+    if "$SR_BIN/sr-apply" "${args[@]}" >>"$LOG/apply.log" 2>&1 9>&-; then
         say apply "重放完成：$(json_field "$APPLY_ROOT/status.json" "'v%s %s %s' % (d.get('version'), d.get('source'), 'ok' if d.get('ok') else 'FAIL')")"
     else
         fail apply "sr-apply boot 返回非 0（看 $LOG/apply.log）"
@@ -289,10 +306,11 @@ do_frr() {
         return
     fi
     if state_frr; then say frr "已在跑"; return; fi
+    # 9>&-：frrinit.sh 会把 zebra/bgpd 起成守护进程；别让他们继承锁 fd。
     if [ -x "$FRR_INIT" ]; then
-        "$FRR_INIT" start >>"$LOG/frr.log" 2>&1 || { fail frr "$FRR_INIT start 失败（看 $LOG/frr.log）"; return; }
+        "$FRR_INIT" start >>"$LOG/frr.log" 2>&1 9>&- || { fail frr "$FRR_INIT start 失败（看 $LOG/frr.log）"; return; }
     else
-        systemctl start frr >>"$LOG/frr.log" 2>&1 || { fail frr "systemctl start frr 失败"; return; }
+        systemctl start frr >>"$LOG/frr.log" 2>&1 9>&- || { fail frr "systemctl start frr 失败"; return; }
     fi
     local i
     for i in $(seq 1 "$FRR_WAIT"); do
@@ -368,6 +386,16 @@ do_bridge() {
 
 run_up() {
     mkdir -p "$RUN" "$LOG"
+    # 抢一把锁再走：见上面 LOCK 那段说明。非阻塞 —— 拿不到就说明对面那份还在跑，
+    # 本次整场跳过；对面完成后，下一轮 watch 会自然补齐还没起来的那几步。
+    # 让后台进程继承 fd 9 的话锁就永远不放（见 launch()/do_vpp()/do_frr()/
+    # do_apply() 里那些 9>&-）。
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        say lock "SKIP: 另一份清单正在跑（$LOCK），本次整场不动进程"
+        exec 9>&-
+        return 0
+    fi
     do_vpp
     do_apply
     do_frr
@@ -376,6 +404,8 @@ run_up() {
     do_fib
     do_bridge
     tunnels_check
+    flock -u 9
+    exec 9>&-
     [ "$FAILED" = 0 ] || return 1
     return 0
 }
@@ -458,6 +488,16 @@ run_check() {
 
 run_stop() {
     local s pid name
+    # 与 run_up 用同一把锁：见上面 LOCK 那段说明。stop 期间对面正在 up，我们若
+    # 硬上就会把刚被另一份拉起来的进程 SIGTERM 掉；对面若正在 stop，我们若硬
+    # 上就会把已经被杀掉的进程再 SIGTERM 一次（虽然只是空跑）。都跳过即可。
+    mkdir -p "$RUN"
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        say stop "SKIP: 另一份清单正在跑（$LOCK），本次不停任何进程"
+        exec 9>&-
+        return 0
+    fi
     # 容器形态下 $RUN/vpp.pid 也是这份清单写的（vpp 那一步真的把 VPP 拉起来了），
     # 但这里仍然不碰它：停 VPP = 现网断流，那不该是"停一份清单"的副作用。
     # 要停数据面请明着停（vpp.service / 那个启动器自己的办法）。
@@ -475,6 +515,8 @@ run_stop() {
         fi
         rm -f "$RUN/$s.pid"
     done
+    flock -u 9
+    exec 9>&-
     say stop "VPP 与 FRR 没动（它们不归这份清单管）"
 }
 
