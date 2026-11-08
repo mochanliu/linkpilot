@@ -647,6 +647,22 @@ func prefixesURL(status string) (string, error) {
 	return u.String(), nil
 }
 
+// deltaPrefixesURL is the steady-state sibling of prefixesURL: same host,
+// path is /local-prefixes/delta. sr-frr uses the full body only on the first
+// successful reconcile or after a delta POST that failed on the sr-route side
+// (bad op, invalid ADD) -- the shape bgpd keeps with zebra, where a reconnect
+// re-announces the whole table (bgp_zebra_announce_table) and every subsequent
+// change is a single ADD/DEL message.
+func deltaPrefixesURL(status string) (string, error) {
+	u, err := url.Parse(status)
+	if err != nil {
+		return "", err
+	}
+	u.Path = "/local-prefixes/delta"
+	u.RawQuery = ""
+	return u.String(), nil
+}
+
 func main() {
 	configPath := flag.String("config", "", "path to the sr-frr config JSON")
 	once := flag.Bool("once", false, "收敛一次后退出（e2e / 手工验证用；不撤路由）")
@@ -689,6 +705,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("sr-frr: status_url: %v", err)
 	}
+	deltaURL, err := deltaPrefixesURL(cfg.StatusURL)
+	if err != nil {
+		log.Fatalf("sr-frr: status_url (delta): %v", err)
+	}
 	if *reset {
 		n := 0
 		for _, r := range stale {
@@ -721,7 +741,7 @@ func main() {
 	st := &importState{}
 
 	hc := &http.Client{Timeout: 5 * time.Second}
-	lastImportSig := ""
+	reporter := &localReporter{hc: hc, fullURL: importURL, deltaURL: deltaURL}
 
 	poll := func() {
 		rc := rt.snapshot()
@@ -746,23 +766,20 @@ func main() {
 				log.Printf("sr-frr: %v", zerr)
 			}
 			reps, stats := imp.Report(rc.rules, exported)
-			if sig := frr.Signature(reps); sig != lastImportSig {
-				if err := pushLocalPrefixes(ctx, hc, importURL, reps); err != nil {
-					ierr = err
-					log.Printf("sr-frr: 上报客户侧前缀失败（下次重试）: %v", err)
-				} else {
-					lastImportSig = sig
-					log.Printf("sr-frr: 客户侧前缀 %d 条 → sr-route（%d 个 VPN）", len(reps), vpnCount(reps))
-				}
+			posted, err := reporter.reconcile(ctx, reps)
+			if err != nil {
+				ierr = err
+				log.Printf("sr-frr: 上报客户侧前缀失败（下次重试）: %v", err)
+			} else if posted {
+				log.Printf("sr-frr: 客户侧前缀 %d 条 → sr-route（%d 个 VPN）", len(reps), vpnCount(reps))
 			}
 			st.setPoll(ierr, stats.Reported, stats.LoopDropped, stats.UnknownVRF, subNames(subs))
 		} else {
-			if len(rc.rules) == 0 && lastImportSig != "" {
+			if len(rc.rules) == 0 && reporter.hasSync() {
 				// 规则被撤光：把上一份上报清掉，不等 zebra 重新通知。
-				if err := pushLocalPrefixes(ctx, hc, importURL, nil); err != nil {
+				if _, err := reporter.reconcile(ctx, nil); err != nil {
 					log.Printf("sr-frr: 清空客户侧前缀失败: %v", err)
 				} else {
-					lastImportSig = ""
 					log.Printf("sr-frr: import_rules 为空，已清空上报")
 				}
 			}
@@ -811,8 +828,11 @@ func main() {
 			interval, cfg.StatusURL, exportList(initial.exportVRFs))
 	}
 	if len(initial.rules) > 0 {
-		log.Printf("sr-frr: 反向导入已开：%d 个 VPN → %s", len(initial.rules), importURL)
+		log.Printf("sr-frr: 反向导入已开：%d 个 VPN → %s（事件走 %s）", len(initial.rules), importURL, deltaURL)
 	}
+
+	go importDeltaLoop(ctx, imp, rt, exp, reporter)
+
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
@@ -902,6 +922,172 @@ func pushLocalPrefixes(ctx context.Context, hc *http.Client, url string, ps []fr
 		return fmt.Errorf("PUT %s: %s: %s", url, resp.Status, strings.TrimSpace(string(msg)))
 	}
 	return nil
+}
+
+// localPrefixDeltaJSON 与 sr-route PUT /local-prefixes/delta 的一行一一对应。
+// Op is "add" | "del"; sr-route rejects the whole batch on any other value.
+type localPrefixDeltaJSON struct {
+	VRFID  uint8  `json:"vrf_id"`
+	Prefix string `json:"prefix"`
+	Op     string `json:"op"`
+}
+
+type localPrefixDeltaDoc struct {
+	Deltas []localPrefixDeltaJSON `json:"deltas"`
+}
+
+func pushLocalPrefixDeltas(ctx context.Context, hc *http.Client, url string, deltas []localPrefixDeltaJSON) error {
+	doc := localPrefixDeltaDoc{Deltas: deltas}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("PUT %s: %s: %s", url, resp.Status, strings.TrimSpace(string(msg)))
+	}
+	return nil
+}
+
+// localReporter keeps "what sr-route last ACKed" and decides between full and
+// delta. Same posture as bgpd's zebra session: the very first successful
+// publish (and any re-publish after a failed delta) is a whole-table PUT,
+// every subsequent change is a batched ADD/DEL.
+//
+// A failed delta demotes the session (synced=false). sr-route's
+// /local-prefixes/delta is all-or-nothing (bad op or invalid ADD rejects the
+// whole batch), so its view is exactly what lastSeen says and the next
+// reconcile recomputes everything as a full PUT -- no half-applied set on
+// either side.
+type localReporter struct {
+	hc       *http.Client
+	fullURL  string
+	deltaURL string
+
+	mu       sync.Mutex
+	synced   bool
+	lastSeen map[frr.ImportKey]struct{}
+}
+
+// hasSync reports whether sr-route is believed to be holding a set from this
+// reporter. poll() uses it to decide whether to send an empty clear when the
+// rules list goes away.
+func (r *localReporter) hasSync() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.synced
+}
+
+// reconcile publishes the current reported set. It returns posted=true when
+// the call produced a body that reached sr-route (a full PUT or a non-empty
+// delta), false when nothing needed to change. Errors leave the reporter in a
+// state safe for the next call.
+func (r *localReporter) reconcile(ctx context.Context, reps []frr.ReportedPrefix) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	next := make(map[frr.ImportKey]struct{}, len(reps))
+	for _, p := range reps {
+		next[frr.ImportKey{VPN: p.VPN, Prefix: p.Prefix}] = struct{}{}
+	}
+	if r.synced {
+		deltas := diffLocalPrefixes(r.lastSeen, next)
+		if len(deltas) == 0 {
+			return false, nil
+		}
+		if err := pushLocalPrefixDeltas(ctx, r.hc, r.deltaURL, deltas); err != nil {
+			// Demote: force a full re-announce next time. sr-route kept the
+			// previous set atomically, but this reporter can't prove its own
+			// lastSeen matches what sr-route actually holds -- a batch can be
+			// rejected by any one line, so the safest stance is bgpd's "on
+			// zebra error, re-announce the whole table".
+			r.synced = false
+			return false, err
+		}
+		r.lastSeen = next
+		return true, nil
+	}
+	if err := pushLocalPrefixes(ctx, r.hc, r.fullURL, reps); err != nil {
+		return false, err
+	}
+	r.synced = true
+	r.lastSeen = next
+	return true, nil
+}
+
+// diffLocalPrefixes turns prev → cur into an ADD/DEL batch. Ordering is
+// deterministic (VRF, prefix, then op) so tests can assert on the body and so
+// the delta reads the same way in the log every time.
+func diffLocalPrefixes(prev, cur map[frr.ImportKey]struct{}) []localPrefixDeltaJSON {
+	out := make([]localPrefixDeltaJSON, 0, len(prev)+len(cur))
+	for k := range cur {
+		if _, ok := prev[k]; !ok {
+			out = append(out, localPrefixDeltaJSON{VRFID: k.VPN, Prefix: k.Prefix.String(), Op: "add"})
+		}
+	}
+	for k := range prev {
+		if _, ok := cur[k]; !ok {
+			out = append(out, localPrefixDeltaJSON{VRFID: k.VPN, Prefix: k.Prefix.String(), Op: "del"})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].VRFID != out[j].VRFID {
+			return out[i].VRFID < out[j].VRFID
+		}
+		if out[i].Prefix != out[j].Prefix {
+			return out[i].Prefix < out[j].Prefix
+		}
+		return out[i].Op < out[j].Op
+	})
+	return out
+}
+
+// importDeltaLoop is the event-driven path from Importer.Handle to sr-route.
+// The tick-based poll still runs (it does the export side and re-syncs the
+// rules), but on a busy customer box the customer-side prefixes only reach
+// the overlay after the next tick, and that gap is the transient blackhole
+// AGENTS.md §1 forbids.
+//
+// The 10ms hold mirrors zebra's ZEBRA_RIB_PROCESS_HOLD_TIME (zebra_router.h):
+// Importer.dirty is buffered size 1 and markDirty is non-blocking, so signals
+// arriving during the sleep collapse into a single reconcile. The reconcile
+// reads the *current* set, not the diff at signal time, which is why the
+// hold is safe: whatever arrived within the window is included, and anything
+// later gets a fresh window.
+//
+// On HTTP failure, localReporter.synced drops back to false; the next wake
+// sends the whole table, and poll's tick is a second fallback if signals
+// stop coming.
+func importDeltaLoop(ctx context.Context, imp *frr.Importer, rt *runtimeStore, exp *exportState, reporter *localReporter) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-imp.Dirty():
+		}
+		t := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		rc := rt.snapshot()
+		exported := exp.exportedSet(rc.exportVRFs)
+		reps, _ := imp.Report(rc.rules, exported)
+		if _, err := reporter.reconcile(ctx, reps); err != nil {
+			log.Printf("sr-frr: 事件上报失败（下一轮 poll 兜底重试）: %v", err)
+		}
+	}
 }
 
 // listenControl prepares the Unix socket. A stale file from a killed process is

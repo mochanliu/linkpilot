@@ -325,6 +325,51 @@ func TestPutLocalPrefixesReplacesAndValidates(t *testing.T) {
 	}
 }
 
+// Slice A #276: sr-frr's fast path is a batched delta, not a whole-table PUT.
+// Endpoint has to accept a mixed add/del batch and reject one malformed line
+// atomically -- the same all-or-nothing posture as /local-prefixes, because a
+// half-applied delta would leave sr-route with a set that neither the last
+// ack nor the next full announce describes.
+func TestPutLocalPrefixDeltaReplacesAndValidates(t *testing.T) {
+	c := testClientWithLocal(t, route.ClientConfig{
+		VRFs: []route.VRFConfig{{ID: 5, ExportRTs: []string{"65000:5"}}},
+	}, route.LocalPrefix{VRFID: 5, Prefix: "10.10.0.0/16"})
+	srv := newServer(t, c)
+
+	code, raw := call(t, srv, http.MethodPut, "/local-prefixes/delta",
+		`{"deltas":[{"vrf_id":5,"prefix":"10.10.0.0/16","op":"del"},{"vrf_id":5,"prefix":"10.30.0.0/16","op":"add"}]}`)
+	if code != http.StatusOK {
+		t.Fatalf("delta = %d: %s", code, raw)
+	}
+	if got := getStatus(t, srv).Local; len(got) != 1 || got[0].Prefix != "10.30.0.0/16" {
+		t.Fatalf("after delta local = %+v", got)
+	}
+
+	// One bad op rejects the whole batch. 10.40 must not have been added.
+	code, raw = call(t, srv, http.MethodPut, "/local-prefixes/delta",
+		`{"deltas":[{"vrf_id":5,"prefix":"10.40.0.0/16","op":"add"},{"vrf_id":5,"prefix":"10.30.0.0/16","op":"drop"}]}`)
+	if code != http.StatusBadRequest || !strings.Contains(raw, "not add/del") {
+		t.Fatalf("bad op = %d: %s", code, raw)
+	}
+	if got := getStatus(t, srv).Local; len(got) != 1 || got[0].Prefix != "10.30.0.0/16" {
+		t.Fatalf("rejected batch changed set: %+v", got)
+	}
+
+	// ADD against an unconfigured VRF is a 400 (same validation path as full).
+	code, raw = call(t, srv, http.MethodPut, "/local-prefixes/delta",
+		`{"deltas":[{"vrf_id":9,"prefix":"10.99.0.0/16","op":"add"}]}`)
+	if code != http.StatusBadRequest || !strings.Contains(raw, "unconfigured vrf") {
+		t.Fatalf("add unknown vrf = %d: %s", code, raw)
+	}
+
+	// GET is not the delta's shape; only PUT is accepted here so the
+	// whole-table endpoint stays the sole read path.
+	code, _ = call(t, srv, http.MethodGet, "/local-prefixes/delta", "")
+	if code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET delta = %d, want 405", code)
+	}
+}
+
 func TestStatusListsRoundTripThroughPut(t *testing.T) {
 	c := testClient(t, route.ClientConfig{
 		VRFs: []route.VRFConfig{

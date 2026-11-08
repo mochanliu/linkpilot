@@ -246,6 +246,21 @@ type localPrefixesDoc struct {
 	Prefixes []localPrefixJSON `json:"prefixes"`
 }
 
+// localPrefixDeltaJSON is one line of PUT /local-prefixes/delta -- the
+// steady-state reverse-import shape, mirroring zebra's
+// ZEBRA_REDISTRIBUTE_ROUTE_ADD/_DEL. Op is "add" or "del"; anything else is
+// rejected and the whole batch is dropped, the same all-or-nothing rule as
+// /local-prefixes.
+type localPrefixDeltaJSON struct {
+	VRFID  uint8  `json:"vrf_id"`
+	Prefix string `json:"prefix"`
+	Op     string `json:"op"`
+}
+
+type localPrefixDeltaDoc struct {
+	Deltas []localPrefixDeltaJSON `json:"deltas"`
+}
+
 func localPrefixes(c *route.Client) []localPrefixJSON {
 	routes := c.LocalRoutes()
 	out := make([]localPrefixJSON, 0, len(routes))
@@ -426,6 +441,33 @@ func statusMux(c *route.Client) *http.ServeMux {
 			writeJSON(w, localPrefixesDoc{Prefixes: localPrefixes(c)})
 		default:
 			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
+		}
+	})
+	// PUT applies a batch of add/del operations to the local set. This is the
+	// steady-state counterpart of /local-prefixes: sr-frr uses the full body
+	// after a reconnect (bgp_zebra_connected -> bgp_zebra_announce_table) and
+	// this endpoint for every subsequent ZEBRA_REDISTRIBUTE_ROUTE_ADD/_DEL that
+	// survives the 10ms RIB coalesce window. Rejecting the batch on any bad op
+	// or invalid ADD matches how zebra treats a malformed message: the client
+	// must fall back to a full announce rather than half-apply.
+	mux.HandleFunc("/local-prefixes/delta", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			var doc localPrefixDeltaDoc
+			if !decodeJSON(w, r, &doc) {
+				return
+			}
+			ds := make([]route.LocalPrefixDelta, 0, len(doc.Deltas))
+			for _, d := range doc.Deltas {
+				ds = append(ds, route.LocalPrefixDelta{VRFID: d.VRFID, Prefix: d.Prefix, Op: d.Op})
+			}
+			if err := c.ApplyLocalPrefixDeltas(ds); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, localPrefixesDoc{Prefixes: localPrefixes(c)})
+		default:
+			http.Error(w, "PUT only", http.StatusMethodNotAllowed)
 		}
 	})
 	// PUT replaces the whole tunnel table -- the same message the RR is sent, so

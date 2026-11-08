@@ -197,6 +197,70 @@ func TestSetLocalPrefixesValidation(t *testing.T) {
 	}
 }
 
+// Slice A #276: sr-frr's steady-state path is a batch of ADD/DEL against the
+// live set, not a whole-table replace. Same validation posture as
+// SetLocalPrefixes -- one bad line rejects the batch and the announcements
+// stay at the last ack'd set.
+func TestApplyLocalPrefixDeltas(t *testing.T) {
+	c, err := NewClient(testClientConfig())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.SetLocalPrefixes(testLocalPrefixes); err != nil {
+		t.Fatalf("SetLocalPrefixes: %v", err)
+	}
+	// ADD + DEL in one batch.
+	if err := c.ApplyLocalPrefixDeltas([]LocalPrefixDelta{
+		{VRFID: 5, Prefix: "10.10.0.0/16", Op: "del"},
+		{VRFID: 5, Prefix: "10.30.0.0/16", Op: "add"},
+		{VRFID: 5, Prefix: "10.40.0.0/16", Op: "add"},
+	}); err != nil {
+		t.Fatalf("ApplyLocalPrefixDeltas: %v", err)
+	}
+	got := c.LocalRoutes()
+	if len(got) != 2 || got[0].Prefix != "10.30.0.0/16" || got[1].Prefix != "10.40.0.0/16" {
+		t.Fatalf("local routes = %+v, want 10.30/10.40 only", got)
+	}
+
+	// Idempotent: applying the same delta twice converges to the same set.
+	// sr-frr's reporter may retry a delta after an HTTP failure that reached
+	// sr-route -- the receiving side has to be safe to apply again.
+	if err := c.ApplyLocalPrefixDeltas([]LocalPrefixDelta{
+		{VRFID: 5, Prefix: "10.30.0.0/16", Op: "add"},
+		{VRFID: 5, Prefix: "10.99.0.0/16", Op: "del"},
+	}); err != nil {
+		t.Fatalf("idempotent apply: %v", err)
+	}
+	if got := c.LocalRoutes(); len(got) != 2 {
+		t.Fatalf("idempotent apply changed set: %+v", got)
+	}
+
+	// One bad op rejects the whole batch (matches SetLocalPrefixes posture).
+	before := append([]Route(nil), c.LocalRoutes()...)
+	if err := c.ApplyLocalPrefixDeltas([]LocalPrefixDelta{
+		{VRFID: 5, Prefix: "10.50.0.0/16", Op: "add"},
+		{VRFID: 5, Prefix: "10.60.0.0/16", Op: "remove"}, // not add/del
+	}); err == nil || !strings.Contains(err.Error(), "not add/del") {
+		t.Fatalf("unknown op: err = %v", err)
+	}
+	after := c.LocalRoutes()
+	if len(before) != len(after) || before[0].Prefix != after[0].Prefix {
+		t.Fatalf("rejected batch changed set: before=%+v after=%+v", before, after)
+	}
+
+	// ADD to an unconfigured VRF fails validation and rejects the batch.
+	// DEL of a prefix whose VRF has since disappeared is still accepted so
+	// the reporter can converge to empty after a SetVRFs withdrawal.
+	if err := c.SetVRFs([]VRFConfig{{ID: 7, ExportRTs: []string{"65000:7"}, ImportRTs: []string{"65000:6"}}}); err != nil {
+		t.Fatalf("SetVRFs: %v", err)
+	}
+	if err := c.ApplyLocalPrefixDeltas([]LocalPrefixDelta{
+		{VRFID: 9, Prefix: "10.70.0.0/16", Op: "add"},
+	}); err == nil || !strings.Contains(err.Error(), "unconfigured vrf") {
+		t.Fatalf("add on unknown vrf: err = %v", err)
+	}
+}
+
 func TestTunnelsAreCanonicalized(t *testing.T) {
 	cfg := testClientConfig()
 	cfg.Tunnels = []Tunnel{

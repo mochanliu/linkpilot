@@ -140,6 +140,14 @@ type Importer struct {
 	unknown map[uint32]struct{}
 	badVRF  uint64
 
+	// dirty is written by Handle/Reset and drained by sr-frr's delta loop.
+	// Buffered size 1: a burst of zebra notifications inside the 10ms coalesce
+	// window collapses into a single wake-up, the same shape as zebra's
+	// rib_process queue (ZEBRA_RIB_PROCESS_HOLD_TIME 10, zebra_router.h). A
+	// signal arriving while the buffer is full is dropped, not queued, because
+	// the coalesced flush will re-read the whole set anyway.
+	dirty chan struct{}
+
 	Logf func(format string, args ...any)
 }
 
@@ -153,7 +161,23 @@ func NewImporter(vpnOf func(vrfID uint32) (uint8, bool)) *Importer {
 		routes:  map[ImportKey]sourceSet{},
 		vpnOf:   vpnOf,
 		unknown: map[uint32]struct{}{},
+		dirty:   make(chan struct{}, 1),
 		Logf:    log.Printf,
+	}
+}
+
+// Dirty returns the channel that fires after every Handle that mutated the
+// set, plus once per Reset. sr-frr reads it in the same loop that owns the
+// 10ms coalesce; a closed channel means the importer was built without one
+// (only reachable from tests).
+func (im *Importer) Dirty() <-chan struct{} { return im.dirty }
+
+// markDirty performs a non-blocking send on im.dirty. Safe under im.mu, since
+// the send never waits.
+func (im *Importer) markDirty() {
+	select {
+	case im.dirty <- struct{}{}:
+	default:
 	}
 }
 
@@ -190,6 +214,7 @@ func (im *Importer) Handle(ev RouteEvent) {
 			set[k] = src
 		}
 		src[ev.Type] = struct{}{}
+		im.markDirty()
 		return
 	}
 	if src := set[k]; src != nil {
@@ -197,6 +222,7 @@ func (im *Importer) Handle(ev RouteEvent) {
 		if len(src) == 0 {
 			delete(set, k)
 		}
+		im.markDirty()
 	}
 }
 
@@ -218,6 +244,7 @@ func (im *Importer) Reset() {
 		im.Logf("sr-frr: 重连，清空本地前缀集（%d 条），等新连接的回放重建", len(im.routes))
 	}
 	im.routes = map[ImportKey]sourceSet{}
+	im.markDirty()
 }
 
 // snapshotLocked is a copy of what the customer side currently holds. Report

@@ -180,6 +180,43 @@ func (c *Client) reachableLocked(rt Route) bool {
 
 **这条不做，除非 owner 逐条点完上面 3 条拍板。**
 
+### 落地实况（切片 A，2026-11-08）
+
+owner 已拍：**全部照抄 FRR**、**先起 A**。切片 A 是"sr-frr → sr-route 反向导入"那半，切片 B（sr-route → sr-fib SSE `/watch`）与切片 C（e2e refill-window 判据）尚未开始。
+
+**代码形状**（全部在 feat/vbond-control-plane，`controller/` 下）：
+
+| 位置 | 加了什么 | FRR 对应 |
+| --- | --- | --- |
+| `internal/route/client.go` `LocalPrefixDelta` + `ApplyLocalPrefixDeltas` | 批量 ADD/DEL 应用到当前 local 集，闸门与 `SetLocalPrefixes` 一致：非法 op、ADD 到未发布 VRF → 整批 400 且不落；DEL 不再校验（VRF 后被撤时仍可清，否则 reporter 无法收敛到空集） | `redistribute.c::redistribute_update` / `redistribute_delete` |
+| `cmd/sr-route/main.go` `PUT /local-prefixes/delta` | 新端点，只 PUT，请求体是 `{deltas: [{vrf_id, prefix, op}]}`；GET 走 405 | zebra 对每个 daemon 单独发 `ZEBRA_REDISTRIBUTE_ROUTE_ADD/_DEL`，无 GET 侧 |
+| `internal/frr/import.go` `Importer.dirty chan struct{}`（size 1）+ `Dirty()` + `markDirty()` | `Handle` 在真发生变更的分支尾部（tracked ADD / tracked DEL / Reset）非阻塞发送；被 gate 拒了（invalid prefix / unknown VRF）不发 | zebra `rib_process` 之后的 work-queue 唤醒 |
+| `cmd/sr-frr/main.go` `localReporter` + `importDeltaLoop` | reporter 保留 `synced/lastSeen`：首次或 delta 失败后回退全量 PUT `/local-prefixes`；其余走 delta PUT `/local-prefixes/delta`。`importDeltaLoop` 每次 `<-imp.Dirty()` 后 sleep 10ms 再算一次 diff | 首连 `bgp_zebra_connected → bgp_zebra_announce_table` 全量、稳态 `zebra_read_route → bgp_redistribute_add` 单条；合并窗口 `ZEBRA_RIB_PROCESS_HOLD_TIME 10` (zebra_router.h:185) |
+
+**没做的**（切片 B/C 的事，或者与 owner 拍板不同）：
+- SSE `/watch` 用在 sr-fib→sr-route 方向（切片 B）。sr-frr 方向沿用 HTTP PUT —— FRR 的 zapi 是长连 socket，我们只在同盒进程间用 PUT 已够，delta 语义（同 zebra 一条消息一条 ADD/DEL）比 transport 更关键。
+- refill-window 判据脚本 `test/lab/vmlab/exp-276/refill-window.sh`（切片 C）；跑之前不动 lab。
+- `seq`/`since_seq` 增量重放（§三 拍板 3 的"如果真出问题再上 delta"分支）：本次采用幂等 delta + 失败即全量兜底，与 bgpd 侧 zebra 死掉后重发全量同形状。
+
+**测过的**：
+- 8 条单测（`TestApplyLocalPrefixDeltas` / `TestPutLocalPrefixDeltaReplacesAndValidates` / `TestImporterDirtyCoalesces` / `TestImporterDirtyOnlyOnTrackedMutation` / `TestDiffLocalPrefixes` / `TestLocalReporterStateMachine` + 旧 2 条 `SetLocalPrefixes` 端点）。全套 `go test ./...` 全绿。
+- **没有**跑 lab / VM 台物理复测；owner 若要 e2e 数字，切片 C 的判据脚本会给。
+
+**为什么这样对齐 FRR 而不是别的**（照抄范围）：
+- 每条 ADD/DEL 一条消息 = 客户侧一条路由变化 = zebra 一条 `ZEBRA_REDISTRIBUTE_ROUTE_ADD`；这是 `redistribute.c::redistribute_update` 的形状。
+- 首次全量 = `bgp_zebra_announce_table`：bgpd 在 zclient 起来时对每个 afi/safi/vrf 走一次 announce，之后走 `zebra_read_route` 单条；我们 reporter 也这样。
+- 10ms 合并 = `ZEBRA_RIB_PROCESS_HOLD_TIME 10`；`rib_process()` 是 zebra 的 RIB 变更 → 客户端推送这一段的工作队列；10ms 是它的 debounce。合并的是"通知发出频率"，不是"维持旧集合" —— 到期一次算的是**当时**的完整集合，不是 10ms 之前的快照，因此 AGENTS.md §1.3 的乐观窗口禁令在这里不适用。
+- Delta 失败 → 下次全量：bgpd 在 zebra socket 断流时靠 `zebra_send_announce` 全量重放，我们 reporter.synced=false 走同一 fallback。
+- **没有**做 seq/last_seq 增量重放：GoBGP 没这层（它是全量 + 邻居自己比对），bgpd 也不用；这条留给真出问题再加。
+
+**四条 pin 的实际选择**（切片 A 只涉及其中两条）：
+- pin A1（合并窗口时长）：10ms，与 zebra 常量同源。**没**做成"每 N 条打包"—— FRR 是按时间合并（ribq），不是按条数。
+- pin A2（delta 语义）：**幂等 ADD/DEL**，接收端不记 seq。sr-frr 侧 reporter 记 lastSeen，重发同一批 delta 是安全的（`ApplyLocalPrefixDeltas` 走 set 语义）。这是 FRR 的形状：zebra 断连后 bgpd 全量重放，中间任何 delta 丢了靠下次 announce 兜住。
+- pin A3（重连恢复）：由 reporter.synced 处理，见上。
+- pin A4（delta 中 DEL 遇到 VRF 已消失）：**接受**。真值场景是"上一轮 ACK 了 10.10/16（当时 VRF 5 已发布）→ 后来运营方撤 VRF 5 → reporter 又观测到客户侧 10.10/16 撤了"，此时 delta 里 DEL 到未发布 VRF。sr-route 端 `ApplyLocalPrefixDeltas` 只在 ADD 上做 `localRoute` 校验，DEL 直接 delete map key。这与 FRR `redistribute_delete` 的语义一致：删除不需要重新查表存在性。
+
+**owner 想回退怎么办**：`Importer.dirty` 那条 send 关掉，delta 端点空转；reporter 走全量 PUT。整条 reporter 只是 lastImportSig 那两行的替代，替换回来不改数据面形状。
+
 ---
 
 ## 与 §10 冲突协议的关系

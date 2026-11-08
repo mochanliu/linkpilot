@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 // TestEncodeRedistributeAddGolden 固定订阅报文的字节序列：头里的 vrf_id 是
@@ -291,5 +292,81 @@ func TestImporterSorts(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("prefixes = %v, want %v", got, want)
 		}
+	}
+}
+
+// Slice A #276: Handle and Reset are the only mutations to im.routes, and the
+// delta loop is driven by the channel they signal on. A burst within the
+// coalesce window must collapse to a single wake-up; otherwise the 10ms hold
+// would produce one HTTP round-trip per notification and we are back to the
+// per-tick behaviour we came here to remove.
+func TestImporterDirtyCoalesces(t *testing.T) {
+	im := NewImporter(nil)
+	// Drain anything Reset might have primed (nothing on a fresh importer).
+	select {
+	case <-im.Dirty():
+		t.Fatal("fresh importer signalled dirty")
+	default:
+	}
+
+	p := netip.MustParsePrefix("10.68.1.0/24")
+	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p, Add: true})
+	im.Handle(RouteEvent{Type: RouteBGP, Prefix: p, Add: false})
+	im.Handle(RouteEvent{Type: RouteConnected, Prefix: p, Add: true})
+
+	// At most one buffered signal survives, no matter how many Handles fired.
+	<-im.Dirty()
+	select {
+	case <-im.Dirty():
+		t.Fatal("dirty is not size 1 -- burst would re-wake the coalesce loop")
+	default:
+	}
+
+	// Reset also fires so the reporter knows to publish the empty set right
+	// after the reconnect (rather than wait for the next tick).
+	im.Reset()
+	select {
+	case <-im.Dirty():
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("Reset did not signal dirty")
+	}
+}
+
+// A Handle that only touched the source set without adding or removing a key
+// still marks dirty (a DEL that leaves the prefix under another source is a
+// real change to the visible set only if it hits the selected source, but we
+// let the reconcile compute the diff and no-op if there isn't one). A Handle
+// rejected at the gate (invalid prefix or unknown VRF) must NOT mark dirty --
+// the customer-side set didn't change and there's no reason to wake sr-route.
+func TestImporterDirtyOnlyOnTrackedMutation(t *testing.T) {
+	im := NewImporter(func(vrfID uint32) (uint8, bool) { return 0, vrfID == 0 })
+	// Drain initial state (there isn't one, but keep the test independent).
+	select {
+	case <-im.Dirty():
+	default:
+	}
+
+	// Unknown VRF → dropped, no dirty.
+	im.Handle(RouteEvent{VRFID: 99, Type: RouteBGP, Prefix: netip.MustParsePrefix("10.0.0.0/8"), Add: true})
+	select {
+	case <-im.Dirty():
+		t.Fatal("dropped notification marked dirty")
+	default:
+	}
+
+	// Invalid prefix → dropped, no dirty.
+	im.Handle(RouteEvent{Type: RouteBGP, Add: true})
+	select {
+	case <-im.Dirty():
+		t.Fatal("invalid prefix marked dirty")
+	default:
+	}
+
+	// Tracked ADD → dirty.
+	im.Handle(RouteEvent{Type: RouteBGP, Prefix: netip.MustParsePrefix("10.0.0.0/8"), Add: true})
+	select {
+	case <-im.Dirty():
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("tracked ADD did not mark dirty")
 	}
 }

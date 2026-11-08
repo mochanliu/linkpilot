@@ -559,6 +559,63 @@ func (c *Client) SetLocalPrefixes(lps []LocalPrefix) error {
 	return nil
 }
 
+// LocalPrefixDelta is one ADD or DEL against the current local set. FRR's
+// shape (redistribute.c::redistribute_update/delete) is one message per
+// customer route change, so the receiving side mutates in place instead of
+// replacing the whole table on every event. sr-frr uses this on the hot path;
+// SetLocalPrefixes stays as the "connect / reconnect announces everything"
+// path (bgp_zebra_connected → bgp_zebra_announce_table).
+type LocalPrefixDelta struct {
+	VRFID  uint8  `json:"vrf_id"`
+	Prefix string `json:"prefix"`
+	Op     string `json:"op"` // "add" | "del"
+}
+
+// ApplyLocalPrefixDeltas mutates c.dynamic as one batch and, if anything
+// changed, re-runs the same rebuild+push SetLocalPrefixes would.
+//
+// All-or-nothing (same rule as SetVRFs): if any ADD fails validation, or any
+// Op is neither "add" nor "del", the whole batch is rejected and c.dynamic
+// keeps its previous content -- a half-applied delta would leave sr-route
+// with a set that neither the reporter's last ack nor the fresh full snapshot
+// describes.
+//
+// ADD and DEL are idempotent (set semantics, not append log). The reporter
+// relies on this after a failed delta POST: retry from its own last-ack map
+// without needing sr-route to remember what it acknowledged.
+func (c *Client) ApplyLocalPrefixDeltas(deltas []LocalPrefixDelta) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next := make(map[localKey]LocalPrefix, len(c.dynamic)+len(deltas))
+	for k, lp := range c.dynamic {
+		next[k] = lp
+	}
+	for _, d := range deltas {
+		lp := LocalPrefix{VRFID: d.VRFID, Prefix: d.Prefix}
+		switch d.Op {
+		case "add":
+			if _, err := c.localRoute(lp); err != nil {
+				return err
+			}
+			next[lp.key()] = lp
+		case "del":
+			// No re-validation: whatever was accepted on the way in is safe
+			// to remove, and a prefix whose VRF later disappeared still has
+			// to be delable so the reporter can converge to empty.
+			delete(next, lp.key())
+		default:
+			return fmt.Errorf("route client: local prefix delta op %q not add/del", d.Op)
+		}
+	}
+	if equalLocalSets(c.dynamic, next) {
+		return nil
+	}
+	c.dynamic = next
+	c.rebuildLocalLocked()
+	c.pushLocalLocked()
+	return nil
+}
+
 // SetVRFs replaces the local VRF table at runtime -- the "新 VPN 后补" half of
 // O5. It is all-or-nothing: a table that fails validation changes nothing,
 // because a half-applied import policy would decide which prefixes get installed
