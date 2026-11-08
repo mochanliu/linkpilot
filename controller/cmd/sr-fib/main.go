@@ -220,8 +220,11 @@ type bfdDP interface {
 }
 
 // fiber 是收敛器。cur 与 last 是原子的（状态口随时可读，不被一轮收敛堵住），
-// mu 只把"换配置 + 收敛"和轮询循环串成一条线 —— Applier 的文档写明它只允许
-// 单线程调用。
+// mu 只把"换配置 + 收敛"串成一条线 —— Applier 的文档写明它只允许单线程调用。
+//
+// 事件视图另有一把 vmu：它必须在收敛（要写 VPP，慢）进行的时候继续被读取线程
+// 更新。共用 mu 的话，一次下发把事件流堵住，sr-route 的背压就会把本进程从订阅
+// 位上踢下来，然后每次抖动都要重来一份全量。
 type fiber struct {
 	mu        sync.Mutex
 	cur       atomic.Pointer[liveConfig]
@@ -232,6 +235,17 @@ type fiber struct {
 	dial      func(context.Context) (bfdDP, error)
 	hc        *http.Client
 	statusURL string
+
+	// stream 读 /watch，没有整体超时：一条健康的流每 5s 才动一次，而 hc 的 5s
+	// 超时正好卡在这个点上。空闲判定另有看心跳的定时器，见 watch.go。
+	stream   *http.Client
+	vmu      sync.Mutex
+	view     map[ribKey]fib.RIBRoute
+	viewOK   bool
+	watchLog string // 只在 vmu 内读写：重连日志去重用
+
+	// wake 是"该收敛一次了"的信号，容量 1：要的是走到最新快照，不是重放历史。
+	wake chan struct{}
 }
 
 // conn 保证这一轮手里有一条活的数据面连接；没有就现连一份。
@@ -270,8 +284,12 @@ func (f *fiber) dropDead(err error) {
 }
 
 // converge 按当前配置重算整份计划并下发。调用者必须持有 mu。
+//
+// 路由输入取自事件视图（有快照时），没有快照时才回落到一次全量 GET /status：
+// 启动的头几轮、流断开到重挂上的这段、以及 sr-route 回 409 的时候，走的都是
+// 后者。这两条路给的是同一份声明式快照，所以下面差分与下发那段一条都不用改。
 func (f *fiber) converge(ctx context.Context) error {
-	routes, err := fetchStatus(ctx, f.hc, f.statusURL)
+	routes, err := f.currentRoutes(ctx)
 	if err != nil {
 		return f.note(fib.Result{}, fmt.Errorf("读 RIB: %w", err))
 	}
@@ -388,6 +406,15 @@ func fetchStatus(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRou
 		}
 	}
 	// map 迭代顺序是随机的，排一下：本进程的日志与每轮计划比较都靠稳定输入。
+	sortRIBRoutes(out)
+	return out, nil
+}
+
+// sortRIBRoutes gives the two RIB inputs (the polled /status body and the
+// event-fed view, both built by iterating a map) one order. Without it the
+// "same as last plan" comparison sees a reordering as a change, and a
+// reordering is not one.
+func sortRIBRoutes(out []fib.RIBRoute) {
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Table != out[j].Table {
 			return out[i].Table < out[j].Table
@@ -395,9 +422,11 @@ func fetchStatus(ctx context.Context, hc *http.Client, url string) ([]fib.RIBRou
 		if out[i].Origin != out[j].Origin {
 			return out[i].Origin < out[j].Origin
 		}
+		if out[i].SourceVRF != out[j].SourceVRF {
+			return out[i].SourceVRF < out[j].SourceVRF
+		}
 		return out[i].Prefix < out[j].Prefix
 	})
-	return out, nil
 }
 
 func main() {
@@ -453,7 +482,10 @@ func main() {
 		applier:   fib.NewApplier(vc),
 		dial:      dial,
 		hc:        &http.Client{Timeout: 5 * time.Second},
+		stream:    &http.Client{},
 		statusURL: cfg.StatusURL,
+		view:      map[ribKey]fib.RIBRoute{},
+		wake:      make(chan struct{}, 1),
 	}
 	f.cur.Store(&live)
 
@@ -470,29 +502,13 @@ func main() {
 		log.Printf("sr-fib: 配置里没有 status_addr，运行中不能热更（VPN 集合/隧道表/逃生开关要换值得重启）")
 	}
 
-	interval := time.Duration(cfg.PollSec) * time.Second
-	log.Printf("sr-fib: %d 个 VRF、%d 条隧道，每 %s 从 %s 收敛一次（逃生开关=%v）",
-		len(live.VRFs), len(live.Tunnels), interval, cfg.StatusURL, live.Escape)
-	tick := time.NewTicker(interval)
-	defer tick.Stop()
-	for {
-		// dp/applier 现在会在轮与轮之间被换掉（重连），必须和 PUT /config 那条
-		// 路径共用一把锁 —— Applier 只允许单线程调用。
-		f.mu.Lock()
-		err := f.converge(ctx)
-		f.mu.Unlock()
-		if err != nil {
-			// 失败不退出：sr-route 可能还没起来，VPP 也偶尔在重启。已下发成功的
-			// 那份计划仍是基线，下一轮按同一目标重试。
-			log.Printf("sr-fib: 本轮收敛失败（保留上次成功的计划）: %v", err)
-		}
-		select {
-		case <-ctx.Done():
-			log.Printf("sr-fib: 停止")
-			return
-		case <-tick.C:
-		}
-	}
+	retryGap := time.Duration(cfg.PollSec) * time.Second
+	log.Printf("sr-fib: %d 个 VRF、%d 条隧道，从 %s 的事件流收敛（断流/占用时先全量补一次，每 %s 再挂一次；逃生开关=%v）",
+		len(live.VRFs), len(live.Tunnels), cfg.StatusURL, retryGap, live.Escape)
+	go f.watchLoop(ctx, retryGap)
+	f.signal() // 起来先收敛一次：此时还没有快照，走的正是老的全量路径
+	f.convergeLoop(ctx)
+	log.Printf("sr-fib: 停止")
 }
 
 // updateTimeout 是一份 PUT 等着收敛完的预算：一次收敛要读 sr-route 的 /status

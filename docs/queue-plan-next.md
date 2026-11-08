@@ -219,6 +219,121 @@ owner 已拍：**全部照抄 FRR**、**先起 A**。切片 A 是"sr-frr → sr-
 
 ---
 
+### 落地实况（切片 B + C，2026-11-08）
+
+owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 frr 的长连方式不相上下就选甲"。
+甲 = SSE `/watch`、每条路由一条事件，范围"全部照抄 FRR"。这一节先给形状，再给数字，
+最后给两条这次顺手抓到、必须他拍的缺口（B3/B4）。切片 B（sr-route → sr-fib 推事件）和
+切片 C（判据 + 实测时长）在同一次提交里收口；B2（三条口共用一套 transport identity）没做，理由在下面。
+
+**代码形状**（全部在 `feat/vbond-control-plane`，`controller/` 下）：
+
+| 位置 | 加了什么 | FRR 里的对应物 |
+| --- | --- | --- |
+| `internal/route/watch.go`（新文件，314 行） | `WatchHub` 一根订阅管道 + `RouteEvent{vrf,prefix,op,next_hops}` + `WatchBatch`（INIT 全量或 delta）+ `viewLocked()`（把 Loc-RIB 拍成"能装的那张视图"）+ `diffView(prev,now)`（视图变了就出一批 ADD/WITHDRAW）+ `coalesceWindow=10ms`（`:41`）+ `watchBufferDepth=1`（`:48`）+ `dropLocked`（`:288`）+ `rearmIfDirty`（`:278`，丢批后立刻重新挂表，不让脏标记睡觉） | zebra `rib_process` 之后的 work-queue：按时间合并（`ZEBRA_RIB_PROCESS_HOLD_TIME 10`，`zebra_router.h:185`），不是按条数打包 |
+| `internal/route/client.go` 七个 `c.notifyWatchLocked()`：`:647 :682 :763 :1236 :1533 :1632 :1675` | 会话建立/撤销、隧道表变化、RT 导通改动、`SetLocalPrefixes`/`ApplyLocalPrefixDeltas`、RR 表更换、`SetTunnelState`（#275 那条可达性回灌）—— 每一条改 Loc-RIB 可见性的路都在这里露头 | zebra 里所有改 RIB 的入口最后都汇到 `rib_process`，没有第二条出口 |
+| `cmd/sr-route/main.go` `:595` 挂 `/watch` + `serveWatch`（`:631`）+ `watchPing=5s`（`:612`） | `text/event-stream`，帧形 `event: routes\ndata: {…}\n\n`；空闲 5s 发一帧 `: ping` 让读端能判死；订阅位被占直接 **409**（`:624` 注释写了为什么不是排队） | zapi 是长连 socket，我们没有那一层，只能把"常连"落在 HTTP 流上；ping 对应 socket 的 keepalive |
+| `cmd/sr-fib/watch.go`（新文件）：`watchLoop`(`:84`) / `watchOnce`(`:108`) / `nextWatchBatch`(`:152`) / `applyBatch`(`:202`) / `dropView`(`:248`) / `currentRoutes`(`:276`) / `convergeLoop`(`:296`) / `signal`(`:320`)，`watchIdleTimeout=15s`（`:49`，= 3 个 ping 周期没帧就判流死） | 起来先挂流；每收到一批就 `signal()` 触发一轮收敛；**看不认识的 op 就把视图作废**（`dropView`）改走全量 `/status`，不猜；流断 → 立即重挂，重挂后先 INIT 全量 | bgpd 的 zclient：断连后 `zebra_send_announce` 全量重放，稳态走 `zebra_read_route` 单条 |
+| `cmd/sr-fib/main.go` `:505-509` | `retryGap = poll_sec` **只当作重挂间隔**；watch 在位时不再有周期性 converge。`f.signal()` 只在启动时收敛一次，之后三处触发：事件批、`PUT /config`、启动 | 这就是"去掉轮询"那一步：FRR 的收敛从来不是定时器驱动的 |
+
+**四条不变量**（这一片的形状约束，逐条都是"照抄 FRR 的哪一件事"）：
+
+1. **变更点只有一处出口。** 七个 `notifyWatchLocked()` 若漏挂一处，症状不是"报错"，是"那次改动没人推、
+   对端只能等下一次全量对齐才发现" —— 那就是 §1 第 3 条禁的乐观窗口（靠一份已经过期的视图继续宣称可达）。
+   所以单测里专门有一条反证：`TestWatchNoBatchForInvisibleChange`（视图没变就不许发空批）与
+   `TestWatchLosingOneRRIsSilent`（双 RR 掉一个、最优路径不变 ⇒ 不发事件，这条是**故意**的静默，
+   因为它不改变可装视图，发了反而是抖动）。
+2. **合并按时间、不按条数**：10ms 窗口到期时算的是**当时**的完整视图差，不是 10ms 之前攒下的那批。
+   这条和切片 A 用同一个常数，同一个理由。
+3. **背压宁丢不藏**：`watchBufferDepth=1`，读端跟不上就 `dropLocked` 断它的流。排队 = 在缓冲区里
+   存一串已经过期的路由事实，读出来时它比 RIB 老；FRR 同样不在 socket 里替客户端攒路由。
+   断掉之后读端自己重挂 + INIT 全量，账对得回来。
+4. **订阅位独占、冲突当场可见**：第二个消费者拿到 409，不是排队。现场证据 —— CPE1 上
+   `stamp-watch.sh` 去占槽时，sr-fib 的日志立刻出现
+   `watch: sr-route 的订阅位被占用（已有另一个消费者）`，并自动退回全量 `/status` 收敛，客户流量 0 抖。
+
+**切片 C 的判据形状**（细节与踩坑过程在 `test/lab/vmlab/exp-276/README.md`，这里只留结论性的口径）：
+
+一条远端前缀从"控制器知道"到"客户包走出去"要过三段，量具必须一段一段读：
+
+- `in` —— 前缀出现在 sr-route `/status` 的任何位置（rib 段或 pending 段）。
+- `ok` —— 它在**可装视图**里（rib 条目带 `"targets"`/next_hops），也就是 `viewLocked`/`AllRIB` 给 sr-fib 的那一份。
+- `ours` —— `vppctl show ip fib <pfx>` 里 `mpls via` 的条数 = 我们的隧道路径确实在转发链上。
+
+`in→ok` 是 sr-route 的可达性门（#262/#275 的账），`ok→ours` 才是切片 B 的账。第一版量具把这两段读成一段
+（pending 条目也含 `"prefix"`），于是算出 873ms/887ms 这种"改了等于没改"的数并记到了切片 B 头上，翻了一次车 —— 记在 README §一，
+别把它当"测量建议"。**`ours=0` 不等于这条前缀不在 FIB 里**：linux-cp 会把内核主表的路由镜像进 VPP VRF0
+（`lcp-rt`，pref 20），对远端前缀那份镜像本身就是黑洞；本轮 68~125 发出现 `line=Y && ours=0`。
+
+**实测：改前（轮询）vs 改后（事件）** —— 同一台 CPE1、同一前缀、同一注入（`systemctl restart frr`）、
+两臂的 sr-route 是**同一份**产物 `26044f78f7969935`，唯一变量是"谁触发 sr-fib 收敛"：
+
+| 边 | 改前 `bab523ff`（poll_sec=1，76ms 分辨率） | 改后 `a9f1bc8c`（事件，60~61ms 分辨率） |
+| --- | --- | --- |
+| 摘路边（可达 → 我们的路径下架） | ≤456ms / ≤593ms | **≤40ms / ≤41ms / ≤45ms**（另一臂 102ms 分辨率下 ≤79ms） |
+| 装路边（可装 → 我们的路径上架） | 868ms / 978ms | **201ms / 294ms / 755ms**（102ms 分辨率臂 ≤272ms） |
+| `in→ok` 那道可达性门 | 未观察到 1→2 单独成段 | 同样一次都没观察到 —— 它不归切片 B，归 #262/#275 |
+| 整条前缀不可用的总时长 | 5.33~6.66s | 5.33~6.66s（**两臂同量**：那半是 zebra 收录 + 客户侧收敛的账，切片 B 压不动它） |
+
+**发射延迟是直接量的，不是推出来的**：用 `stamp-watch.sh` 占住订阅位，逐毫秒打戳每一帧 ——
+摘路边事件比"外部第一次观测到变化"晚 59ms（≤142ms 内发出），装路边晚 8ms（≤84ms）。
+所以残余不在 sr-route 的发射端，在下游：sr-fib 一轮收敛 + VPP 装表。这一段本轮拆不干净
+（`fib.log`/`bridge.log` 只有秒级时间戳），README §五 给了怎么拆（给 converge 加毫秒戳 +
+在 ours=0 窗口里打一份完整 `show ip fib`），登记为残余，不写成结论。
+
+**测过的**：
+- 单测 25 条新增：`internal/route/watch_test.go` 12（INIT 全量 / announce+withdraw / 下一跳集合变化算一条事件 /
+  RT 改动算一条事件 / 不可见改动不发批 / 隧道 down 撤、up 重装 / 丢一个 RR 静默 / 突发合并 /
+  背压丢读端 / 订阅位独占 / 关停收尾 / `viewLocked` 与 `AllRIB` 逐条相等）、
+  `cmd/sr-route/watch_test.go` 3（真编辑能走完整条流 / 槽互斥 / 客户端断开收尾）、
+  `cmd/sr-fib/watch_test.go` 10（URL 换算 / 一帧只读一帧 / 不认识的帧拒收 / applyBatch 给收敛器一张可信视图 /
+  没快照时只请求全量 / 未知 op 作废视图 / 视图可证时用它、不可证时回全量 / 断流回退全量 RIB /
+  watchLoop 真装表 / 槽被占仍从全量 RIB 收敛）。`go test ./...` 全绿，`vm-verify.sh` **392 PASS / 0 FAIL / 0 WARN**，
+  `exp-273/six.sh` 六方向全 **0% 丢包**（2026-11-08 实测）。
+- lab 双臂 A/B 各若干枪，逐枪的客户可见时长写在 README §六 的中断表里；本轮新增两枪
+  `swap276.sh CPE1 sr-fib`（同版本换件，脚本自检）：新 pid 1831ms / 1804ms 起来，
+  **0/2561 与 0/2544 发 FAIL**。
+
+**两条新缺口，要 owner 拍（都不在切片 B 的范围里，本轮没动代码）**：
+
+- **B3 —— watch 模式下，隧道/BFD 状态变化没有任何东西会触发收敛。**
+  场景：隧道起来又塌下去，但这一段时间 RIB 没变（RR 还在发那条前缀）。
+  代码走到哪：`path.resolvable` 只由隧道表决定（`internal/route/client.go:1142` 明写
+  "It is NOT the source of path.resolvable: that flag is the tunnel gate alone"、`:1169`
+  "This is the path.resolvable is set from" 只有 `SetTunnelState`），BFD 的真实状态是
+  **收敛轮内部**才读的（`cmd/sr-fib/main.go:301` → `fib.UnreachablePeers` → `internal/fib/fib.go:306` 该路径跳过）。
+  watch 在位时收敛只有三个触发点（启动 `main.go:509`、事件批 `watch.go:215/233/253`、`PUT /config`），
+  `retryGap` 只是重挂间隔 ⇒ 这三个都不发生的那次抖动，**没人去重算**。
+  症状（现场证据）：poll2 那一枪里 ours 1→0 之后，是下一轮 1s 轮询把它救回来的；换成 watch 就没有"下一轮"。
+  为什么这条要紧：#262 的 hold-down 也要挂在同一个触发点上，挂不上就是"抑制窗口把已塌的隧道继续宣称可达"，
+  正撞 §1 第 3 条。**建议形状**：订阅 VPP 的 BFD 会话状态事件（sr-fib 已经在读 `BFDSessions`，缺的是事件而不是轮询），
+  状态翻转就 `signal()`。**这条不修，不许把 sr-route/sr-fib 抬到其余盒。**
+- **B4 —— 对端（sr-route）重启后，本地前缀集没人重建。**
+  场景：抬 sr-route 那一枪（队列第一节要干的活）之后，`/status` 的 `local` 段是空的且不会自己回来 ——
+  本盒客户侧前缀对全网消失，直到下一次客户侧路由变动。
+  代码走到哪：sr-frr 的上报是**变更驱动**的（`cmd/sr-frr/main.go:745-776`：`reporter.reconcile` 只在
+  `posted` 时打日志、只有 `imp.Dirty()` 或被唤醒才重算），sr-route 起来后不主动向 sr-frr 要。
+  本轮就踩过：我重启 CPE1 的 sr-route 之后 vm-verify 出 5 条 FAIL，根因是这条，不是切片 B。
+  修法（本轮实测可用）：`exp-273/window-swap.sh` 顺带再换 sr-frr 一枪，让它重连后走全量 announce —— 0/2803 发 FAIL。
+  **三个候选形状**：(a) sr-frr 定期重发全量（就是把切片 A 去掉，回到轮询，不推荐）；
+  (b) sr-route 起来后主动 GET sr-frr 的控制口 `/run/sr-frr/control.sock` 要一份全量（形状最像 zebra：
+  新客户端连上，daemon 立刻 `announce`）；(c) 把 local 集落盘当事实快照（和 G-2 隧道表那条同一个形状）。
+  我推荐 (b)：不改数据面形状、不引入周期重发，而且它天然是"谁新连接谁回说什么就是什么"，
+  与 §1 第 3 条对 sr-frr 重连的既有要求同构。
+
+**没做的**：
+- **B2 transport identity** —— `/local-prefixes`、`/local-prefixes/delta`、`/watch` 三条口现在各自判身份，
+  要收口成一套（同一条 mTLS/证书身份贯穿），这属于协议层，不该塞进切片 B。
+- 其余三盒仍是轮询版（CPE2/3/4：`sr-fib bab523ff`、`sr-route 5789c2c0`，2026-11-08 复测，见
+  `docs/agent-handover.md` §3）。**抬它们之前先修 B3，且抬 sr-route 时必须同批处理 B4。**
+- `seq`/`since_seq` 增量重放：与切片 A 同一个理由 —— 幂等批 + 断线全量兜底已经覆盖了丢失，FRR 也没有这层。
+- zebra 收录 K 路由那 1~2s：FRR 侧的账，#276 不压它（实测两臂 5.33~6.66s 同量，见上表）。
+
+**owner 想回退怎么办**：`cmd/sr-fib/main.go:508` 那一行 `go f.watchLoop(...)` 去掉、把 `convergeLoop` 换回
+`retryGap` 周期的 ticker，就退回轮询版；sr-route 侧 `/watch` 端点没人订阅时 `notifyWatchLocked` 是 no-op，
+不产生任何副作用，可以留着。盒上的回滚底：CPE1 `/usr/local/bin/sr-fib.prerun-20261108` = `bab523ff3809f57b`
+（轮询那份，含缺陷⑦ 修复），换回去只需要 `install276.sh` + `swap276.sh` 两枪，全程 0 丢包。
+
 ## 与 §10 冲突协议的关系
 
 抬 sr-route 与 #275/#276 的 e2e 判据脚本都会**动 lab 现状**：抬进程、注 BFD down、断 watch。

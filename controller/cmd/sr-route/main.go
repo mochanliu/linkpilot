@@ -590,12 +590,91 @@ func statusMux(c *route.Client) *http.ServeMux {
 			http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 		}
 	})
+	// GET streams the observable view as it changes -- the event-push
+	// counterpart of GET /status, and the reason sr-fib no longer has to poll.
+	mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
+		serveWatch(w, r, c)
+	})
 	return mux
 }
 
 func serveStatus(addr string, c *route.Client) {
-	log.Printf("sr-route: status on http://%s/status（运行时改表入口 PUT /tunnels、PUT /vrfs、PUT /local-prefixes、PUT /rrs）", addr)
+	log.Printf("sr-route: status on http://%s/status（运行时改表入口 PUT /tunnels、PUT /vrfs、PUT /local-prefixes、PUT /rrs；路由事件流 GET /watch）", addr)
 	if err := http.ListenAndServe(addr, statusMux(c)); err != nil {
 		log.Printf("sr-route: status server: %v", err)
+	}
+}
+
+// watchPing is how often an idle stream gets a comment frame. The reader needs
+// it because a Loc-RIB with nothing to say and a TCP connection that stopped
+// carrying bytes look identical on the wire; the reader's own idle deadline is
+// a multiple of this, so "quiet" stays provably alive.
+const watchPing = 5 * time.Second
+
+// serveWatch turns one subscription into an event-stream response.
+//
+// The shape is deliberate, and each half answers a way this could silently
+// go stale:
+//
+//   - A new reader always gets an INIT batch (the whole current view), never a
+//     replay from a remembered position. That is FRR's
+//     bgp_zebra_connected -> bgp_zebra_announce_table: a fresh connection
+//     re-announces, it does not resume. There is therefore no Last-Event-ID
+//     and nothing to persist about where a reader stopped.
+//   - 409 when the single slot is taken. The newcomer falls back to a full
+//     GET /status and retries; the live reader keeps streaming. Stealing the
+//     slot would work too, but two readers on one box is a bug worth making
+//     loud rather than papering over.
+//   - The response ends the moment the channel closes, which is how a
+//     backpressure drop or a Client shutdown reaches the reader: its own read
+//     gets an EOF and it re-attaches for a fresh INIT.
+func serveWatch(w http.ResponseWriter, r *http.Request, c *route.Client) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	sub, err := c.WatchSubscribe()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	defer sub.Close()
+
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	fl.Flush()
+
+	pings := time.NewTicker(watchPing)
+	defer pings.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case batch, open := <-sub.Events:
+			if !open {
+				return
+			}
+			payload, err := json.Marshal(batch)
+			if err != nil {
+				log.Printf("sr-route: watch encode: %v", err)
+				return
+			}
+			if _, err := fmt.Fprintf(w, "event: routes\ndata: %s\n\n", payload); err != nil {
+				return
+			}
+			fl.Flush()
+		case <-pings.C:
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
+			fl.Flush()
+		}
 	}
 }

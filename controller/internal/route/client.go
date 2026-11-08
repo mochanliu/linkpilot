@@ -245,6 +245,10 @@ type Client struct {
 	sessions []*clientSession // wanted ones first, in configured order, then the retired ones
 	loc      *locRib
 	counters counters
+	// watch is the event-push side of the Loc-RIB. Lazily created on the
+	// first /watch subscribe so test-only Clients don't pay for it; every
+	// mutation site calls notifyWatchLocked, which is nil-safe.
+	watch *WatchHub
 
 	// runCtx is set by Run and is the parent of every session goroutine's ctx, so
 	// SetRRs can start a session after boot and still have it stop on shutdown.
@@ -636,6 +640,11 @@ func (c *Client) SetVRFs(vs []VRFConfig) error {
 	c.vrfs, c.vrfIDs, c.exports = vrfs, ids, exports
 	c.rebuildLocalLocked()
 	c.pushLocalLocked()
+	// The import sets are one of the read-time gates the observable view is
+	// rendered through, and they just changed for every received route at once
+	// -- so a watcher has to be told even though no path entered or left the
+	// Loc-RIB here.
+	c.notifyWatchLocked()
 	// Nothing to re-derive on the received side: import RTs are consulted when
 	// the table is read (GoBGP's CanImportToVrf + Table.Select), so a VRF added
 	// now sees the paths already in the Loc-RIB without any rewrite.
@@ -668,6 +677,9 @@ func (c *Client) SetTunnels(ts []Tunnel) error {
 			c.loc.process(p.route, p.source, len(nextHops[id]) > 0)
 		}
 	}
+	// Not only the changed origins: the view carries the next-hop list itself,
+	// so an origin whose paths stay resolvable still has new next hops to send.
+	c.notifyWatchLocked()
 	return nil
 }
 
@@ -748,6 +760,7 @@ func (c *Client) SetTunnelState(states []TunnelState) error {
 			c.loc.process(p.route, p.source, c.reachableLocked(p.route))
 		}
 	}
+	c.notifyWatchLocked()
 	return nil
 }
 
@@ -1220,6 +1233,7 @@ func (c *Client) dropSessionLocked(s *clientSession) {
 		c.loc.withdraw(k, s.addr)
 	}
 	s.adjIn = map[RouteKey]Route{}
+	c.notifyWatchLocked()
 }
 
 // Run keeps the RR sessions alive until ctx is cancelled. It returns nil.
@@ -1247,7 +1261,15 @@ func (c *Client) Run(ctx context.Context) error {
 			s.conn.Close()
 		}
 	}
+	hub := c.watch
 	c.mu.Unlock()
+	// Detach any /watch reader before waiting for the sessions: the reader's
+	// goroutine is not in c.wg, and a closed Events channel is what tells it to
+	// answer the HTTP request instead of blocking on a channel that will never
+	// be written to again.
+	if hub != nil {
+		hub.CloseHub()
+	}
 	c.wg.Wait()
 	return nil
 }
@@ -1508,6 +1530,7 @@ func (c *Client) markSynced(s *clientSession) {
 	// This is the moment a replacement RR takes over: EOR means its copy of the
 	// table is complete, so the session it replaced can finally be dropped.
 	c.reapRetiringLocked()
+	c.notifyWatchLocked()
 }
 
 func (c *Client) noteError(s *clientSession, err error) {
@@ -1605,6 +1628,9 @@ func (c *Client) applyAnnounce(s *clientSession, routes []Route) error {
 			c.loc.process(rt, s.addr, c.reachableLocked(rt))
 		}
 	}
+	if s.synced {
+		c.notifyWatchLocked()
+	}
 	return nil
 }
 
@@ -1646,6 +1672,7 @@ func (c *Client) applyWithdraw(s *clientSession, keys []RouteKey) error {
 			c.counters.withdrawn++
 		}
 	}
+	c.notifyWatchLocked()
 	return nil
 }
 

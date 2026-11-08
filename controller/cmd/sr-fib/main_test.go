@@ -269,7 +269,17 @@ func newFiberForTest(t *testing.T) (*fiber, *fakeDP, *ribStub) {
 	stub.body.Store(`{"rib":{}}`)
 	srv := httptest.NewServer(stub)
 	t.Cleanup(srv.Close)
-	f := &fiber{dp: dp, applier: fib.NewApplier(dp), hc: srv.Client(), statusURL: srv.URL}
+	// 与 main() 构造的那份一一对应：漏掉 stream/view/wake 的话，watch 那几条
+	// 路径在这份夹具上跑出来的就不是产品里的行为。
+	f := &fiber{
+		dp:        dp,
+		applier:   fib.NewApplier(dp),
+		hc:        srv.Client(),
+		stream:    &http.Client{},
+		statusURL: srv.URL,
+		view:      map[ribKey]fib.RIBRoute{},
+		wake:      make(chan struct{}, 1),
+	}
 	cur := liveConfig{VRFs: []uint8{0}}
 	f.cur.Store(&cur)
 	return f, dp, stub
