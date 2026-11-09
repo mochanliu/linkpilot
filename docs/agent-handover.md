@@ -178,10 +178,17 @@ done'
 
 | 盒 | `sr-route` | `sr-fib` | `sr-frr` | `sr-agent` | 收敛触发 |
 | --- | --- | --- | --- | --- | --- |
-| CPE1 | `26044f78f7969935` run==盘 | `a9f1bc8c8fd49016` run==盘（**事件版**） | `c8e731ddcbca7bd6` run==盘 | `d2ad8519648c031f` run==盘 | `/watch` 事件推，`poll_sec` 只当重挂间隔 |
+| CPE1 | `26044f78f7969935` run==盘 | `a9f1bc8c8fd49016` run==盘（**事件版，但没带 B3**） | `c8e731ddcbca7bd6` run==盘 | `d2ad8519648c031f` run==盘 | `/watch` 事件推，`poll_sec` 只当重挂间隔；**可达性变化不触发收敛（B3 缺陷臂）** |
 | CPE2/3/4 | `5789c2c0f753529b` run==盘 | `bab523ff3809f57b` run==盘（轮询版） | `c8e731dd…` run==盘 | `d2ad8519…` run==盘 | 每秒一轮 |
 
-四台八件 run==盘，**没有静默退回**。CPE1 的轮询版留在盒上当回滚底：`/usr/local/bin/sr-fib.prerun-20261108`
+**2026-11-09 复测（B3 落地后，四台全表，同一套命令）** —— 上面那张表只有 CPE3 变了：
+
+| 盒 | `sr-route` | `sr-fib` | 收敛触发 |
+| --- | --- | --- | --- |
+| CPE3 | `26044f78f7969935` run==盘 | `c213a6caf1b2aabf` run==盘（**B3 版**：订阅本机 VPP 的 BFD 状态事件） | `/watch` 事件推 **+ BFD 状态翻转** |
+
+CPE1 仍是 `a9f1bc8c8fd49016`（事件版、无 B3 —— 它就是缺陷臂那一台，留作对照），CPE2/CPE4 仍是轮询版。
+四台十二件 run==盘，**没有静默退回**。CPE1 的轮询版留在盒上当回滚底：`/usr/local/bin/sr-fib.prerun-20261108`
 = `bab523ff3809f57b`（含缺陷⑦ 修复那份）。换件与自检用的是 `test/lab/vmlab/exp-276/install276.sh`（只装盘）
 与 `swap276.sh`（SIGTERM + 产品自己的开机清单补回 + 客户侧 75 秒探测），2026-11-08 用同版本换件验证过：
 新 pid 1831ms / 1804ms 起来，两枪各 0 FAIL（2561 发 / 2544 发）。
@@ -304,6 +311,15 @@ inode 不同（rename 换上去的，进程还持有旧 inode，所以 ②③ �
 #274 那次四台 sr-frr 换件的实测在 [test/lab/vmlab/exp-274/README.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/test/lab/vmlab/exp-274/README.md)
 （客户可见中断最长 1.0–2.0s，按方向不同）。
 
+**换完 sr-fib 必须立刻补一次隧道表**，否则这一臂作废（2026-11-09 实测，缺口 G-2 在这里咬人）：
+sr-fib 的「下一跳 → 本机 wg 口 + 颜色」那张表只在内存（`PUT /config`），产品里没有任何进程维护它，
+新进程一起来就是 `0 条隧道`，于是所有远端前缀按「下一跳不在隧道表里，该路径跳过」被跳过，
+而 VPP 里的老行还在（`routes+0/-0`、`mpls via` 条数不变）—— 看着像"没坏"，其实收敛根本没发生。
+补法只有一条合法路径：`bash test/lab/vmlab/vm-fib-sync.sh <node>`（数据来自控制台
+`GET /api/underlay` + 盒内 `show interface addr` + `/etc/sdwan/route.json`，脚本不猜）。
+判据是它自己打的那行：`隧道 N 条 … converged=True` 且**没有** `警告:`；换 sr-route 那一枪还要按 B4
+的做法紧跟着换 sr-frr，否则本盒 local 前缀集对全网消失。
+
 ### 5.3 提交
 
 ```bash
@@ -350,8 +366,11 @@ CPE2/3/4 还是轮询版，那些盒上 `poll_sec=1` 依然是"每秒一轮"。
 
 ## 7. 测量陷阱（每一条都付过学费）
 
-1. **盒子之间、盒子与 Mac 之间没有对时**（CPE1 的钟比 UTC 快约 10.7 分钟）。
-   跨机只能比**时长**，不能比绝对时刻，文件 mtime 也不能横着比。注入时刻取盒子自己的 `date +%s.%3N`。
+1. **盒子之间、盒子与 Mac 之间没有对时**（CPE1 的钟比 UTC 快约 10.7 分钟；2026-11-09 再量，
+   被测盒与探测机之间互差 0.8~8.2 小时）。
+   跨机只能比**时长**，不能比绝对时刻，文件 mtime 也不能横着比。注入时刻取盒子自己的 `date +%s.%3N`；
+   判据锚点一律取**被测盒自己采到的那一次状态翻转**，别去对齐对面那台敲命令的时刻——
+   8 小时的差会把 48ms 量成 480ms。
 2. **Mac 的 BSD `date` 没有 `%N`**；`bash 3.2` 在大括号展开上有坑。跨机脚本别用它们。
 3. **并发 `scp` 会静默截断文件**。产物推送一律串行，落地后 `sha256sum` 对一遍再算数。
 4. **打流窗口放在管道子 shell 里会假绿**（"0ms 中断"就是这么来的）。计时要落在真正执行的那一侧。
@@ -367,6 +386,16 @@ CPE2/3/4 还是轮询版，那些盒上 `poll_sec=1` 依然是"每秒一轮"。
 10. **盒子上的 VPP 进程名是 `vpp_main`，不是 `vpp`** —— `pgrep -x vpp` 在这四台上返回空（今天实测），
     取 pid 用 `pgrep vpp_main`。`sha256sum /proc//exe` 这种拼出来的空 pid 会静默给你空哈希，
     看起来像"盘上没有"。
+11. **`ssh -n` 配 heredoc 一声不响输出 0 行**（2026-11-09 踩过）：`-n` 把 stdin 换成 `/dev/null`，
+    `<<'X'` 送不到远端，`bash -s` 就当没有输入直接结束。远端要读 heredoc 的那几条 ssh 一律不带 `-n`。
+12. **引号形式的 heredoc 里本地变量不展开**，脚本会带着 `set -u` 在远端挂掉 ——
+    而且常常是**活干完之后再挂**（`install276.sh` 就是这样：改名已经成功、它自己报 unbound variable 退出码非 0）。
+    要送进远端的值一律走 `bash -s -- a b c` 位置参数；同类坑：`[ "$x" = y ] && echo` 放在脚本最后一行会把退出码带出去。
+13. **客户侧探测必须带 `ping -I <源 loopback>`**（2026-11-09 就是这么误判过一次「BFD 根本没起来」）：
+    不带 `-I` 时源地址取路由表选出来的 underlay 源，那条地址没有回程路径，量出来是 100% 丢包，
+    与可达性无关。owner 在控制台里看到的「bfd 没起来」多数是这一条。
+14. **别把 ECMP 的「留着死腿」读成丢一半**：VPP 按流选桶，同一组源/目的的探测全落在同一个桶里，
+    实测要么这条流 20 秒全断、要么一条不丢（见 `exp-b3/README.md` 三臂）。要量"一半"得开多条并发流。
 
 ---
 
@@ -390,20 +419,21 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 | 任务 | 状态 | 一句话现状 |
 | --- | --- | --- |
 | **#275** `resolvable` 改吃活动隧道 | **已落地（2026-11-08）**，单测 6 条绿；e2e 判据待跑（要注入 BFD down，属于会动 lab 现状的动作，需 owner 声明窗口） | 门换成"配置 && 活着"：`reachableLocked()` 先看 `nextHops`（配置层，未配置=不可达，同旧），再看 `peerBFD[peer]`（活动层）。活动层是 agent 每次 `metricsLoop` 上报的 BFD 结果经 sr-route 新端点 `PUT /tunnel-state` 灌进来的；`sr-agent` 端接线在 `internal/agent/routestate.go`，`RouteStatePusher` 读 `route.json` 里的 `status_addr` 定位到本机 sr-route，把原始 `wire.TunnelMetrics` 行透传过去，聚合逻辑（同 peer 多隧道 any-up-wins、absent=没有信息）全在 `internal/route` 里。细则见 `docs/queue-plan-next.md` §二 落地实况。**四条 pin 的实际选择**：pin1 采用**内部/fib/reach.go 的 fail-open 口径**（"没跑 BFD 的 CPE 不该因为本包而黑洞所有路由"），与 §二 原方案里"严格 fail-closed"那条相反 —— 若 owner 拍要改回 fail-closed，只需调 `reachableLocked` 里 `!s.Known` 那行，代价是刚入网的前几秒（agent 第一次上报之前）本机路由会全部 pending；pin3 按 **peer 粗粒度 any-up-wins**（照 reach.go 的注释"路由只带对端地址，没有本地源，挑不了更细"），不是 §二 建议的 next-hop 精细；pin2 hold-down **本次未做**，交给 #262（那条本来就管"亚秒抖动放大"）；pin5 RR 侧本次未做，交给 #272 |
-| **#276** 收敛改事件驱动 | **切片 A+B+C 全部落地（2026-11-08）**：A=提交 a8083d2（sr-frr→sr-route delta + 10ms 合并 + 重连全量），B=sr-route→sr-fib 的 SSE `/watch`（每前缀一条事件、10ms 合并、背压丢读端、订阅位独占 409、断流立即重挂+INIT 全量），C=判据与实测成文于 `test/lab/vmlab/exp-276/README.md`。新增单测 25 条全绿、`go test ./...` 全绿、`vm-verify.sh` 392/0/0、`exp-273/six.sh` 六方向 0% 丢包。**实测**（同一台 CPE1、同一注入 `systemctl restart frr`、两臂 sr-route 同一份 `26044f78f7969935`）：摘路边 ≤456/593ms → **≤40/41/45ms**，装路边 868/978ms → **201/294/755ms**；sr-route 发射端延迟直接量到（摘 ≤142ms、装 ≤84ms），残余在 sr-fib 一轮收敛 + VPP 装表那侧，本轮秒级日志拆不下去，已登记。**只剩 B2（三条口共用一套 transport identity）没做**。CPE1 已跑事件版，CPE2/3/4 仍旧版 —— **抬它们之前必须先修 B3** | 细则见 `docs/queue-plan-next.md` §三 落地实况（切片 B+C）。**这一片顺手抓到两条要 owner 拍的缺口：B3 watch 模式下隧道/BFD 状态变化没有任何收敛触发（`client.go:1142/1169` 的隧道门 + `cmd/sr-fib/main.go:301` 才读 BFD + 三个触发点 `main.go:509`/`watch.go:215/233/253`，现场证据 poll2 那一枪靠下一轮 1s 轮询救回）；B4 sr-route 重启后本地前缀集没人重建（`cmd/sr-frr/main.go:745-776` 变更驱动，本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 才补回）** |
+| **#276** 收敛改事件驱动 | **切片 A+B+C 全部落地（2026-11-08）**：A=提交 a8083d2（sr-frr→sr-route delta + 10ms 合并 + 重连全量），B=sr-route→sr-fib 的 SSE `/watch`（每前缀一条事件、10ms 合并、背压丢读端、订阅位独占 409、断流立即重挂+INIT 全量），C=判据与实测成文于 `test/lab/vmlab/exp-276/README.md`。新增单测 25 条全绿、`go test ./...` 全绿、`vm-verify.sh` 392/0/0、`exp-273/six.sh` 六方向 0% 丢包。**实测**（同一台 CPE1、同一注入 `systemctl restart frr`、两臂 sr-route 同一份 `26044f78f7969935`）：摘路边 ≤456/593ms → **≤40/41/45ms**，装路边 868/978ms → **201/294/755ms**；sr-route 发射端延迟直接量到（摘 ≤142ms、装 ≤84ms），残余在 sr-fib 一轮收敛 + VPP 装表那侧，本轮秒级日志拆不下去，已登记。**只剩 B2（三条口共用一套 transport identity）没做**。CPE1 已跑事件版，CPE2/3/4 仍旧版 —— 抬它们之前必须先修 B3；**B3 已于 2026-11-09 落地（见下面 B3 那一行，已收口），抬的硬前置只剩 B4** | 细则见 `docs/queue-plan-next.md` §三 落地实况（切片 B+C）。**这一片顺手抓到两条要 owner 拍的缺口：B3 watch 模式下隧道/BFD 状态变化没有任何收敛触发（`client.go:1142/1169` 的隧道门 + `cmd/sr-fib/main.go:301` 才读 BFD + 三个触发点 `main.go:509`/`watch.go:215/233/253`，现场证据 poll2 那一枪靠下一轮 1s 轮询救回）；B4 sr-route 重启后本地前缀集没人重建（`cmd/sr-frr/main.go:745-776` 变更驱动，本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 才补回）** |
 | #272 跨盒回灌 | 待拍 | 注入的 K 路由进了客户 area0 后被别的盒当 `local` 上报 |
-| #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞。**2026-11-08 更新口径**：sr-fib 那"1s 轮询直接摘路"的放大在 CPE1 已经没了（切片 B：摘路边实测 ≤40~45ms），剩下的抖动放大全在 BFD 判定 + 没有 hold-down 这一侧；而 hold-down **必须挂在 B3 那个触发点上**（订阅 VPP BFD 会话状态事件 → `signal()`），挂在轮询上等于挂在一个 watch 模式已经不存在的节拍里 |
+| #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞。**2026-11-09 更新口径**：sr-fib 那"1s 轮询直接摘路"的放大在事件版盒上已经没了（切片 B：摘路边实测 ≤40~45ms；B3 之后连"隧道/BFD 抖一下、RIB 没变"这一类也会立刻触发重算，双向 ≤65ms）。剩下的抖动放大全在 BFD 判定 + 没有 hold-down 这一侧；hold-down 现在**有地方挂了** —— 就挂在 B3 那条 `signal()` 上（`cmd/sr-fib/main.go:461` 造 `wake` → `:469` 建连时订阅 BFD 事件 → `cmd/sr-fib/watch.go:320` 的 `signal()`），挂在轮询上等于挂在一个 watch 模式已经不存在的节拍里 |
 | ~~#269 缺陷⑧~~ | **已修（2026-11-07）** | `controller/deploy/sr-box/start.sh` 加了一把 `flock`（`LOCK=${SR_BOX_LOCK:-$RUN/.lock}`）：`run_up`/`run_stop` 都先抢它，非阻塞拿不到就 SKIP；`launch()`/`do_vpp`/`do_apply`/`do_frr` 每个后台子进程带 `9>&-` 关掉锁 fd，否则被 systemd `TimeoutStartSec` 杀掉时锁攥在守护进程手里永不释放。沙盒 5 路并发实测：`sr-agent`/`sr-route`/`sr-fib`/`sr-frr` 各起 1 份，4 份 SKIP 退出 0。**VM 台的物理复测没跑**（要 `systemctl restart vpp` 撞那一秒，属于会影响 lab 现状的动作，等 owner 点头再做）。抬 `sr-route` 到 HEAD 的**并发抢起阻塞已解**，剩下的只是重启本身的 RR 会话抖动 |
 | ~~#268 / #260 产物没装全~~ | **已收口（#277，2026-11-07）** | 四台盘上已换成在跑那一份，`run==disk` 全一致；判据与留底见 §3 和 `exp-277/README.md`。**代码没再动**，这一轮修的是产物一致性 |
 | G-2 隧道表落盘 | 只出了方案（`3a09f03`） | 隧道层磁盘恢复不了 ⇒ §2.5 那个 `sr-box` exit 1 |
 | NAT 阶梯 #222 + M-4/M-1/M-3/M-5、#211/#213/#244/S8 | 挂着 | 顺序 M-4→M-1→M-2→M-3 |
 
-**本轮（2026-11-08，#276 切片 B/C）新抓到、要 owner 拍的 2 条**（细节与推荐形状在
-`docs/queue-plan-next.md` §三 落地实况末尾、判据与逐枪数字在 `test/lab/vmlab/exp-276/README.md` §七）：
+**#276 切片 B/C（2026-11-08）顺手抓到的 2 条缺口：B3 已于 2026-11-09 落地并实测收口，B4 仍要 owner 拍**
+（B3 的判据与逐枪数字在 `test/lab/vmlab/exp-b3/README.md`，B4 的细节与推荐形状在
+`docs/queue-plan-next.md` §三 落地实况末尾）：
 
 | 缺口 | 场景 | 一句话现状 |
 | --- | --- | --- |
-| **B3** watch 模式下可达性变化无人触发收敛 | 隧道/BFD 抖一下、RIB 没变 | 收敛只剩"事件批 / `PUT /config` / 启动"三个触发点，隧道门变了但没有事件 ⇒ 不重算。**这条不修不许把 sr-route/sr-fib 抬到其余盒**；#262 的 hold-down 也挂在它上面 |
+| ~~**B3**~~ watch 模式下可达性变化无人触发收敛 | 隧道/BFD 抖一下、RIB 没变 | **已修（2026-11-09）**：sr-fib 在建连时订阅本机 VPP 的 `want_bfd_events`，会话状态翻转直接 `signal()` 叫醒收敛轮；订阅失败按"起不来"处理，不留半死状态。三臂实测（CPE3 / 注入在**对端** CPE1 的 wg1009）：轮询版摘路 745ms/装回 492ms；**事件版没有 B3 = 无期限**（那条死腿在 FIB 里挂了 21s、20 发探测全挂、sr-fib 一行日志都没打）；B3 版摘路与装回双向 **≤65ms**（一个采样间隔以下）、1557 发只 FAIL 1。**#262 的 hold-down 现在有这个触发点可以挂了** |
 | **B4** 对端 sr-route 重启后 local 前缀集不重建 | 抬 sr-route 那一枪（队列第一节要干的活）之后 | sr-frr 只在变更时上报，sr-route 起来后不主动要 ⇒ `local` 空到下一次客户侧变动，本盒前缀对全网消失。本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 补回（0/2803 发 FAIL）。三个候选形状里我推荐 **(b) sr-route 起来后向 sr-frr 控制口要一份全量**（形状 = zebra 新客户端一连上 daemon 就 announce；不改数据面、不引入周期重发） |
 
 历史与决策的权威出处（要引结论去这里引，别信二手转述）：
@@ -442,6 +472,13 @@ lab 的当前形状属于 owner，不属于任何一次实验。
 - 控制台：`http://127.0.0.1:8088`（Mac 本机）。运营方令牌文件：`/Users/louis/srvmlab/ctrl/data/console-token`。
   PKI/状态同目录：`ca.key` `ca.pem` `server.key` `server.pem` `state.json`。
   **这些值一个都不许进文件/日志/提交信息**（AGENTS.md §3）。租户账号口令向 owner 当场索取，我们只在对话里传。
+  脚本用的那份租户口令在 `/Users/louis/srvmlab/state/credentials.json`（0600，仓库外，`vm-console.py` 与
+  `vm-fib-sync.sh` 都从这里读）。**它和控制器对不上时不要改脚本、也不要猜口令**：
+  用运营方令牌登录 → `POST /api/accounts/reset {"username": ...}`（控制器生成新口令、只在这次响应里出现一次）
+  → 把返回值写回这个文件并 `chmod 600` → 再跑 `python3 -c` 走 `api_tenant()` 复检登录。
+  2026-11-09 就靠这条把 `vm-fib-sync.sh` 的 `401 invalid username or password` 修好的；
+  **换过一次口令必须当天在日常会话里把新口令交给 owner**（他手里那份会失效）。
+  另：`sr-ctrl` 的 `-admin-token` 在 Mac 的 `ps` 里是明文可见的 —— 别把它抄进任何文件、日志或提交信息。
 - 设备 API：`0.0.0.0:8444`（TLS）；STUN：`3478`/`3479`；RR：`18446/19446`（rr1）、`18447/19447`（rr2）。
 - 盒内：`ssh CPE1|CPE2|CPE3|CPE4|cust12|cust3|cust4`（走 `~/.ssh/config` 别名，直连 IP 被拒）。
 - 构建：`docker exec lp-ctrl sh -lc 'cd /workspace/controller && go build ./... && go vet ./... && go test ./...'`。

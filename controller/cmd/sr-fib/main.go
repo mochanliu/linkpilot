@@ -454,10 +454,27 @@ func main() {
 
 	// 一只 dial 闭包，启动时用一次、连接死了以后每轮再用一次：VPP 重启会关掉所有
 	// api 连接，而客户端不会自己活过来（与 sr-agent 缺陷④ 同一个根因）。
+	//
+	// wake 必须先造出来：BFD 事件的回调要往它里面塞"该收敛一次"，而注册只能做在
+	// dial 里头 —— VPP 侧的订阅是跟着连接一起没的，每次重连都得重新 want_bfd_events
+	// 一遍，放在外面就只剩第一次连接有事件。
+	wake := make(chan struct{}, 1)
 	dial := func(ctx context.Context) (bfdDP, error) {
 		c, err := vppapi.Dial(ctx, cfg.VPPSocket, "sr-fib")
 		if err != nil {
 			return nil, err
+		}
+		// 订阅失败就这次连接算失败：宁可起不来，也不要一个"看着连上了、但可达性
+		// 变化没人叫醒收敛"的半死状态（那正是 B3 之前的形状）。
+		if err := c.WatchBFDEvents(ctx, func(ev vppapi.BFDEvent) {
+			log.Printf("sr-fib: %s", ev)
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		}); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("订阅 BFD 事件: %w", err)
 		}
 		return c, nil
 	}
@@ -485,7 +502,7 @@ func main() {
 		stream:    &http.Client{},
 		statusURL: cfg.StatusURL,
 		view:      map[ribKey]fib.RIBRoute{},
-		wake:      make(chan struct{}, 1),
+		wake:      wake,
 	}
 	f.cur.Store(&live)
 
@@ -505,6 +522,9 @@ func main() {
 	retryGap := time.Duration(cfg.PollSec) * time.Second
 	log.Printf("sr-fib: %d 个 VRF、%d 条隧道，从 %s 的事件流收敛（断流/占用时先全量补一次，每 %s 再挂一次；逃生开关=%v）",
 		len(live.VRFs), len(live.Tunnels), cfg.StatusURL, retryGap, live.Escape)
+	// 走到这里说明 dial 里的订阅已经成功（失败的话进程在上一句就退出了）：
+	// 可达性变化不再要等下一轮，事件本身就会唤醒一次收敛。
+	log.Printf("sr-fib: 已订阅本机 VPP 的 BFD 状态变化事件，可达性一变就唤醒收敛（真值仍以下一次 bfd_udp_session_dump 为准）")
 	go f.watchLoop(ctx, retryGap)
 	f.signal() // 起来先收敛一次：此时还没有快照，走的正是老的全量路径
 	f.convergeLoop(ctx)

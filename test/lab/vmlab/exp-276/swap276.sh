@@ -31,9 +31,9 @@ mkdir -p "$WORK"
 
 {
 echo "== swap $NAME on $BOX $(date -u +%FT%TZ)  探测 $PB: -I $SRC -> $DST"
-ssh -o BatchMode=yes "$BOX" bash -s -- "$NAME" "$MON_PFX" <<'REMOTE'
+ssh -o BatchMode=yes "$BOX" bash -s -- "$NAME" "$MON_PFX" "$BOX" <<'REMOTE'
 set -u
-NAME=$1; MON=$2
+NAME=$1; MON=$2; BX=$3
 PID=$(pgrep -x "$NAME" | head -1 || true)
 [ -n "$PID" ] || { echo "   $NAME 没在跑，swap 无从谈起（先查开机清单）" >&2; exit 1; }
 printf '   换之前 pid=%s 跑=%s 盘=%s\n' "$PID" \
@@ -51,9 +51,9 @@ ssh -n -o BatchMode=yes "$PB" "end=\$((SECONDS+75)); while [ \$SECONDS -lt \$end
 PROBER=$!
 sleep 4
 
-ssh -o BatchMode=yes "$BOX" bash -s -- "$NAME" "$MON_PFX" <<'REMOTE' | tee -a "$LOG"
+ssh -o BatchMode=yes "$BOX" bash -s -- "$NAME" "$MON_PFX" "$BOX" <<'REMOTE' | tee -a "$LOG"
 set -u
-NAME=$1; MON=$2
+NAME=$1; MON=$2; BX=$3
 old=$(pgrep -x "$NAME" | head -1)
 echo "   SIGTERM pid=$old 于 $(date +%s.%3N)"
 kill -TERM "$old"
@@ -84,7 +84,7 @@ case "$NAME" in
     # B4：本地前缀集是 sr-frr 变更驱动上报的，sr-route 起来后没人重发 ⇒ 集会空着。
     n=$(curl -s --max-time 3 http://127.0.0.1:19001/status | tr -d ' \n' | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('local',[])))" 2>/dev/null || echo 取不到)
     echo "   /status 的 local 条数=$n"
-    [ "$n" = "0" ] && echo "   !! B4：换了 sr-route，本地前缀集空了且不会自愈（sr-frr 只在变更时上报）。修法（2026-11-08 实测可用，在 Mac 上仓库根跑）：bash test/lab/vmlab/exp-273/window-swap.sh $BOX cust12 172.16.12.1 172.16.4.1 —— 顺带再换 sr-frr 一枪，让它重连后重报全量"
+    if [ "$n" = "0" ]; then echo "   !! B4：换了 sr-route，本地前缀集空了且不会自愈（sr-frr 只在变更时上报）。修法（2026-11-08 实测可用，在 Mac 上仓库根跑）：bash test/lab/vmlab/exp-273/window-swap.sh $BX cust12 172.16.12.1 172.16.4.1 —— 顺带再换 sr-frr 一枪，让它重连后重报全量"; fi
     ;;
 esac
 REMOTE

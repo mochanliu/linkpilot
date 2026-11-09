@@ -15,9 +15,9 @@ NAME=${2:?sr-route|sr-fib|sr-frr|sr-agent}
 D=/root/vmlab/artifacts/linux
 SRC=${3:-$D/$NAME.new}
 
-ssh -o BatchMode=yes "$BOX" bash -s -- "$NAME" "$SRC" <<'REMOTE'
+ssh -o BatchMode=yes "$BOX" bash -s -- "$NAME" "$SRC" "$BOX" <<'REMOTE'
 set -eu
-NAME=$1; SRC=$2
+NAME=$1; SRC=$2; BX=$3
 BIN=/usr/local/bin/$NAME
 # 只看存在与非空：push276.sh 的 gunzip 落点本来就是 0644，可执行位由下面 chmod 给。
 [ -s "$SRC" ] || { echo "盘上没有产物或它是空的：$SRC（先跑 push276.sh）" >&2; exit 1; }
@@ -33,6 +33,6 @@ printf '   新   盘上=%s（%s 字节）\n   老   盘上=%s\n   跑着的=%s (
 if [ "$NEW" = "$RUN" ]; then
   echo "   !! 跑着的就是这一份 —— 装盘这枪没有改变任何运行事实，不需要 swap"
 else
-  echo "   跑 ≠ 盘：这是预期状态。要生效就接着跑 swap276.sh $BOX $NAME"
+  echo "   跑 ≠ 盘：这是预期状态。要生效就接着跑 swap276.sh $BX $NAME"
 fi
 REMOTE

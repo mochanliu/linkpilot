@@ -134,6 +134,12 @@ var requiredVersions = map[string]string{
 	"bfd_udp_del_reply":             "e8d4e804",
 	"bfd_udp_session_dump":          "51077d14",
 	"bfd_udp_session_details":       "09fb2f2d",
+	// BFD 状态变化的订阅（B3）。三条 CRC 都是 2026-11-08 从 CPE3 运行中的 VPP
+	// 注册表里现抓的（2058 条，见 /tmp/dumpmsg.py），不是从 .api 推的：
+	// want_bfd_events 是 core 的 pub_sub 消息，事件帧才是真正会读到的结构。
+	"want_bfd_events":       "c5e2af94",
+	"want_bfd_events_reply": "e8d4e804",
+	"bfd_udp_session_event": "8eaaf062",
 }
 
 func checkVersions(ids map[string]uint16, crcs map[string]string, want map[string]string) error {

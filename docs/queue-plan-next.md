@@ -223,7 +223,7 @@ owner 已拍：**全部照抄 FRR**、**先起 A**。切片 A 是"sr-frr → sr-
 
 owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 frr 的长连方式不相上下就选甲"。
 甲 = SSE `/watch`、每条路由一条事件，范围"全部照抄 FRR"。这一节先给形状，再给数字，
-最后给两条这次顺手抓到、必须他拍的缺口（B3/B4）。切片 B（sr-route → sr-fib 推事件）和
+最后给两条这次顺手抓到、必须他拍的缺口（B3/B4）。**（2026-11-09 更新：B3 已经落地并实测收口，B4 仍在等他拍。）**切片 B（sr-route → sr-fib 推事件）和
 切片 C（判据 + 实测时长）在同一次提交里收口；B2（三条口共用一套 transport identity）没做，理由在下面。
 
 **代码形状**（全部在 `feat/vbond-control-plane`，`controller/` 下）：
@@ -294,9 +294,9 @@ owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 fr
   `swap276.sh CPE1 sr-fib`（同版本换件，脚本自检）：新 pid 1831ms / 1804ms 起来，
   **0/2561 与 0/2544 发 FAIL**。
 
-**两条新缺口，要 owner 拍（都不在切片 B 的范围里，本轮没动代码）**：
+**两条新缺口的现状（2026-11-09 更新：B3 已落地并实测收口，B4 仍要 owner 拍）**：
 
-- **B3 —— watch 模式下，隧道/BFD 状态变化没有任何东西会触发收敛。**
+- **B3 —— watch 模式下，隧道/BFD 状态变化没有任何东西会触发收敛。已修（2026-11-09 落地 + 三臂实测）。**
   场景：隧道起来又塌下去，但这一段时间 RIB 没变（RR 还在发那条前缀）。
   代码走到哪：`path.resolvable` 只由隧道表决定（`internal/route/client.go:1142` 明写
   "It is NOT the source of path.resolvable: that flag is the tunnel gate alone"、`:1169`
@@ -306,8 +306,42 @@ owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 fr
   `retryGap` 只是重挂间隔 ⇒ 这三个都不发生的那次抖动，**没人去重算**。
   症状（现场证据）：poll2 那一枪里 ours 1→0 之后，是下一轮 1s 轮询把它救回来的；换成 watch 就没有"下一轮"。
   为什么这条要紧：#262 的 hold-down 也要挂在同一个触发点上，挂不上就是"抑制窗口把已塌的隧道继续宣称可达"，
-  正撞 §1 第 3 条。**建议形状**：订阅 VPP 的 BFD 会话状态事件（sr-fib 已经在读 `BFDSessions`，缺的是事件而不是轮询），
-  状态翻转就 `signal()`。**这条不修，不许把 sr-route/sr-fib 抬到其余盒。**
+  正撞 §1 第 3 条。
+  **落地形状（就是建议的那一条，没绕）**：订阅 VPP 的 BFD 会话状态事件，状态翻转就 `signal()`。
+  - `internal/vppapi/events.go`（新）：`WatchBFDEvents(ctx, fn)` 发 `want_bfd_events`
+    （body 是 `[1 个 pad + client_index=1 + pid]`，`bfdEventLen=67`），把 `bfd_udp_session_event`
+    解成 `BFDEvent{SwIfIndex, LocalIP, PeerIP, State}`。**注册异步 handler 必须排在发请求之前** ——
+    事件帧和应答几乎同时回来，先发后注册会丢掉头一条。
+  - `internal/vppapi/vppapi.go`：`Client.asyncs map[uint16]func([]byte)`，`readLoop` 按 msg_id 派发。
+    查表在 `c.mu` 里做，**回调在解锁之后调**（回调里下一步往往就是发一条请求去读真值，锁内回调就是死锁），
+    并且传的是帧的副本。
+  - `internal/vppapi/messages.go`：`requiredVersions` 增加 `want_bfd_events c5e2af94` /
+    `want_bfd_events_reply e8d4e804` / `bfd_udp_session_event 8eaaf062`（三条 CRC 2026-11-08 从 CPE3 现网刮下来）。
+  - `cmd/sr-fib/main.go:461` 先造 `wake`（容量 1 的 chan），注册做在 **dial 闭包内部**：
+    VPP 侧的订阅是跟着连接一起没的，每次重连都得重新 `want_bfd_events`，放在外面就只剩第一次连接有事件。
+    **订阅失败 = 这次连接失败**（`c.Close()` + 包装错误）：宁可起不来，也不要一个"看着连上了、
+    但可达性变化没人叫醒收敛"的半死状态 —— 那正是修之前的形状。
+  - 事件只是**叫醒**，真值仍然从 `bfd_udp_session_dump` 读（level-triggered）：这条决定了它不违反 §1 第 3 条，
+    也不会有"事件丢了就一直以为 up"的乐观窗口。
+  - 新增单测 5 条：投递 / **回调在锁外**（否则死锁）/ 短帧计数不投 / `retval` 透出 / dial 拒结构漂移。
+  **实测（CPE3 被测，故障注入在**对端** CPE1 的 `wg1009`；台账 `test/lab/vmlab/exp-b3/README.md`）**：
+
+  | 臂 | sr-fib | 收敛触发 | 摘路 | 装回 | 死腿在 FIB 里挂多久 | 客户侧探测 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 轮询基线 | `bab523ff3809f57b` | 每秒一轮 | **745ms** | **492ms** | 0.82s / 20.30s | 1588 发 FAIL 1（0.1%） |
+  | 缺陷臂（事件版无 B3） | `a9f1bc8c8fd49016` + sr-route `26044f78` | 只被路由事件叫醒 | **无期限** | 不适用 | **21s 全程没摘**（sr-fib 一行日志都没打） | 871 发 FAIL 20，**连续 20 发覆盖 19.92s** |
+  | B3 | `c213a6caf1b2aabf` | 路由事件 **+ BFD 事件** | **≤65ms** | **≤65ms** | 0（Down 态 290 发 ours 恒 1） | 1557 发 FAIL 1（0.1%），无连续断流 |
+
+  三个口径要点：① 65ms 是**量具的分辨率**（这一轮 fork 数实测 61~65ms），小于它的跳变都打成 "0ms"，
+  只能读成"≤ 一个采样间隔"；② 缺陷臂不是"丢一半"，VPP 按流哈希，那条探测流是**整条 100% 黑洞且不自愈**；
+  ③ 注入必须在对端盒，在本测盒注入量到的是 VPP 的接口级反应，不是 sr-fib 的决策。
+  结论一句话：**摘路这一段从"1s 封顶"变成"65ms 以下"，而中间那一版是"没有期限"。**
+  换件本身的中断也量了（§1 第 4 条要求点名）：`swap276.sh CPE3 sr-fib` 新 pid 1639ms 起来，
+  全程 2790 发 **0 FAIL**。
+  仍然留下的：`#262` 的 hold-down 现在有了触发点（挂在这条 `signal()` 上），但 hold-down 本身还没做。
+  **抬 sr-route/sr-fib 到其余盒的这一条前置已经解除**；换完 sr-fib 必须立刻补一次隧道表
+  （G-2：`test/lab/vmlab/vm-fib-sync.sh <node>`，判据写在 `docs/agent-handover.md` §5.2）。
+
 - **B4 —— 对端（sr-route）重启后，本地前缀集没人重建。**
   场景：抬 sr-route 那一枪（队列第一节要干的活）之后，`/status` 的 `local` 段是空的且不会自己回来 ——
   本盒客户侧前缀对全网消失，直到下一次客户侧路由变动。
@@ -324,8 +358,10 @@ owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 fr
 **没做的**：
 - **B2 transport identity** —— `/local-prefixes`、`/local-prefixes/delta`、`/watch` 三条口现在各自判身份，
   要收口成一套（同一条 mTLS/证书身份贯穿），这属于协议层，不该塞进切片 B。
-- 其余三盒仍是轮询版（CPE2/3/4：`sr-fib bab523ff`、`sr-route 5789c2c0`，2026-11-08 复测，见
-  `docs/agent-handover.md` §3）。**抬它们之前先修 B3，且抬 sr-route 时必须同批处理 B4。**
+- 其余盒还没抬齐（**2026-11-09 复测**，见 `docs/agent-handover.md` §3）：CPE1 `sr-fib a9f1bc8c` = 事件版但**没带 B3**
+  （它就是缺陷臂那一台，留着当对照），CPE2/CPE4 `sr-fib bab523ff` + `sr-route 5789c2c0` = 仍旧的轮询版；
+  CPE3 是眼下唯一一台"事件 + B3"的盒（`sr-fib c213a6ca`、`sr-route 26044f78`）。
+  **B3 这条前置已经解除，抬 sr-fib 可以直接推；抬 sr-route 时必须同批处理 B4。**
 - `seq`/`since_seq` 增量重放：与切片 A 同一个理由 —— 幂等批 + 断线全量兜底已经覆盖了丢失，FRR 也没有这层。
 - zebra 收录 K 路由那 1~2s：FRR 侧的账，#276 不压它（实测两臂 5.33~6.66s 同量，见上表）。
 

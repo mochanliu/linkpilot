@@ -65,7 +65,7 @@ const (
 var ErrClosed = errors.New("vppapi: 连接已关闭")
 
 // Client 是一条到 VPP api.sock 的连接，可并发使用：所有请求按 context 分发，
-// 由单个读循环喂。
+// 由单个读循环喂。异步事件按 msg_id 分发，同样由这一个读循环喂。
 type Client struct {
 	conn        net.Conn
 	clientIndex uint32
@@ -75,6 +75,11 @@ type Client struct {
 
 	mu      sync.Mutex
 	pending map[uint32]*waiter
+
+	// asyncs 按 msg_id 收异步事件订阅者（见 WatchBFDEvents）。它和 pending 是两套
+	// 索引：事件帧头里第 2 字节起是 VPP 盖的 client_index，不是 context，按 context
+	// 永远找不到等待者，只会被计入 drops。
+	asyncs map[uint16]func([]byte)
 
 	nextCtx atomic.Uint32
 	rx      chan struct{} // close 当读循环退出
@@ -115,6 +120,7 @@ func Dial(ctx context.Context, socketPath, appName string) (*Client, error) {
 		ids:     map[string]uint16{},
 		crcs:    map[string]string{},
 		pending: map[uint32]*waiter{},
+		asyncs:  map[uint16]func([]byte){},
 		rx:      make(chan struct{}),
 		closed:  make(chan struct{}),
 	}
@@ -269,6 +275,10 @@ func (c *Client) readLoop() {
 // 投递必须在 c.mu 里完成：failPending 会 close 这些 channel，锁外发送就可能在
 // 对已关闭 channel 发送时 panic —— 连接断开的一瞬间恰好有应答到达即是触发点。
 // 这里只做非阻塞投递，持锁时间是常数。
+//
+// 异步事件走另一条路：帧头第 2 字节是 VPP 盖的 client_index 而不是 context，
+// 按 msg_id 找订阅者。回调**必须在放锁之后**调 —— 回调里的人下一步往往就是
+// 发一条请求（重新 dump 会话），那条请求要拿 c.mu 去 arm，锁内回调就是死锁。
 func (c *Client) dispatch(frame []byte) {
 	if len(frame) < replyHeaderLen {
 		c.drops.Add(1)
@@ -279,19 +289,27 @@ func (c *Client) dispatch(frame []byte) {
 	ctxVal := binary.BigEndian.Uint32(frame[2:6])
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	w := c.pending[ctxVal]
-	if w == nil || !w.want[msgID] {
-		c.drops.Add(1)
-		return
+	async := c.asyncs[msgID]
+	if async == nil {
+		w := c.pending[ctxVal]
+		if w == nil || !w.want[msgID] {
+			c.drops.Add(1)
+		} else {
+			select {
+			case w.ch <- append([]byte(nil), frame...):
+			default:
+				// 队列满了：宁可比 expected 多，也绝不静默少给 —— 截断过的 dump
+				// 看起来就是一份合法但不全的配置，那种错误没人会去复查。
+				w.full.Store(true)
+				c.drops.Add(1)
+			}
+		}
 	}
-	select {
-	case w.ch <- append([]byte(nil), frame...):
-	default:
-		// 队列满了：宁可比 expected 多，也绝不静默少给 —— 截断过的 dump
-		// 看起来就是一份合法但不全的配置，那种错误没人会去复查。
-		w.full.Store(true)
-		c.drops.Add(1)
+	c.mu.Unlock()
+
+	if async != nil {
+		// 交给回调的是副本：frame 指向 readLoop 的缓冲区，下一轮就被覆写了。
+		async(append([]byte(nil), frame...))
 	}
 }
 

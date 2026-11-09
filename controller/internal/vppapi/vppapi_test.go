@@ -255,7 +255,10 @@ func (f *fakeVPP) handle(conn net.Conn, frame []byte) {
 		for i := 0; i < f.portDetails; i++ {
 			f.sendFrameOf(conn, "sr_wg_port_details", reqCtx, portDetailBytes(i))
 		}
-	case "sr_wg_probe_set", "sr_wg_probe_send", "bfd_udp_enable_multihop", "bfd_udp_add", "bfd_udp_del":
+	case "sr_wg_probe_set", "sr_wg_probe_send", "bfd_udp_enable_multihop", "bfd_udp_add", "bfd_udp_del",
+		// 订阅应答只有 retval（CRC 与上面这批 e8d4e804 的同形）。真正的内容在后来
+		// 那些主动推过来的事件帧里，不在这条应答里。
+		"want_bfd_events":
 		f.reply(conn, name, reqCtx, uint32Bytes(uint32(f.retvals[name])))
 	case "sr_wg_probe_dump":
 		for _, raw := range f.probeRaw {
@@ -550,6 +553,41 @@ func (f *fakeVPP) lastRequest(t *testing.T) request {
 		t.Fatal("假 VPP 没收到请求")
 		return request{}
 	}
+}
+
+// waitConn 取回假端 accept 到的那条连接，让测试**从服务端**主动推帧。
+// 事件就是这么来的：真机上由 bfd_set_state 触发，测试里没有对端可拨，只能直接喂。
+func (f *fakeVPP) waitConn(t *testing.T) net.Conn {
+	t.Helper()
+	select {
+	case c := <-f.connCh:
+		return c
+	case <-time.After(2 * time.Second):
+		t.Fatal("假 VPP 没接到连接")
+		return nil
+	}
+}
+
+// bfdEventFrame 拼一整帧 vl_api_bfd_udp_session_event_t（含 msg_id，67 字节）。
+//
+// 不能用 sendFrameOf：那条路会往第 2 字节写 context，而事件帧在那个位置是
+// client_index、紧接着是 pid —— 实测真机这两处都是 0（send_bfd_udp_session_event
+// 只 memset 不填），所以这里也写 0，别不小心把"帧头有 context"这件事测成真的。
+func (f *fakeVPP) bfdEventFrame(swIfIndex uint32, local, peer net.IP, state uint32) []byte {
+	b := make([]byte, 0, bfdEventLen)
+	b = appendU16(b, f.id("bfd_udp_session_event"))
+	b = appendU32(b, 0) // client_index
+	b = appendU32(b, 0) // pid
+	b = appendU32(b, swIfIndex)
+	b = appendAddress(b, local)
+	b = appendAddress(b, peer)
+	b = appendU32(b, state)
+	b = append(b, 0, 0)     // is_authenticated, bfd_key_id
+	b = appendU32(b, 0)     // conf_key_id
+	b = appendU32(b, 50000) // required_min_rx_usec
+	b = appendU32(b, 50000) // desired_min_tx_usec
+	b = append(b, 3)        // detect_mult
+	return b
 }
 
 func shortCtx() (context.Context, context.CancelFunc) {
