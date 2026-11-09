@@ -13,23 +13,31 @@
 #   下一跳 / 本端 overlay / 颜色 ← 控制台 GET /api/underlay（隧道表，就是页面上那五行）
 #   接口名                      ← 盒子里 vppctl show interface addr 的 wg 口 + 口上的 /32
 #   VPN 表号                    ← 盒子里 /etc/sdwan/route.json 的第 4 段（控制台发布的）
-#   逃生开关                    ← 保持盒子 sr-fib 当前值并打印（产品里没有下发路径）
+#   逃生开关                    ← 默认保持盒子 sr-fib 当前值并打印（产品里没有下发路径）；
+#                                 ESCAPE=true|false 可显式推一个值（exp-285 的主/备形状要开）
 #
 # 用法：test/lab/vmlab/vm-fib-sync.sh          # 四台都同步
 #       test/lab/vmlab/vm-fib-sync.sh 2 4      # 只同步指定 node
+#       ESCAPE=true test/lab/vmlab/vm-fib-sync.sh 3    # 顺手把逃生开关推到 true
+#       ESCAPE=false test/lab/vmlab/vm-fib-sync.sh     # 显式关（还原 exp-285 的第二步）
+#       默认 ESCAPE=keep = 保留现值；三个值以外的写法直接报错，不静默当成 keep
 # 判据：每台推完回读 /status —— warnings 非空或 converged=false 就退出码 1。
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 if [ $# -gt 0 ]; then WANTED="$*"; else WANTED="1 2 3 4"; fi
+ESCAPE=${ESCAPE:-keep}
 
-python3 - "$HERE" "$WANTED" <<'PY'
+python3 - "$HERE" "$WANTED" "$ESCAPE" <<'PY'
 import importlib.util
 import json
 import subprocess
 import sys
 
 here, wanted = sys.argv[1], sys.argv[2].split()
+escape_mode = sys.argv[3] if len(sys.argv) > 3 else "keep"
+if escape_mode not in ("keep", "true", "false"):
+    sys.exit("ESCAPE 只能是 keep|true|false，收到 %r" % escape_mode)
 
 spec = importlib.util.spec_from_file_location("vm_console", here + "/vm-console.py")
 vm = importlib.util.module_from_spec(spec)
@@ -84,8 +92,8 @@ try:
                          "color": t["color"]})
         route = json.loads(sh(serial, "cat", "/etc/sdwan/route.json"))
         vrfs = sorted({v.get("id") for v in route.get("vrfs") or [] if "id" in v}) or [0]
-        body = json.dumps({"vrfs": vrfs, "tunnels": rows,
-                           "escape_all_colors": bool(cur.get("escape_all_colors"))})
+        esc = {"true": True, "false": False}.get(escape_mode, bool(cur.get("escape_all_colors")))
+        body = json.dumps({"vrfs": vrfs, "tunnels": rows, "escape_all_colors": esc})
         sh(serial, "curl", "-sf", "-X", "PUT", "-H", "content-type: application/json",
            "--data-binary", "@-", "http://127.0.0.1:%d/config" % FIB_PORT, stdin=body)
         st = json.loads(sh(serial, "curl", "-sf", base))
@@ -93,7 +101,7 @@ try:
         print("   node %d: 隧道 %d 条（%s）vrfs=%s 逃生=%s → converged=%s routes_set=%s removed=%s 标签=%s 删标签=%s%s"
               % (n, len(rows),
                  " ".join("%s→%s" % (r["next_hop"], r["interface"]) for r in rows),
-                 vrfs, bool(cur.get("escape_all_colors")),
+                 vrfs, esc,
                  last.get("converged"), last.get("routes_set"), last.get("routes_removed"),
                  last.get("labels_set"), last.get("labels_removed"),
                  "" if not last.get("warnings") else " 警告:%s" %

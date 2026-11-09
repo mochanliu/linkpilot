@@ -122,12 +122,25 @@ VBoxManage list runningvms   →   CPE1 CPE2 CPE3 CPE4 cust12 cust3 cust4
 
 | 判据 | 今天的读数 | 命令 |
 | --- | --- | --- |
-| VM 台整体验证 | **PASS=392 FAIL=0 WARN=0** | `bash test/lab/vmlab/vm-verify.sh`（约 2 分钟，只读） |
+| VM 台整体验证 | **PASS=398 FAIL=0 WARN=0**（2026-11-09 实测，exp-285 改口径后） | `bash test/lab/vmlab/vm-verify.sh`（约 4 分钟，只读） |
 | Go 单测 | 全绿，仓库内 `func Test` **749 条**（`internal/frr` 41、`internal/route` 72、`internal/underlay` 58） | `docker exec lp-ctrl sh -lc 'cd /workspace/controller && go build ./... && go vet ./... && go test ./...'` |
 | §9.7 六方向客户流量 | 0% 丢包 | `TAG=xx bash test/lab/vmlab/exp-273/six.sh` |
 
 `vm-verify.sh` 结尾自己会写明本轮没覆盖什么（独立终端机、站点 12 的 VRRP），那两行要照抄进你的结论里，
 不要说成"全绿所以全通"。
+
+**392 → 398 这 6 条差在哪（2026-11-09 实测，逐条对过两份输出）**：§6 的「每个 RIB 下一跳都要有
+`mpls via`」换成两条更严的判据 —— ①「下一跳的路径已装且 resolved」（单前缀查询，10 条）
+②「承载集 == 最优 pref 的那组路径」（8 条），净 +8 条；原来那 1 条 FAIL 转成 PASS（+1）；
+§3 里 `t13 颜色 0` 两条 `ok` 因为台账颜色真的变成 2 而降成 `note`（−2）。**不是产品变好了 6 条，是口径换了。**
+
+**现在的 lab 形状不是 #284 提交时的基线**：t13（CPE2↔CPE3）颜色 **0→2**、四台逃生开关 **全 true**，
+这是 exp-285 为了造出「主/备」故意改的（全走产品路径：控制台改色 → 发布 v23 → agent apply；
+逃生开关走 `ESCAPE=true vm-fib-sync.sh`）。所以 CPE3 的 `172.16.12.1/32` 现在是
+`len:2`、pref 10 承载 / pref 12 挂着不承载，CPE2 朝 `172.16.3.1/32` 只有 pref=12 一条腿。
+**还原配方与"为什么必须开逃生开关"在 [test/lab/vmlab/exp-285/README.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/test/lab/vmlab/exp-285/README.md) §五**，
+两步都不重启进程。台账要跟着重生成：`test/lab/vmlab/vm-ledger.py > /tmp/vm-verify-ledger.tsv`
+（旧台账里 t13 还是颜色 0，§3 会照着旧值判）。
 
 ### 2.5 盒内进程与 systemd 单元的真实形状
 
@@ -444,13 +457,26 @@ CPE2/3/4 还是轮询版，那些盒上 `poll_sec=1` 依然是"每秒一轮"。
     与可达性无关。owner 在控制台里看到的「bfd 没起来」多数是这一条。
 14. **别把 ECMP 的「留着死腿」读成丢一半**：VPP 按流选桶，同一组源/目的的探测全落在同一个桶里，
     实测要么这条流 20 秒全断、要么一条不丢（见 `exp-b3/README.md` 三臂）。要量"一半"得开多条并发流。
+15. **`show ip fib table N`（整表）与 `show ip fib <前缀> table N`（单前缀）打的不是同一套东西**
+    （2026-11-09 实测，exp-285 与 vm-verify 各栽一次）：整表 dump **只有承载链**
+    （`unicast-ip4-chain` / `dpo-load-balance … buckets:N` / `mpls-label[…]` / `mpls via …`），
+    **没有 `path:` 行、没有 `path-list`、没有 `forwarding:` 这个头**；单前缀查询才有
+    `path-list:[N] … uPRF-list:M len:K`、每条 `path:[id] … pref=10 … oper-flags:resolved,` 和 `forwarding:` 段。
+    所以「行里装了几条路径 / 各自 pref / resolved 没有」只能单前缀问；「客户流量真走哪条」两种都能读。
+    `vm-verify.sh` 的 `fib_paths()` 就是为此加的（整表块里 awk `/path:\[/` 会一条都读不到，静默判红）。
+16. **精确行被删时 `show ip fib <前缀>` 会打印覆盖它的那条（LPM 回落），不是报"没有"**
+    （2026-11-09 实测回落到 `0.0.0.0/0 fib:0 index:0`，带两条 path-list：`lcp-rt` 管理网默认路由
+    和 `entry-flags:drop` 的空路径）。不判前缀行就会把管理网默认路由的路径集当成我们的，
+    量出「行里还剩两条、pref=20/0」这种根本不存在的形状。判别式：输出里第一条前缀行的
+    `$1` 必须等于你问的前缀且 `$2 ~ /^fib:/`；取 `len`/`buckets` 时取**第一个**匹配，
+    取最后一个会拿到那条 drop 路径的 `len:0`，凭空造出「行被删空」的信号。
 
 ---
 
 ## 8. 交差的门槛（缺一件就别写"已验证"）
 
 一个增量的完整交差 = ① `lp-ctrl` 里 `go build/vet/test` 全绿；② 改前/改后**同一口径**的两组数字；
-③ `bash test/lab/vmlab/vm-verify.sh` 到 392/0/0；④ `TAG=xx bash test/lab/vmlab/exp-273/six.sh` 六方向 0%；
+③ `bash test/lab/vmlab/vm-verify.sh` 到 398/0/0（2026-11-09 起的口径，见 §2.4）；④ `TAG=xx bash test/lab/vmlab/exp-273/six.sh` 六方向 0%；
 ⑤ 换过产物的话，§3 那张 run/disk 哈希表更新（**哈希对，不是 inode 对**，见 §5.2 第 ④ 步那段）；
 ⑥ 文档里点名必然中断与时长；
 ⑦ 提交推分支 + 给登录把手。
@@ -500,7 +526,7 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 
 | 共享资源 | 冲突表现 | 约定 |
 | --- | --- | --- |
-| VirtualBox 7 台（同一时刻只有一个被测现场） | 你的故障注入把对方的基线打脏，两边结论都作废 | **动状态前先打招呼**：在 owner 的会话里声明"要动 CPE1–4 了，窗口 xx 分钟"；只读脚本（`vm-verify.sh`、`box-layers.sh`、`six.sh`）随时可跑，但跑的时候别有人在注入故障 |
+| VirtualBox 7 台（同一时刻只有一个被测现场） | 你的故障注入把对方的基线打脏，两边结论都作废 | ~~动状态前先打招呼~~ **owner 2026-11-09 已撤掉窗口审批**（见本节下方原话）：这套研发台随时可动；仍要做的是「改动走产品路径 + 写清怎么还原」，以及别打脏另一个 agent 正在量的基线。只读脚本（`vm-verify.sh`、`box-layers.sh`、`six.sh`）随时可跑 |
 | `/run/sr-frr/control.sock` 等盒内状态 | 两个 agent 各自热更，`config_hash` 对不上 | 一次只让一个 agent 持有"写盒内"的锁；换件前先看 `stat -c %y /usr/local/bin/<x>` 是否刚被别人动过 |
 | 控制器 `state.json` + 8088 控制台 | 草稿互相覆盖、发布撞上别人的 apply | 草稿是共享的，**改配置类实验前先 `GET` 当前已发布版本**，别拿自己记忆里的值当现状 |
 | `lp-ctrl`（同一份源码树） | `go build` 出来的产物不是你的改动 | 编译前 `git status --short` + `git rev-parse HEAD`，记下你构建时的树；产物一律放**自己任务号的目录**（`~/srvmlab/out-<N>/`），不要覆盖 `artifacts/linux/` 里别人的文件 |
@@ -508,6 +534,14 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 
 一条底线：**不许为了让自己的测量好看去改 lab 现状**（比如临时加条路由把现象压掉）。
 lab 的当前形状属于 owner，不属于任何一次实验。
+
+**owner 2026-11-09 的原话把上表第一行的"窗口"要求撤了**：「lab 是你研发测试用的，不存在窗口概念，
+你随时想动都可以动，除非我明确说不动。」所以这套 VirtualBox 台**不需要先申请窗口**，
+故障注入、换件、改配置发布都可以直接做。仍然成立的是另外两件事：
+① 实验要改 lab 形状时**必须走产品路径**（控制台 → 发布 → agent → apply），并把「改了什么 / 怎么还原」
+写进实验 README（exp-285 §五就是样板：t13 颜色 0→2、四台逃生开关 true，还原两步都不重启进程）；
+② 有第二个 agent 在场时，别把对方正在量的基线打脏 —— 撤的是审批，不是"两边结论都作废"这个物理事实。
+生产盒与别人现场的 lab 不在这条豁免里。
 
 具体如何拉起第二个会话（工作区挂载、任务切分、告示牌锁的落地形式、出事怎么退回干净态）见
 [`docs/second-agent-onboarding.md`](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/second-agent-onboarding.md)。

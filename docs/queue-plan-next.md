@@ -407,7 +407,64 @@ B4 侧的回退同理是**换件**：新 sr-frr 的 `GET /local-prefixes` 没人
 ## 与 §10 冲突协议的关系
 
 抬 sr-route 与 #275/#276 的 e2e 判据脚本都会**动 lab 现状**：抬进程、注 BFD down、断 watch。
-每一次动手前都要在 owner 会话里声明窗口（`agent-handover.md` §10 那张表第一行）。
+**（2026-11-09 更新）owner 已撤掉"动手前先声明窗口"这条**：原话「lab 是你研发测试用的，不存在窗口概念，
+你随时想动都可以动，除非我明确说不动。」这套 VirtualBox 台可以直接动；仍然要做的是把改动走产品路径、
+在实验 README 里写清「改了什么 / 怎么还原」，以及有第二个 agent 在场时别打脏对方正在量的基线。
+生产盒与别人现场的 lab 不在豁免里。
 方案落地顺序建议：**#275 → #276 → 抬 sr-route**。前两条是纯代码 + 单测，
 只有 e2e 判据跑的时候才碰 lab；抬 sr-route 是物理替换，最后做，且它做完之后
 `#275` 的 delta 语义正好可以在同一轮 e2e 里复检。
+（这三件都已完成：#275/#276 见上面两节落地实况，抬盒 = #284。）
+
+---
+
+## 四、#285 主/备切换到底是谁干的（**实测，已完成，2026-11-09**）
+
+owner 点名要复核的说法是：「BFD down 会 set wireguard tunnel down，路由自动变为失效状态，
+并且次优路由自动变成当前主路由。」两臂实测（`test/lab/vmlab/exp-285/README.md`，
+脚本 `failover.sh`，原始读数在 `/tmp/p285/`）结论分三句：
+
+1. **前半句是假的，而且从来没实现过。** 全仓唯一能发 `sw_interface_set_flags` 的是
+   `internal/vppapi/interface.go:41` 的 `SetInterfaceUp`，唯一生产调用者是
+   `internal/agent/dataplane.go:814`，**恒传 `up=true`**；那个 `up bool` 参数从没被传过 `false`。
+   BFD down 不会去动隧道口。
+2. **后半句是真的、客户可见、而且快**，但**成因有两条，取决于故障长什么样**：
+   - **链①（本机口/邻接死）**：VPP 自己把该路径标 `oper-flags:` 非 resolved、踢出 uPRF，
+     按 `frp_preference` 挪到次优。local 臂实测：切换那一发 **BFD 还报 Up、path-list 还是 2 条**，
+     比 BFD 判 down 早 **234ms**；sr-fib 的重写 **108ms** 后才到。客户探测 **1453 发 0 FAIL**。
+   - **链②（只有对端死，本机口全程 up）**：VPP 什么都不做，是 sr-fib 收到 BFD 事件后
+     把那条路径**从行里删掉**、整行 `ip_route_add_del(is_multipath=0)` 覆盖。peer 臂实测：
+     全程没有「承载已挪、行还是两条」那一发，`len` 2→1 与承载挪动同一发；客户探测 **1401 发 FAIL 2（0.1%，两发孤立）**。
+     因为路径是被**删掉**的，**BFD-only 这一形状里 VPP 的原生 preference 回落根本没机会触发**。
+3. **以前为什么会说成那样**：`docs/overlay-design-draft.md` §2.1 那张表第三行量的是
+   「把 pref 0 那条的**接口** `set interface state down`」= 链①，结论没错；
+   但 `internal/fib/fib.go:314-315` 的注释把它概括成「down 顶上、up 回落都是原生行为」写在逃生开关旁边，
+   读起来就像 BFD down 也走原生回落。**这条注释要改**（改成"口/邻接级失效由 VPP 原生回落；
+   BFD 判 down 走的是本文件 §4.3 第 3 步的删路径 + 整行重写"），本轮先记在这里，不动产品代码。
+
+还有第三条更慢的「失效」，两臂都没走到：sr-route Loc-RIB 的 `path.resolvable`
+（`internal/route/rib.go:33`，GoBGP `Path.IsNexthopInvalid` 的取反同位物），只由 agent 每 **10s** 一次的
+`PUT /tunnel-state` 翻（`cmd/sr-agent/main.go:421/448` → `internal/agent/routestate.go:123`）。
+sr-fib 直接读本机 VPP 的 BFD，不等这 10s。
+
+**这一枪把 lab 改成了主/备形状，现在的现场不等于 #284 提交时的基线**：
+t13（CPE2↔CPE3）颜色 **0→2**（控制台改色 → 发布 v23 → agent 已 apply），四台逃生开关 **全 true**
+（`ESCAPE=true vm-fib-sync.sh`，本轮给脚本新加的旋钮）。还原两步、都不重启进程，配方在 exp-285 README §五。
+**G-2 仍未收口**：CPE3 `/etc/sdwan/fib.json` 的 `tunnels` 实测仍是 0 条，sr-fib 一重启这张表就空，
+必须重跑 `vm-fib-sync.sh`；逃生开关同样没有产品下发路径。
+
+**顺手修掉的一处判据缺陷（不是产品缺陷）**：`vm-verify.sh` §6 旧口径要求「RIB 里每个下一跳都要有
+`mpls via`」，那只在所有腿同 pref（ECMP）时成立 —— `mpls via` 只出现在承载链里，而承载链只装最优 preference。
+颜色一分开，备路**装在 path-list 里且 resolved、但不承载**，旧口径把正确的主备形状判红（实测 FAIL 1 条）。
+新口径两条、比旧的严：① 每个 RIB 下一跳都要有 **resolved 的路径装在行里**（新增 `fib_paths()` 单前缀查询，
+因为整表 dump 没有 `path:` 行）；② **承载集必须恰好等于最优 pref 的那组路径**（同 pref 并列 = ECMP，全都要承载）。
+
+新口径在三种形状上都真跑过，不是只在纸面上成立：CPE2 单条颜色 2 的腿（`pref=12`，它承载）、
+CPE3 主备（`pref=10` 承载 / `pref=12` 装着不承载）、CPE4 两条同 `pref=10`（ECMP，两条都承载）。
+定稿后整台复量 **`vm-verify.sh` PASS=398 FAIL=0 WARN=0**（旧口径 392，差额 +6 的逐条账在
+`docs/agent-handover.md` §2.4 —— **不是产品变好了 6 条，是口径换了**：§6 新增 8 条、原来那条假 FAIL 转 PASS 1 条、
+§3 两条颜色 0 的 ok 降为 note 减 2 条）。`exp-273/six.sh` 六方向 **0% 丢包**。
+
+`ESCAPE=false` 这个值第一版是假的（`!= "keep"` 就置 `True`），会让 README 的还原配方还原不掉，
+而且脚本回读自己刚推的值所以照样报绿。已改成显式映射 + 入口拒收非法值，并在 CPE3 上做了往返取证：
+`false` → 主表 `len:1` 只剩 `pref=10`；`true` → `len:2`、`routes_set=1`。逐字读数在 exp-285 README §七 第 9 条。
