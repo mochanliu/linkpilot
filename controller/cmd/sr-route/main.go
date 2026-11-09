@@ -95,6 +95,10 @@ func loadConfig(path string) (*fileConfig, error) {
 
 func main() {
 	configPath := flag.String("config", "", "path to the CPE route config JSON")
+	srfrrConf := flag.String("srfrr-conf", envDefault("SR_BOX_BRIDGE_CONF", defaultSRFrrConf),
+		"sr-frr 的配置文件，只用它来找控制口（与开机清单的 BRIDGE_CONF 同一个键）")
+	srfrrSock := flag.String("srfrr-sock", "",
+		"sr-frr 控制口（默认：-srfrr-conf 里的 control_socket，再退到 "+defaultSRFrrSocket+"）")
 	flag.Parse()
 	if *configPath == "" {
 		log.Fatal("-config is required")
@@ -171,6 +175,14 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	go watchRIB(c, ctx.Done())
+
+	// 开机向 sr-frr 拉一次客户侧前缀（见 pull.go 顶上那段：本盒的本地前缀集
+	// 不在盘上，sr-frr 又只在集合变化时说话，不拉就永久缺一块）。
+	if sock, ok := srfrrControlSocket(*srfrrConf, *srfrrSock); ok {
+		go pullLocalPrefixes(ctx, c, sock)
+	} else {
+		log.Printf("sr-route: 盘上没有 %s，这台盒子不跑 sr-frr，客户侧前缀无人上报（要它就把 sr-frr 配起来）", *srfrrConf)
+	}
 
 	if err := c.Run(ctx); err != nil {
 		log.Fatalf("run: %v", err)

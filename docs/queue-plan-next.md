@@ -223,7 +223,7 @@ owner 已拍：**全部照抄 FRR**、**先起 A**。切片 A 是"sr-frr → sr-
 
 owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 frr 的长连方式不相上下就选甲"。
 甲 = SSE `/watch`、每条路由一条事件，范围"全部照抄 FRR"。这一节先给形状，再给数字，
-最后给两条这次顺手抓到、必须他拍的缺口（B3/B4）。**（2026-11-09 更新：B3 已经落地并实测收口，B4 仍在等他拍。）**切片 B（sr-route → sr-fib 推事件）和
+最后给两条这次顺手抓到、必须他拍的缺口（B3/B4）。**（2026-11-09 更新：B3、B4 都已落地并实测收口 —— B4 的形状 owner 拍的是 (b)：sr-route 起来后向 sr-frr 控制口拉一份全量。）**切片 B（sr-route → sr-fib 推事件）和
 切片 C（判据 + 实测时长）在同一次提交里收口；B2（三条口共用一套 transport identity）没做，理由在下面。
 
 **代码形状**（全部在 `feat/vbond-control-plane`，`controller/` 下）：
@@ -294,7 +294,7 @@ owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 fr
   `swap276.sh CPE1 sr-fib`（同版本换件，脚本自检）：新 pid 1831ms / 1804ms 起来，
   **0/2561 与 0/2544 发 FAIL**。
 
-**两条新缺口的现状（2026-11-09 更新：B3 已落地并实测收口，B4 仍要 owner 拍）**：
+**两条新缺口的现状（2026-11-09 更新：B3、B4 均已落地并实测收口，抬 sr-route 只剩"与 sr-frr 同批"这条部署规则）**：
 
 - **B3 —— watch 模式下，隧道/BFD 状态变化没有任何东西会触发收敛。已修（2026-11-09 落地 + 三臂实测）。**
   场景：隧道起来又塌下去，但这一段时间 RIB 没变（RR 还在发那条前缀）。
@@ -342,26 +342,50 @@ owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 fr
   **抬 sr-route/sr-fib 到其余盒的这一条前置已经解除**；换完 sr-fib 必须立刻补一次隧道表
   （G-2：`test/lab/vmlab/vm-fib-sync.sh <node>`，判据写在 `docs/agent-handover.md` §5.2）。
 
-- **B4 —— 对端（sr-route）重启后，本地前缀集没人重建。**
-  场景：抬 sr-route 那一枪（队列第一节要干的活）之后，`/status` 的 `local` 段是空的且不会自己回来 ——
+- **B4 —— 对端（sr-route）重启后，本地前缀集没人重建。已修（2026-11-09 落地 + 三臂实测）。**
+  场景：抬 sr-route 那一枪之后，`/status` 的 `local` 段是空的且不会自己回来 ——
   本盒客户侧前缀对全网消失，直到下一次客户侧路由变动。
   代码走到哪：sr-frr 的上报是**变更驱动**的（`cmd/sr-frr/main.go:745-776`：`reporter.reconcile` 只在
   `posted` 时打日志、只有 `imp.Dirty()` 或被唤醒才重算），sr-route 起来后不主动向 sr-frr 要。
-  本轮就踩过：我重启 CPE1 的 sr-route 之后 vm-verify 出 5 条 FAIL，根因是这条，不是切片 B。
-  修法（本轮实测可用）：`exp-273/window-swap.sh` 顺带再换 sr-frr 一枪，让它重连后走全量 announce —— 0/2803 发 FAIL。
-  **三个候选形状**：(a) sr-frr 定期重发全量（就是把切片 A 去掉，回到轮询，不推荐）；
-  (b) sr-route 起来后主动 GET sr-frr 的控制口 `/run/sr-frr/control.sock` 要一份全量（形状最像 zebra：
-  新客户端连上，daemon 立刻 `announce`）；(c) 把 local 集落盘当事实快照（和 G-2 隧道表那条同一个形状）。
-  我推荐 (b)：不改数据面形状、不引入周期重发，而且它天然是"谁新连接谁回说什么就是什么"，
-  与 §1 第 3 条对 sr-frr 重连的既有要求同构。
+  这条不是"晚一拍"，是**根本没有请求**：`reconcile` 算的是 `diffLocalPrefixes(lastSeen, next)`
+  （`cmd/sr-frr/main.go:1006`，差量在 `:1014`/`:1041`），集合没变 ⇒ 差量 0 条 ⇒ `posted=false`
+  ⇒ 一次 HTTP 都不发。本轮就踩过：我重启 CPE1 的 sr-route 之后 vm-verify 出 5 条 FAIL，根因是这条，不是切片 B。
+  **修法（owner 拍的是形状 (b)，已按此落地）**：sr-route 起来后主动 GET sr-frr 控制口的 `/local-prefixes`
+  要一份全量 —— 形状就是 zebra 的"新客户端一连上，daemon 立刻 announce"，只是这里把"连上"做成了
+  sr-route 侧的一次拉取。新文件 `cmd/sr-route/pull.go`：`pullLocalPrefixes`（`:61`）在进程起来时
+  （`cmd/sr-route/main.go:182` 的 `go pullLocalPrefixes`）拉，拿到就经 `route.Client.SetLocalPrefixes`
+  （`internal/route/client.go:547`，整表原子、要么全要么不动）应用一次然后**退出**，不再有周期重发
+  （AGENTS.md §1 第 3 条：不许用乐观窗口，也不许靠周期对账兜底）；拉不到就每 2s 重试
+  （`pullRetryEvery` `pull.go:52`）直到第一次可信回答 —— 开机时 `do_route`(:354) 在 `do_bridge`(:383) 之前，
+  socket 那时候本来就不在，重试路径是必须的。
+  sr-frr 侧新增 `GET /local-prefixes`（`cmd/sr-frr/main.go:1192`），两条关键设计：
+  (1) **可信空集闸门**（`:1198`）：`rules` 非空但 zebra 没连上时回 503（"我还没看到客户侧"），
+  `rules` 为空时照常回 200 + 空前缀 —— 否则没配泄露的盒会因为 `ensureImport` 不建客户端而永远 503。
+  (2) **serve 即降级**（`localReporter.demote()` `:996`）：被拉走一次就把 `lastSeen` 置空，
+  下一轮 reconcile（≤`poll_sec`，本机 1s）必然打一次整表 PUT，把"拉取与推送谁先到"这个次序问题关掉。
+  socket 路径三级台阶（`srfrrControlSocket` `pull.go:149`）：显式 `-srfrr-sock` > `/etc/sr-frr.json`
+  里的 `control_socket` > `/run/sr-frr/control.sock`；解析用 `DisallowUnknownFields`（`prefix` 写成
+  `prefixes` 这种拼错会被当成"空集"从而把前缀全撤了，必须硬拒）。
+  **三臂实测**（CPE3，注入=只重启 sr-route，探测 cust12→172.16.3.1，判据脚本 `test/lab/vmlab/exp-b4/`）：
+  老 pair 那一臂 `local` 在 t+1s 掉到 0、**150s 后仍是 0（未自愈）**，客户探测连续断流 **158.66s**；
+  新 pair 这一臂 `local` **t+1s 就是 1**、1899 发探测 **0 FAIL**，sr-route 新 pid 起来用时 1630ms
+  （和老臂 1635ms 同量，说明拉取没有给重启加时长）。日志因果：`开机从 sr-frr 拉到客户侧前缀 1 条
+  （/run/sr-frr/control.sock），之后的变化由它推`。`vm-verify.sh` 换件后整轮 **392/0/0**，
+  `exp-273/six.sh` 六方向 0% 丢包。逐枪数字与诚实口径（A 臂绿回来的那段属于 #272，不算 B4 的功劳）
+  在 `test/lab/vmlab/exp-b4/README.md`。
+
+  **实测出来的部署硬规则（改写了下面"没做的"那条）：`sr-frr` 与 `sr-route` 必须同批抬，且 `sr-frr` 在前。**
+  老 sr-frr 没有这个端点，实测回 `404 page not found`；只抬 sr-route 就是让它对着 404 每 2s 重试到永远，
+  空洞照旧。反过来只抬 sr-frr 是安全的。
 
 **没做的**：
 - **B2 transport identity** —— `/local-prefixes`、`/local-prefixes/delta`、`/watch` 三条口现在各自判身份，
   要收口成一套（同一条 mTLS/证书身份贯穿），这属于协议层，不该塞进切片 B。
 - 其余盒还没抬齐（**2026-11-09 复测**，见 `docs/agent-handover.md` §3）：CPE1 `sr-fib a9f1bc8c` = 事件版但**没带 B3**
   （它就是缺陷臂那一台，留着当对照），CPE2/CPE4 `sr-fib bab523ff` + `sr-route 5789c2c0` = 仍旧的轮询版；
-  CPE3 是眼下唯一一台"事件 + B3"的盒（`sr-fib c213a6ca`、`sr-route 26044f78`）。
-  **B3 这条前置已经解除，抬 sr-fib 可以直接推；抬 sr-route 时必须同批处理 B4。**
+  CPE3 是眼下唯一一台"事件 + B3 + B4"的盒（`sr-fib c213a6ca`、`sr-route 1161534d`、`sr-frr 626b126a`）。
+  **B3/B4 两条前置都已解除，抬 sr-fib 可以直接推；抬 sr-route 必须与 sr-frr 同批、且 sr-frr 在前**
+  （老 sr-frr 没有 `GET /local-prefixes`，实测 404；细节见上面 B4 那一条末尾）。
 - `seq`/`since_seq` 增量重放：与切片 A 同一个理由 —— 幂等批 + 断线全量兜底已经覆盖了丢失，FRR 也没有这层。
 - zebra 收录 K 路由那 1~2s：FRR 侧的账，#276 不压它（实测两臂 5.33~6.66s 同量，见上表）。
 
@@ -369,6 +393,9 @@ owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 fr
 `retryGap` 周期的 ticker，就退回轮询版；sr-route 侧 `/watch` 端点没人订阅时 `notifyWatchLocked` 是 no-op，
 不产生任何副作用，可以留着。盒上的回滚底：CPE1 `/usr/local/bin/sr-fib.prerun-20261108` = `bab523ff3809f57b`
 （轮询那份，含缺陷⑦ 修复），换回去只需要 `install276.sh` + `swap276.sh` 两枪，全程 0 丢包。
+B4 侧的回退同理是**换件**：新 sr-frr 的 `GET /local-prefixes` 没人订阅就是闲置的（`serve` 里多挂一个分支，
+`demote()` 只在真被拉走时才降级），所以把 `sr-route` 单独换回旧版 = 回到"没人重建"的旧行为，不留副作用；
+但**反过来只回退 sr-frr、留着新 sr-route 不行** —— 那正是上面那条 404 无限重试的形状，回退必须同批。
 
 ## 与 §10 冲突协议的关系
 

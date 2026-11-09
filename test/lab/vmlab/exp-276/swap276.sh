@@ -81,10 +81,20 @@ case "$NAME" in
     echo "   $MON 的 mpls via 条数=$N（本盒 local=$ISLOCAL；local 的那条天然 0，不是故障）"
     ;;
   sr-route)
-    # B4：本地前缀集是 sr-frr 变更驱动上报的，sr-route 起来后没人重发 ⇒ 集会空着。
+    # B4（2026-11-09 已修）：新版 sr-route 一起来就向 sr-frr 控制口拉一份 local 全量，
+    # 拉不到每 2s 重试。所以这里 local=0 只剩两种原因：本机 sr-frr 是旧的（没有这个端点，
+    # 实测 404 ⇒ 永远重试），或 sr-frr 反向导入未就绪（503，会自己好）。
     n=$(curl -s --max-time 3 http://127.0.0.1:19001/status | tr -d ' \n' | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('local',[])))" 2>/dev/null || echo 取不到)
-    echo "   /status 的 local 条数=$n"
-    if [ "$n" = "0" ]; then echo "   !! B4：换了 sr-route，本地前缀集空了且不会自愈（sr-frr 只在变更时上报）。修法（2026-11-08 实测可用，在 Mac 上仓库根跑）：bash test/lab/vmlab/exp-273/window-swap.sh $BX cust12 172.16.12.1 172.16.4.1 —— 顺带再换 sr-frr 一枪，让它重连后重报全量"; fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 --unix-socket /run/sr-frr/control.sock http://sr-frr/local-prefixes 2>/dev/null || echo 000)
+    echo "   /status 的 local 条数=$n  sr-frr 的 GET /local-prefixes=$code"
+    if [ "$n" = "0" ]; then
+      case "$code" in
+        404) echo "   !! B4 部署规则被违反：本机 sr-frr 是旧的（404，没有 /local-prefixes），新 sr-route 会对它每 2s 重试到永远。必须 sr-frr 在前、同批抬：bash test/lab/vmlab/exp-276/swap276.sh $BX sr-frr";;
+        503) echo "   local=0 但 sr-frr 只是反向导入未就绪（503，可信空集闸门）—— sr-route 会继续重试，先查盒内 FRR/zebra 连接，别换件";;
+        200) echo "   !! sr-frr 给了 200 但 local 仍是 0：要么这台盒确实没配客户侧泄露（那就是对的），要么拉取/应用没走通，去 /var/log/sr-box/route.log 找「开机从 sr-frr 拉到客户侧前缀」那行";;
+        *)   echo "   !! local=0 且控制口问不通（code=$code）：sr-frr 没在跑或 socket 不在，先补它，sr-route 的重试环会等它";;
+      esac
+    fi
     ;;
 esac
 REMOTE

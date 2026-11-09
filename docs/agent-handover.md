@@ -61,11 +61,17 @@ sr-route Loc-RIB
    └─ frr.PlanFrom ──► 内核 K 路由(netlink, distance 0) ──► zebra redistribute kernel ──► 客户侧（正向）
    ▲
    └─ ZAPI 订阅(按 VPN/来源) ──► to_sdwan 白名单减去已导出 ──► PUT /local-prefixes（反向）
+                        ▲
+                        └── sr-route 开机 GET /local-prefixes（反向的"新客户端回说"，2026-11-09 起）
 ```
 
 反向这条接缝上，**2026-11-07 起没有任何"等一拍"的窗口**：`Importer.Reset()`
 （[controller/internal/frr/import.go:214](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/internal/frr/import.go#L214)）
 在与 zebra 重连的那一刻清空本地前缀集，新连接的回说什么就是什么。
+**2026-11-09 起另一头同理**：反向上报是变更驱动的（集合没变就一个请求都不发），所以 `sr-route` 单独重启
+原本会把本盒前缀对全网抹掉直到下一次变动 —— 现在它一起来就经 sr-frr 的控制口拉一份全量
+（[controller/cmd/sr-route/pull.go:61](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/controller/cmd/sr-route/pull.go#L61)），
+sr-frr 应答即降级自己的 `lastSeen`（`localReporter.demote()`），拉取与推送的先后次序不需要版本号也不需要对齐时钟。
 曾经有过四个窗口（A `BeginResync` / B `BeginLinkWindow` / C `Settled` / F `onceWindow`），
 整族在增量 #274 撤回，理由写在 AGENTS.md 第 3 条。**不要把这些窗口重新加回来**，
 包括看起来无害的"重连后先维持旧值 500ms"。
@@ -181,14 +187,16 @@ done'
 | CPE1 | `26044f78f7969935` run==盘 | `a9f1bc8c8fd49016` run==盘（**事件版，但没带 B3**） | `c8e731ddcbca7bd6` run==盘 | `d2ad8519648c031f` run==盘 | `/watch` 事件推，`poll_sec` 只当重挂间隔；**可达性变化不触发收敛（B3 缺陷臂）** |
 | CPE2/3/4 | `5789c2c0f753529b` run==盘 | `bab523ff3809f57b` run==盘（轮询版） | `c8e731dd…` run==盘 | `d2ad8519…` run==盘 | 每秒一轮 |
 
-**2026-11-09 复测（B3 落地后，四台全表，同一套命令）** —— 上面那张表只有 CPE3 变了：
+**2026-11-09 复测（B3 + B4 落地后，四台全表，同一套命令）** —— 上面两张表只有 CPE3 又变了：
 
-| 盒 | `sr-route` | `sr-fib` | 收敛触发 |
-| --- | --- | --- | --- |
-| CPE3 | `26044f78f7969935` run==盘 | `c213a6caf1b2aabf` run==盘（**B3 版**：订阅本机 VPP 的 BFD 状态事件） | `/watch` 事件推 **+ BFD 状态翻转** |
+| 盒 | `sr-route` | `sr-fib` | `sr-frr` | 收敛触发 |
+| --- | --- | --- | --- | --- |
+| CPE3 | `1161534d5c91db40` run==盘（**B4 版**：开机向 sr-frr 拉一份 local 全量） | `c213a6caf1b2aabf` run==盘（**B3 版**：订阅本机 VPP 的 BFD 状态事件） | `626b126a331f65e0` run==盘（**B4 版**：控制口新增 `GET /local-prefixes`） | `/watch` 事件推 **+ BFD 状态翻转** + 本机重启后自己回拉 local |
 
-CPE1 仍是 `a9f1bc8c8fd49016`（事件版、无 B3 —— 它就是缺陷臂那一台，留作对照），CPE2/CPE4 仍是轮询版。
-四台十二件 run==盘，**没有静默退回**。CPE1 的轮询版留在盒上当回滚底：`/usr/local/bin/sr-fib.prerun-20261108`
+CPE1 仍是 `a9f1bc8c8fd49016`（事件版、无 B3 —— 它就是缺陷臂那一台，留作对照）、`sr-route 26044f78f7969935`；
+CPE2/CPE4 仍是轮询版，两台 `sr-route 5789c2c0f753529b` + `sr-frr c8e731ddcbca7bd6`（**都是 B4 之前的老 sr-frr，
+没有 `/local-prefixes`**）。四台十二件 run==盘，**没有静默退回**（2026-11-09 实测，逐台 `sha256sum /proc/<pid>/exe`
+对 `/usr/local/bin/<name>`）。CPE1 的轮询版留在盒上当回滚底：`/usr/local/bin/sr-fib.prerun-20261108`
 = `bab523ff3809f57b`（含缺陷⑦ 修复那份）。换件与自检用的是 `test/lab/vmlab/exp-276/install276.sh`（只装盘）
 与 `swap276.sh`（SIGTERM + 产品自己的开机清单补回 + 客户侧 75 秒探测），2026-11-08 用同版本换件验证过：
 新 pid 1831ms / 1804ms 起来，两枪各 0 FAIL（2561 发 / 2544 发）。
@@ -199,8 +207,9 @@ CPE1 仍是 `a9f1bc8c8fd49016`（事件版、无 B3 —— 它就是缺陷臂那
 的推导表产品里没人落盘，进程一起来就靠上游重推 —— 详见台账 G-2。**后果**：这种盒子上如果 sr-fib 单独重启、
 而 RR/agent 那条重推链正好没走到，就是缺陷⑦ 那一族的形状。**别把 `fib.json` 里的 `tunnels` 当成现场事实。**
 
-**仍不一致的那一处（有意留着，不是漏）：** CPE2/3/4 三台 `sr-route` 还在跑 `5789c2c0…` = 11-04 那一代的内容
-（CPE1 已于 2026-11-08 抬到 `26044f78…`，即带 #275/#276 的那一份），
+**仍不一致的那一处（有意留着，不是漏）：** CPE2/CPE4 两台 `sr-route` 还在跑 `5789c2c0…` = 11-04 那一代的内容
+（CPE1 已于 2026-11-08 抬到 `26044f78…`，即带 #275/#276 的那一份；CPE3 已于 2026-11-09 抬到 `1161534d…`，
+即带 B4 的那一份，见上面的 11-09 全表），
 盘上也是这一份，所以它没有"静默退回"的风险；但它的**内容**落后于 HEAD。
 把它抬到 HEAD 那一代必须换进程 —— 2026-11-07 之前"换进程"这一步本身还叠了一个坑（开机清单与
 watch 撞在同一秒会各起一份 `sr-route`/`sr-fib`，两个实例抢同一条 RR 会话），缺陷⑧ 已用一把
@@ -317,8 +326,11 @@ sr-fib 的「下一跳 → 本机 wg 口 + 颜色」那张表只在内存（`PUT
 而 VPP 里的老行还在（`routes+0/-0`、`mpls via` 条数不变）—— 看着像"没坏"，其实收敛根本没发生。
 补法只有一条合法路径：`bash test/lab/vmlab/vm-fib-sync.sh <node>`（数据来自控制台
 `GET /api/underlay` + 盒内 `show interface addr` + `/etc/sdwan/route.json`，脚本不猜）。
-判据是它自己打的那行：`隧道 N 条 … converged=True` 且**没有** `警告:`；换 sr-route 那一枪还要按 B4
-的做法紧跟着换 sr-frr，否则本盒 local 前缀集对全网消失。
+判据是它自己打的那行：`隧道 N 条 … converged=True` 且**没有** `警告:`。
+换 sr-route 那一枪必须**与 sr-frr 同批、且 sr-frr 在前**（B4 的部署硬规则，2026-11-09 实测：
+老 sr-frr 没有 `GET /local-prefixes`，实测回 404，只抬 sr-route 会让它对着 404 每 2s 重试到永远，
+本盒 local 前缀集照旧对全网消失）。B4 修好之后已经**不需要**再手工换 sr-frr 补前缀了 ——
+新 sr-route 一起来就自己拉一份全量（CPE3 实测 `local` 在重启后 t+1s 就是 1，1899 发探测 0 FAIL）。
 
 ### 5.3 提交
 
@@ -419,7 +431,7 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 | 任务 | 状态 | 一句话现状 |
 | --- | --- | --- |
 | **#275** `resolvable` 改吃活动隧道 | **已落地（2026-11-08）**，单测 6 条绿；e2e 判据待跑（要注入 BFD down，属于会动 lab 现状的动作，需 owner 声明窗口） | 门换成"配置 && 活着"：`reachableLocked()` 先看 `nextHops`（配置层，未配置=不可达，同旧），再看 `peerBFD[peer]`（活动层）。活动层是 agent 每次 `metricsLoop` 上报的 BFD 结果经 sr-route 新端点 `PUT /tunnel-state` 灌进来的；`sr-agent` 端接线在 `internal/agent/routestate.go`，`RouteStatePusher` 读 `route.json` 里的 `status_addr` 定位到本机 sr-route，把原始 `wire.TunnelMetrics` 行透传过去，聚合逻辑（同 peer 多隧道 any-up-wins、absent=没有信息）全在 `internal/route` 里。细则见 `docs/queue-plan-next.md` §二 落地实况。**四条 pin 的实际选择**：pin1 采用**内部/fib/reach.go 的 fail-open 口径**（"没跑 BFD 的 CPE 不该因为本包而黑洞所有路由"），与 §二 原方案里"严格 fail-closed"那条相反 —— 若 owner 拍要改回 fail-closed，只需调 `reachableLocked` 里 `!s.Known` 那行，代价是刚入网的前几秒（agent 第一次上报之前）本机路由会全部 pending；pin3 按 **peer 粗粒度 any-up-wins**（照 reach.go 的注释"路由只带对端地址，没有本地源，挑不了更细"），不是 §二 建议的 next-hop 精细；pin2 hold-down **本次未做**，交给 #262（那条本来就管"亚秒抖动放大"）；pin5 RR 侧本次未做，交给 #272 |
-| **#276** 收敛改事件驱动 | **切片 A+B+C 全部落地（2026-11-08）**：A=提交 a8083d2（sr-frr→sr-route delta + 10ms 合并 + 重连全量），B=sr-route→sr-fib 的 SSE `/watch`（每前缀一条事件、10ms 合并、背压丢读端、订阅位独占 409、断流立即重挂+INIT 全量），C=判据与实测成文于 `test/lab/vmlab/exp-276/README.md`。新增单测 25 条全绿、`go test ./...` 全绿、`vm-verify.sh` 392/0/0、`exp-273/six.sh` 六方向 0% 丢包。**实测**（同一台 CPE1、同一注入 `systemctl restart frr`、两臂 sr-route 同一份 `26044f78f7969935`）：摘路边 ≤456/593ms → **≤40/41/45ms**，装路边 868/978ms → **201/294/755ms**；sr-route 发射端延迟直接量到（摘 ≤142ms、装 ≤84ms），残余在 sr-fib 一轮收敛 + VPP 装表那侧，本轮秒级日志拆不下去，已登记。**只剩 B2（三条口共用一套 transport identity）没做**。CPE1 已跑事件版，CPE2/3/4 仍旧版 —— 抬它们之前必须先修 B3；**B3 已于 2026-11-09 落地（见下面 B3 那一行，已收口），抬的硬前置只剩 B4** | 细则见 `docs/queue-plan-next.md` §三 落地实况（切片 B+C）。**这一片顺手抓到两条要 owner 拍的缺口：B3 watch 模式下隧道/BFD 状态变化没有任何收敛触发（`client.go:1142/1169` 的隧道门 + `cmd/sr-fib/main.go:301` 才读 BFD + 三个触发点 `main.go:509`/`watch.go:215/233/253`，现场证据 poll2 那一枪靠下一轮 1s 轮询救回）；B4 sr-route 重启后本地前缀集没人重建（`cmd/sr-frr/main.go:745-776` 变更驱动，本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 才补回）** |
+| **#276** 收敛改事件驱动 | **切片 A+B+C 全部落地（2026-11-08）**：A=提交 a8083d2（sr-frr→sr-route delta + 10ms 合并 + 重连全量），B=sr-route→sr-fib 的 SSE `/watch`（每前缀一条事件、10ms 合并、背压丢读端、订阅位独占 409、断流立即重挂+INIT 全量），C=判据与实测成文于 `test/lab/vmlab/exp-276/README.md`。新增单测 25 条全绿、`go test ./...` 全绿、`vm-verify.sh` 392/0/0、`exp-273/six.sh` 六方向 0% 丢包。**实测**（同一台 CPE1、同一注入 `systemctl restart frr`、两臂 sr-route 同一份 `26044f78f7969935`）：摘路边 ≤456/593ms → **≤40/41/45ms**，装路边 868/978ms → **201/294/755ms**；sr-route 发射端延迟直接量到（摘 ≤142ms、装 ≤84ms），残余在 sr-fib 一轮收敛 + VPP 装表那侧，本轮秒级日志拆不下去，已登记。**只剩 B2（三条口共用一套 transport identity）没做**。**2026-11-09 现场复核**：B3、B4 两条硬前置都已落地并实测收口（见下面两行）；四台里 CPE3 是唯一一台"事件 + B3 + B4"的盒（`sr-fib c213a6ca`、`sr-route 1161534d`、`sr-frr 626b126a`），CPE1 是"事件版 sr-fib 但没带 B3"的对照臂（`a9f1bc8c`、`sr-route 26044f78`），CPE2/CPE4 仍是轮询版（`bab523ff` + `sr-route 5789c2c0`） | 细则见 `docs/queue-plan-next.md` §三 落地实况（切片 B+C）。**这一片顺手抓到两条要 owner 拍的缺口：B3 watch 模式下隧道/BFD 状态变化没有任何收敛触发（`client.go:1142/1169` 的隧道门 + `cmd/sr-fib/main.go:301` 才读 BFD + 三个触发点 `main.go:509`/`watch.go:215/233/253`，现场证据 poll2 那一枪靠下一轮 1s 轮询救回）；B4 sr-route 重启后本地前缀集没人重建（`cmd/sr-frr/main.go:745-776` 变更驱动，本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 才补回）。**两条均已于 2026-11-09 收口，B4 按 owner 拍的形状 (b) 落地，判据与三臂数字在 `test/lab/vmlab/exp-b4/README.md`** |
 | #272 跨盒回灌 | 待拍 | 注入的 K 路由进了客户 area0 后被别的盒当 `local` 上报 |
 | #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞。**2026-11-09 更新口径**：sr-fib 那"1s 轮询直接摘路"的放大在事件版盒上已经没了（切片 B：摘路边实测 ≤40~45ms；B3 之后连"隧道/BFD 抖一下、RIB 没变"这一类也会立刻触发重算，双向 ≤65ms）。剩下的抖动放大全在 BFD 判定 + 没有 hold-down 这一侧；hold-down 现在**有地方挂了** —— 就挂在 B3 那条 `signal()` 上（`cmd/sr-fib/main.go:461` 造 `wake` → `:469` 建连时订阅 BFD 事件 → `cmd/sr-fib/watch.go:320` 的 `signal()`），挂在轮询上等于挂在一个 watch 模式已经不存在的节拍里 |
 | ~~#269 缺陷⑧~~ | **已修（2026-11-07）** | `controller/deploy/sr-box/start.sh` 加了一把 `flock`（`LOCK=${SR_BOX_LOCK:-$RUN/.lock}`）：`run_up`/`run_stop` 都先抢它，非阻塞拿不到就 SKIP；`launch()`/`do_vpp`/`do_apply`/`do_frr` 每个后台子进程带 `9>&-` 关掉锁 fd，否则被 systemd `TimeoutStartSec` 杀掉时锁攥在守护进程手里永不释放。沙盒 5 路并发实测：`sr-agent`/`sr-route`/`sr-fib`/`sr-frr` 各起 1 份，4 份 SKIP 退出 0。**VM 台的物理复测没跑**（要 `systemctl restart vpp` 撞那一秒，属于会影响 lab 现状的动作，等 owner 点头再做）。抬 `sr-route` 到 HEAD 的**并发抢起阻塞已解**，剩下的只是重启本身的 RR 会话抖动 |
@@ -427,14 +439,14 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 | G-2 隧道表落盘 | 只出了方案（`3a09f03`） | 隧道层磁盘恢复不了 ⇒ §2.5 那个 `sr-box` exit 1 |
 | NAT 阶梯 #222 + M-4/M-1/M-3/M-5、#211/#213/#244/S8 | 挂着 | 顺序 M-4→M-1→M-2→M-3 |
 
-**#276 切片 B/C（2026-11-08）顺手抓到的 2 条缺口：B3 已于 2026-11-09 落地并实测收口，B4 仍要 owner 拍**
-（B3 的判据与逐枪数字在 `test/lab/vmlab/exp-b3/README.md`，B4 的细节与推荐形状在
-`docs/queue-plan-next.md` §三 落地实况末尾）：
+**#276 切片 B/C（2026-11-08）顺手抓到的 2 条缺口：B3、B4 均已于 2026-11-09 落地并实测收口（B4 的形状 owner 拍的是 (b)）**
+（B3 的判据与逐枪数字在 `test/lab/vmlab/exp-b3/README.md`，B4 的判据与三臂数字在
+`test/lab/vmlab/exp-b4/README.md`，两条的机制与落地实况都在 `docs/queue-plan-next.md` §三 末尾）：
 
 | 缺口 | 场景 | 一句话现状 |
 | --- | --- | --- |
 | ~~**B3**~~ watch 模式下可达性变化无人触发收敛 | 隧道/BFD 抖一下、RIB 没变 | **已修（2026-11-09）**：sr-fib 在建连时订阅本机 VPP 的 `want_bfd_events`，会话状态翻转直接 `signal()` 叫醒收敛轮；订阅失败按"起不来"处理，不留半死状态。三臂实测（CPE3 / 注入在**对端** CPE1 的 wg1009）：轮询版摘路 745ms/装回 492ms；**事件版没有 B3 = 无期限**（那条死腿在 FIB 里挂了 21s、20 发探测全挂、sr-fib 一行日志都没打）；B3 版摘路与装回双向 **≤65ms**（一个采样间隔以下）、1557 发只 FAIL 1。**#262 的 hold-down 现在有这个触发点可以挂了** |
-| **B4** 对端 sr-route 重启后 local 前缀集不重建 | 抬 sr-route 那一枪（队列第一节要干的活）之后 | sr-frr 只在变更时上报，sr-route 起来后不主动要 ⇒ `local` 空到下一次客户侧变动，本盒前缀对全网消失。本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 补回（0/2803 发 FAIL）。三个候选形状里我推荐 **(b) sr-route 起来后向 sr-frr 控制口要一份全量**（形状 = zebra 新客户端一连上 daemon 就 announce；不改数据面、不引入周期重发） |
+| ~~**B4**~~ 对端 sr-route 重启后 local 前缀集不重建 | 抬 sr-route 那一枪（队列第一节要干的活）之后 | **已修（2026-11-09，按 owner 拍的形状 (b)）**：sr-route 一起来就向 sr-frr 控制口 `GET /local-prefixes` 拉一份全量并整表原子应用，拿到就退出、**不做周期重发**（拉不到每 2s 重试，开机时 `do_route` 在 `do_bridge` 之前所以这条必然走到）；sr-frr 侧"应答即降级"把拉取与增量推送的先后次序关掉，"有规则但 zebra 没连上"回 503 而不是交出一张没法信的空集。三臂实测（CPE3，注入=只重启 sr-route，探测 cust12→172.16.3.1）：老 pair 那一臂 `local` t+1s 掉到 0、**150s 仍未自愈**、客户探测连续断流 **158.66s**；新 pair 这一臂 `local` **t+1s=1**、**1899 发 0 FAIL**，sr-route 新 pid 起来 1630ms（与老臂 1635ms 同量，拉没给重启加时长）。换件后 `vm-verify.sh` **392/0/0**、`exp-273/six.sh` 六方向 0%。**部署硬规则（实测）：`sr-frr` 与 `sr-route` 必须同批抬、`sr-frr` 在前** —— 老 sr-frr 没这个端点，实测 404，只抬 sr-route 就是对着 404 重试到永远 |
 
 历史与决策的权威出处（要引结论去这里引，别信二手转述）：
 [docs/vmlab-rebuild-plan.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/vmlab-rebuild-plan.md)（增量台账，最近四节是 §9.19/§9.20/§9.21/§9.22；§9.21 作废了前两节里"窗口保留"的说法，§9.22 是 #277 产物收口）、

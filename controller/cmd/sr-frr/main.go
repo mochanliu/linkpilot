@@ -798,7 +798,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("sr-frr: %v", err)
 		}
-		srv := &http.Server{Handler: controlMux(rt, exp, st, cfg, ctx)}
+		srv := &http.Server{Handler: controlMux(rt, exp, st, imp, reporter, cfg, ctx)}
 		go func() {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("sr-frr: 控制口退出: %v", err)
@@ -809,7 +809,7 @@ func main() {
 			defer cancel()
 			_ = srv.Shutdown(shutdown)
 		}()
-		log.Printf("sr-frr: 控制口 %s（PUT /config, GET /status）", cfg.ControlSocket)
+		log.Printf("sr-frr: 控制口 %s（PUT /config, GET /status, GET /local-prefixes）", cfg.ControlSocket)
 	}
 
 	if *once {
@@ -988,6 +988,17 @@ func (r *localReporter) hasSync() bool {
 	return r.synced
 }
 
+// demote invalidates the belief that sr-route holds lastSeen, so the next
+// reconcile sends the whole table. Used for the same two reasons the delta
+// failure uses it: something happened that this reporter can't account for.
+// Here that something is a third party (sr-route's startup pull, B4) having
+// taken the set straight from the importer instead of from a push.
+func (r *localReporter) demote() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.synced = false
+}
+
 // reconcile publishes the current reported set. It returns posted=true when
 // the call produced a body that reached sr-route (a full PUT or a non-empty
 // delta), false when nothing needed to change. Errors leave the reporter in a
@@ -1116,7 +1127,7 @@ type controlBody struct {
 	RefreshVRFs []uint32        `json:"refresh_vrfs"`
 }
 
-func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileConfig, ctx context.Context) http.Handler {
+func controlMux(rt *runtimeStore, exp *exportState, st *importState, imp *frr.Importer, reporter *localReporter, cfg *fileConfig, ctx context.Context) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
@@ -1170,6 +1181,39 @@ func controlMux(rt *runtimeStore, exp *exportState, st *importState, cfg *fileCo
 			"export_vrfs":  next.exportVRFs,
 			"import_rules": len(next.rules),
 		})
+	})
+	// GET /local-prefixes 是 B4 的另一半：sr-route 起来后主动问一份现值。
+	//
+	// 为什么必须由这里答：reporter 只在集合**变化**时发消息（它记的是"上一次
+	// sr-route 确认过的那一份"）。sr-route 重启后本地是空的，而 sr-frr 这边
+	// 算不出任何差量 —— 谁都不动，这台盒子对 RR 的本地前缀宣告就永久缺一块。
+	// zebra 的形状是新客户端一连上 daemon 就把全表 announce 一遍（bgp_zebra_
+	// connected → bgp_zebra_announce_table），这一条就是它的等价物。
+	mux.HandleFunc("/local-prefixes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		rc := rt.snapshot()
+		if len(rc.rules) > 0 && !st.zebraConnected() {
+			// 有规则却没连上 zebra（或 VPN 的 VRF 设备不在，订不上），此时
+			// "一条也没有"说明不了任何事：宁可不答，也绝不把一份没法信的空集
+			// 交出去（AGENTS.md §1 第 3 条、§2 控制台不造数据）。
+			http.Error(w, "反向导入未就绪（zebra 未连接或 VRF 设备缺失），请稍后重试", http.StatusServiceUnavailable)
+			return
+		}
+		// 与 poll 走同一条计算，应答和下一次 PUT 不会出自两套口径。
+		reps, _ := imp.Report(rc.rules, exp.exportedSet(rc.exportVRFs))
+		doc := localPrefixesDoc{Prefixes: make([]localPrefixJSON, 0, len(reps))}
+		for _, p := range reps {
+			doc.Prefixes = append(doc.Prefixes, localPrefixJSON{VRFID: p.VPN, Prefix: p.Prefix.String()})
+		}
+		// 应答即降级：这份应答交出去以后，reporter 不能再宣称"sr-route 持有的
+		// 就是 lastSeen 那一份"。下一轮（≤poll_sec，或来一条新路由时的 10ms）
+		// 一定重发全量。拉取与增量推送撞在一起时的先后次序，靠这一句就够，
+		// 不需要版本号，也不需要两边对齐时钟。
+		reporter.demote()
+		writeJSON(w, doc)
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		rc := rt.snapshot()
