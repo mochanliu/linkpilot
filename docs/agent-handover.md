@@ -37,7 +37,11 @@ ssh CPE1 'for x in sr-route sr-frr sr-fib sr-agent; do pid=$(pgrep -x $x|head -1
 
 第四条如果哪一行 `run != disk`，说明有人换过件没装盘（或有第二 agent 在铺产物）—— 先问 owner 再动手，
 别直接重启去"对齐"。第二条如果 7 台不全在跑，你的现场是别人的半成品，先声明再说。
-`vm-verify.sh`（约 2 分钟）和 `exp-273/six.sh` 同样随时可跑，但跑的时候确认没人在注入故障（§10）。
+`vm-verify.sh`（约 4 分钟，2026-11-09 改口径后实测）和 `exp-273/six.sh` 同样随时可跑。
+**owner 2026-11-09 已撤掉这套研发台的窗口审批**（§10 有原话），所以"跑的时候确认没人在注入故障"
+不再是审批前置，只剩一条物理事实：对面正在注入时你量到的数不是基线。
+**但 owner 可以对某一次实验单独下冻结令** —— 例如 2026-11-09 #285 交付后他说「lab 先放那里不动，
+我自己测一下再说」，那就是**只读都不必跑、写一律禁止**，直到他解冻。冻结令优先于本节其余各条。
 
 ---
 
@@ -492,8 +496,8 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 
 | 任务 | 状态 | 一句话现状 |
 | --- | --- | --- |
-| **#275** `resolvable` 改吃活动隧道 | **已落地（2026-11-08）**，单测 6 条绿；e2e 判据待跑（要注入 BFD down，属于会动 lab 现状的动作，需 owner 声明窗口） | 门换成"配置 && 活着"：`reachableLocked()` 先看 `nextHops`（配置层，未配置=不可达，同旧），再看 `peerBFD[peer]`（活动层）。活动层是 agent 每次 `metricsLoop` 上报的 BFD 结果经 sr-route 新端点 `PUT /tunnel-state` 灌进来的；`sr-agent` 端接线在 `internal/agent/routestate.go`，`RouteStatePusher` 读 `route.json` 里的 `status_addr` 定位到本机 sr-route，把原始 `wire.TunnelMetrics` 行透传过去，聚合逻辑（同 peer 多隧道 any-up-wins、absent=没有信息）全在 `internal/route` 里。细则见 `docs/queue-plan-next.md` §二 落地实况。**四条 pin 的实际选择**：pin1 采用**内部/fib/reach.go 的 fail-open 口径**（"没跑 BFD 的 CPE 不该因为本包而黑洞所有路由"），与 §二 原方案里"严格 fail-closed"那条相反 —— 若 owner 拍要改回 fail-closed，只需调 `reachableLocked` 里 `!s.Known` 那行，代价是刚入网的前几秒（agent 第一次上报之前）本机路由会全部 pending；pin3 按 **peer 粗粒度 any-up-wins**（照 reach.go 的注释"路由只带对端地址，没有本地源，挑不了更细"），不是 §二 建议的 next-hop 精细；pin2 hold-down **本次未做**，交给 #262（那条本来就管"亚秒抖动放大"）；pin5 RR 侧本次未做，交给 #272 |
-| **#276** 收敛改事件驱动 | **切片 A+B+C 全部落地（2026-11-08）**：A=提交 a8083d2（sr-frr→sr-route delta + 10ms 合并 + 重连全量），B=sr-route→sr-fib 的 SSE `/watch`（每前缀一条事件、10ms 合并、背压丢读端、订阅位独占 409、断流立即重挂+INIT 全量），C=判据与实测成文于 `test/lab/vmlab/exp-276/README.md`。新增单测 25 条全绿、`go test ./...` 全绿、`vm-verify.sh` 392/0/0、`exp-273/six.sh` 六方向 0% 丢包。**实测**（同一台 CPE1、同一注入 `systemctl restart frr`、两臂 sr-route 同一份 `26044f78f7969935`）：摘路边 ≤456/593ms → **≤40/41/45ms**，装路边 868/978ms → **201/294/755ms**；sr-route 发射端延迟直接量到（摘 ≤142ms、装 ≤84ms），残余在 sr-fib 一轮收敛 + VPP 装表那侧，本轮秒级日志拆不下去，已登记。**只剩 B2（三条口共用一套 transport identity）没做**。**2026-11-09 现场复核**：B3、B4 两条硬前置都已落地并实测收口（见下面两行）；四台里 CPE3 是唯一一台"事件 + B3 + B4"的盒（`sr-fib c213a6ca`、`sr-route 1161534d`、`sr-frr 626b126a`），CPE1 是"事件版 sr-fib 但没带 B3"的对照臂（`a9f1bc8c`、`sr-route 26044f78`），CPE2/CPE4 仍是轮询版（`bab523ff` + `sr-route 5789c2c0`） | 细则见 `docs/queue-plan-next.md` §三 落地实况（切片 B+C）。**这一片顺手抓到两条要 owner 拍的缺口：B3 watch 模式下隧道/BFD 状态变化没有任何收敛触发（`client.go:1142/1169` 的隧道门 + `cmd/sr-fib/main.go:301` 才读 BFD + 三个触发点 `main.go:509`/`watch.go:215/233/253`，现场证据 poll2 那一枪靠下一轮 1s 轮询救回）；B4 sr-route 重启后本地前缀集没人重建（`cmd/sr-frr/main.go:745-776` 变更驱动，本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 才补回）。**两条均已于 2026-11-09 收口，B4 按 owner 拍的形状 (b) 落地，判据与三臂数字在 `test/lab/vmlab/exp-b4/README.md`** |
+| **#275** `resolvable` 改吃活动隧道 | **已落地（2026-11-08）**，单测 6 条绿；**e2e 已随 #284 抬盒跑过（2026-11-09）**，四台十二件 run==盘、`vm-verify.sh` 398/0/0、六方向 0% 丢包 | 门换成"配置 && 活着"：`reachableLocked()` 先看 `nextHops`（配置层，未配置=不可达，同旧），再看 `peerBFD[peer]`（活动层）。活动层是 agent 每次 `metricsLoop` 上报的 BFD 结果经 sr-route 新端点 `PUT /tunnel-state` 灌进来的；`sr-agent` 端接线在 `internal/agent/routestate.go`，`RouteStatePusher` 读 `route.json` 里的 `status_addr` 定位到本机 sr-route，把原始 `wire.TunnelMetrics` 行透传过去，聚合逻辑（同 peer 多隧道 any-up-wins、absent=没有信息）全在 `internal/route` 里。细则见 `docs/queue-plan-next.md` §二 落地实况。**四条 pin 的实际选择**：pin1 采用**内部/fib/reach.go 的 fail-open 口径**（"没跑 BFD 的 CPE 不该因为本包而黑洞所有路由"），与 §二 原方案里"严格 fail-closed"那条相反 —— 若 owner 拍要改回 fail-closed，只需调 `reachableLocked` 里 `!s.Known` 那行，代价是刚入网的前几秒（agent 第一次上报之前）本机路由会全部 pending；pin3 按 **peer 粗粒度 any-up-wins**（照 reach.go 的注释"路由只带对端地址，没有本地源，挑不了更细"），不是 §二 建议的 next-hop 精细；pin2 hold-down **本次未做**，交给 #262（那条本来就管"亚秒抖动放大"）；pin5 RR 侧本次未做，交给 #272 |
+| **#276** 收敛改事件驱动 | **切片 A+B+C 全部落地（2026-11-08）**：A=提交 a8083d2（sr-frr→sr-route delta + 10ms 合并 + 重连全量），B=sr-route→sr-fib 的 SSE `/watch`（每前缀一条事件、10ms 合并、背压丢读端、订阅位独占 409、断流立即重挂+INIT 全量），C=判据与实测成文于 `test/lab/vmlab/exp-276/README.md`。新增单测 25 条全绿、`go test ./...` 全绿、`vm-verify.sh` 392/0/0、`exp-273/six.sh` 六方向 0% 丢包。**实测**（同一台 CPE1、同一注入 `systemctl restart frr`、两臂 sr-route 同一份 `26044f78f7969935`）：摘路边 ≤456/593ms → **≤40/41/45ms**，装路边 868/978ms → **201/294/755ms**；sr-route 发射端延迟直接量到（摘 ≤142ms、装 ≤84ms），残余在 sr-fib 一轮收敛 + VPP 装表那侧，本轮秒级日志拆不下去，已登记。**只剩 B2（三条口共用一套 transport identity）没做**。**2026-11-09 现场复核（#284 抬盒之后，以 §3 那张 run/disk 表为准）**：B3、B4 两条硬前置都已落地并实测收口（见下面两行）；**CPE2/CPE3/CPE4 三台现在都是"事件 + B3 + B4"**（`sr-route 1161534d`、`sr-fib c213a6ca`、`sr-frr 626b126a`），**CPE1 是有意留的缺陷臂**：`sr-route`/`sr-frr` 抬了，`sr-fib` 停在 `a9f1bc8c`（事件版、没带 B3），抬上去就没有对照了。抬盒之前那句"CPE2/CPE4 仍是轮询版"已作废 | 细则见 `docs/queue-plan-next.md` §三 落地实况（切片 B+C）。**这一片顺手抓到两条要 owner 拍的缺口：B3 watch 模式下隧道/BFD 状态变化没有任何收敛触发（`client.go:1142/1169` 的隧道门 + `cmd/sr-fib/main.go:301` 才读 BFD + 三个触发点 `main.go:509`/`watch.go:215/233/253`，现场证据 poll2 那一枪靠下一轮 1s 轮询救回）；B4 sr-route 重启后本地前缀集没人重建（`cmd/sr-frr/main.go:745-776` 变更驱动，本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 才补回）。**两条均已于 2026-11-09 收口，B4 按 owner 拍的形状 (b) 落地，判据与三臂数字在 `test/lab/vmlab/exp-b4/README.md`** |
 | #272 跨盒回灌 | 待拍 | 注入的 K 路由进了客户 area0 后被别的盒当 `local` 上报 |
 | #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞。**2026-11-09 更新口径**：sr-fib 那"1s 轮询直接摘路"的放大在事件版盒上已经没了（切片 B：摘路边实测 ≤40~45ms；B3 之后连"隧道/BFD 抖一下、RIB 没变"这一类也会立刻触发重算，双向 ≤65ms）。剩下的抖动放大全在 BFD 判定 + 没有 hold-down 这一侧；hold-down 现在**有地方挂了** —— 就挂在 B3 那条 `signal()` 上（`cmd/sr-fib/main.go:461` 造 `wake` → `:469` 建连时订阅 BFD 事件 → `cmd/sr-fib/watch.go:320` 的 `signal()`），挂在轮询上等于挂在一个 watch 模式已经不存在的节拍里 |
 | ~~#269 缺陷⑧~~ | **已修（2026-11-07）** | `controller/deploy/sr-box/start.sh` 加了一把 `flock`（`LOCK=${SR_BOX_LOCK:-$RUN/.lock}`）：`run_up`/`run_stop` 都先抢它，非阻塞拿不到就 SKIP；`launch()`/`do_vpp`/`do_apply`/`do_frr` 每个后台子进程带 `9>&-` 关掉锁 fd，否则被 systemd `TimeoutStartSec` 杀掉时锁攥在守护进程手里永不释放。沙盒 5 路并发实测：`sr-agent`/`sr-route`/`sr-fib`/`sr-frr` 各起 1 份，4 份 SKIP 退出 0。**VM 台的物理复测没跑**（要 `systemctl restart vpp` 撞那一秒，属于会影响 lab 现状的动作，等 owner 点头再做）。抬 `sr-route` 到 HEAD 的**并发抢起阻塞已解**，剩下的只是重启本身的 RR 会话抖动 |
@@ -526,7 +530,7 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 
 | 共享资源 | 冲突表现 | 约定 |
 | --- | --- | --- |
-| VirtualBox 7 台（同一时刻只有一个被测现场） | 你的故障注入把对方的基线打脏，两边结论都作废 | ~~动状态前先打招呼~~ **owner 2026-11-09 已撤掉窗口审批**（见本节下方原话）：这套研发台随时可动；仍要做的是「改动走产品路径 + 写清怎么还原」，以及别打脏另一个 agent 正在量的基线。只读脚本（`vm-verify.sh`、`box-layers.sh`、`six.sh`）随时可跑 |
+| VirtualBox 7 台（同一时刻只有一个被测现场） | 你的故障注入把对方的基线打脏，两边结论都作废 | ~~动状态前先打招呼~~ **owner 2026-11-09 已撤掉窗口审批**（见本节下方原话）：这套研发台随时可动；仍要做的是「改动走产品路径 + 写清怎么还原」，以及别打脏另一个 agent 正在量的基线。只读脚本（`vm-verify.sh`、`exp-273/box-layers.sh`、`exp-273/six.sh`）随时可跑 —— **但先看 §10.1 有没有冻结令** |
 | `/run/sr-frr/control.sock` 等盒内状态 | 两个 agent 各自热更，`config_hash` 对不上 | 一次只让一个 agent 持有"写盒内"的锁；换件前先看 `stat -c %y /usr/local/bin/<x>` 是否刚被别人动过 |
 | 控制器 `state.json` + 8088 控制台 | 草稿互相覆盖、发布撞上别人的 apply | 草稿是共享的，**改配置类实验前先 `GET` 当前已发布版本**，别拿自己记忆里的值当现状 |
 | `lp-ctrl`（同一份源码树） | `go build` 出来的产物不是你的改动 | 编译前 `git status --short` + `git rev-parse HEAD`，记下你构建时的树；产物一律放**自己任务号的目录**（`~/srvmlab/out-<N>/`），不要覆盖 `artifacts/linux/` 里别人的文件 |
@@ -542,6 +546,24 @@ lab 的当前形状属于 owner，不属于任何一次实验。
 写进实验 README（exp-285 §五就是样板：t13 颜色 0→2、四台逃生开关 true，还原两步都不重启进程）；
 ② 有第二个 agent 在场时，别把对方正在量的基线打脏 —— 撤的是审批，不是"两边结论都作废"这个物理事实。
 生产盒与别人现场的 lab 不在这条豁免里。
+
+### 10.1 当前生效的冻结令（2026-11-09，#285 交付之后）
+
+owner 原话：**「我自己测一下再说，lab 先放那里不动。」**
+
+这条**优先于上面所有豁免**。含义逐条说清，别自己放宽：
+
+- **写一律禁止**：不注故障、不换件、不改配置发布、不 `PUT /config`、不跑 `vm-fib-sync.sh`、
+  不 `ESCAPE=…`、不重启任何进程、不重建 lab。
+- **只读也不必跑**：`vm-verify.sh` / `six.sh` / `box-layers.sh` 这些虽然不写状态，但会占 CPU、
+  打流量、动计数器，owner 正在自己测主备切换，**任何额外负载都会污染他的读数**。要读现场就读文件与 git，
+  或者等他解冻。
+- **冻结的形状是什么**：t13 颜色 2、四台逃生开关 true、CPE3 `172.16.12.1/32` = `len:2`（pref10 承载 /
+  pref12 装着不承载）。这就是他要复测的那一枪的起手形状，**还原配方写在 exp-285 README §五，但现在不许执行**。
+- **解冻条件**：只有 owner 明说。第二个 agent 上车时**第一件事就是问 owner 这条冻结令还在不在**，
+  不许拿"窗口审批已撤"当解冻依据 —— 撤的是常设审批，冻结令是他针对这一次实验单独下的。
+- 冻结期间能干的活：读代码、写方案、写单测、在 `lp-ctrl` 里 `go build/vet/test`（那是容器，不碰 VM 台）、
+  改文档。**不能干的活**：任何需要 VM 台出数字的验证。所以冻结期间领的活必须是"代码 + 单测就能收口"的那一类。
 
 具体如何拉起第二个会话（工作区挂载、任务切分、告示牌锁的落地形式、出事怎么退回干净态）见
 [`docs/second-agent-onboarding.md`](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/second-agent-onboarding.md)。
