@@ -381,21 +381,28 @@ owner 的拍板是**性能条件不是偏好**："只要路由收敛性能与 fr
 **没做的**：
 - **B2 transport identity** —— `/local-prefixes`、`/local-prefixes/delta`、`/watch` 三条口现在各自判身份，
   要收口成一套（同一条 mTLS/证书身份贯穿），这属于协议层，不该塞进切片 B。
-- 其余盒还没抬齐（**2026-11-09 复测**，见 `docs/agent-handover.md` §3）：CPE1 `sr-fib a9f1bc8c` = 事件版但**没带 B3**
-  （它就是缺陷臂那一台，留着当对照），CPE2/CPE4 `sr-fib bab523ff` + `sr-route 5789c2c0` = 仍旧的轮询版；
-  CPE3 是眼下唯一一台"事件 + B3 + B4"的盒（`sr-fib c213a6ca`、`sr-route 1161534d`、`sr-frr 626b126a`）。
-  **B3/B4 两条前置都已解除，抬 sr-fib 可以直接推；抬 sr-route 必须与 sr-frr 同批、且 sr-frr 在前**
-  （老 sr-frr 没有 `GET /local-prefixes`，实测 404；细节见上面 B4 那一条末尾）。
+- **抬盒已经完成（#284，2026-11-09 实测）**，不再是待办：CPE2/CPE3/CPE4 三台是"事件 + B3 + B4"
+  （`sr-route 1161534d`、`sr-fib c213a6ca`、`sr-frr 626b126a`），CPE1 抬了 `sr-route`/`sr-frr` 两件、
+  **`sr-fib` 按方案留在 `a9f1bc8c`**（事件版无 B3，手上唯一的缺陷臂，抬上去就没有对照了）。
+  十二件 run==盘、`vm-verify.sh` 392 PASS/0 FAIL、`exp-273/six.sh` 六方向 0% 丢包。
+  逐枪数字、流量归属表和回滚底在 `test/lab/vmlab/exp-284/README.md`；现场台账在 `agent-handover.md` §3。
+  **抬盒踩出来的一条**：`push276.sh` 只落到 staging（`$D/<name>.new`），不装盘 —— 直接跑 `swap276.sh`
+  等于拿老份做重启自检（脚本自己会喊"跑 == 盘"）。顺序只有 **push → install → swap** 一步不能省。
 - `seq`/`since_seq` 增量重放：与切片 A 同一个理由 —— 幂等批 + 断线全量兜底已经覆盖了丢失，FRR 也没有这层。
 - zebra 收录 K 路由那 1~2s：FRR 侧的账，#276 不压它（实测两臂 5.33~6.66s 同量，见上表）。
 
 **owner 想回退怎么办**：`cmd/sr-fib/main.go:508` 那一行 `go f.watchLoop(...)` 去掉、把 `convergeLoop` 换回
 `retryGap` 周期的 ticker，就退回轮询版；sr-route 侧 `/watch` 端点没人订阅时 `notifyWatchLocked` 是 no-op，
-不产生任何副作用，可以留着。盒上的回滚底：CPE1 `/usr/local/bin/sr-fib.prerun-20261108` = `bab523ff3809f57b`
-（轮询那份，含缺陷⑦ 修复），换回去只需要 `install276.sh` + `swap276.sh` 两枪，全程 0 丢包。
+不产生任何副作用，可以留着。盒上的回滚底（2026-11-09 从 `/proc/<pid>/exe` 抽的，哈希对过在跑的那一份）：
+CPE1 `/usr/local/bin/sr-fib.prerun-20261108` = `bab523ff3809f57b`（轮询那份，含缺陷⑦ 修复）、
+`sr-frr.prerun-20261109` = `c8e731dd`、`sr-route.prerun-20261109` = `26044f78`；
+CPE4 三件同名 `.prerun-20261109` = `c8e731dd` / `5789c2c0` / `bab523ff`。
+换回去只需要 `install276.sh` + `swap276.sh` 两枪，全程 0 丢包。
 B4 侧的回退同理是**换件**：新 sr-frr 的 `GET /local-prefixes` 没人订阅就是闲置的（`serve` 里多挂一个分支，
 `demote()` 只在真被拉走时才降级），所以把 `sr-route` 单独换回旧版 = 回到"没人重建"的旧行为，不留副作用；
 但**反过来只回退 sr-frr、留着新 sr-route 不行** —— 那正是上面那条 404 无限重试的形状，回退必须同批。
+（抬盒时在 CPE4 又实测一遍：老 sr-frr 对这个端点回 `404 page not found`，换成新的之后回 `200` 并给出
+`{"prefixes":[{"vrf_id":0,"prefix":"172.16.4.1/32"}]}`，同一条命令就是"前置到没到位"的现场判据。）
 
 ## 与 §10 冲突协议的关系
 
