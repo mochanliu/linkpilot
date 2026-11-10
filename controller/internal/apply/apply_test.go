@@ -333,11 +333,42 @@ func TestVPPErrorDetection(t *testing.T) {
 		"show: unknown input `frobnicate'": true,
 		"set interface state: unknown interface `nope'":   true,
 		"lcp create: linux-cp pair creation failed (-81)": true,
+		// `show interface` 的计数器不是错误：这行的 error 是计数器名字。
+		"tx-error 3":      false,
+		"drops 87":        false,
+		"rx packets 6928": false,
+		"ip4 6772":        false,
+		// 但带 `<命令>: ` 前缀的才是真的失败 —— 哪怕末列也是数字。
+		"ip route add: failed 999": true,
 	}
 	for out, want := range cases {
 		if got := vppError(out) != ""; got != want {
 			t.Errorf("vppError(%q) = %v, want %v", out, got, want)
 		}
+	}
+}
+
+// TestVPPErrorIgnoresInterfaceCounters 锁住 2026-11-10 在 VM 台 CPE2 上踩到的那次
+// 事故：客户口只要有过一次 tx error，`show interface` 就多出一行 `tx-error 3`，
+// 旧实现把整段输出判成"读接口失败"，apply 在第 1 段就中止 —— 策略段一条都没跑，
+// 而设备回执里只有那张计数表，看着像"应用成功"。
+func TestVPPErrorIgnoresInterfaceCounters(t *testing.T) {
+	// 与 CPE2 那次实测输出同形（去掉列宽无所谓，判定只看内容）。
+	out := `              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     Counter          Count
+host-enp0s8                       1      up          1500/0/0/0     rx packets                  6928
+                                                                    rx bytes                  594312
+                                                                    tx packets                  3569
+                                                                    tx bytes                  303302
+                                                                    drops                         87
+                                                                    ip4                         6772
+                                                                    ip6                           36
+                                                                    tx-error                       3`
+	if msg := vppError(out); msg != "" {
+		t.Fatalf("vppError 把正常的接口计数表判成了错误：%q", msg)
+	}
+	// 同一张表里混进真的 CLI 错误时必须认出来。
+	if msg := vppError(out + "\nshow interface: unknown input `host-enp0s8x'"); msg == "" {
+		t.Fatal("vppError 漏掉了表尾真正的 unknown input")
 	}
 }
 

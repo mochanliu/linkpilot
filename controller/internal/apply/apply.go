@@ -16,7 +16,10 @@
 //     daemons through vtysh (no restart -- see AGENTS.md)
 //  5. overlay segment: merged into /etc/sdwan/route.json, then PUT to the running
 //     sr-route (see route.go)
-//  6. VRRP segment: reconciled against VPP's live virtual routers over the binary
+//  6. sr-frr segment: the leak table sr-frr owns (see srfrr.go)
+//  7. policy segment: ACL + ABF reconciled against VPP's live state, so a policy
+//     change is a diff and not a reinstall (see policy.go)
+//  8. VRRP segment: reconciled against VPP's live virtual routers over the binary
 //     API (see vrrp.go) -- last, so a box that did not fully land its config never
 //     wins the site's VIP
 //
@@ -982,14 +985,53 @@ func permanentMACFrom(out string) (string, bool) {
 
 // vppError returns a non-empty message when vppctl printed an error. vppctl
 // reports failures in the output and still exits 0.
+//
+// The judgement is per line, never "does the whole output contain a keyword":
+// `show interface` prints a counter *named* `tx-error`, and that is a count, not
+// a failed command.
+//
+// That distinction was measured on VM lab CPE2 on 2026-11-10. The box had counted
+// 3 tx errors on its customer port, so `show interface host-enp0s8` grew one more
+// line, `tx-error 3`. The old whole-output scan read it as "could not read the
+// interface", so apply aborted in segment 1 (the interface check) and the route,
+// policy and VRRP segments never ran -- while the reason reported back was the
+// counter table itself. The symptom is "publish succeeded, the device acked the
+// apply, and not a single policy landed", which gives no hint at all that a tx
+// counter is involved.
 func vppError(out string) string {
-	l := strings.ToLower(out)
-	for _, marker := range []string{"unknown input", "unknown interface", "failed", "error"} {
-		if strings.Contains(l, marker) {
-			return strings.TrimSpace(out)
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || vppCounterRow(line) {
+			continue
+		}
+		l := strings.ToLower(line)
+		for _, marker := range []string{"unknown input", "unknown interface", "failed", "error"} {
+			if strings.Contains(l, marker) {
+				return line
+			}
 		}
 	}
 	return ""
+}
+
+// vppCounterRow recognises the "name then number" rows `show interface` prints
+// (`tx-error 3`, `drops 87`, `rx packets 1234`): the last column is a bare number
+// and the line has none of the `<command>: ` prefix every CLI error carries.
+//
+// The numeric last column alone is not enough -- the echo `set interface mtu
+// host-eth3 1500` would match too -- hence the colon test. The other direction
+// matters more: `ip route add: failed 999` does carry the prefix and must still
+// be reported.
+func vppCounterRow(line string) bool {
+	if strings.Contains(line, ":") {
+		return false
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return false
+	}
+	_, err := strconv.ParseUint(fields[len(fields)-1], 10, 64)
+	return err == nil
 }
 
 func (a *Applier) vppShow(ctx context.Context, cmd string) (string, error) {
