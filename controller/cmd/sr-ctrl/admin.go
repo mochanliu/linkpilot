@@ -369,6 +369,9 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/leak/batch", s.handleAdminLeakBatch)
 	mux.HandleFunc("/api/leak/republish", s.handleAdminLeakRepublish)
 	mux.HandleFunc("/api/prefix-lists", s.handleAdminPrefixLists)
+	// 静态策略 (O6-f): 一行 = 一类流走哪个颜色，落地是 VPP 的 ACL + ABF。和泄露
+	// 一样，保存只写草稿，发布走 /api/config/publish 那一条路径（第 7 段）。
+	mux.HandleFunc("/api/policy", s.handleAdminPolicy)
 	// The RR list is the tenant's own (2026-11-01 定案: an RR belongs to one
 	// tenant). Reads come inside /api/overlay with the devices that selected them;
 	// the writes below are scoped to the session's tenant.

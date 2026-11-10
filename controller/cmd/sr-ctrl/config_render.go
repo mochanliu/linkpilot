@@ -336,6 +336,13 @@ type configArtifacts struct {
 	// empty list when the tenant removes the last row. omitempty only spares
 	// bundles published before VRRP existed.
 	Vrrp string `json:"vrrp,omitempty"`
+	// Policy is bundle 第 7 段: 静态策略（ACL + ABF）与每 VRF 每颜色的兜底开关。
+	// Same shape as Vrrp -- VPP memory, reconciled through the binary API -- plus
+	// one difference: the fallback half is executed by sr-fib (it owns the colour
+	// tables), so sr-agent derives it out of this same segment. Empty rows are
+	// emitted as [] because "no policy" is an instruction: remove what is there.
+	// omitempty only spares bundles published before policy existed.
+	Policy string `json:"policy,omitempty"`
 }
 
 // vrrpArtifact is the decoded form of the 6th segment. The rows are keyed by
@@ -357,7 +364,13 @@ type vrrpEntry struct {
 }
 
 func renderArtifacts(c *BasicConfig) configArtifacts {
-	return configArtifacts{FRR: renderFRR(c, nil), VPP: renderVPP(c), Boot: renderBoot(c), Vrrp: renderVRRPArtifact(c)}
+	return configArtifacts{
+		FRR:    renderFRR(c, nil),
+		VPP:    renderVPP(c),
+		Boot:   renderBoot(c),
+		Vrrp:   renderVRRPArtifact(c),
+		Policy: renderPolicyArtifact(c, PolicySet{}),
+	}
 }
 
 // renderVRRPArtifact emits the 6th segment. An empty list is still emitted:
@@ -393,18 +406,20 @@ func renderSrfrrArtifact(a srfrrArtifact) string {
 	return string(b) + "\n"
 }
 
-// artifactsLocked adds the per-device overlay and leak artifacts to the three
-// text fragments. Route depends on the tenant's groups *and* this device's
-// tunnels, and the leak half depends on the tenant's prefix-list library, so
-// neither can be rendered from the draft alone.
-func (s *server) artifactsLocked(tenantID string, nodeID uint16, c *BasicConfig, set LeakSet) configArtifacts {
+// artifactsLocked adds the per-device overlay, leak and policy artifacts to the
+// three text fragments. Route depends on the tenant's groups *and* this device's
+// tunnels, the leak half depends on the tenant's prefix-list library, and a
+// policy row's attach list depends on the draft's customer ports -- so none of
+// them can be rendered from the draft alone.
+func (s *server) artifactsLocked(tenantID string, nodeID uint16, c *BasicConfig, set LeakSet, pol PolicySet) configArtifacts {
 	rules, srfrr := s.leakRenderLocked(tenantID, set)
 	return configArtifacts{
-		FRR:   renderFRR(c, rules),
-		VPP:   renderVPP(c),
-		Boot:  renderBoot(c),
-		Route: s.overlayRouteArtifactLocked(tenantID, nodeID),
-		Srfrr: renderSrfrrArtifact(srfrr),
-		Vrrp:  renderVRRPArtifact(c),
+		FRR:    renderFRR(c, rules),
+		VPP:    renderVPP(c),
+		Boot:   renderBoot(c),
+		Route:  s.overlayRouteArtifactLocked(tenantID, nodeID),
+		Srfrr:  renderSrfrrArtifact(srfrr),
+		Vrrp:   renderVRRPArtifact(c),
+		Policy: renderPolicyArtifact(c, pol),
 	}
 }

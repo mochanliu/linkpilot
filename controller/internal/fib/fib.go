@@ -117,11 +117,20 @@ type Tunnel struct {
 }
 
 // Path 是一条可下发的路径。Label 是压入的 VPN 标签。
+//
+// Deag（dest-address-encoded graph）是另一种形状：这条路径不指向任何接口，
+// 而是"换一张表按目的地址重查"。它不是为路由设计的，是给**兜底默认路由**用的：
+// 颜色 c 的表里放一条 0.0.0.0/0 → 本 VPN 主表，于是"该颜色的隧道全 down、表里
+// 没有这个前缀"时，流会掉进主表（颜色 0 的落点）而不是黑洞。VPP 用
+// sw_if_index=~0 + table_id 表达它，CLI 没有对应写法（`via table` 是 parse error）。
 type Path struct {
 	NextHop    netip.Addr
 	Interface  string
 	Label      uint32
 	Preference uint8
+	Deag       bool
+	// LookupTable 只在 Deag 时有效：要重查的那张表。
+	LookupTable uint32
 }
 
 // Route 是一条要落进 VPP 的前缀。
@@ -135,6 +144,16 @@ type Route struct {
 type Label struct {
 	Label uint32
 	Table uint32
+}
+
+// fallbackPrefix 是兜底那条路由的前缀：一个 VPN 的"其余全部"。
+var fallbackPrefix = netip.MustParsePrefix("0.0.0.0/0")
+
+// ColorFallback 是"颜色 c 查不到就退到颜色 0"的开关，粒度是每 VRF 每颜色
+// （owner 2026-11-10 拍）。颜色 0 自己不在这个集合里：它的落点就是主表。
+type ColorFallback struct {
+	VPN   uint8
+	Color uint8
 }
 
 // Plan 是一份完整的期望状态。
@@ -205,6 +224,12 @@ func pickWinner(list []cand) (win []cand, losers []uint32) {
 // vrfs 是这台 CPE 服务的 VPN VRF（与 sr-route 的 vrfs 配置同源）；每一条都要
 // 登记本地标签 —— 即使某个 VRF 眼下没有任何路由，也可能有对端压着标签进来。
 //
+// fallbacks 是"这台设备的 (VPN, 颜色) 允许退到颜色 0"的开关（控制台策略页的
+// 复选框，粒度按 owner 2026-11-10 拍的是每 VRF 每颜色）。它只合成**一条**路由：
+// 颜色表 颜色*1000+vpn 里的 0.0.0.0/0 → 本 VPN 主表。这样"策略把流引到颜色 c、
+// 但这个颜色表里没有那个前缀"时，流掉进主表（颜色 0 的落点），而不是黑洞。
+// 颜色 0 不需要也不能有兜底：它的落点就是主表本身，自己指向自己是一条环路。
+//
 // down 是"明确不可达"的下一跳集合（来自 UnreachablePeers）；nil 表示没有
 // 可达性信息，所有路径保留。显式不可达的路径与"下一跳不在隧道表里"同样处理：
 // 跳过它、留一条 warning，而不是把整条前缀撤掉 —— 同前缀可能还有别的隧道。
@@ -218,7 +243,7 @@ func pickWinner(list []cand) (win []cand, losers []uint32) {
 // 装表算法是草案 §4.3 的六步，逐字对应：RT 命中哪些本机 VRF（=routes 里的 Table，
 // sr-route 已经算好）→ 标签取来源 VPN → 候选路径按颜色分进主表/颜色表 →
 // 同前缀多来源标签先择一 → 整条交给 Applier 替换。
-func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool, escape bool) (Plan, error) {
+func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.Addr]bool, escape bool, fallbacks []ColorFallback) (Plan, error) {
 	var p Plan
 	if len(vrfs) == 0 {
 		return p, fmt.Errorf("fib: 没有配置任何 VRF，无事可做")
@@ -360,6 +385,40 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 		}
 		p.Routes = append(p.Routes, Route{Table: k.table, Prefix: k.prefix, Paths: uniq})
 	}
+	// 兜底默认路由（每 VRF 每颜色一个开关）：颜色表里一条 0.0.0.0/0 → 本 VPN
+	// 主表。它不参与 pickWinner —— 那条链是"同一前缀多来源择一"，兜底没有来源，
+	// 所以直接进 p.Routes。同一 (VPN, 颜色) 写两遍按一遍算。
+	fbTables := map[key]uint32{}
+	for _, fb := range fallbacks {
+		if fb.Color == 0 {
+			return p, fmt.Errorf("fib: VPN %d 的颜色 0 不能配兜底：颜色 0 的落点就是主表自己", fb.VPN)
+		}
+		if fb.Color > MaxColor {
+			return p, fmt.Errorf("fib: 兜底的颜色 %d 超出上限 %d", fb.Color, MaxColor)
+		}
+		if !seenVRF[fb.VPN] {
+			return p, fmt.Errorf("fib: 兜底配在 VPN %d 上，但本机没服务这个 VPN", fb.VPN)
+		}
+		ct, err := ColorTable(fb.Color, uint32(fb.VPN))
+		if err != nil {
+			return p, err
+		}
+		fbTables[key{table: ct, prefix: fallbackPrefix}] = uint32(fb.VPN)
+	}
+	for k, main := range fbTables {
+		if _, taken := grouped[k]; taken {
+			// RIB 自己就有这个 VPN 的默认路由并落进了颜色表：同一条前缀不能
+			// 既是真默认路由又是兜底，真的那条优先，并说出来。
+			warn("颜色表 %d 里已经有 RIB 给的 0.0.0.0/0，兜底不装（真默认路由优先）", k.table)
+			continue
+		}
+		tables[k.table] = true
+		p.Routes = append(p.Routes, Route{
+			Table:  k.table,
+			Prefix: k.prefix,
+			Paths:  []Path{{Deag: true, LookupTable: main}},
+		})
+	}
 	sort.Slice(p.Routes, func(i, j int) bool {
 		if p.Routes[i].Table != p.Routes[j].Table {
 			return p.Routes[i].Table < p.Routes[j].Table
@@ -427,9 +486,12 @@ func (a *Applier) Apply(ctx context.Context, next Plan) (Result, error) {
 		return res, err
 	}
 
-	// 0. 先把"接口不存在"挡在写动作之前。
+	// 0. 先把"接口不存在"挡在写动作之前。兜底那条 deag 路径没有接口，跳过。
 	for _, r := range next.Routes {
 		for _, p := range r.Paths {
+			if p.Deag {
+				continue
+			}
 			if _, ok := a.ifMap[p.Interface]; !ok {
 				return res, fmt.Errorf("fib: 隧道接口 %s 不存在（路由 %s 的下一跳 %s）",
 					p.Interface, r.Prefix, p.NextHop)
@@ -557,6 +619,12 @@ func (a *Applier) refreshInterfaces(ctx context.Context) error {
 func fibPaths(r Route, ifMap map[string]uint32) []vppapi.FIBPath {
 	paths := make([]vppapi.FIBPath, 0, len(r.Paths))
 	for _, p := range r.Paths {
+		if p.Deag {
+			// "换表重查"：不指向任何接口，只有目标表。NextHop 留空是这种路径的
+			// 正常形状（vppapi.validatePath 认的就是 sw_if_index=~0）。
+			paths = append(paths, vppapi.FIBPath{SWIfIndex: ^uint32(0), TableID: p.LookupTable})
+			continue
+		}
 		fp := vppapi.FIBPath{SWIfIndex: ifMap[p.Interface], NextHop: p.NextHop, Preference: p.Preference}
 		if p.Label != 0 {
 			fp.Labels = []uint32{p.Label}

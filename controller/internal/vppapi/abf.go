@@ -19,9 +19,10 @@
 //	abf_itf_attach_add_del is_add(1) attach{policy_id(4) sw_if_index(4) priority(4) is_ipv6(1)}
 //	fib_path             167 B（与 fib.go 里那份同一个结构）
 //
-// 两点实测事实决定了调用方的写法：
-//   - 策略按 policy_id 整条替换（add 同 id 即覆盖），所以"改一条策略"不需要
-//     先删后加，中间没有空窗；
+// 两点实测事实决定了调用方的写法（2026-11-10 在 lp-cpe1 实测，详见
+// ABFPolicyAddDel 的注释）：
+//   - "改一条策略"只有一条可靠路径：delete(n_paths=0) + add。同 id 带新 ACL
+//     再 add 会被拒成 -7，旧策略原封不动 —— 看上去"改成功了"，实际没改；
 //   - 删除一个不存在的策略返回 NO_SUCH_ENTRY(-6)，reconcile 要把它当"已经是
 //     期望态"，不是错误。
 package vppapi
@@ -63,16 +64,28 @@ func deagPath(p ABFPath) FIBPath {
 	return FIBPath{SWIfIndex: ^uint32(0), TableID: p.Table, Preference: p.Preference}
 }
 
-// ABFPolicyAddDel 建/删一条策略。add 是**整条替换**语义（同 id 覆盖）。
+// ABFPolicyAddDel 建/改/删一条策略。
+//
+// 三种意图，VPP 对它们的回答不一样（2026-11-10 在 lp-cpe1 逐条实测）：
+//
+//   - 新建（id 不存在）：add + 1..255 条路径；
+//   - **改（id 已存在）：必须删了重建。** 同 id 再 add 一条换了 ACL 的策略会被
+//     拒成 INVALID_VALUE(-7)，而 VPP 里那条旧策略原封不动 —— 也就是说"同 id
+//     覆盖"只对"同一 ACL、只改路径"成立，换 ACL 就不成立。与其记住这条半规则，
+//     不如把"改"写成 delete(n_paths=0) + add：代价是这条策略上的一瞬间空窗，
+//     换来的是任何改法都只有一条代码路径；
+//   - 删：paths 为空即整条删除（acl_index 用 0 占位，VPP 不看它）。
 func (c *Client) ABFPolicyAddDel(ctx context.Context, p ABFPolicy, add bool) error {
 	if p.ID == 0 {
 		return fmt.Errorf("vppapi: ABF 策略 id 不能是 0（0 在 attach 里表示'没有策略'）")
 	}
-	if p.ACLIndex == 0 {
-		return fmt.Errorf("vppapi: ABF 策略 %d 需要一个 ACL index", p.ID)
-	}
-	if len(p.Paths) == 0 || len(p.Paths) > 255 {
-		return fmt.Errorf("vppapi: ABF 策略 %d 需要 1..255 条路径，给了 %d", p.ID, len(p.Paths))
+	if add {
+		if p.ACLIndex == 0 {
+			return fmt.Errorf("vppapi: ABF 策略 %d 需要一个 ACL index", p.ID)
+		}
+		if len(p.Paths) == 0 || len(p.Paths) > 255 {
+			return fmt.Errorf("vppapi: ABF 策略 %d 需要 1..255 条路径，给了 %d", p.ID, len(p.Paths))
+		}
 	}
 
 	body := make([]byte, 0, 1+4+4+1+len(p.Paths)*fibPathLen)

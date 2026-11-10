@@ -67,14 +67,16 @@ func configViewOf(nodeID uint16, serial string, dc *DeviceConfig, device *wire.C
 
 func (s *server) buildConfigView(n *NodeRecord, dc *DeviceConfig) configView {
 	v := configViewOf(n.NodeID, n.Serial, dc, n.Config)
-	// The overlay and leak halves are per-device and per-tenant, so they can only
-	// be added where the server's state is in reach: the page must show what a
-	// publish WOULD send.
+	// The overlay, leak and policy halves are per-device and per-tenant, so they
+	// can only be added where the server's state is in reach: the page must show
+	// what a publish WOULD send.
 	var set LeakSet
+	var pol PolicySet
 	if dc != nil {
 		set = dc.Leak
+		pol = dc.Policy
 	}
-	v.Artifacts = s.artifactsLocked(n.TenantID, n.NodeID, &v.Config, set)
+	v.Artifacts = s.artifactsLocked(n.TenantID, n.NodeID, &v.Config, set, pol)
 	// A 导通组 edit does not touch the draft version, so without this the page
 	// would keep saying "已同步" after the tenant changed the overlay and before
 	// anyone published it.

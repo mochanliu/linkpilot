@@ -270,6 +270,20 @@
     padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(6px);
     transition:opacity .18s,transform .18s;pointer-events:none;max-width:420px}
   .toast.show{opacity:.96;transform:none}
+
+  /* ---------- 静态策略 ---------- */
+  /* 一张表里既有输入框也有下拉框，格子按内容自适应；唯一的硬要求是端口那两列
+     在协议不是 tcp/udp 时要看得出"现在是禁用状态"，所以禁用态单独给颜色。 */
+  #pl-rows td{padding:5px 6px}
+  #pl-rows input{width:100%;min-width:84px;padding:4px 7px;font-size:12.5px}
+  #pl-rows input:disabled{color:var(--muted);background:var(--soft)}
+  #pl-rows select{padding:4px 6px;font-size:12.5px;min-width:104px}
+  .pl-attach{font-size:12px;color:var(--muted);max-width:200px;word-break:break-all}
+  .pl-fb td{text-align:center;white-space:nowrap}
+  .pl-fb td:first-child{text-align:left}
+  .pl-fb .chk{justify-content:center;min-width:64px}
+  .pl-bar{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin-bottom:12px}
+  .pl-bar .grow{flex:1 1 220px;min-width:180px}
   @media (max-width:900px){
     .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
     #app{grid-template-columns:1fr}
@@ -323,6 +337,7 @@
       <a class="child" href="#overlay-groups" data-view="overlay-groups" data-roles="tenant">导通策略配置</a>
       <a class="child" href="#leak-to-sdwan" data-view="leak-to-sdwan" data-roles="tenant">路由泄露 · CPE-SDWAN</a>
       <a class="child" href="#leak-to-cpe" data-view="leak-to-cpe" data-roles="tenant">路由泄露 · SDWAN-CPE</a>
+      <a class="child" href="#policy" data-view="policy" data-roles="tenant">SD-WAN 策略</a>
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a class="child" href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
@@ -458,6 +473,7 @@
     S.sites = null;
     S.ov = null;
     S.lk = null;
+    S.pl = null;
     S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
     clearInterval(S.timer);
@@ -713,7 +729,16 @@
       sub: "overlay 前缀下发到客户侧：注入这台设备的内核表（K 路由），再由该 VPN 的 BGP/OSPF 分发给客户；不挂 prefix-list = 全放过。保存只写草稿，发布走和「基础配置」同一条路径",
       roles: ["tenant"]
     },
-    account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" }
+    account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" },
+    policy: {
+      title: "SD-WAN 策略 · 静态",
+      sub: "一行 = 一类流走哪个颜色。颜色对应一张独立的 VPP FIB 表（表号 = 颜色×1000 + VPN），" +
+        "表里的路径由 sr-fib 按隧道与 BFD 状态自己收敛 —— 链路抖动不用改策略。" +
+        "行号就是匹配顺序，前面的先命中；入口口不用选，一行挂到它所属 VPN 的全部客户口上。" +
+        "兜底是每 VRF 每颜色一个开关：勾上 = 该颜色查不到时退到颜色 0（本 VPN 主表）而不是丢掉。" +
+        "保存只写草稿，发布走和「基础配置」同一条路径",
+      roles: ["tenant"]
+    }
   };
 
 
@@ -780,6 +805,7 @@
     else if (S.view === "overlay-groups") c = viewOverlayGroups();
     else if (S.view === "leak-to-sdwan") c = viewLeakToSDWAN();
     else if (S.view === "leak-to-cpe") c = viewLeakToCPE();
+    else if (S.view === "policy") c = viewPolicy();
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "account") c = viewAccount();
     else c = viewPlaceholder();
@@ -6826,6 +6852,407 @@
     if (m) m.hidden = false;
   }
 
+  /* ---------------- SD-WAN 静态策略：一类流走哪个颜色 ---------------- */
+  //
+  // 这一页只有一个结构性的事实要照顾：**行号就是匹配顺序**。所以它不是"一行一个
+  // 小表单"的编辑方式，而是"整份有序数组 + 整份保存" —— 移动一行是重排整个数组，
+  // 保存时服务端按数组顺序重排行号（行号还会进 ACL tag 与 ABF 优先级）。
+  //
+  // 输入框的 input/change 只写进 S.pl.draft，不触发重画：重画会把光标从框里弹出去。
+  // 只有结构性动作（加行/删行/上移/下移/换设备/保存后刷新）才走 render()。
+  //
+  // 校验结果是服务端算的，且只反映"已保存的那一版"：草稿脏了以后页面会说清楚这一点，
+  // 而不是拿旧结论给新输入背书。
+
+  function plStore() {
+    if (!S.pl) S.pl = { node: 0, doc: null, at: 0, loading: false, note: null, draft: null, busy: false };
+    return S.pl;
+  }
+
+  function plRole() { return !!(S.me && S.me.role === "tenant"); }
+
+  function plNodes() {
+    return ((S.state && S.state.nodes) || []).slice().sort(function (a, b) { return a.node_id - b.node_id; });
+  }
+
+  function ensurePolicy() {
+    var o = plStore();
+    if (!plRole()) return o;
+    var ns = plNodes();
+    if (!o.node && ns.length) o.node = ns[0].node_id;
+    if (o.node && o.doc && o.doc.node_id !== o.node) { o.doc = null; o.draft = null; }
+    if (o.node && !o.loading && (!o.doc || nowSec() - o.at >= 10)) plLoad(false);
+    return o;
+  }
+
+  function plLoad(force) {
+    var o = plStore();
+    if (!plRole() || o.loading || !o.node) return;
+    if (!force && o.doc && o.doc.node_id === o.node && nowSec() - o.at < 10) return;
+    o.loading = true;
+    api("GET", "/api/policy?node=" + o.node).then(function (doc) {
+      o.loading = false;
+      if (!doc) { render(); return; }
+      plSetDoc(doc);
+      if (o.note && o.note.fromLoad) o.note = null;
+      render();
+    }).catch(function (err) {
+      o.loading = false;
+      o.note = undErrNote(err);
+      o.note.fromLoad = true;
+      render();
+    });
+  }
+
+  function plSetDoc(doc) {
+    var o = plStore();
+    var same = o.doc && o.doc.node_id === doc.node_id;
+    // "草稿还是干净的"要先拿旧 doc 判，然后再换 doc：否则后台刷新会把别人在另一个
+    // 标签页保存的内容盖掉，或者把一个已经同步的页面标成"有改动"。
+    var clean = !o.draft || !o.doc || !plDirty(o);
+    o.doc = doc;
+    o.at = nowSec();
+    o.loading = false;
+    if (!same || clean || !o.draft) o.draft = plDraftOf(doc);
+  }
+
+  function plDraftOf(doc) {
+    var rows = (doc.rows || []).map(function (r) {
+      return { vpn: r.vpn, color: r.color, src: r.src || "", dst: r.dst || "",
+        proto: r.proto || 0, src_port: r.src_port || "", dst_port: r.dst_port || "" };
+    });
+    var fb = (doc.fallback || []).map(function (f) { return { vpn: f.vpn, color: f.color }; });
+    // 刻意不带版本号：这里的"有没有改动"要回答的是"第 7 段会不会变"，
+    // 而不是"服务端记录动过没有"（别处保存一次基础配置也会让版本号前进）。
+    return { rows: rows, fallback: fb };
+  }
+
+  function plDirty(o) {
+    if (!o.doc || !o.draft) return false;
+    return JSON.stringify(plDraftOf(o.doc)) !== JSON.stringify(o.draft);
+  }
+
+  function plVPNOf(doc, id) {
+    var out = null;
+    (doc.vpns || []).forEach(function (v) { if (v.id === id) out = v; });
+    return out;
+  }
+
+  function plVPNName(doc, id) {
+    var v = plVPNOf(doc, id);
+    if (!v) return "VPN " + id;
+    return v.name ? "VPN " + id + " · " + v.name : "VPN " + id;
+  }
+
+  function plColorTunnels(doc, c) {
+    var out = 0;
+    (doc.colors || []).forEach(function (k) { if (k.value === c) out = k.tunnels; });
+    return out;
+  }
+
+  function plAttachOf(o, vpn) {
+    var v = plVPNOf(o.doc, vpn);
+    if (!v) return "—";
+    if (!v.ifaces || !v.ifaces.length) return "（这个 VPN 没有客户口）";
+    return v.ifaces.join("、");
+  }
+
+  function plFbOn(d, vpn, color) {
+    return d.fallback.some(function (f) { return f.vpn === vpn && f.color === color; });
+  }
+
+  function viewPolicy() {
+    var o = ensurePolicy();
+    if (!plRole()) return '<section class="panel"><div class="empty">只有租户账号能配置策略。</div></section>';
+    var ns = plNodes();
+    if (!ns.length) {
+      return '<section class="panel"><div class="empty">这个租户还没有设备：先入网一台，策略才有地方落。</div></section>';
+    }
+    if (!o.doc || o.doc.node_id !== o.node) {
+      return '<section class="panel"><div class="empty">' +
+        esc(o.note ? o.note.text : "正在读取策略…") + "</div></section>";
+    }
+    var doc = o.doc, d = o.draft, dirty = plDirty(o);
+    var h = '<div id="pl-root">';
+    if (o.note) h += undNote(o.note);
+
+    /* --- 顶栏：选设备 + 版本 + 两个按钮 --- */
+    h += '<section class="panel"><header><h2>设备</h2></header><div class="pl-bar">' +
+      '<div class="field"><label for="pl-node">设备</label><select id="pl-node" data-pl="node">' +
+      ns.map(function (n) {
+        return '<option value="' + n.node_id + '"' + (n.node_id === o.node ? " selected" : "") + ">" +
+          esc("node-" + n.node_id + " · " + n.serial) + "</option>";
+      }).join("") + "</select></div>" +
+      '<div class="field grow"><label>版本</label><div class="muted">草稿 v' + doc.version +
+      (doc.published_version ? " · 已发布 v" + doc.published_version : " · 还没发布过") +
+      (doc.pending ? ' · <span class="tag plan">有未发布的改动</span>' : "") +
+      "</div></div>" +
+      '<div class="row-actions">' +
+      '<button class="primary" type="button" data-pl="save"' + (o.busy ? " disabled" : "") + ">保存草稿</button>" +
+      '<button type="button" data-pl="publish"' + (o.busy ? " disabled" : "") + ">发布到设备</button>" +
+      "</div></div>" +
+      '<div class="hint">' + esc(doc.summary) +
+      (dirty ? ' · <span class="tag plan">页面上的改动还没保存</span>' : "") + "</div></section>";
+
+    /* --- 策略行 --- */
+    h += '<section class="panel"><header><h2>策略行</h2>' +
+      '<div class="row-actions"><button class="small" type="button" data-pl="row-add">加一行</button></div></header>' +
+      '<div class="hint">' + esc(doc.notes.rows) + " " + esc(doc.notes.attach) + "</div>";
+    if (!d.rows.length) {
+      h += '<div class="empty">还没有策略行：所有流量按主表（颜色 0）选路。</div>';
+    } else {
+      h += '<table id="pl-rows"><thead><tr>' +
+        "<th>顺序</th><th>VPN</th><th>颜色</th><th>源前缀</th><th>目的前缀</th><th>协议</th>" +
+        "<th>源端口</th><th>目的端口</th><th>入口口</th><th></th>" +
+        "</tr></thead><tbody>" + d.rows.map(function (r, i) { return plRowHtml(o, r, i); }).join("") +
+        "</tbody></table>";
+    }
+    h += "</section>";
+
+    /* --- 兜底开关 --- */
+    h += '<section class="panel"><header><h2>兜底：允许 fallback 到颜色 0</h2></header>' +
+      '<div class="hint">' + esc(doc.notes.fallback) + "</div>" + plFallbackHtml(o) + "</section>";
+
+    /* --- 校验 --- */
+    h += '<section class="panel"><header><h2>校验</h2></header>' +
+      (dirty ? '<div class="hint">下面是<b>已保存那一版</b>的校验结果。改动保存后会重新校验 —— ' +
+        "没保存的改动在这一页上不受校验约束。</div>" : "") +
+      (doc.checks && doc.checks.length
+        ? '<ul class="chk-list">' + doc.checks.map(undCheckRow).join("") + "</ul>"
+        : '<div class="empty">没有校验结果。</div>') + "</section>";
+
+    /* --- 第 7 段原文 --- */
+    h += '<section class="panel"><header><h2>下发内容（配置包第 7 段）</h2></header>' +
+      '<div class="hint">这一段是设备真正读的东西：行号进 ACL tag 与 ABF 优先级，' +
+      "attach 是上面那些入口口。设备上的 sr-apply 拿它和 VPP 现状对账（ACL/ABF 只在 VPP 内存里，" +
+      "所以这一段是&#34;对账指令&#34;，不是一个盒子要保存的文件）。</div>" +
+      '<pre class="cmd">' + esc(doc.artifact || "(空)") + "</pre></section>";
+
+    h += '<section class="panel"><header><h2>这一页与发布的关系</h2></header><div class="hint">' +
+      "保存只写控制器草稿，设备上什么都不变。发布走 <code>POST /api/config/publish</code>（和「基础配置」同一条路径），" +
+      "设备在下一次心跳（≤" + esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
+      " 秒）拉取。兜底那一半由 sr-fib 执行（它是颜色表的 owner）：sr-agent 从这一段里派生出兜底清单推给它，" +
+      "所以勾选框只有一个来源，就是这一页。</div></section>";
+    return h + "</div>";
+  }
+
+  function plRowHtml(o, r, i) {
+    var last = o.draft.rows.length - 1;
+    var ports = r.proto === 6 || r.proto === 17;
+    var h = "<tr>";
+    h += '<td class="muted num">' + (i + 1) + "</td>";
+    h += "<td>" + plVPNOptions(o, r, i) + "</td>";
+    h += "<td>" + plColorOptions(o, r, i) + "</td>";
+    h += '<td><input data-pl-row="' + i + '" data-pl-f="src" value="' + esc(r.src) + '" placeholder="任意" spellcheck="false"></td>';
+    h += '<td><input data-pl-row="' + i + '" data-pl-f="dst" value="' + esc(r.dst) + '" placeholder="任意" spellcheck="false"></td>';
+    h += "<td>" + plProtoOptions(o, r, i) + "</td>";
+    h += '<td><input data-pl-row="' + i + '" data-pl-f="src_port" value="' + esc(r.src_port) +
+      '" placeholder="任意"' + (ports ? "" : " disabled") + "></td>";
+    h += '<td><input data-pl-row="' + i + '" data-pl-f="dst_port" value="' + esc(r.dst_port) +
+      '" placeholder="任意"' + (ports ? "" : " disabled") + "></td>";
+    h += '<td class="pl-attach">' + esc(plAttachOf(o, r.vpn)) + "</td>";
+    h += '<td class="row-actions">' +
+      '<button class="small" type="button" data-pl="row-up" data-i="' + i + '"' + (i === 0 ? " disabled" : "") + ">↑</button>" +
+      '<button class="small" type="button" data-pl="row-down" data-i="' + i + '"' + (i === last ? " disabled" : "") + ">↓</button>" +
+      '<button class="small danger" type="button" data-pl="row-del" data-i="' + i + '">删除</button>' +
+      "</td></tr>";
+    return h;
+  }
+
+  function plVPNOptions(o, r, i) {
+    var h = '<select data-pl-row="' + i + '" data-pl-f="vpn">';
+    var seen = false;
+    (o.doc.vpns || []).forEach(function (v) {
+      var sel = v.id === r.vpn;
+      if (sel) seen = true;
+      h += '<option value="' + v.id + '"' + (sel ? " selected" : "") + ">" +
+        esc(plVPNName(o.doc, v.id)) + (v.iface_count ? "" : "（无客户口）") + "</option>";
+    });
+    if (!seen) h += '<option value="' + r.vpn + '" selected>VPN ' + esc(r.vpn) + "（不在基础配置里）</option>";
+    return h + "</select>";
+  }
+
+  function plColorOptions(o, r, i) {
+    var h = '<select data-pl-row="' + i + '" data-pl-f="color">';
+    for (var c = 0; c <= o.doc.max_color; c++) {
+      var tun = plColorTunnels(o.doc, c);
+      var label = "颜色 " + c + (c === 0 ? " · 主表" : (tun ? " · " + tun + " 条隧道" : " · 无隧道"));
+      h += '<option value="' + c + '"' + (c === r.color ? " selected" : "") + ">" + esc(label) + "</option>";
+    }
+    return h + "</select>";
+  }
+
+  function plProtoOptions(o, r, i) {
+    var h = '<select data-pl-row="' + i + '" data-pl-f="proto">';
+    (o.doc.protocols || []).forEach(function (p) {
+      h += '<option value="' + p.value + '"' + (p.value === r.proto ? " selected" : "") + ">" + esc(p.label) + "</option>";
+    });
+    return h + "</select>";
+  }
+
+  function plFallbackHtml(o) {
+    var doc = o.doc, d = o.draft;
+    if (!doc.vpns || !doc.vpns.length) return '<div class="empty">这台设备还没有 VPN。</div>';
+    var h = '<table class="pl-fb"><thead><tr><th>VPN</th>';
+    for (var c = 0; c <= doc.max_color; c++) h += "<th>颜色 " + c + "</th>";
+    h += "</tr></thead><tbody>";
+    doc.vpns.forEach(function (v) {
+      h += "<tr><td>" + esc(plVPNName(doc, v.id)) + "</td>";
+      for (var c = 0; c <= doc.max_color; c++) {
+        if (c === 0) {
+          h += '<td class="muted" title="颜色 0 的落点就是这张 VPN 的主表本身，兜底到它没有意义">—</td>';
+          continue;
+        }
+        var tun = plColorTunnels(doc, c);
+        h += "<td>" +
+          '<label class="chk"><input type="checkbox" data-pl-fb="' + v.id + ":" + c + '"' +
+          (plFbOn(d, v.id, c) ? " checked" : "") + "></label>" +
+          (tun ? ' <span class="tag online">' + tun + " 条</span>" : ' <span class="muted">无隧道</span>') +
+          "</td>";
+      }
+      h += "</tr>";
+    });
+    return h + "</tbody></table>";
+  }
+
+  function plSave(publish) {
+    var o = plStore();
+    if (!o.doc || !o.draft || o.busy) return;
+    var nodeID = o.doc.node_id;
+    o.busy = true;
+    var body = { node_id: nodeID, rows: o.draft.rows, fallback: o.draft.fallback };
+    api("PUT", "/api/policy", body).then(function (res) {
+      o.busy = false;
+      o.note = { text: res.changed
+        ? "草稿已保存（v" + res.policy.version + "）。设备要等「发布到设备」之后才会拿到。"
+        : "内容和已保存的一样，版本没有动。" };
+      plSetDoc(res.policy);
+      o.draft = plDraftOf(res.policy);
+      blurContent();
+      if (publish) return plPublish();
+      render();
+    }).catch(function (err) {
+      o.busy = false;
+      o.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function plPublish() {
+    var o = plStore();
+    if (!o.doc || o.busy) return;
+    var nodeID = o.doc.node_id;
+    o.busy = true;
+    api("POST", "/api/config/publish", { node_id: nodeID }).then(function (view) {
+      o.busy = false;
+      o.note = { text: "已发布 v" + view.published_version + "。设备在下一次心跳时拉取；装没装上要以设备回报为准。" };
+      o.doc = null;
+      plLoad(true);
+    }).catch(function (err) {
+      o.busy = false;
+      o.note = undErrNote(err);
+      render();
+    });
+  }
+
+  // 行结构的动作：整份重排后重画。保存之前这些改动只在草稿里。
+  function plRowMove(i, delta) {
+    var o = plStore();
+    if (!o.draft) return;
+    var rows = o.draft.rows, j = i + delta;
+    if (j < 0 || j >= rows.length) return;
+    var t = rows[i];
+    rows[i] = rows[j];
+    rows[j] = t;
+    blurContent();
+    render();
+  }
+
+  function plRowAdd() {
+    var o = plStore();
+    if (!o.draft) return;
+    var doc = o.doc;
+    var vpn = doc.vpns && doc.vpns.length ? doc.vpns[0].id : 0;
+    // 新行默认"任意 → 颜色 0"：最保守的一行，保存前一定要改颜色才有意义。
+    o.draft.rows.push({ vpn: vpn, color: 0, src: "", dst: "", proto: 0, src_port: "", dst_port: "" });
+    blurContent();
+    render();
+  }
+
+  function plRowDel(i) {
+    var o = plStore();
+    if (!o.draft) return;
+    o.draft.rows.splice(i, 1);
+    blurContent();
+    render();
+  }
+
+  function plClick(ev) {
+    var el = ev.target.closest ? ev.target.closest("[data-pl]") : null;
+    if (!el) return;
+    var act = el.getAttribute("data-pl");
+    var o = plStore();
+    var i = Number(el.getAttribute("data-i"));
+    if (act === "save") plSave(false);
+    else if (act === "publish") plSave(true);
+    else if (act === "row-add") plRowAdd();
+    else if (act === "row-del") plRowDel(i);
+    else if (act === "row-up") plRowMove(i, -1);
+    else if (act === "row-down") plRowMove(i, 1);
+  }
+
+  function plChange(ev) {
+    var el = ev.target;
+    if (!el || !el.getAttribute) return;
+    var o = plStore();
+    if (el.getAttribute("data-pl") === "node") {
+      o.node = Number(el.value);
+      o.doc = null;
+      o.draft = null;
+      o.note = null;
+      blurContent();
+      plLoad(true);
+      return;
+    }
+    var fb = el.getAttribute("data-pl-fb");
+    if (fb && o.draft) {
+      var parts = fb.split(":");
+      var vpn = Number(parts[0]), color = Number(parts[1]);
+      var on = o.draft.fallback.filter(function (f) { return !(f.vpn === vpn && f.color === color); });
+      if (el.checked) on.push({ vpn: vpn, color: color });
+      on.sort(function (a, b) { return a.vpn - b.vpn || a.color - b.color; });
+      o.draft.fallback = on;
+      return;
+    }
+    var row = el.getAttribute("data-pl-row"), f = el.getAttribute("data-pl-f");
+    if (row == null || !f || !o.draft) return;
+    var r = o.draft.rows[Number(row)];
+    if (!r) return;
+    if (f === "vpn" || f === "color" || f === "proto") r[f] = Number(el.value);
+    else r[f] = el.value;
+    // 协议换成 icmp/任意时端口不再有意义：两个框当场禁用并清空，免得"填了端口
+    // 却说协议不是 tcp/udp"这种错要等到校验才被发现。
+    if (f === "proto") {
+      if (r.proto !== 6 && r.proto !== 17) {
+        r.src_port = "";
+        r.dst_port = "";
+      }
+      blurContent();
+      render();
+    }
+  }
+
+  function plInput(ev) {
+    var el = ev.target;
+    if (!el || !el.getAttribute) return;
+    var o = plStore();
+    var row = el.getAttribute("data-pl-row"), f = el.getAttribute("data-pl-f");
+    if (row == null || !f || !o.draft) return;
+    var r = o.draft.rows[Number(row)];
+    if (!r) return;
+    r[f] = el.value;
+  }
+
   /* ---------------- actions ---------------- */
 
   // The 10s poll skips re-render while a form field has focus, so it cannot
@@ -7268,6 +7695,14 @@
       lkRoot.addEventListener("change", lkChange);
       lkRoot.addEventListener("input", lkInput);
       lkRoot.addEventListener("submit", lkSubmit);
+    }
+
+    // 策略页同样只挂一次、挂在每次整页重建都会换掉的 #pl-root 上。
+    var plRoot = $("pl-root");
+    if (plRoot) {
+      plRoot.addEventListener("click", plClick);
+      plRoot.addEventListener("change", plChange);
+      plRoot.addEventListener("input", plInput);
     }
 
     document.querySelectorAll("#content [data-act]").forEach(function (el) {

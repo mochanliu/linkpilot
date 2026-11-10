@@ -127,7 +127,7 @@ func TestSrfrrArtifactExpandsLibraryAndFollowsEdits(t *testing.T) {
 	putRow(leakToSDWAN, 10, []string{"bgp"}, all)
 
 	dc := s.state.Configs[configKey("t", 1)]
-	art := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak)
+	art := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak, dc.Policy)
 	var got srfrrArtifact
 	if err := json.Unmarshal([]byte(art.Srfrr), &got); err != nil {
 		t.Fatalf("srfrr artifact is not JSON: %v\n%s", err, art.Srfrr)
@@ -155,7 +155,7 @@ func TestSrfrrArtifactExpandsLibraryAndFollowsEdits(t *testing.T) {
 	if rec := leakDo(t, s, http.MethodPut, "/api/prefix-lists", string(body), ten); rec.Code != http.StatusOK {
 		t.Fatalf("edit list = %d (%s)", rec.Code, rec.Body.String())
 	}
-	edited := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak)
+	edited := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak, dc.Policy)
 	if edited == art {
 		t.Fatal("editing the prefix-list did not change the artifacts")
 	}
@@ -163,7 +163,7 @@ func TestSrfrrArtifactExpandsLibraryAndFollowsEdits(t *testing.T) {
 		t.Fatalf("edited entries did not reach the srfrr artifact:\n%s", edited.Srfrr)
 	}
 
-	again := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak)
+	again := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak, dc.Policy)
 	if again != edited {
 		t.Fatal("artifacts not stable across two renders")
 	}
@@ -192,7 +192,7 @@ func TestSrfrrArtifactExpandsLibraryAndFollowsEdits(t *testing.T) {
 	// Removing every row must still produce a document that says "nothing", so
 	// sr-apply can turn the box's previous leak off.
 	dc.Leak = LeakSet{}
-	empty := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak)
+	empty := s.artifactsLocked("t", 1, &dc.Draft, dc.Leak, dc.Policy)
 	want := "{\n  \"export_vrfs\": [],\n  \"import_rules\": []\n}\n"
 	if empty.Srfrr != want {
 		t.Fatalf("empty srfrr artifact = %q, want %q", empty.Srfrr, want)

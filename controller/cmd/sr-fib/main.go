@@ -49,6 +49,25 @@ type fileConfig struct {
 	Escape  bool           `json:"escape_all_colors"`
 	VRFs    []uint8        `json:"vrfs"`
 	Tunnels []tunnelConfig `json:"tunnels"`
+	// Fallbacks 是"某个 VPN 的某个颜色查不到就退到颜色 0"的开关，粒度 (VPN, 颜色)。
+	// 它由控制台的策略页决定，但落点是**表**而不是策略：一条默认路由住在那张颜色
+	// 表里，所以归 sr-fib 管（表是它建的、也是它在 VPP 重启后补回来的）。
+	Fallbacks []fallbackConfig `json:"fallbacks,omitempty"`
+}
+
+// fallbackConfig 是上面那个开关的一行。颜色 1..7：颜色 0 的落点就是主表自己，
+// 给它配兜底等于让主表指向主表。
+type fallbackConfig struct {
+	VPN   uint8 `json:"vpn"`
+	Color uint8 `json:"color"`
+}
+
+func fibFallbacks(cfgs []fallbackConfig) []fib.ColorFallback {
+	out := make([]fib.ColorFallback, 0, len(cfgs))
+	for _, f := range cfgs {
+		out = append(out, fib.ColorFallback{VPN: f.VPN, Color: f.Color})
+	}
+	return out
 }
 
 // tunnelConfig 是控制面分配的隧道映射。下一跳必须与 RIB 里 next_hops 的某个元素逐字相同。
@@ -108,13 +127,19 @@ func loadConfig(path string) (*fileConfig, error) {
 // liveConfig 是运行中可变的那半份配置。status_url / vpp_socket / poll_sec /
 // status_addr 是进程级参数，换个值要有新进程，不在这里。
 type liveConfig struct {
-	VRFs    []uint8
-	Tunnels []fib.Tunnel
-	Escape  bool
+	VRFs      []uint8
+	Tunnels   []fib.Tunnel
+	Escape    bool
+	Fallbacks []fib.ColorFallback
 }
 
 func (cfg *fileConfig) live() liveConfig {
-	return liveConfig{VRFs: cfg.VRFs, Tunnels: fibTunnels(cfg.Tunnels), Escape: cfg.Escape}
+	return liveConfig{
+		VRFs:      cfg.VRFs,
+		Tunnels:   fibTunnels(cfg.Tunnels),
+		Escape:    cfg.Escape,
+		Fallbacks: fibFallbacks(cfg.Fallbacks),
+	}
 }
 
 // validateLive 用同一个纯函数校验一份表。没有路由时 PlanFrom 只做形状检查：
@@ -122,7 +147,7 @@ func (cfg *fileConfig) live() liveConfig {
 // 同一对端只有一条。校验不过就整份不接 —— 这里读错一个字段的代价不是报错，
 // 而是某个 VPN 静默不转发。
 func validateLive(c liveConfig) error {
-	_, err := fib.PlanFrom(c.VRFs, nil, c.Tunnels, nil, c.Escape)
+	_, err := fib.PlanFrom(c.VRFs, nil, c.Tunnels, nil, c.Escape, c.Fallbacks)
 	return err
 }
 
@@ -134,9 +159,10 @@ func validateLive(c liveConfig) error {
 // （"AA=="），而磁盘上的 fib.json 和 sr-route 的 /vrfs 都是 [0,100] 这种数组。
 // 同一份配置在两条通道上形态不同，排障时一定有人读错。
 type configDoc struct {
-	VRFs            []int          `json:"vrfs"`
-	Tunnels         []tunnelConfig `json:"tunnels"`
-	EscapeAllColors bool           `json:"escape_all_colors"`
+	VRFs            []int            `json:"vrfs"`
+	Tunnels         []tunnelConfig   `json:"tunnels"`
+	EscapeAllColors bool             `json:"escape_all_colors"`
+	Fallbacks       []fallbackConfig `json:"fallbacks,omitempty"`
 }
 
 func configOf(c liveConfig) configDoc {
@@ -148,7 +174,11 @@ func configOf(c liveConfig) configDoc {
 	for _, t := range c.Tunnels {
 		ts = append(ts, tunnelConfig{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color})
 	}
-	return configDoc{VRFs: vs, Tunnels: ts, EscapeAllColors: c.Escape}
+	fbs := make([]fallbackConfig, 0, len(c.Fallbacks))
+	for _, f := range c.Fallbacks {
+		fbs = append(fbs, fallbackConfig{VPN: f.VPN, Color: f.Color})
+	}
+	return configDoc{VRFs: vs, Tunnels: ts, EscapeAllColors: c.Escape, Fallbacks: fbs}
 }
 
 func (d configDoc) live() (liveConfig, error) {
@@ -163,7 +193,7 @@ func (d configDoc) live() (liveConfig, error) {
 	for _, t := range d.Tunnels {
 		ts = append(ts, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color})
 	}
-	c := liveConfig{VRFs: vs, Tunnels: ts, Escape: d.EscapeAllColors}
+	c := liveConfig{VRFs: vs, Tunnels: ts, Escape: d.EscapeAllColors, Fallbacks: fibFallbacks(d.Fallbacks)}
 	if err := validateLive(c); err != nil {
 		return liveConfig{}, err
 	}
@@ -316,7 +346,7 @@ func (f *fiber) converge(ctx context.Context) error {
 		return f.note(fib.Result{}, fmt.Errorf("读 BFD 会话: %w", err))
 	}
 	cfg := *f.cur.Load()
-	plan, err := fib.PlanFrom(cfg.VRFs, routes, cfg.Tunnels, fib.UnreachablePeers(sessions), cfg.Escape)
+	plan, err := fib.PlanFrom(cfg.VRFs, routes, cfg.Tunnels, fib.UnreachablePeers(sessions), cfg.Escape, cfg.Fallbacks)
 	if err != nil {
 		return f.note(fib.Result{}, err)
 	}

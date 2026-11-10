@@ -58,6 +58,7 @@ type FibTableSync struct {
 
 	// 测试缝：真实现读盘，测试直接给答案。
 	readVRFs func() ([]int, error)
+	readFB   func() ([]FibFallback, error)
 	baseURL  func() (string, error)
 
 	mu       sync.Mutex
@@ -78,8 +79,18 @@ func NewFibTableSync(ts *TunnelSync, routeConfPath, fibConfPath string, logf fun
 		logf:          logf,
 	}
 	f.readVRFs = func() ([]int, error) { return readRouteVRFs(routeConfPath) }
+	f.readFB = func() ([]FibFallback, error) { return nil, nil }
 	f.baseURL = func() (string, error) { return fibStatusBase(fibConfPath) }
 	return f
+}
+
+// SetFallbacks installs the source of the per-(VPN, colour) fallback switches.
+// sr-agent wires it to the installed bundle's 7th segment; a nil source means
+// "this box has no policy segment", which derives to an empty list.
+func (f *FibTableSync) SetFallbacks(fn func() ([]FibFallback, error)) {
+	if fn != nil {
+		f.readFB = fn
+	}
 }
 
 // MaybeRun starts one derivation round in the background unless one is already
@@ -116,9 +127,23 @@ type fibRowDoc struct {
 // fibConfigDoc is the GET/PUT /config body of sr-fib. Whole-replacement: the
 // escape switch rides along untouched because this component does not own it.
 type fibConfigDoc struct {
-	VRFs            []int       `json:"vrfs"`
-	Tunnels         []fibRowDoc `json:"tunnels"`
-	EscapeAllColors bool        `json:"escape_all_colors"`
+	VRFs            []int            `json:"vrfs"`
+	Tunnels         []fibRowDoc      `json:"tunnels"`
+	EscapeAllColors bool             `json:"escape_all_colors"`
+	Fallbacks       []fibFallbackDoc `json:"fallbacks,omitempty"`
+}
+
+// fibFallbackDoc 是"某 VPN 的某颜色查不到就退到颜色 0"的一行。它是 sr-fib 在
+// 颜色表里装的一条默认路由，来源是配置包第 7 段（策略页的复选框）。
+type fibFallbackDoc struct {
+	VPN   uint8 `json:"vpn"`
+	Color uint8 `json:"color"`
+}
+
+// FibFallback 是这段派生的输入：由 sr-agent 从已安装配置包的策略段解出来。
+type FibFallback struct {
+	VPN   uint8
+	Color uint8
 }
 
 // fibAnswer is the part of sr-fib's answer this component reports: whether the
@@ -188,7 +213,15 @@ func (f *FibTableSync) Sync(ctx context.Context) error {
 	if err != nil {
 		return f.note("sr-fib %s 连不上（还没起来？下一拍再试）: %v", base, err)
 	}
-	derived := fibConfigDoc{VRFs: vrfs, Tunnels: tunnels, EscapeAllColors: cur.EscapeAllColors}
+	fbs, err := f.readFB()
+	if err != nil {
+		return f.note("读配置包第 7 段的兜底开关: %v（本轮不推：把兜底当成\"全关\"会静默撤掉已经装好的默认路由）", err)
+	}
+	fbRows := make([]fibFallbackDoc, 0, len(fbs))
+	for _, fb := range fbs {
+		fbRows = append(fbRows, fibFallbackDoc{VPN: fb.VPN, Color: fb.Color})
+	}
+	derived := fibConfigDoc{VRFs: vrfs, Tunnels: tunnels, EscapeAllColors: cur.EscapeAllColors, Fallbacks: fbRows}
 	if sameFibTables(cur, derived) {
 		f.clearNote()
 		return nil
@@ -213,8 +246,8 @@ func (f *FibTableSync) Sync(ctx context.Context) error {
 	if len(skipped) > 0 {
 		skipNote = fmt.Sprintf("，跳过 %d 条（%s）", len(skipped), strings.Join(skipped, "、"))
 	}
-	f.logf("sr-fib 隧道表%s：%d 行、vrfs=%v、escape=%v%s%s",
-		state, len(tunnels), vrfs, derived.EscapeAllColors, skipNote, fibWarnText(ans))
+	f.logf("sr-fib 隧道表%s：%d 行、vrfs=%v、escape=%v、兜底 %d 条%s%s",
+		state, len(tunnels), vrfs, derived.EscapeAllColors, len(fbRows), skipNote, fibWarnText(ans))
 	return nil
 }
 
@@ -222,7 +255,31 @@ func (f *FibTableSync) Sync(ctx context.Context) error {
 // on purpose: sr-fib keeps the order it was given, and a reshuffle is not a
 // change worth a PUT.
 func sameFibTables(a, b fibConfigDoc) bool {
-	return sameInts(a.VRFs, b.VRFs) && sameRows(a.Tunnels, b.Tunnels)
+	return sameInts(a.VRFs, b.VRFs) && sameRows(a.Tunnels, b.Tunnels) && sameFallbacks(a.Fallbacks, b.Fallbacks)
+}
+
+func sameFallbacks(a, b []fibFallbackDoc) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]fibFallbackDoc(nil), a...)
+	y := append([]fibFallbackDoc(nil), b...)
+	less := func(r []fibFallbackDoc) {
+		sort.Slice(r, func(i, j int) bool {
+			if r[i].VPN != r[j].VPN {
+				return r[i].VPN < r[j].VPN
+			}
+			return r[i].Color < r[j].Color
+		})
+	}
+	less(x)
+	less(y)
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sameInts(a, b []int) bool {

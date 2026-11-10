@@ -59,12 +59,14 @@ type Check struct {
 	Text     string `json:"text"`
 }
 
-// Artifacts is the six-way split the controller renders. Route is the overlay
+// Artifacts is the seven-way split the controller renders. Route is the overlay
 // segment (the tunnels/vrfs keys of the box's route.json) and Srfrr is the two
 // controller-owned keys of the box's sr-frr.json; both are empty in a bundle
-// published before their stage, and sr-apply must keep reading those. Vrrp is
-// not a file the box keeps at all -- it is the list of virtual routers VPP must
-// be running, reconciled against the live dump (see vrrp.go).
+// published before their stage, and sr-apply must keep reading those. Vrrp and
+// Policy are not files the box keeps for its own sake -- they are the lists VPP
+// must be running (virtual routers; ACL/ABF policy), reconciled against the live
+// dump (see vrrp.go, policy.go). Policy is stored as policy.json so that the
+// agent can hand its fallback half to sr-fib without asking the controller.
 type Artifacts struct {
 	FRR   string `json:"frr"`
 	VPP   string `json:"vpp"`
@@ -72,6 +74,10 @@ type Artifacts struct {
 	Route string `json:"route,omitempty"`
 	Srfrr string `json:"srfrr,omitempty"`
 	Vrrp  string `json:"vrrp,omitempty"`
+	// Policy is bundle 第 7 段: 静态策略（ACL + ABF）以及每 VRF 每颜色的兜底开关。
+	// omitempty 只放过没有策略的旧包；新发布的包即使策略清空也要带空数组，
+	// 否则"删掉最后一条策略"永远到不了盒子。
+	Policy string `json:"policy,omitempty"`
 }
 
 // Bundle is what the controller hands out and what the box persists.
@@ -131,15 +137,17 @@ type Installed struct {
 	Route    string
 	Srfrr    string
 	Vrrp     string
+	Policy   string
 }
 
 const (
-	frrFile   = "frr.conf"
-	vppFile   = "vpp.conf"
-	bootFile  = "boot.sh"
-	routeFile = "route.json"
-	srfrrFile = "srfrr.json"
-	vrrpFile  = "vrrp.json"
+	frrFile    = "frr.conf"
+	vppFile    = "vpp.conf"
+	bootFile   = "boot.sh"
+	routeFile  = "route.json"
+	srfrrFile  = "srfrr.json"
+	vrrpFile   = "vrrp.json"
+	policyFile = "policy.json"
 )
 
 // artifactFile is one file inside a version directory.
@@ -188,7 +196,8 @@ func (s Store) Install(b Bundle) (Installed, error) {
 		}
 		if cur.FRR != b.Artifacts.FRR || cur.VPP != b.Artifacts.VPP ||
 			cur.Boot != b.Artifacts.Boot || cur.Route != b.Artifacts.Route ||
-			cur.Srfrr != b.Artifacts.Srfrr || cur.Vrrp != b.Artifacts.Vrrp {
+			cur.Srfrr != b.Artifacts.Srfrr || cur.Vrrp != b.Artifacts.Vrrp ||
+			cur.Policy != b.Artifacts.Policy {
 			return Installed{}, fmt.Errorf("version %d is already installed with different content", b.Version)
 		}
 		return cur, nil
@@ -213,6 +222,9 @@ func (s Store) Install(b Bundle) (Installed, error) {
 	}
 	if b.Artifacts.Vrrp != "" {
 		files = append(files, artifactFile{name: vrrpFile, content: b.Artifacts.Vrrp})
+	}
+	if b.Artifacts.Policy != "" {
+		files = append(files, artifactFile{name: policyFile, content: b.Artifacts.Policy})
 	}
 	hashes := make(map[string]string, len(files))
 	for _, f := range files {
@@ -291,6 +303,7 @@ func (s Store) read(version int) (Installed, error) {
 		{routeFile, &inst.Route, true},
 		{srfrrFile, &inst.Srfrr, true},
 		{vrrpFile, &inst.Vrrp, true},
+		{policyFile, &inst.Policy, true},
 	} {
 		data, err := os.ReadFile(filepath.Join(dir, f.name))
 		if os.IsNotExist(err) && f.optional {
@@ -425,12 +438,14 @@ type Applier struct {
 	// configured, which is an error for a bundle that carries a 6th segment.
 	VPPAPI string
 	// DialVRRP opens the vrrp plane. A test seam; the default is vppapi.Dial.
-	DialVRRP  func(ctx context.Context, socket string) (vrrpPlane, error)
-	Wait      time.Duration
-	DryRun    bool
-	Exec      Executor
-	Sleep     func(time.Duration)
-	TAPExists func(string) bool
+	DialVRRP func(ctx context.Context, socket string) (vrrpPlane, error)
+	// DialPolicy opens the ACL/ABF plane (7th segment). Same seam, same default.
+	DialPolicy func(ctx context.Context, socket string) (policyPlane, error)
+	Wait       time.Duration
+	DryRun     bool
+	Exec       Executor
+	Sleep      func(time.Duration)
+	TAPExists  func(string) bool
 	// HostPermMAC reads a NIC's burned-in MAC (default: ethtool -P). A test
 	// seam; nil means "use the default".
 	HostPermMAC func(ctx context.Context, netdev string) (mac string, permanent bool)
@@ -451,6 +466,13 @@ func New(store Store) *Applier {
 		FRRConf:   "/etc/frr/frr.conf",
 		RouteConf: "/etc/sdwan/route.json",
 		SrfrrConf: defaultSrfrrConf,
+		DialPolicy: func(ctx context.Context, socket string) (policyPlane, error) {
+			c, err := vppapi.Dial(ctx, socket, "sr-apply-policy")
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
 		DialVRRP: func(ctx context.Context, socket string) (vrrpPlane, error) {
 			c, err := vppapi.Dial(ctx, socket, "sr-apply-vrrp")
 			if err != nil {
@@ -485,6 +507,9 @@ func (a *Applier) setDefaults() {
 	}
 	if a.DialVRRP == nil {
 		a.DialVRRP = def.DialVRRP
+	}
+	if a.DialPolicy == nil {
+		a.DialPolicy = def.DialPolicy
 	}
 	if a.HTTP == nil {
 		a.HTTP = def.HTTP
@@ -571,9 +596,9 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		return fmt.Errorf("read current version: %w", perr)
 	}
 	if a.DryRun {
-		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B, srfrr %d B, vrrp %d B)", b.Version,
+		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B, srfrr %d B, vrrp %d B, policy %d B)", b.Version,
 			len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot), len(b.Artifacts.Route),
-			len(b.Artifacts.Srfrr), len(b.Artifacts.Vrrp))
+			len(b.Artifacts.Srfrr), len(b.Artifacts.Vrrp), len(b.Artifacts.Policy))
 		inst := Installed{
 			Dir:      "<dry-run>",
 			Manifest: Manifest{Version: b.Version},
@@ -583,6 +608,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 			Route:    b.Artifacts.Route,
 			Srfrr:    b.Artifacts.Srfrr,
 			Vrrp:     b.Artifacts.Vrrp,
+			Policy:   b.Artifacts.Policy,
 		}
 		if err := a.replay(ctx, inst); err != nil {
 			return err
@@ -592,6 +618,9 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 			return err
 		}
 		if _, err := a.applySrfrr(ctx, inst, prev, !a.NoSrfrrPush); err != nil {
+			return err
+		}
+		if err := a.applyPolicy(ctx, inst); err != nil {
 			return err
 		}
 		return a.applyVRRP(ctx, inst)
@@ -634,6 +663,12 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		} else if note != "" {
 			notes = append(notes, note)
 		}
+	}
+	// Policy before VRRP: a policy that steers traffic into a colour table is a
+	// forwarding change like any other, and a box whose config only half landed
+	// must not also take the site's VIP (VRRP stays last).
+	if err == nil {
+		err = a.applyPolicy(ctx, inst)
 	}
 	// VRRP is the very last thing: the VIP is this box's claim to be the site's
 	// first hop, and a box whose remaining segments only half landed must not win
@@ -681,6 +716,11 @@ func (a *Applier) Boot(ctx context.Context, frrDiff bool) error {
 		} else if note != "" {
 			notes = append(notes, note)
 		}
+	}
+	// Policy here too: ACL/ABF are VPP memory as well, and a restarted VPP comes
+	// back with neither. Same order as a hot apply -- policy, then VRRP.
+	if err == nil {
+		err = a.applyPolicy(ctx, inst)
 	}
 	// VRRP last here too. The VRs are VPP's own memory -- they are in no file --
 	// so whatever a VPP restart erases, it erases them, and without this replay a

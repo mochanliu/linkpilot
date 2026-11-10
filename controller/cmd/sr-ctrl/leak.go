@@ -532,8 +532,9 @@ func (s *server) leakSetChecksLocked(tenantID string, nodeID uint16, set LeakSet
 }
 
 // publishChecksLocked is the one gate every publish path uses: base config,
-// overlay membership and the stored leak rules. publishChecksForLeakLocked is
-// the batch variant that checks a candidate set before any write.
+// overlay membership, the stored leak rules and the stored static policy.
+// publishChecksForLeakLocked is the batch variant that checks a candidate leak
+// set before any write.
 func (s *server) publishChecksLocked(tenantID string, nodeID uint16, dc *DeviceConfig) []ConfigCheck {
 	return s.publishChecksForLeakLocked(tenantID, nodeID, dc, dc.Leak)
 }
@@ -542,6 +543,9 @@ func (s *server) publishChecksForLeakLocked(tenantID string, nodeID uint16, dc *
 	checks := validateBasicConfig(&dc.Draft)
 	checks = append(checks, s.overlayNodeChecksLocked(tenantID, nodeID)...)
 	checks = append(checks, s.leakSetChecksLocked(tenantID, nodeID, set)...)
+	// 策略排最后：它的错误要建立在"VPN 与客户口已经合法"这个前提上，排在前面
+	// 只会让一条根因变成一串连带报错。
+	checks = append(checks, s.policyChecksLocked(tenantID, nodeID, dc, dc.Policy)...)
 	return checks
 }
 
@@ -674,7 +678,7 @@ func (s *server) leakViewLocked(tenantID string, now int64) leakView {
 			set = leakSetCopy(dc.Leak)
 			if dc.Published != nil {
 				row.PublishedVersion = dc.Published.Version
-				art := s.artifactsLocked(tenantID, n.NodeID, &dc.Draft, dc.Leak)
+				art := s.artifactsLocked(tenantID, n.NodeID, &dc.Draft, dc.Leak, dc.Policy)
 				row.Pending = dc.Published.Version != dc.Version || dc.Published.Artifacts != art
 			}
 		}

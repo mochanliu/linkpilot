@@ -117,13 +117,13 @@ func (f *fakeDP) CLI(_ context.Context, cmd string) (string, error) {
 
 // planFrom 是"没有可达性信息、逃生开关关着"的 PlanFrom：这些用例只关心 RIB 的翻译。
 func planFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
-	return PlanFrom(vrfs, routes, tunnels, nil, false)
+	return PlanFrom(vrfs, routes, tunnels, nil, false, nil)
 }
 
 // planEscape 只把逃生开关翻成"开"（§5）。开关影响的是**主表收哪些颜色**，
 // 颜色表两种情况下都照写，所以它必须和关着的那份逐条对比才有意义。
 func planEscape(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel) (Plan, error) {
-	return PlanFrom(vrfs, routes, tunnels, nil, true)
+	return PlanFrom(vrfs, routes, tunnels, nil, true, nil)
 }
 
 // ribOne 是单 VPN 的常见形状：来源 VPN 就是目标表。Origin 固定成一个正常设备号，
@@ -495,7 +495,7 @@ func TestPlanFromSkipsBFDDownPaths(t *testing.T) {
 			ribOne(100, "10.1.0.0/24", "10.255.0.2", "10.255.0.3"),
 			ribOne(100, "10.2.0.0/24", "10.255.0.3"),
 		},
-		tun, down, false,
+		tun, down, false, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -529,7 +529,7 @@ func TestApplyBFDDownRemovesPath(t *testing.T) {
 	routes := []RIBRoute{
 		ribOne(100, "10.1.0.0/24", "10.255.0.2", "10.255.0.3"),
 	}
-	up, err := PlanFrom([]uint8{100}, routes, tun, nil, false)
+	up, err := PlanFrom([]uint8{100}, routes, tun, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +541,7 @@ func TestApplyBFDDownRemovesPath(t *testing.T) {
 	}
 
 	down, err := PlanFrom([]uint8{100}, routes, tun,
-		map[netip.Addr]bool{netip.MustParseAddr("10.255.0.3"): true}, false)
+		map[netip.Addr]bool{netip.MustParseAddr("10.255.0.3"): true}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +580,7 @@ func TestApplyVPN0UsesGlobalTable(t *testing.T) {
 	plan, err := PlanFrom([]uint8{0},
 		[]RIBRoute{ribOne(0, "10.68.2.0/24", "192.168.99.2")},
 		[]Tunnel{{NextHop: "192.168.99.2", Interface: "wg0"}},
-		nil, false)
+		nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +605,7 @@ func TestApplyVPN0UsesGlobalTable(t *testing.T) {
 	plan7, err := PlanFrom([]uint8{0},
 		[]RIBRoute{ribOne(0, "10.68.2.0/24", "192.168.99.2")},
 		[]Tunnel{{NextHop: "192.168.99.2", Interface: "wg0", Color: 7}},
-		nil, true)
+		nil, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +629,7 @@ func TestPlanFromColorPreference(t *testing.T) {
 		[]Tunnel{
 			{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
 			{NextHop: "10.255.0.3", Interface: "wg1", Color: 7},
-		}, nil, false)
+		}, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +658,7 @@ func TestPlanFromEscapePutsAllColorsInMainTable(t *testing.T) {
 		{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
 		{NextHop: "10.255.0.3", Interface: "wg1", Color: 7},
 	}
-	off, err := PlanFrom(vrfs, routes, tunnels, nil, false)
+	off, err := PlanFrom(vrfs, routes, tunnels, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -788,7 +788,7 @@ func TestPlanFromColorZeroDownWithEscape(t *testing.T) {
 	}
 	down := map[netip.Addr]bool{netip.MustParseAddr("10.255.0.2"): true}
 
-	on, err := PlanFrom(vrfs, routes, tunnels, down, true)
+	on, err := PlanFrom(vrfs, routes, tunnels, down, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,7 +822,7 @@ func TestPlanFromColorZeroDownWithEscape(t *testing.T) {
 		}
 	}
 
-	off, err := PlanFrom(vrfs, routes, tunnels, down, false)
+	off, err := PlanFrom(vrfs, routes, tunnels, down, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -844,7 +844,7 @@ func TestPlanFromRejectsBadColor(t *testing.T) {
 	_, err := PlanFrom(
 		[]uint8{100},
 		[]RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2")},
-		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 8}}, nil, false)
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 8}}, nil, false, nil)
 	if err == nil {
 		t.Fatal("Color 8 (PrefBase+8 > PrefBase+MaxColor) must fail")
 	}
@@ -1113,4 +1113,111 @@ func TestPlanFromTablesAreSeededPlusUsed(t *testing.T) {
 	if len(plan.Routes) != 1 {
 		t.Errorf("routes = %+v, want 只有颜色 3 表那一条", plan.Routes)
 	}
+}
+
+// 兜底：颜色表里一条 0.0.0.0/0 → 本 VPN 主表。它必须
+//
+//	① 让那张颜色表存在（哪怕这张表里一条普通路由都没有），
+//	② 走 deag 形状（sw_if_index=~0 + table_id=主表），不是普通下一跳，
+//	③ 和其它路由一样参与整份计划的差异计算（幂等）。
+func TestPlanFallbackDefaultRoute(t *testing.T) {
+	vrfs := []uint8{100}
+	routes := []RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2")}
+	tun := []Tunnel{
+		{NextHop: "10.255.0.2", Interface: "wg0", Color: 0},
+	}
+	fb := []ColorFallback{{VPN: 100, Color: 2}}
+
+	plan, err := PlanFrom(vrfs, routes, tun, nil, false, fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, _ := ColorTable(2, 100)
+	var got *Route
+	for i := range plan.Routes {
+		if plan.Routes[i].Table == ct {
+			got = &plan.Routes[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("颜色表 %d 里没有兜底路由：%+v", ct, plan.Routes)
+	}
+	if got.Prefix.String() != "0.0.0.0/0" {
+		t.Fatalf("兜底路由的前缀是 %s，应该是 0.0.0.0/0", got.Prefix)
+	}
+	if len(got.Paths) != 1 || !got.Paths[0].Deag || got.Paths[0].LookupTable != 100 {
+		t.Fatalf("兜底路径形状不对（要 deag → 表 100）：%+v", got.Paths)
+	}
+	if !containsTable(plan.Tables, ct) {
+		t.Fatalf("计划里的表没有 %d：%v", ct, plan.Tables)
+	}
+
+	// 下发形状：deag 必须是 sw_if_index=~0 + table_id=主表。
+	dp := newFakeDP()
+	dp.tables[100] = true
+	ap := NewApplier(dp)
+	if _, err := ap.Apply(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	paths := dp.routes[fmt.Sprintf("%d|0.0.0.0/0", ct)]
+	if len(paths) != 1 || paths[0].SWIfIndex != ^uint32(0) || paths[0].TableID != 100 {
+		t.Fatalf("下发的兜底路径是 %+v，期望 sw_if_index=~0 table_id=100", paths)
+	}
+
+	// 幂等：同一个 Applier 再收敛一份同样的计划，什么都不写。
+	writes := dp.writes
+	res, err := ap.Apply(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Changed() || dp.writes != writes {
+		t.Fatalf("同一份计划重复收敛不应有写动作：res=%+v writes %d -> %d", res, writes, dp.writes)
+	}
+}
+
+func TestPlanFallbackRejectsColorZeroAndUnknownVPN(t *testing.T) {
+	vrfs := []uint8{100}
+	routes := []RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2")}
+	tun := []Tunnel{{NextHop: "10.255.0.2", Interface: "wg0"}}
+
+	if _, err := PlanFrom(vrfs, routes, tun, nil, false, []ColorFallback{{VPN: 100, Color: 0}}); err == nil ||
+		!strings.Contains(err.Error(), "颜色 0") {
+		t.Fatalf("颜色 0 的兜底必须被拒绝，得到 %v", err)
+	}
+	if _, err := PlanFrom(vrfs, routes, tun, nil, false, []ColorFallback{{VPN: 77, Color: 2}}); err == nil ||
+		!strings.Contains(err.Error(), "没服务这个 VPN") {
+		t.Fatalf("没服务的 VPN 上的兜底必须被拒绝，得到 %v", err)
+	}
+}
+
+// RIB 自己就有这个 VPN 的默认路由时，兜底不能把它顶掉：同一条前缀只能有一条。
+func TestPlanFallbackYieldsToRealDefaultRoute(t *testing.T) {
+	vrfs := []uint8{100}
+	routes := []RIBRoute{ribOne(100, "0.0.0.0/0", "10.255.0.2")}
+	tun := []Tunnel{{NextHop: "10.255.0.2", Interface: "wg0", Color: 2}}
+
+	plan, err := PlanFrom(vrfs, routes, tun, nil, false, []ColorFallback{{VPN: 100, Color: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, _ := ColorTable(2, 100)
+	for _, r := range plan.Routes {
+		if r.Table != ct || r.Prefix.String() != "0.0.0.0/0" {
+			continue
+		}
+		if len(r.Paths) != 1 || r.Paths[0].Deag {
+			t.Fatalf("真默认路由被兜底顶掉了：%+v", r.Paths)
+		}
+		return
+	}
+	t.Fatalf("颜色表 %d 里没有 RIB 的那条默认路由：%+v", ct, plan.Routes)
+}
+
+func containsTable(ts []uint32, want uint32) bool {
+	for _, t := range ts {
+		if t == want {
+			return true
+		}
+	}
+	return false
 }

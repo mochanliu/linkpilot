@@ -166,10 +166,16 @@ type DeviceConfig struct {
 	// lives here and not inside BasicConfig: the 基础配置 page saves a whole
 	// BasicConfig, and a leak row stored in it would be wiped by every save from
 	// that page.
-	Leak      LeakSet `json:"leak"`
-	Version   int     `json:"version"`
-	UpdatedAt int64   `json:"updated_at_unix"`
-	UpdatedBy string  `json:"updated_by,omitempty"`
+	Leak LeakSet `json:"leak"`
+	// Policy is the 静态策略 rows plus the per-(VRF, colour) fallback switches.
+	// Same reason as Leak for living outside BasicConfig: the 基础配置 page PUTs a
+	// whole BasicConfig and would wipe anything stored inside it. It is also
+	// rendered against the draft's interfaces (a row attaches to every customer
+	// port of its VPN), which is why it cannot be a stand-alone document either.
+	Policy    PolicySet `json:"policy"`
+	Version   int       `json:"version"`
+	UpdatedAt int64     `json:"updated_at_unix"`
+	UpdatedBy string    `json:"updated_by,omitempty"`
 
 	Published *PublishedBundle `json:"published,omitempty"`
 }

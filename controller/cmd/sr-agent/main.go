@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -235,6 +236,27 @@ func main() {
 		tun = agent.NewTunnelSync(dp, id, client.UnderlayBundle, log.Printf)
 		tun.SetRedial(dial)
 		fibTab = agent.NewFibTableSync(tun, *routeConf, *fibConf, log.Printf)
+		// 兜底开关（每 VRF 每颜色）住在配置包第 7 段里：读**已安装**的那一版，
+		// 而不是问控制器 —— sr-fib 的这张表是运行时状态，盒子上有一个唯一来源
+		// （current → policy.json），重启后不需要任何人在线也能补回来。
+		fibTab.SetFallbacks(func() ([]agent.FibFallback, error) {
+			inst, err := (apply.Store{Root: *storeRoot}).Current()
+			if errors.Is(err, apply.ErrNoConfig) {
+				return nil, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			fbs, err := apply.PolicyFallbacks(inst.Policy)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]agent.FibFallback, 0, len(fbs))
+			for _, f := range fbs {
+				out = append(out, agent.FibFallback{VPN: f.VPN, Color: f.Color})
+			}
+			return out, nil
+		})
 		log.Printf("tunnel applier on (vpp api %s)", *vppAPI)
 		log.Printf("fib-table deriver on (sr-fib %s, vrfs from %s)", *fibConf, *routeConf)
 	}

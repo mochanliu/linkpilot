@@ -24,6 +24,7 @@
 package vppapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -151,6 +152,81 @@ func (c *Client) ACLAddReplace(ctx context.Context, index uint32, tag string, ru
 		return 0, APIError{Op: "acl_add_replace", Retval: rv}
 	}
 	return got, nil
+}
+
+// ACLDetail is what a reconcile needs back from acl_dump: the index VPP assigned,
+// the tag this system put on it, and the rules byte-for-byte as VPP holds them.
+//
+// Rules is the raw wire image (count*48 bytes) on purpose. Comparing it with
+// aclRulesBlob(desired) is the only honest "same rules?" test available: the
+// plugin does not promise that its dump echoes prefixes the way they were sent,
+// so a decoded comparison would have to guess at normalisation, while a byte
+// comparison against VPP's own output proves the bytes it holds are the bytes we
+// meant.
+type ACLDetail struct {
+	Index uint32
+	Tag   string
+	Rules []byte
+}
+
+// ACLRulesBlob is the wire encoding of a rule list (no tag, no count). It is
+// exported because the reconciler compares it against acl_details' raw rule
+// bytes -- see ACLDetail.
+func ACLRulesBlob(rules []ACLRule) []byte {
+	b := make([]byte, 0, len(rules)*aclRuleLen)
+	for _, r := range rules {
+		b = appendACLRule(b, r)
+	}
+	return b
+}
+
+// ACLs reads every ACL on the box. The tag is the identity a reconcile keys on:
+// an acl_index is assigned by VPP and can never be chosen by the caller
+// (acl_add_replace with an index that does not exist answers NO_SUCH_ENTRY -6,
+// measured on lab-cpe1 2026-11-10), so "policy row 7" has to be spelled as a tag.
+func (c *Client) ACLs(ctx context.Context) ([]ACLDetail, error) {
+	// acl_index = ~0 means "every ACL". An empty body would be read as index 0,
+	// and ACL 0 never exists (indices start at 1 in practice), so the dump would
+	// answer nothing at all -- measured on lab-cpe1, 2026-11-10.
+	body := appendU32(nil, ^uint32(0))
+	frames, err := c.dump(ctx, "acl_dump", "acl_details", body)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ACLDetail, 0, len(frames))
+	for _, f := range frames {
+		d, err := parseACLDetails(f)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// parseACLDetails 解一帧 acl_details：header 6 + acl_index 4 + tag(64 定长) +
+// count 4 + r[count]（每条 48 字节）。
+//
+// tag 在这里是**定长 64 字节**字段（acl.api.json 里写作 ["string","tag",64]），
+// 不是"长度前缀 + 内容"那种变长 string：按变长读会让 count 落在错误的位置，
+// 而错位的 count 看上去只是一个离谱的数字。
+func parseACLDetails(f []byte) (ACLDetail, error) {
+	const head = 6 + 4 + aclTagLen + 4
+	if len(f) < head {
+		return ACLDetail{}, fmt.Errorf("vppapi: acl_details 太短（%d 字节）", len(f))
+	}
+	d := ACLDetail{Index: binary.BigEndian.Uint32(f[6:10])}
+	tag := f[10 : 10+aclTagLen]
+	if i := bytes.IndexByte(tag, 0); i >= 0 {
+		tag = tag[:i]
+	}
+	d.Tag = string(tag)
+	n := int(binary.BigEndian.Uint32(f[10+aclTagLen : head]))
+	if len(f) < head+n*aclRuleLen {
+		return ACLDetail{}, fmt.Errorf("vppapi: acl_details 声称 %d 条规则但只有 %d 字节", n, len(f))
+	}
+	d.Rules = f[head : head+n*aclRuleLen]
+	return d, nil
 }
 
 // ACLDel 删掉一个 ACL。删除不存在的 ACL 会拿到 NO_SUCH_ENTRY(-6)，调用方按
