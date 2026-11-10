@@ -80,9 +80,9 @@ func (c *Client) ABFPolicyAddDel(ctx context.Context, p ABFPolicy, add bool) err
 		return fmt.Errorf("vppapi: ABF 策略 id 不能是 0（0 在 attach 里表示'没有策略'）")
 	}
 	if add {
-		if p.ACLIndex == 0 {
-			return fmt.Errorf("vppapi: ABF 策略 %d 需要一个 ACL index", p.ID)
-		}
+		// 这里**不能**把 ACLIndex==0 当成"没填"：VPP 给第一张 ACL 分配的索引就是 0
+		// （2026-11-10 VM 台实测）。用 0 当哨兵会让"配了第一条策略"这种最常见的
+		// 情况在下发时被自己拒掉。
 		if len(p.Paths) == 0 || len(p.Paths) > 255 {
 			return fmt.Errorf("vppapi: ABF 策略 %d 需要 1..255 条路径，给了 %d", p.ID, len(p.Paths))
 		}

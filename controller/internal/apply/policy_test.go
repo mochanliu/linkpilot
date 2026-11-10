@@ -68,7 +68,7 @@ func newFakePolicyPlane() *fakePolicyPlane {
 			{SWIfIndex: policyIfBIdx, Name: policyIfB},
 		},
 		acls:     map[uint32]*fakeACL{},
-		nextACL:  1,
+		nextACL:  0,
 		policies: map[uint32]vppapi.ABFPolicy{},
 		attaches: map[[2]uint32]vppapi.ABFAttach{},
 		tables:   map[uint32]bool{},
@@ -110,7 +110,7 @@ func (p *fakePolicyPlane) ACLAddReplace(_ context.Context, index uint32, tag str
 	if p.aclErr != nil {
 		return 0, p.aclErr
 	}
-	if index != 0 {
+	if index != vppapi.ACLNew {
 		if _, ok := p.acls[index]; !ok {
 			// 实测：给一个不存在的 index 是 NO_SUCH_ENTRY，index 只能由 VPP 分配。
 			p.calls = append(p.calls, fmt.Sprintf("acl-replace-missing(%d)", index))
@@ -581,5 +581,83 @@ func TestPolicyDeletesOnlyOurOrphanACLs(t *testing.T) {
 	}
 	if _, ok := plane.acls[77]; !ok {
 		t.Fatalf("别人的 ACL 被删了（只该动 sr-pol- 前缀的那些）: %v", plane.acls)
+	}
+}
+
+// VPP 给第一张 ACL 分配的索引就是 0（2026-11-10 VM 台实测：
+// `show acl-plugin acl` → `acl-index 0 tag {sr-pol-1}`）。
+//
+// 这条钉的是那次真机失败：把 0 当"没填"时，第一行策略永远下发不下去
+// （abf_policy_add_del 前被自己的校验拦掉），日志里只有一句
+// "ABF 策略 1001 需要一个 ACL index"，看上去像配置错，其实是索引 0 被当成了空值。
+func TestPolicyFirstRowUsesACLIndexZero(t *testing.T) {
+	plane := newFakePolicyPlane()
+	a := newPolicyApplier(t, plane)
+	seg := policySegment(t, []policyRowJSON{
+		policyRowOf(1, policyVPN, 2, "192.0.2.0/24", policyIfA),
+	})
+	if err := a.applyPolicy(context.Background(), installedPolicy(seg)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	acl, ok := plane.acls[0]
+	if !ok {
+		t.Fatalf("第一张 ACL 的索引应该是 0（VPP 实测如此），实际 %v", plane.acls)
+	}
+	if acl.tag != "sr-pol-1" {
+		t.Fatalf("0 号 ACL 的 tag = %q，应为 sr-pol-1", acl.tag)
+	}
+	pol, ok := plane.policies[1001]
+	if !ok {
+		t.Fatalf("策略 1001 没建出来: %v", plane.policies)
+	}
+	if pol.ACLIndex != 0 {
+		t.Fatalf("策略 1001 指的 ACL = %d，应为 0", pol.ACLIndex)
+	}
+	// 第二遍必须是空操作：索引 0 被当成"不存在"的话，这里会再建一张 ACL。
+	first := len(plane.calls)
+	if err := a.applyPolicy(context.Background(), installedPolicy(seg)); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	for _, c := range plane.calls[first:] {
+		if strings.HasPrefix(c, "acl-add") || strings.HasPrefix(c, "acl-replace") {
+			t.Fatalf("第二遍不该动 ACL（0 号被当成不存在了？）: %v", plane.calls[first:])
+		}
+	}
+	if len(plane.acls) != 1 {
+		t.Fatalf("ACL 数量 = %d，应恒为 1: %v", len(plane.acls), plane.acls)
+	}
+}
+
+// 换一个 0 号 ACL 的规则，必须是**原地替换**（index 不变），不能新建一张。
+// 这也是同一个哨兵写错的第二种坏法：每轮对账多一张 ACL，索引一路涨，旧的一直留着。
+func TestPolicyReplacesIndexZeroACLInPlace(t *testing.T) {
+	plane := newFakePolicyPlane()
+	a := newPolicyApplier(t, plane)
+	first := policySegment(t, []policyRowJSON{
+		policyRowOf(1, policyVPN, 2, "192.0.2.0/24", policyIfA),
+	})
+	if err := a.applyPolicy(context.Background(), installedPolicy(first)); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	second := policySegment(t, []policyRowJSON{
+		policyRowOf(1, policyVPN, 2, "198.51.100.0/24", policyIfA),
+	})
+	if err := a.applyPolicy(context.Background(), installedPolicy(second)); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if len(plane.acls) != 1 {
+		t.Fatalf("改规则不该多出 ACL，实际 %v", plane.acls)
+	}
+	if _, ok := plane.acls[0]; !ok {
+		t.Fatalf("0 号 ACL 不见了: %v", plane.acls)
+	}
+	sawReplace := false
+	for _, c := range plane.calls {
+		if strings.HasPrefix(c, "acl-replace(0,") {
+			sawReplace = true
+		}
+	}
+	if !sawReplace {
+		t.Fatalf("没有在 0 号上原地替换，调用序列: %v", plane.calls)
 	}
 }

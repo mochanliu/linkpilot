@@ -40,11 +40,22 @@ const (
 	ACLPermit ACLAction = 1
 )
 
+// ACLNew 是 ACLAddReplace 的"新建、索引由 VPP 分配"标记。
+//
+// **不能拿 0 当这个标记**：VPP 给第一张 ACL 分配的索引就是 0。2026-11-10 在 VM
+// 实验台 CPE1 首次下发策略时实测到这一点 —— `show acl-plugin acl` 打出
+// `acl-index 0 tag {sr-pol-1}` 与 `acl-index 1 tag {sr-pol-2}`，而本包当时把
+// "0" 当哨兵，于是"建好了 ACL"和"没有 ACL"在返回值上无法区分：策略创建那步
+// 被判成"没有 index"，整段 apply 以 `ABF 策略 1001 需要一个 ACL index` 失败。
+//
+// 用 0 当哨兵的第二种坏法更隐蔽：替换 0 号 ACL 会被改写成"新建"，于是每轮都对账
+// 出一张新 ACL，索引一路往上涨，旧的一直留着。
+const ACLNew = ^uint32(0)
+
 const (
 	aclTagLen     = 64
 	aclRuleLen    = 48
-	aclNewIndex   = ^uint32(0) // acl_add_replace 用 ~0 表示"新建，由 VPP 分配"
-	aclPortAnyEnd = 0xffff     // 端口字段的"任意"是 0..65535，不是 0
+	aclPortAnyEnd = 0xffff // 端口字段的"任意"是 0..65535，不是 0
 )
 
 // PortRange 是一个闭区间。零值不是"任意"——要任意就写 AnyPorts()，
@@ -111,8 +122,9 @@ func appendACLRule(b []byte, r ACLRule) []byte {
 
 // ACLAddReplace 建或整条替换一个 ACL，返回 VPP 侧的 acl_index。
 //
-// index = 0 表示新建（内部发 ~0）；给一个已存在的 index 就是整条替换——
-// 这是本系统要的语义：策略行集合变了，ACL 必须是新那一份，不是增量叠加。
+// index = ACLNew 表示新建（内部发 ~0）；给任何别的值就是整条替换那个索引 ——
+// 包括 0，因为 0 是 VPP 会给出来的真实索引（见 ACLNew 的注释）。这是本系统要的
+// 语义：策略行集合变了，ACL 必须是新那一份，不是增量叠加。
 func (c *Client) ACLAddReplace(ctx context.Context, index uint32, tag string, rules []ACLRule) (uint32, error) {
 	if len(rules) == 0 {
 		return 0, fmt.Errorf("vppapi: ACL 至少要有 1 条规则")
@@ -126,12 +138,8 @@ func (c *Client) ACLAddReplace(ctx context.Context, index uint32, tag string, ru
 		}
 	}
 
-	wire := index
-	if wire == 0 {
-		wire = aclNewIndex
-	}
 	body := make([]byte, 0, 4+aclTagLen+4+len(rules)*aclRuleLen)
-	body = appendU32(body, wire)
+	body = appendU32(body, index)
 	tagBuf := make([]byte, aclTagLen)
 	copy(tagBuf, tag)
 	body = append(body, tagBuf...)

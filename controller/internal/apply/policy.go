@@ -311,19 +311,23 @@ func (a *Applier) applyPolicy(ctx context.Context, inst Installed) error {
 	}
 
 	// 3. 写 ACL：已存在的原地替换（index 不变，挂在上面的策略不用动），
-	//    没有的新建（index 由 VPP 分配）。
+	//    没有的新建（index 由 VPP 分配）。这里的"新建"必须用 ACLNew 表示：
+	//    VPP 分配的第一个索引就是 0，拿 0 当哨兵会把新建写成"替换 0 号"。
 	for _, d := range desired {
 		if !aclMissing[d.aclTag] && !aclReplace[d.aclTag] {
 			continue
 		}
-		idx := tagIndex[d.aclTag]
+		idx, exists := tagIndex[d.aclTag]
+		if !exists {
+			idx = vppapi.ACLNew
+		}
 		got, err := plane.ACLAddReplace(ctx, idx, d.aclTag, d.rules)
 		if err != nil {
 			return fmt.Errorf("policy: %s 的 ACL 写不进去: %w", d.label, err)
 		}
 		tagIndex[d.aclTag] = got
 		verb := "替换"
-		if idx == 0 {
+		if !exists {
 			verb = "新建"
 		}
 		a.Logf("policy: %s ACL %s %s -> index %d（%d 条规则）", d.label, d.aclTag, verb, got, len(d.rules))
