@@ -1022,6 +1022,23 @@ type TunnelMetrics struct {
 type MetricsReport struct {
 	NodeID  uint16          `json:"node_id"`
 	Tunnels []TunnelMetrics `json:"tunnels"`
+	// Selections 是动态策略行**此刻**的选路结果（sla.Selector 的状态快照）。
+	// 与 Tunnels 同一节拍上报：控制台策略页的"当前颜色"要的是和 SLA 数字同一
+	// 时刻的事实，分成两条消息只会造出"数字说这条好、颜色说走的另一条"的裂缝。
+	// nil = 这台盒子没有动态策略（或版本太老），存侧按"没有上报"处理。
+	Selections []PolicySelection `json:"selections,omitempty"`
+}
+
+// PolicySelection 是一台盒子上一条动态策略行的选路状态。
+type PolicySelection struct {
+	RowID int    `json:"row_id"` // 与第 7 段的行号同一个号
+	VPN   uint32 `json:"vpn"`
+	// Color 是当前选中的颜色（0 = 兜底进主表）。Reason 是一句给人看的话
+	// （为什么选中/为什么没切），控制台原样展示 —— 选路组件的解释是排障时
+	// 唯一便宜的证据。
+	Color     uint8  `json:"color"`
+	Reason    string `json:"reason,omitempty"`
+	UpdatedAt int64  `json:"updated_at_unix,omitempty"`
 }
 
 // NodeTelemetry is one node's most recent sampling window as the controller
@@ -1032,6 +1049,10 @@ type NodeTelemetry struct {
 	SeenAt  int64           `json:"seen_at_unix"`
 	AgeSec  uint64          `json:"age_sec"`
 	Tunnels []TunnelMetrics `json:"tunnels"`
+	// Selections 是这台盒子上动态策略行的当前选路（可能为空：没有动态策略，
+	// 或盒子的 agent 还是旧版本）。nil 与空列表在这里是同一个意思 —— 页面把
+	// 没上报的行显示成"未上报"，不发明一个颜色。
+	Selections []PolicySelection `json:"selections,omitempty"`
 }
 
 // TelemetryView is the northbound read of a tenant's in-tunnel telemetry.

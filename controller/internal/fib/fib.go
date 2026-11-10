@@ -90,6 +90,29 @@ func ColorTable(color uint8, main uint32) (uint32, error) {
 	return uint32(color)*ColorTableStride + main, nil
 }
 
+// SelectorTableBase 是动态策略"选路表"的段基址。选路表是**一行策略一张**的过渡
+// 表：ABF 把命中行引到它，它里面只有一条 0.0.0.0/0 的 deag 路由指向当前选中的
+// 颜色表，由 sla.Selector 按 SLA 重写。行号 1..policyMaxRows(999) ⇒ 表号
+// 10001..10999。
+//
+// 段基址取 10000 的原因：颜色表最高到 7*1000+255=7255，而早先那个 "10000+t" 的
+// 段基址已在 L-3 退役（见 ColorTable 上面的注释），10000 起整段是空的 —— 放在
+// 颜色段上方，任何"颜色 c 折出来的表号"都不可能与它撞车，validate 侧只需要
+// 一个 >= 判断就能把动态行和静态行分开。
+//
+// 表号由**控制器渲染**进第 7 段（selector_table 字段），盒子不自己算：表号要是
+// 两边各算一次，改公式那天就是一个"各自都对、合起来不对"的静默 bug。
+const SelectorTableBase uint32 = 10000
+
+// SelectorTable 把策略行号折成它的选路表号。行号范围与 ACL tag / ABF policy_id
+// 同源（1..999），超界报错而不是静默折进别的段。
+func SelectorTable(rowID int) (uint32, error) {
+	if rowID < 1 || rowID > 999 {
+		return 0, fmt.Errorf("fib: 策略行号 %d 超出 1..999，折不出选路表号", rowID)
+	}
+	return SelectorTableBase + uint32(rowID), nil
+}
+
 // RIBRoute 是喂给本包的最小路由形状（由 cmd/sr-fib 从 sr-route /status 转换）。
 //
 // 三个字段是三件事，混成一个就是 §2.4 那个坑：

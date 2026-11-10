@@ -48,11 +48,14 @@ type fakeACL struct {
 type fakePolicyPlane struct {
 	ifaces []vppapi.SwInterface
 
-	acls      map[uint32]*fakeACL
-	nextACL   uint32
-	policies  map[uint32]vppapi.ABFPolicy
-	attaches  map[[2]uint32]vppapi.ABFAttach
-	tables    map[uint32]bool
+	acls     map[uint32]*fakeACL
+	nextACL  uint32
+	policies map[uint32]vppapi.ABFPolicy
+	attaches map[[2]uint32]vppapi.ABFAttach
+	tables   map[uint32]bool
+	// routes 是"表号 → 前缀集合"，只记录我们写过的：选路表种子路由的存在性
+	// 靠它判定。真实现是 VPP 的 FIB。
+	routes    map[uint32]map[netip.Prefix]bool
 	calls     []string
 	closed    int
 	tableErr  error
@@ -72,6 +75,7 @@ func newFakePolicyPlane() *fakePolicyPlane {
 		policies: map[uint32]vppapi.ABFPolicy{},
 		attaches: map[[2]uint32]vppapi.ABFAttach{},
 		tables:   map[uint32]bool{},
+		routes:   map[uint32]map[netip.Prefix]bool{},
 	}
 }
 
@@ -89,6 +93,29 @@ func (p *fakePolicyPlane) IPTableAddDel(_ context.Context, table uint32, add boo
 		return nil
 	}
 	delete(p.tables, table)
+	return nil
+}
+
+func (p *fakePolicyPlane) IPRoutes(_ context.Context, table uint32) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(p.routes[table]))
+	for pfx := range p.routes[table] {
+		out = append(out, pfx)
+	}
+	return out, nil
+}
+
+func (p *fakePolicyPlane) IPRouteAddDel(_ context.Context, table uint32, prefix netip.Prefix, _ []vppapi.FIBPath, add bool) error {
+	p.calls = append(p.calls, fmt.Sprintf("route(%d,%s,%v)", table, prefix, add))
+	m := p.routes[table]
+	if m == nil {
+		m = map[netip.Prefix]bool{}
+		p.routes[table] = m
+	}
+	if add {
+		m[prefix] = true
+	} else {
+		delete(m, prefix)
+	}
 	return nil
 }
 
@@ -250,13 +277,19 @@ func (p *fakePolicyPlane) sawCall(prefix string) bool {
 type policyRowJSON struct {
 	ID      int      `json:"id"`
 	VPN     uint32   `json:"vpn"`
-	Color   uint8    `json:"color"`
+	Color   uint8    `json:"color,omitempty"`
 	Src     string   `json:"src,omitempty"`
 	Dst     string   `json:"dst,omitempty"`
 	Proto   uint8    `json:"proto,omitempty"`
 	SrcPort string   `json:"src_port,omitempty"`
 	DstPort string   `json:"dst_port,omitempty"`
 	Attach  []string `json:"attach"`
+
+	Mode          string          `json:"mode,omitempty"`
+	Peer          uint16          `json:"peer,omitempty"`
+	Colors        []uint8         `json:"colors,omitempty"`
+	SLA           *map[string]any `json:"sla,omitempty"`
+	SelectorTable uint32          `json:"selector_table,omitempty"`
 }
 
 func policySegment(t *testing.T, rows []policyRowJSON, fallback ...map[string]uint32) string {
@@ -659,5 +692,71 @@ func TestPolicyReplacesIndexZeroACLInPlace(t *testing.T) {
 	}
 	if !sawReplace {
 		t.Fatalf("没有在 0 号上原地替换，调用序列: %v", plane.calls)
+	}
+}
+
+// 动态行：ABF 指向这一行自己的选路表（10000+行号），选路表要建出来，表空时种
+// 一条指向主表的默认路由。
+func TestPolicyDynamicRowPointsAtSelectorTable(t *testing.T) {
+	plane := newFakePolicyPlane()
+	a := newPolicyApplier(t, plane)
+	sla := map[string]any{"latency_ms": 50, "jitter_ms": 10, "loss_permille": 30}
+	seg := policySegment(t, []policyRowJSON{
+		{ID: 1, VPN: policyVPN, Dst: "192.0.2.0/24", Attach: []string{policyIfA},
+			Mode: "dynamic", Peer: 3, Colors: []uint8{2, 3}, SLA: &sla, SelectorTable: 10001},
+	})
+	if err := a.applyPolicy(context.Background(), installedPolicy(seg)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	pol, ok := plane.policies[1001]
+	if !ok {
+		t.Fatalf("策略 1001 没建出来: %v", plane.policies)
+	}
+	if len(pol.Paths) != 1 || pol.Paths[0].Table != 10001 {
+		t.Fatalf("策略 1001 的路径应查选路表 10001，实际 %v", pol.Paths)
+	}
+	if !plane.tables[10001] {
+		t.Fatalf("选路表 10001 没建出来: %v", plane.tables)
+	}
+	// 种子路由：表里没有 0.0.0.0/0 → 必须种一条指向主表。
+	if !plane.routes[10001][netip.MustParsePrefix("0.0.0.0/0")] {
+		t.Fatalf("空选路表没有种子路由: %v", plane.routes)
+	}
+}
+
+// 选路表里已有默认路由（SLA 组件选过路）时，apply 不得覆盖它的选择。
+func TestPolicyDynamicSeedSkipsExistingRoute(t *testing.T) {
+	plane := newFakePolicyPlane()
+	a := newPolicyApplier(t, plane)
+	p := netip.MustParsePrefix("0.0.0.0/0")
+	seg := policySegment(t, []policyRowJSON{
+		{ID: 2, VPN: policyVPN, Dst: "192.0.2.0/24", Attach: []string{policyIfA},
+			Mode: "dynamic", Peer: 3, SelectorTable: 10002},
+	})
+	plane.routes[10002] = map[netip.Prefix]bool{p: true} // SLA 组件已经写过
+	if err := a.applyPolicy(context.Background(), installedPolicy(seg)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for _, c := range plane.calls {
+		if strings.HasPrefix(c, "route(10002,") {
+			t.Fatalf("选路表已有选择，apply 不该再写路由: %v", plane.calls)
+		}
+	}
+}
+
+// selector_table 与行号不一致 = 两边的公式分叉了，宁可拒绝也不下发。
+func TestPolicyDynamicRejectsForeignSelectorTable(t *testing.T) {
+	plane := newFakePolicyPlane()
+	a := newPolicyApplier(t, plane)
+	seg := policySegment(t, []policyRowJSON{
+		{ID: 1, VPN: policyVPN, Dst: "192.0.2.0/24", Attach: []string{policyIfA},
+			Mode: "dynamic", Peer: 3, SelectorTable: 20001},
+	})
+	err := a.applyPolicy(context.Background(), installedPolicy(seg))
+	if err == nil || !strings.Contains(err.Error(), "不一致") {
+		t.Fatalf("selector_table 与行号不一致应整段拒绝，实际 err=%v", err)
+	}
+	if len(plane.policies) != 0 {
+		t.Fatalf("拒绝之后不该有任何策略落地: %v", plane.policies)
 	}
 }

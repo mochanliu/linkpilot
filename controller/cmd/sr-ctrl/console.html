@@ -278,6 +278,15 @@
   #pl-rows input{width:100%;min-width:84px;padding:4px 7px;font-size:12.5px}
   #pl-rows input:disabled{color:var(--muted);background:var(--soft)}
   #pl-rows select{padding:4px 6px;font-size:12.5px;min-width:104px}
+  /* 动态行的控件都住在"颜色 / 动态"那一格里：对端下拉、候选颜色、SLA 门槛、
+     盒子上报的当前颜色，从上往下排 —— 和静态行的单个下拉相比，这一格宽不了，
+     只能高。 */
+  #pl-rows .pl-dyn{display:flex;flex-direction:column;gap:4px;min-width:190px}
+  #pl-rows .pl-cands{display:flex;flex-wrap:wrap;gap:2px 8px;font-size:12px;color:var(--fg)}
+  #pl-rows .pl-cands .chk{gap:3px}
+  #pl-rows .pl-sla{display:flex;flex-wrap:wrap;gap:2px 8px;font-size:12px;color:var(--muted)}
+  #pl-rows .pl-sla input{width:58px;min-width:58px;padding:2px 4px;font-size:12px}
+  #pl-rows .pl-dyn .tag{align-self:flex-start}
   .pl-attach{font-size:12px;color:var(--muted);max-width:200px;word-break:break-all}
   .pl-fb td{text-align:center;white-space:nowrap}
   .pl-fb td:first-child{text-align:left}
@@ -6918,8 +6927,19 @@
 
   function plDraftOf(doc) {
     var rows = (doc.rows || []).map(function (r) {
-      return { vpn: r.vpn, color: r.color, src: r.src || "", dst: r.dst || "",
+      var row = { vpn: r.vpn, color: r.color, src: r.src || "", dst: r.dst || "",
         proto: r.proto || 0, src_port: r.src_port || "", dst_port: r.dst_port || "" };
+      // 动态行才带这几个键（undefined 不会进 JSON.stringify）：静态行保持和老
+      // 版本一样的形状，"没改动"的比较才不会因为多出 null 字段而误报。
+      if (r.mode === "dynamic") {
+        row.mode = "dynamic";
+        row.peer = r.peer || 0;
+        row.colors = (r.colors || []).slice();
+        row.sla = { latency_ms: (r.sla && r.sla.latency_ms) || 0,
+          jitter_ms: (r.sla && r.sla.jitter_ms) || 0,
+          loss_permille: (r.sla && r.sla.loss_permille) || 0 };
+      }
+      return row;
     });
     var fb = (doc.fallback || []).map(function (f) { return { vpn: f.vpn, color: f.color }; });
     // 刻意不带版本号：这里的"有没有改动"要回答的是"第 7 段会不会变"，
@@ -6997,12 +7017,13 @@
     /* --- 策略行 --- */
     h += '<section class="panel"><header><h2>策略行</h2>' +
       '<div class="row-actions"><button class="small" type="button" data-pl="row-add">加一行</button></div></header>' +
-      '<div class="hint">' + esc(doc.notes.rows) + " " + esc(doc.notes.attach) + "</div>";
+      '<div class="hint">' + esc(doc.notes.rows) + " " + esc(doc.notes.attach) + " " +
+      esc(doc.notes.dynamic || "") + "</div>";
     if (!d.rows.length) {
       h += '<div class="empty">还没有策略行：所有流量按主表（颜色 0）选路。</div>';
     } else {
       h += '<table id="pl-rows"><thead><tr>' +
-        "<th>顺序</th><th>VPN</th><th>颜色</th><th>源前缀</th><th>目的前缀</th><th>协议</th>" +
+        "<th>顺序</th><th>VPN</th><th>模式</th><th>颜色 / 动态</th><th>源前缀</th><th>目的前缀</th><th>协议</th>" +
         "<th>源端口</th><th>目的端口</th><th>入口口</th><th></th>" +
         "</tr></thead><tbody>" + d.rows.map(function (r, i) { return plRowHtml(o, r, i); }).join("") +
         "</tbody></table>";
@@ -7039,10 +7060,12 @@
   function plRowHtml(o, r, i) {
     var last = o.draft.rows.length - 1;
     var ports = r.proto === 6 || r.proto === 17;
+    var dyn = r.mode === "dynamic";
     var h = "<tr>";
     h += '<td class="muted num">' + (i + 1) + "</td>";
     h += "<td>" + plVPNOptions(o, r, i) + "</td>";
-    h += "<td>" + plColorOptions(o, r, i) + "</td>";
+    h += "<td>" + plModeOptions(o, r, i) + "</td>";
+    h += "<td>" + (dyn ? plDynamicPanel(o, r, i) : plColorOptions(o, r, i)) + "</td>";
     h += '<td><input data-pl-row="' + i + '" data-pl-f="src" value="' + esc(r.src) + '" placeholder="任意" spellcheck="false"></td>';
     h += '<td><input data-pl-row="' + i + '" data-pl-f="dst" value="' + esc(r.dst) + '" placeholder="任意" spellcheck="false"></td>';
     h += "<td>" + plProtoOptions(o, r, i) + "</td>";
@@ -7056,6 +7079,68 @@
       '<button class="small" type="button" data-pl="row-down" data-i="' + i + '"' + (i === last ? " disabled" : "") + ">↓</button>" +
       '<button class="small danger" type="button" data-pl="row-del" data-i="' + i + '">删除</button>' +
       "</td></tr>";
+    return h;
+  }
+
+  function plModeOptions(o, r, i) {
+    var peers = plPeersOf(o.doc);
+    var noPeers = !peers.length;
+    var h = '<select data-pl-row="' + i + '" data-pl-f="mode"' + (noPeers ? " disabled title=\"这台设备还没有隧道拓扑，动态模式不可用\"" : "") + ">";
+    h += '<option value="static"' + (!dyn(r) ? " selected" : "") + ">静态（钉死颜色）</option>";
+    h += '<option value="dynamic"' + (dyn(r) ? " selected" : "") + ">动态（按 SLA 挑）</option>";
+    return h + "</select>";
+  }
+
+  function dyn(r) { return r.mode === "dynamic"; }
+
+  // plDynamicPanel 是动态行在"颜色"那一格里的一组控件：对端、候选颜色、SLA
+  // 门槛，外加盒子上报的"当前颜色"。都在一个格里是为了和静态行的颜色下拉一样
+  // "一眼看到这一行把流送去了哪"。
+  function plDynamicPanel(o, r, i) {
+    var doc = o.doc;
+    var peers = plPeersOf(doc);
+    var h = '<div class="pl-dyn">';
+    h += '<select data-pl-row="' + i + '" data-pl-f="peer">';
+    if (!peers.length) {
+      h += '<option value="0">（无隧道拓扑）</option>';
+    } else {
+      var seen = false;
+      peers.forEach(function (p) {
+        var sel = p.node_id === r.peer;
+        if (sel) seen = true;
+        h += '<option value="' + p.node_id + '"' + (sel ? " selected" : "") + ">" +
+          esc(plPeerName(doc, p.node_id)) + "（" + (p.colors || []).join("/") + "）</option>";
+      });
+      if (!seen) h += '<option value="' + (r.peer || 0) + '" selected>node-' + esc(r.peer || 0) + "（无隧道）</option>";
+    }
+    h += "</select>";
+    // 候选颜色：来自该对端的隧道颜色；不勾 = 全部候选。
+    var p = plPeerOf(doc, r.peer);
+    if (p && (p.colors || []).length) {
+      h += '<div class="pl-cands">';
+      (p.colors || []).forEach(function (c) {
+        // 不勾 = 全部候选：这里把"空数组"显示成"全选"，但保存的仍是空数组
+        // （语义由盒子解释：空 = 该对端全部颜色）。勾选状态只反映"会参与选路"。
+        var checked = !(r.colors || []).length || (r.colors || []).indexOf(c) >= 0;
+        h += '<label class="chk"><input type="checkbox" data-pl-cand="' + i + '" value="' + c + '"' +
+          (checked ? " checked" : "") + ">颜色 " + c + "</label>";
+      });
+      h += "</div>";
+    } else {
+      h += '<div class="pl-cands muted">（该对端暂无隧道颜色）</div>';
+    }
+    var sla = r.sla || {};
+    h += '<div class="pl-sla">' +
+      '<label>延迟≤<input type="number" min="0" step="any" data-pl-row="' + i + '" data-pl-f="sla_latency_ms" value="' + esc(sla.latency_ms || "") + '" placeholder="不限">ms</label>' +
+      '<label>抖动≤<input type="number" min="0" step="any" data-pl-row="' + i + '" data-pl-f="sla_jitter_ms" value="' + esc(sla.jitter_ms || "") + '" placeholder="不限">ms</label>' +
+      '<label>丢包≤<input type="number" min="0" step="1" data-pl-row="' + i + '" data-pl-f="sla_loss_permille" value="' + esc(sla.loss_permille || "") + '" placeholder="不限">‰</label>' +
+      "</div>";
+    // 盒子上报的当前选择（只读）：doc 里的行和草稿按同一下标对齐。
+    var docRow = (doc.rows || [])[i];
+    if (docRow && docRow.mode === "dynamic" && docRow.current_color) {
+      h += '<div class="tag online">当前 → 颜色 ' + esc(docRow.current_color) + "</div>";
+    }
+    h += "</div>";
     return h;
   }
 
@@ -7179,6 +7264,21 @@
     render();
   }
 
+  // plPeersOf 是对端下拉框的数据：动态行的 SLA 量到哪台对端，从这台设备的
+  // 隧道拓扑来。没有隧道拓扑时返回空数组，页面上动态模式会被禁用。
+  function plPeersOf(doc) { return doc.peers || []; }
+
+  function plPeerOf(doc, id) {
+    var out = null;
+    plPeersOf(doc).forEach(function (p) { if (p.node_id === id) out = p; });
+    return out;
+  }
+
+  function plPeerName(doc, id) {
+    var p = plPeerOf(doc, id);
+    return p ? ("node-" + id + (p.name ? " · " + p.name : "")) : "node-" + id;
+  }
+
   function plRowDel(i) {
     var o = plStore();
     if (!o.draft) return;
@@ -7228,6 +7328,46 @@
     if (row == null || !f || !o.draft) return;
     var r = o.draft.rows[Number(row)];
     if (!r) return;
+    if (f === "mode") {
+      // 静态↔动态是两种不同的行：切过去就补上动态行的初始形状（对端取拓扑里
+      // 第一台、候选留空 = 全部、门槛全 0 = 不设门槛），切回来就清掉动态字段，
+      // 颜色回到 0（保存前用户一定会改）。
+      if (el.value === "dynamic") {
+        var peers = plPeersOf(o.doc);
+        r.mode = "dynamic";
+        r.peer = r.peer || (peers.length ? peers[0].node_id : 0);
+        r.colors = r.colors || [];
+        r.sla = r.sla || { latency_ms: 0, jitter_ms: 0, loss_permille: 0 };
+      } else {
+        delete r.mode;
+        delete r.peer;
+        delete r.colors;
+        delete r.sla;
+        r.color = 0;
+      }
+      blurContent();
+      render();
+      return;
+    }
+    if (f === "peer") {
+      r.peer = Number(el.value);
+      // 换对端后候选集合也换了：清空让"空 = 全部"语义重新生效，避免留着一组
+      // 新对端根本没有的颜色。
+      r.colors = [];
+      blurContent();
+      render();
+      return;
+    }
+    var cand = el.getAttribute("data-pl-cand");
+    if (cand != null && r.mode === "dynamic") {
+      var c = Number(el.value);
+      r.colors = r.colors || [];
+      var at = r.colors.indexOf(c);
+      if (el.checked && at < 0) r.colors.push(c);
+      if (!el.checked && at >= 0) r.colors.splice(at, 1);
+      r.colors.sort(function (a, b) { return a - b; });
+      return;
+    }
     if (f === "vpn" || f === "color" || f === "proto") r[f] = Number(el.value);
     else r[f] = el.value;
     // 协议换成 icmp/任意时端口不再有意义：两个框当场禁用并清空，免得"填了端口
@@ -7250,6 +7390,13 @@
     if (row == null || !f || !o.draft) return;
     var r = o.draft.rows[Number(row)];
     if (!r) return;
+    if (f.indexOf("sla_") === 0) {
+      // SLA 三项是数字：空串 = 不约束 = 0。
+      r.sla = r.sla || { latency_ms: 0, jitter_ms: 0, loss_permille: 0 };
+      var v = parseFloat(el.value);
+      r.sla[f.slice(4)] = isNaN(v) ? 0 : v;
+      return;
+    }
     r[f] = el.value;
   }
 

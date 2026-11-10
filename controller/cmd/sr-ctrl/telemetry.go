@@ -25,6 +25,7 @@ import (
 // the next window's numbers.
 type nodeTelemetry struct {
 	rows   []wire.TunnelMetrics
+	sel    []wire.PolicySelection
 	seenAt int64
 }
 
@@ -81,6 +82,18 @@ func (s *server) postMetrics(w http.ResponseWriter, r *http.Request, tenant stri
 		}
 		seen[row.SwIfIndex] = true
 	}
+	selSeen := map[int]bool{}
+	for _, s := range rep.Selections {
+		if s.RowID == 0 {
+			http.Error(w, "selection with row_id 0", 400)
+			return
+		}
+		if selSeen[s.RowID] {
+			http.Error(w, "duplicate row_id "+strconv.Itoa(s.RowID)+" in selections", 400)
+			return
+		}
+		selSeen[s.RowID] = true
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -90,6 +103,7 @@ func (s *server) postMetrics(w http.ResponseWriter, r *http.Request, tenant stri
 	}
 	s.tel[key(tenant, nodeID)] = &nodeTelemetry{
 		rows:   rep.Tunnels,
+		sel:    rep.Selections,
 		seenAt: time.Now().Unix(),
 	}
 	// No save(): see the file header. Responding without touching disk also keeps
@@ -144,6 +158,9 @@ func (s *server) telemetryLocked(tenant string, reader, only uint16, now int64) 
 			}
 			if t.rows != nil {
 				row.Tunnels = t.rows
+			}
+			if t.sel != nil {
+				row.Selections = t.sel
 			}
 		}
 		v.Nodes = append(v.Nodes, row)

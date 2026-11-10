@@ -1,8 +1,17 @@
 // The 7th artifact: static SD-WAN policy (VPP ABF + ACL).
 //
-// 一条策略行 = "这类流属于哪个颜色"。落地方式不是"引流到某个下一跳"，而是
+// 一条**静态**策略行 = "这类流属于哪个颜色"。落地方式不是"引流到某个下一跳"，而是
 // "引流到那张颜色的 FIB 表"：颜色表由 sr-fib 按 BFD/隧道状态自己收敛路径，
 // 所以链路抖动不需要重写策略，策略也不必知道隧道现在通不通（owner 2026-11-10）。
+//
+// 一条**动态**策略行（mode=dynamic）= "这类流按 SLA 现场挑颜色"。它不指向颜色表，
+// 而是指向这一行自己的**选路表**（fib.SelectorTable(id)，表号由控制器渲染进段里）：
+// 表里只有一条 0.0.0.0/0 的 deag 路由，指向当前选中的颜色表。改选路 = 重写那一条
+// 路由，ACL 与 ABF 原封不动 —— 这是刻意的：改 ABF 的路径要走
+// 摘挂点→删策略→建策略→挂回，每次重选都来一遍既慢、又撞"删挂着的策略会崩 VPP"
+// 那条红线。写这条路由的日常责任在盒子的 sla.Selector（cmd/sr-agent 内的组件）；
+// 这一段只在表为空时种一条指向主表的种子路由，填掉"配置落地到首次选路之间"的
+// 黑洞窗口。
 //
 // 和 VRRP（第 6 段）同一个形状：这不是一个盒子要保存的文件，而是 VPP 内存里的
 // 状态，所以这一段是**对账指令** —— 盒子读 VPP 自己的 dump，把差异补齐。三个
@@ -45,6 +54,7 @@ import (
 	"strings"
 
 	"sdwan/controller/internal/fib"
+	"sdwan/controller/internal/sla"
 	"sdwan/controller/internal/vppapi"
 )
 
@@ -60,7 +70,13 @@ const (
 	policyAttachBase = 1000
 	// policyMaxRowID 与控制器侧的约束一致（行号进 tag 与 policy_id）。
 	policyMaxRowID = 999
+
+	// policyModeDynamic 是动态行的 mode 值，与控制器侧同名常量对齐。
+	policyModeDynamic = "dynamic"
 )
+
+// fallbackPrefix4 是选路表里那条种子路由的前缀（sr-fib 的兜底路由也用它）。
+var fallbackPrefix4 = netip.MustParsePrefix("0.0.0.0/0")
 
 // policySegmentDoc 是第 7 段的形状。Rows 必填（可以为空数组：策略清空也是一种
 // 指令）；Fallback 是"每 VRF 每颜色"的兜底开关，只带勾上的那些。
@@ -72,13 +88,30 @@ type policySegmentDoc struct {
 type policyRowDoc struct {
 	ID      int      `json:"id"`
 	VPN     uint32   `json:"vpn"`
-	Color   uint8    `json:"color"`
+	Color   uint8    `json:"color,omitempty"`
 	Src     string   `json:"src,omitempty"`
 	Dst     string   `json:"dst,omitempty"`
 	Proto   uint8    `json:"proto,omitempty"`
 	SrcPort string   `json:"src_port,omitempty"`
 	DstPort string   `json:"dst_port,omitempty"`
 	Attach  []string `json:"attach"`
+
+	// 动态行专属（控制器渲染，见 cmd/sr-ctrl/policy.go 的 PolicyRow）。动态行
+	// 的 ABF 不指向颜色表，而是指向这一行自己的**选路表**：表里只有一条
+	// 0.0.0.0/0 的 deag 路由，指向当前选中的颜色表，由盒子的 sla.Selector 按
+	// 探针指标重写。SLA 在这里只是留给 sla.Selector 的输入，第 7 段的对账不读它。
+	Mode          string        `json:"mode,omitempty"`
+	Peer          uint16        `json:"peer,omitempty"`
+	Colors        []uint8       `json:"colors,omitempty"`
+	SLA           *policySLADoc `json:"sla,omitempty"`
+	SelectorTable uint32        `json:"selector_table,omitempty"`
+}
+
+// policySLADoc 是动态行的门槛（低于/不多于算达标；0 = 这一项不约束）。
+type policySLADoc struct {
+	LatencyMS    float64 `json:"latency_ms,omitempty"`
+	JitterMS     float64 `json:"jitter_ms,omitempty"`
+	LossPermille uint32  `json:"loss_permille,omitempty"`
 }
 
 type policyFBRowDoc struct {
@@ -124,6 +157,42 @@ func PolicyFallbacks(seg string) ([]Fallback, error) {
 	return out, nil
 }
 
+// DynamicPolicyRows 从第 7 段里解出动态行，喂给盒子的 sla.Selector。静态行不
+// 出现在结果里：它们的 ABF 已经钉死颜色，选路组件不需要知道它们。
+//
+// 与 PolicyFallbacks 同一个角色：两个组件（apply 与 selector）各读第 7 段里自己
+// 的那一半，段损坏都报错，静默返回空会让动态策略悄悄失效。空段（老配置包）返回
+// nil。
+func DynamicPolicyRows(seg string) ([]sla.Row, error) {
+	if strings.TrimSpace(seg) == "" {
+		return nil, nil
+	}
+	doc, err := decodePolicySegment(seg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sla.Row, 0, len(*doc.Rows))
+	for _, r := range *doc.Rows {
+		if r.Mode != policyModeDynamic {
+			continue
+		}
+		row := sla.Row{
+			ID:            r.ID,
+			VPN:           r.VPN,
+			Peer:          r.Peer,
+			Colors:        r.Colors,
+			SelectorTable: r.SelectorTable,
+		}
+		if s := r.SLA; s != nil {
+			row.MaxLatencyMS = s.LatencyMS
+			row.MaxJitterMS = s.JitterMS
+			row.MaxLossPermille = s.LossPermille
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 func decodePolicySegment(seg string) (policySegmentDoc, error) {
 	var doc policySegmentDoc
 	if err := json.Unmarshal([]byte(seg), &doc); err != nil {
@@ -141,6 +210,10 @@ type policyPlane interface {
 	// IPTableAddDel 只用来在 ABF 之前把目标颜色表补出来：颜色表的 owner 是
 	// sr-fib，但它是另一个进程，这一轮跑的时候那张表可能还没被建出来。
 	IPTableAddDel(context.Context, uint32, bool) error
+	// IPRoutes / IPRouteAddDel 只服务动态行的选路表：读现状判断要不要种种子
+	// 路由，种路由用的是与 sr-fib 兜底同一个 deag 形态。日常的重选不在这里。
+	IPRoutes(context.Context, uint32) ([]netip.Prefix, error)
+	IPRouteAddDel(context.Context, uint32, netip.Prefix, []vppapi.FIBPath, bool) error
 	ACLs(context.Context) ([]vppapi.ACLDetail, error)
 	ACLAddReplace(context.Context, uint32, string, []vppapi.ACLRule) (uint32, error)
 	ACLDel(context.Context, uint32) error
@@ -153,13 +226,15 @@ type policyPlane interface {
 
 // desiredRow 是一行策略解开之后的样子：VPP 需要的三样东西都在这里。
 type desiredRow struct {
-	label  string
-	aclTag string
-	abfID  uint32
-	rules  []vppapi.ACLRule
-	table  uint32
-	ifaces []uint32
-	prio   uint32
+	label   string
+	aclTag  string
+	abfID   uint32
+	rules   []vppapi.ACLRule
+	table   uint32
+	ifaces  []uint32
+	prio    uint32
+	vpn     uint32
+	dynamic bool
 }
 
 // applyPolicy 把 VPP 里的 ACL/ABF/挂点对账到第 7 段。段不存在时什么都不动
@@ -346,6 +421,41 @@ func (a *Applier) applyPolicy(ctx context.Context, inst Installed) error {
 		}
 	}
 
+	// 4b. 动态行的选路表里种一条默认路由（指向主表，即颜色 0），**仅当表里还没有**
+	//
+	// 选路表的日常写者是盒子的 sla.Selector（按探针指标改那一条 deag 路由），
+	// 不是这一段。这里补种子只覆盖一个窗口：配置刚落地、SLA 组件还没来得及做
+	// 第一次选择的那一秒 —— 表空着就是黑洞，而"发布完策略、流量断一秒"是最难
+	// 排的那种故障。已经选过路（表里有 0.0.0.0/0）就什么都不动：selector 的选择
+	// 不许被一次 apply 冲掉。
+	for _, d := range desired {
+		if !d.dynamic {
+			continue
+		}
+		pfx, err := plane.IPRoutes(ctx, d.table)
+		if err != nil {
+			return fmt.Errorf("policy: 读选路表 %d 现状: %w", d.table, err)
+		}
+		seeded := false
+		for _, p := range pfx {
+			if p == fallbackPrefix4 {
+				seeded = true
+				break
+			}
+		}
+		if seeded {
+			continue
+		}
+		// 种子指向主表（= 颜色 0 的落点），不是某个候选颜色：这一步没有探针数据
+		// 可用，猜一个"最好"的颜色没有依据；主表是这台 VPN 的默认路径，语义是
+		// "先按普通路由走，SLA 组件上来之后马上接管"。
+		path := vppapi.FIBPath{SWIfIndex: ^uint32(0), TableID: d.vpn}
+		if err := plane.IPRouteAddDel(ctx, d.table, fallbackPrefix4, []vppapi.FIBPath{path}, true); err != nil {
+			return fmt.Errorf("policy: %s 的选路表 %d 种不出默认路由: %w", d.label, d.table, err)
+		}
+		a.Logf("policy: %s 选路表 %d 种入 0.0.0.0/0 → 表 %d（种子，等 SLA 组件接管）", d.label, d.table, d.vpn)
+	}
+
 	// 5. 建策略：不存在或刚被删掉的。
 	for _, d := range desired {
 		if _, ok := polByID[d.abfID]; ok {
@@ -432,8 +542,15 @@ func planPolicyRows(ctx context.Context, plane policyPlane, rows []policyRowDoc)
 	}
 	out := make([]desiredRow, 0, len(rows))
 	seenID := map[int]bool{}
+	seenSelector := map[uint32]int{}
 	for _, r := range rows {
-		label := fmt.Sprintf("行 %d（VPN %d，颜色 %d）", r.ID, r.VPN, r.Color)
+		dynamic := r.Mode == "dynamic"
+		var label string
+		if dynamic {
+			label = fmt.Sprintf("行 %d（VPN %d，动态→对端 %d）", r.ID, r.VPN, r.Peer)
+		} else {
+			label = fmt.Sprintf("行 %d（VPN %d，颜色 %d）", r.ID, r.VPN, r.Color)
+		}
 		if r.ID < 1 || r.ID > policyMaxRowID {
 			return nil, fmt.Errorf("policy: %s 的行号必须在 1..%d 之间（它要进 ACL tag 与 policy_id）", label, policyMaxRowID)
 		}
@@ -444,24 +561,55 @@ func planPolicyRows(ctx context.Context, plane policyPlane, rows []policyRowDoc)
 		if r.VPN > uint32(fib.MaxVRFID) || r.VPN == uint32(fib.OverlayTable) {
 			return nil, fmt.Errorf("policy: %s 的 VPN 号不合法（0..%d，%d 留给 overlay）", label, fib.MaxVRFID, fib.OverlayTable)
 		}
-		if r.Color > fib.MaxColor {
-			return nil, fmt.Errorf("policy: %s 的颜色超出 0..%d", label, fib.MaxColor)
+		if r.Mode != "" && r.Mode != "dynamic" {
+			return nil, fmt.Errorf("policy: %s 的 mode「%s」不认识（留空 = 静态，dynamic = 动态）", label, r.Mode)
 		}
-		table, err := fib.ColorTable(r.Color, r.VPN)
-		if err != nil {
-			return nil, fmt.Errorf("policy: %s: %w", label, err)
+		var table uint32
+		if dynamic {
+			// 动态行查的是它自己的选路表。表号必须等于 SelectorTableBase+行号：
+			// 控制器渲染的，这里不认第二个公式 —— 不一致说明两边的实现分叉了，
+			// 放过去就是把流量引到一张没人写的表里（黑洞）。
+			st, err := fib.SelectorTable(r.ID)
+			if err != nil {
+				return nil, fmt.Errorf("policy: %s: %w", label, err)
+			}
+			if r.SelectorTable != st {
+				return nil, fmt.Errorf("policy: %s 的 selector_table=%d 与行号折算的 %d 不一致：两边有一边的公式分叉了，拒绝下发", label, r.SelectorTable, st)
+			}
+			if r.Peer == 0 {
+				return nil, fmt.Errorf("policy: %s 是动态行但没有对端（peer）：SLA 是按到对端的隧道量的", label)
+			}
+			if prev := seenSelector[r.SelectorTable]; prev != 0 {
+				return nil, fmt.Errorf("policy: 行 %d 与行 %d 的选路表都是 %d：一个表号只能属于一行", prev, r.ID, r.SelectorTable)
+			}
+			seenSelector[r.SelectorTable] = r.ID
+			table = r.SelectorTable
+		} else {
+			if r.Color > fib.MaxColor {
+				return nil, fmt.Errorf("policy: %s 的颜色超出 0..%d", label, fib.MaxColor)
+			}
+			ct, err := fib.ColorTable(r.Color, r.VPN)
+			if err != nil {
+				return nil, fmt.Errorf("policy: %s: %w", label, err)
+			}
+			table = ct
+		}
+		if s := r.SLA; s != nil && (s.LatencyMS < 0 || s.JitterMS < 0 || s.LossPermille > 1000) {
+			return nil, fmt.Errorf("policy: %s 的 SLA 门槛不合法（延迟/抖动 ≥ 0，丢包 ≤ 1000‰）", label)
 		}
 		rules, err := aclRulesFor(r)
 		if err != nil {
 			return nil, fmt.Errorf("policy: %s: %w", label, err)
 		}
 		d := desiredRow{
-			label:  label,
-			aclTag: policyTagPrefix + strconv.Itoa(r.ID),
-			abfID:  policyABFBase + uint32(r.ID),
-			rules:  rules,
-			table:  table,
-			prio:   policyAttachBase + uint32(r.ID),
+			label:   label,
+			aclTag:  policyTagPrefix + strconv.Itoa(r.ID),
+			abfID:   policyABFBase + uint32(r.ID),
+			rules:   rules,
+			table:   table,
+			prio:    policyAttachBase + uint32(r.ID),
+			vpn:     r.VPN,
+			dynamic: dynamic,
 		}
 		if len(r.Attach) == 0 {
 			return nil, fmt.Errorf("policy: %s 一个入口口都没有（这个 VPN 下没有接口？）：装了也不会匹配任何流量", label)

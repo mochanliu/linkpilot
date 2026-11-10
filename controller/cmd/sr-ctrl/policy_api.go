@@ -11,12 +11,14 @@ package main
 // 心跳自己拉），所以这一页没有第二个发布实现。
 
 import (
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"sdwan/controller/internal/fib"
 	"sdwan/controller/internal/underlay"
 	"sdwan/controller/internal/wire"
 )
@@ -45,6 +47,24 @@ type policyRowView struct {
 	DstPort string   `json:"dst_port,omitempty"`
 	Attach  []string `json:"attach"`
 	Match   string   `json:"match"`
+
+	// 动态行专属。静态行这些键是零值，页面按 Mode 分支渲染。
+	Mode          string     `json:"mode,omitempty"`
+	Peer          uint16     `json:"peer,omitempty"`
+	PeerName      string     `json:"peer_name,omitempty"`
+	Colors        []uint8    `json:"colors,omitempty"`
+	SLA           *PolicySLA `json:"sla,omitempty"`
+	SelectorTable uint32     `json:"selector_table,omitempty"`
+	// CurrentColor 是盒子上的选路组件**现在**给这一行选的颜色（-1 = 还没有
+	// 上报/这一行是静态的）。它来自监控回报，不是草稿的一部分。
+	CurrentColor int8 `json:"current_color,omitempty"`
+}
+
+// policyPeerRow 是动态行的对端下拉框：这台设备到每台对端各有哪些颜色。
+type policyPeerRow struct {
+	NodeID uint16  `json:"node_id"`
+	Name   string  `json:"name,omitempty"`
+	Colors []uint8 `json:"colors"`
 }
 
 // policyVPNRow 是 VPN 选择框的一项。IfaceCount 为 0 的 VPN 在页面上要标出来：
@@ -92,6 +112,7 @@ type policyView struct {
 	Fallback []policyFallbackRow `json:"fallback"`
 	VPNs     []policyVPNRow      `json:"vpns"`
 	Colors   []policyColorRow    `json:"colors"`
+	Peers    []policyPeerRow     `json:"peers"`
 
 	Protocols []policyProtoOption `json:"protocols"`
 	MaxRows   int                 `json:"max_rows"`
@@ -134,6 +155,29 @@ func policyRowMatchText(r PolicyRow) string {
 		}
 		out += " · 源端口 " + sp + " · 目的端口 " + dp
 	}
+	if r.Mode == policyModeDynamic {
+		out += " · 动态 → 对端 #" + strconv.FormatUint(uint64(r.Peer), 10)
+		if len(r.Colors) > 0 {
+			out += " · 候选 " + policyColorList(r.Colors)
+		}
+		if s := r.SLA; s != nil && *s != (PolicySLA{}) {
+			var parts []string
+			if s.LatencyMS > 0 {
+				parts = append(parts, fmt.Sprintf("延迟≤%gms", s.LatencyMS))
+			}
+			if s.JitterMS > 0 {
+				parts = append(parts, fmt.Sprintf("抖动≤%gms", s.JitterMS))
+			}
+			if s.LossPermille > 0 {
+				parts = append(parts, fmt.Sprintf("丢包≤%d‰", s.LossPermille))
+			}
+			if len(parts) > 0 {
+				out += " · " + strings.Join(parts, "，")
+			}
+		} else {
+			out += " · 不设门槛"
+		}
+	}
 	return out
 }
 
@@ -158,6 +202,7 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 		Fallback:  []policyFallbackRow{},
 		VPNs:      []policyVPNRow{},
 		Colors:    []policyColorRow{},
+		Peers:     []policyPeerRow{},
 		Protocols: policyProtoOptions(),
 		MaxRows:   policyMaxRows,
 		MaxColor:  underlay.MaxTunnelColor,
@@ -171,6 +216,9 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 				"加一条默认路由指向颜色 0（本 VPN 主表），该颜色查不到时退回去而不是丢掉。",
 			"color": "颜色决定走哪张 VPP 表（表号 = 颜色×1000 + VPN）。表里的路径由 sr-fib " +
 				"按隧道状态自己收敛，所以链路抖动不用改策略。",
+			"dynamic": "动态行不钉颜色：盒子盯着到指定对端的每条颜色隧道的探针指标" +
+				"（延迟/抖动/丢包），满足门槛的里面挑延迟最低的一条。全部不达标时走" +
+				"最接近的一条，不会因为一时抖动断流。\"当前颜色\"是盒子上报的实时选择。",
 		},
 	}
 
@@ -211,14 +259,57 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 		view.Colors = append(view.Colors, row)
 	}
 
+	// 对端下拉框：动态行要选"SLA 量到哪台对端"。没有隧道拓扑的设备给空列表，
+	// 页面把动态模式禁用掉并说明原因 —— 和 VPN 下拉框同一个形状。
+	peerColors, hasPeers := s.nodeTunnelPeersLocked(tenantID, nodeID)
+	if hasPeers {
+		for peer, colors := range peerColors {
+			row := policyPeerRow{NodeID: peer, Colors: colors}
+			if n := s.state.Nodes[key(tenantID, peer)]; n != nil {
+				row.Name = n.Serial
+			}
+			view.Peers = append(view.Peers, row)
+		}
+		sort.Slice(view.Peers, func(i, j int) bool { return view.Peers[i].NodeID < view.Peers[j].NodeID })
+	}
+
+	// 当前选路来自监控回报（agent 的 sla.Selector 随遥测一起报）。没有回报就
+	// 是"未上报"，CurrentColor 保持 0 且靠 omitempty 缺省。
+	var currentColor map[int]wire.PolicySelection
+	if t := s.tel[key(tenantID, nodeID)]; t != nil && t.sel != nil {
+		currentColor = make(map[int]wire.PolicySelection, len(t.sel))
+		for _, sel := range t.sel {
+			currentColor[sel.RowID] = sel
+		}
+	}
+
 	for _, r := range set.Rows {
-		view.Rows = append(view.Rows, policyRowView{
+		row := policyRowView{
 			ID: r.ID, VPN: r.VPN, Color: r.Color,
 			Src: r.Src, Dst: r.Dst, Proto: r.Proto,
 			SrcPort: r.SrcPort, DstPort: r.DstPort,
 			Attach: policyAttachIfaces(&cfg, r.VPN),
 			Match:  policyRowMatchText(r),
-		})
+		}
+		if r.Mode == policyModeDynamic {
+			row.Mode = r.Mode
+			row.Peer = r.Peer
+			if n := s.state.Nodes[key(tenantID, r.Peer)]; n != nil {
+				row.PeerName = n.Serial
+			}
+			row.Colors = r.Colors
+			row.SLA = r.SLA
+			if st, err := fib.SelectorTable(r.ID); err == nil {
+				row.SelectorTable = st
+			}
+		}
+		if sel, ok := currentColor[r.ID]; ok {
+			row.CurrentColor = int8(sel.Color)
+			if row.Match != "" {
+				row.Match += " · 当前颜色 " + strconv.Itoa(int(sel.Color))
+			}
+		}
+		view.Rows = append(view.Rows, row)
 	}
 	for _, f := range set.Fallback {
 		view.Fallback = append(view.Fallback, policyFallbackRow{VPN: f.VPN, Color: f.Color})
@@ -331,7 +422,8 @@ func (s *server) putPolicy(w http.ResponseWriter, r *http.Request, id consoleIde
 }
 
 // policySetEqual 比的是"下发出去会不一样吗"，所以只比归一化之后的字段：
-// 行号（顺序）、匹配条件、兜底清单。ID 由 normalize 按顺序重排，天然包含在内。
+// 行号（顺序）、匹配条件、动态行的对端/候选/SLA、兜底清单。ID 由 normalize
+// 按顺序重排，天然包含在内；行的比较用 policyRowEqual（SLA 是指针，== 比不了）。
 func policySetEqual(a, b PolicySet) bool {
 	x, y := policySetCopy(a), policySetCopy(b)
 	normalizePolicySet(&x)
@@ -340,7 +432,7 @@ func policySetEqual(a, b PolicySet) bool {
 		return false
 	}
 	for i := range x.Rows {
-		if x.Rows[i] != y.Rows[i] {
+		if !policyRowEqual(x.Rows[i], y.Rows[i]) {
 			return false
 		}
 	}

@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -40,6 +41,7 @@ import (
 	"sdwan/controller/internal/agent"
 	"sdwan/controller/internal/apply"
 	"sdwan/controller/internal/keybinding"
+	"sdwan/controller/internal/sla"
 	"sdwan/controller/internal/vppapi"
 	"sdwan/controller/internal/wire"
 )
@@ -225,6 +227,11 @@ func main() {
 	// 才 PUT —— 所以 sr-fib 自己重启丢表、隧道增删、VPP 重启换口名，都是同一
 	// 条路自愈。
 	var fibTab *agent.FibTableSync
+	// sel / selRefresh 是动态策略选路（internal/sla）与它的"重读第 7 段"动作。
+	// 声明在这里是因为两个使用者分居两处：apply 成功的回调（下面 newConfigSync
+	// 的包装）要调 selRefresh，metricsLoop 要 sel 的状态快照。
+	var sel *sla.Selector
+	var selRefresh func()
 	if *tunnels {
 		dial := func(ctx context.Context) (agent.DataPlane, error) {
 			return vppapi.Dial(ctx, *vppAPI, "sr-agent-tunnel")
@@ -259,6 +266,39 @@ func main() {
 		})
 		log.Printf("tunnel applier on (vpp api %s)", *vppAPI)
 		log.Printf("fib-table deriver on (sr-fib %s, vrfs from %s)", *fibConf, *routeConf)
+
+		// 动态策略选路（internal/sla）。行来自配置包第 7 段的动态行（apply 成功
+		// 之后刷新 + 启动时读已安装的那一版），隧道表来自 TunnelSync 的实时读数
+		// （sw_if_index 会被 VPP 重启换掉，必须每拍重读）。探测与写入走自己的
+		// VPP 连接：探针会话的建立/删除归 agent.Telemetry，这里只读。
+		if *applyCfg {
+			sel = sla.NewSelector(func(ctx context.Context) (sla.Plane, error) {
+				return vppapi.Dial(ctx, *vppAPI, "sr-agent-sla")
+			}, log.Printf)
+			refreshRows := func() {
+				inst, err := (apply.Store{Root: *storeRoot}).Current()
+				if errors.Is(err, apply.ErrNoConfig) {
+					sel.Reconcile(nil, nil)
+					return
+				}
+				if err != nil {
+					log.Printf("sla: 读已安装配置: %v", err)
+					return
+				}
+				rows, err := apply.DynamicPolicyRows(inst.Policy)
+				if err != nil {
+					log.Printf("sla: 第 7 段的动态行解析失败（保持上一版）: %v", err)
+					return
+				}
+				sel.Reconcile(rows, slaTunnels(tun.FibRows()))
+				if len(rows) > 0 {
+					log.Printf("sla: %d 条动态策略行在选路", len(rows))
+				}
+			}
+			selRefresh = refreshRows
+			refreshRows()
+			go slaLoop(ctx, sel, refreshRows, tun, log.Printf)
+		}
 	}
 	st.setChannels(tun, *vppAPI != "")
 	st.setStun(ss)
@@ -287,7 +327,7 @@ func main() {
 		} else if pusher != nil {
 			log.Printf("route-state pusher on (sr-route %s)", *routeConf)
 		}
-		go metricsLoop(ctx, tun.Telemetry(), client, pusher, log.Printf)
+		go metricsLoop(ctx, tun.Telemetry(), client, pusher, sel, log.Printf)
 	}
 
 	var cfg *configSync
@@ -304,7 +344,17 @@ func main() {
 		applier.RouteConf = *routeConf
 		applier.Logf = log.Printf
 		cfg = newConfigSync(id.NodeID(), store, client.ConfigBundle,
-			func(ctx context.Context, b apply.Bundle) error { return applier.Apply(ctx, b, false) },
+			func(ctx context.Context, b apply.Bundle) error {
+				if err := applier.Apply(ctx, b, false); err != nil {
+					return err
+				}
+				// 第 7 段可能换了动态行：选路组件重新读已安装的那一版。放在
+				// Apply 成功之后 —— apply 失败时 VPP 里还是旧策略，选路不该跟着换。
+				if selRefresh != nil {
+					selRefresh()
+				}
+				return nil
+			},
 			log.Printf, time.Now)
 		if cur := cfg.State(); cur.Version > 0 {
 			log.Printf("config sync on (store %s, running v%d)", *storeRoot, cur.Version)
@@ -463,6 +513,50 @@ func nextBackoff(cur time.Duration) time.Duration {
 	return cur
 }
 
+// slaInterval 是选路的评估节拍。探针默认 300ms 一发，1 秒一拍 = 每拍手里有
+// 3 个左右的新样本；迟滞要连续 3 拍（sla.holdRounds），整条切换链路 ≈ 3 秒，
+// 和"链路真断了多快要绕行"的运营预期一致。
+const slaInterval = time.Second
+
+// slaTunnels 把 TunnelSync 的隧道读数折成选路组件的输入。颜色可能缺（老控制器
+// 下发的隧道没有 color）：缺颜色的隧道对选路没有意义，丢掉而不是当成颜色 0 ——
+// 颜色 0 是主表，把它混进候选会让选路"选"到一条根本不存在的隧道。
+func slaTunnels(rows []agent.FibTunnelRow) []sla.Tunnel {
+	out := make([]sla.Tunnel, 0, len(rows))
+	for _, r := range rows {
+		if r.Color == nil || r.SWIfIndex == 0 {
+			continue
+		}
+		nh, err := netip.ParseAddr(r.NextHop)
+		if err != nil {
+			continue
+		}
+		out = append(out, sla.Tunnel{SWIfIndex: r.SWIfIndex, Peer: r.Peer, Color: *r.Color, NextHop: nh})
+	}
+	return out
+}
+
+// slaLoop 每拍：重读隧道表 → 评估 → 必要时写选路表。行清单由 refreshRows 在
+// apply 成功时刷新，这里不重读磁盘。
+func slaLoop(ctx context.Context, sel *sla.Selector, refreshRows func(), tun *agent.TunnelSync, logf func(string, ...any)) {
+	t := time.NewTicker(slaInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		// 隧道表每拍重读：VPP 重启会换 sw_if_index，探针会话也跟着重建，
+		// 选路组件必须跟着换输入，不能缓存一份"上次还行"的映射。行清单不在这里
+		// 刷新 —— 那是 selRefresh（apply 成功时）的事，避免每秒读一次盘。
+		sel.SetTunnels(slaTunnels(tun.FibRows()))
+		if err := sel.Tick(ctx); err != nil {
+			logf("sla: %v", err)
+		}
+	}
+}
+
 // metricsInterval 是上报窗口的长度。300ms 的探针在这一段里跑约 33 轮，够算出
 // 有意义的抖动/丢包；再短只是把同一条隧道的行刷得更勤，再长则断链要等更久才可见。
 const metricsInterval = 10 * time.Second
@@ -476,7 +570,7 @@ const metricsInterval = 10 * time.Second
 // pusher 是本机 sr-route 的 tunnel-state 客户端（#275）；nil 表示这台没有
 // route.json/status_addr，路由客户端仍按配置门槛走。上报控制器与推给
 // sr-route 各自成功/失败：一份份独立的通路，一条断了不影响另一条。
-func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client, pusher *agent.RouteStatePusher, logf func(string, ...any)) {
+func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client, pusher *agent.RouteStatePusher, sel *sla.Selector, logf func(string, ...any)) {
 	hadRows := false
 	for {
 		select {
@@ -487,7 +581,13 @@ func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		rows, err := tel.Sample(rctx)
 		if err == nil && (len(rows) > 0 || hadRows) {
-			err = client.ReportMetrics(rctx, wire.MetricsReport{Tunnels: rows})
+			rep := wire.MetricsReport{Tunnels: rows}
+			// 动态行的选路状态随同一节拍上报：控制台的"当前颜色"要的是和
+			// SLA 数字同一时刻的事实（见 wire.PolicySelection）。
+			if sel != nil {
+				rep.Selections = selectionsOf(sel.Status())
+			}
+			err = client.ReportMetrics(rctx, rep)
 		}
 		if err == nil && pusher != nil {
 			// sr-route 一侧走自己的短超时（Push 内部已限 3s），不再复用
@@ -501,6 +601,25 @@ func metricsLoop(ctx context.Context, tel *agent.Telemetry, client *agent.Client
 		}
 		hadRows = len(rows) > 0
 	}
+}
+
+// selectionsOf 把选路组件的状态折成上报形状。UpdatedUnix 是墙钟：控制台那侧
+// 没有这盒子启动时刻的上下文，"相对 VPP 启动"的秒数对它毫无意义。
+func selectionsOf(states []sla.State) []wire.PolicySelection {
+	if len(states) == 0 {
+		return nil
+	}
+	out := make([]wire.PolicySelection, 0, len(states))
+	for _, st := range states {
+		out = append(out, wire.PolicySelection{
+			RowID:     st.RowID,
+			VPN:       st.VPN,
+			Color:     st.Color,
+			Reason:    st.Reason,
+			UpdatedAt: st.UpdatedAt.Unix(),
+		})
+	}
+	return out
 }
 
 // readInventory takes one inventory reading for this heartbeat on its own,

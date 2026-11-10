@@ -265,6 +265,10 @@ type FibTunnelRow struct {
 	NextHop   string
 	Color     *uint8
 	SWIfIndex uint32
+	// Peer 是对端节点号。sr-fib 的表用不到它，动态选路要：SLA 按"到某台对端"
+	// 量，行里写的 peer 得在这里对上号。t.peerOf 在 setLink 时就存了，这里是
+	// 把它也带出来。
+	Peer uint16
 }
 
 // FibRows 是"这台盒子现在跑着哪些隧道"的读数，给 FibTableSync 派生 sr-fib 的
@@ -287,6 +291,7 @@ func (t *TunnelSync) FibRows() []FibTunnelRow {
 			NextHop:   l.cfg.PeerOverlay.Addr().String(),
 			Color:     t.colors[id],
 			SWIfIndex: idx,
+			Peer:      t.peerOf[id],
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

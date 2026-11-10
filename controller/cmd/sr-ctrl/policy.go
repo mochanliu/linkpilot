@@ -36,8 +36,10 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 
+	"sdwan/controller/internal/fib"
 	"sdwan/controller/internal/route"
 	"sdwan/controller/internal/underlay"
 )
@@ -54,6 +56,10 @@ const (
 	policyProtoICMP uint8 = 1
 	policyProtoTCP  uint8 = 6
 	policyProtoUDP  uint8 = 17
+
+	// policyModeDynamic 是动态行的 Mode 值。空串是静态行 —— 老草稿里没有这个
+	// 字段，语义必须保持"钉死颜色"不变。
+	policyModeDynamic = "dynamic"
 )
 
 // PolicyRow 是一行策略：五元组（可留空 = 任意）→ 颜色。
@@ -61,15 +67,40 @@ const (
 // ID 由控制器在保存时按数组顺序重排成 1..N，不需要页面填。存盘里带 ID 是为了
 // 让"存下来的那份"和"发给设备的那份"逐字一致，好让"发布改了没有"能靠字节比较
 // 判定（和 VRRP 段同一个理由）。
+//
+// 两种模式（owner 2026-11-10 拍）：
+//
+//   - Mode == ""（静态）：这一行钉死在 Color 上。落地是 ABF → 颜色表。
+//   - Mode == "dynamic"（动态）：这一行交给盒子上的 sla.Selector 现场挑。它
+//     盯着**到 Peer 这台 CPE** 的各条颜色隧道的探针指标（延迟/抖动/丢包，
+//     插件 sr_wg_probe），在 Colors 候选里挑满足 SLA 的最好一条，把选中结果
+//     写进这一行自己的**选路表**（fib.SelectorTable(ID)，表号控制器渲染成
+//     selector_table）。落地是 ABF → 选路表 → 颜色表。所以动态行上 Color 没有
+//     语义，normalize 会把它清成 0；SLA 三项全 0 也是合法的 —— 含义是"不设
+//     门槛，永远挑延迟最低的那条"。
 type PolicyRow struct {
 	ID      int    `json:"id"`
 	VPN     uint32 `json:"vpn"`
-	Color   uint8  `json:"color"`
+	Color   uint8  `json:"color,omitempty"`
 	Src     string `json:"src,omitempty"` // 空 = 任意
 	Dst     string `json:"dst,omitempty"` // 空 = 任意
 	Proto   uint8  `json:"proto,omitempty"`
 	SrcPort string `json:"src_port,omitempty"` // "80" 或 "1000-2000"，空 = 任意
 	DstPort string `json:"dst_port,omitempty"`
+
+	Mode   string     `json:"mode,omitempty"`   // "" = 静态；"dynamic" = 动态
+	Peer   uint16     `json:"peer,omitempty"`   // dynamic：SLA 量的是到这台 CPE 的隧道
+	Colors []uint8    `json:"colors,omitempty"` // dynamic：候选颜色；空 = 该对端全部颜色
+	SLA    *PolicySLA `json:"sla,omitempty"`    // dynamic：门槛；nil / 全 0 = 不设门槛
+}
+
+// PolicySLA 是动态行的门槛，三项都是"低于/不多于"才算达标；0 表示这一项不
+// 约束。不达标不丢流（owner 2026-11-10 拍）：SLA 是偏好不是准入，全部候选都
+// 不达标时选最接近的一条（丢包最少 → 延迟最低），只有全部 100% 丢包才保持不动。
+type PolicySLA struct {
+	LatencyMS    float64 `json:"latency_ms,omitempty"`
+	JitterMS     float64 `json:"jitter_ms,omitempty"`
+	LossPermille uint32  `json:"loss_permille,omitempty"`
 }
 
 // PolicyFallback 是"允许 fallback 到颜色 0"的一个开关：粒度是每 VRF 每颜色。
@@ -93,13 +124,21 @@ type PolicySet struct {
 type policyArtifactRow struct {
 	ID      int      `json:"id"`
 	VPN     uint32   `json:"vpn"`
-	Color   uint8    `json:"color"`
+	Color   uint8    `json:"color,omitempty"`
 	Src     string   `json:"src,omitempty"`
 	Dst     string   `json:"dst,omitempty"`
 	Proto   uint8    `json:"proto,omitempty"`
 	SrcPort string   `json:"src_port,omitempty"`
 	DstPort string   `json:"dst_port,omitempty"`
 	Attach  []string `json:"attach"`
+
+	// 动态行专属。静态行这些键不出现（omitempty），一份全静态的策略渲染出来和
+	// 老版本逐字节一致 —— "发布没改动"要靠字节比较判定。
+	Mode          string     `json:"mode,omitempty"`
+	Peer          uint16     `json:"peer,omitempty"`
+	Colors        []uint8    `json:"colors,omitempty"`
+	SLA           *PolicySLA `json:"sla,omitempty"`
+	SelectorTable uint32     `json:"selector_table,omitempty"`
 }
 
 type policyArtifactFB struct {
@@ -134,6 +173,24 @@ func policyProtoName(p uint8) string {
 	return fmt.Sprintf("协议 %d", p)
 }
 
+// policyRowLabel 是检查里指名道姓用的行标签：静态行报颜色，动态行报对端 ——
+// 动态行上颜色没有语义，报"颜色 0"只会把人引去查一个不存在的配置项。
+func policyRowLabel(r PolicyRow, i int) string {
+	if r.Mode == policyModeDynamic {
+		return fmt.Sprintf("第 %d 行（VPN %d → 动态·对端 %d）", i+1, r.VPN, r.Peer)
+	}
+	return fmt.Sprintf("第 %d 行（VPN %d → 颜色 %d）", i+1, r.VPN, r.Color)
+}
+
+// policyColorList 把颜色清单说成人话："2, 3"。
+func policyColorList(cs []uint8) string {
+	parts := make([]string, 0, len(cs))
+	for _, c := range cs {
+		parts = append(parts, strconv.Itoa(int(c)))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // normalizePolicySet 整理一份策略集。它**不**做校验（校验是 policyChecksLocked
 // 的事，要报给人看），只做三件让"同一份内容渲染出同一份字节"成立的事：
 //
@@ -144,6 +201,10 @@ func policyProtoName(p uint8) string {
 //
 // 非 tcp/udp 上残留的端口字符串**不**在这里清掉：清掉会让"填了端口却说协议是
 // ICMP"这个错误悄悄消失，校验就看不见它了。
+//
+// 动态行在这里做两件归一化：Color 清成 0（动态行没有固定颜色，留着一个残值会让
+// "改了没有"的比较误报）；候选颜色排序去重。Mode 不在这里纠正 —— 拼错的 mode
+// 要让校验报出来，而不是被悄悄当成静态。
 func normalizePolicySet(set *PolicySet) {
 	for i := range set.Rows {
 		r := &set.Rows[i]
@@ -152,6 +213,23 @@ func normalizePolicySet(set *PolicySet) {
 		r.Dst = strings.TrimSpace(r.Dst)
 		r.SrcPort = strings.TrimSpace(r.SrcPort)
 		r.DstPort = strings.TrimSpace(r.DstPort)
+		if r.Mode == policyModeDynamic {
+			r.Color = 0
+			seenC := map[uint8]bool{}
+			out := make([]uint8, 0, len(r.Colors))
+			for _, c := range r.Colors {
+				if seenC[c] {
+					continue
+				}
+				seenC[c] = true
+				out = append(out, c)
+			}
+			sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+			r.Colors = out
+		} else {
+			r.Colors = nil
+			r.SLA = nil
+		}
 	}
 	if set.Rows == nil {
 		set.Rows = []PolicyRow{}
@@ -177,16 +255,56 @@ func normalizePolicySet(set *PolicySet) {
 
 func policySetCopy(in PolicySet) PolicySet {
 	out := PolicySet{
-		Rows:     append([]PolicyRow(nil), in.Rows...),
+		Rows:     make([]PolicyRow, len(in.Rows)),
 		Fallback: append([]PolicyFallback(nil), in.Fallback...),
 	}
-	if out.Rows == nil {
-		out.Rows = []PolicyRow{}
+	// 行要深拷：Colors 与 SLA 是引用类型，浅拷会让两份 PolicySet 共享底层数组，
+	// 改一份等于改两份，"改了没有"的比较就再也测不出差异。
+	for i, r := range in.Rows {
+		out.Rows[i] = r
+		if r.Colors != nil {
+			out.Rows[i].Colors = append([]uint8(nil), r.Colors...)
+		}
+		if r.SLA != nil {
+			s := *r.SLA
+			out.Rows[i].SLA = &s
+		}
 	}
 	if out.Fallback == nil {
 		out.Fallback = []PolicyFallback{}
 	}
 	return out
+}
+
+// policyRowEqual 比一行的内容。SLA 是指针，不能用 == ：nil 和"全 0 的 SLA"是
+// 两种写法（"没设门槛"和"门槛全 0"），但语义相同 —— 按"展开后相等"比，两种
+// 写法之间来回改不会触发重下发。
+func policyRowEqual(a, b PolicyRow) bool {
+	if a.ID != b.ID || a.VPN != b.VPN || a.Color != b.Color ||
+		a.Src != b.Src || a.Dst != b.Dst || a.Proto != b.Proto ||
+		a.SrcPort != b.SrcPort || a.DstPort != b.DstPort ||
+		a.Mode != b.Mode || a.Peer != b.Peer {
+		return false
+	}
+	if len(a.Colors) != len(b.Colors) {
+		return false
+	}
+	for i := range a.Colors {
+		if a.Colors[i] != b.Colors[i] {
+			return false
+		}
+	}
+	switch {
+	case (a.SLA == nil) != (b.SLA == nil):
+		// 一个 nil 一个非 nil：只有非 nil 的那个全 0 才算相等。
+		if a.SLA == nil {
+			return *b.SLA == PolicySLA{}
+		}
+		return *a.SLA == PolicySLA{}
+	case a.SLA != nil:
+		return *a.SLA == *b.SLA
+	}
+	return true
 }
 
 // policyAttachIfaces 派生一行的入口口：这个 VPN 的全部客户口。
@@ -210,13 +328,14 @@ func policyAttachIfaces(c *BasicConfig, vpn uint32) []string {
 
 // renderPolicyArtifact 渲染第 7 段。空策略集也要渲染出 rows: []（见文件头）。
 func renderPolicyArtifact(c *BasicConfig, set PolicySet) string {
+	set = policySetCopy(set)
 	normalizePolicySet(&set)
 	doc := policyArtifactDoc{
 		Rows:     make([]policyArtifactRow, 0, len(set.Rows)),
 		Fallback: make([]policyArtifactFB, 0, len(set.Fallback)),
 	}
 	for _, r := range set.Rows {
-		doc.Rows = append(doc.Rows, policyArtifactRow{
+		row := policyArtifactRow{
 			ID:      r.ID,
 			VPN:     r.VPN,
 			Color:   r.Color,
@@ -226,7 +345,24 @@ func renderPolicyArtifact(c *BasicConfig, set PolicySet) string {
 			SrcPort: r.SrcPort,
 			DstPort: r.DstPort,
 			Attach:  policyAttachIfaces(c, r.VPN),
-		})
+		}
+		if r.Mode == policyModeDynamic {
+			// 选路表号在这里定死并写进 artifact：盒子不自己算（见
+			// fib.SelectorTable 的注释——表号两边各算一次是静默 bug 的形状）。
+			st, err := fib.SelectorTable(r.ID)
+			if err != nil {
+				// 行号在 1..999 之外不可能到这里（normalize 重排 + 校验挡住）；
+				// 真发生了就渲染不出这一行，宁可 panic 也不发一份会静默错路的配置。
+				panic(fmt.Sprintf("renderPolicyArtifact: %v", err))
+			}
+			row.Mode = r.Mode
+			row.Peer = r.Peer
+			row.Colors = r.Colors
+			row.SLA = r.SLA
+			row.SelectorTable = st
+			row.Color = 0 // 动态行没有固定颜色（normalize 已清；这里再钉一次）
+		}
+		doc.Rows = append(doc.Rows, row)
 	}
 	for _, f := range set.Fallback {
 		doc.Fallback = append(doc.Fallback, policyArtifactFB{VPN: f.VPN, Color: f.Color})
@@ -395,6 +531,40 @@ func (s *server) nodeTunnelColorsLocked(tenantID string, nodeID uint16) (map[uin
 	return out, true
 }
 
+// nodeTunnelPeersLocked 是"到每台对端各有哪些颜色"：动态策略的 SLA 是按对端
+// 量的（插针挂在到对端的每条隧道上），所以动态行的校验与页面下拉都要这份视图，
+// 而不是上面那份按颜色聚合计数的。同一对端同色多条隧道按一条算 —— 探针按隧道
+// 建，选路却只到颜色这一层，多了一条只是多一份样本，不改变可选集合。
+func (s *server) nodeTunnelPeersLocked(tenantID string, nodeID uint16) (map[uint16][]uint8, bool) {
+	uc := s.underlayConfigLocked(tenantID, false)
+	if uc == nil || uc.State == nil || !uc.State.Configured() {
+		return nil, false
+	}
+	seen := map[[2]uint32]bool{}
+	out := map[uint16][]uint8{}
+	for _, t := range uc.State.SortedTunnels() {
+		var peer uint16
+		switch {
+		case t.A.NodeID == nodeID:
+			peer = t.B.NodeID
+		case t.B.NodeID == nodeID:
+			peer = t.A.NodeID
+		default:
+			continue
+		}
+		k := [2]uint32{uint32(peer), uint32(t.Color)}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out[peer] = append(out[peer], t.Color)
+	}
+	for p := range out {
+		sort.Slice(out[p], func(i, j int) bool { return out[p][i] < out[p][j] })
+	}
+	return out, true
+}
+
 // policyChecksLocked 是第 7 段的校验，和基础配置一样在保存与发布两处都跑：
 // 设备的客户口、隧道颜色都可能在策略写完之后变。
 //
@@ -422,6 +592,7 @@ func (s *server) policyChecksLocked(tenantID string, nodeID uint16, dc *DeviceCo
 	}
 
 	tunnelColors, hasUnderlay := s.nodeTunnelColorsLocked(tenantID, nodeID)
+	peerColors, hasPeers := s.nodeTunnelPeersLocked(tenantID, nodeID)
 	fbOn := map[[2]uint32]bool{}
 	for _, f := range set.Fallback {
 		fbOn[[2]uint32{f.VPN, uint32(f.Color)}] = true
@@ -429,7 +600,67 @@ func (s *server) policyChecksLocked(tenantID string, nodeID uint16, dc *DeviceCo
 
 	var prior []policyMatch
 	for i, r := range set.Rows {
-		label := fmt.Sprintf("第 %d 行（VPN %d → 颜色 %d）", i+1, r.VPN, r.Color)
+		label := policyRowLabel(r, i)
+		if r.Mode != "" && r.Mode != policyModeDynamic {
+			add("error", "%s 的 mode「%s」不认识：留空 = 静态（钉死颜色），或写 dynamic（按 SLA 现场挑）。", label, r.Mode)
+		}
+		if r.Mode == policyModeDynamic {
+			// 动态行的专有校验。它和静态行共享下面的 VPN/入口口/五元组检查；
+			// "颜色上有没有隧道"那条检查只属于静态行。
+			switch {
+			case r.Peer == 0:
+				add("error", "%s 是动态行，但没有指定对端 CPE：SLA 是按\"到这台对端的隧道\"量的，没有对端就没法量。", label)
+			case r.Peer == nodeID:
+				add("error", "%s 的对端是它自己（节点 %d）：到自己没有隧道，也没有 SLA 可量。", label, nodeID)
+			case !hasPeers:
+				add("error", "%s：这台设备还没有隧道拓扑（先在「SD-WAN 隧道」页配置并发布），动态行没有可量的隧道。", label)
+			case len(peerColors[r.Peer]) == 0:
+				add("error", "%s：这台设备到节点 %d 一条隧道都没有，动态行没有可量的隧道。", label, r.Peer)
+			}
+			if len(peerColors) > 0 && r.Peer != nodeID {
+				got := map[uint8]bool{}
+				for _, c := range peerColors[r.Peer] {
+					got[c] = true
+				}
+				if len(r.Colors) == 0 {
+					// 空候选 = 该对端全部颜色。这是一句现状说明，不是错误。
+					if len(peerColors[r.Peer]) > 0 {
+						add("info", "%s：候选颜色留空 = 到节点 %d 的全部颜色（当前 %s）。", label, r.Peer, policyColorList(peerColors[r.Peer]))
+					}
+				} else {
+					usable := 0
+					for _, c := range r.Colors {
+						switch {
+						case c > underlay.MaxTunnelColor:
+							add("error", "%s 的候选颜色 %d 超出 0–%d。", label, c, underlay.MaxTunnelColor)
+						case c == 0:
+							add("error", "%s 的候选颜色里有 0：颜色 0 的落点就是主表，不是一条隧道，没有探针可量。"+
+								"不达标时盒子会自动走最接近的一条，不需要把颜色 0 排进来。", label)
+						case got[c]:
+							usable++
+						default:
+							add("warning", "%s 的候选颜色里有 %d，但到节点 %d 没有这个颜色的隧道：它会被当成永远不可选。", label, c, r.Peer)
+						}
+					}
+					if usable == 0 && len(peerColors[r.Peer]) > 0 {
+						add("error", "%s：候选颜色里没有一条到节点 %d 的隧道，这一行动态选不出任何路径。", label, r.Peer)
+					}
+				}
+			}
+			if s := r.SLA; s != nil {
+				switch {
+				case s.LatencyMS < 0 || s.JitterMS < 0:
+					add("error", "%s 的 SLA 门槛不能是负数。", label)
+				case s.LatencyMS > 60000 || s.JitterMS > 60000:
+					add("error", "%s 的 SLA 门槛超过 60 秒：探针的超时上限就是 60 秒，比它更宽的门槛量不出来。", label)
+				case s.LossPermille > 1000:
+					add("error", "%s 的丢包门槛 %d‰ 超过 1000‰。", label, s.LossPermille)
+				}
+				if *s == (PolicySLA{}) {
+					add("info", "%s 的 SLA 三项都是 0 = 不设门槛：永远挑延迟最低的那条颜色。这是合法用法。", label)
+				}
+			}
+		}
 		switch {
 		case r.VPN > uint32(route.MaxVRFID):
 			add("error", "%s 的 VPN 号超出范围（0–%d）：路由平面的 VRF id 只有 8 位。", label, route.MaxVRFID)
