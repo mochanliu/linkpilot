@@ -907,11 +907,13 @@ const (
 	DefaultProbeIntervalMS uint32 = 300
 	// ProbeTimeoutMult is the plugin's rule for TimeoutMS=0: three intervals.
 	ProbeTimeoutMult uint32 = 3
-	// BFD defaults are the timers of the lab session measured 2026-10-24, whose
-	// rule (detect_mult × max(tx, rx) = 150 ms) plus VPP's ~1 s Init/Down period
-	// reported a dead WG interface about 1.5 s after it went.
-	DefaultBFDMinTxUS    uint32 = 50000
-	DefaultBFDMinRxUS    uint32 = 50000
+	// BFD defaults are owner-mandated: 300 ms × 3 = 900 ms detection window.
+	// #286 measured that 50 ms × 3 (150 ms) has no headroom on a single-thread
+	// VPP that also runs WG crypto, tap punting and CLI on vpp_main -- BFD
+	// sessions flapped with zero packet loss. The window must survive a busy
+	// main thread; faster convergence is a per-tenant setting, not a default.
+	DefaultBFDMinTxUS    uint32 = 300000
+	DefaultBFDMinRxUS    uint32 = 300000
 	DefaultBFDDetectMult uint8  = 3
 )
 

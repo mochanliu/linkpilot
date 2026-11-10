@@ -81,9 +81,12 @@ func (t *Telemetry) plane() (TelemetryPlane, error) { return t.src() }
 
 // Ensure 把一条隧道的遥测配置落进数据面，幂等。
 //
-// BFD 先读现状再决定要不要 Add：重复 Add 会把一个已 Up 的会话重建回 Init，
-// 健康检查自己制造抖动。探针则每次都 Set —— 插件对同地址是原地更新、不重置
-// 统计，而间隔变化只有通过 Set 才能落地。
+// BFD 先读现状再决定要不要动：会话在且定时器相同就不碰（重复 Add 会把一个
+// 已 Up 的会话重建回 Init，健康检查自己制造抖动）；同 (local, peer) 但定时器
+// 不同 = 租户改了剖面，VPP 没有原地改参数的 API、对已存在会话的 Add 一律回
+// BFD_EEXIST（-101，#287 实测），只能先删再建 —— 删除会把会话打回 Init、
+// 几秒内重新 Up，这是「改剖面」的固有代价。探针则每次都 Set —— 插件对同
+// 地址是原地更新、不重置统计，而间隔变化只有通过 Set 才能落地。
 func (t *Telemetry) Ensure(ctx context.Context, cfg wire.TunnelTelemetry) error {
 	if cfg.SwIfIndex == 0 {
 		return errors.New("agent: 遥测配置缺 sw_if_index")
@@ -146,6 +149,11 @@ func (t *Telemetry) Ensure(ctx context.Context, cfg wire.TunnelTelemetry) error 
 		return fmt.Errorf("agent: 读 BFD 会话: %w", err)
 	}
 	if !hasBFDSession(cur, bfd) {
+		if hasBFDKey(cur, bfd) {
+			if err := dp.DelBFDSession(ctx, bfd); err != nil {
+				return fmt.Errorf("agent: 换 BFD 定时器先删旧会话 sw_if=%d: %w", cfg.SwIfIndex, err)
+			}
+		}
 		if err := dp.AddBFDSession(ctx, bfd); err != nil {
 			return fmt.Errorf("agent: 建 BFD 会话 sw_if=%d: %w", cfg.SwIfIndex, err)
 		}
@@ -391,6 +399,19 @@ func hasBFDSession(sessions []vppapi.BFDSession, p vppapi.BFDSessionParams) bool
 		if s.DesiredMinTxUS == p.DesiredMinTxUS &&
 			s.RequiredMinRxUS == p.RequiredMinRxUS &&
 			s.DetectMult == p.DetectMult {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBFDKey 只按 (local, peer) 认会话、不比定时器：Ensure 用它区分
+// "会话不在，直接新建" 和 "会话在但定时器是旧的，先删再建"。VPP 对后者的
+// 直接 Add 回 BFD_EEXIST，旧代码在这里无限退避重试、新剖面永远落不了地。
+func hasBFDKey(sessions []vppapi.BFDSession, p vppapi.BFDSessionParams) bool {
+	for _, s := range sessions {
+		if s.SwIfIndex == vppapi.BFDMultihopSwIfIndex &&
+			s.LocalIP.Equal(p.LocalIP) && s.PeerIP.Equal(p.PeerIP) {
 			return true
 		}
 	}

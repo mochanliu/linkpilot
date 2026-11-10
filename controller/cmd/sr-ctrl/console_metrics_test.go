@@ -178,7 +178,7 @@ func TestConsoleMetricsStaleNodeIsListedButLosesItsWindow(t *testing.T) {
 // nil, and the page then says the timers are unknown instead of printing 150ms.
 func TestConsoleMetricsCarriesTheDeliveredTelemetryPolicy(t *testing.T) {
 	s, ten, _ := underlayFixture(t)
-	delivered := wire.TelemetryPolicy{ProbeIntervalMS: 300, BFDMinTxUS: 50000, BFDMinRxUS: 50000, BFDDetectMult: 3}
+	delivered := wire.TelemetryPolicy{ProbeIntervalMS: 300, BFDMinTxUS: wire.DefaultBFDMinTxUS, BFDMinRxUS: wire.DefaultBFDMinRxUS, BFDDetectMult: wire.DefaultBFDDetectMult}
 
 	_, out := consoleMetricsReq(t, s, ten, http.MethodGet, "")
 	if out.Telemetry != nil {

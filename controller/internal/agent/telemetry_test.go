@@ -136,6 +136,14 @@ func TestTelemetryEnsureReappliesChangedBFDTimers(t *testing.T) {
 	if last := dp.bfdAdds[1]; last.DesiredMinTxUS != 100000 || last.DetectMult != 5 {
 		t.Errorf("重下发的定时器 = %+v", last)
 	}
+	// 真 VPP 对已存在会话的 Add 回 BFD_EEXIST（-101）：不先删，agent 会在
+	// 这里无限退避重试、新剖面永远落不了地（#286 换 300ms 剖面时实测）。
+	if len(dp.bfdDels) != 1 {
+		t.Fatalf("重 Add 前必须先 Del 旧会话（真 VPP 回 BFD_EEXIST），Del 调用了 %d 次", len(dp.bfdDels))
+	}
+	if d := dp.bfdDels[0]; !d.LocalIP.Equal(dp.bfdAdds[1].LocalIP) || !d.PeerIP.Equal(dp.bfdAdds[1].PeerIP) {
+		t.Errorf("Del 的会话 = %v -> %v，期望与 Add 同一个 (local, peer)", d.LocalIP, d.PeerIP)
+	}
 }
 
 func TestTelemetryEnsureRejectsBadConfigBeforeSend(t *testing.T) {
