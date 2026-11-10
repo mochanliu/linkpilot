@@ -218,7 +218,7 @@ if [ ! -s "$LEDGER" ]; then
     exit 2
 fi
 mkdir -p "$WORKDIR"
-echo "===== VM 台端到端体检（节点 $NODES；台账 $LEDGER，$(grep -c . "$LEDGER") 行）====="
+echo "===== VM 台端到端体检（节点 ${NODES}；台账 ${LEDGER}，$(grep -c . "$LEDGER") 行）====="
 
 sect "1. 主机、VPP、插件与盒内进程"
 for n in $NODES; do
@@ -232,7 +232,7 @@ for n in $NODES; do
     done
     for d in sr-agent sr-route sr-fib sr-frr; do
         pid=$(ssh_run "$h" "pidof $d" | awk '{print $1}')
-        [ -n "$pid" ] && ok "$h: $d 在跑（pid $pid）" || bad "$h: $d 没在跑"
+        [ -n "$pid" ] && ok "$h: $d 在跑（pid ${pid}）" || bad "$h: $d 没在跑"
     done
     # 问题6（#270，§9.18）：VPP 主线程落哪一核是这台盒子里最大的一根时延开关。
     # 不写 cpu 段时落点由内核开机随手给（四台里三台拿到 vCPU1，客户 overlay 从 8~12ms
@@ -269,9 +269,9 @@ else
             out=$(ssh_run "$h" "/root/vmlab/check-selfheal.sh $IF $CIDR $TAP $PEER $h-$side")
             nf=$(echo "$out" | grep -c '^  FAIL')
             if [ "${nf:-0}" = 0 ] && echo "$out" | grep -q '结论：全部 PASS'; then
-                ok "$h: $side（$IF ↔ $TAP）形状 13 条全 PASS"
+                ok "$h: ${side}（$IF ↔ ${TAP}）形状 13 条全 PASS"
             else
-                bad "$h: $side（$IF ↔ $TAP）形状 $nf 条 FAIL"
+                bad "$h: ${side}（$IF ↔ ${TAP}）形状 $nf 条 FAIL"
                 echo "$out" | grep '^  FAIL' | sed 's/^/       /'
             fi
         done
@@ -301,21 +301,21 @@ for n in $NODES; do
         || bad "$h: 中转端口 $(node_transit "$n") 不在 transit 集合（$(echo "$PORTS" | grep '^transit')）"
     OUTIF=$(echo "$rows" | head -1 | cut -f7)
     if echo "$TUND" | grep -q "encap enabled on" && echo "$TUND" | grep -q "  $OUTIF "; then
-        ok "$h: encap 挂在 $OUTIF（客户口的包才进得了隧道）"
+        ok "$h: encap 挂在 ${OUTIF}（客户口的包才进得了隧道）"
     else
-        bad "$h: encap 没挂在 $OUTIF（SR 路径不会生效）"
+        bad "$h: encap 没挂在 ${OUTIF}（SR 路径不会生效）"
     fi
     while IFS=$'\t' read -r _ nn tid lov lport laddr oiface pnn pov pport paddr color tmtu; do
         [ -n "$tid" ] || continue
         wg=$(iface_for_overlay "$ADDR" "$lov")
         [ -n "$wg" ] || { bad "$h: $tid 的本端 overlay $lov 在 VPP 里没有对应 wg 口"; continue; }
         echo "$VP_IF" | awk -v x="$wg" '$1 == x && $3 == "up" {f = 1} END {exit !f}' \
-            && ok "$h: $tid → $wg（对端 $pov）口在且 up" || bad "$h: $tid → $wg 不存在或没 up"
+            && ok "$h: $tid → ${wg}（对端 ${pov}）口在且 up" || bad "$h: $tid → $wg 不存在或没 up"
         echo "$ADDR" | grep -A1 "^$wg (" | grep -q "L3 $lov/32 ip4 table-id $OVERLAY" \
             && ok "$h: $wg 持有 $lov/32 且在 overlay 表 $OVERLAY" \
-            || bad "$h: $wg 上不是「$lov/32 + table-id $OVERLAY」"
+            || bad "$h: $wg 上不是「$lov/32 + table-id ${OVERLAY}」"
         mtu=$(echo "$VP_IF" | awk -v x="$wg" '$1 == x {split($4, m, "/"); print m[1]; exit}')
-        [ "${mtu:-0}" = "$tmtu" ] && ok "$h: $wg MTU=$mtu（台账 $tmtu）" \
+        [ "${mtu:-0}" = "$tmtu" ] && ok "$h: $wg MTU=${mtu}（台账 ${tmtu}）" \
             || bad "$h: $wg MTU=${mtu:-无}，台账 $tmtu"
         case ",$vpnports," in
             *",$lport,"*) ok "$h: $wg 的监听端口 $lport 在 vpn 集合" ;;
@@ -333,14 +333,14 @@ for n in $NODES; do
             || bad "$h: $wg 的路径 '$pid' 不在路径表里"
         ep="endpoint:\[$laddr:$lport->$paddr:$pport\]"
         echo "$PEERS" | grep -q "$ep $wg" \
-            && ok "$h: peer 端点 $laddr:$lport→$paddr:$pport（$wg）与台账一致" \
-            || bad "$h: 没有 '$laddr:$lport→$paddr:$pport' 这条 peer（$wg）"
+            && ok "$h: peer 端点 $laddr:${lport}→$paddr:${pport}（${wg}）与台账一致" \
+            || bad "$h: 没有 '$laddr:${lport}→$paddr:$pport' 这条 peer（${wg}）"
         echo "$PEERS" | grep "$ep" | grep -q "flags: 2" \
             && ok "$h: $wg 的 peer established" || bad "$h: $wg 的 peer 不是 flags: 2"
         echo "$PEERS" | grep -A3 "$ep" | grep -q "allowed-ips: 0.0.0.0/0" \
             && ok "$h: $wg 的 allowed-ips 是常量 0.0.0.0/0（不参与转发）" \
             || bad "$h: $wg 的 allowed-ips 不是 0.0.0.0/0"
-        [ "$color" = 0 ] && ok "$h: $tid 颜色 0（落主表 $VPN，无颜色表）" \
+        [ "$color" = 0 ] && ok "$h: $tid 颜色 0（落主表 ${VPN}，无颜色表）" \
             || note "$h: $tid 颜色 $color —— 落颜色表 $((color * 1000 + VPN))；主表收不收它由逃生开关决定（承载集在 §6 判）"
     done <<EOF
 $rows
@@ -366,10 +366,10 @@ for n in $NODES; do
         [ -n "$tid" ] || continue
         wg=$(iface_for_overlay "$ADDR" "$lov")
         if retry 20 overlay_ping "$h" "$pov" "${wg:-wg-none}"; then
-            ok "$h → $pov（cpe$pnn，source ${wg:-?}）通"
+            ok "$h → ${pov}（cpe${pnn}，source ${wg:-?}）通"
             note "$(echo "$PING_OUT" | grep 'round-trip' | tail -1)"
         else
-            bad "$h → $pov（cpe$pnn，source ${wg:-?}）不通：$(echo "$PING_OUT" | tail -1)"
+            bad "$h → ${pov}（cpe${pnn}，source ${wg:-?}）不通：$(echo "$PING_OUT" | tail -1)"
         fi
     done <<EOF
 $(tunnels_of "$n")
@@ -377,7 +377,7 @@ EOF
 done
 
 sect "5. 控制面（Mac 上的 sr-ctrl / 双 RR + 盒内身份 / RIB / 隧道表）"
-[ -s "$CA_FILE" ] && ok "sr-ctrl CA 已生成（$CA_FILE）" || bad "sr-ctrl 没有 CA：$CA_FILE"
+[ -s "$CA_FILE" ] && ok "sr-ctrl CA 已生成（${CA_FILE}）" || bad "sr-ctrl 没有 CA：$CA_FILE"
 nc -z -w 2 "$CTRL_ADDR" "$CTRL_PORT" 2>/dev/null && ok "设备入口 $CTRL_ADDR:$CTRL_PORT 在听" \
     || bad "设备入口 $CTRL_ADDR:$CTRL_PORT 不通"
 curl -sf -o /dev/null "http://127.0.0.1:$CONSOLE_PORT/" && ok "控制台 127.0.0.1:$CONSOLE_PORT 在答" \
@@ -399,12 +399,12 @@ for n in $NODES; do
     [ "$st" = online ] && ok "$h: 控制台侧 status=online" || bad "$h: 控制台侧 status=$st"
     dv=$(node_deliv_v "$n"); do_=$(node_deliv_ok "$n")
     if [ "$do_" = true ]; then
-        ok "$h: 隧道下发回执 ok=true（设备侧版本 $dv，控制台已确认）"
+        ok "$h: 隧道下发回执 ok=true（设备侧版本 ${dv}，控制台已确认）"
         # 缺陷④的反证位：回执 ok 但盒内一条隧道都没有时，页面会显示"已下发"。
         # 上面 §3 的口名/绑定计数已经封住这条路，这里只把两者并排放出来好核。
         note "$h: 回执 v$dv + 盒内隧道 $(tun_count "$n") 条实际在位（两个口径一起看）"
     else
-        bad "$h: 隧道下发回执 ok=$do_（版本 $dv）—— 页面会显示未确认"
+        bad "$h: 隧道下发回执 ok=${do_}（版本 ${dv}）—— 页面会显示未确认"
     fi
     if retry 30 route_check "$n" "$h"; then
         ok "$h: sr-route 的 RIB/local 与台账逐条一致 —— $(cat "$WORKDIR/route-$n.note")"
@@ -427,7 +427,7 @@ for n in $NODES; do
         [ -n "$pfx" ] || continue
         block=$(fib_block "$pfx" "$WORKDIR/fib-$h")
         if [ -z "$block" ]; then bad "$h: table $VPN 缺远端 $pfx"; continue; fi
-        ok "$h: table $VPN 有远端 $pfx（sr-fib 直接装 VPP）"
+        ok "$h: table $VPN 有远端 ${pfx}（sr-fib 直接装 VPP）"
         echo "$block" | grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" \
             && ok "$h: $pfx 压标签 $LABEL" || bad "$h: $pfx 没压标签 $LABEL"
         # 路径集与承载集必须分开判。旧口径是「RIB 里每个下一跳都要有 mpls via」，
@@ -435,7 +435,7 @@ for n in $NODES; do
         # 只装最优 preference 的那条。颜色一分开（exp-285 把 t13 改成颜色 2 ⇒ pref 10/12
         # 主备），备路**装在 path-list 里且 resolved、但不承载**，旧口径就把正确的主备
         # 形状判红了（2026-11-09 实测 FAIL 1 条）。
-        # 整表 dump（$block）里根本没有 path:/forwarding: 这些行，路径集只能单前缀问。
+        # 整表 dump（${block}）里根本没有 path:/forwarding: 这些行，路径集只能单前缀问。
         # 新口径两条，比旧的严：① 每个 RIB 下一跳都要有 resolved 的路径装在行里；
         # ② 承载集必须**恰好等于**最优 pref 的那组路径（同 pref 并列就是 ECMP，全都要承载）。
         paths=$(fib_paths "$h" "$pfx")
@@ -445,7 +445,7 @@ for n in $NODES; do
             if [ -z "$line" ]; then
                 bad "$h: $pfx 的 path-list 里没有下一跳 $nh 的路径"
             elif [ "${line##* }" != R ]; then
-                bad "$h: $pfx 下一跳 $nh 的路径不是 resolved（$line）"
+                bad "$h: $pfx 下一跳 $nh 的路径不是 resolved（${line}）"
             else
                 ok "$h: $pfx 下一跳 $nh 的路径已装且 resolved（pref=$(echo "$line" | awk '{print $2}')）"
             fi
@@ -469,7 +469,7 @@ EOF
     ADDR=$(vppc "$h" show interface addr)
     xc=$(echo "$ADDR" | awk -v w="$cust" '$1 ~ /^host-/ && $0 ~ /\(/ {cur=$1}
                                          index($0, "L3 " w "/") {print cur; exit}')
-    [ -n "$xc" ] || { bad "$h: VPP 里没有客户口地址 $cust（本地前缀无从核对）"; continue; }
+    [ -n "$xc" ] || { bad "$h: VPP 里没有客户口地址 ${cust}（本地前缀无从核对）"; continue; }
     one=$(vppc "$h" show ip fib table "$VPN" "$lb/32")
     echo "$one" | grep -q "via $peer $xc" \
         && ok "$h: 本地 $lb/32 在 VPP 里经 $xc 交给客户机 $peer" \
@@ -499,7 +499,7 @@ sect "7. 正向导出：sr-route RIB → sr-frr 注 K 路由（出口 lo）→ r
 for n in $NODES; do
     h=CPE$n; c=$(box_ssh "$n"); proto=$(box_proto "$n"); peer=$(box_peer "$n"); cust=$(box_cust "$n")
     ssh_run "$h" "vtysh -c 'show running-config'" | grep -q "redistribute kernel route-map SDWAN2CPE-vpn$VPN" \
-        && ok "$h: FRR 有 redistribute kernel route-map SDWAN2CPE-vpn$VPN（第 5 段落进去了）" \
+        && ok "$h: FRR 有 redistribute kernel route-map SDWAN2CPE-vpn${VPN}（第 5 段落进去了）" \
         || bad "$h: FRR 缺 redistribute kernel route-map（正向导出这条链没接上）"
     case "$proto" in
         ospf) adj=$(ssh_run "$h" "vtysh -c 'show ip ospf neighbor'")
@@ -510,7 +510,7 @@ for n in $NODES; do
                   && ok "$h: BGP 与客户机 $peer 建立" || bad "$h: BGP 与 $peer 没建立"
               # 会话的本地源必须是客户口上那份地址（linux-cp 的 TAP），证明 BGP 没走内核转发。
               ssh_run "$h" "vtysh -c 'show bgp neighbors $peer'" | grep -q "Local host: $cust," \
-                  && ok "$h: BGP 本地源是 $cust（走盒内 TAP）" || bad "$h: BGP 本地源不是 $cust"
+                  && ok "$h: BGP 本地源是 ${cust}（走盒内 TAP）" || bad "$h: BGP 本地源不是 $cust"
               ;;
     esac
     while IFS=$'\t' read -r _ _ pfx _; do
@@ -535,7 +535,7 @@ EOF
     while IFS=$'\t' read -r _ _ pfx _; do
         [ -n "$pfx" ] || continue
         if echo "$cr" | grep -qE "^[$( [ "$proto" = ospf ] && echo O || echo B)]>?\*?[[:space:]]+$pfx([[:space:]]|\$)"; then
-            ok "$c: 客户侧 $proto 学到远端 $pfx（正向导出落到了客户路由表）"
+            ok "$c: 客户侧 $proto 学到远端 ${pfx}（正向导出落到了客户路由表）"
         else
             bad "$c: 客户侧没学到远端 $pfx"
         fi
@@ -591,7 +591,7 @@ while IFS=$'\t' read -r _ c src dst; do
     loss=$(echo "$out" | grep -oE '[0-9]+% packet loss')
     rtt=$(echo "$out" | tail -1 | sed 's/.*= //')
     if [ "$loss" = "0% packet loss" ]; then
-        ok "$c（源 $src）→ $dst：0% loss，rtt $rtt"
+        ok "${c}（源 ${src}）→ ${dst}：0% loss，rtt $rtt"
     else
         acc=""; tw=0
         for n in $NODES; do
@@ -602,9 +602,9 @@ while IFS=$'\t' read -r _ c src dst; do
             tw=$((tw + w))
         done
         if [ "$tw" -gt 0 ]; then
-            warn "$c（源 $src）→ $dst 丢包（$loss）：同窗口四台摘路条数$acc —— 归因缺陷⑥（#262）"
+            warn "${c}（源 ${src}）→ $dst 丢包（${loss}）：同窗口四台摘路条数$acc —— 归因缺陷⑥（#262）"
         else
-            bad "$c（源 $src）→ $dst 丢包（$loss，rtt $rtt）：同窗口四台一条摘路都没有$acc（没解释的丢包按回归算）"
+            bad "${c}（源 ${src}）→ $dst 丢包（${loss}，rtt ${rtt}）：同窗口四台一条摘路都没有${acc}（没解释的丢包按回归算）"
         fi
     fi
 done < <(grep '^ping' "$LEDGER")
@@ -618,16 +618,16 @@ for n in $NODES; do
     st=$(vppc "$h" show sr-wg stats)
     e1=$(echo "$st" | awk '/Encap:/{e=1} e&&/ok:/{print $2; exit}')
     d1=$(echo "$st" | awk '/Decap:/{d=1} d&&/ok:/{print $2; exit}')
-    [ "$((e1 - e0))" -gt 0 ] && ok "$h: Encap ok $e0 → $e1（跑完客户 ping 在涨 +$((e1 - e0))）" \
+    [ "$((e1 - e0))" -gt 0 ] && ok "$h: Encap ok $e0 → ${e1}（跑完客户 ping 在涨 +$((e1 - e0))）" \
         || bad "$h: Encap ok $e0 → $e1 没涨（客户流量没进隧道）"
-    [ "$((d1 - d0))" -gt 0 ] && ok "$h: Decap ok $d0 → $d1（+$((d1 - d0))）" \
+    [ "$((d1 - d0))" -gt 0 ] && ok "$h: Decap ok $d0 → ${d1}（+$((d1 - d0))）" \
         || bad "$h: Decap ok $d0 → $d1 没涨（没收到隧道里的包）"
     f0=$(echo "$F0" | tr ' ' '\n' | awk -F= -v x="$h" '$1 == x {print $2}')
     f1=$(ssh_run "$h" "awk '/^Ip:/{n++; if(n==2){print \$2; exit}}' /proc/net/snmp")
     [ "$f1" = "2" ] && ok "$h: 内核 Ip:Forwarding=2（MIB 口径 notForwarding）" \
-        || bad "$h: Ip:Forwarding=$f1（期望 2 = notForwarding）"
+        || bad "$h: Ip:Forwarding=${f1}（期望 2 = notForwarding）"
     [ -n "$f0" ] && [ "$f1" = "$f0" ] \
-        && ok "$h: 跑完客户流量 Ip:Forwarding 没变（$f0 → $f1，内核没参与转发）" \
+        && ok "$h: 跑完客户流量 Ip:Forwarding 没变（$f0 → ${f1}，内核没参与转发）" \
         || bad "$h: Ip:Forwarding 从 ${f0:-?} 变成 ${f1:-?}（内核参与了转发）"
     [ "$(ssh_run "$h" "cat /proc/sys/net/ipv4/ip_forward")" = "0" ] \
         && ok "$h: 全局 ip_forward=0" || bad "$h: 全局 ip_forward 不是 0"
