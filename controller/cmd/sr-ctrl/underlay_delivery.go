@@ -151,6 +151,12 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	if spec.PeerOverlay, err = overlayPrefix("对端", peer); err != nil {
 		return wire.TunnelSpec{}, err
 	}
+	// 颜色跟着隧道段一起下发（G-2 的唯一契约改动）。设备侧的 sr-fib 隧道表要
+	// {next_hop, interface, color} 三个键，前两个设备自己拿得到，color 只有
+	// 控制器知道 —— 不发，主备关系在这台盒子上就永远立不起来。指针不是值：
+	// 颜色 0 是合法颜色，"老控制器没发过 color"必须能和它区分开。
+	color := t.Color
+	spec.Color = &color
 	// UnderlayMTU is THIS box's egress link MTU; the controller writes only what
 	// the device itself reported (each side configures its own port). The map is
 	// empty until the agent has reported an inventory, and then the field stays 0

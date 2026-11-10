@@ -74,7 +74,7 @@ for t in d.get("tunnels", []):
 }
 PRIMTUN=$(tunof "$PRIM")
 BAKTUN=$(tunof "$BAK")
-[ -n "$PRIMTUN" ] && [ -n "$BAKTUN" ] || { echo "!! 在 $BOX 的 sr-fib 活表里查不到主/备口名（主=$PRIM 备=$BAK）—— 先跑 vm-fib-sync.sh" >&2; exit 1; }
+[ -n "$PRIMTUN" ] && [ -n "$BAKTUN" ] || { echo "!! 在 $BOX 的 sr-fib 活表里查不到主/备口名（主=$PRIM 备=$BAK）—— 查 sr-fib 隧道表是否被 agent 派生过（#288 起由 sr-agent 维护，手工脚本已退役）" >&2; exit 1; }
 
 # 注入点：peer 模式的口在 PEERBOX 上，判据是「该口 L3 == PRIM/32」（对端那条隧道的本端 overlay 就是 PRIM）。
 if [ "$MODE" = "peer" ]; then
@@ -268,7 +268,7 @@ def oper(tok):
 head = [x for x in plen[:20] if x >= 0]
 headb = [x for x in bk[:20] if x >= 0]
 if not head:
-    print("   !! 起手 20 发里精确行一次都不在 —— 这条前缀根本没装进表，先跑 vm-fib-sync.sh / 查 overlay 发布"); sys.exit(0)
+    print("   !! 起手 20 发里精确行一次都不在 —— 这条前缀根本没装进表，查 sr-fib 隧道表（#288 起由 sr-agent 派生）与 overlay 发布"); sys.exit(0)
 base_plen = max(set(head), key=head.count)
 print(f"   起手 path-list len={base_plen}（主+备都在行里）；buckets={max(set(headb), key=headb.count) if headb else '?'}"
       f"（只有最优那条在承载）")

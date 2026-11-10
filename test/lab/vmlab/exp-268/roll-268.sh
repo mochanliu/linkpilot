@@ -13,7 +13,6 @@ set -uo pipefail
 # D 是读数和日志的落盘目录，默认建在临时目录；原始数据不进仓库。
 D=${D:-$(mktemp -d)/gate-268}
 BIN=${BIN:?要显式给出待铺的 sr-fib 二进制（容器里 GOOS=linux go build 出来的那个）}
-REPO=${REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}
 EXPECT=$(shasum -a 256 "$BIN" | cut -d' ' -f1)
 LOGD=$D/roll
 mkdir -p "$LOGD"
@@ -66,11 +65,25 @@ for n in "$@"; do
 
   say "4/5 只重启 sr-fib，经产品开机清单带回"
   ssh "CPE$n" 'pkill -x sr-fib; sleep 1; /usr/local/lib/sr-box/start.sh up; echo "up 退出码=$?"; pgrep -x sr-fib' 2>>"$L" | tee -a "$L"
-  say "   重启后日志（隧道表应为空 —— G-2 的现场）："
+  say "   重启后日志（此刻隧道表为空、路径被跳过 —— 这是 #288 之前 G-2 的现场）:"
   ssh "CPE$n" 'tail -4 /var/log/sr-box/fib.log' 2>/dev/null | sed 's/^/     /' | tee -a "$L"
 
-  say "5/5 推隧道表回内存（lab 代偿，产品里没有这一步就是缺口 G-2）"
-  (cd "$REPO" && ./test/lab/vmlab/vm-fib-sync.sh "$n") 2>>"$L" | tee -a "$L"
+  # 5/5 原先跑的是 lab 代偿 vm-fib-sync.sh（手工 PUT 隧道表）。#288 起这张表由 sr-agent
+  # 每拍派生，产品里有人管了，lab 再手工补一枪就等于把缺口盖回去 —— 所以改成"等它自己回来"，
+  # 并且把等待时间打出来：等不到就是回归，不是"lab 环境问题"。
+  say "5/5 等 sr-agent 把隧道表派生回来（#288：产品自己维护，不再手工推）"
+  t0=$(python3 -c 'import time;print(int(time.time()))')
+  tun=0
+  for i in $(seq 1 40); do
+    # tail -1：known_hosts 的 "Permanently added" 会混进 stdout（不受 LogLevel 控制），
+    # 不剃掉的话 `${tun:-0} -gt 0` 拿到的是两行文本，判据永远是假红。
+    tun=$(ssh "CPE$n" "curl -s --max-time 3 http://127.0.0.1:19011/status | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get(\"tunnels\") or []))'" 2>/dev/null | tr -d '\r' | tail -1)
+    [ "${tun:-0}" -gt 0 ] 2>/dev/null && break
+    sleep 1
+  done
+  say "   隧道表=${tun:-0} 条，等了 $(( $(python3 -c 'import time;print(int(time.time()))') - t0 ))s"
+  [ "${tun:-0}" -gt 0 ] && say "   OK：表自己回来了" \
+      || say "   !! 40s 内没回来 —— 派生器没在推（看 /var/log/sr-box/agent.log 的「sr-fib 隧道表」行）"
 
   say "恢复定时器原状"
   ssh "CPE$n" 'systemctl start sr-box-watch.timer; systemctl is-active sr-box-watch.timer' 2>/dev/null | tee -a "$L"

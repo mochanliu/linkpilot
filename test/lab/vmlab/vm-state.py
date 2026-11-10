@@ -71,24 +71,38 @@ def cmd_route(json_path, ledger, node):
 def cmd_fib(json_path, ledger, node, vpn):
     d = load(json_path)
     # 台账 tun 行：tun node tid 本端overlay 本端口 本端地址 出接口 对端node 对端overlay 对端端口 对端地址 颜色 MTU
-    # sr-fib 的 next_hop 是「对端 overlay」，即第 9 列（0 基下标 8）。
-    want = sorted(r[8] for r in ledger_rows(ledger, "tun", node))
-    got = sorted(t.get("next_hop") for t in (d.get("tunnels") or []))
+    # sr-fib 的 next_hop 是「对端 overlay」，即第 9 列（0 基下标 8）；颜色是第 12 列（下标 11）。
+    #
+    # 颜色也进判据（#288 之后才可能）：G-2 之前这张表是 lab 脚本推的、颜色恒 0，
+    # 台账里有颜色但没人能判；现在是 sr-agent 从下发里派生的，颜色必须一致。
+    # sr-fib 的 JSON 用了 omitempty，颜色 0 不出现 —— 缺字段按 0 算，不是"没颜色"。
+    want = {r[8]: int(r[11] or 0) for r in ledger_rows(ledger, "tun", node)}
+    got = {t.get("next_hop"): int(t.get("color") or 0) for t in (d.get("tunnels") or [])}
     if got != want:
-        sys.exit("隧道表不符：盒里=%s 台账下一跳=%s" % (got, want))
+        sys.exit("隧道表不符：盒里=%s 台账下一跳(颜色)=%s" % (got, want))
     if sorted(str(v) for v in (d.get("vrfs") or [])) != sorted(str(v) for v in vpn.split(",")):
         sys.exit("vrfs 不符：盒里=%s 期望=%s" % (d.get("vrfs"), vpn))
     last = d.get("last") or {}
     if not last.get("converged"):
         sys.exit("上一次装表没收敛（last=%s）" % json.dumps(last, ensure_ascii=False))
-    # 逃生开关产品里没有下发路径（缺口 G-2：vm-fib-sync.sh 保持盒子的现值），
-    # 所以这里只报数不判红 —— 台账里没有它，硬判等于我造一个期望值。
+    # 「下一跳不在隧道表里」是 G-2 那条缺口的独有症状：表是空的/缺行，于是整条路径被跳过、
+    # FIB 里一条 overlay 路由都装不出来。它进硬判据（不是只报数）：#288 之后表由产品自己维护，
+    # 这条警告出现就等于"表又没人管了"。
+    # 其余警告（"BFD 会话不是 Up"）是缺陷⑥的正常抖动，只报数 —— 判红会跟 #262 混在一起。
+    warns = last.get("warnings") or []
+    orphan = [w for w in warns if "不在隧道表里" in w]
+    if orphan:
+        sys.exit("隧道表缺行（G-2 回归）：%s" % "；".join(orphan))
+    # 逃生开关产品里仍没有下发路径（缺口在 O6-b，见 docs/g2-tunnel-table-derivation-plan.md §6），
+    # 派生器按「读-改-写」原样带回，所以这里只报数不判红 —— 台账里没有它，硬判等于我造一个期望值。
     print("隧道表 %d 条[%s] vrfs=%s 逃生=%s 上次收敛 +%s/-%s 标签+%s/-%s"
-          % (len(got), " ".join("%s→%s" % (t.get("next_hop"), t.get("interface"))
+          % (len(got), " ".join("%s→%s/色%s" % (t.get("next_hop"), t.get("interface"),
+                                                t.get("color") or 0)
                                 for t in (d.get("tunnels") or [])),
              d.get("vrfs"), bool(d.get("escape_all_colors")),
              last.get("routes_set"), last.get("routes_removed"),
-             last.get("labels_set"), last.get("labels_removed")))
+             last.get("labels_set"), last.get("labels_removed"))
+          + ("" if not warns else "；非 G-2 警告 %d 条（缺陷⑥）" % len(warns)))
 
 
 def cmd_rr(json_path, tenant, node_count):

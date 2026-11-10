@@ -204,6 +204,34 @@ fib_check() {     # <node> <host>；证据行写到 $WORKDIR/fib-<node>.note
     python3 "$HERE/vm-state.py" fib "$WORKDIR/fib-$n.json" "$LEDGER" "$n" "$VPN" \
         > "$WORKDIR/fib-$n.note" 2>&1
 }
+
+# ---- 反向取证：这张表是谁写的（#288 / G-2 的判据，不是旁证）----
+# 2026-11-10 之前 sr-fib 的隧道表只有两个来源：开机读磁盘 fib.json、或者人/脚本 PUT。
+# "表非空"对这两种来源都成立，所以它不是判据 —— exp-284 记过一枪：重启 sr-fib 后表空，
+# 手工补一发 vm-fib-sync.sh 就"绿"了，掩盖了产品里根本没人维护这张表。
+# #288 之后多了一条产品路径（sr-agent 每拍派生）。要证明它真的在跑，三条一起看：
+#   ① 磁盘 fib.json 里还是 0 条（派生器只改内存、不落盘，见 fibtable.go 的注释）；
+#   ② 盒里现在非空（人没插手的话，非空只可能来自运行时 PUT）；
+#   ③ agent.log 最后一条「隧道表已收敛：N 行」的 N 等于盒里条数（写的人自报）。
+fib_source_check() {   # <node> <host>
+    local n=$1 h=$2 mem disk lin last
+    mem=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])).get("tunnels") or []))' \
+          "$WORKDIR/fib-$n.json" 2>/dev/null)
+    disk=$(ssh_run "$h" "python3 -c 'import json;d=json.load(open(\"/etc/sdwan/fib.json\"));print(len(d.get(\"tunnels\") or []))'" 2>/dev/null)
+    lin=$(ssh_run "$h" "grep '隧道表已收敛：' /var/log/sr-box/agent.log 2>/dev/null | tail -1")
+    last=$(printf '%s' "$lin" | sed -n 's/.*隧道表已收敛：\([0-9]*\) 行.*/\1/p')
+    if [ -z "${mem:-}" ] || [ -z "${disk:-}" ]; then
+        bad "$h: 反向取证取不到数（盒里 ${mem:-?} 条、磁盘 ${disk:-?} 条）"
+    elif [ "$mem" = "$disk" ]; then
+        bad "$h: 盒里 $mem 条 == 磁盘 $disk 条 —— 这张表是开机从 fib.json 读的，不是 agent 派生的"
+    elif [ -z "$last" ]; then
+        bad "$h: 磁盘 0 条、盒里 $mem 条（说明是运行时 PUT 的），但 agent.log 里没有一条「隧道表已收敛」"
+    elif [ "$last" != "$mem" ]; then
+        bad "$h: agent 最后推的是 $last 行，盒里是 $mem 条（还有别的写入者，或推完又被改）"
+    else
+        ok "$h: 隧道表是 sr-agent 派生的（log $last 行 == 盒里 $mem 条，磁盘 fib.json 仍 0 条）"
+    fi
+}
 rr_check() {      # <1|2>；证据行写到 $WORKDIR/rr-<r>.note
     local r=$1
     curl -sf "http://127.0.0.1:${RR_STATUS[$r]}/status" > "$WORKDIR/rr-$r.json" 2>/dev/null || {
@@ -376,7 +404,7 @@ $(tunnels_of "$n")
 EOF
 done
 
-sect "5. 控制面（Mac 上的 sr-ctrl / 双 RR + 盒内身份 / RIB / 隧道表）"
+sect "5. 控制面（Mac 上的 sr-ctrl / 双 RR + 盒内身份 / RIB / 隧道表 / 隧道表是谁写的）"
 [ -s "$CA_FILE" ] && ok "sr-ctrl CA 已生成（${CA_FILE}）" || bad "sr-ctrl 没有 CA：$CA_FILE"
 nc -z -w 2 "$CTRL_ADDR" "$CTRL_PORT" 2>/dev/null && ok "设备入口 $CTRL_ADDR:$CTRL_PORT 在听" \
     || bad "设备入口 $CTRL_ADDR:$CTRL_PORT 不通"
@@ -416,6 +444,8 @@ for n in $NODES; do
     else
         bad "$h: sr-fib 状态不符（$(cat "$WORKDIR/fib-$n.note" 2>/dev/null | tail -1)）"
     fi
+    # 上面那条只说"表对不对"，这条说"表是谁写的"（#288）。两条都要，缺一条就能被手工补表蒙过去。
+    fib_source_check "$n" "$h"
 done
 
 sect "6. VPP FIB（远端 loopback 压 $LABEL 走 wg；本地前缀交回客户机；表 $OVERLAY 只有隧道）"

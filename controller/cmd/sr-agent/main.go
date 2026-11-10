@@ -71,6 +71,10 @@ func main() {
 		frrReload = flag.String("frr-reload", "", "frr-reload.py used to diff FRR config through vtysh (default: /usr/lib/frr/frr-reload.py)")
 		routeConf = flag.String("route-conf", "/etc/sdwan/route.json",
 			"sr-route config file; the bundle's overlay segment is merged into it (never created here)")
+		// sr-fib 的隧道表由这个进程派生并推过去（G-2）。地址从 fib.json 的
+		// status_addr 读：那是盒子自己的键，不是控制器能下发的。
+		fibConf = flag.String("fib-conf", "/etc/sdwan/fib.json",
+			"sr-fib config file; its status_addr is where the derived tunnel table is pushed")
 
 		// The interface inventory is read-only and off by default: a box whose
 		// VPP is managed by hand may not have this socket, and an agent that
@@ -214,6 +218,12 @@ func main() {
 	// reason to refuse to run, and the reconciler redials by itself (see
 	// TunnelSync.dropDeadConnection).
 	var tun *agent.TunnelSync
+	// fibTab 是 sr-fib 隧道表的派生器（G-2）：sr-fib 要 {next_hop, interface,
+	// color}，这三个键只有这个进程同时手上有（隧道段 + route.json + VPP 口名）。
+	// 它不落盘、不自设定时器，跟着心跳每拍算一次，只有和 sr-fib 现在那份不同
+	// 才 PUT —— 所以 sr-fib 自己重启丢表、隧道增删、VPP 重启换口名，都是同一
+	// 条路自愈。
+	var fibTab *agent.FibTableSync
 	if *tunnels {
 		dial := func(ctx context.Context) (agent.DataPlane, error) {
 			return vppapi.Dial(ctx, *vppAPI, "sr-agent-tunnel")
@@ -224,7 +234,9 @@ func main() {
 		}
 		tun = agent.NewTunnelSync(dp, id, client.UnderlayBundle, log.Printf)
 		tun.SetRedial(dial)
+		fibTab = agent.NewFibTableSync(tun, *routeConf, *fibConf, log.Printf)
 		log.Printf("tunnel applier on (vpp api %s)", *vppAPI)
+		log.Printf("fib-table deriver on (sr-fib %s, vrfs from %s)", *fibConf, *routeConf)
 	}
 	st.setChannels(tun, *vppAPI != "")
 	st.setStun(ss)
@@ -313,6 +325,14 @@ func main() {
 				log.Fatalf("tunnel v%d: %v", resp.TunnelVersion, err)
 			}
 		}
+		// 隧道表照样派生并推一次：-once 打印完就退出，留给 goroutine 的活不会落地。
+		if fibTab != nil {
+			fctx, fcancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := fibTab.Sync(fctx); err != nil {
+				log.Printf("fib-table: %v", err)
+			}
+			fcancel()
+		}
 		// Reported AFTER applying, so the tunnel table the controller stores is
 		// what the dataplane really has, not what the bundle asked for. -once has
 		// no probe loop running, so discovery takes its one round here: a printed
@@ -382,6 +402,11 @@ func main() {
 			}
 			if tun != nil {
 				tun.Kick(ctx, resp.TunnelVersion)
+			}
+			// 隧道表的派生跟在 Kicked 的对账后面：它读的是 TunnelSync 已经装好
+			// 的 Link（含刚换上来的新连接），自己的 goroutine 不进心跳的关键路径。
+			if fibTab != nil {
+				fibTab.MaybeRun(ctx)
 			}
 			// What this box really runs, reported every beat: the mapping table
 			// (binding + tunnel endpoints + own addresses) and one window of

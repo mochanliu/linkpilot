@@ -270,3 +270,11 @@ underlay.sh 会自动重新接管、agent v24 自动重装隧道，实测恢复 
    → `ip link set enp0s8 address <烧录值>` → 重跑 `takeover-if.sh enp0s8 lcp-x0 <烧录值>`。
    修复后 OSPF 双邻居 Full、CPE1↔LAN 0% 丢包。**建议立缺陷票**：agent 建口时
    MAC 必须取配置值并对内核做校正，而不是信内核现值。
+
+   > **2026-11-10 复测（exp-288 §2.3）**：上面这串手工步骤里，"改 netdev 地址"那一步
+   > 不能省，也不能指望 `hw-addr` 代劳 —— 实测 `create host-interface name X hw-addr <烧录值>`
+   > 只让 VPP 侧和镜像出来的 lcp TAP 拿到烧录值，内核 netdev 仍是脏值。产品侧的修法因此是
+   > 两步：先 `down`→`address`→`up` 改回 netdev，再 `create ... hw-addr`（`internal/apply`
+   > 的 `ensureHostIface`）。顺带记一条：lab 的 `underlay.sh` 遇到 MAC 不符会**拒绝接管**
+   > （`FAIL … 先放开 VPP 再把 netdev 修回该值`），所以脏值会让盒子停在"客户口没被接管"的
+   > 半死状态，等人手工救。

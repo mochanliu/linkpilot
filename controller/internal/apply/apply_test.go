@@ -438,3 +438,178 @@ func TestStoreRoundTripsEverySegment(t *testing.T) {
 		}
 	}
 }
+
+// -------------------------------------------------- 缺陷③：重接管用脏 MAC
+//
+// 现场（exp-286 §5.5，CPE1）：lcp-sync 把 tap 的随机 MAC 反写进内核 netdev，
+// VPP 重启后重接管信了内核现值（ca:a3:…），VPP 里的口和烧录值（08:00:27:…）
+// 不一致 —— 对端 ARP FAILED、OSPF 卡 ExStart，而"接管成功"的日志一切正常。
+//
+// 修法落在产品路径上：`lcp create host-<netdev>` 之前先保证 af_packet 口存在，
+// 建它时 hw-addr 取 ethtool -P 的烧录值；内核 netdev 被写脏过时另外显式改回
+// （hw-addr 只管 VPP 侧与 lcp TAP，管不到内核 —— 2026-11-10 现场实测，见 apply.go）。
+
+func hostIfaceFragment() string {
+	return "# 客户口\nlcp create host-eth5 host-if lcp-x5\n"
+}
+
+func TestHostIfaceCreatedWithPermanentMAC(t *testing.T) {
+	fx := &fakeExec{outputs: map[string]string{
+		"vppctl show lcp":                 "",
+		"vppctl show interface host-eth5": "unknown interface 'host-eth5'\n",
+		"ethtool -P eth5":                 "Permanent address: 08:00:27:9f:f9:1f\n",
+	}}
+	a := newTestApplier(t, t.TempDir(), filepath.Join(t.TempDir(), "frr.conf"), fx)
+	if err := a.runVPP(context.Background(), hostIfaceFragment()); err != nil {
+		t.Fatalf("runVPP: %v", err)
+	}
+	want := "vppctl create host-interface name eth5 hw-addr 08:00:27:9f:f9:1f"
+	if n := fx.count(want); n != 1 {
+		t.Fatalf("create host-interface 次数 = %d, want 1（calls=%v）", n, fx.calls)
+	}
+	if fx.count("ip link set dev eth5 allmulticast on") != 1 {
+		t.Fatalf("接管前没打开 allmulticast（calls=%v）", fx.calls)
+	}
+	// 顺序：先建口、后配对。
+	if !(fx.index(want) < fx.index("vppctl lcp create host-eth5 host-if lcp-x5")) {
+		t.Fatalf("先配了对再建口（calls=%v）", fx.calls)
+	}
+}
+
+// 内核 netdev 被 lcp-sync 写脏：改 MAC 的三步必须发出去，而且发生在建口之前。
+// 现场证据（2026-11-10 CPE2，VPP 26.06）：用 hw-addr 建出来的口和 lcp TAP 都拿到了
+// 烧录值，但 /sys/class/net/enp0s8/address 还是脏的 02:de:ad:be:ef:01 —— hw-addr 不改
+// 内核那一侧。而脏值会让下一个接管者直接拒绝接管（lab 的 underlay.sh 就是这么干的），
+// 于是这台盒子要人手工修一次才能再被接管。所以这一步不能省。
+func TestHostIfaceRepairsDirtyKernelMAC(t *testing.T) {
+	fx := &fakeExec{outputs: map[string]string{
+		"vppctl show lcp":                 "",
+		"vppctl show interface host-eth5": "unknown interface 'host-eth5'\n",
+		"ethtool -P eth5":                 "Permanent address: 08:00:27:9f:f9:1f\n",
+	}}
+	a := newTestApplier(t, t.TempDir(), filepath.Join(t.TempDir(), "frr.conf"), fx)
+	var logs []string
+	a.Logf = func(f string, args ...any) { logs = append(logs, fmt.Sprintf(f, args...)) }
+	a.NetdevMAC = func(string) (string, error) { return "ca:a3:04:12:a7:f8", nil }
+	if err := a.runVPP(context.Background(), hostIfaceFragment()); err != nil {
+		t.Fatalf("runVPP: %v", err)
+	}
+	for _, want := range []string{
+		"ip link set dev eth5 down",
+		"ip link set dev eth5 address 08:00:27:9f:f9:1f",
+	} {
+		if n := fx.count(want); n != 1 {
+			t.Fatalf("%q 次数 = %d, want 1（calls=%v）", want, n, fx.calls)
+		}
+	}
+	// 顺序：down → address → 建口。在 up 的口上内核会拒绝改地址，所以 down 必须在前面；
+	// 建口放在改完之后，这样 hw-addr 与内核两侧是同一个值。
+	down, addr := fx.index("ip link set dev eth5 down"),
+		fx.index("ip link set dev eth5 address 08:00:27:9f:f9:1f")
+	create := fx.index("vppctl create host-interface name eth5 hw-addr 08:00:27:9f:f9:1f")
+	if !(down < addr && addr < create) {
+		t.Fatalf("改 MAC 的顺序不对：down=%d address=%d create=%d（calls=%v）", down, addr, create, fx.calls)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "写脏") {
+		t.Fatalf("改 MAC 没说明原因：%q", strings.Join(logs, "\n"))
+	}
+}
+
+// 内核 MAC 本来就是烧录值（没被写脏过的盒子）：不发改 MAC 的命令 —— 每次收敛轮
+// 都 down/up 一下网口是没有必要的抖动。大小写不同不算脏。
+func TestHostIfaceCleanKernelMACIsNotRewritten(t *testing.T) {
+	fx := &fakeExec{outputs: map[string]string{
+		"vppctl show lcp":                 "",
+		"vppctl show interface host-eth5": "unknown interface 'host-eth5'\n",
+		"ethtool -P eth5":                 "Permanent address: 08:00:27:9f:f9:1f\n",
+	}}
+	a := newTestApplier(t, t.TempDir(), filepath.Join(t.TempDir(), "frr.conf"), fx)
+	a.NetdevMAC = func(string) (string, error) { return "08:00:27:9F:F9:1F", nil }
+	if err := a.runVPP(context.Background(), hostIfaceFragment()); err != nil {
+		t.Fatalf("runVPP: %v", err)
+	}
+	if n := fx.count("ip link set dev eth5 address"); n != 0 {
+		t.Fatalf("MAC 本来就是烧录值还去改：%d 次（calls=%v）", n, fx.calls)
+	}
+	if n := fx.count("ip link set dev eth5 down"); n != 0 {
+		t.Fatalf("不该把干净的口 down 一下：%d 次（calls=%v）", n, fx.calls)
+	}
+	if n := fx.count("vppctl create host-interface name eth5 hw-addr 08:00:27:9f:f9:1f"); n != 1 {
+		t.Fatalf("口还是要建的（calls=%v）", fx.calls)
+	}
+}
+
+// 口已经在 VPP 里（正常收敛轮）：不多做任何写动作。
+func TestHostIfacePresentSkipsCreation(t *testing.T) {
+	fx := &fakeExec{outputs: map[string]string{
+		"vppctl show lcp":                 "",
+		"vppctl show interface host-eth5": "host-eth5 (up):\n  Ethernet address 08:00:27:9f:f9:1f\n",
+	}}
+	a := newTestApplier(t, t.TempDir(), filepath.Join(t.TempDir(), "frr.conf"), fx)
+	if err := a.runVPP(context.Background(), hostIfaceFragment()); err != nil {
+		t.Fatalf("runVPP: %v", err)
+	}
+	if n := fx.count("create host-interface"); n != 0 {
+		t.Fatalf("口已经在了还建：%d 次（calls=%v）", n, fx.calls)
+	}
+	if fx.count("vppctl lcp create host-eth5 host-if lcp-x5") != 1 {
+		t.Fatalf("配对没做（calls=%v）", fx.calls)
+	}
+}
+
+// ethtool -P 读不到时回落内核现值，但回落必须说出来：那条路正是脏 MAC 的形状。
+func TestHostIfaceFallsBackToKernelMACLoudly(t *testing.T) {
+	fx := &fakeExec{outputs: map[string]string{
+		"vppctl show lcp":                 "",
+		"vppctl show interface host-eth5": "unknown interface 'host-eth5'\n",
+		"ethtool -P eth5":                 "Permanent address: \n", // 驱动不报
+	}}
+	a := newTestApplier(t, t.TempDir(), filepath.Join(t.TempDir(), "frr.conf"), fx)
+	var logs []string
+	a.Logf = func(f string, args ...any) { logs = append(logs, fmt.Sprintf(f, args...)) }
+	a.NetdevMAC = func(string) (string, error) { return "ca:a3:04:12:a7:f8", nil }
+	if err := a.runVPP(context.Background(), hostIfaceFragment()); err != nil {
+		t.Fatalf("runVPP: %v", err)
+	}
+	if n := fx.count("vppctl create host-interface name eth5 hw-addr ca:a3:04:12:a7:f8"); n != 1 {
+		t.Fatalf("回落路径没把内核现值写进 hw-addr（calls=%v）", fx.calls)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "回落") || !strings.Contains(joined, "脏 MAC") {
+		t.Fatalf("回落没被点名：%q", joined)
+	}
+}
+
+// 两个来源都读不到（口名写错就是这种）：失败要响，不能建一个 MAC 不明的口。
+func TestHostIfaceUnknownNetdevFails(t *testing.T) {
+	fx := &fakeExec{outputs: map[string]string{
+		"vppctl show lcp":                 "",
+		"vppctl show interface host-eth9": "unknown interface 'host-eth9'\n",
+	}}
+	a := newTestApplier(t, t.TempDir(), filepath.Join(t.TempDir(), "frr.conf"), fx)
+	a.NetdevMAC = func(string) (string, error) { return "", errors.New("no such file") }
+	err := a.runVPP(context.Background(), "lcp create host-eth9 host-if lcp-x9\n")
+	if err == nil || !strings.Contains(err.Error(), "MAC") {
+		t.Fatalf("MAC 读不到时 = %v, want 报错", err)
+	}
+}
+
+func TestPermanentMACParsing(t *testing.T) {
+	cases := []struct {
+		out  string
+		want string
+		ok   bool
+	}{
+		{"Permanent address: 08:00:27:9f:f9:1f\n", "08:00:27:9f:f9:1f", true},
+		{"Permanent address: 08:00:27:9F:F9:1F", "08:00:27:9f:f9:1f", true},
+		{"Permanent address: \n", "", false},
+		{"", "", false},
+		{"netlink error: Operation not supported", "", false},
+	}
+	for _, c := range cases {
+		got, ok := permanentMACFrom(c.out)
+		if got != c.want || ok != c.ok {
+			t.Fatalf("%q → %q,%v; want %q,%v", c.out, got, ok, c.want, c.ok)
+		}
+	}
+}

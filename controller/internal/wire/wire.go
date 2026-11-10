@@ -539,6 +539,17 @@ type TunnelSpec struct {
 	LocalOverlay string `json:"local_overlay"`
 	PeerOverlay  string `json:"peer_overlay"`
 
+	// Color is the tunnel's SD-WAN color (0..7): it decides the VPP preference
+	// (10+color) of the FIB paths that resolve through this tunnel's next hop.
+	// It is a POINTER on purpose, not a default-0 uint8: color 0 is a real
+	// color ("best"), while an old controller that never sends the field is a
+	// different fact altogether -- the device must be able to tell them apart,
+	// because installing every path at preference 0 silently flattens the
+	// primary/backup ordering (G-2, docs/g2-tunnel-table-derivation-plan.md §4.1).
+	// nil means "the controller predates the color field": the agent refuses to
+	// derive the sr-fib tunnel table rather than guess.
+	Color *uint8 `json:"color,omitempty"`
+
 	// Peer identity: the certificate and the attested key binding travel with
 	// the tunnel so the device authenticates the peer itself instead of
 	// trusting the controller's word (see agent.Link.authenticate).

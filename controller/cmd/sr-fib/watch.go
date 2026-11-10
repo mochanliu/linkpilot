@@ -293,12 +293,30 @@ func (f *fiber) currentRoutes(ctx context.Context) ([]fib.RIBRoute, error) {
 // convergeLoop is the only place a plan is pushed to the data plane: an event
 // batch or a new config sets the flag, and one pass consumes everything that
 // arrived while it ran.
+//
+// Since exp-286 it also runs one pass per healthPoll regardless of events. The
+// event stream alone only covers moments when somebody is talking: a VPP
+// restart kills the BFD event subscription with the connection, and if the RIB
+// is quiet at that moment nothing ever wakes a converge -- the process then sits
+// on a dead api handle with an empty FIB and no log line (measured: one page of
+// broken-pipe lines 203 s apart from the recovery, FIB empty the whole time).
+// A periodic pass is the probe: reading BFD sessions goes over that same
+// connection, so a dead one reports ErrClosed here, dropDead drops the handle
+// and the following pass redials from scratch. When healthy it is three reads
+// and zero writes, and it doubles as drift self-heal.
 func (f *fiber) convergeLoop(ctx context.Context) {
+	poll := f.healthPoll
+	if poll <= 0 {
+		poll = defaultHealthPoll
+	}
+	health := time.NewTicker(poll)
+	defer health.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-f.wake:
+		case <-health.C:
 		}
 		// dp/applier 会在两次收敛之间被换掉（重连），必须和 PUT /config 那条
 		// 路径共用一把锁 —— Applier 只允许单线程调用。

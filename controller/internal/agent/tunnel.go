@@ -64,10 +64,13 @@ type TunnelSync struct {
 	// calls, so it must never be mu (which only guards the report).
 	applyMu sync.Mutex
 
-	mu       sync.Mutex
-	links    map[string]*Link
-	peerOf   map[string]uint16
-	localOf  map[string]netip.Prefix
+	mu      sync.Mutex
+	links   map[string]*Link
+	peerOf  map[string]uint16
+	localOf map[string]netip.Prefix
+	// colors 记每条隧道在 bundle 里的颜色（spec.Color；nil = 老控制器没发过
+	// color 字段）。sr-fib 隧道表的派生（FibTableSync）读同一份，不另立状态。
+	colors   map[string]*uint8
 	skipped  map[string]string
 	state    wire.TunnelState
 	applying bool
@@ -93,6 +96,7 @@ func NewTunnelSync(dp DataPlane, id *Identity,
 		links:   map[string]*Link{},
 		peerOf:  map[string]uint16{},
 		localOf: map[string]netip.Prefix{},
+		colors:  map[string]*uint8{},
 		skipped: map[string]string{},
 		state:   wire.TunnelState{Capable: true},
 	}
@@ -167,12 +171,18 @@ func (t *TunnelSync) getLink(id string) *Link {
 	return t.links[id]
 }
 
-func (t *TunnelSync) setLink(id string, l *Link, peer uint16, local netip.Prefix) {
+func (t *TunnelSync) setLink(id string, l *Link, peer uint16, local netip.Prefix, color *uint8) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.links[id] = l
 	t.peerOf[id] = peer
 	t.localOf[id] = local
+	if color == nil {
+		delete(t.colors, id)
+	} else {
+		c := *color
+		t.colors[id] = &c
+	}
 }
 
 func (t *TunnelSync) delLink(id string) {
@@ -181,6 +191,7 @@ func (t *TunnelSync) delLink(id string) {
 	delete(t.links, id)
 	delete(t.peerOf, id)
 	delete(t.localOf, id)
+	delete(t.colors, id)
 }
 
 func (t *TunnelSync) takeLinks() map[string]*Link {
@@ -243,8 +254,51 @@ func (t *TunnelSync) Endpoints() *[]wire.TunnelEndpoint {
 	return &out
 }
 
-// teardownLink 先撤遥测再撤接口。顺序是硬的：多跳 BFD 会话不带隧道身份，
-// 接口一删就再也对不上它属于哪条隧道（Remove 还得按 sw_if_index 删探针），
+// FibTunnelRow 是派生 sr-fib 隧道表要的一行：对端 overlay /32（下一跳）、
+// 颜色、以及这条隧道口的 sw_if_index（接口名由调用方问 VPP 要，见
+// FibTableSync：名字是 VPP 的命名结果，不拼、不猜）。
+//
+// Color 为 nil 只可能来自老控制器的 bundle（wire.TunnelSpec.Color 的指针语义），
+// 派生器遇到它就整轮拒绝 —— 不是"按 0 装进去"。
+type FibTunnelRow struct {
+	TunnelID  string
+	NextHop   string
+	Color     *uint8
+	SWIfIndex uint32
+}
+
+// FibRows 是"这台盒子现在跑着哪些隧道"的读数，给 FibTableSync 派生 sr-fib 的
+// 隧道表用。只收口子已经在 VPP 里、overlay 已经绑上的 Link：一条还没建起来的
+// 隧道没有"下一跳走哪张口"这个事实，凑一行进去只会让 FIB 装一条走空口的路径。
+//
+// 与 Endpoints() 的区别只在用途：那边是"我能给对端提供哪些下一跳"（要么 Ready），
+// 这边是"这些下一跳在我自己的 FIB 里怎么落"（口在就算数，可达性归 BFD）。
+func (t *TunnelSync) FibRows() []FibTunnelRow {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]FibTunnelRow, 0, len(t.links))
+	for id, l := range t.links {
+		idx := l.SWIfIndex()
+		if idx == 0 || !l.cfg.PeerOverlay.IsValid() {
+			continue
+		}
+		out = append(out, FibTunnelRow{
+			TunnelID:  id,
+			NextHop:   l.cfg.PeerOverlay.Addr().String(),
+			Color:     t.colors[id],
+			SWIfIndex: idx,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NextHop != out[j].NextHop {
+			return out[i].NextHop < out[j].NextHop
+		}
+		return out[i].TunnelID < out[j].TunnelID
+	})
+	return out
+}
+
+// teardownLink 先撤遥测再撤接口。顺序是硬的：多跳 BFD 会话不带隧道身份，// 接口一删就再也对不上它属于哪条隧道（Remove 还得按 sw_if_index 删探针），
 // 留下一条指向已消失隧道口的会话比撤销失败更难查。撤不下来就整条撤销失败、
 // 下一轮重试，绝不"先把接口删了再说"。
 func (t *TunnelSync) teardownLink(ctx context.Context, l *Link) error {
@@ -604,8 +658,11 @@ func (t *TunnelSync) applySpec(ctx context.Context, b wire.UnderlayBundle,
 		// Recorded before it is opened: if Open or ApplyPeer fails the next
 		// attempt continues from this object instead of creating a second
 		// interface for the same instance.
-		t.setLink(spec.TunnelID, l, spec.PeerNodeID, cfg.LocalOverlay)
 	}
+	// 每次收敛都刷新一遍这条记录，不只建 Link 那一次：颜色是控制台随时可改的
+	// 属性，改色不重建接口（VPP preference 归 sr-fib），但派生出来的隧道表必须
+	// 当场跟上，否则主备换了颜色而 FIB 还是旧优先级。
+	t.setLink(spec.TunnelID, l, spec.PeerNodeID, cfg.LocalOverlay, spec.Color)
 
 	keys, err := linkKeys(b.PKeys)
 	if err != nil {

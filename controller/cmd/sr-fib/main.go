@@ -246,7 +246,16 @@ type fiber struct {
 
 	// wake 是"该收敛一次了"的信号，容量 1：要的是走到最新快照，不是重放历史。
 	wake chan struct{}
+
+	// healthPoll 是兜底收敛的间隔（见 convergeLoop）：VPP 那条连接没有别处
+	// 探活，而事件驱动只在"有人说话"时发生。0 表示用 defaultHealthPoll。
+	healthPoll time.Duration
 }
+
+// defaultHealthPoll 是兜底收敛的间隔。要权衡的两头：VPP 重启后多久被发现
+// （等于这个数 + 一次重连 + 一轮收敛），和健康时每轮三次只读 API dump 的开销。
+// 10s 让最坏恢复在十几秒量级，同时每台盒子每分钟只有 6 轮空转。
+const defaultHealthPoll = 10 * time.Second
 
 // conn 保证这一轮手里有一条活的数据面连接；没有就现连一份。
 //
@@ -280,7 +289,10 @@ func (f *fiber) dropDead(err error) {
 	_ = f.dp.Close()
 	f.dp = nil
 	f.applier = nil
-	log.Printf("sr-fib: VPP api 连接断了（%v）：下一次重连，按整份计划从头收敛", err)
+	log.Printf("sr-fib: VPP api 连接断了（%v）：立刻重连，按整份计划从头收敛", err)
+	// 当场叫醒下一轮：确认连接死了的这一刻正是最该重连的一刻，等下一个事件
+	// 或下一次心跳都只是白白延长 FIB 空着的时间。
+	f.signal()
 }
 
 // converge 按当前配置重算整份计划并下发。调用者必须持有 mu。
@@ -495,14 +507,15 @@ func main() {
 	}
 
 	f := &fiber{
-		dp:        vc,
-		applier:   fib.NewApplier(vc),
-		dial:      dial,
-		hc:        &http.Client{Timeout: 5 * time.Second},
-		stream:    &http.Client{},
-		statusURL: cfg.StatusURL,
-		view:      map[ribKey]fib.RIBRoute{},
-		wake:      wake,
+		dp:         vc,
+		applier:    fib.NewApplier(vc),
+		dial:       dial,
+		hc:         &http.Client{Timeout: 5 * time.Second},
+		stream:     &http.Client{},
+		statusURL:  cfg.StatusURL,
+		view:       map[ribKey]fib.RIBRoute{},
+		wake:       wake,
+		healthPoll: defaultHealthPoll,
 	}
 	f.cur.Store(&live)
 

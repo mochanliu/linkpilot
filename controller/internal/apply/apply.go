@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -430,6 +431,13 @@ type Applier struct {
 	Exec      Executor
 	Sleep     func(time.Duration)
 	TAPExists func(string) bool
+	// HostPermMAC reads a NIC's burned-in MAC (default: ethtool -P). A test
+	// seam; nil means "use the default".
+	HostPermMAC func(ctx context.Context, netdev string) (mac string, permanent bool)
+	// NetdevMAC reads the kernel netdev's CURRENT MAC (default
+	// /sys/class/net/<if>/address). Only a fallback, and the fallback is said
+	// out loud -- that path is exactly the dirty-MAC defect's shape.
+	NetdevMAC func(netdev string) (string, error)
 	Logf      func(format string, args ...any)
 	Now       func() time.Time
 	HTTP      *http.Client
@@ -450,14 +458,14 @@ func New(store Store) *Applier {
 			}
 			return c, nil
 		},
-		Wait:      10 * time.Second,
-		Exec:      execRunner{},
-		Sleep:     time.Sleep,
-		TAPExists: func(name string) bool { _, err := os.Stat("/sys/class/net/" + name); return err == nil },
+		Wait:         10 * time.Second,
+		Exec:         execRunner{},
+		Sleep:        time.Sleep,
+		TAPExists:    func(name string) bool { _, err := os.Stat("/sys/class/net/" + name); return err == nil },
 		SrfrrRunning: func() bool { return procExists("sr-frr") },
-		Logf:      func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
-		Now:       time.Now,
-		HTTP:      &http.Client{Timeout: routePushTimeout},
+		Logf:         func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
+		Now:          time.Now,
+		HTTP:         &http.Client{Timeout: routePushTimeout},
 	}
 }
 
@@ -492,6 +500,24 @@ func (a *Applier) setDefaults() {
 	}
 	if a.TAPExists == nil {
 		a.TAPExists = def.TAPExists
+	}
+	if a.HostPermMAC == nil {
+		a.HostPermMAC = func(ctx context.Context, netdev string) (string, bool) {
+			out, err := a.Exec.Run(ctx, "ethtool", "-P", netdev)
+			if err != nil {
+				return "", false
+			}
+			return permanentMACFrom(out)
+		}
+	}
+	if a.NetdevMAC == nil {
+		a.NetdevMAC = func(netdev string) (string, error) {
+			b, err := os.ReadFile("/sys/class/net/" + netdev + "/address")
+			if err != nil {
+				return "", err
+			}
+			return strings.TrimSpace(string(b)), nil
+		}
 	}
 	if a.SrfrrRunning == nil {
 		a.SrfrrRunning = def.SrfrrRunning
@@ -716,6 +742,19 @@ func artifactCommands(text string) []string {
 // cases (interface already in the wanted table, lcp pair already present) are
 // resolved by asking VPP first instead of by ignoring an error.
 func (a *Applier) runVPP(ctx context.Context, text string) error {
+	// 先把 fragment 里要接管的 host-* 口建出来，再逐句执行。必须在最前面：
+	// 同一张 fragment 里 `set interface mtu/state host-eth3` 排在 `lcp create`
+	// 之前，af_packet 口不在 VPP 里时第一句就以 unknown interface 失败，逐行
+	// 分支里的建口逻辑根本轮不到 —— VPP 重启后的重放就是这个形状。
+	for _, cmd := range artifactCommands(text) {
+		m := reLCPCreate.FindStringSubmatch(cmd)
+		if m == nil || !strings.HasPrefix(m[1], "host-") {
+			continue
+		}
+		if err := a.ensureHostIface(ctx, strings.TrimPrefix(m[1], "host-"), m[1]); err != nil {
+			return err
+		}
+	}
 	for _, cmd := range artifactCommands(text) {
 		if m := reLCPCreate.FindStringSubmatch(cmd); m != nil {
 			vppIf, tap := m[1], m[2]
@@ -758,6 +797,147 @@ func (a *Applier) runVPP(ctx context.Context, text string) error {
 		}
 	}
 	return nil
+}
+
+// ensureHostIface makes sure the af_packet interface behind an `lcp create
+// host-<netdev>` pair exists in VPP, and that it was created with the NIC's
+// BURNED-IN MAC.
+//
+// Why the product has to do this: the fragment only carries
+// `lcp create host-eth3 host-if lcp-x3`, which presumes host-eth3 is already in
+// VPP. VPP keeps interfaces in memory only, so a restart takes that interface
+// with it and nothing in the product path rebuilds it (in the lab this was
+// covered by underlay.sh/takeover-if.sh). The next link in that gap is the
+// dirty-MAC incident (exp-286 §5.5): lcp-sync writes the tap's random MAC back
+// onto the kernel netdev, so a re-takeover that trusts the kernel's current
+// value re-installs the dirty MAC -- the peer's ARP then goes FAILED and OSPF
+// sticks in ExStart while everything looks "taken over".
+//
+// The only trustworthy source is ethtool -P: the NIC's own permanent address,
+// immune to whatever lcp-sync wrote. Falling back to the kernel's current value
+// is allowed but said out loud, because that fallback is the defect's shape.
+//
+// What hw-addr does NOT do (measured 2026-11-10, VPP 26.06 on the VM lab):
+// it gives the af_packet interface -- and the lcp tap mirrored from it -- the
+// burned-in MAC, but it leaves the KERNEL netdev at whatever lcp-sync wrote.
+// So this function repairs the netdev explicitly (down, set address, up) before
+// creating the interface. Leaving it dirty is a landmine: verifiable two ways.
+// The lab's own underlay.sh refuses to take such a port over at all
+// ("FAIL enp0s8 的 netdev MAC=02:... 与传入的 08:... 不等"), and the lcp tap's
+// MAC is the one the customer's FRR sees, so a mismatch between the two is
+// exactly the shape of the incident above.
+func (a *Applier) ensureHostIface(ctx context.Context, netdev, hostIf string) error {
+	if a.HostPermMAC == nil || a.NetdevMAC == nil || a.Exec == nil {
+		a.setDefaults()
+	}
+	exists, err := a.vppIfaceExists(ctx, hostIf)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	if a.DryRun {
+		a.Logf("vpp: would create host-interface name %s hw-addr <烧录 MAC>", netdev)
+		return nil
+	}
+	mac, permanent := a.HostPermMAC(ctx, netdev)
+	src := "ethtool -P 烧录值"
+	if !permanent {
+		cur, kerr := a.NetdevMAC(netdev)
+		if kerr != nil {
+			return fmt.Errorf("取 %s 的 MAC：ethtool -P 读不到，内核现值也读不到: %w", netdev, kerr)
+		}
+		mac, src = cur, "内核现值"
+		a.Logf("vpp: %s 的烧录 MAC 读不到（ethtool -P），回落内核现值 %s —— 这个口若被 lcp-sync 写脏过，这里就是脏 MAC", netdev, cur)
+	}
+	if _, err := net.ParseMAC(mac); err != nil {
+		return fmt.Errorf("%s 的 MAC %q 不合法: %w", netdev, mac, err)
+	}
+	// 内核那一侧先改回烧录值。hw-addr 管不到它（现场实测，见函数头），而脏值是地雷：
+	// 这台盒子下次被谁接管时，只要对方先核 MAC（lab 的 underlay.sh 就核），就会直接
+	// 拒绝接管，等人来手工修。改 MAC 必须先 down —— 内核拒绝在 up 的 netdev 上改地址。
+	// 非致命：修不动也要把 VPP 那边接上，否则整条接管都停在这一步。
+	if cur, cerr := a.NetdevMAC(netdev); cerr != nil {
+		a.Logf("vpp: %s 的内核 MAC 读不到（%v），跳过改回", netdev, cerr)
+	} else if !strings.EqualFold(strings.TrimSpace(cur), mac) {
+		if a.DryRun {
+			a.Logf("vpp: would set %s address %s（内核现值 %s 是脏的）", netdev, mac, cur)
+		} else {
+			a.Logf("vpp: %s 的内核 MAC=%s 与要用的 %s 不一致（lcp-sync 写脏过），先改回", netdev, cur, mac)
+			if _, ierr := a.Exec.Run(ctx, "ip", "link", "set", "dev", netdev, "down"); ierr != nil {
+				a.Logf("vpp: %s 改 MAC 前 down 失败（非致命）: %v", netdev, ierr)
+			}
+			if out, ierr := a.Exec.Run(ctx, "ip", "link", "set", "dev", netdev, "address", mac); ierr != nil {
+				a.Logf("vpp: %s 的 MAC 改不回 %s（非致命，VPP 侧仍会用 hw-addr）: %v: %s", netdev, mac, ierr, strings.TrimSpace(out))
+			}
+			if _, ierr := a.Exec.Run(ctx, "ip", "link", "set", "dev", netdev, "up"); ierr != nil {
+				a.Logf("vpp: %s 改完 MAC 起不来（非致命，下面还会再拉一次）: %v", netdev, ierr)
+			}
+		}
+	}
+	// 多播过滤要在接管前打开：FRR 的组播订阅落在 lcp TAP 上，e1000 的硬件过滤
+	// 会直接丢掉 224.0.0.5（docs/vmlab-rebuild-plan.md §9.3；容器台是 veth，
+	// 所以从来没暴露）。非致命 —— 这条口能不能接管不该被一个过滤开关挡住。
+	if out, ierr := a.Exec.Run(ctx, "ip", "link", "set", "dev", netdev, "allmulticast", "on"); ierr != nil {
+		a.Logf("vpp: %s allmulticast 打不开（非致命）: %v: %s", netdev, ierr, strings.TrimSpace(out))
+	}
+	if _, ierr := a.Exec.Run(ctx, "ip", "link", "set", netdev, "up"); ierr != nil {
+		a.Logf("vpp: %s 起不来（非致命，create host-interface 会自己拉起）", netdev)
+	}
+	a.Logf("vpp: 建 af_packet %s ← %s，hw-addr=%s（%s）", hostIf, netdev, mac, src)
+	out, err := a.Exec.Run(ctx, a.VPPCtl, "create", "host-interface", "name", netdev, "hw-addr", mac)
+	if err != nil {
+		return fmt.Errorf("vppctl create host-interface name %s: %v: %s", netdev, err, strings.TrimSpace(out))
+	}
+	if msg := vppError(out); msg != "" {
+		// 并发接管时（lab 的 underlay.sh 也在建同一个口）"already exists" 不是失败。
+		if ok, e := a.vppIfaceExists(ctx, hostIf); e == nil && ok {
+			a.Logf("vpp: %s 已经被另一条路径建好，继续配对", hostIf)
+			return nil
+		}
+		return fmt.Errorf("vppctl create host-interface name %s: %s", netdev, msg)
+	}
+	return nil
+}
+
+// vppIfaceExists asks VPP whether an interface exists. A missing one makes
+// vppctl print "unknown interface", never an empty answer -- so an empty answer
+// (only reachable from a stub executor) counts as "exists" and leaves the
+// fragment's own `lcp create` as the authority: if the interface really is
+// missing, that command fails loudly instead of being papered over.
+func (a *Applier) vppIfaceExists(ctx context.Context, name string) (bool, error) {
+	if a.DryRun {
+		return false, nil
+	}
+	out, err := a.Exec.Run(ctx, a.VPPCtl, "show", "interface", name)
+	if err != nil {
+		return false, fmt.Errorf("vppctl show interface %s: %v: %s", name, err, strings.TrimSpace(out))
+	}
+	if strings.TrimSpace(out) == "" {
+		return true, nil
+	}
+	if strings.Contains(strings.ToLower(out), "unknown interface") {
+		return false, nil
+	}
+	if msg := vppError(out); msg != "" {
+		return false, fmt.Errorf("vppctl show interface %s: %s", name, msg)
+	}
+	return true, nil
+}
+
+// rePermanentMAC matches ethtool -P's answer: "Permanent address: 08:00:27:..".
+var rePermanentMAC = regexp.MustCompile(`(?i)permanent\s+address:\s*([0-9a-f]{2}(?::[0-9a-f]{2}){5})`)
+
+// permanentMACFrom extracts the MAC from ethtool -P output. ok=false means the
+// driver did not report one (a handful do not), which forces the caller to
+// state its fallback instead of silently using a value that may be dirty.
+func permanentMACFrom(out string) (string, bool) {
+	m := rePermanentMAC.FindStringSubmatch(out)
+	if m == nil {
+		return "", false
+	}
+	return strings.ToLower(m[1]), true
 }
 
 // vppError returns a non-empty message when vppctl printed an error. vppctl

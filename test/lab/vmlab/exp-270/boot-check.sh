@@ -106,11 +106,23 @@ b "vppctl show bfd sessions" 2>/dev/null | awk '/Session state/{n++; if($3=="Up"
 st=$(b "curl -s http://127.0.0.1:19011/status")
 tun=$(echo "$st" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("tunnels") or []))' 2>/dev/null)
 warn=$(echo "$st" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len((d.get("last") or {}).get("warnings") or []))' 2>/dev/null)
-say "  sr-fib 隧道表=$tun 条、上次收敛 warnings=$warn 条"
-[ "${tun:-0}" -gt 0 ] && ok "sr-fib 隧道表非空（$tun 条）—— 别读成「开机自己就好了」：真开机那一刻这里是 0
-      （G-2：产品里没有进程维护这张表），非空是因为 lab 侧 vm-fib-sync.sh 事后 PUT /config 推过。
-      第一次开机后的原始读回记在 §9.18 与本目录 raw/boot-CPE4-first-readback.log。" \
-    || bad "sr-fib 隧道表=0（G-2：开机没人推这张表，overlay 装不出来；lab 侧靠 vm-fib-sync.sh 兜）"
+orphan=$(echo "$st" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len([w for w in ((d.get("last") or {}).get("warnings") or []) if "不在隧道表里" in w]))' 2>/dev/null)
+disk=$(b "python3 -c 'import json;print(len(json.load(open(\"/etc/sdwan/fib.json\")).get(\"tunnels\") or []))'")
+say "  sr-fib 隧道表=$tun 条、磁盘 fib.json=$disk 条、上次收敛 warnings=$warn 条（其中「不在隧道表里」$orphan 条）"
+# 判据换过一版（#288）。旧判据只要求"表非空"，而那时候表是 lab 脚本 vm-fib-sync.sh 手工
+# PUT 的 —— 于是「开机后产品里没人管这张表」这个缺口被脚本盖住，判据一直是绿的。
+# 现在这张表由 sr-agent 每拍派生（不落盘），所以开机判据要同时看三条：
+#   ① 非空；② 磁盘 fib.json 仍 0 条（非空只能是运行时推的，不是开机从盘上读的）；
+#   ③ 没有「下一跳不在隧道表里」（表缺行的独有症状）。
+if [ "${tun:-0}" -gt 0 ] && [ "${disk:-1}" = "0" ] && [ "${orphan:-1}" = "0" ]; then
+    ok "sr-fib 隧道表 $tun 条，是 sr-agent 开机后派生的（磁盘 fib.json 仍 0 条、无缺行警告）"
+elif [ "${disk:-0}" != "0" ]; then
+    bad "sr-fib 隧道表 $tun 条，但磁盘 fib.json 也有 $disk 条 —— 分不清是开机读的还是 agent 推的（lab 又手工写盘了？）"
+elif [ "${orphan:-0}" != "0" ]; then
+    bad "sr-fib 隧道表缺行（$orphan 条「下一跳不在隧道表里」）—— 派生器没把表推全，overlay 装不出来"
+else
+    bad "sr-fib 隧道表=0（agent 派生器没推：看 /var/log/sr-box/agent.log 的「sr-fib 隧道表」行）"
+fi
 
 say ""
 say "判据汇总：PASS=$PASS FAIL=$FAIL"

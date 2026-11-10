@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"sdwan/controller/internal/fib"
 	"sdwan/controller/internal/vppapi"
@@ -558,5 +559,65 @@ func TestOrdinaryFailureKeepsConnection(t *testing.T) {
 	f.mu.Unlock()
 	if held == nil {
 		t.Fatal("普通失败把好的连接扔了")
+	}
+}
+
+// ------------------------------------------------- 缺陷①：惰性断连检测
+//
+// 现场读数（exp-286, 2026-11-09）：CPE1 重启 VPP 之后 BFD 事件订阅随连接死掉，
+// 而 RIB 那时没有变化 —— 没有任何东西会唤醒收敛，sr-fib 抱着死句柄待着，
+// FIB 一直空着且一行日志都没有（直到人工 pkill）。事件驱动只覆盖"有人在说话"
+// 的时刻，所以这里必须有一条不依赖任何事件的兜底：心跳收敛自己就是探活。
+//
+// 这条测试不允许调用 f.signal()：它要证明的正是"没有事件也能发现并自愈"。
+
+func TestHealthTickRedialsDeadVPPWithoutAnyEvent(t *testing.T) {
+	f, dp1, stub := newFiberForTest(t)
+	stub.body.Store(ribWithVPN100)
+	body := `{"vrfs":[0,100],"tunnels":[{"next_hop":"10.255.0.2","interface":"wg0"}]}`
+	if rec, _ := putConfig(t, f, body); rec.Code != http.StatusOK {
+		t.Fatalf("前置 PUT = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	dp2 := newFakeDP() // VPP 重启后的新进程
+	var dials int32
+	f.dial = func(context.Context) (bfdDP, error) {
+		atomic.AddInt32(&dials, 1)
+		return dp2, nil
+	}
+	f.healthPoll = 20 * time.Millisecond
+	dp1.setDead()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		f.convergeLoop(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, _, routes := snapshotOf(dp2)
+		if routes["10.100.2.0/24@100"] == 1 && atomic.LoadInt32(&dials) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("没有事件的情况下 %s 内没自愈：dials=%d routes=%v",
+				5*time.Second, atomic.LoadInt32(&dials), routes)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// 自愈之后不该反复重连：连接是活的，心跳轮只做读。
+	first := atomic.LoadInt32(&dials)
+	time.Sleep(80 * time.Millisecond)
+	if got := atomic.LoadInt32(&dials); got != first {
+		t.Fatalf("活连接被反复重连（dials %d → %d）", first, got)
+	}
+	if st := getStatus(t, f); st.Last == nil || !st.Last.Converged {
+		t.Fatalf("/status 没如实说恢复成功: %+v", st.Last)
 	}
 }
