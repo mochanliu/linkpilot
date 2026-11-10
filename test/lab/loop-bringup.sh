@@ -139,7 +139,7 @@ hand_if_to_vpp() {   # <cpe> <ip> <pfx> <with-addr 0|1>
     ifn=$(kernel_if_for_ip "$c" "$ip")
     if [ -z "$ifn" ]; then
         ifn=$(hint_if_for_ip "$c" "$ip")
-        [ -n "$ifn" ] || die "$c: 内核上没有 $ip，也没有 /tmp/lab-ifstate 记录"
+        [ -n "$ifn" ] || die "$c: 内核上没有 ${ip}，也没有 /tmp/lab-ifstate 记录"
         dx "$c" ip addr add "$ip/$pfx" dev "$ifn" || die "$c: 恢复 $ip/$pfx 到 $ifn 失败"
     fi
     vif="host-$ifn"
@@ -203,7 +203,7 @@ stop_proc() {   # <container> <process-name>：SIGTERM 先走，等真退出
 stage_containers() {
     log "containers: 重建 ${PROJECT}"
     docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-        die "缺少镜像 $IMAGE（cd test/lab && docker build -t $IMAGE .）"
+        die "缺少镜像 ${IMAGE}（cd test/lab && docker build -t $IMAGE .）"
     docker image inspect "$CUST_IMAGE" >/dev/null 2>&1 || die "缺少镜像 $CUST_IMAGE"
     mkdir -p "$RUN" "$BIN"
     [ "$KEEP" = "1" ] || docker compose -f "$COMPOSE" -p "$PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -293,7 +293,7 @@ stage_platform() {
         dx "$c" bash -lc 'if ip -o -4 addr show dev '"$LCP_IF"' | grep -q inet; then
                              echo "lcp TAP 上已经有地址，说明有人手配了" >&2; exit 1; fi' ||
             die "$c: $LCP_IF 提前拿到地址"
-        note "$c: $vif + $LCP_IF，WAN ${WAN[$n]} 在 VPP，客户口地址未配（等控制台）"
+        note "$c: $vif + ${LCP_IF}，WAN ${WAN[$n]} 在 VPP，客户口地址未配（等控制台）"
     done
 
     log "platform: P-7 客户路由器与终端（客户自己的网络，不归控制器）"
@@ -359,7 +359,7 @@ EOF
                 vtysh "lp-cust$n" -c 'show ip route' 2>/dev/null | grep -q "${loop}" && { ok=1; break; }
             sleep 0.5
         done
-        [ "$ok" = "1" ] || die "lp-cust$n: 客户路由器的协议/loopback 没就绪（docker logs lp-cust$n）"
+        [ "$ok" = "1" ] || die "lp-cust$n: 客户路由器的协议/loopback 没就绪（docker logs lp-cust${n}）"
         # docker 给每个网段都塞了一条默认路由（走网桥网关，黑洞）。它距离是 0，
         # 会盖住客户自己写的静态默认，所以删掉；zebra 发现自己装的路由没了会再装回来。
         dx "lp-cust$n" sh -c 'while ip route del default 2>/dev/null; do :; done' || true
@@ -474,7 +474,7 @@ EOF
         for i in $(seq 1 40); do vtysh "$c" -c 'show version' >/dev/null 2>&1 && break; sleep 0.5; done
         vtysh "$c" -c 'show version' >/dev/null 2>&1 || die "$c: vtysh 没响应"
         vtysh "$c" -c 'show running-config' | grep -q "^hostname" || die "$c: FRR 空壳配置没应用"
-        note "$c: node_id=$id tenant=$tenant，route/fib/sr-frr bootstrap 就位，FRR 空壳已起"
+        note "$c: node_id=$id tenant=${tenant}，route/fib/sr-frr bootstrap 就位，FRR 空壳已起"
     done
 }
 
