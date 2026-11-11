@@ -289,6 +289,7 @@ type policyRowJSON struct {
 	Peer          uint16          `json:"peer,omitempty"`
 	Colors        []uint8         `json:"colors,omitempty"`
 	SLA           *map[string]any `json:"sla,omitempty"`
+	Preempt       bool            `json:"preempt,omitempty"`
 	SelectorTable uint32          `json:"selector_table,omitempty"`
 }
 
@@ -758,5 +759,38 @@ func TestPolicyDynamicRejectsForeignSelectorTable(t *testing.T) {
 	}
 	if len(plane.policies) != 0 {
 		t.Fatalf("拒绝之后不该有任何策略落地: %v", plane.policies)
+	}
+}
+
+// DynamicPolicyRows 要把第 7 段的动态行原样喂给选路组件：preempt（粘住/抢占）
+// 与 SLA 门槛都要带过去，静态行不出现。
+func TestDynamicPolicyRowsCarryPreemptAndSLA(t *testing.T) {
+	sla := map[string]any{"latency_ms": 50, "jitter_ms": 10, "loss_permille": 30}
+	seg := policySegment(t, []policyRowJSON{
+		{ID: 1, VPN: 100, Dst: "192.0.2.0/24", Attach: []string{policyIfA},
+			Mode: "dynamic", Peer: 3, Colors: []uint8{2, 3}, SLA: &sla,
+			Preempt: true, SelectorTable: 10001},
+		{ID: 2, VPN: 100, Dst: "198.51.100.0/24", Attach: []string{policyIfA},
+			Mode: "dynamic", Peer: 4, SelectorTable: 10002},
+		{ID: 3, VPN: 100, Color: 2, Dst: "203.0.113.0/24", Attach: []string{policyIfA}},
+	})
+	rows, err := DynamicPolicyRows(seg)
+	if err != nil {
+		t.Fatalf("DynamicPolicyRows: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("应解出 2 条动态行（静态行不进），实际 %d: %+v", len(rows), rows)
+	}
+	if !rows[0].Preempt {
+		t.Fatalf("行 1 的 preempt=true 应带过去: %+v", rows[0])
+	}
+	if rows[0].MaxLatencyMS != 50 || rows[0].MaxJitterMS != 10 || rows[0].MaxLossPermille != 30 {
+		t.Fatalf("行 1 的 SLA 门槛没带过去: %+v", rows[0])
+	}
+	if rows[1].Preempt {
+		t.Fatalf("行 2 没勾抢占应默认 false: %+v", rows[1])
+	}
+	if rows[1].MaxLatencyMS != 0 || rows[1].MaxJitterMS != 0 || rows[1].MaxLossPermille != 0 {
+		t.Fatalf("行 2 没有 SLA 应全 0（不约束）: %+v", rows[1])
 	}
 }

@@ -104,6 +104,7 @@ type policyRowDoc struct {
 	Peer          uint16        `json:"peer,omitempty"`
 	Colors        []uint8       `json:"colors,omitempty"`
 	SLA           *policySLADoc `json:"sla,omitempty"`
+	Preempt       bool          `json:"preempt,omitempty"`
 	SelectorTable uint32        `json:"selector_table,omitempty"`
 }
 
@@ -181,6 +182,7 @@ func DynamicPolicyRows(seg string) ([]sla.Row, error) {
 			VPN:           r.VPN,
 			Peer:          r.Peer,
 			Colors:        r.Colors,
+			Preempt:       r.Preempt,
 			SelectorTable: r.SelectorTable,
 		}
 		if s := r.SLA; s != nil {

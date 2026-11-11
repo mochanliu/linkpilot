@@ -92,6 +92,12 @@ type PolicyRow struct {
 	Peer   uint16     `json:"peer,omitempty"`   // dynamic：SLA 量的是到这台 CPE 的隧道
 	Colors []uint8    `json:"colors,omitempty"` // dynamic：候选颜色；空 = 该对端全部颜色
 	SLA    *PolicySLA `json:"sla,omitempty"`    // dynamic：门槛；nil / 全 0 = 不设门槛
+	// Preempt（dynamic）是"抢占"开关，默认不勾：
+	//   - 不勾（粘住）：当前隧道只要还达标就一直用，别的隧道更优也不切；直到它
+	//     不达标且**有**达标的候选可用才切。
+	//   - 勾（抢占）：永远追当前 SLA 最优的一条 —— 别的隧道连续 holdRounds 拍
+	//     更优就切过去。切换理由的语义差别见 sla.Selector.decide。
+	Preempt bool `json:"preempt,omitempty"`
 }
 
 // PolicySLA 是动态行的门槛，三项都是"低于/不多于"才算达标；0 表示这一项不
@@ -138,6 +144,7 @@ type policyArtifactRow struct {
 	Peer          uint16     `json:"peer,omitempty"`
 	Colors        []uint8    `json:"colors,omitempty"`
 	SLA           *PolicySLA `json:"sla,omitempty"`
+	Preempt       bool       `json:"preempt,omitempty"`
 	SelectorTable uint32     `json:"selector_table,omitempty"`
 }
 
@@ -229,6 +236,7 @@ func normalizePolicySet(set *PolicySet) {
 		} else {
 			r.Colors = nil
 			r.SLA = nil
+			r.Preempt = false
 		}
 	}
 	if set.Rows == nil {
@@ -283,7 +291,7 @@ func policyRowEqual(a, b PolicyRow) bool {
 	if a.ID != b.ID || a.VPN != b.VPN || a.Color != b.Color ||
 		a.Src != b.Src || a.Dst != b.Dst || a.Proto != b.Proto ||
 		a.SrcPort != b.SrcPort || a.DstPort != b.DstPort ||
-		a.Mode != b.Mode || a.Peer != b.Peer {
+		a.Mode != b.Mode || a.Peer != b.Peer || a.Preempt != b.Preempt {
 		return false
 	}
 	if len(a.Colors) != len(b.Colors) {
@@ -359,6 +367,7 @@ func renderPolicyArtifact(c *BasicConfig, set PolicySet) string {
 			row.Peer = r.Peer
 			row.Colors = r.Colors
 			row.SLA = r.SLA
+			row.Preempt = r.Preempt
 			row.SelectorTable = st
 			row.Color = 0 // 动态行没有固定颜色（normalize 已清；这里再钉一次）
 		}

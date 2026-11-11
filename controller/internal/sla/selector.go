@@ -17,8 +17,9 @@
 //   - 达标的里面挑**延迟最低**的颜色（并列看抖动、丢包、颜色号）；
 //   - 全部不达标 = 走**最接近**的一条（丢包最少 → 延迟最低），SLA 是偏好不是
 //     准入，不因为一时抖动断流；
-//   - 切换有迟滞：新颜色要连续赢 holdRounds 拍才切；但当前颜色 100% 丢包（探针
-//     全判丢）时立即切，不等迟滞；
+//   - Preempt（owner 2026-11-11 补）：默认**粘住** —— 当前隧道还达标就一直用，
+//     更优的候选不抢；勾了抢占才永远追最优。切换本身有迟滞：新颜色要连续赢
+//     holdRounds 拍才切；但当前颜色 100% 丢包（探针全判丢）时立即切，不等迟滞；
 //   - 选路表空（VPP 重启过、路由没了）时立即恢复写入，不经过迟滞。
 //
 // 宿主是 sr-agent：它已经拥有探针会话的生命周期、隧道→对端→颜色的映射和到控制
@@ -53,7 +54,12 @@ type Row struct {
 	MaxLatencyMS    float64 // 0 = 不约束
 	MaxJitterMS     float64 // 0 = 不约束
 	MaxLossPermille uint32  // 0 = 不约束
-	SelectorTable   uint32
+	// Preempt（owner 2026-11-11 补）：默认 false = 粘住 —— 当前隧道只要还达标
+	// 就一直用，别的隧道更优也不切；它不达标且有达标候选可用才切。true = 抢占，
+	// 永远追最优（下方迟滞语义）。两种模式的其余路径（100% 丢包立即切、颜色被
+	// 挤掉立即重选、全不达标走最接近）完全一致。
+	Preempt       bool
+	SelectorTable uint32
 }
 
 // Tunnel 是这台盒子的一条隧道（agent.TunnelSync.FibRows 的形状 + 对端节点号）。
@@ -226,8 +232,8 @@ func (s *Selector) Tick(ctx context.Context) error {
 //
 // 三个分支的次序就是语义：
 //  1. 当前已经是最优 → 保持（最常见路径，零动作）；
-//  2. 有比当前更优的候选，但**两边都达标** → 迟滞：新候选连续赢 holdRounds 拍
-//     才切，孤立的抖动不切；
+//  2. 有比当前更优的候选，且**两边都达标** → 看 Preempt：不勾（默认，粘住）就
+//     按兵不动；勾了（抢占）走迟滞，新候选连续赢 holdRounds 拍才切；
 //  3. 其余（当前不达标 / 当前颜色已不在候选里）→ 立即切到最优。当前 100% 丢包、
 //     首次选择、当前颜色被配置挤掉、SLA 不达标四种来路各有一句原因。
 func (s *Selector) decide(r Row, byIf map[uint32]Sample, st *rowState) (uint8, string) {
@@ -274,7 +280,13 @@ func (s *Selector) decide(r Row, byIf map[uint32]Sample, st *rowState) (uint8, s
 	}
 	cur, hasCur := byColor[st.current]
 	if hasCur && eligible(r, cur.s) && eligible(r, best.s) {
-		// 双方都达标，只是当前不是最优：迟滞。
+		if !r.Preempt {
+			// 粘住模式（默认）：当前隧道还达标就按兵不动，即使别的更优。
+			st.pendingN = 0
+			return st.current, fmt.Sprintf("保持颜色 %d（未勾抢占：仍达标，延迟 %.1fms，抖动 %.1fms，丢包 %d‰；颜色 %d 更优（延迟 %.1fms）但不抢占）",
+				st.current, cur.s.RTTms, cur.s.JitterMs, cur.s.LossPermille, best.color, best.s.RTTms)
+		}
+		// 抢占模式：双方都达标，只是当前不是最优：迟滞。
 		if st.pending == best.color {
 			st.pendingN++
 		} else {

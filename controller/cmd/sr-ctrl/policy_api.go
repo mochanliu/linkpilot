@@ -54,6 +54,7 @@ type policyRowView struct {
 	PeerName      string     `json:"peer_name,omitempty"`
 	Colors        []uint8    `json:"colors,omitempty"`
 	SLA           *PolicySLA `json:"sla,omitempty"`
+	Preempt       bool       `json:"preempt,omitempty"`
 	SelectorTable uint32     `json:"selector_table,omitempty"`
 	// CurrentColor 是盒子上的选路组件**现在**给这一行选的颜色（-1 = 还没有
 	// 上报/这一行是静态的）。它来自监控回报，不是草稿的一部分。
@@ -218,7 +219,8 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 				"按隧道状态自己收敛，所以链路抖动不用改策略。",
 			"dynamic": "动态行不钉颜色：盒子盯着到指定对端的每条颜色隧道的探针指标" +
 				"（延迟/抖动/丢包），满足门槛的里面挑延迟最低的一条。全部不达标时走" +
-				"最接近的一条，不会因为一时抖动断流。\"当前颜色\"是盒子上报的实时选择。",
+				"最接近的一条，不会因为一时抖动断流。默认粘住：当前隧道还达标就一直用，" +
+				"更优的不抢；勾上\"抢占\"才永远追最优。\"当前颜色\"是盒子上报的实时选择。",
 		},
 	}
 
@@ -299,6 +301,7 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 			}
 			row.Colors = r.Colors
 			row.SLA = r.SLA
+			row.Preempt = r.Preempt
 			if st, err := fib.SelectorTable(r.ID); err == nil {
 				row.SelectorTable = st
 			}
@@ -308,6 +311,9 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 			if row.Match != "" {
 				row.Match += " · 当前颜色 " + strconv.Itoa(int(sel.Color))
 			}
+		}
+		if r.Preempt {
+			row.Match += " · 抢占"
 		}
 		view.Rows = append(view.Rows, row)
 	}

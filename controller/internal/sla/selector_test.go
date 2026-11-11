@@ -72,6 +72,12 @@ func row(id int, table uint32) Row {
 	return Row{ID: id, VPN: 0, Peer: 3, SelectorTable: table, MaxLatencyMS: 50, MaxJitterMS: 10, MaxLossPermille: 100}
 }
 
+func preemptRow(id int, table uint32) Row {
+	r := row(id, table)
+	r.Preempt = true
+	return r
+}
+
 // 达标里挑延迟最低。
 func TestChoosePicksLowestLatencyAmongEligible(t *testing.T) {
 	f := &fakePlane{}
@@ -118,11 +124,11 @@ func TestChooseWalksToBestWhenNothingEligible(t *testing.T) {
 	}
 }
 
-// 迟滞：双方都达标时，更优者要连续 holdRounds 拍才接管。
+// 迟滞（抢占模式）：双方都达标时，更优者要连续 holdRounds 拍才接管。
 func TestHysteresisHoldsHealthySwitch(t *testing.T) {
 	f := &fakePlane{}
 	s := newSelectorWith(f)
-	s.Reconcile([]Row{row(1, 10001)}, []Tunnel{
+	s.Reconcile([]Row{preemptRow(1, 10001)}, []Tunnel{
 		tunnel(10, 3, 2),
 		tunnel(11, 3, 3),
 	})
@@ -153,6 +159,53 @@ func TestHysteresisHoldsHealthySwitch(t *testing.T) {
 	}
 	if st := s.Status(); st[0].Color != 3 {
 		t.Fatalf("第 %d 拍应切到颜色 3，实际 %+v", holdRounds, st)
+	}
+}
+
+// 粘住模式（默认，不勾抢占）：当前隧道还达标就一直用，更优的候选不抢；直到
+// 它不达标才切到达标的候选（owner 2026-11-11 拍）。
+func TestStickyKeepsEligibleCurrentUntilItFailsSLA(t *testing.T) {
+	f := &fakePlane{}
+	s := newSelectorWith(f)
+	s.Reconcile([]Row{row(1, 10001)}, []Tunnel{
+		tunnel(10, 3, 2),
+		tunnel(11, 3, 3),
+	})
+	// 先让颜色 2 当选（8ms）。
+	f.probes = []vppapi.ProbeStats{
+		probe(10, 100, 0, 8_000, 1_000),
+		probe(11, 100, 0, 30_000, 1_000),
+	}
+	p := f
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if st := s.Status(); st[0].Color != 2 {
+		t.Fatalf("初选应为颜色 2，实际 %+v", st)
+	}
+	// 颜色 3 变得远比颜色 2 优：粘住模式按兵不动（抢占模式这里会走迟滞切换）。
+	p.probes[1].LastRTTus = 1_000
+	for i := 0; i < holdRounds+2; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+		if st := s.Status(); st[0].Color != 2 {
+			t.Fatalf("未勾抢占：当前仍达标就不该被颜色 3 抢走，第 %d 拍实际 %+v", i, st)
+		}
+	}
+	if p.written != 1 {
+		t.Fatalf("粘住期间不应写路由，实际 %d 次", p.written)
+	}
+	// 颜色 2 劣化到不达标（延迟 80ms > 50ms）：立即切到达标的颜色 3。
+	p.probes[0].LastRTTus = 80_000
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if st := s.Status(); st[0].Color != 3 {
+		t.Fatalf("当前颜色不达标且颜色 3 达标，应立即切换，实际 %+v", st)
+	}
+	if got := p.deag[10001]; got != 3000 {
+		t.Fatalf("选路表 10001 应指向颜色表 3000，实际 %v", got)
 	}
 }
 

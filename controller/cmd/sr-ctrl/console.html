@@ -6935,6 +6935,7 @@
         row.mode = "dynamic";
         row.peer = r.peer || 0;
         row.colors = (r.colors || []).slice();
+        row.preempt = !!r.preempt;
         row.sla = { latency_ms: (r.sla && r.sla.latency_ms) || 0,
           jitter_ms: (r.sla && r.sla.jitter_ms) || 0,
           loss_permille: (r.sla && r.sla.loss_permille) || 0 };
@@ -7135,6 +7136,10 @@
       '<label>抖动≤<input type="number" min="0" step="any" data-pl-row="' + i + '" data-pl-f="sla_jitter_ms" value="' + esc(sla.jitter_ms || "") + '" placeholder="不限">ms</label>' +
       '<label>丢包≤<input type="number" min="0" step="1" data-pl-row="' + i + '" data-pl-f="sla_loss_permille" value="' + esc(sla.loss_permille || "") + '" placeholder="不限">‰</label>' +
       "</div>";
+    // 抢占开关（owner 2026-11-11）：默认不勾 = 粘住（当前隧道达标就一直用）；
+    // 勾上 = 永远追当前 SLA 最优的一条。
+    h += '<div class="pl-preempt"><label class="chk"><input type="checkbox" data-pl-row="' + i + '" data-pl-f="preempt"' +
+      (r.preempt ? " checked" : "") + ">抢占：永远追最优（不勾 = 粘住当前隧道直到它不达标）</label></div>";
     // 盒子上报的当前选择（只读）：doc 里的行和草稿按同一下标对齐。
     var docRow = (doc.rows || [])[i];
     if (docRow && docRow.mode === "dynamic" && docRow.current_color) {
@@ -7338,11 +7343,13 @@
         r.peer = r.peer || (peers.length ? peers[0].node_id : 0);
         r.colors = r.colors || [];
         r.sla = r.sla || { latency_ms: 0, jitter_ms: 0, loss_permille: 0 };
+        r.preempt = false; // 抢占默认不勾
       } else {
         delete r.mode;
         delete r.peer;
         delete r.colors;
         delete r.sla;
+        delete r.preempt;
         r.color = 0;
       }
       blurContent();
@@ -7366,6 +7373,11 @@
       if (el.checked && at < 0) r.colors.push(c);
       if (!el.checked && at >= 0) r.colors.splice(at, 1);
       r.colors.sort(function (a, b) { return a - b; });
+      return;
+    }
+    if (f === "preempt") {
+      // 抢占是布尔复选框：checked 才是真，不能走下面 r[f] = el.value 的字符串路。
+      if (r.mode === "dynamic") r.preempt = el.checked;
       return;
     }
     if (f === "vpn" || f === "color" || f === "proto") r[f] = Number(el.value);
