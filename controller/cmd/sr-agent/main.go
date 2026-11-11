@@ -205,6 +205,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("client: %v", err)
 	}
+	// 远程诊断执行器（diag.go）：命令随心跳下发、结果 POST 回控制器。在任何
+	// 模式下都开着 —— 心跳本来就开着，诊断是它顺路能做的唯一一件事，单独一个
+	// 开关只会造成"两台盒子一个能 ping 一个不能"的排障陷阱。
+	diag := newDiagRunner(client, id, log.Printf)
 
 	// Read-only interface inventory. Off unless -vpp-api is given, because a box
 	// whose VPP lives in another namespace may not have this socket at all --
@@ -434,6 +438,7 @@ func main() {
 		req := wire.HeartbeatRequest{Uptime: int64(time.Since(processStart).Seconds())}
 		req.Bindings = signedBindings(id, log.Printf)
 		req.Config = st.configReport()
+		req.DiagBusy = diag.Busy()
 		// 清单在这一次心跳里只读一次，而且先于隧道回执：数据面已经把上次装的口
 		// 带走了（VPP 单独重启）时，那次收敛的结论要当场被否掉，否则心跳一直报
 		// ok=true、下面那道 Kick 的闸永不放行，盒子空转不自愈（缺陷④）。
@@ -485,6 +490,11 @@ func main() {
 			// outer-source observations. Both are readings, so they are taken
 			// after the reconcile was Kicked rather than before it.
 			reporter.send(ctx, req.Ifaces)
+			// 远程诊断命令随心跳下来（成功的那拍才看：心跳失败的响应体没有可
+			// 信任的应答）。Offer 自己判断忙闲，忙时这一条留在控制器队列里。
+			if resp.Diag != nil {
+				diag.Offer(resp.Diag)
+			}
 		}
 
 		wait := time.Duration(hbSec) * time.Second

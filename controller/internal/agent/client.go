@@ -181,6 +181,13 @@ func (c *Client) ReportMetrics(ctx context.Context, req wire.MetricsReport) erro
 	return c.post(ctx, "/v1/metrics", req, nil)
 }
 
+// ReportDiag 回执一条远程诊断命令的结果。回执不重试：命令丢了控制台看得见
+// （"已下发、无结果"），重发一个还在跑的命令的结果反而会串。
+func (c *Client) ReportDiag(ctx context.Context, res wire.DiagResult) error {
+	res.NodeID = c.nodeID
+	return c.post(ctx, "/v1/diag", res, nil)
+}
+
 // maxBundleBytes bounds what one response may hold. A bundle is a few KB of
 // text; this exists so a broken or hostile controller cannot make the box
 // allocate without limit, not because real bundles approach it.

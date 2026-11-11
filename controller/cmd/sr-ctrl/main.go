@@ -777,6 +777,14 @@ type server struct {
 	// opsPruneDay is the last day the ledger prune ran (local date), so the
 	// 2s sweeper does directory work once per day instead of once per tick.
 	opsPruneDay string
+
+	// diagRecs holds the remote-diagnosis records (diag.go), keyed by node key
+	// like obs/tel: a pending command that outlives a controller restart is
+	// dropped on purpose (nobody is watching the console for it anymore), and
+	// the durable trail lives in the ledger.
+	diagRecs map[string][]*diagRecord
+	// diagSeq mints diag ids. Only touched under s.mu.
+	diagSeq int
 }
 
 // pendingObs is an observation the controller could not name yet, kept with the
@@ -1369,6 +1377,11 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// transit port just moved.
 		s.admin.publish("node.underlay", rec.TenantID, rec)
 	}
+	// 远程诊断：盒子自报在忙就不派发，命令在队列里等下一拍。
+	var diagCmd *wire.DiagCommand
+	if !req.DiagBusy {
+		diagCmd = s.diagPopLocked(tenant, nodeID)
+	}
 	json.NewEncoder(w).Encode(wire.HeartbeatResponse{
 		Epoch:         s.advanceEpoch(),
 		PeerCount:     len(s.peersLocked(tenant, nodeID)),
@@ -1381,6 +1394,10 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// carries no reflector offer, so the full list goes out and the agent
 		// applies its own cap.
 		Reflectors: s.advertiseStun(-1),
+		// 远程诊断命令搭心跳下行。盒子自报在忙时（DiagBusy）不派发，命令留
+		// 在队列里等下一拍；派发即标记 dispatched，盒子收下没执行就是台账里
+		// 一条"无结果"，控制台重发即可。
+		Diag: diagCmd,
 	})
 }
 
@@ -2401,6 +2418,7 @@ func main() {
 		alertStrikes:  map[string]int{},
 		lastSampleAt:  map[string]int64{},
 		lastSelection: map[string]uint8{},
+		diagRecs:      map[string][]*diagRecord{},
 	}
 
 	go s.ttlSweeper(ctx)
@@ -2414,6 +2432,7 @@ func main() {
 	mux.HandleFunc("/v1/mapping", s.handleMapping)
 	mux.HandleFunc("/v1/observe", s.handleObserve)
 	mux.HandleFunc("/v1/metrics", s.handleMetrics)
+	mux.HandleFunc("/v1/diag", s.handleDiagResult)
 	mux.HandleFunc("/v1/reach", s.handleReach)
 	mux.HandleFunc("/v1/registry", s.handleRegistry)
 	mux.HandleFunc("/v1/watch", s.handleWatch)

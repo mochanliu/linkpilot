@@ -350,6 +350,7 @@
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a class="child" href="#ops" data-view="ops" data-roles="tenant">台账与告警</a>
+      <a class="child" href="#diag" data-view="diag" data-roles="tenant">远程诊断</a>
       <a class="child" href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
       <div class="sect">资产</div>
       <a class="child" href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
@@ -396,7 +397,14 @@
     // histNode 是监控页趋势图选中的设备，histAt 节流历史拉取（5s 心跳里
     // 历史最多 30s 一次）。
     alerts: null, ledger: null, ledgerFilter: { kind: "", hours: 48, node: 0 },
-    history: null, histNode: 0, histAt: 0 };
+    history: null, histNode: 0, histAt: 0,
+    // 远程诊断页：records 来自 /api/diag?node=，diagNode 是当前选中的设备，
+    // diagTool 决定表单里显示哪几个输入框。记录表 5s 快速轮询里一起刷。
+    diag: null, diagNode: 0, diagTool: "ping",
+    // 基础配置页的版本历史 / diff / 回滚：vers 是 /api/config/versions 的
+    // 版本清单，verDiff 是最近一次 /api/config/diff 的结果，diffA/diffB 是
+    // 对比下拉当前的选择。
+    vers: null, verDiff: null, diffA: "", diffB: "draft" };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -609,14 +617,16 @@
   // should not poll. History samples are fetched on their own throttle (30s) —
   // they come off the ledger files and a 5s refetch would just burn disk reads.
   function syncFast() {
-    var need = !!(S.me && S.me.role === "tenant" && (S.view === "monitor" || S.view === "ops"));
+    var need = !!(S.me && S.me.role === "tenant" && (S.view === "monitor" || S.view === "ops" || S.view === "diag"));
     if (need && S.fast === null) {
       S.fast = setInterval(function () {
         if (S.view === "monitor") loadMetrics();
         else if (S.view === "ops") loadOps();
+        else if (S.view === "diag") loadDiag();
         loadHistory();
       }, 5000);
       if (S.view === "monitor") loadMetrics();
+      else if (S.view === "diag") loadDiag();
       else loadOps();
       loadHistory();
     } else if (!need && S.fast !== null) {
@@ -658,6 +668,25 @@
       }).catch(function () { /* 趋势图拉不到不打扰页面，下次轮询再试 */ });
   }
 
+  // loadDiag 拉远程诊断记录（跟随 5s 快速轮询）。节点为 0 时取设备列表里
+  // 第一台（开进页面就有一个有用的默认）。
+  function loadDiag() {
+    if (!(S.me && S.me.role === "tenant")) return Promise.resolve();
+    if (S.view !== "diag") return Promise.resolve();
+    if (!S.diagNode) {
+      var nodes = (S.state && S.state.nodes) || [];
+      if (!nodes.length) { S.diag = null; return Promise.resolve(); }
+      S.diagNode = nodes[0].node_id;
+    }
+    return api("GET", "/api/diag?node=" + S.diagNode).then(function (d) {
+      S.diag = d;
+      render();
+    }).catch(function (err) {
+      $("live-dot").className = "dot bad";
+      $("live-text").textContent = "诊断离线：" + err.message;
+    });
+  }
+
   function roleLine(me) {
     if (me.role === "operator") return me.via === "token" ? "运营方 · 应急令牌" : "运营方";
     return "租户 · " + (me.tenant_name || me.tenant_id || "");
@@ -688,13 +717,14 @@
         $("live-dot").className = "dot ok";
         $("live-text").textContent = "实时";
       });
-      ["node.online", "node.enrolled", "node.stale", "node.config", "node.underlay", "config.published", "tenant.created", "claim.created", "claim.revoked", "claim.updated", "alert.raised", "alert.cleared"].forEach(function (n) {
+      ["node.online", "node.enrolled", "node.stale", "node.config", "node.underlay", "node.diag", "config.published", "tenant.created", "claim.created", "claim.revoked", "claim.updated", "alert.raised", "alert.cleared"].forEach(function (n) {
         S.es.addEventListener(n, function (e) {
           var ev = {};
           try { ev = JSON.parse(e.data); } catch (_) {}
           load();
           if (S.view === "monitor") loadMetrics();
           if (S.view === "ops") loadOps();
+          if (S.view === "diag") loadDiag();
           // The config page shows published vs applied, so a device report or a
           // publish must reach it. A dirty draft still wins: reloading would
           // throw away what the tenant is typing, and "重新载入" is right there.
@@ -760,6 +790,11 @@
     ops: {
       title: "台账与告警",
       sub: "活动告警、告警通知设置，和按时间倒排的运维台账（设备上下线、配置发布、选路切换、控制台操作审计）。台账按天落盘保留 30 天；告警推送到下面配置的 webhook",
+      roles: ["tenant"]
+    },
+    diag: {
+      title: "远程诊断",
+      sub: "从控制器往盒子上发 ping / traceroute / vpp show：命令随设备下一次心跳下发（盒子在 NAT 后，控制器不主动连接），结果回执后在这里显示。每次诊断都进台账",
       roles: ["tenant"]
     },
     "underlay-settings": {
@@ -876,6 +911,7 @@
     else if (S.view === "policy") c = viewPolicy();
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "ops") c = viewOps();
+    else if (S.view === "diag") c = viewDiag();
     else if (S.view === "account") c = viewAccount();
     else c = viewPlaceholder();
     if (me.initial_password) c = initialPassBanner() + c;
@@ -1614,10 +1650,12 @@
     // 台账：过滤 + 表。行来自 /api/ledger，最新在前，最多 2000 行。
     var f = S.ledgerFilter;
     var kinds = ["", "node.enrolled", "node.online", "node.stale", "config.publish",
-      "underlay.publish", "underlay.change", "selection", "alert.raise", "alert.clear", "audit"];
+      "config.rollback", "underlay.publish", "underlay.change", "selection",
+      "diag.issue", "diag.result", "alert.raise", "alert.clear", "audit"];
     var names = { "": "全部类型", "node.enrolled": "入网", "node.online": "上线", "node.stale": "失联",
-      "config.publish": "发布配置", "underlay.publish": "发布隧道全局", "underlay.change": "隧道变更",
-      "selection": "选路切换", "alert.raise": "告警升起", "alert.clear": "告警恢复", "audit": "操作" };
+      "config.publish": "发布配置", "config.rollback": "回滚配置", "underlay.publish": "发布隧道全局",
+      "underlay.change": "隧道变更", "selection": "选路切换", "diag.issue": "诊断发起",
+      "diag.result": "诊断结果", "alert.raise": "告警升起", "alert.clear": "告警恢复", "audit": "操作" };
     var kindOpts = kinds.map(function (k) {
       return '<option value="' + k + '"' + (f.kind === k ? " selected" : "") + ">" + names[k] + "</option>";
     }).join("");
@@ -1651,6 +1689,101 @@
       if (entries.length >= 2000) {
         h += '<div class="hint">结果超过 2000 行被截断——缩小时间范围或按类型过滤。</div>';
       }
+    }
+    h += "</section>";
+    return h;
+  }
+
+  /* ---------------- diag ---------------- */
+
+  // viewDiag 是「远程诊断」页：选设备 + 选工具发起，下面是这台设备最近的
+  // 诊断记录（pending → dispatched → done，盒子收下没执行就停在 dispatched）。
+  // 工具集与控制器侧白名单一一对应：ping / traceroute / vpp-show。
+  function diagStateTag(st) {
+    if (st === "pending") return '<span class="tag pending">待下发</span>';
+    if (st === "dispatched") return '<span class="tag plan">已下发</span>';
+    if (st === "done") return '<span class="tag online">完成</span>';
+    return '<span class="tag">' + esc(st) + "</span>";
+  }
+
+  function viewDiag() {
+    var h = "";
+    var nodes = ((S.state && S.state.nodes) || []).filter(function (n) { return n.tenant_id; });
+    var nodeOpts = nodes.map(function (n) {
+      return '<option value="' + n.node_id + '"' + (S.diagNode === n.node_id ? " selected" : "") + ">" +
+        "node-" + esc(n.node_id) + (n.serial ? " · " + esc(n.serial) : "") +
+        (n.status === "online" ? "" : "（" + (n.status === "stale" ? "失联" : "未心跳") + "）") +
+        "</option>";
+    }).join("");
+
+    var tool = S.diagTool || "ping";
+    var toolOpts = [["ping", "ping"], ["traceroute", "traceroute"], ["vpp-show", "vpp show（白名单命令）"]]
+      .map(function (t) { return '<option value="' + t[0] + '"' + (tool === t[0] ? " selected" : "") + ">" + t[1] + "</option>"; })
+      .join("");
+    var vppCmds = ["show interface", "show ip fib", "show ip6 fib", "show ip tunnel",
+      "show bfd session", "show acl-plugin acl", "show abf"];
+    var vppOpts = vppCmds.map(function (c) { return '<option value="' + c + '">' + c + "</option>"; }).join("");
+
+    h += '<section class="panel"><header><h2>发起诊断</h2>' +
+      '<button class="small" data-act="diag-refresh">刷新</button></header>' +
+      '<div class="hint">命令随设备下一次心跳下发（默认 5 秒一颗），设备执行后结果自动回到下面。' +
+      'ping / traceroute 从盒子内核发出；指定源接口时用内核接口名（客户侧是 lcp TAP，例如 tap 开头）。' +
+      '超时 30 秒、输出截断 32KB；同一台盒子一次只跑一条命令。</div>' +
+      '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">' +
+      '<label>设备<br><select id="diag-node" style="font:inherit;font-size:13px">' +
+      (nodeOpts || '<option value="0">（还没有设备）</option>') + "</select></label>" +
+      '<label>工具<br><select id="diag-tool" style="font:inherit;font-size:13px">' + toolOpts + "</select></label>";
+    if (tool === "vpp-show") {
+      h += '<label>命令<br><select id="diag-vpp" style="font:inherit;font-size:13px">' + vppOpts + "</select></label>";
+    } else {
+      h += '<label>目标<br><input id="diag-target" type="text" style="width:220px" placeholder="IP 或主机名"></label>';
+      if (tool === "ping") {
+        h += '<label>次数<br><input id="diag-count" type="number" min="1" max="10" style="width:70px" value="4"></label>';
+      }
+      h += '<label>源接口（可选）<br><input id="diag-iface" type="text" style="width:140px" placeholder="例如 tap12"></label>';
+    }
+    h += '<button class="small primary" data-act="diag-run">执行</button></div>' +
+      "</section>";
+
+    // 记录表。done 的行把输出折叠在 <details> 里：ping 的输出就几行，展开
+    // 不喧宾夺主；tracert 长输出也适用。
+    var recs = (S.diag && S.diag.records) || [];
+    h += '<section class="panel"><header><h2>诊断记录</h2>' +
+      '<span class="muted">node-' + esc(S.diagNode || 0) + "</span></header>";
+    if (!recs.length) {
+      h += '<div class="empty">这台设备还没有诊断记录。</div>';
+    } else {
+      h += '<table><thead><tr><th>时间</th><th>工具</th><th>内容</th><th>发起人</th><th>状态</th><th>耗时</th><th>结果</th></tr></thead><tbody>';
+      recs.slice().reverse().forEach(function (r) {
+        var c = r.cmd || {};
+        var res = r.result || null;
+        var desc = c.tool === "vpp-show" ? (c.vpp_show || "") :
+          (c.target || "") + (c.iface ? " @ " + c.iface : "") + (c.count ? " ×" + c.count : "");
+        var outHtml = "";
+        if (res) {
+          var txt = res.output || "";
+          if (res.err) txt += (txt ? "\n" : "") + "[" + res.err + "]";
+          outHtml = '<details><summary style="cursor:pointer">' +
+            (res.ok ? '<span class="tag online">成功</span>' : '<span class="tag stale">失败</span>') +
+            " 查看输出</summary><pre class=\"mono\" style=\"white-space:pre-wrap;margin:6px 0 0;max-height:300px;overflow:auto;background:var(--inset);padding:8px;border-radius:6px\">" +
+            esc(txt) + "</pre></details>";
+        } else if (r.stat === "dispatched") {
+          outHtml = '<span class="muted">已下发，等设备回执（下次刷新可见）</span>';
+        } else {
+          outHtml = '<span class="muted">—</span>';
+        }
+        h += "<tr>" +
+          '<td class="muted mono" style="white-space:nowrap">' + esc(clock(c.issued_at_unix)) + "</td>" +
+          "<td>" + esc(c.tool || "") + "</td>" +
+          '<td class="mono">' + esc(desc) + "</td>" +
+          '<td class="mono">' + esc(c.issued_by || "") + "</td>" +
+          "<td>" + diagStateTag(r.stat) + "</td>" +
+          '<td class="muted">' + (res && res.dur_ms != null ? res.dur_ms + " ms" : "—") + "</td>" +
+          "<td>" + outHtml + "</td></tr>";
+      });
+      h += "</tbody></table>";
+      h += '<div class="hint" style="margin:8px 0 0">每条诊断（发起与结果）都写进「台账与告警」的事件流水；结果输出在台账里保留前 4KB。' +
+        "控制器重启会清空这里的记录，台账不受影响。</div>";
     }
     h += "</section>";
     return h;
@@ -1773,6 +1906,7 @@
       cs.bundle = null;
       if (!cfgVPNExists(cs.draft, cs.vpn)) cs.vpn = 0;
       render();
+      loadVersions();
     }).catch(function (err) {
       if (S.cfg !== cs) return;
       cs.loading = false;
@@ -1826,6 +1960,8 @@
       return h + '<section class="panel"><div class="empty">' +
         (cs.loading ? "正在读取配置…" : "还没有读到配置。") + "</div></section>";
     }
+    // 版本历史 / diff / 回滚是设备才有的（预授权没有发布过任何东西）。
+    if (!cfgIsPA(cs) && cs.nodeID) h += cfgVersionsPanel(cs);
     return h + cfgBase(cs);
   }
 
@@ -1966,6 +2102,107 @@
     h += cfgChecksPanel(cs);
     h += cfgArtifactsPanel(cs);
     h += cfgBundlePanel(cs);
+    return h;
+  }
+
+  /* ---------------- 版本历史 / diff / 回滚 ---------------- */
+
+  // loadVersions 拉这台设备的版本清单。进页、发布、回滚后各拉一次，不进 5s
+  // 轮询：版本只在显式动作之后才会变。
+  function loadVersions() {
+    var cs = S.cfg;
+    if (!cs || cs.pa || !cs.nodeID) return Promise.resolve();
+    return api("GET", "/api/config/versions?node=" + cs.nodeID).then(function (v) {
+      if (S.cfg !== cs) return;
+      S.vers = v;
+      render();
+    }).catch(function () { /* 没有历史不打扰页面 */ });
+  }
+
+  // loadVerDiff 拉两个快照的差异。选择器是版本号或 "draft"。
+  function loadVerDiff(a, b) {
+    var cs = S.cfg;
+    if (!cs || cs.pa || !cs.nodeID) return Promise.resolve();
+    return api("GET", "/api/config/diff?node=" + cs.nodeID + "&a=" + encodeURIComponent(a) +
+      "&b=" + encodeURIComponent(b)).then(function (d) {
+      if (S.cfg !== cs) return;
+      S.verDiff = d;
+      render();
+    }).catch(function (err) { toast(err.message); });
+  }
+
+  function cfgVerOpts() {
+    var sel = (S.vers && S.vers.versions) || [];
+    var vals = sel.map(function (v) { return String(v.version); });
+    vals.push("draft");
+    var a = S.diffA || (sel.length ? String(sel[0].version) : "draft");
+    var b = S.diffB || "draft";
+    function opts(pick) {
+      return vals.map(function (v) {
+        var label = v === "draft" ? "当前草稿" : "v" + v;
+        return '<option value="' + v + '"' + (pick === v ? " selected" : "") + ">" + label + "</option>";
+      }).join("");
+    }
+    return { aOpts: opts(a), bOpts: opts(b) };
+  }
+
+  function cfgVerLineHTML(l) {
+    var color = "";
+    var ch = l.charAt(0);
+    if (ch === "+") color = "var(--ok)";
+    else if (ch === "-") color = "var(--bad)";
+    else if (ch === "@") color = "var(--accent)";
+    return '<div class="mono" style="white-space:pre-wrap;' +
+      (color ? "color:" + color : "") + '">' + esc(l) + "</div>";
+  }
+
+  function cfgVersionsPanel(cs) {
+    var h = '<section class="panel"><header><h2>版本历史 · 对比 · 回滚</h2>' +
+      '<button class="small" data-act="vers-refresh">刷新</button></header>' +
+      '<div class="hint">每次「发布到设备」都会在这里留一份快照（最多 20 份）。回滚会把那个版本的草稿内容恢复回来、' +
+      '作为<b>新版本</b>重新走一遍发布——设备按普通发布拉取，控制器的版本号一直向前。' +
+      "更早（此功能上线前）发布的版本只能看内容、不能回滚。</div>";
+    var v = S.vers;
+    if (!v) {
+      h += '<div class="empty">正在读取版本清单…</div></section>';
+      return h;
+    }
+    var rows = v.versions || [];
+    if (!rows.length) {
+      h += '<div class="empty">这台设备还没有发布过任何版本。发布一次之后这里就有历史了。</div></section>';
+      return h;
+    }
+    h += '<table><thead><tr><th>版本</th><th>发布时间</th><th>发布人</th><th>设备在跑</th><th>可回滚</th><th></th></tr></thead><tbody>';
+    rows.forEach(function (r) {
+      h += "<tr>" +
+        '<td class="mono">v' + esc(r.version) + "</td>" +
+        '<td class="muted">' + esc(clock(r.published_at_unix)) + (r.published_by ? " · " + esc(r.published_by) : "") + "</td>" +
+        "<td>" + (r.is_running ? '<span class="tag online">运行中</span>' : "") + "</td>" +
+        "<td>" + (r.has_source ? '<span class="tag online">是</span>' : '<span class="tag pending">否（旧版本）</span>') + "</td>" +
+        "<td>" + (r.has_source ? '<button class="small" data-act="ver-rollback" data-ver="' + esc(r.version) + '">回滚到此版</button>' : "") +
+        "</td></tr>";
+    });
+    h += "</tbody></table>";
+
+    // 对比区：任意两个快照（或当前草稿）。
+    var o = cfgVerOpts();
+    h += '<div style="display:flex;gap:12px;align-items:flex-end;margin-top:14px;flex-wrap:wrap">' +
+      '<label>对比 A<br><select id="ver-a" style="font:inherit;font-size:13px">' + o.aOpts + "</select></label>" +
+      '<label>对比 B<br><select id="ver-b" style="font:inherit;font-size:13px">' + o.bOpts + "</select></label>" +
+      '<button class="small" data-act="ver-diff">查看差异</button></div>';
+    if (S.verDiff) {
+      var segs = S.verDiff.segs || [];
+      if (!segs.length) {
+        h += '<div class="hint" style="margin-top:10px">v' + esc(S.verDiff.a) + " 与 " +
+          (S.verDiff.b === "draft" ? "当前草稿" : "v" + esc(S.verDiff.b)) + " 渲染结果完全一致。</div>";
+      } else {
+        h += '<div style="margin-top:10px">' + segs.map(function (seg) {
+          var inner = (seg.lines || []).map(cfgVerLineHTML).join("");
+          return '<div style="margin-bottom:12px"><b>' + esc(seg.seg) + '</b><div style="background:var(--inset);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:360px;overflow:auto">' + inner + "</div></div>";
+        }).join("") + "</div>";
+      }
+    }
+    h += "</section>";
     return h;
   }
 
@@ -2424,6 +2661,7 @@
         : { kind: "", text: "v" + nv.published_version + " 这次发布没有变化。" };
       blurContent();
       render();
+      loadVersions();
       toast(changed ? "已发布 v" + nv.published_version : "没有变化");
     }).catch(function (err) { toast("发布失败：" + err.message); });
   }
@@ -8087,6 +8325,25 @@
       loadHistory();
     });
 
+    // 远程诊断页：设备与工具切换。
+    var diagNodeSel = $("diag-node");
+    if (diagNodeSel) diagNodeSel.addEventListener("change", function () {
+      S.diagNode = Number(diagNodeSel.value) || 0;
+      S.diag = null;
+      loadDiag();
+    });
+    var diagToolSel = $("diag-tool");
+    if (diagToolSel) diagToolSel.addEventListener("change", function () {
+      S.diagTool = diagToolSel.value || "ping";
+      render();
+    });
+
+    // 基础配置页的版本对比下拉：只记选择，点「查看差异」才发请求。
+    var verA = $("ver-a");
+    if (verA) verA.addEventListener("change", function () { S.diffA = verA.value; });
+    var verB = $("ver-b");
+    if (verB) verB.addEventListener("change", function () { S.diffB = verB.value; });
+
     // A dropdown's value only exists on "change"; the generic [data-act] click
     // handler below would read it before the user has picked anything.
     document.querySelectorAll('#content select[data-act="node-site"]').forEach(function (el) {
@@ -8155,6 +8412,59 @@
             toast("告警设置已保存");
             render();
           }).catch(function (err) { toast(err.message); });
+        }
+        else if (act === "diag-refresh") {
+          S.diag = null;
+          loadDiag();
+        }
+        else if (act === "diag-run") {
+          var tool = S.diagTool || "ping";
+          var b = { node_id: S.diagNode, tool: tool };
+          if (tool === "vpp-show") {
+            b.vpp_show = (($("diag-vpp") || {}).value || "").trim();
+          } else {
+            b.target = (($("diag-target") || {}).value || "").trim();
+            b.iface = (($("diag-iface") || {}).value || "").trim();
+            if (tool === "ping") b.count = Number(($("diag-count") || {}).value) || 0;
+          }
+          if (tool !== "vpp-show" && !b.target) { toast("先填目标地址"); return; }
+          api("POST", "/api/diag", b).then(function () {
+            toast("命令已进入队列，等设备下一次心跳拉取");
+            S.diag = null;
+            loadDiag();
+          }).catch(function (err) { toast(err.message); });
+        }
+        else if (act === "vers-refresh") {
+          S.vers = null;
+          S.verDiff = null;
+          loadVersions();
+        }
+        else if (act === "ver-diff") {
+          var a = (($("ver-a") || {}).value || "").trim();
+          var bb = (($("ver-b") || {}).value || "").trim();
+          if (!a || !bb) { toast("先选两个对比对象"); return; }
+          S.diffA = a;
+          S.diffB = bb;
+          loadVerDiff(a, bb);
+        }
+        else if (act === "ver-rollback") {
+          var csRb = S.cfg;
+          var ver = Number(el.getAttribute("data-ver")) || 0;
+          if (!csRb || !ver) return;
+          if (!confirm("回滚到 v" + ver + "？\n\n草稿内容会被恢复成 v" + ver + " 的样子，并作为新版本重新发布；设备下一次心跳拉取安装。当前草稿里未保存的修改会被覆盖。")) return;
+          api("POST", "/api/config/rollback", { node_id: csRb.nodeID, version: ver }).then(function (nv) {
+            if (S.cfg !== csRb) return;
+            csRb.view = nv;
+            csRb.draft = cfgClone(nv.config);
+            csRb.dirty = false;
+            csRb.edit = null;
+            csRb.note = { kind: "", text: "已回滚到 v" + ver + " 的内容并发布为 v" + (nv.published_version || nv.version) +
+              "：设备在下一次心跳拉取安装。" };
+            blurContent();
+            render();
+            loadVersions();
+            toast("已回滚，新版本 v" + (nv.published_version || nv.version));
+          }).catch(function (err) { toast("回滚失败：" + err.message); });
         }
         else if (act === "goto") {
           if (S.view === "enroll") S.codeReveal = null;

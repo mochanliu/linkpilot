@@ -603,8 +603,9 @@ func (s *server) handleAdminLedger(w http.ResponseWriter, r *http.Request) {
 	// 数据，不是给人读的行。
 	if len(kinds) == 0 {
 		kinds = map[string]bool{"node.enrolled": true, "node.online": true, "node.stale": true,
-			"config.publish": true, "underlay.publish": true, "underlay.change": true,
-			"selection": true, "alert.raise": true, "alert.clear": true, "audit": true}
+			"config.publish": true, "config.rollback": true, "underlay.publish": true,
+			"underlay.change": true, "selection": true, "alert.raise": true, "alert.clear": true,
+			"diag.issue": true, "diag.result": true, "audit": true}
 	}
 	now := time.Now().Unix()
 	s.mu.Lock()

@@ -178,6 +178,29 @@ type DeviceConfig struct {
 	UpdatedBy string    `json:"updated_by,omitempty"`
 
 	Published *PublishedBundle `json:"published,omitempty"`
+	// History is the tail of past published bundles, newest last, capped at
+	// configHistoryCap. One entry per publish -- a re-publish of identical
+	// bytes does not create one (publishConfigLocked already refuses to move
+	// anything in that case). Together with Source (below) it is what makes
+	// "回到 v12" a restorable operation instead of a screenshot.
+	History []*PublishedBundle `json:"history,omitempty"`
+}
+
+// configHistoryCap bounds how many past bundles one device keeps. Each entry
+// carries rendered artifacts (a few KB of text each), so the cap is what keeps
+// a churn-happy tenant from growing state.json without limit; the ledger is
+// where the long-term trail lives.
+const configHistoryCap = 20
+
+// ConfigSource is the draft input that produced a published bundle: the model,
+// not the render. Rollback restores THIS and re-renders, so the rebuilt bundle
+// reflects the underlay/overlay state of today -- rolling back a draft that
+// leaked prefixes into a group since deleted would otherwise resurrect a
+// segment referencing an RT that no longer exists.
+type ConfigSource struct {
+	Draft  BasicConfig `json:"draft"`
+	Leak   LeakSet     `json:"leak"`
+	Policy PolicySet   `json:"policy"`
 }
 
 // PublishedBundle is the snapshot a device is asked to install. Checks travel
@@ -190,6 +213,11 @@ type PublishedBundle struct {
 	PublishedBy string          `json:"published_by,omitempty"`
 	Checks      []ConfigCheck   `json:"checks"`
 	Artifacts   configArtifacts `json:"artifacts"`
+	// Source is the draft input behind this bundle, snapshotted at publish
+	// time. Bundles published before this field existed have nil: they stay
+	// diffable (their artifacts are here) but not restorable, and the rollback
+	// endpoint says so instead of guessing.
+	Source *ConfigSource `json:"source,omitempty"`
 }
 
 // ConfigCheck is one server-side validation result. Errors block a future

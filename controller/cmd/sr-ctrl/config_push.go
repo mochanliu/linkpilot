@@ -53,6 +53,13 @@ func (s *server) publishConfigLocked(tenantID string, nodeID uint16, dc *DeviceC
 		if dc.Published.Version == dc.Version {
 			dc.Version++
 		}
+		// The replaced bundle goes to history (capped): diff and rollback read
+		// it, and without the cap a churn-happy tenant would grow state.json
+		// without limit.
+		dc.History = append(dc.History, dc.Published)
+		if len(dc.History) > configHistoryCap {
+			dc.History = dc.History[len(dc.History)-configHistoryCap:]
+		}
 	}
 	dc.Published = &PublishedBundle{
 		Version:     dc.Version,
@@ -60,8 +67,30 @@ func (s *server) publishConfigLocked(tenantID string, nodeID uint16, dc *DeviceC
 		PublishedBy: by,
 		Checks:      checks,
 		Artifacts:   art,
+		// The draft inputs travel with the bundle: this is what rollback
+		// restores. Deep-copied -- the draft keeps moving after publish, and a
+		// shared slice would make "v12" silently follow today's edits.
+		Source: snapshotConfigSource(dc),
 	}
 	return true
+}
+
+// snapshotConfigSource deep-copies the draft input behind one publish. JSON
+// round-trip: the model types are all JSON value shapes, and the copy must not
+// share any slice with the live draft.
+func snapshotConfigSource(dc *DeviceConfig) *ConfigSource {
+	in := ConfigSource{Draft: dc.Draft, Leak: dc.Leak, Policy: dc.Policy}
+	b, err := json.Marshal(in)
+	if err != nil {
+		// The model marshals by construction (it is state.json's own payload);
+		// a failure here means memory corruption, not a bad draft.
+		return nil
+	}
+	var out ConfigSource
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil
+	}
+	return &out
 }
 
 // publishDeviceLocked is the one publish body every console entry point uses

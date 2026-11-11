@@ -372,6 +372,11 @@ func (s *server) adminHandler() http.Handler {
 	// 静态策略 (O6-f): 一行 = 一类流走哪个颜色，落地是 VPP 的 ACL + ABF。和泄露
 	// 一样，保存只写草稿，发布走 /api/config/publish 那一条路径（第 7 段）。
 	mux.HandleFunc("/api/policy", s.handleAdminPolicy)
+	// 版本历史 / diff / 一键回滚（config_versions.go）：基础配置的发布在
+	// DeviceConfig.History 里留快照，回滚 = 恢复草稿 + 走同一条发布路径。
+	mux.HandleFunc("/api/config/versions", s.handleAdminConfigVersions)
+	mux.HandleFunc("/api/config/diff", s.handleAdminConfigDiff)
+	mux.HandleFunc("/api/config/rollback", s.handleAdminConfigRollback)
 	// The RR list is the tenant's own (2026-11-01 定案: an RR belongs to one
 	// tenant). Reads come inside /api/overlay with the devices that selected them;
 	// the writes below are scoped to the session's tenant.
@@ -391,6 +396,9 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/history", s.handleAdminHistory)
 	mux.HandleFunc("/api/ledger", s.handleAdminLedger)
 	mux.HandleFunc("/api/alerts", s.handleAdminAlerts)
+	// 远程诊断（diag.go）：往盒子上发 ping/traceroute/vpp-show，命令随设备
+	// 心跳下去，结果回 /v1/diag。租户专属，operator 角色不进客户的盒子。
+	mux.HandleFunc("/api/diag", s.handleAdminDiag)
 	// 审计中间件包在最外层：/api/* 的写请求记一条 audit 台账，一个钩子
 	// 覆盖现在和将来的全部写端点，新增 handler 不用记得埋点。
 	return s.auditMiddleware(mux)

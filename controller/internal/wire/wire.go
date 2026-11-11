@@ -676,6 +676,10 @@ type HeartbeatRequest struct {
 	// vpp api socket); Capable=false means "newer binary, channel switched off".
 	// The distinction matters because only the first one is an old agent.
 	Tunnel *TunnelState `json:"tunnel,omitempty"`
+	// DiagBusy reports "a remote-diagnosis command is still running here". The
+	// controller holds back the next command while this is set, so commands
+	// execute one at a time and a slow ping never swallows a newer traceroute.
+	DiagBusy bool `json:"diag_busy,omitempty"`
 }
 
 // IfaceInfo is one entry of the device's interface inventory. Every field is a
@@ -722,6 +726,13 @@ type HeartbeatResponse struct {
 	// enrolls again, must still find out. The agent keeps one probe socket for
 	// its lifetime, so a changed list is re-probed rather than appended to.
 	Reflectors []string `json:"reflectors,omitempty"`
+	// Diag is one queued remote-diagnosis command, delivered here instead of a
+	// separate pull because the beat is already the reliable downlink. nil =
+	// nothing pending (or the agent said it is busy). Delivery is pop-once:
+	// the controller marks the command dispatched when it hands it over, and a
+	// box that dies before executing it just leaves a "no result" row the
+	// console re-runs.
+	Diag *DiagCommand `json:"diag,omitempty"`
 }
 
 // ------------------------------------------------------------------ rendezvous
@@ -1066,4 +1077,51 @@ type TelemetryView struct {
 	TenantID string          `json:"tenant_id"`
 	Self     uint16          `json:"self"`
 	Nodes    []NodeTelemetry `json:"nodes"`
+}
+
+// ------------------------------------------------------------------ remote diagnostics
+
+// DiagCommand is one remote-diagnosis job the controller hands a device on its
+// heartbeat. The tool set is a fixed whitelist (see the agent's executor): a
+// diagnostic is something the box runs on the operator's behalf, not a shell.
+// Output is capped on both sides and the whole thing is ephemeral -- a pending
+// command that outlives a controller restart is dropped, because nobody is
+// watching the console for its result anymore.
+//
+// The channel reuses the config-push shape on purpose: the controller never
+// dials the box (it is behind NAT), so the command rides the heartbeat down and
+// the result comes back as its own POST.
+type DiagCommand struct {
+	ID     string `json:"id"` // diag_<seq>, unique per controller process
+	Tool   string `json:"tool"` // ping | traceroute | vpp-show
+	Target string `json:"target,omitempty"` // host/IP for ping & traceroute
+	// Count for ping (1..10). Zero is stored as the default on issue.
+	Count int `json:"count,omitempty"`
+	// Iface is an optional source interface for ping/traceroute (kernel name,
+	// e.g. a lcp TAP); validated by charset only -- argv exec has no shell to
+	// inject into, and the box reports "unknown iface" from ping itself.
+	Iface string `json:"iface,omitempty"`
+	// VppShow is the exact vppctl command for tool=vpp-show; the agent accepts
+	// only prefixes from its own whitelist.
+	VppShow string `json:"vpp_show,omitempty"`
+	IssuedBy string `json:"issued_by,omitempty"`
+	IssuedAt int64  `json:"issued_at_unix"`
+}
+
+// DiagResult is the box's answer to one DiagCommand. OK=false covers both "the
+// tool ran and told us the target is unreachable" (ExitErr) and "the tool
+// itself could not run" (Err) -- Output and Err together always say which.
+type DiagResult struct {
+	NodeID uint16 `json:"node_id"`
+	ID     string `json:"id"`
+	Tool   string `json:"tool"`
+	OK     bool   `json:"ok"`
+	// Output is the combined stdout/stderr, capped (the agent truncates, and
+	// the controller re-caps before storing: neither side trusts the other).
+	Output string `json:"output,omitempty"`
+	// Err is the reason the tool could not run or was killed (timeout, missing
+	// binary, whitelist refusal). Empty when the tool ran to completion.
+	Err      string `json:"err,omitempty"`
+	DurMS    int64  `json:"dur_ms,omitempty"`
+	Finished int64  `json:"finished_at_unix"`
 }
