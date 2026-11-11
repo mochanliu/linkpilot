@@ -228,8 +228,8 @@ func (s *Selector) Tick(ctx context.Context) error {
 //  1. 当前已经是最优 → 保持（最常见路径，零动作）；
 //  2. 有比当前更优的候选，但**两边都达标** → 迟滞：新候选连续赢 holdRounds 拍
 //     才切，孤立的抖动不切；
-//  3. 其余（当前不达标 / 当前颜色已不在候选里）→ 立即切到最优。当前 100% 丢包
-//     时单独给一句原因，其余统一按"当前不再达标"解释。
+//  3. 其余（当前不达标 / 当前颜色已不在候选里）→ 立即切到最优。当前 100% 丢包、
+//     首次选择、当前颜色被配置挤掉、SLA 不达标四种来路各有一句原因。
 func (s *Selector) decide(r Row, byIf map[uint32]Sample, st *rowState) (uint8, string) {
 	// 候选 = 到这个对端的、颜色在候选集里的隧道，按颜色聚出"每颜色最好的一条"。
 	byColor := map[uint8]candidate{}
@@ -292,6 +292,19 @@ func (s *Selector) decide(r Row, byIf map[uint32]Sample, st *rowState) (uint8, s
 	if hasCur && cur.s.HasProbe && cur.s.Tx > 0 && cur.s.LossPermille >= 1000 {
 		// 当前颜色 100% 丢包：立即切，不等迟滞 —— 等三秒等于断三秒。
 		return best.color, switchReason(best, r, "当前颜色 100% 丢包，立即切")
+	}
+	if !hasCur {
+		// 当前颜色不在候选里。两种来路要说人话：第一次决策（什么都没选过），
+		// 和配置变了把当前颜色挤掉（改颜色、删隧道）。
+		if !st.written {
+			return best.color, switchReason(best, r, "首次选择")
+		}
+		colors := make([]string, 0, len(list))
+		for _, c := range list {
+			colors = append(colors, fmt.Sprint(c.color))
+		}
+		return best.color, switchReason(best, r,
+			fmt.Sprintf("当前颜色 %d 已不在候选隧道里（候选：%s），按 SLA 重选", st.current, strings.Join(colors, ", ")))
 	}
 	return best.color, switchReason(best, r, "当前颜色不再达标（SLA 是偏好不是准入，走最接近的一条）")
 }
