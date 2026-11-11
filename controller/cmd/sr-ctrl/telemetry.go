@@ -106,6 +106,9 @@ func (s *server) postMetrics(w http.ResponseWriter, r *http.Request, tenant stri
 		sel:    rep.Selections,
 		seenAt: time.Now().Unix(),
 	}
+	// 台账四件事都在这里：质量采样落盘、隧道丢包/BFD 告警、选路变化、动态行
+	// SLA 全不达标（见 opslog.go）。持有 s.mu，函数本身也按 Locked 约定。
+	s.recordMetricsLocked(tenant, nodeID, &rep, time.Now().Unix())
 	// No save(): see the file header. Responding without touching disk also keeps
 	// a 300 ms probe cadence from turning into a 300 ms fsync cadence.
 	json.NewEncoder(w).Encode(map[string]any{"ok": true})

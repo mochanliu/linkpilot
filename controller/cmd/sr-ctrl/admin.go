@@ -387,7 +387,13 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/accounts/reset", s.handleAdminAccountReset)
 	mux.HandleFunc("/api/accounts/disable", s.handleAdminAccountDisable)
 	mux.HandleFunc("/api/events", s.handleAdminEvents)
-	return mux
+	// 运维台账（opslog.go）：历史趋势、事件流水、告警与告警设置。全部租户专属。
+	mux.HandleFunc("/api/history", s.handleAdminHistory)
+	mux.HandleFunc("/api/ledger", s.handleAdminLedger)
+	mux.HandleFunc("/api/alerts", s.handleAdminAlerts)
+	// 审计中间件包在最外层：/api/* 的写请求记一条 audit 台账，一个钩子
+	// 覆盖现在和将来的全部写端点，新增 handler 不用记得埋点。
+	return s.auditMiddleware(mux)
 }
 
 func (s *server) handleConsolePage(w http.ResponseWriter, r *http.Request) {

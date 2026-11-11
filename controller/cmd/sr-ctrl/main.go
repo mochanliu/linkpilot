@@ -329,7 +329,6 @@ type State struct {
 	// the dataplane. It exists so several boxes in one building share one position
 	// instead of each carrying its own typed-in copy.
 	Sites map[string]*Site `json:"sites"`
-
 	// PreAuths is the tenant's on-paper device list: names and site assignments
 	// for boxes that have not enrolled yet, keyed by pre-authorization id. It is
 	// deliberately NOT a NodeRecord with a reserved node id -- a node id only ever
@@ -342,6 +341,11 @@ type State struct {
 	// draft moves into Configs at the enrollment that claims the record, and a
 	// draft that never got claimed is dropped with the record.
 	PreAuthConfigs map[string]*DeviceConfig `json:"preauth_configs"`
+
+	// Alerts is each tenant's alert settings (webhook, thresholds), keyed by
+	// tenant id. Configuration, not state: it survives a restart because a
+	// webhook that silently vanished after an upgrade is worse than no webhook.
+	Alerts map[string]*AlertSettings `json:"alert_settings,omitempty"`
 }
 
 // Account is one console login. Passwords are stored only as PBKDF2 hashes
@@ -438,8 +442,9 @@ func seedState() *State {
 		Underlays:   map[string]*UnderlayConfig{},
 		Overlays:    map[string]*OverlayConfig{},
 		LeakConfigs: map[string]*LeakConfig{},
-		Sites:       map[string]*Site{},
-		PreAuths:    map[string]*PreAuth{},
+		Sites:        map[string]*Site{},
+		PreAuths:     map[string]*PreAuth{},
+		Alerts:       map[string]*AlertSettings{},
 
 		PreAuthConfigs: map[string]*DeviceConfig{},
 	}
@@ -656,6 +661,11 @@ func normalizeState(s *State) bool {
 	// pointing at a site that no longer exists (or belongs to another tenant)
 	// would be drawn at someone else's coordinates. Clear those and let the
 	// topology say 未上报.
+	// 告警设置按租户一张表：老 state 文件没有这块，读侧 alertSettingsLocked
+	// 对缺省补默认值，这里只兜 nil map。
+	if s.Alerts == nil {
+		s.Alerts = map[string]*AlertSettings{}
+	}
 	if normalizeSites(s) {
 		migrated = true
 	}
@@ -746,6 +756,27 @@ type server struct {
 	// outlives the report that produced it.
 	tel       map[string]*nodeTelemetry
 	telTTLSec int
+
+	// ops is the append-only 运维台账 (opslog.go): history samples, events,
+	// alerts and audits all land here. nil in tests -- every entry point is
+	// nil-safe and skips.
+	ops *opsLedger
+
+	// alerts holds the ACTIVE alert records, keyed by alertKey. In-memory on
+	// purpose: the rules re-derive them within one sweep after a restart, and
+	// the raise/clear transitions are persisted in the ledger.
+	alerts map[string]*alertRecord
+
+	// alertStrikes counts consecutive over-threshold windows per tunnel
+	// (loss alert debounce), and lastSampleAt/lastSelection throttle the
+	// sample ledger and dedupe selection-change entries.
+	alertStrikes  map[string]int
+	lastSampleAt  map[string]int64
+	lastSelection map[string]uint8
+
+	// opsPruneDay is the last day the ledger prune ran (local date), so the
+	// 2s sweeper does directory work once per day instead of once per tick.
+	opsPruneDay string
 }
 
 // pendingObs is an observation the controller could not name yet, kept with the
@@ -1155,7 +1186,9 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	rec.CertPEM = certPEM
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
 	s.save()
-	s.admin.publish("node.enrolled", tenant, rec)
+		s.admin.publish("node.enrolled", tenant, rec)
+		s.appendOps("node.enrolled", tenant, rec.NodeID, "", "info",
+			fmt.Sprintf("设备入网：node %d，serial %s，授权 %s", rec.NodeID, req.Serial, claim.ID))
 	if transitAssigned {
 		// The 全局配置 page lists every device's transit port; it just changed.
 		s.admin.publish("node.underlay", tenant, rec)
@@ -1320,6 +1353,12 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if wasStale || firstContact {
 		// Console-facing: the device table's online/stale column just flipped.
 		s.admin.publish("node.online", rec.TenantID, rec)
+		// 台账：上线/恢复是排障时最常查的事件；失联告警在这里画上句号。
+		s.appendOps("node.online", rec.TenantID, rec.NodeID, "", "info",
+			fmt.Sprintf("设备上线（node %d，serial %s）", rec.NodeID, rec.Serial))
+		if wasStale {
+			s.clearAlertLocked("node.stale", rec.TenantID, rec.NodeID, "")
+		}
 	}
 	if configChanged {
 		// Console-facing: the config page's applied/failed/applying column moved.
@@ -2227,6 +2266,10 @@ func (s *server) ttlSweeper(ctx context.Context) {
 					rec.Stale = true
 					log.Printf("ttl: node %d (tenant %s) stale after %ds idle",
 						rec.NodeID, rec.TenantID, now-rec.LastSeen)
+					s.appendOps("node.stale", rec.TenantID, rec.NodeID, "", "warn",
+						fmt.Sprintf("设备失联：心跳 %d 秒没有上报", now-rec.LastSeen))
+					s.raiseAlertLocked("node.stale", rec.TenantID, rec.NodeID, "", "crit",
+						fmt.Sprintf("设备失联：心跳超过 %d 秒没有上报", ttl))
 					// Its address stops being a fact the moment its agent stops
 					// answering: whatever a peer saw 40 seconds ago describes a
 					// binding that may already be gone.
@@ -2247,6 +2290,12 @@ func (s *server) ttlSweeper(ctx context.Context) {
 			s.expireObservationsLocked()
 			s.expireTelemetryLocked(now)
 			s.expireClaimCodesLocked(now)
+			s.sweepTelemetryGapLocked(now)
+			// 台账清理按天跑一次：日期变了才扫目录，平时这一拍零开销。
+			if d := time.Unix(now, 0).Format("2006-01-02"); d != s.opsPruneDay {
+				s.opsPruneDay = d
+				s.ops.prune(time.Unix(now, 0), opsRetentionDays)
+			}
 			s.save()
 			s.mu.Unlock()
 		}
@@ -2327,21 +2376,31 @@ func main() {
 		reflectors = refs
 	}
 
+	ops, err := openOpsLedger(filepath.Join(*dataDir, "opslog"))
+	if err != nil {
+		log.Fatalf("opslog: %v", err)
+	}
+
 	s := &server{
-		state:      st,
-		store:      store,
-		subs:       map[int]*subscriber{},
-		hbSec:      *hbSec,
-		tlsAddrs:   []string{*listen},
-		reflectors: reflectors,
-		caCert:     ca,
-		caKey:      caKey,
-		dataDir:    *dataDir,
-		obs:        map[string]observerView{},
-		pendingObs: map[string]map[string]*pendingObs{},
-		tel:        map[string]*nodeTelemetry{},
-		telTTLSec:  *metricsTTL,
-		adminToken: *adminTokenF,
+		state:         st,
+		store:         store,
+		subs:          map[int]*subscriber{},
+		hbSec:         *hbSec,
+		tlsAddrs:      []string{*listen},
+		reflectors:    reflectors,
+		caCert:        ca,
+		caKey:         caKey,
+		dataDir:       *dataDir,
+		obs:           map[string]observerView{},
+		pendingObs:    map[string]map[string]*pendingObs{},
+		tel:           map[string]*nodeTelemetry{},
+		telTTLSec:     *metricsTTL,
+		adminToken:    *adminTokenF,
+		ops:           ops,
+		alerts:        map[string]*alertRecord{},
+		alertStrikes:  map[string]int{},
+		lastSampleAt:  map[string]int64{},
+		lastSelection: map[string]uint8{},
 	}
 
 	go s.ttlSweeper(ctx)

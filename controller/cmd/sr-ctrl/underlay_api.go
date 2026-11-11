@@ -176,6 +176,8 @@ func (s *server) handleAdminUnderlayPublish(w http.ResponseWriter, r *http.Reque
 	}
 	uc.PublishedBy = id.Username
 	s.save()
+	s.appendOps("underlay.publish", id.TenantID, 0, id.Username, "info",
+		fmt.Sprintf("发布 underlay 全局配置（%d 台设备的中转端口已分配）", len(ids)))
 	log.Printf("underlay: tenant=%s published global config by %s (%d device(s), transit ports assigned)",
 		id.TenantID, id.Username, len(ids))
 	writeJSON(w, map[string]any{
@@ -357,6 +359,8 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 			return
 		}
 		s.save()
+		s.appendOps("underlay.change", id.TenantID, 0, id.Username, "info",
+			fmt.Sprintf("新建隧道 %s：设备 %d ↔ %d，颜色 %d", tun.ID, tun.A.NodeID, tun.B.NodeID, tun.Color))
 		writeJSONStatus(w, http.StatusCreated, map[string]any{
 			"ok":       true,
 			"tunnel":   buildTunnelView(st, &tun, serialMap(views), views),
@@ -399,6 +403,8 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 		return
 	}
 	s.save()
+	s.appendOps("underlay.change", id.TenantID, 0, id.Username, "info",
+		fmt.Sprintf("修改隧道 %s（颜色 %d）", tun.ID, tun.Color))
 	writeJSON(w, map[string]any{
 		"ok":       true,
 		"tunnel":   buildTunnelView(st, &tun, serialMap(views), views),
@@ -471,6 +477,8 @@ func (s *server) deleteUnderlayTunnel(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	s.save()
+	s.appendOps("underlay.change", id.TenantID, 0, id.Username, "info",
+		fmt.Sprintf("删除隧道 %s", tunnelID))
 	log.Printf("underlay: tenant=%s deleted tunnel %s by %s", id.TenantID, tunnelID, id.Username)
 	writeJSON(w, map[string]any{
 		"ok":       true,

@@ -74,6 +74,10 @@ func (s *server) publishDeviceLocked(tenantID string, nodeID uint16, dc *DeviceC
 		if n := s.state.Nodes[key(tenantID, nodeID)]; n != nil {
 			s.admin.publish("config.published", tenantID, n)
 		}
+		// 台账：泄露/策略/基础配置的发布都走这一条路，一处记录全都有。
+		// 版本号是租户在页面上看到的那个 vN，排障时对得上。
+		s.appendOps("config.publish", tenantID, nodeID, by, "info",
+			fmt.Sprintf("发布设备配置 v%d（%d 个校验项）", dc.Version, len(checks)))
 	}
 	return changed
 }

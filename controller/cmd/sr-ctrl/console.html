@@ -349,6 +349,7 @@
       <a class="child" href="#policy" data-view="policy" data-roles="tenant">SD-WAN 策略</a>
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
+      <a class="child" href="#ops" data-view="ops" data-roles="tenant">台账与告警</a>
       <a class="child" href="#underlay-topology" data-view="underlay-topology" data-roles="tenant">拓扑图</a>
       <div class="sect">资产</div>
       <a class="child" href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
@@ -389,7 +390,13 @@
     view: "dashboard", lastResult: null, lastSecret: null, codeReveal: null,
     html: "", timer: null, ago: null, es: null,
     metrics: null, fast: null, cfg: null, und: null, topo: null, sites: null, pa: null,
-    rr: null, ov: null };
+    rr: null, ov: null,
+    // 运维台账（opslog.go）：alerts = /api/alerts 的活动告警+设置；ledger =
+    // /api/ledger 的事件流水（带过滤条件）；history = /api/history 的采样；
+    // histNode 是监控页趋势图选中的设备，histAt 节流历史拉取（5s 心跳里
+    // 历史最多 30s 一次）。
+    alerts: null, ledger: null, ledgerFilter: { kind: "", hours: 48, node: 0 },
+    history: null, histNode: 0, histAt: 0 };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -483,6 +490,9 @@
     S.ov = null;
     S.lk = null;
     S.pl = null;
+    S.alerts = null;
+    S.ledger = null;
+    S.history = null;
     S.html = "";
     if (S.es) { S.es.close(); S.es = null; }
     clearInterval(S.timer);
@@ -594,17 +604,58 @@
     });
   }
 
-  // 5s while monitoring, nothing otherwise: the probe window is far shorter
-  // than the 10s state poll, and a view nobody is looking at should not poll.
+  // 5s while monitoring or the ops ledger, nothing otherwise: the probe window
+  // is far shorter than the 10s state poll, and a view nobody is looking at
+  // should not poll. History samples are fetched on their own throttle (30s) —
+  // they come off the ledger files and a 5s refetch would just burn disk reads.
   function syncFast() {
-    var need = !!(S.me && S.me.role === "tenant" && S.view === "monitor");
+    var need = !!(S.me && S.me.role === "tenant" && (S.view === "monitor" || S.view === "ops"));
     if (need && S.fast === null) {
-      S.fast = setInterval(loadMetrics, 5000);
-      loadMetrics();
+      S.fast = setInterval(function () {
+        if (S.view === "monitor") loadMetrics();
+        else if (S.view === "ops") loadOps();
+        loadHistory();
+      }, 5000);
+      if (S.view === "monitor") loadMetrics();
+      else loadOps();
+      loadHistory();
     } else if (!need && S.fast !== null) {
       clearInterval(S.fast);
       S.fast = null;
     }
+  }
+
+  function loadOps() {
+    if (!(S.me && S.me.role === "tenant")) return Promise.resolve();
+    var f = S.ledgerFilter;
+    var url = "/api/ledger?hours=" + f.hours + (f.node ? "&node=" + f.node : "");
+    if (f.kind) url += "&kind=" + encodeURIComponent(f.kind);
+    return Promise.all([
+      api("GET", "/api/alerts"),
+      api("GET", url)
+    ]).then(function (r) {
+      S.alerts = r[0];
+      S.ledger = r[1];
+      render();
+    }).catch(function (err) {
+      $("live-dot").className = "dot bad";
+      $("live-text").textContent = "台账离线：" + err.message;
+    });
+  }
+
+  // loadHistory 拉趋势采样。5s 的轮询里它最多 30s 跑一次（S.histAt 节流），
+  // 切进监控页的那一下（S.histAt=0）总是立刻拉。
+  function loadHistory() {
+    if (!(S.me && S.me.role === "tenant")) return Promise.resolve();
+    if (S.view !== "monitor") return Promise.resolve();
+    var now = Date.now();
+    if (S.histAt && now - S.histAt < 30000) return Promise.resolve();
+    S.histAt = now;
+    return api("GET", "/api/history?hours=24" + (S.histNode ? "&node=" + S.histNode : ""))
+      .then(function (h) {
+        S.history = h;
+        render();
+      }).catch(function () { /* 趋势图拉不到不打扰页面，下次轮询再试 */ });
   }
 
   function roleLine(me) {
@@ -637,12 +688,13 @@
         $("live-dot").className = "dot ok";
         $("live-text").textContent = "实时";
       });
-      ["node.online", "node.enrolled", "node.stale", "node.config", "node.underlay", "config.published", "tenant.created", "claim.created", "claim.revoked", "claim.updated"].forEach(function (n) {
+      ["node.online", "node.enrolled", "node.stale", "node.config", "node.underlay", "config.published", "tenant.created", "claim.created", "claim.revoked", "claim.updated", "alert.raised", "alert.cleared"].forEach(function (n) {
         S.es.addEventListener(n, function (e) {
           var ev = {};
           try { ev = JSON.parse(e.data); } catch (_) {}
           load();
           if (S.view === "monitor") loadMetrics();
+          if (S.view === "ops") loadOps();
           // The config page shows published vs applied, so a device report or a
           // publish must reach it. A dirty draft still wins: reloading would
           // throw away what the tenant is typing, and "重新载入" is right there.
@@ -656,6 +708,8 @@
           if (n === "node.stale") toast("设备失联：心跳超时");
           if (n === "config.published") toast("配置已发布，等待设备下一次心跳拉取");
           if (n === "claim.created" || n === "tenant.created") toast(n === "tenant.created" ? "租户已创建" : "已下发新的入网授权");
+          if (n === "alert.raised") toast("有新告警，见「台账与告警」");
+          if (n === "alert.cleared") toast("有告警恢复，见「台账与告警」");
         });
       });
       S.es.onerror = function () {
@@ -701,6 +755,11 @@
     monitor: {
       title: "监控",
       sub: "设备存活与隧道内遥测：两端各自上报，不合并，没有上报就明说",
+      roles: ["tenant"]
+    },
+    ops: {
+      title: "台账与告警",
+      sub: "活动告警、告警通知设置，和按时间倒排的运维台账（设备上下线、配置发布、选路切换、控制台操作审计）。台账按天落盘保留 30 天；告警推送到下面配置的 webhook",
       roles: ["tenant"]
     },
     "underlay-settings": {
@@ -816,6 +875,7 @@
     else if (S.view === "leak-to-cpe") c = viewLeakToCPE();
     else if (S.view === "policy") c = viewPolicy();
     else if (S.view === "monitor") c = viewMonitor();
+    else if (S.view === "ops") c = viewOps();
     else if (S.view === "account") c = viewAccount();
     else c = viewPlaceholder();
     if (me.initial_password) c = initialPassBanner() + c;
@@ -1368,6 +1428,20 @@
       card("遥测在报", reporting, "台") +
       "</div>";
 
+    // 24 小时趋势：台账里的 tunnel.sample 采样（10 秒一条）画成折线。
+    // 数据独立于上面的实时窗口——实时窗口说"现在"，这里说"过去一天"。
+    var nodeOpts = nodes.map(function (n) {
+      return '<option value="' + n.node_id + '"' +
+        (Number(S.histNode || 0) === n.node_id || (!S.histNode && n.node_id === (nodes[0] || {}).node_id)
+          ? " selected" : "") + ">node-" + esc(n.node_id) + "</option>";
+    }).join("");
+    h += '<section class="panel"><header><h2>24 小时隧道质量</h2>' +
+      '<select id="hist-node" style="font:inherit;font-size:13px">' + nodeOpts + "</select></header>" +
+      '<div class="hint">来自控制器的台账采样，一条线 = 到一个对端的隧道（图例带颜色号）。' +
+      '设备失联的时间段自然是空的——空档本身就是发生过事情的证据。</div>' +
+      histCharts(S.history, S.histNode || (nodes[0] ? nodes[0].node_id : 0)) +
+      "</section>";
+
     h += '<section class="panel"><header><h2>设备健康</h2>' +
       '<button class="small" data-act="refresh">刷新</button></header>' +
       '<div class="hint">控制器按心跳判断存活：设备每 ' + hb + " 秒上报一次，连续 " + lapse +
@@ -1403,6 +1477,180 @@
       h += '<div class="empty">没有设备，就没有遥测。</div>';
     } else {
       nodes.forEach(function (n) { h += telemetryBlock(n); });
+    }
+    h += "</section>";
+    return h;
+  }
+
+  /* ---------------- 历史趋势与运维台账（opslog.go 的页面半边） ---------------- */
+
+  var HIST_COLORS = ["#3b82f6", "#f97316", "#10b981", "#a855f7", "#eab308", "#64748b", "#ec4899"];
+
+  // histCharts 把台账采样画成两张小图（延迟 / 丢包）。samples 形如
+  // {samples:[{at, node, rows:[{peer,color,rtt_ms,loss_permille}]}]}，只画
+  // node 过滤后的那台。空数据说清原因，不画一张空坐标系装样子。
+  function histCharts(h, node) {
+    var samples = ((h && h.samples) || []).filter(function (s) {
+      return !node || s.node === node;
+    });
+    if (!samples.length) {
+      return '<div class="empty">还没有采样。设备每 10 秒落一条，上报几分钟后再来看就有线了。</div>';
+    }
+    if (samples.length < 3) {
+      return '<div class="empty">采样刚开始积累，过几分钟再来。</div>';
+    }
+    var t0 = samples[0].at, t1 = samples[samples.length - 1].at;
+    // 两条线：延迟（ms）与丢包（‰）。series 按 对端/颜色 分组。
+    function split(val) {
+      var series = [];
+      var idx = {};
+      samples.forEach(function (s) {
+        (s.rows || []).forEach(function (r) {
+          var k = r.peer + "/" + (r.color || 0);
+          if (!idx[k]) {
+            idx[k] = { peer: r.peer, color: r.color || 0, pts: [] };
+            series.push(idx[k]);
+          }
+          idx[k].pts.push([s.at, val(r)]);
+        });
+      });
+      series.forEach(function (sr) { sr.pts.sort(function (a, b) { return a[0] - b[0]; }); });
+      return series;
+    }
+    var rtt = split(function (r) { return r.rtt_ms || 0; });
+    var loss = split(function (r) { return r.loss_permille || 0; });
+    // 纵轴上限：数据没有时给个非零底（10ms / 100‰），有数据就取最大值的 1.15 倍。
+    var maxRtt = 10, maxLoss = 100;
+    rtt.forEach(function (sr) { sr.pts.forEach(function (p) { if (p[1] > maxRtt) maxRtt = p[1]; }); });
+    loss.forEach(function (sr) { sr.pts.forEach(function (p) { if (p[1] > maxLoss) maxLoss = p[1]; }); });
+    maxRtt *= 1.15; maxLoss = Math.min(1000, maxLoss * 1.15);
+    var W = 680, H = 110;
+    function polyline(series, maxV) {
+      var out = "";
+      series.forEach(function (sr, i) {
+        var c = HIST_COLORS[i % HIST_COLORS.length];
+        var pts = sr.pts.map(function (p) {
+          var x = ((p[0] - t0) / (t1 - t0) * (W - 8) + 4).toFixed(1);
+          var y = (H - 6 - p[1] / maxV * (H - 16)).toFixed(1);
+          return x + "," + y;
+        }).join(" ");
+        out += '<polyline points="' + pts + '" fill="none" stroke="' + c + '" stroke-width="1.5"/>';
+      });
+      return out;
+    }
+    function legend(series) {
+      return series.map(function (sr, i) {
+        var c = HIST_COLORS[i % HIST_COLORS.length];
+        return '<span style="color:' + c + '">▬</span> node-' + esc(sr.peer) +
+          (sr.color ? "（颜色 " + sr.color + "）" : "");
+      }).join("　");
+    }
+    return '<div style="margin-top:6px">' +
+      '<div style="font-size:12px;color:var(--muted)">往返延迟 ms（上限 ' + Math.round(maxRtt) + '）</div>' +
+      '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;height:' + H + 'px">' +
+      polyline(rtt, maxRtt) + "</svg>" +
+      '<div style="font-size:11px">' + legend(rtt) + "</div>" +
+      '<div style="font-size:12px;color:var(--muted);margin-top:8px">丢包 ‰（上限 ' + Math.round(maxLoss) + "）</div>" +
+      '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;height:' + H + 'px">' +
+      polyline(loss, maxLoss) + "</svg>" +
+      '<div style="font-size:11px">' + legend(loss) + "</div></div>";
+  }
+
+  // opsKindText 把台账 kind 译成人话；未知的 kind 原样显示（服务端加新种类
+  // 时页面不用跟着改才能看）。
+  function opsKindText(k) {
+    return {
+      "node.enrolled": "入网", "node.online": "上线", "node.stale": "失联",
+      "config.publish": "发布配置", "underlay.publish": "发布隧道全局",
+      "underlay.change": "隧道变更", "selection": "选路切换",
+      "tunnel.sample": "采样", "alert.raise": "告警升起", "alert.clear": "告警恢复",
+      "audit": "操作"
+    }[k] || k;
+  }
+
+  function opsSevTag(sev) {
+    if (sev === "crit") return '<span class="dot bad"></span>严重';
+    if (sev === "warn") return '<span class="dot warn"></span>警告';
+    return '<span class="dot ok"></span>信息';
+  }
+
+  // viewOps 是「台账与告警」页：活动告警 + 告警设置 + 运维台账三块。
+  function viewOps() {
+    var h = "";
+    var a = S.alerts;
+    h += '<section class="panel"><header><h2>活动告警</h2>' +
+      '<button class="small" data-act="ops-refresh">刷新</button></header>' +
+      '<div class="hint">告警由控制器按规则自动升起与恢复：设备失联、隧道丢包连续超标、BFD down、' +
+      '动态策略行没有候选隧道满足 SLA、设备在线但遥测中断。升起与恢复都会写进下面的台账并推送到 webhook。</div>';
+    if (!a) {
+      h += '<div class="empty">正在读取告警…</div>';
+    } else if (!(a.active || []).length) {
+      h += '<div class="empty">当前没有活动告警。</div>';
+    } else {
+      h += "<table><thead><tr><th>级别</th><th>设备</th><th>类型</th><th>内容</th><th>升起于</th><th>最近发生</th></tr></thead><tbody>";
+      (a.active || []).forEach(function (al) {
+        h += "<tr><td>" + opsSevTag(al.sev) + "</td>" +
+          '<td class="mono">' + (al.node ? "node-" + esc(al.node) : "—") + "</td>" +
+          "<td>" + esc(al.kind) + "</td><td>" + esc(al.msg) + "</td>" +
+          '<td class="muted">' + esc(clock(al.raised_at_unix)) + "</td>" +
+          '<td class="muted"><span data-ago="' + esc(al.last_at_unix) + '"></span></td></tr>';
+      });
+      h += "</tbody></table>";
+    }
+    h += "</section>";
+
+    // 告警设置：webhook 推送 + 丢包门槛。告警规则本身不需要配置——能自动
+    // 判定的事实不需要问人。
+    var st = (a && a.settings) || {};
+    h += '<section class="panel"><header><h2>告警通知</h2></header>' +
+      '<div class="hint">告警升起 / 恢复时向 webhook 发一条 JSON POST（5 秒超时，失败只记日志不重试）。' +
+      '留空 = 不推送，只在台账里记。丢包门槛是‰（千分之），0 恢复默认 200。</div>' +
+      '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">' +
+      '<label>webhook 地址<br><input id="ops-webhook" type="text" style="width:340px" value="' + esc(st.webhook_url || "") + '" placeholder="http://…（留空不推送）"></label>' +
+      '<label>丢包门槛 ‰<br><input id="ops-loss" type="number" min="0" max="1000" style="width:90px" value="' + esc(st.loss_permille || "") + '" placeholder="200"></label>' +
+      '<button class="small" data-act="alert-save">保存告警设置</button></div>' +
+      "</section>";
+
+    // 台账：过滤 + 表。行来自 /api/ledger，最新在前，最多 2000 行。
+    var f = S.ledgerFilter;
+    var kinds = ["", "node.enrolled", "node.online", "node.stale", "config.publish",
+      "underlay.publish", "underlay.change", "selection", "alert.raise", "alert.clear", "audit"];
+    var names = { "": "全部类型", "node.enrolled": "入网", "node.online": "上线", "node.stale": "失联",
+      "config.publish": "发布配置", "underlay.publish": "发布隧道全局", "underlay.change": "隧道变更",
+      "selection": "选路切换", "alert.raise": "告警升起", "alert.clear": "告警恢复", "audit": "操作" };
+    var kindOpts = kinds.map(function (k) {
+      return '<option value="' + k + '"' + (f.kind === k ? " selected" : "") + ">" + names[k] + "</option>";
+    }).join("");
+    var hourOpts = [1, 6, 24, 72, 168].map(function (n) {
+      return '<option value="' + n + '"' + (f.hours === n ? " selected" : "") + ">" +
+        (n >= 24 ? n / 24 + " 天" : n + " 小时") + "</option>";
+    }).join("");
+    var nodeSel = ((S.state && S.state.nodes) || []);
+    var nodeOpts2 = '<option value="0">全部设备</option>' + nodeSel.map(function (n) {
+      return '<option value="' + n.node_id + '"' + (f.node === n.node_id ? " selected" : "") +
+        ">node-" + esc(n.node_id) + "</option>";
+    }).join("");
+    h += '<section class="panel"><header><h2>运维台账</h2>' +
+      '<div>类型 <select id="ops-kind" style="font:inherit;font-size:13px">' + kindOpts + "</select>　" +
+      '范围 <select id="ops-hours" style="font:inherit;font-size:13px">' + hourOpts + "</select>　" +
+      '设备 <select id="ops-node" style="font:inherit;font-size:13px">' + nodeOpts2 + "</select></div></header>";
+    var entries = (S.ledger && S.ledger.entries) || [];
+    if (!entries.length) {
+      h += '<div class="empty">这个范围内还没有事件。事件随设备与操作自动产生，不需要手动记录。</div>';
+    } else {
+      h += '<table><thead><tr><th>时间</th><th>类型</th><th>设备</th><th>操作者</th><th>内容</th></tr></thead><tbody>';
+      entries.forEach(function (e) {
+        h += "<tr>" +
+          '<td class="muted mono" style="white-space:nowrap">' + esc(clock(e.at_unix)) + "</td>" +
+          "<td>" + opsKindText(e.kind) + "</td>" +
+          '<td class="mono">' + (e.node ? "node-" + esc(e.node) : "—") + "</td>" +
+          '<td class="mono">' + esc(e.actor || "") + "</td>" +
+          "<td>" + esc(e.msg || "") + "</td></tr>";
+      });
+      h += "</tbody></table>";
+      if (entries.length >= 2000) {
+        h += '<div class="hint">结果超过 2000 行被截断——缩小时间范围或按类型过滤。</div>';
+      }
     }
     h += "</section>";
     return h;
@@ -7818,6 +8066,27 @@
       if (!el || !el.getAttribute || !el.getAttribute("data-ov-rr-slot")) return;
       ovSetDeviceRR(Number(el.getAttribute("data-ov-rr-node")), el.getAttribute("data-ov-rr-slot"), el.value);
     });
+    // 台账页的过滤下拉：值一变就按新条件重拉（loadOps 读 S.ledgerFilter）。
+    var opsKindSel = $("ops-kind");
+    if (opsKindSel) opsKindSel.addEventListener("change", function () {
+      S.ledgerFilter.kind = opsKindSel.value; loadOps();
+    });
+    var opsHoursSel = $("ops-hours");
+    if (opsHoursSel) opsHoursSel.addEventListener("change", function () {
+      S.ledgerFilter.hours = Number(opsHoursSel.value) || 48; loadOps();
+    });
+    var opsNodeSel = $("ops-node");
+    if (opsNodeSel) opsNodeSel.addEventListener("change", function () {
+      S.ledgerFilter.node = Number(opsNodeSel.value) || 0; loadOps();
+    });
+    // 监控页趋势图的设备下拉：切设备立即重拉历史（绕过 30s 节流）。
+    var histSel = $("hist-node");
+    if (histSel) histSel.addEventListener("change", function () {
+      S.histNode = Number(histSel.value) || 0;
+      S.histAt = 0;
+      loadHistory();
+    });
+
     // A dropdown's value only exists on "change"; the generic [data-act] click
     // handler below would read it before the user has picked anything.
     document.querySelectorAll('#content select[data-act="node-site"]').forEach(function (el) {
@@ -7869,7 +8138,23 @@
         var act = el.getAttribute("data-act");
         if (act === "refresh") {
           load().then(function () { toast("已刷新"); });
-          if (S.view === "monitor") loadMetrics();
+          if (S.view === "monitor") { loadMetrics(); S.histAt = 0; loadHistory(); }
+          if (S.view === "ops") loadOps();
+        }
+        else if (act === "ops-refresh") {
+          S.histAt = 0;
+          loadOps();
+        }
+        else if (act === "alert-save") {
+          var body = {
+            webhook_url: ($("ops-webhook") || {}).value || "",
+            loss_permille: Number(($("ops-loss") || {}).value) || 0
+          };
+          api("PUT", "/api/alerts", body).then(function (res) {
+            S.alerts = { active: (S.alerts && S.alerts.active) || [], settings: res.settings };
+            toast("告警设置已保存");
+            render();
+          }).catch(function (err) { toast(err.message); });
         }
         else if (act === "goto") {
           if (S.view === "enroll") S.codeReveal = null;
