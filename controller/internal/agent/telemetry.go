@@ -38,6 +38,10 @@ type TelemetryPlane interface {
 	AddBFDSession(ctx context.Context, p vppapi.BFDSessionParams) error
 	DelBFDSession(ctx context.Context, p vppapi.BFDSessionParams) error
 	BFDSessions(ctx context.Context) ([]vppapi.BFDSession, error)
+
+	// IfStats 读全部接口的 rx/tx 累计计数（VPP stats 共享内存段）。读不到
+	// 报错即可——计数是监控的加分项，绝不能因为它拖垮质量上报。
+	IfStats(ctx context.Context) ([]vppapi.IfCounter, error)
 }
 
 var _ TelemetryPlane = (*vppapi.Client)(nil)
@@ -50,6 +54,13 @@ type tunnelWindow struct {
 	tx, rx, lost, late uint64
 	at                 time.Time
 	sampled            bool
+
+	// 接口计数器有自己的窗口状态：一条隧道可能先有 BFD、探针一直没配起来，
+	// 计数器照样要算增量。counted/cAt 与 sampled/at 分开，避免"计数窗口把
+	// 探针窗口带跑了"和反过来的串味。
+	rxPk, rxBy, txPk, txBy uint64
+	cAt                    time.Time
+	counted                bool
 }
 
 // Telemetry 是每台 CPE 一份的遥测采样器。Ensure/Remove 来自隧道对账，
@@ -59,7 +70,15 @@ type Telemetry struct {
 	src     func() (TelemetryPlane, error)
 	now     func() time.Time
 	tunnels map[uint32]*tunnelWindow
+
+	// logf 是可选的（TunnelSync 接线时给）。接口计数读不到时喊一次——
+	// "流量"列显示未上报而没有一行日志，运维只会以为 agent 坏了。
+	logf        func(string, ...any)
+	statsWarned bool
 }
+
+// SetLogf 给采样器接日志（在 NewTunnelSync 里接线；不接就是哑的）。
+func (t *Telemetry) SetLogf(logf func(string, ...any)) { t.logf = logf }
 
 // NewTelemetry 建一个采样器，固定用 dp 这条连接。dp 是 *vppapi.Client。
 func NewTelemetry(dp TelemetryPlane) *Telemetry {
@@ -255,6 +274,21 @@ func (t *Telemetry) Sample(ctx context.Context) ([]wire.TunnelMetrics, error) {
 	if err != nil {
 		return nil, fmt.Errorf("agent: 读 BFD 会话: %w", err)
 	}
+	// 接口计数读不到（stats 段没开、目录重建）只影响"流量"这一列，本窗标
+	// has_counters=false 即可，绝不能让它把质量上报整个拦下。失败喊一次：
+	// 每窗都喊会把日志刷成瀑布，一句"为什么是未上报"的答案已经够了。
+	ifStats, err := dp.IfStats(ctx)
+	if err != nil {
+		ifStats = nil
+		if t.logf != nil && !t.statsWarned {
+			t.statsWarned = true
+			t.logf("telemetry: 接口计数读不到，流量列将显示未上报: %v", err)
+		}
+	}
+	ifMap := make(map[uint32]vppapi.IfCounter, len(ifStats))
+	for _, c := range ifStats {
+		ifMap[c.SwIfIndex] = c
+	}
 
 	byPeer := make(map[string]vppapi.BFDSession, len(bfds))
 	for _, s := range bfds {
@@ -277,7 +311,7 @@ func (t *Telemetry) Sample(ctx context.Context) ([]wire.TunnelMetrics, error) {
 	for _, p := range probes {
 		seenPeer[p.PeerIP.String()] = true
 		bfd, ok := byPeer[p.PeerIP.String()]
-		out = append(out, t.row(p, bfd, ok, now, true))
+		out = append(out, t.row(p, bfd, ok, now, true, ifMap))
 	}
 	for _, s := range bfds {
 		if s.SwIfIndex != vppapi.BFDMultihopSwIfIndex {
@@ -292,7 +326,7 @@ func (t *Telemetry) Sample(ctx context.Context) ([]wire.TunnelMetrics, error) {
 		if !ok {
 			continue
 		}
-		out = append(out, t.row(vppapi.ProbeStats{SwIfIndex: swIf}, s, true, now, false))
+		out = append(out, t.row(vppapi.ProbeStats{SwIfIndex: swIf}, s, true, now, false, ifMap))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SwIfIndex < out[j].SwIfIndex })
 	return out, nil
@@ -300,8 +334,9 @@ func (t *Telemetry) Sample(ctx context.Context) ([]wire.TunnelMetrics, error) {
 
 // row 把一条探针会话（可能有）与 BFD 会话（可能有）合成一行，并推进窗口。
 // hasProbe=false 时 p 只带 sw_if_index；hasBFD 区分"状态恰好是 admin-down"
-// 与"根本没有会话"。
-func (t *Telemetry) row(p vppapi.ProbeStats, bfd vppapi.BFDSession, hasBFD bool, now time.Time, hasProbe bool) wire.TunnelMetrics {
+// 与"根本没有会话"。ifStats 是本次采样读到的接口计数（可能为 nil = 没读到，
+// 行上 has_counters=false，不是零流量）。
+func (t *Telemetry) row(p vppapi.ProbeStats, bfd vppapi.BFDSession, hasBFD bool, now time.Time, hasProbe bool, ifStats map[uint32]vppapi.IfCounter) wire.TunnelMetrics {
 	m := wire.TunnelMetrics{
 		SwIfIndex:  p.SwIfIndex,
 		BFDState:   "absent",
@@ -316,6 +351,35 @@ func (t *Telemetry) row(p vppapi.ProbeStats, bfd vppapi.BFDSession, hasBFD bool,
 		m.BFDState = vppapi.BFDStateName(bfd.State)
 		m.Up = bfd.State == vppapi.BFDStateUp
 		m.PeerIP = bfd.PeerIP.String()
+	}
+
+	// 接口计数：探针行和只有 BFD 的行都带 —— 流量是监控的一半，探针没配
+	// 起来不该让"这条隧道每天走多少字节"跟着消失。窗口独立于探针（见
+	// tunnelWindow.counted）：计数从哪个窗口开始、增量就从哪个窗口算起。
+	if c, ok := ifStats[p.SwIfIndex]; ok {
+		m.HasCounters = true
+		if w == nil {
+			w = &tunnelWindow{}
+			t.tunnels[p.SwIfIndex] = w
+		}
+		if w.counted {
+			m.RxPackets = counterDelta(c.RxPackets, w.rxPk)
+			m.RxBytes = counterDelta(c.RxBytes, w.rxBy)
+			m.TxPackets = counterDelta(c.TxPackets, w.txPk)
+			m.TxBytes = counterDelta(c.TxBytes, w.txBy)
+			m.CounterSec = uint32(now.Sub(w.cAt) / time.Second)
+		} else {
+			// 第一个计数窗口：报累计，CounterSec=0，消费方按"累计"读。
+			m.RxPackets, m.RxBytes = c.RxPackets, c.RxBytes
+			m.TxPackets, m.TxBytes = c.TxPackets, c.TxBytes
+		}
+		w.rxPk, w.rxBy = c.RxPackets, c.RxBytes
+		w.txPk, w.txBy = c.TxPackets, c.TxBytes
+		w.cAt, w.counted = now, true
+	} else if w != nil {
+		// 这窗没读到：窗口作废，下一窗重新从"累计"起步——计数器没读到的
+		// 那段流量不可恢复，编一个增量出来比空着更误导。
+		w.counted = false
 	}
 
 	if !hasProbe {

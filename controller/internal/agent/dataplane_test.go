@@ -1925,6 +1925,12 @@ func (f *fakeVPP) DelBFDSession(_ context.Context, p vppapi.BFDSessionParams) er
 	return nil
 }
 
+// IfStats 满足 TelemetryPlane：真客户端从 stats 共享内存段读，替身没有接口
+// 计数（返回错误即"这窗没数"，agent 的行为是行上 has_counters=false 继续）。
+func (f *fakeVPP) IfStats(context.Context) ([]vppapi.IfCounter, error) {
+	return nil, fmt.Errorf("fakeVPP: 没有接口计数")
+}
+
 func (f *fakeVPP) BFDSessions(context.Context) ([]vppapi.BFDSession, error) {
 	out := make([]vppapi.BFDSession, 0, len(f.bfds))
 	for _, s := range f.bfds {

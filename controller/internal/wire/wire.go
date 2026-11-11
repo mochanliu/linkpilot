@@ -1025,6 +1025,24 @@ type TunnelMetrics struct {
 	AvgRTTms float64 `json:"avg_rtt_ms"` // lifetime mean
 	MaxRTTms float64 `json:"max_rtt_ms"` // lifetime maximum
 	JitterMs float64 `json:"jitter_ms"`  // RFC3550 EWMA, current
+
+	// Per-tunnel traffic, from VPP's per-interface combined counters read off
+	// the stats shared-memory segment (no data-plane change: every tunnel is
+	// its own WG interface). DELTAS over CounterSec, same window discipline as
+	// the probe counters; the first frame after the agent starts counting a
+	// tunnel is cumulative (CounterSec = 0), like ProbeTx above.
+	//
+	// HasCounters=false means the data plane gave nothing this window (old
+	// agent binary, stats segment unreadable) -- which is NOT zero traffic,
+	// and must render as "未上报", never as 0 B/s. The counters count overlay
+	// bytes (inner packets after decap / before encap), so WG+SR+UDP overhead
+	// is excluded on purpose: this is what the customer's traffic did.
+	HasCounters bool   `json:"has_counters,omitempty"`
+	CounterSec  uint32 `json:"counter_sec,omitempty"`
+	RxPackets   uint64 `json:"rx_packets,omitempty"`
+	RxBytes     uint64 `json:"rx_bytes,omitempty"`
+	TxPackets   uint64 `json:"tx_packets,omitempty"`
+	TxBytes     uint64 `json:"tx_bytes,omitempty"`
 }
 
 // MetricsReport carries one sampling window of in-tunnel telemetry. There is no

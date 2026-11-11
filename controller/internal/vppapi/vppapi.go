@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -69,6 +70,7 @@ var ErrClosed = errors.New("vppapi: 连接已关闭")
 type Client struct {
 	conn        net.Conn
 	clientIndex uint32
+	apiSock     string // api.sock 路径；IfStats 用它定位同目录的 stats.sock
 
 	ids  map[string]uint16
 	crcs map[string]string
@@ -86,6 +88,12 @@ type Client struct {
 	closed  chan struct{} // close 当 Close() 被调用
 	drops   atomic.Uint64 // 收到但没人等的帧（异步通知、错 id 应答）
 	err     atomic.Pointer[error]
+
+	// stats 是惰性打开的 stats 段客户端（见 statseg.go）。一条 Client 对应一个
+	// VPP 进程的一生（agent 在 VPP 重启后换新连接），所以这里缓存一次就够；
+	// 读数瞬时失败（目录重建）不弃缓存，下个窗口重试。
+	statsMu sync.Mutex
+	stats   *StatSeg
 }
 
 type waiter struct {
@@ -117,6 +125,7 @@ func Dial(ctx context.Context, socketPath, appName string) (*Client, error) {
 
 	c := &Client{
 		conn:    conn,
+		apiSock: socketPath,
 		ids:     map[string]uint16{},
 		crcs:    map[string]string{},
 		pending: map[uint32]*waiter{},
@@ -138,6 +147,15 @@ func Dial(ctx context.Context, socketPath, appName string) (*Client, error) {
 
 // Close 关掉连接；在途请求与后续调用拿到 ErrClosed（不是挂到超时）。
 func (c *Client) Close() error {
+	if s := func() *StatSeg {
+		c.statsMu.Lock()
+		defer c.statsMu.Unlock()
+		s := c.stats
+		c.stats = nil
+		return s
+	}(); s != nil {
+		s.Close()
+	}
 	select {
 	case <-c.closed:
 	default:
@@ -145,6 +163,27 @@ func (c *Client) Close() error {
 	}
 	c.conn.SetDeadline(time.Now())
 	return c.conn.Close()
+}
+
+// IfStats 读全部接口的 rx/tx 累计计数（statseg.go 的 stats 共享内存段）。
+// 段客户端在第一次调用时惰性打开（api.sock 同目录的 stats.sock），随 Client
+// 一起关闭。ctx 只管第一次打开的拨号预算，读本身是本地内存操作。
+func (c *Client) IfStats(ctx context.Context) ([]IfCounter, error) {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	if c.stats == nil {
+		s, err := OpenStatSeg(statsSocketPath(c.apiSock))
+		if err != nil {
+			return nil, err
+		}
+		c.stats = s
+	}
+	return c.stats.IfStats()
+}
+
+// statsSocketPath 由 api.sock 推 stats.sock 的路径（同一运行目录）。
+func statsSocketPath(apiSock string) string {
+	return filepath.Join(filepath.Dir(apiSock), "stats.sock")
 }
 
 // Drops 返回收到但没人等的帧数，排障用。

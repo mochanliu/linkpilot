@@ -1352,6 +1352,21 @@
     return sec + " 秒";
   }
   function fmtMs(v) { return (Number(v) || 0).toFixed(1) + " ms"; }
+  // 字节与速率的人话格式。fmtRate 按 window 秒折算成每秒；窗口为 0 不进来。
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    var units = ["KB", "MB", "GB", "TB"], v = n;
+    for (var i = 0; i < units.length; i++) {
+      v /= 1024;
+      if (v < 1024 || i === units.length - 1) return v.toFixed(v < 10 ? 2 : 1) + " " + units[i];
+    }
+  }
+  function fmtRate(bytes, sec) {
+    sec = Number(sec) || 0;
+    if (sec <= 0) return fmtBytes(bytes);
+    return fmtBytes(Math.round((Number(bytes) || 0) / sec)) + "/s";
+  }
   function fmtPct(v) { return ((Number(v) || 0) / 10).toFixed(1) + "%"; }
 
   function bfdTag(row) {
@@ -1407,6 +1422,7 @@
     }
     h += "<table><thead><tr><th>隧道</th><th>对端</th><th>BFD</th>" +
       "<th>时延 当前 / min / avg / max</th><th>抖动</th><th>丢包</th>" +
+      "<th>流量 ↓/↑</th>" +
       "<th>探针 tx / rx（丢 / 晚）</th><th>采样</th></tr></thead><tbody>";
     n.tunnels.forEach(function (row) {
       // 质量三项（时延/抖动/丢包）只来自隧道内探针，所以「有没有探针会话」
@@ -1426,6 +1442,18 @@
       var peer = row.peer_node_id
         ? '<span class="mono">node-' + esc(row.peer_node_id) + '</span> <span class="mono muted">' + esc(row.peer_ip) + "</span>"
         : '<span class="mono">' + esc(row.peer_ip) + "</span>";
+      // 流量列：has_counters 才有数（老盒子/读数失败是"未上报"，不是 0）。
+      // counter_sec=0 是首窗累计；有窗口的按每秒折算， tunnel 是 overlay 口径
+      // （解封装之后/封装之前的内层字节，不含隧道开销）。
+      var traffic;
+      if (row.has_counters) {
+        var dn = Number(row.rx_bytes) || 0, up = Number(row.tx_bytes) || 0;
+        traffic = (row.counter_sec
+          ? "↓" + fmtRate(dn, row.counter_sec) + " ↑" + fmtRate(up, row.counter_sec)
+          : "↓" + fmtBytes(dn) + " ↑" + fmtBytes(up) + ' <span class="muted">累计</span>');
+      } else {
+        traffic = '<span class="muted">—</span>';
+      }
       h += "<tr>" +
         '<td class="mono">' + esc(row.sw_if_index) + "</td>" +
         "<td>" + peer + "</td>" +
@@ -1433,6 +1461,7 @@
         '<td class="num">' + rtt + "</td>" +
         '<td class="num">' + (probed && replied ? fmtMs(row.jitter_ms) : (probed ? '<span class="muted">无回包</span>' : none)) + "</td>" +
         '<td class="num">' + (probed ? fmtPct(row.loss_permille) : none) + "</td>" +
+        '<td class="num mono">' + traffic + "</td>" +
         '<td class="num muted">' + (probed
           ? esc(row.probe_tx) + " / " + esc(row.probe_rx) +
             "（丢 " + esc(row.probe_lost) + " · 晚 " + esc(row.probe_late) + "）"
@@ -1542,12 +1571,15 @@
       var idx = {};
       samples.forEach(function (s) {
         (s.rows || []).forEach(function (r) {
+          var v = val(r);
+          // v === null 的行（如没上报计数的采样）不出点：线断在"没数"上。
+          if (v === null || v === undefined) return;
           var k = r.peer + "/" + (r.color || 0);
           if (!idx[k]) {
             idx[k] = { peer: r.peer, color: r.color || 0, pts: [] };
             series.push(idx[k]);
           }
-          idx[k].pts.push([s.at, val(r)]);
+          idx[k].pts.push([s.at, v]);
         });
       });
       series.forEach(function (sr) { sr.pts.sort(function (a, b) { return a[0] - b[0]; }); });
@@ -1555,11 +1587,18 @@
     }
     var rtt = split(function (r) { return r.rtt_ms || 0; });
     var loss = split(function (r) { return r.loss_permille || 0; });
+    // 流量线：每采样窗口的 (rx+tx)*8/window = bps。没上报计数（老盒子）的行
+    // 不出点——线断在"没数"上，而不是掉到 0 假装没流量。
+    var traffic = split(function (r) {
+      if (!r.has_counters || !r.counter_sec) return null;
+      return (Number(r.rx_bytes || 0) + Number(r.tx_bytes || 0)) * 8 / r.counter_sec;
+    }).filter(function (sr) { return sr.pts.length > 0; });
     // 纵轴上限：数据没有时给个非零底（10ms / 100‰），有数据就取最大值的 1.15 倍。
-    var maxRtt = 10, maxLoss = 100;
+    var maxRtt = 10, maxLoss = 100, maxBps = 1e6;
     rtt.forEach(function (sr) { sr.pts.forEach(function (p) { if (p[1] > maxRtt) maxRtt = p[1]; }); });
     loss.forEach(function (sr) { sr.pts.forEach(function (p) { if (p[1] > maxLoss) maxLoss = p[1]; }); });
-    maxRtt *= 1.15; maxLoss = Math.min(1000, maxLoss * 1.15);
+    traffic.forEach(function (sr) { sr.pts.forEach(function (p) { if (p[1] > maxBps) maxBps = p[1]; }); });
+    maxRtt *= 1.15; maxLoss = Math.min(1000, maxLoss * 1.15); maxBps *= 1.15;
     var W = 680, H = 110;
     function polyline(series, maxV) {
       var out = "";
@@ -1589,7 +1628,25 @@
       '<div style="font-size:12px;color:var(--muted);margin-top:8px">丢包 ‰（上限 ' + Math.round(maxLoss) + "）</div>" +
       '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;height:' + H + 'px">' +
       polyline(loss, maxLoss) + "</svg>" +
-      '<div style="font-size:11px">' + legend(loss) + "</div></div>";
+      '<div style="font-size:11px">' + legend(loss) + "</div>" +
+      (traffic.length
+        ? '<div style="font-size:12px;color:var(--muted);margin-top:8px">流量 bps（上限 ' + fmtBps(maxBps) + "）</div>" +
+          '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;height:' + H + 'px">' +
+          polyline(traffic, maxBps) + "</svg>" +
+          '<div style="font-size:11px">' + legend(traffic) + "</div>"
+        : '<div class="muted" style="font-size:12px;margin-top:8px">流量趋势等设备换上新 agent、积累一段采样后出现。</div>') +
+      "</div>";
+  }
+
+  // fmtBps 把比特率折成 K/M/G 的可读串（图轴上限用）。
+  function fmtBps(v) {
+    v = Number(v) || 0;
+    if (v < 1000) return Math.round(v) + " bps";
+    var units = ["Kbps", "Mbps", "Gbps"], x = v;
+    for (var i = 0; i < units.length; i++) {
+      x /= 1000;
+      if (x < 1000 || i === units.length - 1) return x.toFixed(x < 10 ? 2 : 1) + " " + units[i];
+    }
   }
 
   // opsKindText 把台账 kind 译成人话；未知的 kind 原样显示（服务端加新种类

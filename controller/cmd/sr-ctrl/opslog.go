@@ -371,6 +371,13 @@ type sampleRow struct {
 	RTTms    float64 `json:"rtt_ms"`
 	JitterMs float64 `json:"jitter_ms"`
 	Loss     uint32  `json:"loss_permille"`
+
+	// 流量（字节，窗口增量；CounterSec=0 是首窗累计）。agent 没给（老盒子、
+	// stats 段读不到）时 HasCounters=false——页面上是"未上报"，不是 0 B/s。
+	HasCounters bool   `json:"has_counters,omitempty"`
+	CounterSec  uint32 `json:"counter_sec,omitempty"`
+	RxBytes     uint64 `json:"rx_bytes,omitempty"`
+	TxBytes     uint64 `json:"tx_bytes,omitempty"`
 }
 
 // recordMetricsLocked 在 postMetrics 存完实时窗口后跑，做四件事：
@@ -396,6 +403,8 @@ func (s *server) recordMetricsLocked(tenant string, nodeID uint16, rep *wire.Met
 				Peer: t.PeerNodeID, Color: s.underlayColorForPeerLocked(tenant, nodeID, t.PeerNodeID),
 				Up: t.Up, BFD: t.BFDState, HasProbe: t.HasProbe,
 				RTTms: t.RTTms, JitterMs: t.JitterMs, Loss: t.LossPermille,
+				HasCounters: t.HasCounters, CounterSec: t.CounterSec,
+				RxBytes: t.RxBytes, TxBytes: t.TxBytes,
 			})
 		}
 		s.appendOpsData("tunnel.sample", tenant, nodeID, "", "", rows)

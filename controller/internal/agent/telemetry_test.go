@@ -19,6 +19,9 @@ type fakeTelemetryPlane struct {
 	bfdAdds []vppapi.BFDSessionParams
 	bfdDels []vppapi.BFDSessionParams
 	bfds    []vppapi.BFDSession
+
+	ifStats []vppapi.IfCounter
+	ifErr   error
 }
 
 func (f *fakeTelemetryPlane) SetProbe(_ context.Context, p vppapi.ProbeParams) error {
@@ -54,6 +57,13 @@ func (f *fakeTelemetryPlane) DelBFDSession(_ context.Context, p vppapi.BFDSessio
 
 func (f *fakeTelemetryPlane) BFDSessions(context.Context) ([]vppapi.BFDSession, error) {
 	return f.bfds, nil
+}
+
+func (f *fakeTelemetryPlane) IfStats(context.Context) ([]vppapi.IfCounter, error) {
+	if f.ifErr != nil {
+		return nil, f.ifErr
+	}
+	return f.ifStats, nil
 }
 
 func telemetryCfg() wire.TunnelTelemetry {
@@ -463,5 +473,89 @@ func TestTelemetryRemoveKeepsParallelTunnelSession(t *testing.T) {
 	}
 	if _, ok := tel.tunnels[6]; !ok {
 		t.Error("另一条隧道的窗口记录被一起删掉了")
+	}
+}
+
+// ==================== 接口计数（每隧道流量） ====================
+
+// 计数窗口的三个事实：首窗报累计（CounterSec=0）、后续窗报增量、某窗没读
+// 到计数（stats 段抖动）之后重新从累计起步——编不出丢失那段的增量。
+func TestTelemetryCounterWindows(t *testing.T) {
+	dp := &fakeTelemetryPlane{
+		probes: []vppapi.ProbeStats{{
+			SwIfIndex: 5, PeerIP: net.IPv4(192, 168, 99, 2), LocalIP: net.IPv4(192, 168, 99, 1),
+		}},
+	}
+	tel := NewTelemetry(dp)
+	tick := 0
+	tel.now = func() time.Time { return time.Unix(1700000000+int64(tick)*10, 0) }
+	ctx := context.Background()
+	if err := tel.Ensure(ctx, telemetryCfg()); err != nil {
+		t.Fatal(err)
+	}
+
+	step := func(rx uint64) wire.TunnelMetrics {
+		dp.ifStats = []vppapi.IfCounter{{SwIfIndex: 5, Name: "wg1009",
+			RxPackets: rx, RxBytes: rx * 800, TxPackets: rx / 2, TxBytes: rx * 400}}
+		tick++
+		rows, err := tel.Sample(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows[0]
+	}
+
+	// 首窗：累计。
+	m := step(1000)
+	if !m.HasCounters || m.CounterSec != 0 ||
+		m.RxPackets != 1000 || m.RxBytes != 800000 || m.TxBytes != 400000 {
+		t.Fatalf("首窗应报累计: %+v", m)
+	}
+	// 第二窗：增量 500。
+	m = step(1500)
+	if m.RxPackets != 500 || m.RxBytes != 400000 ||
+		m.TxPackets != 250 || m.TxBytes != 200000 || m.CounterSec == 0 {
+		t.Fatalf("第二窗应报增量: %+v", m)
+	}
+	// 第三窗：计数器"没读到"（丢给空表）——行不能消失，has_counters=false，
+	// 且不是 0 流量。
+	dp.ifStats = nil
+	tick++
+	rows, err := tel.Sample(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].HasCounters {
+		t.Fatalf("没读到计数的行不能报 has_counters: %+v", rows[0])
+	}
+	// 第四窗：重新起步，又是累计（窗口重建），丢的那段不编增量。
+	m = step(1600)
+	if m.CounterSec != 0 || m.RxPackets != 1600 {
+		t.Fatalf("重读后应重新从累计起步: %+v", m)
+	}
+}
+
+// 计数器和探针互相独立：探针没配起来的隧道（只有 BFD 的行）照样带流量。
+func TestTelemetryCountersWithoutProbe(t *testing.T) {
+	dp := &fakeTelemetryPlane{
+		bfds: []vppapi.BFDSession{{
+			SwIfIndex: vppapi.BFDMultihopSwIfIndex,
+			LocalIP:   net.IPv4(192, 168, 99, 1), PeerIP: net.IPv4(192, 168, 99, 2),
+			State: vppapi.BFDStateUp,
+		}},
+		ifStats: []vppapi.IfCounter{{SwIfIndex: 5, RxPackets: 42, RxBytes: 42000}},
+	}
+	tel := NewTelemetry(dp)
+	ctx := context.Background()
+	if err := tel.Ensure(ctx, telemetryCfg()); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tel.Sample(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].HasCounters ||
+		rows[0].RxPackets != 42 || rows[0].RxBytes != 42000 {
+		t.Fatalf("BFD-only 行应带计数: %+v", rows)
 	}
 }

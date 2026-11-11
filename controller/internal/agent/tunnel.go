@@ -113,6 +113,7 @@ func NewTunnelSync(dp DataPlane, id *Identity,
 		}
 		return p, nil
 	})
+	t.tel.SetLogf(logf)
 	return t
 }
 
