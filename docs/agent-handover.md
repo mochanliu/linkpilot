@@ -283,6 +283,18 @@ NAT → apply 自己装出形状 G（ssh 40/40 ALIVE、cust4 8/8、会话 1 条�
 （ssh 30/30 ALIVE）。26.10 升级对 NAT 不再必要。早间"cust12 transit 5/5 丢且 0 会话"系
 半配置状态（使能链在 pool 步被打断），不能作数据面坏的证据。
 
+**QoS 路径 C 方案已成文（2026-11-12，未写代码）**：`docs/qos-path-c-plan.md`。三句话记住它：
+①Cisco 的 QoS 是两半 —— 无状态的分类/标记/限速，和有状态的**队列调度**（bandwidth%、buffer%、
+wrr、llq、red）；②这台盒子**原生只有前半**（87 个插件里无 dpdk/hqos/qos，HQoS 是 DPDK 专属；
+af_packet **只有 1 个共享 TX 队列**，`show features` 里的 qos 节点全是标记/限速，没有一个是排队）；
+③后半**能借到但代价明确** —— 实测 af_packet 默认 `PACKET_QDISC_BYPASS` 让 VPP 出口包**完全绕过
+主机 qdisc**（veth 上 `Sent 0 bytes 0 pkt`），建口加 `qdisc-bypass-disable` 后 105 包全过，
+且 HTB **真限速**（100 kbit 下 500 发只过 60 发、88% 丢、backlog 201p）。产品建议：先做 C1
+（VPP 原生 policer+标记），**把 Cisco 的队列字段做成发布期硬错误**而不是静默忽略；
+C2（VPP 标记 + 主机 tc 调度）单独立项，先量 pps 代价/单队列排队行为/外层 DSCP 改写顺序三项。
+C1 的第一块砖是 `policer_classify_set_interface` 的 CRC（机箱只装了 `policer.api.json` 与
+core `classify.api.json`，这条消息只有 message-table 里的 id 1062）。**盒面已还原，无残留。**
+
 **顺带抓到的一处真实不一致（缺口 G-2，不是本次引入）**：CPE3 的 sr-fib 运行时隧道表 3 条
 （`curl -s http://127.0.0.1:19011/status` 的 `tunnels`），盘上 `/etc/sdwan/fib.json` 写的是 **`tunnels: 0`**
 （CPE2/3/4 全 0，CPE1 是本轮我手工 `PUT /config` 恢复过的 2 条）。这张"下一跳 ↔ 本机 wg 口名 ↔ 颜色"
