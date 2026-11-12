@@ -103,6 +103,14 @@ box_proto()  { lfld box "$1" 8; }      # 客户侧协议 ospf|bgp
 tunnels_of() { lrows tun "$1"; }
 tun_count()  { tunnels_of "$1" | grep -c .; }
 
+# 台账 tun 行第 9 列 = 本盒朝对端的下一跳、第 12 列 = 这条隧道的颜色。
+# 颜色→VPP 表号公式与产品一致：ColorTable(color, main) = color*1000 + 主表号
+# （controller/internal/fib/fib.go 的 ColorTable；颜色 0 折出来就是主表本身）。
+# 2026-11-12 起 §6 按"每个下一跳装在它自己颜色的表里"核对 —— 全部塞进主表的旧口径
+# 是 2026-11-10 策略引流（静态策略行引流到颜色表）落地前的形状。
+tun_color() { awk -F'\t' -v n="$1" -v nh="$2" '$1 == "tun" && $2 == n && $9 == nh {print $12; exit}' "$LEDGER"; }
+ctable()    { echo $(($1 * 1000 + $2)); }   # <color> <main>
+
 retry() {   # <秒> <命令...>：收敛类断言用，判据本身不变
     local limit=$1 i=0; shift
     while [ "$i" -lt "$((limit * 2))" ]; do
@@ -128,10 +136,10 @@ fib_block() {   # <prefix> <dump 文件>
 # 路径、各自 pref 多少、resolved 没有」必须单前缀查询。判前缀行是防 LPM 回落：精确行被删时
 # show ip fib 会打印覆盖它的那条（实测回落到 0.0.0.0/0 管理网默认路由），那不是我们的路径集
 # （exp-285 的采样器就这么被污染过一枪）。行不在 ⇒ 输出空，由调用方判红。
-fib_paths() {   # <host> <prefix>；输出「下一跳 pref R|U」
+fib_paths() {   # <host> <table> <prefix>；输出「下一跳 pref R|U」
     local out
-    out=$(vppc "$1" show ip fib table "$VPN" "$2") || return 0
-    printf '%s\n' "$out" | awk -v p="$2" '
+    out=$(vppc "$1" show ip fib table "$2" "$3") || return 0
+    printf '%s\n' "$out" | awk -v p="$3" '
         $1 == p && $2 ~ /^fib:/ { f = 1; next }
         f && /^[^[:space:]]/ { f = 0 }
         f && /path:\[/ && /pref=/ {
@@ -145,17 +153,28 @@ fib_paths() {   # <host> <prefix>；输出「下一跳 pref R|U」
 # 远端前缀的 FIB 断言不能"抓一次就判"：BFD 在这台共享 CPU 的宿主上实测每分钟会漏掉
 # 1–3 次检测（六会话同时掉，~1s 自己恢复），sr-fib 按规矩把那条路径撤掉、下一轮再装
 # 回来（缺陷⑥）。先把 dump 存下来供逐条断言，10s 仍不收敛才算红。
+# 2026-11-12 口径更新：前缀不再要求全在主表 —— 每个下一跳按它隧道的颜色核对
+# （颜色 c 的路径装在表 color*1000+VPN，颜色 0 = 主表）。每个用到的表 dump 一份，
+# 存 $WORKDIR/fib-<host>-<T> 供 §6 循环复用。
 fib_ready() {   # <host> <node>
-    local h=$1 n=$2 out pfx
-    out=$(vppc "$h" show ip fib table "$VPN")
-    [ -n "$out" ] || return 1
-    for pfx in $(lrows rib "$n" | cut -f3); do
-        echo "$out" | grep -q "^$pfx" || return 1
-    done
-    printf '%s\n' "$out" > "$WORKDIR/fib-$h"
-    for pfx in $(lrows rib "$n" | cut -f3); do
-        fib_block "$pfx" "$WORKDIR/fib-$h" | grep -q "dpo-drop" && return 1
-    done
+    local h=$1 n=$2 pfx nhs nh c T
+    rm -f "$WORKDIR"/fib-"$h"-*
+    while IFS=$'\t' read -r _ _ pfx nhs; do
+        [ -n "$pfx" ] || continue
+        for nh in $(echo "$nhs" | tr ',' ' '); do
+            c=$(tun_color "$n" "$nh")
+            case "$c" in ''|*[!0-9]*) return 1;; esac
+            T=$(ctable "$c" "$VPN")
+            if [ ! -s "$WORKDIR/fib-$h-$T" ]; then
+                vppc "$h" show ip fib table "$T" > "$WORKDIR/fib-$h-$T" 2>/dev/null || return 1
+            fi
+            block=$(fib_block "$pfx" "$WORKDIR/fib-$h-$T")
+            [ -n "$block" ] || return 1
+            echo "$block" | grep -q "dpo-drop" && return 1
+        done
+    done <<EOF
+$(lrows rib "$n")
+EOF
     return 0
 }
 
@@ -448,50 +467,56 @@ for n in $NODES; do
     fib_source_check "$n" "$h"
 done
 
-sect "6. VPP FIB（远端 loopback 压 $LABEL 走 wg；本地前缀交回客户机；表 $OVERLAY 只有隧道）"
+sect "6. VPP FIB（远端 loopback 压 $LABEL 走 wg；每个下一跳装在它自己颜色的表；本地前缀交回客户机）"
 for n in $NODES; do
     h=CPE$n
     retry 20 fib_ready "$h" "$n" || bad "$h: 10s 内 FIB 没收敛（远端前缀缺失或 dpo-drop）"
-    [ -f "$WORKDIR/fib-$h" ] || { bad "$h: 没有可用的 FIB dump，本节其余判据跳过"; continue; }
     while IFS=$'\t' read -r _ _ pfx nhs; do
         [ -n "$pfx" ] || continue
-        block=$(fib_block "$pfx" "$WORKDIR/fib-$h")
-        if [ -z "$block" ]; then bad "$h: table $VPN 缺远端 $pfx"; continue; fi
-        ok "$h: table $VPN 有远端 ${pfx}（sr-fib 直接装 VPP）"
-        echo "$block" | grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" \
-            && ok "$h: $pfx 压标签 $LABEL" || bad "$h: $pfx 没压标签 $LABEL"
-        # 路径集与承载集必须分开判。旧口径是「RIB 里每个下一跳都要有 mpls via」，
-        # 那只在所有腿同 pref（ECMP）时成立：`mpls via` 只出现在承载链里，而承载链
-        # 只装最优 preference 的那条。颜色一分开（exp-285 把 t13 改成颜色 2 ⇒ pref 10/12
-        # 主备），备路**装在 path-list 里且 resolved、但不承载**，旧口径就把正确的主备
-        # 形状判红了（2026-11-09 实测 FAIL 1 条）。
-        # 整表 dump（${block}）里根本没有 path:/forwarding: 这些行，路径集只能单前缀问。
-        # 新口径两条，比旧的严：① 每个 RIB 下一跳都要有 resolved 的路径装在行里；
-        # ② 承载集必须**恰好等于**最优 pref 的那组路径（同 pref 并列就是 ECMP，全都要承载）。
-        paths=$(fib_paths "$h" "$pfx")
-        carrying=$(echo "$block" | awk '/mpls via/{print $4}' | sort)
+        # 2026-11-10 策略引流落地（owner 拍板"静态策略行引流到那张颜色的 FIB 表"，
+        # controller/internal/fib/fib.go ColorTable）后的形状：颜色 c 的路径装在
+        # 表 color*1000+VPN，颜色 0 折出来就是主表。旧口径"远端 /32 全在主表"
+        # 与这个设计打架，2026-11-12 全量 verify 四台各 2-5 条假红。
         for nh in $(echo "$nhs" | tr ',' ' '); do
+            c=$(tun_color "$n" "$nh")
+            if [ -z "$c" ]; then
+                bad "$h: 台账 tun 行里没有下一跳 ${nh}（$pfx 的颜色/表号算不出来）"
+                continue
+            fi
+            T=$(ctable "$c" "$VPN")
+            [ "$c" = 0 ] && desc="主表 ${T}（颜色 0）" || desc="颜色 $c 的表 $T"
+            block=$(fib_block "$pfx" "$WORKDIR/fib-$h-$T")
+            if [ -z "$block" ]; then bad "$h: $desc 缺远端 ${pfx}（下一跳 ${nh}）"; continue; fi
+            ok "$h: $desc 有远端 ${pfx}（下一跳 ${nh}，sr-fib 直接装 VPP）"
+            echo "$block" | grep -qE "mpls-label\[@[0-9]+\]:\[$LABEL:" \
+                && ok "$h: $pfx 压标签 ${LABEL}（表 ${T}）" || bad "$h: $pfx 没压标签 ${LABEL}（表 ${T}）"
+            # 路径集与承载集必须分开判（exp-285 的教训，判据不变、范围缩到单表内）：
+            # `mpls via` 只出现在承载链里，备路装在 path-list 里且 resolved、但不承载。
+            # ① 每个 RIB 下一跳都要有 resolved 的路径装在行里；
+            # ② 承载集必须**恰好等于**该表内最优 pref 的那组路径（同 pref 并列=ECMP）。
+            paths=$(fib_paths "$h" "$T" "$pfx")
+            carrying=$(echo "$block" | awk '/mpls via/{print $4}' | sort)
             line=$(echo "$paths" | awk -v n="$nh" '$1==n{print; exit}')
             if [ -z "$line" ]; then
-                bad "$h: $pfx 的 path-list 里没有下一跳 $nh 的路径"
+                bad "$h: ${pfx}（表 ${T}）的 path-list 里没有下一跳 $nh 的路径"
             elif [ "${line##* }" != R ]; then
-                bad "$h: $pfx 下一跳 $nh 的路径不是 resolved（${line}）"
+                bad "$h: ${pfx}（表 ${T}）下一跳 $nh 的路径不是 resolved（${line}）"
             else
-                ok "$h: $pfx 下一跳 $nh 的路径已装且 resolved（pref=$(echo "$line" | awk '{print $2}')）"
+                ok "$h: ${pfx}（表 ${T}）下一跳 $nh 的路径已装且 resolved（pref=$(echo "$line" | awk '{print $2}')）"
             fi
+            best=$(echo "$paths" | awk '$3=="R"{print $2}' | sort -n | head -1)
+            if [ -z "$best" ]; then
+                bad "$h: ${pfx}（表 ${T}）没有任何 resolved 路径"
+            else
+                want=$(echo "$paths" | awk -v b="$best" '$3=="R" && $2==b {print $1}' | sort)
+                if [ "$want" = "$carrying" ]; then
+                    ok "$h: ${pfx}（表 ${T}）承载集 == 最优 pref=$best 的路径集（$(echo $carrying | tr '\n' ' ')）"
+                else
+                    bad "$h: ${pfx}（表 ${T}）承载集与最优 pref=$best 不符：应承载 $(echo $want | tr '\n' ' ')，实际 $(echo $carrying | tr '\n' ' ')"
+                fi
+            fi
+            echo "$block" | grep -q dpo-drop && bad "$h: ${pfx}（表 ${T}）是 dpo-drop" || ok "$h: ${pfx}（表 ${T}）不是 dpo-drop"
         done
-        best=$(echo "$paths" | awk '$3=="R"{print $2}' | sort -n | head -1)
-        if [ -z "$best" ]; then
-            bad "$h: $pfx 没有任何 resolved 路径"
-        else
-            want=$(echo "$paths" | awk -v b="$best" '$3=="R" && $2==b {print $1}' | sort)
-            if [ "$want" = "$carrying" ]; then
-                ok "$h: $pfx 承载集 == 最优 pref=$best 的路径集（$(echo $carrying | tr '\n' ' ')）"
-            else
-                bad "$h: $pfx 承载集与最优 pref=$best 不符：应承载 $(echo $want | tr '\n' ' ')，实际 $(echo $carrying | tr '\n' ' ')"
-            fi
-        fi
-        echo "$block" | grep -q dpo-drop && bad "$h: $pfx 是 dpo-drop" || ok "$h: $pfx 不是 dpo-drop"
     done <<EOF
 $(lrows rib "$n")
 EOF
