@@ -174,20 +174,36 @@ tunnels     0 条：VPP 里的 wg 口是 sr-agent -tunnels 从**控制器**取�
 （2026-11-05 23:08 实测 sr-route 在 72s 采样里只活着 47.0–49.1s）。复核：
 `ssh CPE1 'systemctl status sr-box --no-pager | tail -12'`。
 
-### 2.6 VPP 插件已换件（2026-11-12 19:3x，仅 CPE4）
+### 2.6 VPP 插件已换件（2026-11-12 19:3x，仅 CPE4；**21:2x 已回退一次，见下**）
 
 `sr_wg_plugin.so` 现在带 QoS 挂点节点 **`sr-wg4-qos`**（`vpp-plugin/sr_qos.{c,h}`）。
 第一阶段只做分类骨架：挂在 `ip4-output` 弧、排在 `wg4-output-tun` **之前**，按
 (出口口, 内层 DSCP) 计数后原样透传，**默认不启用**（`set sr-wg qos-hook enable <if>`）。
-节点存在、弧序、真实流量计数三项已在 CPE4 实测通过（细则 `docs/qos-path-c-plan.md` §9.4）。
+节点存在、弧序两项已在 CPE4 实测；~~真实流量计数~~ 一项被推翻（那批计数是本机自发包，
+转发流量不走这条弧）—— 见 `docs/qos-path-c-plan.md` §9.4/§10。
+
+**2026-11-12 21:2x 回退**：把挂点改成**入口弧 `ip4-unicast`** 的版本（O3，qos3）部署后
+数据面瘫痪（无钩子也瘫、整机重启也瘫，`docs/qos-path-c-plan.md` §10.6），已经把
+CPE4 的盘挂到 CPE1 上把插件拷回 `.bak-qos3-20261112` 那份（md5 `73ac8574…`，即
+20:12 的 ip4-output 版）。当前盒上跑的就是这份；仓库里 `vpp-plugin/sr_qos.{c,h}` 是
+**未定罪的 O3 版**，带 LCP 复现定位之前**禁止部署**。
 
 - 安装位置：`/usr/lib/x86_64-linux-gnu/vpp_plugins/sr_wg_plugin.so`（该目录下无 `plugins{}`
   段，VPP 启动时自动装载，**没有运行时加载**）；
-- 旧版留底：`sr_wg_plugin.so.bak-qos-20261112`。回退 = 拷回原名 + `systemctl restart vpp`；
+- 留底齐全：`.bak-qos-20261112`（最老）、`.bak-qos2-20261112`（19:28）、
+  `.bak-qos3-20261112`（20:12，**当前在跑**）。回退 = 拷回原名 + `systemctl restart vpp`；
 - 版本号仍是 **1.0.0**（下次连整形器一起 bump，别拿版本号判断有没有这个节点，用
   `show sr-wg qos-hook`）；
 - **换插件必重启 VPP，而管理口在 VPP 里** ⇒ 换件必须 detached（`systemd-run`）+ 失败自回滚，
   照 #307 的教训做，不要在前台 ssh 里敲 `systemctl restart vpp`；
+- **失联救援路径（2026-11-12 实测有效）**：CPE4 是 VirtualBox VM（`~/vm-lab/vms/CPE4/`，
+  无 NAT 网卡、无快照、控制台口令 ubuntu/vm123）。数据面瘫时：
+  `VBoxManage controlvm CPE4 acpipowerbutton` →
+  `VBoxManage storageattach CPE1 --storagectl SATA --port 2 --device 0 --type hdd
+  --medium ~/vm-lab/vms/CPE4/disk.vdi` → 在 CPE1 上 `mount /dev/sdb1 /mnt/c4`
+  （脏盘用 `-o ro,noload`）修文件 → 卸盘 detach → `startvm CPE4`。
+  健康判据别只看 `systemctl is-active`（VPP活着≠数据面活着）：
+  从另一台盒 ping 它的 WAN IP + 抓包看有没有应答。
 - 构建：`docker run --rm -v "$PWD/vpp-plugin":/workspace/vpp-plugin -w /workspace/vpp-plugin
   srwg-dev:latest` → `cmake -G Ninja && ninja`，产物在 `build-qos/lib/vpp_plugins/`。
   镜像里有 `vpp-dev 26.06-release`（`/usr/include/vnet/feature/feature.h` 是 26.06 的路径）。

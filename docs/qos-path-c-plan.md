@@ -26,6 +26,11 @@ owner 这一条的命令是**先读 Cisco 的实现**，所以第一节是 Cisco
 5. **§9 是关键修正**：真正的对象是 **WireGuard 隧道**，不是网卡。隧道流量不经内核，
    所以 C2 对隧道无效；外层 `udp sport` 逐隧道不同（实测 20000/20001/20002），
    三条可行路径重排在 §9.3，加密前的挂点判断在 §9.4。
+6. **§10 是第二次修正，而且是坏消息**：`wg` 口的 `ip4-output` 弧**不承载转发流量**
+   （只有本机自发包走它），所以 §9.4 的挂点作废。转发流量能拿到内层 DSCP 的唯一
+   不用改 VPP 内部结构的位置是**入口弧 `ip4-unicast`**（O3），代价是每包多一次 FIB 查表。
+7. **§10.6 是事故记录**：O3 版上盒即瘫（数据面死、重启无效），已回退到 20:12 的版本、
+   盒子恢复基线。**O3 版在容器里带 LCP 复现定位之前，禁止部署到任何真机。**
 
 ---
 
@@ -555,12 +560,16 @@ A 的判别方式就是 9.2 那张表（`tc filter ... match ip sport 20000 → 
   —— 我们的节点排在**第一位**，`wg4-output-tun` 在第 11 位；
 - 逐口启用后 `show interface features wg1010` 显示 `ip4-output: sr-wg4-qos, wg4-output-tun`
   —— 链是 `sr-wg4-qos → wg4-output-tun`，正是"明文 → 加密"的顺序；
-- **真实客户流量被计到**：挂上三条隧道后累计 1159 包，按口分开
-  （wg1010 273 / wg1011 51 / wg1014 38，随后继续增长到千级），全部落 dscp 0 桶。
+- ~~**真实客户流量被计到**：挂上三条隧道后累计 1159 包（wg1010 273 / wg1011 51 /
+  wg1014 38，随后继续增长到千级），全部落 dscp 0 桶~~ —— **这一条 2026-11-12 晚
+  被推翻**：那批计数是本机自发的 probe/keepalive，**转发流量根本不走这条弧**。
+  详见 §10。第一阶段的实验只证明了"节点能挂上弧"，没有证明"能看到客户流量"。
 
-所以 8 队列整形器可以直接长在 `sr-wg4-qos` 节点上：分类发生在加密前、内层头可读、
-逐隧道可分。**注意**：`vppctl ping` 打到 overlay 地址走的是 main FIB（overlay 路由在
-table 250），不进隧道，所以别用它做注入测试——真实流量才是这里的判据。
+所以 4 队列整形器可以长在 `sr-wg4-qos` 节点上（分类发生在加密前、内层头可读），
+但**前提是这条弧真的承载转发流量 —— 实测它不承载**。换挂点见 §10.3。
+
+**注意**：`vppctl ping` 打到 overlay 地址走的是 main FIB（overlay 路由在
+table 250），不进隧道，所以别用它做注入测试。
 
 ### 9.5 写 C 的真实代价（不美化）
 
@@ -593,9 +602,169 @@ table 250），不进隧道，所以别用它做注入测试——真实流量�
 
 ---
 
+## 10. 挂点错了：`wg` 的 `ip4-output` 弧不承载转发流量（2026-11-12 晚，实测）
+
+§9.4 的结论"节点能挂上 `ip4-output` 弧、能看到明文"成立，但**"能看到客户流量"这一步被自己
+的下一轮实验推翻了**。这一节只写实测，不写希望。
+
+### 10.1 三个实测事实
+
+**事实一：转发流量根本不走 `wg` 口的 `ip4-output` 弧。**
+
+`cust4` 去 `172.16.12.1` 的路由是 `ipv4 [features] via 10.250.0.8 wg1014`，挂上 `wg1014`
+（`rate 2000`）后：**接口计数在涨（~110 KB/s），我们的节点桶不动**。为排除"包太小/太散"，
+做了只改包长的对照 —— 同样 50 包，只改 payload：
+
+| 动作 | `sr-wg4-qos` 累计（pkt / B） | `q2 DEF` 累计（B） |
+| --- | --- | --- |
+| 基线 | 1491 / 165912 | — |
+| 再打 50 × 200 B | 1539 / 171264（+48 / +5352） | 未动 |
+| 再打 50 × 1000 B | 1580 / 175824（+41 / +4560） | 未动 |
+
+`+5352 B / 48 包 ≈ 111 B/包`，和 200 B、1000 B 的注入量都对不上 —— 那是背景探针，
+不是我们的注入。**结论：包没经过这个节点。**
+
+`show node wg4-output-tun` 的 previous nodes 给了结构解释：
+
+```
+sr-wg4-qos (1), sr-wg4-mpls-out (6), linux-cp-xc-ip4 (254),
+ip4-dvr-dpo (466), ip4-midchain (735), ip4-mcast-midchain (736),
+ip4-rewrite-mcast (737), ip4-rewrite (739)
+```
+
+转发流量是从 **`ip4-midchain` / `ip4-rewrite`** 直接进 `wg4-output-tun` 的，只有本机自发流量
+（`linux-cp-xc-ip4`、我们的探针）才走 `ip4-output` 弧。§9.4 里"1159 包真实客户流量"就是这些
+自发包。**FIB 里的 `[features]` 标记不保证输出弧被遍历** —— midchain 邻接的下一跳是
+`wg4-output-tun` 本身，不经过弧入口节点。
+
+**事实二：把挂点挪到 underlay 口，弧是过了，但内层 DSCP 没了。**
+
+挂 `host-enp0s9`（`rate 0`，只计数）：`total=826`，`dscp 0: 809 pkt / 240941 B` ——
+**确实看得到隧道包**。但注入 50 × 1000 B 让 `dscp 0` 的字节涨了 **173582 B**（≈ 3.5 倍），
+说明这条弧上同一条流被多次经过（加密后 + 回程 / 多次重写），**不能直接当限速点用**。
+
+**事实三：外层头不带内层 DSCP。**
+
+注入 50 × DSCP 46 之后：`dscp 0` 从 7315 涨到 7750（+435），**`dscp 46` 桶一次都没出现**。
+加密后外层 TOS 是 0，内层的分类信息在 underlay 那一层**不存在**。
+
+→ 一句话：**underlay 只能按"哪条隧道"分流（外层 `udp sport` 20000/20001/20002），
+拿不到"哪一类业务"。** 而 owner 要的 4 队列 LLQ 的前提正是"哪一类业务"。
+
+### 10.2 为什么绕开（结构，非推断）
+
+VPP IPv4 只有这几条可以挂钩的弧（`show features` 实测）：
+
+```
+ip4-unicast  → 终端节点 ip4-lookup      （入口，按**入接口**生效，包是明文）
+ip4-output   → 终端节点 interface-output（出口，按**出接口**生效）
+ip4-local / ip4-multicast / ip4-drop / ip4-punt / interface-output / device-input / …
+```
+
+**没有 `ip4-midchain` 弧，也没有 post-rewrite 弧。** 转发进隧道走的是
+`ip4-lookup → ip4-rewrite → ip4-midchain → wg4-output-tun`，这条链上没有任何 feature
+arc 的入口节点，所以"挂在出口弧上"对转发流量天然无效。
+
+### 10.3 候选挂点（按可行性排，附证据强度）
+
+| | O3：入口弧 `ip4-unicast` | O4：underlay `ip4-output` | O1：midchain 路径改造 |
+| --- | --- | --- | --- |
+| 挂在哪 | 客户口/隧道口的**入方向** | WAN 口出方向 | 改 midchain 邻接的 next 指向 |
+| 能看到内层 DSCP | **能**（明文） | **不能**（实测事实三） | 能 |
+| 能拿到"出哪条隧道" | 要自己查一次 FIB（邻接→`sw_if_index`） | 直接（外层 `udp sport`） | 直接（就是那条邻接） |
+| 每包代价 | +1 次 FIB 查（命中 mtrie，~几十 ns） | 0 | 0 |
+| 4 队列 / LLQ | **能** | 只能单队列（无分类） | 能 |
+| 风险 | 分类口径必须和 `ip4-lookup` 一致（同 fib、同 VRF） | 计数被多次经过污染（实测 3.5×） | 动 VPP 邻接内部结构，升级即碎 |
+| 依赖 | 全部是公开头文件（`ip4_fib_table_get_index_for_sw_if_index`、`ip4_fib_forwarding_lookup`、`adj_get`） | 无 | 无公开 API |
+
+**选 O3。** 理由不是它最省事（它多一次查表），而是它是**唯一同时满足"内层 DSCP"和
+"不动 VPP 邻接内部结构"**的位置；而且出队回注天然干净 —— 入口弧的终端就是 `ip4-lookup`，
+drain 时把包丢回 `ip4-lookup` 就等于"重新走一遍原来的路"，不需要碰加密节点。
+
+O3 的确切口径（这一条必须写死，否则又是一次 §9.4）：
+
+- 入口弧在**入接口**上生效 ⇒ 要 enable 的是 `cust4`（客户）与 `wg101X`（隧道口，用于
+  hub 中转：解密后的明文再从另一条隧道出去），**不是** enable 隧道本身；
+- 隧道判别：`fib = ip4_fib_table_get_index_for_sw_if_index (rx_sw_if_index)` →
+  `adj = adj_get (ip4_fib_forwarding_lookup (fib, &ip->dst_address))` →
+  `tun_sw_if = adj->rewrite_header.sw_if_index`；查不到已配置隧道就**原样透传**；
+- 节点排在入口弧**末尾**（不加 `runs_before`），保证 NAT/ACL/ABF 都已经跑完，
+  我们的 FIB 查询和随后的 `ip4-lookup` 看到同一个结果；顺序要在 `show features` 里核。
+
+### 10.4 落地改动（相对现有 `sr_qos.c`，已实现，**禁止部署**，见 §10.6）
+
+不需要重写调度器 —— 4 队列、token bucket、LLQ 上限、DRR、tail-drop、计数器全部不动。
+变的只有三处（均已写进 `vpp-plugin/sr_qos.{c,h}`，容器内编译通过、VPP 能加载）：
+
+1. `VNET_FEATURE_INIT` 的 `arc_name` 从 `ip4-output` 换成 `ip4-unicast`；
+2. 入队时的隧道判别换成自查 FIB：`ip4_fib_lookup` → 取 load-balance 第一个桶的 DPO →
+   **先验 `dpoi_type == DPO_ADJACENCY`** 再 `adj_get`，只认 `IP_LOOKUP_NEXT_MIDCHAIN`
+   （不验类型直接 `adj_get` 是拿别人的索引去邻接池取值，越界读）；
+3. `drain_next` 变成 `ip4-lookup`（由弧的终端自动给出，仍走"相对 next → 绝对 next"
+   解析，`show sr-wg qos` 打印出来核对）。
+
+CLI 语义随之分开，避免"enable 的是谁"再被读错：
+
+| 命令 | 作用对象 |
+| --- | --- |
+| `set sr-wg qos-hook enable\|disable <if>` | **入接口**（客户口 / 隧道口），决定"哪些口进来的包参与调度" |
+| `set sr-wg qos rate <tunnel-if> <kbps>` | **隧道**，决定这条隧道的整形速率 |
+| `set sr-wg qos llq <tunnel-if> percent <1-100>` | **隧道**，LLQ 上限 |
+
+容器内已核过的事实（VPP 26.06，2026-11-12 晚）：
+
+- 节点能加载、能挂上 `ip4-unicast` 弧，CLI 正常；
+- **弧内落点**：无约束时落**第 1 位**；`runs_before ip4-lookup` 仍是第 1 位
+  （约束满足即可，排序器不挑最末）；`runs_after ip4-not-enabled` 也只到第 3 位。
+  现版本选择无约束（第 1 位）—— 出队是把包送回弧里的下一个 feature，urpf/ACL/NAT
+  照样执行，被丢的包不会因经过我们就活下来；唯一会不一致的是 ABF（本盒未用），
+  这一点已写在 `VNET_FEATURE_INIT` 上方的注释里；
+- ipip 隧道邻接确实是 midchain（`show ip fib` flags:[fixup-ip4o4]），FIB→邻接→
+  `sw_if_index` 这条判别链在头文件层面成立；
+- 打流的端到端验证**没有做完**（容器里 packet-generator 的 data 模板解析不过，
+  tap 需要 /dev/net/tun）—— 分类是否真的命中，还没有实测数字。
+
+### 10.5 这一节要拍的
+
+1. 接受 O3（入口弧 + 自查 FIB）吗？—— 不接受的话，剩下能选的是 O4 单队列（丢掉 4 队列
+   这个需求），或者回到 §9.3 的 A/B 两条路。
+2. 哪些口要 enable？建议 `host-enp0s8`（LAN 入）+ 三条 `wg101X`（hub 中转），
+   `tap4096/4097` 是 LCP 的内核侧，不需要。
+
+### 10.6 部署事故（2026-11-12 20:36–21:20）：O3 版本上盒即瘫，已回退，原因未明
+
+按 §9.6 的既定流程把 O3 版部署到 CPE4（`/root/qos3-deploy.sh`，备份
+`.bak-qos3-20261112`）。结果：
+
+- 20:35:57 `systemctl restart vpp`，VPP 起来，underlay OK（20:35:59），CLI 正常
+  （20:36:08 `show sr-wg qos-hook` 有日志）—— **钩子一个都没挂**；
+- 之后数据面死亡：Mac 和 CPE1 对 `192.168.1.104` 的 ICMP 100% 丢，CPE1 抓包只见到
+  别家发来的 WG keepalive、无任何应答；TCP 22 不通；sr-agent 连不上控制器
+  （"tunnels 0 条……控制器不可达时开机就是这个形状"）；
+- **整机重启也无效**（21:03、21:07 两次重启，underlay 每次 OK，但数据面同样死亡）
+  —— 说明是盘上那个 `.so` 的问题，不是 VPP 一次性的状态；
+- 恢复：把 CPE4 的盘挂到 CPE1（`VBoxManage storageattach CPE1 ... port 2`），
+  `cp .bak-qos3-20261112 → sr_wg_plugin.so`，卸盘、开机，21:20 回到基线
+  （5 口 + 3 隧道，LAN 侧 ping 通）。
+
+**为什么可疑**：钩子从未启用，O3 版相对 20:12 那版（在盒上跑了 23 分钟、带钩子带流量、
+一切正常）的唯一**加载期**差异就是把 feature 从 `ip4-output` 弧挪到 `ip4-unicast` 弧。
+怀疑方向是"注册在 ip4-unicast 弧 × LCP（linux-cp-xc-ip4 也在同一条弧上）"的相互作用，
+但**没有证据**，可能是完全别的原因（如进程节点/内存）。
+
+**结论与纪律**：O3 版在能复现、能解释之前**不许再上任何一台真机**。下一步是在
+特权容器里带 LCP 复现（`--device /dev/net/tun` + veth + `lcp create`，容器里
+tap/LCP 才建得起来），定位后再谈部署。控制台口令已在本次恢复中重置为 vm123
+（此前控制台登录失败的原因不明）。
+
+---
+
 ## 8. 这份文档不承诺的东西
 
-- **没有写代码**，也没有改 bundle 段格式。第 5 节的模型是方案，不是已落地形状。
+- ~~**没有写代码**，也没有改 bundle 段格式。第 5 节的模型是方案，不是已落地形状。~~
+  —— **部分作废（2026-11-12 夜）**：路径 C 的调度器已经写出来并跑通（`vpp-plugin/sr_qos.{c,h}`，
+  4 队列 + LLQ + DRR + shaper，容器内实测见 §10.4 之前的记录），但**挂点未定**（§10），
+  第 5 节 C1 的 bundle 模型仍然只是方案。
 - **C2 的三个数字一个都没量**（§6.4）。在那三项之前，C2 的任何"能保证带宽"都是纸面的。
 - **`policer_classify_set_interface` 的 CRC 没取到**（§5.6），这是 C1 的第一块砖。
 - **没有在 CPE1/2/3 上验**：这轮只用了 CPE4。四台的 VPP 版本/插件面同构（同一 deb），
