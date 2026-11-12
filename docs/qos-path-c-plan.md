@@ -759,6 +759,117 @@ tap/LCP 才建得起来），定位后再谈部署。控制台口令已在本次
 
 ---
 
+## 11. O3 挂点落地：事故被推翻，隧道判别换到控制面（2026-11-12 深夜）
+
+### 11.1 §10.6 的"上盒即瘫"不是 O3 造成的
+
+两件事，都有实测：
+
+1. **容器复现（6 案例）**：`test/lab/vpp-qos/lab-o3-repro.sh` 在特权容器里搭了
+   与盒子同形的拓扑（`create tap` 建客户口、`lcp create ... host-if` 建管理面、
+   管理面走 `linux-cp-xc-ip4`），6 个组合全部 PASS：①无插件无 LCP ②无插件有 LCP
+   ③O3 插件无 LCP ④O3 插件有 LCP ⑤O3 插件有 LCP 且钩子启用（rate=0）⑥旧
+   `ip4-output` 版。**"注册在 ip4-unicast 弧会把数据面搞死"不成立**。
+   顺便证伪了当时的一条旁证：无插件基线也有 `null-node blackholed`，那个计数不是
+   插件有罪的证据。
+2. **真机二次部署**：今晚连续 4 次把 O3 版换到 CPE4（每次 `qos-guard` 看门狗
+   守着，见 §11.5），4 次都恢复健康（`result.txt` 全 OK），5 口 + 3 隧道在、
+   BGP/MPLS 转发在、ssh 全程不中断。
+
+那 20:36 那次到底为什么瘫，**仍然没有根因**（盘上 .so 是变量，但同类 .so 现在
+能跑）。诚实的说法是：**事故不可归因于 O3 的弧选择**；它可能是一次坏换件/坏盘写，
+也可能是当时那版代码里别的东西。纪律改成"换件必须有看门狗 + 备份"，而不是
+"O3 禁部署"。
+
+### 11.2 隧道判别踩了三次坑，前两次都是"拿类型号当判据"
+
+| 版本 | 判据 | 容器 | CPE4 | 为什么错 |
+|---|---|---|---|---|
+| v1 | `dpoi_type == DPO_ADJACENCY` | 失败 | 失败 | 漏掉 `DPO_ADJACENCY_MIDCHAIN`；且 CPE4 上同一个桶打出来 `type=30` |
+| v2 | 加 `DPO_ADJACENCY_MIDCHAIN` / `dpoi_next_node == IP_LOOKUP_NEXT_MIDCHAIN` | 失败 | 失败 | **枚举数值随 build 变**：镜像里 `ADJ_MIDCHAIN=8 / NEXT_MIDCHAIN=6`，CPE4 上是 `type=30 next_node=14`（`raw=0x00000001000e001e`）。CPE4 的 vpp 是另一次编译（md5 `33b5611c…` vs 镜像 `32d4ef86…`，build host 也不同） |
+| v3 | `adj_is_valid(dpoi_index)` + 邻接 rewrite 出接口在隧道表里 | PASS | 失败 | **MPLS over WG 的桶里根本不是邻接**：CPE4 的客户前缀转发链是 `load-balance → mpls-label[1000] → mpls via 10.250.0.8 wg1014 → stacked-on 192.168.1.102 host-enp0s9`，`dpoi_index=2` 只是**恰好命中**邻接 #2（enp0s8）。这条路在 MPLS 拓扑下原理上取不到隧道口 |
+| v4 | 控制面：`fib_table_lookup` → `fib_entry_get_resolving_interface`，按 (fib,dst) 缓存 | PASS | PASS | — |
+
+v2 的现场（CPE4，`show sr-wg qos resolve`，已固化进 CLI）：
+
+```
+bucket[0]: type=30 proto=0 next_node=14 (wg6-input-data-handoff) index=1 raw=0x00000001000e001e
+  本插件编译期枚举（仅构建环境自测有效）: IP_LOOKUP_NEXT_MIDCHAIN=6 DPO_ADJACENCY=6 DPO_ADJACENCY_MIDCHAIN=8
+=> 判定 why=2
+```
+
+`next_node=14` 在**这台**盒子上是 VPP wireguard 插件的 `wg6-input-data-handoff`
+（`grep -a -o '[a-z0-9%-]*-input[a-z0-9%-]*' wireguard_plugin.so` 里有它）。
+于是"按名字查节点索引"也不成立 —— 它压根不是 midchain 派发。
+
+### 11.3 现在的判据（跨 build、跨 MPLS）
+
+```
+fib_table_lookup(fib_index, dst/32)          → fib_entry
+fib_entry_get_resolving_interface(fib_entry) → 出口 sw_if_index
+出口在我们的"配了速率的隧道表"里              → 排队；否则直通
+```
+
+CPE4 实测三种形状全对：
+
+| 目的 | resolving_interface | 判定 |
+|---|---|---|
+| 172.16.12.1（客户，走隧道） | 7 `wg1014` | 排队 ✔ |
+| 172.31.4.2（直连 LAN） | 1 `host-enp0s8` | 直通 ✔ |
+| 8.8.8.8（默认路由 WAN） | 3 `host-enp0s9` | 直通 ✔ |
+
+代价与对策：这两步是控制面量级（池查 + 路径解析，可能递归），**不能每包做**。
+所以按 `(fib_index, dst)` 缓存进 `qm->rt_cache`（一次 `hash_get` 命中），process
+节点每 2 秒整体失效一次 —— 路由改了最多 2 秒内跟上；这段时间里可能按老隧道排队，
+**排队不改变转发结果**，最坏是速率算错 2 秒。
+
+已知限制：ECMP 到多条隧道时取主路径，不按流哈希（与 §9 的"一前缀一隧道"一致）。
+
+### 11.4 CPE4 验收数字（2026-11-12 23:20–23:45）
+
+- **分类**：cust4（172.31.4.2）打 172.16.12.1，钩子挂在 `host-enp0s8`、
+  `rate wg1014 1000`：`dscp 46: 30 pkt` → `q0 LLQ tx 30`；`dscp 0: 44 pkt` →
+  `q2 DEF tx 30`；`未归隧道` 里没有这两条流（19 个未归是去 WAN 的其它流量，
+  `last_dpo_type=12`，正常直通）。
+- **整形**：从 cust4 灌 UDP（1400B × 数万包）到 172.16.12.1，
+  `wg1014` 出口 `tx_bytes` 5 秒增量 664500 B ⇒ **1063 kbps**，配置 1000 kbps
+  （差的那 6% 是外层加密头，shaper 量的是内层字节）；同时
+  `q2 drop 113836 / backlog 20（峰值 128）` —— 尾丢真的在丢，队列真的在积压。
+  置 `rate 0` 后立刻恢复直通、积压归零。
+- **容器回归**：`test/lab/vpp-qos/lab-qos-tunnel.sh` PASS（`未归隧道=0`、
+  q0=40、q2=40、出队目标 `ip4-lookup`）。
+
+### 11.5 换件纪律（写进 handover §2.6）
+
+管理面在 VPP 里 ⇒ `systemctl restart vpp` 会杀掉自己的 ssh。现在的流程：
+
+1. `scp` 新 `.so` 到 `/root/*.so`（不动盘上那个）；
+2. `systemd-run --unit=qosguard --collect --no-block /bin/bash /root/qos-guard.sh`
+   —— 180 秒后 ping 三个锚点（192.168.1.1 / 172.31.4.2 / 10.250.0.1），全不通就
+   把盘上 `.so` 换回最新的 `.bak-qos3-*`（= 已知可用的 `ip4-output` 版）、
+   `reboot -f`、自己 disable；
+3. `systemd-run --unit=qosdeploy --collect --no-block --setenv=SRC=... /bin/bash
+   /root/qos4-deploy.sh` —— 备份、install、restart、等 CLI、快照证据到
+   `/tmp/qos4-*.txt`；
+4. ssh 断了也没关系，回来读 `/var/log/qos-deploy/{deploy.log,result.txt,after-*.txt}`。
+
+### 11.6 本节遗留
+
+- **返回方向 ping 100% 丢**（cust4 → 172.16.12.1 通到 cust12 的 `enp0s8`，回程包
+  也到了 CPE4 的 `enp0s9:20002`，但没进 `lcp-x0`）。**与 QoS 无关**：钩子摘掉、
+  `rate 0` 时同样丢。这是这台盒子今晚之前的既有状态（`wg4-input Peer error 1`、
+  `mpls-output 90 encapsulated`），下次上盒单独查。
+- 队列→DSCP 映射、bundle 段、控制台仍是纸面（§5.1–5.3）。
+- 探针/看门狗脚本还是 `/root/*.sh`，没进仓库（下一步收进 `test/lab/vmlab/`）。
+
+### 11.7 这一节要拍的
+
+1. §10.6 的"O3 禁部署"**解除**（改成"换件必须带看门狗"）—— 是否同意？
+2. 隧道判别用控制面 + 2 秒缓存，接受"路由切换后最多 2 秒按老速率排队"吗？
+3. 返回方向丢包要不要现在查（不影响 QoS 验收，但会让客户面看起来是坏的）。
+
+---
+
 ## 8. 这份文档不承诺的东西
 
 - ~~**没有写代码**，也没有改 bundle 段格式。第 5 节的模型是方案，不是已落地形状。~~

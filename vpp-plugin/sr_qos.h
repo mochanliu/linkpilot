@@ -99,6 +99,20 @@ typedef struct
   u64 total;               /* 该接口进入本节点的总包数 */
   u64 non_ip;              /* 头部不像 IP4 的包（布局假设被打破的信号） */
   u64 unclassified;        /* 查表后不是隧道（本机收包/直连路由），正常直通 */
+  /*
+   * 未归隧道的原因分解。真机上"未归隧道"这一个大数字没法定位，按原因拆开：
+   *   0 无（正常） 1 查表无路（无路由/没有 fib） 2 出口不是"配了速率的隧道"
+   *   （直连、WAN 默认路由、隧道没配速率 —— 都属于正常直通）
+   */
+  u64 why[5];
+  /*
+   * 最近一次"未归隧道"时桶 0 的现场：DPO 类型号、load-balance 索引、派发目标
+   * 节点索引。真机上只看计数分不清"是不是类型号没认出来"，把三个号打出来，
+   * 再用 `show sr-wg qos resolve` 对照节点名字，就能判断是判据问题还是配置问题。
+   */
+  u32 last_dpo_type;
+  u32 last_lbi;
+  u32 last_next_node;
 } sr_qos_ifc_t;
 
 /* 一条队列：定长环 + 计数。ring 在第一次入队时按 depth 分配。 */
@@ -152,6 +166,24 @@ typedef struct
   sr_qos_tunnel_t *tunnels; /* pool */
   u32 *tunnel_by_sw_if;     /* vec：pool index + 1，0 = 没有 */
   u32 shaped_count;         /* shaper_kbps > 0 的隧道数 */
+
+  /*
+   * 隧道判别**不存任何"类型号"**。dpo_type_t / ip_lookup_next_t 是编译期枚举，
+   * 数值随 build 变（CPE4 上同一个桶打出来 type=30 next_node=14，构建镜像里
+   * DPO_ADJACENCY_MIDCHAIN=8、IP_LOOKUP_NEXT_MIDCHAIN=6），拿来做判据线上永远
+   * 不相等。判据只有两个运行时事实：桶的下标在邻接池里活着（adj_is_valid）、
+   * 邻接 rewrite 出来的出接口在我们这张"配过速率的隧道表"里。
+   */
+
+  /*
+   * "目的地址 → 出接口"的缓存：key = (fib_index<<32)|dst.as_u32, value = sw_if_index。
+   *
+   * 这一步走控制面（fib_table_lookup + fib_entry_get_resolving_interface），
+   * 是唯一能穿过 MPLS/SR 栈拿到隧道口的办法，但每包做太重。process 节点每 2 秒
+   * 整体失效一次；路由变化最多 2 秒内自我纠正。
+   */
+  uword *rt_cache;
+  f64 rt_cache_flush;
 
   /* 全局配置（队列模型本身，不随隧道变） */
   u8 dscp_map[SR_QOS_N_DSCP];

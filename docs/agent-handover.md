@@ -174,19 +174,56 @@ tunnels     0 条：VPP 里的 wg 口是 sr-agent -tunnels 从**控制器**取�
 （2026-11-05 23:08 实测 sr-route 在 72s 采样里只活着 47.0–49.1s）。复核：
 `ssh CPE1 'systemctl status sr-box --no-pager | tail -12'`。
 
-### 2.6 VPP 插件已换件（2026-11-12 19:3x，仅 CPE4；**21:2x 已回退一次，见下**）
+### 2.6 VPP 插件已换件（2026-11-12，CPE4）
 
-`sr_wg_plugin.so` 现在带 QoS 挂点节点 **`sr-wg4-qos`**（`vpp-plugin/sr_qos.{c,h}`）。
-第一阶段只做分类骨架：挂在 `ip4-output` 弧、排在 `wg4-output-tun` **之前**，按
-(出口口, 内层 DSCP) 计数后原样透传，**默认不启用**（`set sr-wg qos-hook enable <if>`）。
-节点存在、弧序两项已在 CPE4 实测；~~真实流量计数~~ 一项被推翻（那批计数是本机自发包，
-转发流量不走这条弧）—— 见 `docs/qos-path-c-plan.md` §9.4/§10。
+`sr_wg_plugin.so` 现在带 QoS 节点 **`sr-wg4-qos`**（`vpp-plugin/sr_qos.{c,h}`）：
+**挂在入口弧 `ip4-unicast`**，4 队列（q0 LLQ + q1..3 DRR）+ 每隧道令牌桶整形，
+按内层 DSCP 分类、每包查一次"这个包会从哪条隧道出去"（控制面解析 + 2s 缓存），
+出队回注 `ip4-lookup`。**默认全关**：`set sr-wg qos-hook enable <入接口>` 才参与，
+`set sr-wg qos rate <wg 口> <kbps>` 才整形（rate=0 完全直通）。
+为什么不在出口弧、为什么用控制面解析：`docs/qos-path-c-plan.md` §10/§11。
 
-**2026-11-12 21:2x 回退**：把挂点改成**入口弧 `ip4-unicast`** 的版本（O3，qos3）部署后
-数据面瘫痪（无钩子也瘫、整机重启也瘫，`docs/qos-path-c-plan.md` §10.6），已经把
-CPE4 的盘挂到 CPE1 上把插件拷回 `.bak-qos3-20261112` 那份（md5 `73ac8574…`，即
-20:12 的 ip4-output 版）。当前盒上跑的就是这份；仓库里 `vpp-plugin/sr_qos.{c,h}` 是
-**未定罪的 O3 版**，带 LCP 复现定位之前**禁止部署**。
+**2026-11-12 21:2x 回退，23:2x 又装回去（结论已改）**：挂点改成**入口弧
+`ip4-unicast`** 的版本（O3，qos3）第一次上盒后数据面瘫痪（无钩子也瘫、整机重启也瘫，
+`docs/qos-path-c-plan.md` §10.6），当时把 CPE4 的盘挂到 CPE1 上拷回
+`.bak-qos3-20261112`（20:12 的 `ip4-output` 版）。
+
+**当晚深夜同一版本又部署了 4 次，全部健康**（`/var/log/qos-deploy/result.txt` 全 `OK`），
+容器里 6 案例复现也全 PASS（`test/lab/vpp-qos/lab-o3-repro.sh`）。所以 §10.6 的
+"上盒即瘫"**不能归因于 O3 的弧选择**，根因仍未明；纪律从"O3 禁部署"改成
+**"换件必须带看门狗 + 备份"**（见下）。CPE4 现在跑的就是 O3 版（md5 见 `deploy.log`），
+`show sr-wg qos-hook` 可确认节点在、钩子默认全关。
+
+**换件流程（2026-11-12 夜定型，4 次零失联）**
+
+1. `scp` 新 `.so` 到 `/root/sr_wg_plugin.<tag>.so`，**不动盘上那个**；
+2. 先起看门狗（脱离 ssh，180s 后判活）：
+   `systemctl reset-failed qosguard; systemd-run --unit=qosguard --collect --no-block
+   /bin/bash /root/qos-guard.sh`；
+   判据是 ping 三个锚点（192.168.1.1 / 172.31.4.2 / 10.250.0.1），**全不通**才回滚：
+   把盘上 `.so` 换回最新 `.bak-qos3-*`（已知可用的 `ip4-output` 版）→ `sync` → `reboot -f`
+   → 自己 `disable`。证据写 `/var/log/qos-deploy/after-HHMM.txt`；
+3. 再起部署（同样 detached）：`systemd-run --unit=qosdeploy --collect --no-block
+   --setenv=SRC=/root/sr_wg_plugin.<tag>.so /bin/bash /root/qos4-deploy.sh`；
+   它做：备份 `.bak-qos4-HHMMSS` → `install -m 0755` → `systemctl restart vpp` →
+   等 CLI → 快照 plugins/features/interfaces/lcp/hook/errors/ip 到 `/tmp/qos4-*.txt`；
+4. ssh 掉线不用管，回来先看 `/var/log/qos-deploy/{deploy.log,result.txt,after-*.txt}`，
+   再 `ping` 客户侧。
+
+**这一轮踩到的坑（都要记住）**
+
+- **`dpo_type_t` / `ip_lookup_next_t` 的枚举值跨 build 不稳定**：镜像里
+  `DPO_ADJACENCY_MIDCHAIN=8`、`IP_LOOKUP_NEXT_MIDCHAIN=6`，CPE4 的 vpp 是另一次编译
+  （md5/build-host 都不同），同一个桶打出来 `type=30 next_node=14`。
+  **判据里不许出现类型号**，要用运行时事实（邻接下标有效性、控制面解析出的出接口）。
+- **`dpoi_index` 不一定是邻接下标**：MPLS over WG 的桶里是 `mpls-label` DPO，
+  下标落到标签池，`adj_is_valid` 可能"侥幸命中"另一个邻接 —— 只看它会静默判错。
+- **`vlib_get_node_by_name` 依赖 vlib 自己的 init 填充的哈希**，插件 init 早跑一步就查不到；
+  要按名字找节点就扫 `vm->node_main.nodes`。
+- **`fib_table_lookup` + `fib_entry_get_resolving_interface` 是唯一能穿过 MPLS/SR 栈
+  拿到隧道口的办法**，但它是控制面量级的，**必须缓存**（见 `sr_qos.c` 的 `rt_cache`，2s 失效）。
+- 诊断入口固定为 `show sr-wg qos resolve <ip> [from <if>]`：一次把 fib_index、
+  load-balance 桶、桶的 DPO 类型/目标节点名、控制面解析结果、最终判定摊开。
 
 - 安装位置：`/usr/lib/x86_64-linux-gnu/vpp_plugins/sr_wg_plugin.so`（该目录下无 `plugins{}`
   段，VPP 启动时自动装载，**没有运行时加载**）；

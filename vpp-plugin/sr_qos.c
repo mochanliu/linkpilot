@@ -27,6 +27,8 @@
 #include <vnet/ip/ip4.h>
 #include <vnet/ip/format.h>
 #include <vnet/fib/ip4_fib.h>
+#include <vnet/fib/fib_table.h>
+#include <vnet/fib/fib_entry.h>
 #include <vnet/adj/adj.h>
 #include <vnet/dpo/dpo.h>
 #include <vnet/dpo/load_balance.h>
@@ -181,53 +183,140 @@ sr_qos_tunnel_at (sr_qos_main_t *qm, u32 sw_if_index)
 }
 
 /*
- * 入口弧上还没有"出接口"：查一次 FIB，把"这个包会从哪条隧道出去"找出来。
+ * 入口弧上还没有"出接口"：这个包会从哪条隧道出去，必须自己问出来。
  *
- * 走的是 FIB 里公开的那条路：`ip4_fib_lookup` 取等价多路径（load-balance）索引
- * → 取第一个桶的 DPO → **先确认它真的是邻接**，再 `adj_get`。这一步不能省：
- * 本机收包（DPO_RECEIVE）、丢弃、组播在这里是别的 DPO 类型，直接 `adj_get`
- * 等于拿别人的索引去邻接池里取值，是越界读，不是"分类不准"。
+ * **为什么不用"逐桶取邻接"那条路**（第一版实现，已被实测否掉）：CPE4 上客户
+ * 前缀的转发链是 `load-balance → mpls-label[1000] → mpls via ... wg1014 →
+ * stacked-on 192.168.1.102 host-enp0s9`。桶里的 DPO 是 mpls-label，dpoi_index
+ * 指向标签栈/标签池，**根本不是邻接下标**；拿它去 `adj_is_valid`/`adj_get`
+ * 侥幸命中别的邻接（实测命中 enp0s8 的 #1），只能靠"出接口必须在隧道表里"
+ * 兜住。也就是说这条路在 MPLS over WG 的拓扑下**原理上取不到隧道口**。
  *
- * 只认 `IP_LOOKUP_NEXT_MIDCHAIN`：WG 隧道的邻接就是 midchain（外层 dst 要等加密
- * 后才解析）。其它一律返回 ~0 —— 那些流量本来就不过隧道，不该被排队。
+ * **换成控制面口径**（这才是 FIB 里唯一记着"从哪个口出去"的地方）：
+ *   fib_table_lookup(fib_index, dst/32)   → fib_entry
+ *   fib_entry_get_resolving_interface(fe) → 出口 sw_if_index
+ * CPE4 实测：172.16.12.1→wg1014(7)、172.31.4.2→host-enp0s8(1)、
+ * 8.8.8.8→host-enp0s9(3) —— 隧道/直连/WAN 三种形状全对。
  *
- * 代价是每包一次 mtrie 查表，换的是"内层 DSCP 与隧道判别同时可得"。别为省这一次
- * 查表把它挪回出口弧：出口弧看不到转发流量（docs/qos-path-c-plan.md §10.1）。
+ * 代价是这两步是控制面量级的（池查、路径解析，可能递归），不能每包做。所以按
+ * (fib_index, dst) 缓存，缓存由 process 节点每 2 秒整体失效一次（路由变了最多
+ * 2 秒内自我纠正，代价是那一瞬间可能按老隧道排队 —— 排队不改变转发结果）。
  *
- * 已知限制：等价多路径只按**第一个桶**归隧道。本场景一条隧道一条路由，
- * 真出现"同一前缀 ECMP 到两条隧道"时要改成按流哈希选桶。
+ * 已知限制：ECMP 到多条隧道时 `fib_entry_get_resolving_interface` 取主路径，
+ * 不按流哈希。本场景一条前缀一条隧道；真要做 ECMP 得在这里补流哈希。
  */
-always_inline u32
-sr_qos_tunnel_sw_if (vlib_buffer_t *b, ip4_header_t *ip4)
+static u32
+sr_qos_rt_cp (u32 fib_index, ip4_address_t *dst)
 {
-  u32 rx = vnet_buffer (b)->sw_if_index[VLIB_RX];
-  u32 lbi;
-  const load_balance_t *lb;
-  const dpo_id_t *dpo;
-  ip_adjacency_t *adj;
+  fib_prefix_t pfx;
+  fib_node_index_t fei;
 
-  if (ip4 == 0 || rx == ~0u)
-    return ~0u;
+  clib_memset (&pfx, 0, sizeof (pfx));
+  pfx.fp_proto = FIB_PROTOCOL_IP4;
+  pfx.fp_addr.ip4 = *dst;
+  pfx.fp_len = 32;
 
-  lbi = ip4_fib_lookup (&ip4_main, rx, (ip4_address_t *) &ip4->dst_address);
-  if (lbi == ~0u)
+  fei = fib_table_lookup (fib_index, &pfx);
+  if (fei == FIB_NODE_INDEX_INVALID)
     return ~0u;
-
-  lb = load_balance_get (lbi);
-  if (lb == 0 || lb->lb_n_buckets == 0)
-    return ~0u;
-  dpo = load_balance_get_bucket_i (lb, 0);
-  if (dpo == 0 || dpo->dpoi_type != DPO_ADJACENCY)
-    return ~0u;
-
-  adj = adj_get (dpo->dpoi_index);
-  if (adj->lookup_next_index != IP_LOOKUP_NEXT_MIDCHAIN)
-    return ~0u;
-
-  return adj->rewrite_header.sw_if_index;
+  return fib_entry_get_resolving_interface (fei);
 }
 
-/* 清空积压：要么关整形，要么隧道没了。缓冲区归我们，必须还回去。 */static void
+/* 带缓存的版本。命中就是一次 hash_get，热路径只走这里。 */
+static inline u32
+sr_qos_rt_lookup (u32 fib_index, ip4_address_t *dst)
+{
+  sr_qos_main_t *qm = &sr_qos_main;
+  u64 key = ((u64) fib_index << 32) | (u64) dst->as_u32;
+  uword *p;
+  u32 sw;
+
+  if (PREDICT_FALSE (qm->rt_cache == 0))
+    qm->rt_cache = hash_create (0, sizeof (uword));
+
+  p = hash_get (qm->rt_cache, key);
+  if (p)
+    return (u32) p[0];
+
+  sw = sr_qos_rt_cp (fib_index, dst);
+  hash_set (qm->rt_cache, key, sw);
+  return sw;
+}
+
+always_inline u32
+sr_qos_resolve (u32 rx, ip4_address_t *dst, u32 *why, u32 *out_type,
+                u32 *out_lbi, u32 *out_next)
+{
+  sr_qos_main_t *qm = &sr_qos_main;
+  const load_balance_t *lb;
+  u32 lbi, fib_index, sw;
+
+  *why = 0;
+  *out_type = ~0u;
+  *out_lbi = ~0u;
+  *out_next = ~0u;
+  if (dst == 0 || rx == ~0u
+      || rx >= vec_len (ip4_main.fib_index_by_sw_if_index))
+    {
+      *why = 1;
+      return ~0u;
+    }
+
+  fib_index = vec_elt (ip4_main.fib_index_by_sw_if_index, rx);
+
+  /* 只为了诊断：把桶 0 的类型/目标节点记下来，真机上看这一栏定位问题 */
+  lbi = ip4_fib_lookup (&ip4_main, rx, dst);
+  *out_lbi = lbi;
+  if (lbi != ~0u)
+    {
+      lb = load_balance_get (lbi);
+      if (lb && lb->lb_n_buckets)
+        {
+          const dpo_id_t *d0 = load_balance_get_bucket_i (lb, 0);
+
+          if (d0)
+            {
+              *out_type = (u32) d0->dpoi_type;
+              *out_next = (u32) d0->dpoi_next_node;
+            }
+        }
+    }
+  if (lbi == ~0u)
+    {
+      *why = 1;
+      return ~0u;
+    }
+
+  sw = sr_qos_rt_lookup (fib_index, dst);
+  if (sw == ~0u)
+    {
+      *why = 1;
+      return ~0u;
+    }
+
+  /*
+   * 唯一的裁决：出接口必须是一条**配了速率**的隧道（我们自己的隧道表）。
+   * 直连、WAN 默认路由、本机收包都不在那张表里，正常直通。隧道在但没配速率
+   * 也直通 —— "先挂钩子"这个动作永远不掉包、不排队。
+   */
+  if (sr_qos_tunnel_at (qm, sw) != 0)
+    return sw;
+
+  *why = 2;
+  return ~0u;
+}
+
+always_inline u32
+sr_qos_tunnel_sw_if (vlib_buffer_t *b, ip4_header_t *ip4, u32 *why,
+                     u32 *out_type, u32 *out_lbi, u32 *out_next)
+{
+  return sr_qos_resolve (vnet_buffer (b)->sw_if_index[VLIB_RX],
+                         ip4 ? (ip4_address_t *) &ip4->dst_address : 0, why,
+                         out_type, out_lbi, out_next);
+}
+
+/* 清空积压：要么关整形，要么隧道没了。缓冲区归我们，必须还回去。 */
+static void
 sr_qos_tunnel_flush (vlib_main_t *vm, sr_qos_tunnel_t *t)
 {
   sr_qos_free_t fr = { {0}, 0 };
@@ -503,9 +592,24 @@ sr_qos_process (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 
   while (1)
     {
-      f64 tick;
+      f64 tick, now = vlib_time_now (vm);
 
       sr_qos_drain_all (vm);
+
+      /*
+       * 路由缓存整体失效：控制面解析（fib_table_lookup + resolving interface）
+       * 只在未命中时走，命中就是一次 hash_get。2 秒一次的代价可以忽略，换的是
+       * "路由改了最多 2 秒内跟上"。不清的话，隧道切换后会把包一直算到旧隧道头上。
+       */
+      if (now - qm->rt_cache_flush >= 2.0)
+        {
+          if (qm->rt_cache)
+            {
+              hash_free (qm->rt_cache);
+              qm->rt_cache = 0;
+            }
+          qm->rt_cache_flush = now;
+        }
 
       /* 没有启整形的隧道就把唤醒周期放长，别在空闲盒子上 1ms 空转 */
       tick = qm->shaped_count ? SR_QOS_TICK : SR_QOS_IDLE_TICK;
@@ -573,10 +677,20 @@ VLIB_NODE_FN (sr_wg4_qos_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       vnet_feature_next (&rel, b);
 
       /* 隧道判别：查一次 FIB，不是读 sw_if_index[VLIB_TX]（入口弧上它还是空的） */
-      tun_sw_if = sr_qos_tunnel_sw_if (b, ip4);
-      t = (tun_sw_if == ~0u) ? 0 : sr_qos_tunnel_at (qm, tun_sw_if);
-      if (t == 0)
-        ic->unclassified++;
+      {
+        u32 why = 0, dtype = ~0u, lbi = ~0u, nnext = ~0u;
+
+        tun_sw_if = sr_qos_tunnel_sw_if (b, ip4, &why, &dtype, &lbi, &nnext);
+        t = (tun_sw_if == ~0u) ? 0 : sr_qos_tunnel_at (qm, tun_sw_if);
+        if (t == 0)
+          {
+            ic->unclassified++;
+            ic->why[why <= 4 ? why : 0]++;
+            ic->last_dpo_type = dtype;
+            ic->last_lbi = lbi;
+            ic->last_next_node = nnext;
+          }
+      }
 
       /* 直通条件：没配速率、process 没起来、或弧的下一跳解析不出来 */
       if (t == 0 || t->shaper_kbps == 0 || sr_qos_proc_ready == 0
@@ -1147,6 +1261,13 @@ sr_wg_show_qos_hook_command_fn (vlib_main_t *vm, unformat_input_t *input,
                        (unsigned long long) ic->total,
                        (unsigned long long) ic->unclassified,
                        ic->non_ip ? "  (有 non_ip，头部布局需复核)" : "");
+      if (ic->unclassified)
+        vlib_cli_output (vm,
+                         "    未归原因: 查表无路=%llu 出口不是隧道/未配速率=%llu   "
+                         "last_dpo_type=%u last_next_node=%u last_lbi=%u",
+                         (unsigned long long) ic->why[1],
+                         (unsigned long long) ic->why[2], ic->last_dpo_type,
+                         ic->last_next_node, ic->last_lbi);
       for (u32 d = 0; d < SR_QOS_N_DSCP; d++)
         if (ic->pkts[d])
           vlib_cli_output (vm, "    dscp %2u: %llu pkt / %llu B", d,
@@ -1162,6 +1283,150 @@ VLIB_CLI_COMMAND (sr_wg_show_qos_hook_command, static) = {
   .path = "show sr-wg qos-hook",
   .short_help = "show sr-wg qos-hook   （挂点计数，按隧道与 DSCP 分桶）",
   .function = sr_wg_show_qos_hook_command_fn,
+};
+
+/*
+ * 隧道判别自查：把"这个目的地址会被判成哪条隧道"的全过程摊开打印。
+ * 真机上"未归隧道"只能看到一个数字，这一条能把 FIB 索引、load-balance 桶、
+ * 每个桶的 DPO 类型都摊出来 —— 排查挂点问题全靠它。
+ *
+ *   show sr-wg qos resolve <ip> [from <interface>]
+ */
+static clib_error_t *
+sr_wg_show_qos_resolve_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                                   vlib_cli_command_t *cmd)
+{
+  ip4_address_t addr;
+  u32 rx = 0, fib_index, lbi, leaf;
+  int have_addr = 0;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "%U", unformat_ip4_address, &addr))
+        have_addr = 1;
+      else if (unformat (input, "from %U", unformat_vnet_sw_interface,
+                         vnet_get_main (), &rx))
+        ;
+      else
+        return clib_error_return (0, "unknown input `%U'",
+                                  format_unformat_error, input);
+    }
+  if (!have_addr)
+    return clib_error_return (0, "usage: show sr-wg qos resolve <ip> [from <if>]");
+
+  vlib_cli_output (vm, "目的 %U  from sw_if_index=%u", format_ip4_address,
+                   &addr, rx);
+  if (rx >= vec_len (ip4_main.fib_index_by_sw_if_index))
+    {
+      vlib_cli_output (vm, "  !! rx 超出 fib_index_by_sw_if_index（len=%u）",
+                       vec_len (ip4_main.fib_index_by_sw_if_index));
+      return 0;
+    }
+  fib_index = vec_elt (ip4_main.fib_index_by_sw_if_index, rx);
+  lbi = ip4_fib_lookup (&ip4_main, rx, &addr);
+  leaf = ip4_fib_forwarding_lookup (fib_index, &addr);
+  vlib_cli_output (vm, "  fib_index=%u  ip4_fib_lookup(load-balance)=%u  "
+                   "forwarding_lookup(leaf)=%u",
+                   fib_index, lbi, leaf);
+  /*
+   * 控制面口径的"这个目的地址从哪个口出去"：FIB 表最长匹配拿 fib_entry，
+   * 再问它解析到哪个接口。MPLS/SR 场景下转发表里是 mpls-label DPO，数据面
+   * 看不出接口，只有这条路能拿到（wg1014 这种）。
+   */
+  {
+    fib_prefix_t pfx = { .fp_proto = FIB_PROTOCOL_IP4,
+                         .fp_addr = { .ip4 = addr },
+                         .fp_len = 32 };
+    fib_node_index_t fei = fib_table_lookup (fib_index, &pfx);
+    u32 rsw = (fei != FIB_NODE_INDEX_INVALID)
+                ? fib_entry_get_resolving_interface (fei)
+                : ~0u;
+
+    vlib_cli_output (vm, "  控制面: fib_table_lookup=%d resolving_interface=%u"
+                     "  %U", (int) fei, rsw, format_vnet_sw_if_index_name,
+                     vnet_get_main (), rsw);
+  }
+
+  /*
+   * 先跑一次 resolver：它顺带把"目的地址→出接口"落进缓存，下面的解释性输出
+   * 与判定用的是同一条路 —— 早先这里先打印后解析，打出来的永远是 0。
+   */
+  {
+    u32 why = 0, dtype = ~0u, lbi2 = ~0u, nnext = ~0u;
+    u32 sw = sr_qos_resolve (rx, &addr, &why, &dtype, &lbi2, &nnext);
+
+    if (lbi != ~0u)
+      {
+        const load_balance_t *lb = load_balance_get (lbi);
+
+        vlib_cli_output (vm, "  lb: buckets=%u inline=%u proto=%u hash_cfg=0x%x",
+                         lb->lb_n_buckets,
+                         lb->lb_n_buckets <= LB_NUM_INLINE_BUCKETS ? 1 : 0,
+                         lb->lb_proto, lb->lb_hash_config);
+        for (u32 i = 0; i < lb->lb_n_buckets && i < 8; i++)
+          {
+            const dpo_id_t *d = load_balance_get_bucket_i (lb, i);
+            u8 *name = (u8 *) "?";
+
+            if (d)
+              {
+                vlib_node_t *n = vlib_get_node (vm, d->dpoi_next_node);
+
+                if (n && n->name)
+                  name = n->name;
+              }
+            vlib_cli_output (vm,
+                             "    bucket[%u]: type=%u proto=%u next_node=%u "
+                             "(%v) index=%u raw=0x%016llx",
+                             i, d ? (u32) d->dpoi_type : ~0u,
+                             d ? (u32) d->dpoi_proto : ~0u,
+                             d ? (u32) d->dpoi_next_node : ~0u, name,
+                             d ? d->dpoi_index : ~0u,
+                             d ? (unsigned long long) d->as_u64 : 0ULL);
+            if (d == 0)
+              continue;
+            if (!adj_is_valid (d->dpoi_index))
+              {
+                vlib_cli_output (vm, "        ↳ dpoi_index 不在邻接池里"
+                                 "（MPLS/标签/LB 这类 DPO，出接口要看控制面那行）");
+                continue;
+              }
+            {
+              ip_adjacency_t *a = adj_get (d->dpoi_index);
+
+              vlib_cli_output (vm,
+                               "        ↳ 若当成邻接看: lookup_next_index=%u "
+                               "flags=0x%x rewrite.sw_if_index=%u 隧道表里%s",
+                               (u32) a->lookup_next_index, (u32) a->ia_flags,
+                               a->rewrite_header.sw_if_index,
+                               (a->rewrite_header.sw_if_index != ~0u
+                                && sr_qos_tunnel_at (&sr_qos_main,
+                                                     a->rewrite_header
+                                                       .sw_if_index) != 0)
+                                 ? "有（会被排队）"
+                                 : "没有（不排队）");
+            }
+          }
+      }
+    vlib_cli_output (vm,
+                     "  本插件编译期枚举（仅构建环境自测有效）: "
+                     "IP_LOOKUP_NEXT_MIDCHAIN=%d DPO_ADJACENCY=%d "
+                     "DPO_ADJACENCY_MIDCHAIN=%d",
+                     IP_LOOKUP_NEXT_MIDCHAIN, DPO_ADJACENCY,
+                     DPO_ADJACENCY_MIDCHAIN);
+    vlib_cli_output (vm,
+                     "  => 判定 sw_if_index=%u %U  why=%u（0 正常/1 查表无路/"
+                     "2 出口不是配了速率的隧道）  bucket0_type=%u bucket0_next=%u",
+                     sw, format_vnet_sw_if_index_name, vnet_get_main (), sw, why,
+                     dtype, nnext);
+  }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sr_wg_show_qos_resolve_command, static) = {
+  .path = "show sr-wg qos resolve",
+  .short_help = "show sr-wg qos resolve <ip> [from <if>]（隧道判别自查）",
+  .function = sr_wg_show_qos_resolve_command_fn,
 };
 
 /* ==================== Init ==================== */
