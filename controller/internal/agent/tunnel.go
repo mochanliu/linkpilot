@@ -76,6 +76,11 @@ type TunnelSync struct {
 	applying bool
 	fails    int
 	nextTry  time.Time
+	// syncedOnce：至少完成过一轮成功的对账（bundle 拉取成功，links/colors 从此
+	// 反映控制器视角的现实）。FibTableSync 用它区分"这台盒子真的一条隧道都没有"
+	// （推空表是对的）和"进程刚起来、隧道事实还没建立"（推空表会把 sr-fib 里
+	// 已有的行清掉 —— 2026-11-12 换件现场实测的 ~5s 远端路径全跳过瞬态）。
+	syncedOnce bool
 
 	// tel 是隧道内可达性（BFD）与质量（探针）的落地点。对账装/撤隧道时顺带
 	// Ensure/Remove，心跳循环从 Telemetry() 取它做采样上报。
@@ -149,6 +154,16 @@ func (t *TunnelSync) setDataPlane(dp DataPlane) {
 	t.dpMu.Lock()
 	t.dp = dp
 	t.dpMu.Unlock()
+}
+
+// SyncedOnce 报告 TunnelSync 是否完成过至少一轮成功的对账（bundle 拉取成功，
+// links/colors 已反映控制器视角的现实）。FibTableSync 借它区分"控制器真的把
+// 隧道删光了"（推空表是对的）和"进程刚起来、隧道事实还没建立"（推空表会清掉
+// sr-fib 里已有的行）。
+func (t *TunnelSync) SyncedOnce() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.syncedOnce
 }
 
 // Links exposes the installed tunnels for the telemetry/observation loops
@@ -482,6 +497,9 @@ func (t *TunnelSync) Sync(ctx context.Context, desired int) error {
 		t.state.OK = false
 		t.state.Error = err.Error()
 	default:
+		// bundle 拉取成功：无论这台盒子装了几条（哪怕 0 条），隧道事实从此成立。
+		// per-tunnel 失败不算"没对账过"——links/colors 已按控制器视角写好。
+		t.syncedOnce = true
 		t.state.Version = ver
 		t.state.AppliedAt = t.now().Unix()
 		t.state.Tunnels = applied

@@ -163,6 +163,15 @@ type fibAnswer struct {
 func (f *FibTableSync) Sync(ctx context.Context) error {
 	rows := f.ts.FibRows()
 
+	// 启动瞬态守卫（2026-11-12 换件现场实证）：TunnelSync 还没完成过一轮对账时
+	// links 是空的 → rows 空，这时推出去的空表会把 sr-fib 内存里已有的隧道行清掉
+	// （sr-fib 按「下一跳不在隧道表里」跳过所有远端路径，直到下一拍补回，实测 ~5s）。
+	// 两种"rows 空"必须分开：控制器真的删光了所有隧道（SyncedOnce=true，推空表
+	// 是对的）和"隧道事实还没建立"（本轮不推，下一拍再说）。
+	if len(rows) == 0 && !f.ts.SyncedOnce() {
+		return f.note("TunnelSync 还没完成过一轮对账（隧道事实还没建立），本轮不推 sr-fib 隧道表 —— 现在推空表会把已有的行清掉")
+	}
+
 	// 规则 3：颜色缺失整轮拒绝。指针为 nil 只可能是老控制器的 bundle。
 	for _, r := range rows {
 		if r.Color == nil {

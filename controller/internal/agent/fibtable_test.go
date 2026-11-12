@@ -279,3 +279,67 @@ func TestFibStatusBase(t *testing.T) {
 		t.Fatal("没有 status_addr 却给出了地址：sr-fib 没开热更入口时要说出来")
 	}
 }
+
+// emptyFixture：links 为空的 TunnelSync（对账还没跑过，或控制器真的一条隧道都没有）。
+func emptyFixture(t *testing.T, synced bool) (*FibTableSync, *fibStub, *[]string) {
+	t.Helper()
+	ts := &TunnelSync{
+		links:   map[string]*Link{},
+		colors:  map[string]*uint8{},
+		peerOf:  map[string]uint16{},
+		localOf: map[string]netip.Prefix{},
+	}
+	ts.syncedOnce = synced
+	ts.dp = &fakeVPP{dumpIfs: []vppapi.SwInterface{}}
+	stub := &fibStub{current: `{"vrfs":[0,100],"tunnels":[{"next_hop":"10.250.0.2","interface":"wg1002","color":3}],"escape_all_colors":true}`}
+	srv := httptest.NewServer(stub)
+	t.Cleanup(srv.Close)
+
+	var logs []string
+	var mu sync.Mutex
+	f := NewFibTableSync(ts, "/nonexistent/route.json", "/nonexistent/fib.json", func(format string, args ...any) {
+		mu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	})
+	f.readVRFs = func() ([]int, error) { return []int{0, 100}, nil }
+	f.baseURL = func() (string, error) { return srv.URL, nil }
+	return f, stub, &logs
+}
+
+// 启动瞬态守卫（2026-11-12 换件现场实测）：TunnelSync 还没完成过一轮对账时，
+// rows 是空的 —— 这时推出去的空表会把 sr-fib 里已有的行清掉，sr-fib 按
+// 「下一跳不在隧道表里」跳过所有远端路径，直到下一拍补回（实测 ~5s）。
+func TestFibTableHoldsWithoutFirstSync(t *testing.T) {
+	f, stub, logs := emptyFixture(t, false)
+	err := f.Sync(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "还没完成过一轮对账") {
+		t.Fatalf("首轮对账没跑过时 = %v, want 说明原因且不推", err)
+	}
+	if got := stub.putBodies(); len(got) != 0 {
+		t.Fatalf("隧道事实还没建立却 PUT 了：%v", got)
+	}
+	if joined := strings.Join(*logs, ""); !strings.Contains(joined, "还没完成过一轮对账") {
+		t.Fatalf("原因没进日志：%q", joined)
+	}
+}
+
+// 对照：对账完成过（哪怕这台盒子真的 0 条隧道），推空表是合法的 —— 那是"删光了"
+// 而不是"还没建立"。sr-fib 当前还挂着旧行，所以这次 PUT 必须发生（整份替换语义）。
+func TestFibTablePushesEmptyAfterSyncedOnce(t *testing.T) {
+	f, stub, _ := emptyFixture(t, true)
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	bodies := stub.putBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("PUT 次数 = %d, want 1（删光隧道要推空表）", len(bodies))
+	}
+	var doc fibConfigDoc
+	if err := json.Unmarshal([]byte(bodies[0]), &doc); err != nil {
+		t.Fatalf("PUT 体不是 JSON: %v", err)
+	}
+	if len(doc.Tunnels) != 0 {
+		t.Fatalf("tunnels = %+v, want 空（控制器删光了）", doc.Tunnels)
+	}
+}
