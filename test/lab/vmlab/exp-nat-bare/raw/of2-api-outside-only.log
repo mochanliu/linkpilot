@@ -1,0 +1,66 @@
+2026-11-12 16:57:02 of2 start: probe with -keep -outpostroute (API path, outside-only postrouting)
+--- round 1
+enable retval=0
+interface host-enp0s8 add retval=0 (flags 16)
+output interface host-enp0s9 add retval=0 (postrouting in2out)
+interface dump: 1 rows
+  sw_if_index=1 inside=true outside=false
+address range add retval=0
+address dump: 1 rows
+  ip=10.9.9.10 vrf=0
+keep: NAT enabled, pool = host-enp0s9 address
+ALL ROUNDS OK
+2026-11-12 16:57:02 probe rc=0 (NAT left on for the traffic window)
+== hold 50s (cust4 delayed ping + Mac ssh probe window)
+== sessions
+NAT44 sessions:
+-------- thread 0 vpp_main: 0 sessions --------
+== interfaces
+NAT44 interfaces:
+ host-enp0s8 in
+ host-enp0s9 output-feature in out
+== errors
+   Count                  Node                              Reason               Severity 
+         9             null-node                      blackholed packets           error  
+         3           wg4-output-tun                     Keypair error              error  
+      2751          nat44-ei-out2in                     no translation             error  
+       907  nat44-ei-in2out-output-slowpath              out of ports              error  
+     12681          af-packet-input                    timed out block             error  
+     12702          af-packet-input                  total received block          error  
+       270             arp-reply                       ARP replies sent            info   
+        14             arp-reply             ARP request IP4 source address lear   info   
+         4             arp-reply             RX interface is unnumbered to diffe   error  
+      2905           bfd-udp4-input                           OK                   info   
+      1777             ip4-input                  Multicast RPF check failed       error  
+         7           ip6-icmp-input                     valid packets              info   
+       351           ip6-icmp-input          neighbor solicitations for unknown    error  
+        26           ip6-icmp-input              neighbor advertisements sent      info   
+         7           ip6-icmp-input             router advertisements received     info   
+        29           ip4-icmp-error            hop limit exceeded response sent    info   
+       144           ip4-icmp-input                   echo replies sent            info   
+       213           ethernet-input                        no error                error  
+       390           ethernet-input                 unknown ethernet type          error  
+         1         host-enp0s8-output                 interface is down            error  
+== interface counters
+              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     Counter          Count     
+host-enp0s8                       1      up          1500/0/0/0     rx packets                   130
+                                                                    rx bytes                   20119
+                                                                    tx packets                   142
+                                                                    tx bytes                   19826
+                                                                    drops                         42
+                                                                    ip4                          122
+                                                                    ip6                            1
+                                                                    tx-error                       1
+host-enp0s9                       3      up          1500/0/0/0     rx packets                 17337
+                                                                    rx bytes                 5798121
+                                                                    tx packets                 10569
+                                                                    tx bytes                 2046887
+                                                                    drops                       5332
+                                                                    punt                         399
+                                                                    ip4                        16149
+                                                                    ip6                          516
+== VPP alive locally
+vpp v26.06-release built by root on 4bf4caa1c4e5 at 2026-06-24T09:27:07
+2026-11-12 16:57:52 disabling NAT
+nat44 ei plugin: already disabled
+2026-11-12 16:57:54 of2 done

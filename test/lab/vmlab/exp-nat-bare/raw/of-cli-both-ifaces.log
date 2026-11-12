@@ -1,0 +1,136 @@
+2026-11-12 16:35:59 of-test start
+== enable
+enable rc=0
+iface+of rc=0
+pool rc=0
+== readback: interfaces
+NAT44 interfaces:
+ host-enp0s8 output-feature in out
+ host-enp0s9 output-feature in out
+== readback: output features on host-enp0s9 (ip4-output arc)
+Feature paths configured on host-enp0s9...
+
+nsh-eth-output:
+  none configured
+
+arp:
+  linux-cp-arp-phy
+  arp-reply
+
+nsh-output:
+  none configured
+
+mpls-output:
+  none configured
+
+mpls-input:
+  mpls-not-enabled
+
+ip6-drop:
+  none configured
+
+ip6-punt:
+  none configured
+
+ip6-local:
+  none configured
+
+ip6-output:
+  none configured
+
+ip6-multicast:
+  none configured
+
+ip6-unicast:
+  none configured
+
+ip4-drop:
+  none configured
+
+ip4-punt:
+  none configured
+
+ip4-local:
+  none configured
+
+ip4-output:
+  ip4-sv-reassembly-output-feature
+  nat44-ei-in2out-output
+
+ip4-multicast:
+  none configured
+
+ip4-unicast:
+  ip4-sv-reassembly-feature
+  nat44-ei-out2in
+
+l2-output-nonip:
+  none configured
+
+l2-input-nonip:
+  none configured
+
+l2-output-ip6:
+  none configured
+
+l2-input-ip6:
+  none configured
+
+l2-output-ip4:
+  none configured
+
+l2-input-ip4:
+  none configured
+
+ethernet-output:
+  none configured
+
+error-drop:
+  none configured
+
+interface-output:
+  none configured
+
+port-rx-eth:
+  none configured
+
+device-input:
+  none configured
+
+l2-input:
+  none configured
+
+l2-output:
+  none configured
+== readback: arc dump
+2026-11-12 16:36:01 arc: 310 lines
+== hold 90s (customer ping + Mac ssh probe window)
+== sessions after window
+NAT44 sessions:
+-------- thread 0 vpp_main: 11 sessions --------
+  192.168.1.104: 8 dynamic translations, 0 static translations
+  172.31.4.1: 3 dynamic translations, 0 static translations
+== errors after window
+   Count                  Node                              Reason               Severity 
+       180          nat44-ei-out2in                     no translation             error  
+      1186          af-packet-input                    timed out block             error  
+      1186          af-packet-input                  total received block          error  
+       119             arp-reply                       ARP replies sent            info   
+         9             arp-reply             ARP request IP4 source address lear   info   
+         2             arp-reply             RX interface is unnumbered to diffe   error  
+       753             ip4-input                  Multicast RPF check failed       error  
+         6           ip6-icmp-input                     valid packets              info   
+       195           ip6-icmp-input          neighbor solicitations for unknown    error  
+        12           ip6-icmp-input              neighbor advertisements sent      info   
+         6           ip6-icmp-input             router advertisements received     info   
+         9           ip4-icmp-error            hop limit exceeded response sent    info   
+        60           ip4-icmp-input                   echo replies sent            info   
+       104           ethernet-input                        no error                error  
+       165           ethernet-input                 unknown ethernet type          error  
+         3           ethernet-input                    l3 mac mismatch             error  
+         1         host-enp0s8-output                 interface is down            error  
+== VPP alive locally
+vpp v26.06-release built by root on 4bf4caa1c4e5 at 2026-06-24T09:27:07
+2026-11-12 16:37:31 disabling NAT
+nat44 ei plugin: already disabled
+2026-11-12 16:37:33 of-test done

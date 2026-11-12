@@ -29,6 +29,7 @@ func main() {
 	sessions := flag.Uint("sessions", 16384, "max sessions per thread")
 	keep := flag.Bool("keep", false, "leave NAT enabled (for traffic tests)")
 	pool := flag.String("pool", "", "dedicated pool address for keep mode (else outside interface address)")
+	outpostroute := flag.Bool("outpostroute", false, "mark the outside interface for postrouting in2out (nat44_ei_add_del_output_interface) -- keeps box-originated traffic translated so management survives")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -77,16 +78,33 @@ func main() {
 		} else {
 			fmt.Println("enable retval=0")
 		}
+		// -outpostroute: the outside interface must NOT be registered as a
+		// plain outside interface -- nat44-ei keeps "interfaces" and
+		// "output-feature interfaces" in mutually exclusive registries
+		// (nat44_ei_add_output_interface returns VALUE_EXIST/-81 otherwise,
+		// measured 2026-11-12). The output-interface registration carries
+		// both out2in (input) and postrouting in2out (output), which is what
+		// lets box-originated traffic create sessions and management survive.
 		for _, r := range []struct {
 			name  string
 			idx   uint32
 			flags byte
 		}{{*inside, inIdx, vppapi.Nat44FlagIfInside}, {*outside, outIdx, vppapi.Nat44FlagIfOutside}} {
+			if *outpostroute && r.idx == outIdx {
+				continue
+			}
 			if err := c.Nat44InterfaceFeature(ctx, r.idx, r.flags, true); err != nil {
 				fmt.Printf("interface %s add FAIL: %v\n", r.name, err)
 				os.Exit(2)
 			}
 			fmt.Printf("interface %s add retval=0 (flags %d)\n", r.name, r.flags)
+		}
+		if *outpostroute {
+			if err := c.Nat44OutputInterface(ctx, outIdx, true); err != nil {
+				fmt.Printf("output interface %s add FAIL: %v\n", *outside, err)
+				os.Exit(2)
+			}
+			fmt.Printf("output interface %s add retval=0 (postrouting in2out)\n", *outside)
 		}
 		rows, err := c.Nat44Interfaces(ctx)
 		if err != nil {

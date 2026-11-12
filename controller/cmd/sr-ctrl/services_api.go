@@ -123,7 +123,11 @@ func (s *server) servicesViewLocked(tenantID string, nodeID uint16, now int64) (
 }
 
 // natPendingText 是 apply 对 NAT 行"不下发"的说明，页面与状态共用一份文案。
-const natPendingText = "NAT 行已发布但暂不下发：盒子上 VPP 26.06 自带 NAT44 插件的数据面有崩溃缺陷（2026-11-11 实测），后端落定前不生效。"
+// 2026-11-12 exp-nat-bare 裁决：VPP 26.06 的 nat44_ei 数据面本身没有缺陷
+// （裸 VPP + 纯 CLI，客户流量 8/8 通）；卡点是配置形状——pool 用外口自身地址
+// 会让所有入向管理流量被 out2in "no translation" 丢掉。下发前要先落定
+// pool 语义（专用地址）+ 外口 output-interface 注册，见 exp-nat-bare/README.md。
+const natPendingText = "NAT 行已发布但暂不下发：实测 VPP 26.06 的 NAT44 本身可用（2026-11-12 exp-nat-bare），但产品配置形状未落定——pool 用外口自身地址会丢掉所有入向管理流量，需先改为专用 pool 地址 + 外口 output-interface 注册再下发。"
 
 // servicesNatBlocked 报告 NAT 后端是否仍处于"暂不下发"状态。它是编译期事实
 // （当前这个 build 判死 nat44_ei），不是运行时状态，所以直接返回常量。

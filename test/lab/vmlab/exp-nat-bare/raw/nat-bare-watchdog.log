@@ -1,0 +1,14 @@
+2026-11-12 16:21:59 armed: auto-disable in 180s unless /root/vmlab/nat-bare-keep exists
+2026-11-12 16:24:59 TRIGGER: dumping evidence then disabling NAT
+== date
+Thu Nov 12 16:24:59 UTC 2026
+== show errors
+== nat44 ei sessions
+== nat44 ei interfaces
+== interface counters
+connect: Connection refused
+== features host-enp0s9
+connect: Connection refused
+connect: Connection refused
+nat44 ei plugin: already disabled
+2026-11-12 16:25:18 recovery done; disabling again returned: see lines above

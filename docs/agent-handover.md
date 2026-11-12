@@ -262,13 +262,18 @@ mv 把执行位一起带走，systemd 下次开机就是 `vmlab-underlay.service
 脚本要 `ls -la` 确认 755。取证/诊断工具见 `test/lab/vmlab/nat-watch.sh`（2s 轻采样）
 与 `nat-deep.sh`（vppctl 节点级深采样，走 unix socket 假死时也能答话）。
 
-**#302 NAT 缺陷定性更新（2026-11-12 带取证 4/4 秒级复现）**：26.06 的 nat44_ei 经
-binary API enable（retval=0、dumps 准确）后，**两个 NAT 接口上的所有包被 nat44 特性
-节点全丢**（WAN 口 drops 以背景流量全速上涨；cust12→WAN 网关 transit 100% 丢、会话表
-恒 0），入向 TCP（SSH）秒死而 ICMP echo/盒内/本地交付全部正常——当日"整机假死"实为
-管理面失联。资源层零异常、无 panic。与 hook 点无关（host-enp0s8/9 就是 af_packet
-转发口），与内存/CPU 无关。详见 docs/vpp-upgrade-compat-2610.md §1.3；金丝雀判据已
-换成节点级（drops 不全速、sessions>0）。
+**#302 NAT 缺陷定性终版（2026-11-12 exp-nat-bare 裁决，推翻同日早间"特性节点全丢"结论）**：
+**不是 VPP 26.06 发行版缺陷，是配置形状问题。** 裸 VPP（禁 sr_wg、无 agent）+ 纯 CLI +
+同形状 af_packet 口：客户数据面完全正常（cust4→网关 8/8 回包、会话建立）。"整机假死"
+机制 = out2in 的标准 EI 语义：**目的为 pool 地址且无会话的入向包一律丢**；产品把 pool
+设成外口自身地址（=管理 IP），管理面因此必死。正确形状（of4 实测）：内口普通 IF_INSIDE
+注册 + 外口 `nat44_ei_add_del_output_interface`（postrouting in2out）+ 专用 pool 地址
+（外口 secondary）→ 客户 8/8 通且管理面存活。细节与机制账本：
+test/lab/vmlab/exp-nat-bare/README.md。产品含义：①NAT 行 pool 语义改专用地址；②外口
+注册方式改 output-interface（vppapi 已加 `Nat44OutputInterface`、probe 已加
+`-outpostroute`）；③盒子自身服务过 NAT 需单独设计（out of ports 半失败）。26.10 升级
+对 NAT 不再必要。早间"cust12 transit 5/5 丢且 0 会话"系半配置状态（使能链在 pool 步被打
+断），不能作数据面坏的证据。
 
 **顺带抓到的一处真实不一致（缺口 G-2，不是本次引入）**：CPE3 的 sr-fib 运行时隧道表 3 条
 （`curl -s http://127.0.0.1:19011/status` 的 `tunnels`），盘上 `/etc/sdwan/fib.json` 写的是 **`tunnels: 0`**
@@ -317,9 +322,10 @@ agent.log 的 `sr-fib 隧道表已收敛：N 行`（写的人自报）+ `curl 12
    `$var（` 形态统一 `${var}` 括护（本机 bash 把 UTF-8 标点字节并进变量名）。全量
    **PASS=398 FAIL=0 WARN=0**。瞬态①已由 `4e2c432` 的 FibTableSync 守卫收口
    （CPE1 sr-agent `1e8c8894`，换件实测首拍 hold、0 次 PUT、表未动）。
-   **NAT 解套**：owner 拍了升级方向 —— 评估与四步落地路径在
+   **NAT 解套**：~~owner 拍了升级方向~~ —— **2026-11-12 exp-nat-bare 裁决后升级对 NAT
+   不再必要**（NAT 是配置形状问题，见 #302 终版定性）；
    [docs/vpp-upgrade-compat-2610.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/vpp-upgrade-compat-2610.md)
-   （26.10 已发布但升级不承诺修好 NAT，须 build spike + 金丝雀盒流量实测裁决）。
+   的四步路径保留作纯产品动机（其他 26.10 收益）时的参考，NAT 一节已过时。
 
 **仍不一致的那唯一一处（有意留着，不是漏）：** CPE1 的 `sr-fib` 还是 `a9f1bc8c8fd49016` —— 事件版但**没带 B3**，
 它就是 B3 那一族的缺陷臂，抬到 `c213a6ca` 会把手上唯一的对照臂杀掉，所以按 #284 的方案**不动它**。

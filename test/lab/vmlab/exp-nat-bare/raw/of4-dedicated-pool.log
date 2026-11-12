@@ -1,0 +1,59 @@
+== secondary pool address on host-enp0s9
+secaddr rc=0
+2026-11-12 17:01:14 probe: -keep -outpostroute -pool 192.168.1.200
+--- round 1
+enable retval=0
+interface host-enp0s8 add retval=0 (flags 16)
+output interface host-enp0s9 add retval=0 (postrouting in2out)
+interface dump: 1 rows
+  sw_if_index=1 inside=true outside=false
+address range add retval=0
+address dump: 1 rows
+  ip=10.9.9.10 vrf=0
+keep: NAT enabled, pool = dedicated 192.168.1.200
+ALL ROUNDS OK
+2026-11-12 17:01:14 probe rc=0 (NAT on)
+== readback: pool
+NAT44 pool addresses:
+192.168.1.200
+  tenant VRF: 0
+  0 busy other ports
+  0 busy udp ports
+  0 busy tcp ports
+  0 busy icmp ports
+== readback: interfaces
+NAT44 interfaces:
+ host-enp0s8 in
+ host-enp0s9 output-feature in out
+== hold 50s (cust4 ping + Mac ssh window)
+== sessions
+NAT44 sessions:
+-------- thread 0 vpp_main: 8 sessions --------
+  192.168.1.104: 7 dynamic translations, 0 static translations
+  172.31.4.2: 1 dynamic translations, 0 static translations
+== errors
+   Count                  Node                              Reason               Severity 
+        15             null-node                      blackholed packets           error  
+         3           wg4-output-tun                     Keypair error              error  
+      3532          nat44-ei-out2in                     no translation             error  
+      1603  nat44-ei-in2out-output-slowpath              out of ports              error  
+     21190          af-packet-input                    timed out block             error  
+     21211          af-packet-input                  total received block          error  
+       444             arp-reply                       ARP replies sent            info   
+        15             arp-reply             ARP request IP4 source address lear   info   
+         6             arp-reply             RX interface is unnumbered to diffe   error  
+      5203           bfd-udp4-input                           OK                   info   
+      2944             ip4-input                  Multicast RPF check failed       error  
+         9           ip6-icmp-input                     valid packets              info   
+       546           ip6-icmp-input          neighbor solicitations for unknown    error  
+        42           ip6-icmp-input              neighbor advertisements sent      info   
+         9           ip6-icmp-input             router advertisements received     info   
+        41           ip4-icmp-error            hop limit exceeded response sent    info   
+       235           ip4-icmp-input                   echo replies sent            info   
+       341           ethernet-input                        no error                error  
+       645           ethernet-input                 unknown ethernet type          error  
+         1         host-enp0s8-output                 interface is down            error  
+2026-11-12 17:02:04 cleanup: disable NAT, drop secondary address
+set interface ip address: failed to add 192.168.1.200/24 on host-enp0s9 which conflicts with 192.168.1.200/24 for interface host-enp0s9
+nat44 ei plugin: already disabled
+2026-11-12 17:02:06 of4 done

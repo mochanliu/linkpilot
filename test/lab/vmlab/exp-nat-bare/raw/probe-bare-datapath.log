@@ -1,0 +1,95 @@
+2026-11-12 16:19:54 probe start (single-thread VPP; stock nat44-ei; CLI config)
+== enable NAT via CLI (users 4096 / user-sessions 256 / sessions 16384)
+enable rc=0
+iface rc=0
+pool rc=0
+== readback
+NAT44 interfaces:
+ host-enp0s8 in
+ host-enp0s9 out
+NAT44 pool addresses:
+192.168.1.104
+  tenant VRF independent
+  0 busy other ports
+  0 busy udp ports
+  0 busy tcp ports
+  0 busy icmp ports
+== arc order: ip4-unicast on host-enp0s9 (full dump)
+2026-11-12 16:19:56 arc dump: 310 lines -> /root/vmlab/nat-bare-arc.txt
+== errors right after enable
+   Count                  Node                              Reason               Severity 
+      1699          nat44-ei-out2in                     no translation             error  
+      4890          af-packet-input                    timed out block             error  
+      4890          af-packet-input                  total received block          error  
+      1008             arp-reply                       ARP replies sent            info   
+        29             arp-reply             ARP request IP4 source address lear   info   
+         4             arp-reply             RX interface is unnumbered to diffe   error  
+         3             ip6-glean                          throttled                info   
+         1             ip6-glean                 neighbor solicitations sent       info   
+         1             ip4-glean                      ARP requests sent            info   
+         8             ip6-input                    ip6 source lookup miss         error  
+      1750             ip4-input                  Multicast RPF check failed       error  
+         7           ip6-icmp-input                     valid packets              info   
+        10           ip6-icmp-input                   echo replies sent            info   
+       507           ip6-icmp-input          neighbor solicitations for unknown    error  
+        27           ip6-icmp-input              neighbor advertisements sent      info   
+         7           ip6-icmp-input             router advertisements received     info   
+        41           ip4-icmp-error            hop limit exceeded response sent    info   
+       157           ip4-icmp-input                   echo replies sent            info   
+       184           ethernet-input                        no error                error  
+       385           ethernet-input                 unknown ethernet type          error  
+         1         host-enp0s8-output                 interface is down            error  
+== customer window: wait 45s (cust4 delayed ping fires in here)
+2026-11-12 16:19:56 waiting 45s for cust4 traffic
+== sessions after customer traffic
+NAT44 sessions:
+-------- thread 0 vpp_main: 1 sessions --------
+  172.31.4.2: 1 dynamic translations, 0 static translations
+NAT44 interfaces:
+ host-enp0s8 in
+ host-enp0s9 out
+== errors after customer traffic
+   Count                  Node                              Reason               Severity 
+      2020          nat44-ei-out2in                     no translation             error  
+      5401          af-packet-input                    timed out block             error  
+      5401          af-packet-input                  total received block          error  
+      1045             arp-reply                       ARP replies sent            info   
+        31             arp-reply             ARP request IP4 source address lear   info   
+         6             arp-reply             RX interface is unnumbered to diffe   error  
+         3             ip6-glean                          throttled                info   
+         1             ip6-glean                 neighbor solicitations sent       info   
+         1             ip4-glean                      ARP requests sent            info   
+        10             ip6-input                    ip6 source lookup miss         error  
+      1962             ip4-input                  Multicast RPF check failed       error  
+         7           ip6-icmp-input                     valid packets              info   
+        10           ip6-icmp-input                   echo replies sent            info   
+       585           ip6-icmp-input          neighbor solicitations for unknown    error  
+        31           ip6-icmp-input              neighbor advertisements sent      info   
+         7           ip6-icmp-input             router advertisements received     info   
+        54           ip4-icmp-error            hop limit exceeded response sent    info   
+       175           ip4-icmp-input                   echo replies sent            info   
+       213           ethernet-input                        no error                error  
+       430           ethernet-input                 unknown ethernet type          error  
+         1         host-enp0s8-output                 interface is down            error  
+== interface counters (drop ratio on the two NAT ports)
+              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     Counter          Count     
+host-enp0s8                       1      up          1500/0/0/0     rx packets                   181
+                                                                    rx bytes                   28297
+                                                                    tx packets                   211
+                                                                    tx bytes                   29496
+                                                                    drops                         61
+                                                                    ip4                          170
+                                                                    tx-error                       1
+host-enp0s9                       3      up          1500/0/0/0     rx packets                  8246
+                                                                    rx bytes                 1431451
+                                                                    tx packets                  2386
+                                                                    tx bytes                  527572
+                                                                    drops                       5797
+                                                                    punt                         430
+                                                                    ip4                         5964
+                                                                    ip6                          779
+== VPP still alive locally? (vppctl answers = yes)
+vpp v26.06-release built by root on 4bf4caa1c4e5 at 2026-06-24T09:27:07
+2026-11-12 16:20:41 disabling NAT (no keep file) so the management path comes back
+nat44 ei plugin: already disabled
+2026-11-12 16:20:43 probe done

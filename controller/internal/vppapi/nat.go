@@ -2,27 +2,28 @@
 // API, and this build gives no alternative: the plugin's CLI **cannot** carry
 // the two knobs that decide whether enabling it survives at all.
 //
-// Why the CLI path is not just inconvenient but unusable (all measured on
-// lab-cpe1, VPP 26.06-release, 2026-11-11):
+// 2026-11-12 exp-nat-bare 裁决修正：nat44_ei 数据面本身没有缺陷（裸 VPP +
+// 纯 CLI，客户流量 8/8 通）。此前"API 使能后整机假死"的真实机制是配置形状：
+// pool 用了外口自身地址（= 管理 IP），out2in 对目的为 pool 且无会话的入向包
+// 一律丢（EI 标准语义），管理面因此必死。正确形状见
+// test/lab/vmlab/exp-nat-bare/README.md：专用 pool 地址 + 外口走
+// Nat44OutputInterface（postrouting in2out），普通 IF_OUTSIDE 注册不要用。
+//
+// 以下 CLI 路径的历史测量仍成立：
 //
 //   - `nat44 plugin enable` with the CLI's default users/user_sessions sizes
 //     panics the whole VPP process: "Out-of-memory, calling os_panic()" -- the
 //     per-thread user/session hash tables are allocated from the main heap and
-//     the defaults do not fit a small heap. Once VPP dies, the underlay
-//     takeover and the config replay race each other on the way back up; two
-//     back-to-back crashes wedged the lab VM so hard only a machine reset
-//     brought it back.
+//     the defaults do not fit a small heap.
 //   - With a bigger heap the CLI enable *succeeds* and then silently does not
 //     stick: `nat44 plugin disable` right after answers "already disabled".
-//     `set interface nat44` follows with bare "add <ifc> failed" lines.
 //
 // The API message carries every sizing knob explicitly
 // (nat44_ei_plugin_enable_disable: users, user_memory, sessions,
 // session_memory, user_sessions), so the caller decides the memory shape
-// instead of inheriting whatever the CLI parses. That is the only path this
-// file drives. Readback goes through the plugin's dumps (interfaces / addresses
-// / interface addresses) -- `show nat44 ei ...` CLI output parsing is not used
-// anywhere here.
+// instead of inheriting whatever the CLI parses. Readback goes through the
+// plugin's dumps (interfaces / addresses / interface addresses) -- `show
+// nat44 ei ...` CLI output parsing is not used anywhere here.
 //
 // Byte layouts are read from /usr/share/vpp/api/plugins/nat44_ei.api.json on
 // the box, not guessed. Enum vl_api_nat44_ei_config_flags_t is enumtype u8 --
@@ -124,6 +125,24 @@ func (c *Client) Nat44AddressRange(ctx context.Context, first, last netip.Addr, 
 		return err
 	}
 	return c.retval("nat44_ei_add_del_address_range", frame)
+}
+
+// Nat44OutputInterface marks one interface for postrouting in2out
+// translation (nat44_ei_add_del_output_interface, the non-deprecated
+// replacement of nat44_ei_interface_add_del_output_feature). This is what
+// keeps a box manageable with NAT on: packets the box itself sends out the
+// outside interface get translated, so their replies match a session --
+// without it, every inbound packet to a pool address with no session dies
+// "no translation" at nat44-ei-out2in, which includes all management
+// traffic to the box's own WAN address (measured 2026-11-12, CPE4).
+func (c *Client) Nat44OutputInterface(ctx context.Context, swIfIndex uint32, add bool) error {
+	body := []byte{b2u8(add)}
+	body = appendU32(body, swIfIndex)
+	frame, err := c.call(ctx, "nat44_ei_add_del_output_interface", "nat44_ei_add_del_output_interface_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("nat44_ei_add_del_output_interface", frame)
 }
 
 // Nat44Interface is one row of nat44_ei_interface_details: which interface

@@ -1,0 +1,12 @@
+t=+5 dead
+t=+10 dead
+t=+15 dead
+t=+20 dead
+t=+25 dead
+t=+30 dead
+t=+35 ALIVE
+t=+40 ALIVE
+t=+45 ALIVE
+t=+50 ALIVE
+t=+55 ALIVE
+t=+60 ALIVE

@@ -6,13 +6,13 @@
 //     length, kernel TAP name), so the box only has to write them into
 //     /etc/sdwan/svc.json and signal sr-svc -- sr-svc binds exactly what it is
 //     told and re-derives nothing.
-//   - NAT rows ride along in the artifact but are NOT applied here: the nat44_ei
-//     plugin in VPP 26.06-release crashes the data plane on the first transit
-//     vector (measured 2026-11-11 on lab-cpe1: CLI enable OOM-panics with
-//     default sizing, the API path enables cleanly but the box wedges as soon
-//     as customer traffic crosses the NAT feature; both pool shapes tested).
-//     Until the backend is settled (own plugin or a newer VPP), a NAT row in
-//     the bundle is an explicit note in the status, never a silent no-op.
+//   - NAT rows ride along in the artifact but are NOT applied here. 2026-11-12
+//     exp-nat-bare 裁决：VPP 26.06 的 nat44_ei 数据面没有缺陷（裸 VPP + 纯 CLI
+//     客户流量 8/8 通）；卡点是配置形状——pool 用外口自身地址会让所有入向管理
+//     流量（ssh/控制器心跳）被 out2in "no translation" 丢掉，盒子表现为管理面
+//     失联。下发前必须先落定：pool 改专用地址（外口 secondary）、外口改
+//     nat44_ei_add_del_output_interface 注册、盒子自身服务要不要过 NAT 单独设计。
+//     证据与机制账本：test/lab/vmlab/exp-nat-bare/README.md。
 //
 // The file write happens even when the segment carries empty tables: "删掉最后
 // 一行 DHCP" has to stop sr-svc from serving, and the way that happens is the
@@ -44,7 +44,7 @@ const (
 // The console shows the same text (cmd/sr-ctrl natPendingText); two sources of
 // truth would drift, so the wording lives in both and says the same measured
 // fact.
-const NatPendingNote = "NAT 行已发布但暂不下发：盒子上 VPP 26.06 自带 NAT44 插件的数据面有崩溃缺陷（2026-11-11 实测），后端落定前不生效。"
+const NatPendingNote = "NAT 行已发布但暂不下发：实测 VPP 26.06 的 NAT44 本身可用（2026-11-12 exp-nat-bare），但产品配置形状未落定——pool 用外口自身地址会丢掉所有入向管理流量，需先改为专用 pool 地址 + 外口 output-interface 注册再下发。"
 
 // svcDHCPRow / svcDNSRow mirror the controller's rendered rows (cmd/sr-ctrl
 // config_render.go). The JSON shapes are the contract: the controller renders,

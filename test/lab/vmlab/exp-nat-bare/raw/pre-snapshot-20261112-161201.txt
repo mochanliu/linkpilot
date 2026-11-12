@@ -1,0 +1,660 @@
+== 2026-11-12 16:12:01 phase=pre-snapshot
+== show version
+vpp v26.06-release built by root on 4bf4caa1c4e5 at 2026-06-24T09:27:07
+== show plugins (sr/wg/nat)
+ 10. cnat_plugin.so                           26.06-release                    CNat Translate
+ 14. det44_plugin.so                          26.06-release                    Deterministic NAT (CGN)
+ 45. nat44_ei_plugin.so                       26.06-release                    IPv4 Endpoint-Independent NAT (NAT44 EI)
+ 46. nat64_plugin.so                          26.06-release                    NAT64
+ 47. nat66_plugin.so                          26.06-release                    NAT66
+ 48. nat_plugin.so                            26.06-release                    Network Address Translation (NAT)
+ 54. pnat_plugin.so                           26.06-release                    Policy 1:1 NAT
+ 68. srmpls_plugin.so                         26.06-release                    Segment Routing for MPLS plugin
+ 87. sr_wg_plugin.so                          1.0.0                            SR-WG: Segment Routing over WireGuard transit/encap/decap
+== features host-enp0s8
+Available feature paths
+[ 0] nsh-eth-output:
+  [ 0]: error-drop
+  [ 1]: interface-output
+[ 1] arp:
+  [ 0]: vrrp4-arp-input
+  [ 1]: linux-cp-arp-host
+  [ 2]: linux-cp-arp-phy
+  [ 3]: arping-input
+  [ 4]: arp-reply
+  [ 5]: arp-proxy
+  [ 6]: arp-disabled
+  [ 7]: error-drop
+[ 2] nsh-output:
+  [ 0]: error-drop
+[ 3] mpls-output:
+  [ 0]: mpls-qos-mark
+  [ 1]: vlan-mpls-qos-mark
+  [ 2]: interface-output
+[ 4] mpls-input:
+  [ 0]: vlan-mpls-qos-record
+  [ 1]: mpls-qos-record
+  [ 2]: linux-cp-xc-mpls
+  [ 3]: mpls-not-enabled
+  [ 4]: mpls-lookup
+[ 5] ip6-drop:
+  [ 0]: error-drop
+[ 6] ip6-punt:
+  [ 0]: stn-ip6-punt
+  [ 1]: ip6-punt-acl
+  [ 2]: ip6-punt-policer
+  [ 3]: linux-cp-punt-l3
+  [ 4]: ip6-punt-redirect
+  [ 5]: error-punt
+[ 7] ip6-local:
+  [ 0]: vrrp6-nd-input
+  [ 1]: arping6-input
+  [ 2]: ip6-local-end-of-arc
+[ 8] ip6-output:
+  [ 0]: acl-plugin-out-ip6-fa
+  [ 1]: cnat-output-ip6
+  [ 2]: cnat-writeback-ip6
+  [ 3]: gso-ip6
+  [ 4]: wg6-output-tun
+  [ 5]: ip6-tx-urpf-strict
+  [ 6]: ip6-tx-urpf-loose
+  [ 7]: policer-output
+  [ 8]: tcp-mss-clamping-ip6-out
+  [ 9]: hsi6-out
+  [10]: flowprobe-output-ip6
+  [11]: ip6-qos-mark
+  [12]: vlan-ip6-qos-mark
+  [13]: ip6-dvr-reinject
+  [14]: pt
+  [15]: ip6-sv-reassembly-output-feature
+  [16]: ip6-outacl
+  [17]: ipsec6-output-feature
+  [18]: interface-output
+[ 9] ip6-multicast:
+  [ 0]: vrrp6-accept-owner-input
+  [ 1]: ip6-qos-store
+  [ 2]: vlan-ip6-qos-record
+  [ 3]: ip6-qos-record
+  [ 4]: linux-cp-xc-l3-ip6
+  [ 5]: linux-cp-xc-ip6
+  [ 6]: flowprobe-input-ip6
+  [ 7]: ip6-multicast-nd-proxy
+  [ 8]: ip6-sv-reassembly-mcast-feature
+  [ 9]: ip6-not-enabled
+  [10]: vpath-input-ip6
+  [11]: ip6-mfib-forward-lookup
+[10] ip6-unicast:
+  [ 0]: ip6-vxlan-gpe-bypass
+  [ 1]: ip6-rx-urpf-loose
+  [ 2]: ip6-rx-urpf-strict
+  [ 3]: svs-ip6
+  [ 4]: srv6-end-m-gtp6-dt
+  [ 5]: srv6-end-m-gtp6-d-di
+  [ 6]: srv6-end-m-gtp6-d
+  [ 7]: srv6-end-m-gtp6-e
+  [ 8]: srv6-end-m-gtp4-e
+  [ 9]: srv6-as6-rewrite
+  [10]: srv6-am-rewrite
+  [11]: srv6-ad6-flow-rewrite
+  [12]: srv6-ad6-rewrite
+  [13]: sfdp-interface-input-ip6
+  [14]: ip6-pvti-bypass
+  [15]: policer-input
+  [16]: ip6-sv-reassembly-feature
+  [17]: nat66-out2in
+  [18]: nat66-in2out
+  [19]: nat64-in2out-handoff
+  [20]: nat64-in2out
+  [21]: ip6-map-t
+  [22]: ip6-full-reassembly-feature
+  [23]: ip6-map
+  [24]: flowprobe-input-ip6
+  [25]: cnat-lookup-ip6
+  [26]: cnat-input-ip6
+  [27]: acl-plugin-in-ip6-fa
+  [28]: ip6-flow-classify
+  [29]: ip6-inacl
+  [30]: ip6-policer-classify
+  [31]: tcp-mss-clamping-ip6-in
+  [32]: ip6-qos-store
+  [33]: vlan-ip6-qos-record
+  [34]: ip6-qos-record
+  [35]: linux-cp-xc-l3-ip6
+  [36]: linux-cp-xc-ip6
+  [37]: lb-nat6-in2out
+  [38]: l3xc-input-ip6
+  [39]: sir-to-ila
+  [40]: hsi6-in
+  [41]: ip6-gtpu-bypass
+  [42]: ct6-out2in
+  [43]: cnat-snat-ip6-return
+  [44]: cnat-snat-ip6
+  [45]: abf-input-ip6
+  [46]: ip6-unicast-nd-proxy
+  [47]: ip6-not-enabled
+  [48]: ipsec6-input-feature
+  [49]: l2tp-decap
+  [50]: vpath-input-ip6
+  [51]: ip6-vxlan-bypass
+  [52]: ip6-lookup
+[11] ip4-drop:
+  [ 0]: error-drop
+[12] ip4-punt:
+  [ 0]: stn-ip4-punt
+  [ 1]: ip4-punt-acl
+  [ 2]: ip4-punt-policer
+  [ 3]: linux-cp-punt-l3
+  [ 4]: ip4-punt-redirect
+  [ 5]: error-punt
+[13] ip4-local:
+  [ 0]: nat44-ei-hairpinning
+  [ 1]: syn-filter-4
+  [ 2]: ip4-local-end-of-arc
+[14] ip4-output:
+  [ 0]: sr-wg4-encap
+  [ 1]: ip4-sv-reassembly-output-feature
+  [ 2]: nat44-ed-in2out-output
+  [ 3]: nat44-in2out-output-worker-handoff
+  [ 4]: nat-pre-in2out-output
+  [ 5]: acl-plugin-out-ip4-fa
+  [ 6]: cnat-output-ip4
+  [ 7]: cnat-writeback-ip4
+  [ 8]: gso-ip4
+  [ 9]: wg4-output-tun
+  [10]: ip4-tx-urpf-strict
+  [11]: ip4-tx-urpf-loose
+  [12]: sasc-feature-arc-return
+  [13]: sasc-input-out
+  [14]: policer-output
+  [15]: pnat-output
+  [16]: nsh-md2-ioam-encap-transit
+  [17]: nat44-ei-in2out-output-worker-handoff
+  [18]: nat44-ei-in2out-output
+  [19]: tcp-mss-clamping-ip4-out
+  [20]: vxlan-gpe-transit-ioam
+  [21]: hsi4-out
+  [22]: flowprobe-output-ip4
+  [23]: ip4-qos-mark
+  [24]: vlan-ip4-qos-mark
+  [25]: ip4-dvr-reinject
+  [26]: ip4-source-and-port-range-check-tx
+  [27]: ip4-outacl
+  [28]: ipsec4-output-feature
+  [29]: interface-output
+[15] ip4-multicast:
+  [ 0]: vrrp4-accept-owner-input
+  [ 1]: ip4-qos-store
+  [ 2]: vlan-ip4-qos-record
+  [ 3]: ip4-qos-record
+  [ 4]: linux-cp-xc-l3-ip4
+  [ 5]: linux-cp-xc-ip4
+  [ 6]: flowprobe-input-ip4
+  [ 7]: ip4-sv-reassembly-mcast-feature
+  [ 8]: ip4-not-enabled
+  [ 9]: vpath-input-ip4
+  [10]: ip4-mfib-forward-lookup
+[16] ip4-unicast:
+  [ 0]: ip4-vxlan-gpe-bypass
+  [ 1]: ip4-rx-urpf-loose
+  [ 2]: ip4-rx-urpf-strict
+  [ 3]: svs-ip4
+  [ 4]: srv6-t-m-gtp4-dt
+  [ 5]: srv6-t-m-gtp4-d
+  [ 6]: srv6-as4-rewrite
+  [ 7]: srv6-ad4-flow-rewrite
+  [ 8]: srv6-ad4-rewrite
+  [ 9]: sfdp-geneve-input
+  [10]: sfdp-interface-input-ip4
+  [11]: nat-external-input
+  [12]: ip4-full-reassembly-feature
+  [13]: ip4-sv-reassembly-feature
+  [14]: sasc-input
+  [15]: ip4-pvti-bypass
+  [16]: policer-input
+  [17]: pnat-input
+  [18]: ip4-dhcp-client-detect
+  [19]: cnat-lookup-ip4
+  [20]: cnat-input-ip4
+  [21]: acl-plugin-in-ip4-fa
+  [22]: nat44-ed-out2in
+  [23]: nat44-ed-in2out
+  [24]: nat44-out2in-worker-handoff
+  [25]: nat44-in2out-worker-handoff
+  [26]: nat44-handoff-classify
+  [27]: nat44-ed-classify
+  [28]: nat-pre-out2in
+  [29]: nat-pre-in2out
+  [30]: nat64-out2in-handoff
+  [31]: nat64-out2in
+  [32]: nat44-ei-out2in-worker-handoff
+  [33]: nat44-ei-in2out-worker-handoff
+  [34]: nat44-ei-out2in
+  [35]: nat44-ei-in2out
+  [36]: nat44-ei-handoff-classify
+  [37]: nat44-ei-classify
+  [38]: ip4-map-t
+  [39]: ip4-map
+  [40]: flowprobe-input-ip4
+  [41]: ip4-source-and-port-range-check-rx
+  [42]: ip4-flow-classify
+  [43]: ip4-inacl
+  [44]: ip4-policer-classify
+  [45]: tcp-mss-clamping-ip4-in
+  [46]: ip4-qos-store
+  [47]: vlan-ip4-qos-record
+  [48]: ip4-qos-record
+  [49]: linux-cp-xc-l3-ip4
+  [50]: linux-cp-xc-ip4
+  [51]: lb-nat4-in2out
+  [52]: l3xc-input-ip4
+  [53]: hsi4-in
+  [54]: ip4-gtpu-bypass
+  [55]: det44-out2in
+  [56]: det44-in2out
+  [57]: cnat-snat-ip4-return
+  [58]: cnat-snat-ip4
+  [59]: abf-input-ip4
+  [60]: ip4-not-enabled
+  [61]: ipsec4-input-feature
+  [62]: vpath-input-ip4
+  [63]: ip4-vxlan-bypass
+  [64]: ip4-lookup
+[17] l2-output-nonip:
+  [ 0]: acl-plugin-out-nonip-l2
+  [ 1]: l2-output-feat-arc-end
+[18] l2-input-nonip:
+  [ 0]: acl-plugin-in-nonip-l2
+  [ 1]: l2-input-feat-arc-end
+[19] l2-output-ip6:
+  [ 0]: acl-plugin-out-ip6-l2
+  [ 1]: gso-l2-ip6
+  [ 2]: l2-output-feat-arc-end
+[20] l2-input-ip6:
+  [ 0]: acl-plugin-in-ip6-l2
+  [ 1]: l2-input-feat-arc-end
+[21] l2-output-ip4:
+  [ 0]: acl-plugin-out-ip4-l2
+  [ 1]: gso-l2-ip4
+  [ 2]: l2-output-feat-arc-end
+[22] l2-input-ip4:
+  [ 0]: acl-plugin-in-ip4-l2
+  [ 1]: l2-input-feat-arc-end
+[23] ethernet-output:
+  [ 0]: error-drop
+[24] error-drop:
+  [ 0]: sflow-drop
+  [ 1]: drop
+[25] interface-output:
+  [ 0]: sflow-egress
+  [ 1]: nsim-output-feature
+  [ 2]: mactime-tx
+  [ 3]: flowprobe-output-l2
+  [ 4]: ct6-in2out
+  [ 5]: stats-collect-tx
+  [ 6]: ipsec-if-output
+  [ 7]: span-output
+  [ 8]: interface-output-arc-end
+[26] port-rx-eth:
+  [ 0]: soft-rss
+  [ 1]: bond-input
+  [ 2]: p2p-ethernet-input
+  [ 3]: span-input
+  [ 4]: worker-handoff
+  [ 5]: l2-patch
+  [ 6]: ethernet-input
+[27] device-input:
+  [ 0]: srv6-as2-rewrite
+  [ 1]: srv6-ad2-rewrite
+  [ 2]: soft-rss
+  [ 3]: sflow
+  [ 4]: sfdp-dummy-dot1q-input
+  [ 5]: pppoe-input
+  [ 6]: nsim
+  [ 7]: mactime
+  [ 8]: flowprobe-input-l2
+  [ 9]: adl-input
+  [10]: pg-input-mac-filter
+  [11]: sr-pl-rewrite-encaps-l2
+  [12]: bond-input
+  [13]: stats-collect-rx
+  [14]: p2p-ethernet-input
+  [15]: span-input
+  [16]: worker-handoff
+  [17]: l2-patch
+  [18]: ethernet-input
+unknown input `host-enp0s8'
+== features host-enp0s9
+Available feature paths
+[ 0] nsh-eth-output:
+  [ 0]: error-drop
+  [ 1]: interface-output
+[ 1] arp:
+  [ 0]: vrrp4-arp-input
+  [ 1]: linux-cp-arp-host
+  [ 2]: linux-cp-arp-phy
+  [ 3]: arping-input
+  [ 4]: arp-reply
+  [ 5]: arp-proxy
+  [ 6]: arp-disabled
+  [ 7]: error-drop
+[ 2] nsh-output:
+  [ 0]: error-drop
+[ 3] mpls-output:
+  [ 0]: mpls-qos-mark
+  [ 1]: vlan-mpls-qos-mark
+  [ 2]: interface-output
+[ 4] mpls-input:
+  [ 0]: vlan-mpls-qos-record
+  [ 1]: mpls-qos-record
+  [ 2]: linux-cp-xc-mpls
+  [ 3]: mpls-not-enabled
+  [ 4]: mpls-lookup
+[ 5] ip6-drop:
+  [ 0]: error-drop
+[ 6] ip6-punt:
+  [ 0]: stn-ip6-punt
+  [ 1]: ip6-punt-acl
+  [ 2]: ip6-punt-policer
+  [ 3]: linux-cp-punt-l3
+  [ 4]: ip6-punt-redirect
+  [ 5]: error-punt
+[ 7] ip6-local:
+  [ 0]: vrrp6-nd-input
+  [ 1]: arping6-input
+  [ 2]: ip6-local-end-of-arc
+[ 8] ip6-output:
+  [ 0]: acl-plugin-out-ip6-fa
+  [ 1]: cnat-output-ip6
+  [ 2]: cnat-writeback-ip6
+  [ 3]: gso-ip6
+  [ 4]: wg6-output-tun
+  [ 5]: ip6-tx-urpf-strict
+  [ 6]: ip6-tx-urpf-loose
+  [ 7]: policer-output
+  [ 8]: tcp-mss-clamping-ip6-out
+  [ 9]: hsi6-out
+  [10]: flowprobe-output-ip6
+  [11]: ip6-qos-mark
+  [12]: vlan-ip6-qos-mark
+  [13]: ip6-dvr-reinject
+  [14]: pt
+  [15]: ip6-sv-reassembly-output-feature
+  [16]: ip6-outacl
+  [17]: ipsec6-output-feature
+  [18]: interface-output
+[ 9] ip6-multicast:
+  [ 0]: vrrp6-accept-owner-input
+  [ 1]: ip6-qos-store
+  [ 2]: vlan-ip6-qos-record
+  [ 3]: ip6-qos-record
+  [ 4]: linux-cp-xc-l3-ip6
+  [ 5]: linux-cp-xc-ip6
+  [ 6]: flowprobe-input-ip6
+  [ 7]: ip6-multicast-nd-proxy
+  [ 8]: ip6-sv-reassembly-mcast-feature
+  [ 9]: ip6-not-enabled
+  [10]: vpath-input-ip6
+  [11]: ip6-mfib-forward-lookup
+[10] ip6-unicast:
+  [ 0]: ip6-vxlan-gpe-bypass
+  [ 1]: ip6-rx-urpf-loose
+  [ 2]: ip6-rx-urpf-strict
+  [ 3]: svs-ip6
+  [ 4]: srv6-end-m-gtp6-dt
+  [ 5]: srv6-end-m-gtp6-d-di
+  [ 6]: srv6-end-m-gtp6-d
+  [ 7]: srv6-end-m-gtp6-e
+  [ 8]: srv6-end-m-gtp4-e
+  [ 9]: srv6-as6-rewrite
+  [10]: srv6-am-rewrite
+  [11]: srv6-ad6-flow-rewrite
+  [12]: srv6-ad6-rewrite
+  [13]: sfdp-interface-input-ip6
+  [14]: ip6-pvti-bypass
+  [15]: policer-input
+  [16]: ip6-sv-reassembly-feature
+  [17]: nat66-out2in
+  [18]: nat66-in2out
+  [19]: nat64-in2out-handoff
+  [20]: nat64-in2out
+  [21]: ip6-map-t
+  [22]: ip6-full-reassembly-feature
+  [23]: ip6-map
+  [24]: flowprobe-input-ip6
+  [25]: cnat-lookup-ip6
+  [26]: cnat-input-ip6
+  [27]: acl-plugin-in-ip6-fa
+  [28]: ip6-flow-classify
+  [29]: ip6-inacl
+  [30]: ip6-policer-classify
+  [31]: tcp-mss-clamping-ip6-in
+  [32]: ip6-qos-store
+  [33]: vlan-ip6-qos-record
+  [34]: ip6-qos-record
+  [35]: linux-cp-xc-l3-ip6
+  [36]: linux-cp-xc-ip6
+  [37]: lb-nat6-in2out
+  [38]: l3xc-input-ip6
+  [39]: sir-to-ila
+  [40]: hsi6-in
+  [41]: ip6-gtpu-bypass
+  [42]: ct6-out2in
+  [43]: cnat-snat-ip6-return
+  [44]: cnat-snat-ip6
+  [45]: abf-input-ip6
+  [46]: ip6-unicast-nd-proxy
+  [47]: ip6-not-enabled
+  [48]: ipsec6-input-feature
+  [49]: l2tp-decap
+  [50]: vpath-input-ip6
+  [51]: ip6-vxlan-bypass
+  [52]: ip6-lookup
+[11] ip4-drop:
+  [ 0]: error-drop
+[12] ip4-punt:
+  [ 0]: stn-ip4-punt
+  [ 1]: ip4-punt-acl
+  [ 2]: ip4-punt-policer
+  [ 3]: linux-cp-punt-l3
+  [ 4]: ip4-punt-redirect
+  [ 5]: error-punt
+[13] ip4-local:
+  [ 0]: nat44-ei-hairpinning
+  [ 1]: syn-filter-4
+  [ 2]: ip4-local-end-of-arc
+[14] ip4-output:
+  [ 0]: sr-wg4-encap
+  [ 1]: ip4-sv-reassembly-output-feature
+  [ 2]: nat44-ed-in2out-output
+  [ 3]: nat44-in2out-output-worker-handoff
+  [ 4]: nat-pre-in2out-output
+  [ 5]: acl-plugin-out-ip4-fa
+  [ 6]: cnat-output-ip4
+  [ 7]: cnat-writeback-ip4
+  [ 8]: gso-ip4
+  [ 9]: wg4-output-tun
+  [10]: ip4-tx-urpf-strict
+  [11]: ip4-tx-urpf-loose
+  [12]: sasc-feature-arc-return
+  [13]: sasc-input-out
+  [14]: policer-output
+  [15]: pnat-output
+  [16]: nsh-md2-ioam-encap-transit
+  [17]: nat44-ei-in2out-output-worker-handoff
+  [18]: nat44-ei-in2out-output
+  [19]: tcp-mss-clamping-ip4-out
+  [20]: vxlan-gpe-transit-ioam
+  [21]: hsi4-out
+  [22]: flowprobe-output-ip4
+  [23]: ip4-qos-mark
+  [24]: vlan-ip4-qos-mark
+  [25]: ip4-dvr-reinject
+  [26]: ip4-source-and-port-range-check-tx
+  [27]: ip4-outacl
+  [28]: ipsec4-output-feature
+  [29]: interface-output
+[15] ip4-multicast:
+  [ 0]: vrrp4-accept-owner-input
+  [ 1]: ip4-qos-store
+  [ 2]: vlan-ip4-qos-record
+  [ 3]: ip4-qos-record
+  [ 4]: linux-cp-xc-l3-ip4
+  [ 5]: linux-cp-xc-ip4
+  [ 6]: flowprobe-input-ip4
+  [ 7]: ip4-sv-reassembly-mcast-feature
+  [ 8]: ip4-not-enabled
+  [ 9]: vpath-input-ip4
+  [10]: ip4-mfib-forward-lookup
+[16] ip4-unicast:
+  [ 0]: ip4-vxlan-gpe-bypass
+  [ 1]: ip4-rx-urpf-loose
+  [ 2]: ip4-rx-urpf-strict
+  [ 3]: svs-ip4
+  [ 4]: srv6-t-m-gtp4-dt
+  [ 5]: srv6-t-m-gtp4-d
+  [ 6]: srv6-as4-rewrite
+  [ 7]: srv6-ad4-flow-rewrite
+  [ 8]: srv6-ad4-rewrite
+  [ 9]: sfdp-geneve-input
+  [10]: sfdp-interface-input-ip4
+  [11]: nat-external-input
+  [12]: ip4-full-reassembly-feature
+  [13]: ip4-sv-reassembly-feature
+  [14]: sasc-input
+  [15]: ip4-pvti-bypass
+  [16]: policer-input
+  [17]: pnat-input
+  [18]: ip4-dhcp-client-detect
+  [19]: cnat-lookup-ip4
+  [20]: cnat-input-ip4
+  [21]: acl-plugin-in-ip4-fa
+  [22]: nat44-ed-out2in
+  [23]: nat44-ed-in2out
+  [24]: nat44-out2in-worker-handoff
+  [25]: nat44-in2out-worker-handoff
+  [26]: nat44-handoff-classify
+  [27]: nat44-ed-classify
+  [28]: nat-pre-out2in
+  [29]: nat-pre-in2out
+  [30]: nat64-out2in-handoff
+  [31]: nat64-out2in
+  [32]: nat44-ei-out2in-worker-handoff
+  [33]: nat44-ei-in2out-worker-handoff
+  [34]: nat44-ei-out2in
+  [35]: nat44-ei-in2out
+  [36]: nat44-ei-handoff-classify
+  [37]: nat44-ei-classify
+  [38]: ip4-map-t
+  [39]: ip4-map
+  [40]: flowprobe-input-ip4
+  [41]: ip4-source-and-port-range-check-rx
+  [42]: ip4-flow-classify
+  [43]: ip4-inacl
+  [44]: ip4-policer-classify
+  [45]: tcp-mss-clamping-ip4-in
+  [46]: ip4-qos-store
+  [47]: vlan-ip4-qos-record
+  [48]: ip4-qos-record
+  [49]: linux-cp-xc-l3-ip4
+  [50]: linux-cp-xc-ip4
+  [51]: lb-nat4-in2out
+  [52]: l3xc-input-ip4
+  [53]: hsi4-in
+  [54]: ip4-gtpu-bypass
+  [55]: det44-out2in
+  [56]: det44-in2out
+  [57]: cnat-snat-ip4-return
+  [58]: cnat-snat-ip4
+  [59]: abf-input-ip4
+  [60]: ip4-not-enabled
+  [61]: ipsec4-input-feature
+  [62]: vpath-input-ip4
+  [63]: ip4-vxlan-bypass
+  [64]: ip4-lookup
+[17] l2-output-nonip:
+  [ 0]: acl-plugin-out-nonip-l2
+  [ 1]: l2-output-feat-arc-end
+[18] l2-input-nonip:
+  [ 0]: acl-plugin-in-nonip-l2
+  [ 1]: l2-input-feat-arc-end
+[19] l2-output-ip6:
+  [ 0]: acl-plugin-out-ip6-l2
+  [ 1]: gso-l2-ip6
+  [ 2]: l2-output-feat-arc-end
+[20] l2-input-ip6:
+  [ 0]: acl-plugin-in-ip6-l2
+  [ 1]: l2-input-feat-arc-end
+[21] l2-output-ip4:
+  [ 0]: acl-plugin-out-ip4-l2
+  [ 1]: gso-l2-ip4
+  [ 2]: l2-output-feat-arc-end
+[22] l2-input-ip4:
+  [ 0]: acl-plugin-in-ip4-l2
+  [ 1]: l2-input-feat-arc-end
+[23] ethernet-output:
+  [ 0]: error-drop
+[24] error-drop:
+  [ 0]: sflow-drop
+  [ 1]: drop
+[25] interface-output:
+  [ 0]: sflow-egress
+  [ 1]: nsim-output-feature
+  [ 2]: mactime-tx
+  [ 3]: flowprobe-output-l2
+  [ 4]: ct6-in2out
+  [ 5]: stats-collect-tx
+  [ 6]: ipsec-if-output
+  [ 7]: span-output
+  [ 8]: interface-output-arc-end
+[26] port-rx-eth:
+  [ 0]: soft-rss
+  [ 1]: bond-input
+  [ 2]: p2p-ethernet-input
+  [ 3]: span-input
+  [ 4]: worker-handoff
+  [ 5]: l2-patch
+  [ 6]: ethernet-input
+[27] device-input:
+  [ 0]: srv6-as2-rewrite
+  [ 1]: srv6-ad2-rewrite
+  [ 2]: soft-rss
+  [ 3]: sflow
+  [ 4]: sfdp-dummy-dot1q-input
+  [ 5]: pppoe-input
+  [ 6]: nsim
+  [ 7]: mactime
+  [ 8]: flowprobe-input-l2
+  [ 9]: adl-input
+  [10]: pg-input-mac-filter
+  [11]: sr-pl-rewrite-encaps-l2
+  [12]: bond-input
+  [13]: stats-collect-rx
+  [14]: p2p-ethernet-input
+  [15]: span-input
+  [16]: worker-handoff
+  [17]: l2-patch
+  [18]: ethernet-input
+unknown input `host-enp0s9'
+== nat44 ei interfaces
+NAT44 interfaces:
+== nat44 ei sessions
+NAT44 sessions:
+-------- thread 0 vpp_main: 0 sessions --------
+== nat44 ei addresses
+NAT44 pool addresses:
+== errors (nat/drop tail)
+         9             arp-reply             IP4 destination address not local t   error  
+        16             arp-input               IP4 destination address is unset    error  
+== lcp pairs
+lcp default netns '<unset>'
+lcp lcp-auto-subint on
+lcp lcp-sync on
+lcp lcp-sync-unnumbered on
+lcp del-static-on-link-down off
+lcp del-dynamic-on-link-down off
+itf-pair: [0] host-enp0s8 tap4096 lcp-x0 6 type tap
+itf-pair: [1] host-enp0s9 tap4097 vpp0 7 type tap
+== abf
+show abf: unknown input `'
+== on-box watchdog log
+
