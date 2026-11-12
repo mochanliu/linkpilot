@@ -81,6 +81,11 @@ type Artifacts struct {
 	// omitempty 只放过没有策略的旧包；新发布的包即使策略清空也要带空数组，
 	// 否则"删掉最后一条策略"永远到不了盒子。
 	Policy string `json:"policy,omitempty"`
+	// Services is bundle 第 8 段: 服务面（NAT/DHCP/DNS）。DHCP/DNS 落成
+	// /etc/sdwan/svc.json 交给 sr-svc（见 services.go）；NAT 行只随包携带、
+	// 暂不下发（nat44_ei 数据面缺陷，见 services.go 的头部说明）。
+	// omitempty 只放过该段出现之前发布的旧包。
+	Services string `json:"services,omitempty"`
 }
 
 // Bundle is what the controller hands out and what the box persists.
@@ -141,16 +146,18 @@ type Installed struct {
 	Srfrr    string
 	Vrrp     string
 	Policy   string
+	Services string
 }
 
 const (
-	frrFile    = "frr.conf"
-	vppFile    = "vpp.conf"
-	bootFile   = "boot.sh"
-	routeFile  = "route.json"
-	srfrrFile  = "srfrr.json"
-	vrrpFile   = "vrrp.json"
-	policyFile = "policy.json"
+	frrFile      = "frr.conf"
+	vppFile      = "vpp.conf"
+	bootFile     = "boot.sh"
+	routeFile    = "route.json"
+	srfrrFile    = "srfrr.json"
+	vrrpFile     = "vrrp.json"
+	policyFile   = "policy.json"
+	servicesFile = "services.json"
 )
 
 // artifactFile is one file inside a version directory.
@@ -200,7 +207,7 @@ func (s Store) Install(b Bundle) (Installed, error) {
 		if cur.FRR != b.Artifacts.FRR || cur.VPP != b.Artifacts.VPP ||
 			cur.Boot != b.Artifacts.Boot || cur.Route != b.Artifacts.Route ||
 			cur.Srfrr != b.Artifacts.Srfrr || cur.Vrrp != b.Artifacts.Vrrp ||
-			cur.Policy != b.Artifacts.Policy {
+			cur.Policy != b.Artifacts.Policy || cur.Services != b.Artifacts.Services {
 			return Installed{}, fmt.Errorf("version %d is already installed with different content", b.Version)
 		}
 		return cur, nil
@@ -228,6 +235,9 @@ func (s Store) Install(b Bundle) (Installed, error) {
 	}
 	if b.Artifacts.Policy != "" {
 		files = append(files, artifactFile{name: policyFile, content: b.Artifacts.Policy})
+	}
+	if b.Artifacts.Services != "" {
+		files = append(files, artifactFile{name: servicesFile, content: b.Artifacts.Services})
 	}
 	hashes := make(map[string]string, len(files))
 	for _, f := range files {
@@ -307,6 +317,7 @@ func (s Store) read(version int) (Installed, error) {
 		{srfrrFile, &inst.Srfrr, true},
 		{vrrpFile, &inst.Vrrp, true},
 		{policyFile, &inst.Policy, true},
+		{servicesFile, &inst.Services, true},
 	} {
 		data, err := os.ReadFile(filepath.Join(dir, f.name))
 		if os.IsNotExist(err) && f.optional {
@@ -444,7 +455,10 @@ type Applier struct {
 	DialVRRP func(ctx context.Context, socket string) (vrrpPlane, error)
 	// DialPolicy opens the ACL/ABF plane (7th segment). Same seam, same default.
 	DialPolicy func(ctx context.Context, socket string) (policyPlane, error)
-	Wait       time.Duration
+	// SvcConf is the box's sr-svc config file. The services segment's DHCP/DNS
+	// half lands here (see services.go).
+	SvcConf string
+	Wait    time.Duration
 	DryRun     bool
 	Exec       Executor
 	Sleep      func(time.Duration)
@@ -513,6 +527,9 @@ func (a *Applier) setDefaults() {
 	}
 	if a.DialPolicy == nil {
 		a.DialPolicy = def.DialPolicy
+	}
+	if a.SvcConf == "" {
+		a.SvcConf = svcFile
 	}
 	if a.HTTP == nil {
 		a.HTTP = def.HTTP
@@ -599,9 +616,9 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		return fmt.Errorf("read current version: %w", perr)
 	}
 	if a.DryRun {
-		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B, srfrr %d B, vrrp %d B, policy %d B)", b.Version,
+		a.Logf("would install version %d (frr %d B, vpp %d B, boot %d B, route %d B, srfrr %d B, vrrp %d B, policy %d B, services %d B)", b.Version,
 			len(b.Artifacts.FRR), len(b.Artifacts.VPP), len(b.Artifacts.Boot), len(b.Artifacts.Route),
-			len(b.Artifacts.Srfrr), len(b.Artifacts.Vrrp), len(b.Artifacts.Policy))
+			len(b.Artifacts.Srfrr), len(b.Artifacts.Vrrp), len(b.Artifacts.Policy), len(b.Artifacts.Services))
 		inst := Installed{
 			Dir:      "<dry-run>",
 			Manifest: Manifest{Version: b.Version},
@@ -612,6 +629,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 			Srfrr:    b.Artifacts.Srfrr,
 			Vrrp:     b.Artifacts.Vrrp,
 			Policy:   b.Artifacts.Policy,
+			Services: b.Artifacts.Services,
 		}
 		if err := a.replay(ctx, inst); err != nil {
 			return err
@@ -624,6 +642,9 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 			return err
 		}
 		if err := a.applyPolicy(ctx, inst); err != nil {
+			return err
+		}
+		if _, err := a.applyServices(ctx, inst); err != nil {
 			return err
 		}
 		return a.applyVRRP(ctx, inst)
@@ -673,6 +694,16 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 	if err == nil {
 		err = a.applyPolicy(ctx, inst)
 	}
+	// Services before VRRP too: DHCP/DNS 是服务面，写文件 + 重载 sr-svc；NAT 行
+	// 只随包携带（见 services.go 的头部说明）。失败同 policy 一样拦住 VRRP。
+	if err == nil {
+		note, serr := a.applyServices(ctx, inst)
+		if serr != nil {
+			err = serr
+		} else if note != "" {
+			notes = append(notes, note)
+		}
+	}
 	// VRRP is the very last thing: the VIP is this box's claim to be the site's
 	// first hop, and a box whose remaining segments only half landed must not win
 	// it. If anything above failed, the peer keeps the address.
@@ -721,9 +752,18 @@ func (a *Applier) Boot(ctx context.Context, frrDiff bool) error {
 		}
 	}
 	// Policy here too: ACL/ABF are VPP memory as well, and a restarted VPP comes
-	// back with neither. Same order as a hot apply -- policy, then VRRP.
+	// back with neither. Same order as a hot apply -- policy, then services,
+	// then VRRP.
 	if err == nil {
 		err = a.applyPolicy(ctx, inst)
+	}
+	if err == nil {
+		note, serr := a.applyServices(ctx, inst)
+		if serr != nil {
+			err = serr
+		} else if note != "" {
+			notes = append(notes, note)
+		}
 	}
 	// VRRP last here too. The VRs are VPP's own memory -- they are in no file --
 	// so whatever a VPP restart erases, it erases them, and without this replay a

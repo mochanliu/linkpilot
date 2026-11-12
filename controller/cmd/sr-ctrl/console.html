@@ -347,6 +347,7 @@
       <a class="child" href="#leak-to-sdwan" data-view="leak-to-sdwan" data-roles="tenant">路由泄露 · CPE-SDWAN</a>
       <a class="child" href="#leak-to-cpe" data-view="leak-to-cpe" data-roles="tenant">路由泄露 · SDWAN-CPE</a>
       <a class="child" href="#policy" data-view="policy" data-roles="tenant">SD-WAN 策略</a>
+      <a class="child" href="#services" data-view="services" data-roles="tenant">服务配置（NAT / DHCP / DNS）</a>
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a class="child" href="#ops" data-view="ops" data-roles="tenant">台账与告警</a>
@@ -841,6 +842,15 @@
         "兜底是每 VRF 每颜色一个开关：勾上 = 该颜色查不到时退到颜色 0（本 VPN 主表）而不是丢掉。" +
         "保存只写草稿，发布走和「基础配置」同一条路径",
       roles: ["tenant"]
+    },
+    services: {
+      title: "服务配置 · NAT / DHCP / DNS",
+      sub: "一行 = 一条服务：NAT 出口把客户口的流量翻译到地址池地址，DHCP server 给客户口子网发地址，" +
+        "DNS 转发器听客户口地址的 53。行都挂在基础配置里的客户口（VPP 名）上，" +
+        "地址、掩码、内核 TAP 名在发布时解出来冻进配置包。DHCP/DNS 由盒子上的 sr-svc 用户态进程执行，" +
+        "NAT 行因 VPP 26.06 NAT44 插件的数据面缺陷暂不下发（页面上会标明）。" +
+        "保存只写草稿，发布走和「基础配置」同一条路径",
+      roles: ["tenant"]
     }
   };
 
@@ -909,6 +919,7 @@
     else if (S.view === "leak-to-sdwan") c = viewLeakToSDWAN();
     else if (S.view === "leak-to-cpe") c = viewLeakToCPE();
     else if (S.view === "policy") c = viewPolicy();
+    else if (S.view === "services") c = viewServices();
     else if (S.view === "monitor") c = viewMonitor();
     else if (S.view === "ops") c = viewOps();
     else if (S.view === "diag") c = viewDiag();
@@ -7955,6 +7966,400 @@
     r[f] = el.value;
   }
 
+  /* ---------------- 服务配置：NAT 出口 / DHCP server / DNS 转发器 ---------------- */
+  //
+  // 和策略页同一套交互骨架：按设备读、整份草稿、整份保存、发布走 /api/config/publish。
+  // 行的挂点是基础配置里的客户口（VPP 名），所以 VPN 不让手填 —— 选了口就从口的
+  // VPN 带出来，"VPN 与客户口不一致"这类校验错误根本没机会产生。
+  //
+  // 输入框的 input 只写 S.sv.draft 不重画（重画弹光标）；结构性动作（加行/删行/
+  // 换设备/保存后刷新）才走 render()。校验是服务端算的，只反映已保存那一版。
+
+  function svStore() {
+    if (!S.sv) S.sv = { node: 0, doc: null, at: 0, loading: false, note: null, draft: null, busy: false };
+    return S.sv;
+  }
+
+  function svRole() { return !!(S.me && S.me.role === "tenant"); }
+
+  function svNodes() {
+    return ((S.state && S.state.nodes) || []).slice().sort(function (a, b) { return a.node_id - b.node_id; });
+  }
+
+  function ensureServices() {
+    var o = svStore();
+    if (!svRole()) return o;
+    var ns = svNodes();
+    if (!o.node && ns.length) o.node = ns[0].node_id;
+    if (o.node && o.doc && o.doc.node_id !== o.node) { o.doc = null; o.draft = null; }
+    if (o.node && !o.loading && (!o.doc || nowSec() - o.at >= 10)) svLoad(false);
+    return o;
+  }
+
+  function svLoad(force) {
+    var o = svStore();
+    if (!svRole() || o.loading || !o.node) return;
+    if (!force && o.doc && o.doc.node_id === o.node && nowSec() - o.at < 10) return;
+    o.loading = true;
+    api("GET", "/api/services?node=" + o.node).then(function (doc) {
+      o.loading = false;
+      if (!doc) { render(); return; }
+      svSetDoc(doc);
+      if (o.note && o.note.fromLoad) o.note = null;
+      render();
+    }).catch(function (err) {
+      o.loading = false;
+      o.note = undErrNote(err);
+      o.note.fromLoad = true;
+      render();
+    });
+  }
+
+  function svSetDoc(doc) {
+    var o = svStore();
+    var same = o.doc && o.doc.node_id === doc.node_id;
+    // 与策略页同一 consideration：先拿旧 doc 判"草稿干净吗"，再换 doc，
+    // 后台刷新才不会把用户没保存的输入标丢或盖掉。
+    var clean = !o.draft || !o.doc || !svDirty(o);
+    o.doc = doc;
+    o.at = nowSec();
+    o.loading = false;
+    if (!same || clean || !o.draft) o.draft = svDraftOf(doc);
+  }
+
+  function svDraftOf(doc) {
+    var svc = doc.services || {};
+    var nat = (svc.nat || []).map(function (r) {
+      return { on: !!r.on, vpn: r.vpn || 0, inside: r.inside || "", outside: r.outside || "",
+        pool: (r.pool || []).slice(), mss_clamp: r.mss_clamp || 0 };
+    });
+    var dhcp = (svc.dhcp || []).map(function (r) {
+      return { vpn: r.vpn || 0, vpp: r.vpp || "", start: r.start || "", end: r.end || "",
+        lease_sec: r.lease_sec || 0, router: r.router || "", dns: r.dns || "" };
+    });
+    var dns = (svc.dns || []).map(function (r) {
+      return { vpn: r.vpn || 0, vpp: r.vpp || "", upstream: (r.upstream || []).slice() };
+    });
+    // 与 plDraftOf 同理：不带版本号，"有没有改动"只回答服务段会不会变。
+    return { nat: nat, dhcp: dhcp, dns: dns };
+  }
+
+  function svDirty(o) {
+    if (!o.doc || !o.draft) return false;
+    return JSON.stringify(svDraftOf(o.doc)) !== JSON.stringify(o.draft);
+  }
+
+  function svIfaceOf(doc, vpp) {
+    var out = null;
+    (doc.ifaces || []).forEach(function (it) { if (it.vpp === vpp) out = it; });
+    return out;
+  }
+
+  function svIfaceLabel(doc, vpp) {
+    var it = svIfaceOf(doc, vpp);
+    if (!it) return vpp || "—";
+    return it.vpp + " · " + (it.ip ? it.ip + "/" + it.prefix_len : "无地址") + " · VPN " + it.vpn;
+  }
+
+  // 行的 VPN 由客户口带出来：口换了 VPN 跟着换，页面上只读显示。
+  function svRowVPN(doc, r) {
+    var it = svIfaceOf(doc, r.inside || r.vpp || "");
+    return it ? it.vpn : (r.vpn || 0);
+  }
+
+  function svIfaceOptions(doc, cur) {
+    var h = "";
+    var seen = false;
+    (doc.ifaces || []).forEach(function (it) {
+      var sel = it.vpp === cur;
+      if (sel) seen = true;
+      h += '<option value="' + esc(it.vpp) + '"' + (sel ? " selected" : "") + ">" +
+        esc(it.vpp + " · " + (it.ip ? it.ip + "/" + it.prefix_len : "无地址") + " · VPN " + it.vpn) +
+        (it.vpn ? "" : "（VPN 0）") + "</option>";
+    });
+    if (!seen && cur) h += '<option value="' + esc(cur) + '" selected>' + esc(cur) + "（不在基础配置里）</option>";
+    return h;
+  }
+
+  function viewServices() {
+    var o = ensureServices();
+    if (!svRole()) return '<section class="panel"><div class="empty">只有租户账号能配置服务。</div></section>';
+    var ns = svNodes();
+    if (!ns.length) {
+      return '<section class="panel"><div class="empty">这个租户还没有设备：先入网一台，服务才有地方落。</div></section>';
+    }
+    if (!o.doc || o.doc.node_id !== o.node) {
+      return '<section class="panel"><div class="empty">' +
+        esc(o.note ? o.note.text : "正在读取服务配置…") + "</div></section>";
+    }
+    var doc = o.doc, d = o.draft, dirty = svDirty(o);
+    var h = '<div id="sv-root">';
+    if (o.note) h += undNote(o.note);
+
+    /* --- 顶栏：选设备 + 版本 + 两个按钮 --- */
+    h += '<section class="panel"><header><h2>设备</h2></header><div class="pl-bar">' +
+      '<div class="field"><label for="sv-node">设备</label><select id="sv-node" data-sv-node>' +
+      ns.map(function (n) {
+        return '<option value="' + n.node_id + '"' + (n.node_id === o.node ? " selected" : "") + ">" +
+          esc("node-" + n.node_id + " · " + n.serial) + "</option>";
+      }).join("") + "</select></div>" +
+      '<div class="field grow"><label>版本</label><div class="muted">草稿 v' + doc.version +
+      (doc.published_version ? " · 已发布 v" + doc.published_version : " · 还没发布过") +
+      (doc.pending ? ' · <span class="tag plan">有未发布的改动</span>' : "") +
+      "</div></div>" +
+      '<div class="row-actions">' +
+      '<button class="primary" type="button" data-sv="save"' + (o.busy ? " disabled" : "") + ">保存草稿</button>" +
+      '<button type="button" data-sv="publish"' + (o.busy ? " disabled" : "") + ">发布到设备</button>" +
+      "</div></div>" +
+      (dirty ? '<div class="hint"><span class="tag plan">页面上的改动还没保存</span></div>' : "") +
+      "</section>";
+
+    /* --- NAT 暂不下发的说明 --- */
+    if (doc.nat_pending) {
+      h += '<section class="panel"><header><h2>NAT 暂不下发</h2></header>' +
+        '<div class="hint">' + esc(doc.nat_pending) + "</div></section>";
+    }
+
+    /* --- NAT 出口 --- */
+    h += '<section class="panel"><header><h2>NAT 出口</h2>' +
+      '<div class="row-actions"><button class="small" type="button" data-sv="nat-add">加一行</button></div></header>' +
+      '<div class="hint">' + esc(doc.notes.nat) + "</div>";
+    if (!d.nat.length) {
+      h += '<div class="empty">还没有 NAT 行。</div>';
+    } else {
+      h += '<table><thead><tr>' +
+        "<th>启用</th><th>客户口（inside）</th><th>出口口（outside）</th><th>VPN</th><th>地址池</th><th>MSS 钳制</th><th></th>" +
+        "</tr></thead><tbody>" + d.nat.map(function (r, i) { return svNATRowHtml(doc, r, i); }).join("") +
+        "</tbody></table>";
+    }
+    h += "</section>";
+
+    /* --- DHCP server --- */
+    h += '<section class="panel"><header><h2>DHCP server</h2>' +
+      '<div class="row-actions"><button class="small" type="button" data-sv="dhcp-add">加一行</button></div></header>' +
+      '<div class="hint">' + esc(doc.notes.dhcp) + "</div>";
+    if (!d.dhcp.length) {
+      h += '<div class="empty">还没有 DHCP 行。</div>';
+    } else {
+      h += '<table><thead><tr>' +
+        "<th>客户口</th><th>VPN</th><th>池起点</th><th>池终点</th><th>租约（秒）</th><th>下发给客户的网关</th><th>下发给客户的 DNS</th><th></th>" +
+        "</tr></thead><tbody>" + d.dhcp.map(function (r, i) { return svDHCPRowHtml(doc, r, i); }).join("") +
+        "</tbody></table>";
+    }
+    h += "</section>";
+
+    /* --- DNS 转发器 --- */
+    h += '<section class="panel"><header><h2>DNS 转发器</h2>' +
+      '<div class="row-actions"><button class="small" type="button" data-sv="dns-add">加一行</button></div></header>' +
+      '<div class="hint">' + esc(doc.notes.dns) + "</div>";
+    if (!d.dns.length) {
+      h += '<div class="empty">还没有 DNS 行。</div>';
+    } else {
+      h += '<table><thead><tr>' +
+        "<th>客户口（监听它的地址 :53）</th><th>VPN</th><th>上游解析器</th><th></th>" +
+        "</tr></thead><tbody>" + d.dns.map(function (r, i) { return svDNSRowHtml(doc, r, i); }).join("") +
+        "</tbody></table>";
+    }
+    h += "</section>";
+
+    /* --- 校验 --- */
+    h += '<section class="panel"><header><h2>校验</h2></header>' +
+      (dirty ? '<div class="hint">下面是<b>已保存那一版</b>的校验结果。改动保存后会重新校验 —— ' +
+        "没保存的改动在这一页上不受校验约束。</div>" : "") +
+      (doc.checks && doc.checks.length
+        ? '<ul class="chk-list">' + doc.checks.map(undCheckRow).join("") + "</ul>"
+        : '<div class="empty">没有校验结果。</div>') + "</section>";
+
+    /* --- 第 8 段原文 --- */
+    h += '<section class="panel"><header><h2>下发内容（配置包第 8 段）</h2></header>' +
+      '<div class="hint">这一段是设备真正读的东西：客户口在发布时解出地址/掩码和内核 TAP 名冻进段里，' +
+      "盒子上的 sr-svc 进程读它起 DHCP/DNS 监听（配置改动由 sr-apply 发 SIGHUP 重载，租约不丢）。</div>" +
+      '<pre class="cmd">' + esc(doc.artifact || "(空)") + "</pre></section>";
+
+    h += '<section class="panel"><header><h2>这一页与发布的关系</h2></header><div class="hint">' +
+      esc(doc.notes.publish) + " 发布走 <code>POST /api/config/publish</code>（和「基础配置」同一条路径），" +
+      "设备在下一次心跳（≤" + esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
+      " 秒）拉取。</div></section>";
+    return h + "</div>";
+  }
+
+  function svNATRowHtml(doc, r, i) {
+    var last = doc.ifaces && doc.ifaces.length;
+    var h = "<tr>";
+    h += '<td><label class="chk"><input type="checkbox" data-sv-row="' + i + '" data-sv-k="nat" data-sv-f="on"' +
+      (r.on ? " checked" : "") + "></label></td>";
+    h += '<td><select data-sv-row="' + i + '" data-sv-k="nat" data-sv-f="inside">' +
+      svIfaceOptions(doc, r.inside) + "</select></td>";
+    h += '<td><select data-sv-row="' + i + '" data-sv-k="nat" data-sv-f="outside"' + (last ? "" : " disabled") + ">" +
+      '<option value=""' + (!r.outside ? " selected" : "") + ">（选出口口）</option>" +
+      svIfaceOptions(doc, r.outside) + "</select></td>";
+    h += '<td class="muted">VPN ' + svRowVPN(doc, r) + "</td>";
+    h += '<td><input data-sv-row="' + i + '" data-sv-k="nat" data-sv-f="pool" value="' +
+      esc((r.pool || []).join(" ")) + '" placeholder="192.168.1.201 192.168.1.202（空格或逗号分隔）" spellcheck="false"></td>';
+    h += '<td><input type="number" min="0" data-sv-row="' + i + '" data-sv-k="nat" data-sv-f="mss_clamp" value="' +
+      esc(r.mss_clamp || "") + '" placeholder="不钳制"></td>';
+    h += '<td class="row-actions"><button class="small danger" type="button" data-sv="nat-del" data-i="' + i + '">删除</button></td>';
+    return h + "</tr>";
+  }
+
+  function svDHCPRowHtml(doc, r, i) {
+    var h = "<tr>";
+    h += '<td><select data-sv-row="' + i + '" data-sv-k="dhcp" data-sv-f="vpp">' +
+      svIfaceOptions(doc, r.vpp) + "</select></td>";
+    h += '<td class="muted">VPN ' + svRowVPN(doc, r) + "</td>";
+    h += '<td><input data-sv-row="' + i + '" data-sv-k="dhcp" data-sv-f="start" value="' + esc(r.start) +
+      '" placeholder="192.168.10.100" spellcheck="false"></td>';
+    h += '<td><input data-sv-row="' + i + '" data-sv-k="dhcp" data-sv-f="end" value="' + esc(r.end) +
+      '" placeholder="192.168.10.200" spellcheck="false"></td>';
+    h += '<td><input type="number" min="300" data-sv-row="' + i + '" data-sv-k="dhcp" data-sv-f="lease_sec" value="' +
+      esc(r.lease_sec || "") + '" placeholder="86400（默认 24h）"></td>';
+    h += '<td><input data-sv-row="' + i + '" data-sv-k="dhcp" data-sv-f="router" value="' + esc(r.router) +
+      '" placeholder="留空 = 客户口地址" spellcheck="false"></td>';
+    h += '<td><input data-sv-row="' + i + '" data-sv-k="dhcp" data-sv-f="dns" value="' + esc(r.dns) +
+      '" placeholder="留空 = 本机转发器" spellcheck="false"></td>';
+    h += '<td class="row-actions"><button class="small danger" type="button" data-sv="dhcp-del" data-i="' + i + '">删除</button></td>';
+    return h + "</tr>";
+  }
+
+  function svDNSRowHtml(doc, r, i) {
+    var h = "<tr>";
+    h += '<td><select data-sv-row="' + i + '" data-sv-k="dns" data-sv-f="vpp">' +
+      svIfaceOptions(doc, r.vpp) + "</select></td>";
+    h += '<td class="muted">VPN ' + svRowVPN(doc, r) + "</td>";
+    h += '<td><input data-sv-row="' + i + '" data-sv-k="dns" data-sv-f="upstream" value="' +
+      esc((r.upstream || []).join(" ")) + '" placeholder="上游 IP，空格分隔；留空 = 只回 SERVFAIL" spellcheck="false"></td>';
+    h += '<td class="row-actions"><button class="small danger" type="button" data-sv="dns-del" data-i="' + i + '">删除</button></td>';
+    return h + "</tr>";
+  }
+
+  function svAdd(kind) {
+    var o = svStore();
+    if (!o.draft || !o.doc) return;
+    var it = (o.doc.ifaces || [])[0] || null;
+    var vpn = it ? it.vpn : 0;
+    var vpp = it ? it.vpp : "";
+    if (kind === "nat") {
+      o.draft.nat.push({ on: true, vpn: vpn, inside: vpp, outside: "", pool: [], mss_clamp: 0 });
+    } else if (kind === "dhcp") {
+      o.draft.dhcp.push({ vpn: vpn, vpp: vpp, start: "", end: "", lease_sec: 86400, router: "", dns: "" });
+    } else {
+      o.draft.dns.push({ vpn: vpn, vpp: vpp, upstream: [] });
+    }
+    blurContent();
+    render();
+  }
+
+  function svDel(kind, i) {
+    var o = svStore();
+    if (!o.draft) return;
+    o.draft[kind].splice(i, 1);
+    blurContent();
+    render();
+  }
+
+  function svSave(publish) {
+    var o = svStore();
+    if (!o.doc || !o.draft || o.busy) return;
+    var nodeID = o.doc.node_id;
+    o.busy = true;
+    var body = { node_id: nodeID, services: { nat: o.draft.nat, dhcp: o.draft.dhcp, dns: o.draft.dns } };
+    api("PUT", "/api/services", body).then(function (res) {
+      o.busy = false;
+      o.note = { text: res.changed
+        ? "草稿已保存（v" + res.services.version + "）。设备要等「发布到设备」之后才会拿到。"
+        : "内容和已保存的一样，版本没有动。" };
+      svSetDoc(res.services);
+      o.draft = svDraftOf(res.services);
+      blurContent();
+      if (publish) return svPublish();
+      render();
+    }).catch(function (err) {
+      o.busy = false;
+      o.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function svPublish() {
+    var o = svStore();
+    if (!o.doc || o.busy) return;
+    var nodeID = o.doc.node_id;
+    o.busy = true;
+    api("POST", "/api/config/publish", { node_id: nodeID }).then(function (view) {
+      o.busy = false;
+      o.note = { text: "已发布 v" + view.published_version + "。设备在下一次心跳时拉取；装没装上要以设备回报为准。" };
+      o.doc = null;
+      svLoad(true);
+    }).catch(function (err) {
+      o.busy = false;
+      o.note = undErrNote(err);
+      render();
+    });
+  }
+
+  function svClick(ev) {
+    var el = ev.target.closest ? ev.target.closest("[data-sv]") : null;
+    if (!el) return;
+    var act = el.getAttribute("data-sv");
+    var i = Number(el.getAttribute("data-i"));
+    if (act === "save") svSave(false);
+    else if (act === "publish") svSave(true);
+    else if (act === "nat-add") svAdd("nat");
+    else if (act === "dhcp-add") svAdd("dhcp");
+    else if (act === "dns-add") svAdd("dns");
+    else if (act === "nat-del") svDel("nat", i);
+    else if (act === "dhcp-del") svDel("dhcp", i);
+    else if (act === "dns-del") svDel("dns", i);
+  }
+
+  function svChange(ev) {
+    var el = ev.target;
+    if (!el || !el.getAttribute) return;
+    var o = svStore();
+    if (el.getAttribute("data-sv-node") != null) {
+      o.node = Number(el.value);
+      o.doc = null;
+      o.draft = null;
+      o.note = null;
+      blurContent();
+      svLoad(true);
+      return;
+    }
+    var row = el.getAttribute("data-sv-row"), k = el.getAttribute("data-sv-k"), f = el.getAttribute("data-sv-f");
+    if (row == null || !k || !f || !o.draft) return;
+    var r = o.draft[k][Number(row)];
+    if (!r) return;
+    if (f === "on") { r.on = el.checked; return; }
+    if (f === "inside" || f === "outside" || f === "vpp") {
+      r[f] = el.value;
+      // VPN 从口带出来：口换了 VPN 跟着换，不一致的校验错误没有机会产生。
+      var it = svIfaceOf(o.doc, el.value);
+      if (it) r.vpn = it.vpn;
+      return;
+    }
+  }
+
+  function svInput(ev) {
+    var el = ev.target;
+    if (!el || !el.getAttribute) return;
+    var o = svStore();
+    var row = el.getAttribute("data-sv-row"), k = el.getAttribute("data-sv-k"), f = el.getAttribute("data-sv-f");
+    if (row == null || !k || !f || !o.draft) return;
+    var r = o.draft[k][Number(row)];
+    if (!r) return;
+    if (f === "pool" || f === "upstream") {
+      // 列表进一个框：空格/逗号分隔。存回数组，"没改动"的比较才能对上。
+      r[f] = el.value.split(/[\s,]+/).filter(function (s) { return s; });
+      return;
+    }
+    if (f === "vpn" || f === "lease_sec" || f === "mss_clamp") {
+      var v = parseInt(el.value, 10);
+      r[f] = isNaN(v) ? 0 : v;
+      return;
+    }
+    r[f] = el.value;
+  }
+
   /* ---------------- actions ---------------- */
 
   // The 10s poll skips re-render while a form field has focus, so it cannot
@@ -8445,6 +8850,14 @@
       plRoot.addEventListener("click", plClick);
       plRoot.addEventListener("change", plChange);
       plRoot.addEventListener("input", plInput);
+    }
+
+    // 服务配置页同一套做法：挂在每次整页重建都会换掉的 #sv-root 上。
+    var svRoot = $("sv-root");
+    if (svRoot) {
+      svRoot.addEventListener("click", svClick);
+      svRoot.addEventListener("change", svChange);
+      svRoot.addEventListener("input", svInput);
     }
 
     document.querySelectorAll("#content [data-act]").forEach(function (el) {

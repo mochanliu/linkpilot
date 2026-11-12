@@ -230,13 +230,14 @@ func bundleFor(p *PublishedBundle, nodeID uint16) apply.Bundle {
 		GeneratedAt: p.PublishedAt,
 		Checks:      checks,
 		Artifacts: apply.Artifacts{
-			FRR:    p.Artifacts.FRR,
-			VPP:    p.Artifacts.VPP,
-			Boot:   p.Artifacts.Boot,
-			Route:  p.Artifacts.Route,
-			Srfrr:  p.Artifacts.Srfrr,
-			Vrrp:   p.Artifacts.Vrrp,
-			Policy: p.Artifacts.Policy,
+			FRR:      p.Artifacts.FRR,
+			VPP:      p.Artifacts.VPP,
+			Boot:     p.Artifacts.Boot,
+			Route:    p.Artifacts.Route,
+			Srfrr:    p.Artifacts.Srfrr,
+			Vrrp:     p.Artifacts.Vrrp,
+			Policy:   p.Artifacts.Policy,
+			Services: p.Artifacts.Services,
 		},
 	}
 }

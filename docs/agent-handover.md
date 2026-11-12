@@ -98,6 +98,15 @@ sr-frr 应答即降级自己的 `lastSeen`（`localReporter.demote()`），拉�
 
 Mac 的 LAN 地址是 `192.168.1.4`，控制台在 `127.0.0.1:8088`（只对 loopback 开）。
 
+**2026-11-12 增量（实测）：sr-ctrl 的启动方式变了，`~/Library/LaunchAgents/com.louis.sr-ctrl.plist` 是死的。**
+launchd bootstrap 这份 plist 一直报 EIO（历代 sr-ctrl 其实都是脚本 nohup 起的，launchd 从没管过它）；
+agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 agent 会话退出被杀**（2026-11-12 实测 08:42 起的进程 2 分钟内消失）。
+现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
+`~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
+（先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
+当前代际：sr-ctrl `38dff0c71a9852c6`。同日新增服务面：`/api/services` GET/PUT + 控制台「服务配置」页 +
+bundle 第 8 段（NAT/DHCP/DNS）；CPE1 盒内新增 daemon `sr-svc`（DHCP server + DNS 转发器，状态口 127.0.0.1:8092）。
+
 ### 2.2 被测现场是 VirtualBox 那 7 台
 
 ```
@@ -156,7 +165,10 @@ tunnels     0 条：VPP 里的 wg 口是 sr-agent -tunnels 从**控制器**取�
               磁盘上没有那份表。控制器不可达时开机就是这个形状。
 ```
 
-隧道表磁盘恢复不了是已知缺口（G-2，方案在 [docs/g2-tunnel-table-derivation-plan.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/g2-tunnel-table-derivation-plan.md)）。
+隧道表磁盘恢复不了曾是已知缺口（G-2）。**产品修复已落地（`cfb3dee` ②）**：`internal/agent/fibtable.go`
+的 FibTableSync 借心跳节拍每轮派生（GET /config → 只换 vrfs/tunnels → 不同才 PUT），**不落盘是有意设计**
+（盘上存一份，开机就得在"用盘上那份"和"重新派生"之间选，选前者正是"基线是假的"那类缺陷的源头）。
+原 lab 手工补表脚本 `vm-fib-sync.sh` 已随之退役（仓库里已删），别再找它。
 真正让 daemon 常驻的是 `sr-box-watch.service.timer`（60s 一轮，Type=oneshot，`KillMode=process`）。
 `KillMode=process` 是硬要求：默认的控制组 kill 每 60s 把 nohup 起来的 sr-route/sr-frr SIGKILL 掉
 （2026-11-05 23:08 实测 sr-route 在 72s 采样里只活着 47.0–49.1s）。复核：
@@ -225,7 +237,21 @@ done'
 `/usr/local/bin/<name>`）。抬盒的逐枪实测、流量归属表和回滚底在
 [test/lab/vmlab/exp-284/README.md](test/lab/vmlab/exp-284/README.md)；用的仍是
 `test/lab/vmlab/exp-276/install276.sh`（只装盘）+ `swap276.sh`（SIGTERM + 产品自己的开机清单补回 +
-客户侧 75 秒探测）。**换 sr-fib 的那一枪之后必须立刻 `vm-fib-sync.sh <节点>` 补隧道表**（G-2，见下）。
+客户侧 75 秒探测）。~~换 sr-fib 的那一枪之后必须立刻 `vm-fib-sync.sh <节点>` 补隧道表~~
+（此法已随 `cfb3dee` 退役：sr-agent 现在每拍心跳自动派生 sr-fib 隧道表，重启后一个心跳内自动回填，无需手工补）。
+
+**2026-11-12 增量（服务面落地，只动了 CPE1 的三个件，其余盒未动）**：
+
+| 盒 | 件 | 在跑 == 盘上 | 说明 |
+| --- | --- | --- | --- |
+| CPE1 | `sr-agent` | `6cb56276a23bf224` | SIGTERM→watch 补回换件，实测心跳断 ~90s（watch 60s 一轮），数据面 0 扰动。换它的原因：bundle 里新增 services.json 段，老 agent 进程内的 apply 拷贝不认这段会静默丢掉 |
+| CPE1 | `sr-apply` | `c000b288a6efb2bc` | one-shot（agent 每次 apply 时 exec），只装盘即可生效 |
+| CPE1 | `sr-svc` | `02db9629f312b2b1` | **新 daemon**：DHCP server + DNS 转发器，读 `/etc/sdwan/svc.json`（bundle 第 8 段），状态口 `127.0.0.1:8092/status`，SIGHUP 热换行不丢租约；start.sh 的 svc 步在 svc.json 存在且进程不在时拉起 |
+| CPE2–4 | —— | 未动 | 服务面只在 CPE1 验证过；配置模型/下发路径四台同构 |
+
+**注意：CPE1 又踩了一次 af_packet offload 雷（#302 的重复）**：00:13 盒子重启后内核 TSO/GSO/GRO 回到 on，
+scp/任何 bulk 全卡；已手工重关（`ethtool -K enp0s8/9 tso off gso off gro off`）。
+**这个 offload-off 至今没有持久化（ensureHostIface/underlay.sh 都没加）——谁重启盒子谁先补一刀。**
 
 **顺带抓到的一处真实不一致（缺口 G-2，不是本次引入）**：CPE3 的 sr-fib 运行时隧道表 3 条
 （`curl -s http://127.0.0.1:19011/status` 的 `tunnels`），盘上 `/etc/sdwan/fib.json` 写的是 **`tunnels: 0`**
@@ -237,8 +263,38 @@ done'
 `vm-fib-sync.sh` 补上隧道表之间，空窗分别 **124s / 79s**（这段里 `/status` 的 `tunnels=0`，所有远端路径按
 「下一跳不在隧道表里」跳过）。两次窗口里的收敛行都是 `routes+0/-0` —— **它不拆已经装好的 VPP 行，只是不再收敛**。
 所以形状是"从这一刻起路由变化全部失效"，不是"立刻断客户流量"：这两段窗口内客户探测 **0 FAIL**，
-VPP 里 `mpls via` 条数也没变（没变是孤儿行还在，别把它当 B3 生效）。判定隧道表补没补上只认
-`vm-fib-sync.sh` 那行 `隧道 N 条 … converged=True` 且没有 `警告:`。
+VPP 里 `mpls via` 条数也没变（没变是孤儿行还在，别把它当 B3 生效）。~~判定隧道表补没补上只认
+`vm-fib-sync.sh` 那行 `隧道 N 条 … converged=True` 且没有 `警告:`~~（脚本已退役）——现在判定看两条：
+agent.log 的 `sr-fib 隧道表已收敛：N 行`（写的人自报）+ `curl 127.0.0.1:19011/status` 的
+`last.converged=true` 且 `warnings` 为空。
+
+**2026-11-12 两笔 G-2 族的实况（服务面增量期间实测）**：
+
+1. **CPE1 盘上 fib.json 里的 2 条陈年隧道已清（上面那段"手工 PUT 恢复过的 2 条"的残留，
+   文件 mtime 2026-11-08）**：行内容还是 `wg1009/wg1010` + color 0 的手工时代形状，与派生纪律
+   （不落盘）冲突，vm-verify 的 `fib_source_check` 因"盒里 2 条 == 磁盘 2 条"误判为非派生。
+   已备份后清空 `tunnels`（`/etc/sdwan/fib.json.bak-20261112`），与 CPE2-4 的盘面（0 条）对齐；
+   运行中的 sr-fib 不受影响（表在内存，agent 每拍重推）。
+2. **抓到 agent 启动瞬态（新登记的已知缺口，G-2 族，非本次增量引入）**：换 sr-agent 后
+   （01:04:39）FibTableSync 在 TunnelSync 还没填好 `links` 时推了一份 **0 行**的隧道表给 sr-fib，
+   sr-fib 按警告「下一跳不在隧道表里」把远端路径全跳过，5 秒后（01:04:44）TunnelSync 就绪重推
+   2 行、重新收敛。窗口 ~5s，窗口内客户探测 0 FAIL（§9 六方向 4/4），但它会撞上"agent 重启后
+   恰好做 FIB 断言"的验证。根因：`FibTableSync.Sync()` 对 `FibRows()` 为空且 TunnelSync 从未
+   成功同步过这一状态没有守卫（`fibtable.go` 在 rows 检查之后才判 dp==nil）。修法方向：首拍
+   不推（等 TunnelSync 完成过一次），待 owner 拍板后另行落地。
+3. **vm-verify §6 剩余 FAIL（本轮 13 条）定性：verify 口径落后于 2026-11-10 的策略引流设计，不是产品故障**。
+   证据链：① §6 断言"overlay /32 全在 table 0"是策略引流（policy.go 头注，owner 2026-11-10 拍板
+   "静态策略行引流到那张颜色的 FIB 表"）之前的口径；现在静态/动态策略行落地成**颜色表/选路表**
+   （apply.log：`policy 1001 → 表 10001`、`policy 1002 → 表 3000`），远端 /32 的 mpls 路径物理上
+   装在 2000/3000 这些颜色表里，表里还有 `0.0.0.0/0 → lookup in VRF:0` 的兜底默认 —— 这正是设计的
+   数据面形状；② 四台（含**今天完全没动过**的 CPE2-4）呈同一形状 ⇒ 与服务面增量无关（服务面增量
+   只加 sr-svc + services.json 段，机制上碰不到 VPP FIB）；③ 数据面全绿：§9 六方向 0% 丢包、
+   客户 ping 实测 4/4、Encap 计数器在涨；④ 上一次全绿是 2026-11-09，策略引流 2026-11-10 落地，
+   中间没人跑过全量 verify —— 口径在这窗口里过时了。**修法**：§6 判据要按"颜色表 + 基表"双表
+   口径重写（哪个前缀该在基表、哪个该在颜色表、ABF 挂点在哪个口），待 owner 排期。
+   另记一笔：CPE2 的 sr-fib 隧道表里有一行 `10.250.0.9 color=None`（手工时代 PUT 的残留，
+   CPE2-4 今天没换 agent/config，老状态原封不动）—— 这行与台账对不上是 §3/§5 之外的潜在噪音，
+   下次给 CPE2-4 发新 bundle（agent 派生整份替换）时会自然自愈。
 
 **仍不一致的那唯一一处（有意留着，不是漏）：** CPE1 的 `sr-fib` 还是 `a9f1bc8c8fd49016` —— 事件版但**没带 B3**，
 它就是 B3 那一族的缺陷臂，抬到 `c213a6ca` 会把手上唯一的对照臂杀掉，所以按 #284 的方案**不动它**。
@@ -373,13 +429,16 @@ inode 不同（rename 换上去的，进程还持有旧 inode，所以 ②③ �
 #274 那次四台 sr-frr 换件的实测在 [test/lab/vmlab/exp-274/README.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/test/lab/vmlab/exp-274/README.md)
 （客户可见中断最长 1.0–2.0s，按方向不同）。
 
-**换完 sr-fib 必须立刻补一次隧道表**，否则这一臂作废（2026-11-09 实测，缺口 G-2 在这里咬人）：
-sr-fib 的「下一跳 → 本机 wg 口 + 颜色」那张表只在内存（`PUT /config`），产品里没有任何进程维护它，
-新进程一起来就是 `0 条隧道`，于是所有远端前缀按「下一跳不在隧道表里，该路径跳过」被跳过，
-而 VPP 里的老行还在（`routes+0/-0`、`mpls via` 条数不变）—— 看着像"没坏"，其实收敛根本没发生。
-补法只有一条合法路径：`bash test/lab/vmlab/vm-fib-sync.sh <node>`（数据来自控制台
-`GET /api/underlay` + 盒内 `show interface addr` + `/etc/sdwan/route.json`，脚本不猜）。
-判据是它自己打的那行：`隧道 N 条 … converged=True` 且**没有** `警告:`。
+**换完 sr-fib 现在不需要手工补隧道表了**（2026-11-09 实测过 G-2 在这里咬人：sr-fib 的
+「下一跳 → 本机 wg 口 + 颜色」那张表只在内存（`PUT /config`），新进程一起来就是 `0 条隧道`，
+所有远端前缀按「下一跳不在隧道表里，该路径跳过」被跳过，而 VPP 里的老行还在
+（`routes+0/-0`、`mpls via` 条数不变）—— 看着像"没坏"，其实收敛根本没发生）。
+**2026-11-09 之后（`cfb3dee` ②）sr-agent 已在心跳节拍上自动派生并推送这张表**：
+sr-fib 重启后一个心跳内自动回填，无需任何手工动作。原手工脚本 `vm-fib-sync.sh` 已退役删除。
+判定自动回填完成的两条判据：agent.log 的 `sr-fib 隧道表已收敛：N 行` +
+`curl 127.0.0.1:19011/status` 的 `last.converged=true` 且 `warnings` 为空。
+已知残余：agent 自身刚启动的**第一拍**可能推 0 行瞬态（见上面 2026-11-12 那笔），换 sr-agent
+之后若立刻做 FIB 断言，等它出「已收敛」行再判。
 换 sr-route 那一枪必须**与 sr-frr 同批、且 sr-frr 在前**（B4 的部署硬规则，2026-11-09 实测：
 老 sr-frr 没有 `GET /local-prefixes`，实测回 404，只抬 sr-route 会让它对着 404 每 2s 重试到永远，
 本盒 local 前缀集照旧对全网消失）。B4 修好之后已经**不需要**再手工换 sr-frr 补前缀了 ——
@@ -502,7 +561,7 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 | #262 缺陷⑥ | 待拍 | 亚秒抖动被放大成 ≥1s 客户黑洞。**2026-11-09 更新口径**：sr-fib 那"1s 轮询直接摘路"的放大在事件版盒上已经没了（切片 B：摘路边实测 ≤40~45ms；B3 之后连"隧道/BFD 抖一下、RIB 没变"这一类也会立刻触发重算，双向 ≤65ms）。剩下的抖动放大全在 BFD 判定 + 没有 hold-down 这一侧；hold-down 现在**有地方挂了** —— 就挂在 B3 那条 `signal()` 上（`cmd/sr-fib/main.go:461` 造 `wake` → `:469` 建连时订阅 BFD 事件 → `cmd/sr-fib/watch.go:320` 的 `signal()`），挂在轮询上等于挂在一个 watch 模式已经不存在的节拍里 |
 | ~~#269 缺陷⑧~~ | **已修（2026-11-07）** | `controller/deploy/sr-box/start.sh` 加了一把 `flock`（`LOCK=${SR_BOX_LOCK:-$RUN/.lock}`）：`run_up`/`run_stop` 都先抢它，非阻塞拿不到就 SKIP；`launch()`/`do_vpp`/`do_apply`/`do_frr` 每个后台子进程带 `9>&-` 关掉锁 fd，否则被 systemd `TimeoutStartSec` 杀掉时锁攥在守护进程手里永不释放。沙盒 5 路并发实测：`sr-agent`/`sr-route`/`sr-fib`/`sr-frr` 各起 1 份，4 份 SKIP 退出 0。**VM 台的物理复测没跑**（要 `systemctl restart vpp` 撞那一秒，属于会影响 lab 现状的动作，等 owner 点头再做）。抬 `sr-route` 到 HEAD 的**并发抢起阻塞已解**，剩下的只是重启本身的 RR 会话抖动 |
 | ~~#268 / #260 产物没装全~~ | **已收口（#277，2026-11-07）** | 四台盘上已换成在跑那一份，`run==disk` 全一致；判据与留底见 §3 和 `exp-277/README.md`。**代码没再动**，这一轮修的是产物一致性 |
-| G-2 隧道表落盘 | 只出了方案（`3a09f03`） | 隧道层磁盘恢复不了 ⇒ §2.5 那个 `sr-box` exit 1 |
+| ~~G-2 隧道表落盘~~ | **产品修复已落地（`cfb3dee` ②）** | sr-agent 心跳节拍自动派生 sr-fib 隧道表（`internal/agent/fibtable.go`），磁盘 0 条是有意设计；残余：agent 启动第一拍推 0 行的瞬态（2026-11-12 实测，见 §5.2/§3 附近那笔），待拍 |
 | NAT 阶梯 #222 + M-4/M-1/M-3/M-5、#211/#213/#244/S8 | 挂着 | 顺序 M-4→M-1→M-2→M-3 |
 
 **#276 切片 B/C（2026-11-08）顺手抓到的 2 条缺口：B3、B4 均已于 2026-11-09 落地并实测收口（B4 的形状 owner 拍的是 (b)）**
@@ -576,8 +635,8 @@ owner 原话：**「我自己测一下再说，lab 先放那里不动。」**
 - 控制台：`http://127.0.0.1:8088`（Mac 本机）。运营方令牌文件：`/Users/louis/srvmlab/ctrl/data/console-token`。
   PKI/状态同目录：`ca.key` `ca.pem` `server.key` `server.pem` `state.json`。
   **这些值一个都不许进文件/日志/提交信息**（AGENTS.md §3）。租户账号口令向 owner 当场索取，我们只在对话里传。
-  脚本用的那份租户口令在 `/Users/louis/srvmlab/state/credentials.json`（0600，仓库外，`vm-console.py` 与
-  `vm-fib-sync.sh` 都从这里读）。**它和控制器对不上时不要改脚本、也不要猜口令**：
+  脚本用的那份租户口令在 `/Users/louis/srvmlab/state/credentials.json`（0600，仓库外，`vm-console.py`
+  从这里读；`vm-fib-sync.sh` 已退役删除，但它当年的 401 排障记录保留在下面）。**它和控制器对不上时不要改脚本、也不要猜口令**：
   用运营方令牌登录 → `POST /api/accounts/reset {"username": ...}`（控制器生成新口令、只在这次响应里出现一次）
   → 把返回值写回这个文件并 `chmod 600` → 再跑 `python3 -c` 走 `api_tenant()` 复检登录。
   2026-11-09 就靠这条把 `vm-fib-sync.sh` 的 `401 invalid username or password` 修好的；

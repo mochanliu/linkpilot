@@ -172,10 +172,16 @@ type DeviceConfig struct {
 	// whole BasicConfig and would wipe anything stored inside it. It is also
 	// rendered against the draft's interfaces (a row attaches to every customer
 	// port of its VPN), which is why it cannot be a stand-alone document either.
-	Policy    PolicySet `json:"policy"`
-	Version   int       `json:"version"`
-	UpdatedAt int64     `json:"updated_at_unix"`
-	UpdatedBy string    `json:"updated_by,omitempty"`
+	Policy PolicySet `json:"policy"`
+	// Services is the 基础配置服务面：NAT 出口、DHCP server、DNS forwarder 的行。
+	// Living outside BasicConfig for the same wipe-proof reason as Leak/Policy:
+	// the 基础配置 page PUTs a whole BasicConfig, and a NAT row stored in it would
+	// be erased by every save from that page. The rows reference draft interfaces
+	// by VPP name, so the rendered segment resolves their addresses at publish.
+	Services  ServicesSet `json:"services"`
+	Version   int         `json:"version"`
+	UpdatedAt int64       `json:"updated_at_unix"`
+	UpdatedBy string      `json:"updated_by,omitempty"`
 
 	Published *PublishedBundle `json:"published,omitempty"`
 	// History is the tail of past published bundles, newest last, capped at
@@ -198,9 +204,10 @@ const configHistoryCap = 20
 // leaked prefixes into a group since deleted would otherwise resurrect a
 // segment referencing an RT that no longer exists.
 type ConfigSource struct {
-	Draft  BasicConfig `json:"draft"`
-	Leak   LeakSet     `json:"leak"`
-	Policy PolicySet   `json:"policy"`
+	Draft    BasicConfig `json:"draft"`
+	Leak     LeakSet     `json:"leak"`
+	Policy   PolicySet   `json:"policy"`
+	Services ServicesSet `json:"services"`
 }
 
 // PublishedBundle is the snapshot a device is asked to install. Checks travel

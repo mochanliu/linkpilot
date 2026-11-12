@@ -546,6 +546,11 @@ func (s *server) publishChecksForLeakLocked(tenantID string, nodeID uint16, dc *
 	// 策略排最后：它的错误要建立在"VPN 与客户口已经合法"这个前提上，排在前面
 	// 只会让一条根因变成一串连带报错。
 	checks = append(checks, s.policyChecksLocked(tenantID, nodeID, dc, dc.Policy)...)
+	// 服务面（NAT/DHCP/DNS）挂在客户口上，校验也要草稿先行：行引用一个不存在
+	// 的口，错误必须指向那行，而不是让盒子上 apply 才发现。
+	svc := dc.Services
+	normalizeServices(&svc)
+	checks = append(checks, servicesChecks(&dc.Draft, &svc)...)
 	return checks
 }
 

@@ -343,6 +343,13 @@ type configArtifacts struct {
 	// emitted as [] because "no policy" is an instruction: remove what is there.
 	// omitempty only spares bundles published before policy existed.
 	Policy string `json:"policy,omitempty"`
+	// Services is bundle 第 8 段: 服务面（NAT 出口 / DHCP server / DNS 转发器）。
+	// DHCP 与 DNS 落成 /etc/sdwan/svc.json 交给 sr-svc；NAT 行这里照样渲染（地址
+	// 池是租户显式配置的），但 26.06 的 nat44_ei 数据面有崩溃缺陷（2026-11-11 实测，
+	// 见 docs/dia-nat-dhcp-dns-plan.md），盒子的 applier 在后端落定前对 NAT 行只记
+	// 一条 note 不下发。空表也发 —— "删掉最后一行"是指令，不是无操作。
+	// omitempty 只放过该段出现之前发布的旧包。
+	Services string `json:"services,omitempty"`
 }
 
 // vrrpArtifact is the decoded form of the 6th segment. The rows are keyed by
@@ -365,11 +372,12 @@ type vrrpEntry struct {
 
 func renderArtifacts(c *BasicConfig) configArtifacts {
 	return configArtifacts{
-		FRR:    renderFRR(c, nil),
-		VPP:    renderVPP(c),
-		Boot:   renderBoot(c),
-		Vrrp:   renderVRRPArtifact(c),
-		Policy: renderPolicyArtifact(c, PolicySet{}),
+		FRR:      renderFRR(c, nil),
+		VPP:      renderVPP(c),
+		Boot:     renderBoot(c),
+		Vrrp:     renderVRRPArtifact(c),
+		Policy:   renderPolicyArtifact(c, PolicySet{}),
+		Services: renderServicesArtifact(c, ServicesSet{}),
 	}
 }
 
@@ -406,6 +414,122 @@ func renderSrfrrArtifact(a srfrrArtifact) string {
 	return string(b) + "\n"
 }
 
+// servicesArtifact is the decoded form of the services segment the box installs.
+// The controller resolves what only it knows (the draft's interface addresses,
+// prefix lengths, kernel TAP names) into explicit fields; sr-svc then binds
+// exactly what it is told, and sr-apply never re-derives anything.
+type servicesArtifact struct {
+	NAT  []svcNATRow  `json:"nat"`
+	DHCP []svcDHCPRow `json:"dhcp"`
+	DNS  []svcDNSRow  `json:"dns"`
+}
+
+type svcNATRow struct {
+	On       bool     `json:"on"`
+	VPN      uint32   `json:"vpn"`
+	Inside   string   `json:"inside"`
+	Outside  string   `json:"outside"`
+	Pool     []string `json:"pool"`
+	MSSClamp uint16   `json:"mss_clamp,omitempty"`
+}
+
+type svcDHCPRow struct {
+	VPN uint32 `json:"vpn"`
+	// VPP / LCP: the customer port and the kernel TAP lcp mirrors it to.
+	VPP string `json:"vpp"`
+	LCP string `json:"lcp"`
+	// Listen is the port's own address (sr-svc binds it for unicast traffic);
+	// Prefix is the port's mask length.
+	Listen string `json:"listen"`
+	Prefix uint8  `json:"prefix"`
+	// Start/End 是可分配池；Router/DNS 是要下发给客户端的两个地址，发布时就
+	// 解析成最终值 —— 租户留空表示"用客户口自己的地址"，盒子不该再猜。
+	Start    string `json:"start"`
+	End      string `json:"end"`
+	LeaseSec int    `json:"lease_sec"`
+	Router   string `json:"router"`
+	DNS      string `json:"dns"`
+}
+
+type svcDNSRow struct {
+	VPN    uint32   `json:"vpn"`
+	VPP    string   `json:"vpp"`
+	LCP    string   `json:"lcp"`
+	Listen string   `json:"listen"`
+	Prefix uint8    `json:"prefix"`
+	// Upstream 按序转发；空列表 = 只回 SERVFAIL。
+	Upstream []string `json:"upstream"`
+}
+
+// renderServicesArtifact emits the 8th segment. Every table is emitted even
+// when empty: "删掉最后一行 DHCP" has to reach the box as an empty list, not as
+// silence that leaves the old service running. Rows whose interface cannot be
+// resolved are dropped here rather than emitting garbage -- the same draft
+// passes servicesChecks first, so a dropped row means the draft changed under
+// the render, and the checks on the next publish will name it.
+func renderServicesArtifact(c *BasicConfig, svc ServicesSet) string {
+	a := servicesArtifact{
+		NAT:  make([]svcNATRow, 0, len(svc.NAT)),
+		DHCP: make([]svcDHCPRow, 0, len(svc.DHCP)),
+		DNS:  make([]svcDNSRow, 0, len(svc.DNS)),
+	}
+	for _, r := range svc.NAT {
+		pool := make([]string, 0, len(r.Pool))
+		for _, p := range r.Pool {
+			if _, ok := parseIPv4(p); ok {
+				pool = append(pool, p)
+			}
+		}
+		a.NAT = append(a.NAT, svcNATRow{
+			On: r.On, VPN: r.VPN, Inside: r.Inside, Outside: r.Outside,
+			Pool: pool, MSSClamp: r.MSSClamp,
+		})
+	}
+	for _, r := range svc.DHCP {
+		it, ok := ifaceByVPP(c, r.VPP)
+		if !ok || it.IP == "" || it.PrefixLen == 0 {
+			continue
+		}
+		dns := r.DNS
+		if dns == "" {
+			dns = it.IP // 留空 = 本机转发器（客户口地址）
+		}
+		router := r.Router
+		if router == "" {
+			router = it.IP
+		}
+		a.DHCP = append(a.DHCP, svcDHCPRow{
+			VPN: r.VPN, VPP: r.VPP, LCP: it.LCP,
+			Listen: it.IP, Prefix: it.PrefixLen,
+			Start: r.Start, End: r.End, LeaseSec: r.LeaseSec,
+			Router: router, DNS: dns,
+		})
+	}
+	for _, r := range svc.DNS {
+		it, ok := ifaceByVPP(c, r.VPP)
+		if !ok || it.IP == "" || it.PrefixLen == 0 {
+			continue
+		}
+		up := make([]string, 0, len(r.Upstream))
+		for _, u := range r.Upstream {
+			if _, ok := parseIPv4(u); ok {
+				up = append(up, u)
+			}
+		}
+		a.DNS = append(a.DNS, svcDNSRow{
+			VPN: r.VPN, VPP: r.VPP, LCP: it.LCP,
+			Listen: it.IP, Prefix: it.PrefixLen,
+			Upstream: up,
+		})
+	}
+	b, err := json.MarshalIndent(a, "", "  ")
+	if err != nil {
+		// Plain scalars and slices of them; unreachable.
+		return ""
+	}
+	return string(b) + "\n"
+}
+
 // artifactsLocked adds the per-device overlay, leak and policy artifacts to the
 // three text fragments. Route depends on the tenant's groups *and* this device's
 // tunnels, the leak half depends on the tenant's prefix-list library, and a
@@ -414,12 +538,25 @@ func renderSrfrrArtifact(a srfrrArtifact) string {
 func (s *server) artifactsLocked(tenantID string, nodeID uint16, c *BasicConfig, set LeakSet, pol PolicySet) configArtifacts {
 	rules, srfrr := s.leakRenderLocked(tenantID, set)
 	return configArtifacts{
-		FRR:    renderFRR(c, rules),
-		VPP:    renderVPP(c),
-		Boot:   renderBoot(c),
-		Route:  s.overlayRouteArtifactLocked(tenantID, nodeID),
-		Srfrr:  renderSrfrrArtifact(srfrr),
-		Vrrp:   renderVRRPArtifact(c),
-		Policy: renderPolicyArtifact(c, pol),
+		FRR:      renderFRR(c, rules),
+		VPP:      renderVPP(c),
+		Boot:     renderBoot(c),
+		Route:    s.overlayRouteArtifactLocked(tenantID, nodeID),
+		Srfrr:    renderSrfrrArtifact(srfrr),
+		Vrrp:     renderVRRPArtifact(c),
+		Policy:   renderPolicyArtifact(c, pol),
+		Services: renderServicesArtifact(c, s.servicesFor(tenantID, nodeID, c)),
 	}
+}
+
+// servicesFor returns the services rows a device publishes with. The caller
+// holds the state lock; the lookup must not touch s.state directly, which is
+// why the set travels in from the DeviceConfig by the publish paths.
+func (s *server) servicesFor(tenantID string, nodeID uint16, c *BasicConfig) ServicesSet {
+	if dc := s.state.Configs[configKey(tenantID, nodeID)]; dc != nil {
+		svc := dc.Services
+		normalizeServices(&svc)
+		return svc
+	}
+	return ServicesSet{}
 }

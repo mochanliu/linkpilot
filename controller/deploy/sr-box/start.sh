@@ -25,6 +25,10 @@
 #   fib    sr-fib：轮询 sr-route 的 /status 装 VPP 表。它吃的是 route 的口，所以在 route 之后。
 #   frrbridge sr-frr：一头连 FRR 的 zserv，一头往 sr-route 的 /local-prefixes 送。
 #          两边都要活着，所以放最后。
+#   svc    sr-svc：读 /etc/sdwan/svc.json（bundle 第 8 段的 DHCP/DNS 半），
+#          DHCPv4 server + DNS forwarder，绑客户口的内核 TAP。放在 bridge 之后：
+#          客户口地址由 FRR/lcp-sync 摆好，没有它 sr-svc 绑不上。配置热更走
+#          sr-apply 的 SIGHUP，这份清单只在开机时第一次拉起。
 #
 # 四条规矩，都是这条清单存在的理由：
 #   1. **门控**：一步缺什么就明说缺什么并跳过。中转-only 盒子没有 route.json，未入网的
@@ -98,6 +102,7 @@ ROUTE_CONF=${SR_BOX_ROUTE_CONF:-/etc/sdwan/route.json}
 ROUTE_STATUS=${SR_BOX_ROUTE_STATUS:-}          # 留空则从 route.json 的 status_addr 推
 FIB_CONF=${SR_BOX_FIB_CONF:-/etc/sdwan/fib.json}
 BRIDGE_CONF=${SR_BOX_BRIDGE_CONF:-/etc/sr-frr.json}
+SVC_CONF=${SR_BOX_SVC_CONF:-/etc/sdwan/svc.json}
 STATUS_WAIT=${SR_BOX_STATUS_WAIT:-30}
 
 # ------------------------------------------------------------------ 输出
@@ -147,6 +152,7 @@ name_of() {
         route) echo sr-route ;;
         fib)   echo sr-fib ;;
         bridge) echo sr-frr ;;
+        svc)   echo sr-svc ;;
     esac
 }
 
@@ -253,6 +259,9 @@ state_route() {
 
 gate_fib() { [ -s "$FIB_CONF" ]; }
 state_fib() { alive fib; }
+
+gate_svc() { [ -s "$SVC_CONF" ]; }
+state_svc() { alive svc; }
 
 gate_bridge() { [ -s "$BRIDGE_CONF" ]; }
 state_bridge() { alive bridge; }
@@ -384,6 +393,16 @@ do_bridge() {
     say bridge "在跑"
 }
 
+do_svc() {
+    if ! gate_svc; then
+        say svc "SKIP: 没有 $SVC_CONF（这一版没有 DHCP/DNS 行）"
+        return
+    fi
+    if alive svc; then say svc "已在跑（配置重载走 sr-apply 的 SIGHUP，清单不碰）"; return; fi
+    launch svc sr-svc "$SR_BIN/sr-svc" -config "$SVC_CONF" || return
+    say svc "在跑（行见 $SVC_CONF，租约/计数在 127.0.0.1:8092/status）"
+}
+
 run_up() {
     mkdir -p "$RUN" "$LOG"
     # 抢一把锁再走：见上面 LOCK 那段说明。非阻塞 —— 拿不到就说明对面那份还在跑，
@@ -403,6 +422,7 @@ run_up() {
     do_route
     do_fib
     do_bridge
+    do_svc
     tunnels_check
     flock -u 9
     exec 9>&-
@@ -480,6 +500,12 @@ run_check() {
         report bridge 无 "$BRIDGE_CONF 不在"
     fi
 
+    if gate_svc; then
+        if alive svc; then report svc 有 "在跑（pid $(pid_of svc)）"; else report svc 有 "配置在，进程没跑"; fi
+    else
+        report svc 无 "$SVC_CONF 不在（没有 DHCP/DNS 行）"
+    fi
+
     tunnels_check
     return 0
 }
@@ -501,7 +527,7 @@ run_stop() {
     # 容器形态下 $RUN/vpp.pid 也是这份清单写的（vpp 那一步真的把 VPP 拉起来了），
     # 但这里仍然不碰它：停 VPP = 现网断流，那不该是"停一份清单"的副作用。
     # 要停数据面请明着停（vpp.service / 那个启动器自己的办法）。
-    for s in bridge fib route agent; do
+    for s in svc bridge fib route agent; do
         [ -f "$RUN/$s.pid" ] || continue
         name=$(name_of "$s")
         pid=$(cat "$RUN/$s.pid")

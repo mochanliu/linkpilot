@@ -372,6 +372,9 @@ func (s *server) adminHandler() http.Handler {
 	// 静态策略 (O6-f): 一行 = 一类流走哪个颜色，落地是 VPP 的 ACL + ABF。和泄露
 	// 一样，保存只写草稿，发布走 /api/config/publish 那一条路径（第 7 段）。
 	mux.HandleFunc("/api/policy", s.handleAdminPolicy)
+	// 服务面 (2026-11-11): NAT 出口 / DHCP / DNS，一行挂在设备的客户口上。
+	// 保存只写草稿，发布走同一条 /api/config/publish 路径（第 8 段 services）。
+	mux.HandleFunc("/api/services", s.handleAdminServices)
 	// 版本历史 / diff / 一键回滚（config_versions.go）：基础配置的发布在
 	// DeviceConfig.History 里留快照，回滚 = 恢复草稿 + 走同一条发布路径。
 	mux.HandleFunc("/api/config/versions", s.handleAdminConfigVersions)
