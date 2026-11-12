@@ -40,6 +40,9 @@ import (
 const (
 	Nat44FlagIfInside  = 16
 	Nat44FlagIfOutside = 32
+	// Nat44FlagAddrOnly marks an identity mapping as address-only: the whole
+	// address maps 1:1 and every protocol/port passes through unchanged.
+	Nat44FlagAddrOnly = 8
 )
 
 // Nat44Params is the sizing half of nat44_ei_plugin_enable_disable. The zero
@@ -143,6 +146,44 @@ func (c *Client) Nat44OutputInterface(ctx context.Context, swIfIndex uint32, add
 		return err
 	}
 	return c.retval("nat44_ei_add_del_output_interface", frame)
+}
+
+// Nat44IdentityMapping adds or removes an address-only identity mapping: one
+// address maps to itself, all protocols and ports preserved
+// (nat44_ei_add_del_identity_mapping with NAT44_EI_ADDR_ONLY_MAPPING).
+//
+// Why the product needs it: an outside interface's out2in node drops every
+// session-less inbound packet ("no translation"), and that includes packets to
+// the box's own WAN address -- the management path and the box's overlay
+// (BFD/encap) return traffic. Registering that address as a pool address is
+// what made the first attempt kill management; registering it as an identity
+// mapping makes inbound packets to it legitimately reverse-resolvable, while
+// box-originated sockets keep their ports (no allocation, hence no "out of
+// ports" in the in2out-output slowpath).
+//
+// sw_if_index is ~0 ("not used", the address is enough) and vrf is the NAT
+// instance's inside VRF.
+func (c *Client) Nat44IdentityMapping(ctx context.Context, addr netip.Addr, vrf uint32, add bool) error {
+	if !addr.Is4() {
+		return fmt.Errorf("vppapi: NAT44 identity mapping 只支持 IPv4 (%s)", addr)
+	}
+	a := addr.As4()
+	body := make([]byte, 0, 1+1+4+1+2+4+4+64)
+	body = append(body, b2u8(add))
+	body = append(body, Nat44FlagAddrOnly)
+	body = append(body, a[:]...)
+	body = append(body, 0)             // protocol (ignored with ADDR_ONLY)
+	body = appendU16(body, 0)          // port (ignored with ADDR_ONLY)
+	body = appendU32(body, ^uint32(0)) // sw_if_index: not used
+	body = appendU32(body, vrf)
+	tag := make([]byte, 64)
+	copy(tag, "sr-nat")
+	body = append(body, tag...)
+	frame, err := c.call(ctx, "nat44_ei_add_del_identity_mapping", "nat44_ei_add_del_identity_mapping_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("nat44_ei_add_del_identity_mapping", frame)
 }
 
 // Nat44Interface is one row of nat44_ei_interface_details: which interface

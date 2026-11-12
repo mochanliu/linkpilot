@@ -262,18 +262,26 @@ mv 把执行位一起带走，systemd 下次开机就是 `vmlab-underlay.service
 脚本要 `ls -la` 确认 755。取证/诊断工具见 `test/lab/vmlab/nat-watch.sh`（2s 轻采样）
 与 `nat-deep.sh`（vppctl 节点级深采样，走 unix socket 假死时也能答话）。
 
-**#302 NAT 缺陷定性终版（2026-11-12 exp-nat-bare 裁决，推翻同日早间"特性节点全丢"结论）**：
+**#302 NAT 缺陷定性终版（2026-11-12 exp-nat-bare 裁决，含形状 D→G 四轮对照）**：
 **不是 VPP 26.06 发行版缺陷，是配置形状问题。** 裸 VPP（禁 sr_wg、无 agent）+ 纯 CLI +
 同形状 af_packet 口：客户数据面完全正常（cust4→网关 8/8 回包、会话建立）。"整机假死"
-机制 = out2in 的标准 EI 语义：**目的为 pool 地址且无会话的入向包一律丢**；产品把 pool
-设成外口自身地址（=管理 IP），管理面因此必死。正确形状（of4 实测）：内口普通 IF_INSIDE
-注册 + 外口 `nat44_ei_add_del_output_interface`（postrouting in2out）+ 专用 pool 地址
-（外口 secondary）→ 客户 8/8 通且管理面存活。细节与机制账本：
-test/lab/vmlab/exp-nat-bare/README.md。产品含义：①NAT 行 pool 语义改专用地址；②外口
-注册方式改 output-interface（vppapi 已加 `Nat44OutputInterface`、probe 已加
-`-outpostroute`）；③盒子自身服务过 NAT 需单独设计（out of ports 半失败）。26.10 升级
-对 NAT 不再必要。早间"cust12 transit 5/5 丢且 0 会话"系半配置状态（使能链在 pool 步被打
-断），不能作数据面坏的证据。
+机制 = out2in 的 EI 语义：**外口上无会话的入向包一律丢（不止 pool 地址，外口地址自己也丢）**；
+产品把 pool 设成外口自身地址（=管理 IP），管理面因此必死。四轮对照后定下的形状 G：
+内口普通 `IF_INSIDE` + 外口普通 `IF_OUTSIDE` + 专用 pool 地址（外口 secondary）+
+**外口自身地址的 address-only 身份映射** → 客户 8/8、盒子自身流量 3/3、ssh 50/50 存活、
+`no translation` 只多 6 次、零 out of ports（形状 D 的 output-interface 有 1603 次
+out of ports，会把 BFD/封装心跳吃掉；形状 E 的专用 pool 单独不够，管理面仍全丢）。
+证据与机制账本：test/lab/vmlab/exp-nat-bare/README.md。
+
+**产品已实现（本轮）**：`controller/internal/apply/nat.go` 按形状 G 对账 VPP（顺反：
+pool 地址挂 secondary → 使能 → 身份映射 → 池范围 → 特性；退场反序），`services.go` 把
+NAT 段接进 apply 流程（applyServices 现在带 prev，退场靠上一版的 pool 摘 secondary）；
+`vppapi` 新增 `Nat44IdentityMapping`；保存期校验拦住"pool 含外口自身地址""pool 越出外口
+网段""两行抢同一个池地址"；控制台 `nat_pending` 机制随之删除。CPE4 验收：bundle 带一行
+NAT → apply 自己装出形状 G（ssh 40/40 ALIVE、cust4 8/8、会话 1 条、identity mapping 在位），
+重复 apply 幂等，删行后全退；`systemctl restart vpp` 后 `sr-apply boot` 重放同样通过
+（ssh 30/30 ALIVE）。26.10 升级对 NAT 不再必要。早间"cust12 transit 5/5 丢且 0 会话"系
+半配置状态（使能链在 pool 步被打断），不能作数据面坏的证据。
 
 **顺带抓到的一处真实不一致（缺口 G-2，不是本次引入）**：CPE3 的 sr-fib 运行时隧道表 3 条
 （`curl -s http://127.0.0.1:19011/status` 的 `tunnels`），盘上 `/etc/sdwan/fib.json` 写的是 **`tunnels: 0`**

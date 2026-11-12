@@ -1,0 +1,18 @@
+{
+  "node_id": 4,
+  "version": 1,
+  "generated_at_unix": 1762930000,
+  "checks": [
+    { "severity": "info", "text": "NAT e2e: 一行 NAT，专用池地址 192.168.1.200" }
+  ],
+  "artifacts": {
+    "frr": "",
+    "vpp": "",
+    "boot": "#!/bin/sh\ntrue\n",
+    "route": "",
+    "srfrr": "",
+    "vrrp": "",
+    "policy": "",
+    "services": "{\"nat\":[{\"on\":true,\"vpn\":0,\"inside\":\"host-enp0s8\",\"outside\":\"host-enp0s9\",\"pool\":[\"192.168.1.200\"]}],\"dhcp\":[],\"dns\":[]}"
+  }
+}

@@ -29,6 +29,7 @@ func main() {
 	sessions := flag.Uint("sessions", 16384, "max sessions per thread")
 	keep := flag.Bool("keep", false, "leave NAT enabled (for traffic tests)")
 	pool := flag.String("pool", "", "dedicated pool address for keep mode (else outside interface address)")
+	identity := flag.String("identity", "", "address-only identity mapping for keep mode (1:1, ports preserved) -- the box's own WAN address, so inbound to it is not dropped as 'no translation'")
 	outpostroute := flag.Bool("outpostroute", false, "mark the outside interface for postrouting in2out (nat44_ei_add_del_output_interface) -- keeps box-originated traffic translated so management survives")
 	flag.Parse()
 
@@ -149,6 +150,14 @@ func main() {
 					os.Exit(2)
 				}
 				fmt.Printf("keep: NAT enabled, pool = %s address\n", *outside)
+			}
+			if *identity != "" {
+				ia := netip.MustParseAddr(*identity)
+				if err := c.Nat44IdentityMapping(ctx, ia, 0, true); err != nil {
+					fmt.Println("identity mapping FAIL:", err)
+					os.Exit(2)
+				}
+				fmt.Printf("keep: identity mapping %s (addr-only, ports preserved)\n", ia)
 			}
 			break
 		}

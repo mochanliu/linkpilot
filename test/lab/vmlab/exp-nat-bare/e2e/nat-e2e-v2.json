@@ -1,0 +1,18 @@
+{
+  "node_id": 4,
+  "version": 2,
+  "generated_at_unix": 1762930100,
+  "checks": [
+    { "severity": "info", "text": "NAT e2e: 删掉 NAT 行（退场路径）" }
+  ],
+  "artifacts": {
+    "frr": "",
+    "vpp": "",
+    "boot": "#!/bin/sh\ntrue\n",
+    "route": "",
+    "srfrr": "",
+    "vrrp": "",
+    "policy": "",
+    "services": "{\"nat\":[],\"dhcp\":[],\"dns\":[]}"
+  }
+}

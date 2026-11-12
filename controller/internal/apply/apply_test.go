@@ -51,11 +51,17 @@ type fakeExec struct {
 	calls   []string
 	outputs map[string]string
 	fail    map[string]error
+	// hook 让测试把"这条命令改了什么状态"反馈回自己的替身（NAT 的地址挂靠
+	// 就是靠它：vppctl 加完地址，下一轮的 DumpInterfaces 要能看见）。
+	hook func(key string)
 }
 
 func (f *fakeExec) Run(_ context.Context, name string, args ...string) (string, error) {
 	key := name + " " + strings.Join(args, " ")
 	f.calls = append(f.calls, key)
+	if f.hook != nil {
+		f.hook(key)
+	}
 	return f.outputs[key], f.fail[key]
 }
 

@@ -1,0 +1,8 @@
+== sr-apply v2 输出（上） ==
+== 退场后状态 ==
+NAT44 interfaces:
+NAT44 pool addresses:
+192.168.1.104/24
+---
+active
+active

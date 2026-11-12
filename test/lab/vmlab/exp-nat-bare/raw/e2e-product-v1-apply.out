@@ -1,0 +1,10 @@
+installed version 1 at /root/vmlab/nat-e2e/store/versions/1
+frr: 差量已生效，复检 0 条差异
+overlay: 这份配置包没有第 4 段，/root/vmlab/nat-e2e/route.json 未改动
+sr-frr: 这份配置包没有第 5 段，/root/vmlab/nat-e2e/srfrr.json 未改动
+policy: 这份配置包没有第 7 段，VPP 里的 ACL/ABF 一条没动
+NAT 第 1 行：192.168.1.200 挂到 host-enp0s9 作为地址池地址（应答上游 ARP）
+NAT：外口地址 192.168.1.104 加身份映射（管理面/盒子自身流量靠它存活）
+svc: /etc/sdwan/svc.json 未变化，跳过重载
+vrrp: 这份配置包没有第 6 段，VPP 里的 VR 一条没动
+applied version 1

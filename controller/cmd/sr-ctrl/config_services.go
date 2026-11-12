@@ -157,6 +157,9 @@ func servicesChecks(c *BasicConfig, s *ServicesSet) []ConfigCheck {
 		add("error", "NAT 行数超过上限 %d。", cfgMaxNATRows)
 	}
 	seenNAT := map[string]bool{}
+	// poolClaim 让两个行抢同一个池地址在保存时就报错：盒子上后一行会把前一行
+	// 的池地址顶掉，而两行都显示"已生效"。
+	poolClaim := map[netip.Addr]int{}
 	for i, r := range s.NAT {
 		if r.Inside == "" || r.Outside == "" {
 			add("error", "NAT 第 %d 行：客户口与出口口都必须填。", i+1)
@@ -179,6 +182,29 @@ func servicesChecks(c *BasicConfig, s *ServicesSet) []ConfigCheck {
 		if len(r.Pool) > cfgMaxPool {
 			add("error", "NAT 第 %d 行：地址池超过上限 %d 个。", i+1, cfgMaxPool)
 		}
+		// 出口口必须是一个真实存在的口，而且地址池要落在它的网段里：盒子会把
+		// 池地址挂成该口的 secondary（同网段的上游要 ARP 池地址），越界的池地址
+		// 到盒子上一定挂不上——在这里拦住，比发布后让盒子上报错早一步。
+		outIt, outOK := ifaceByVPP(c, r.Outside)
+		if !outOK {
+			add("error", "NAT 第 %d 行：出口口 %s 不在基础配置里。", i+1, r.Outside)
+		}
+		if outOK && outIt.VPP == r.Inside {
+			add("error", "NAT 第 %d 行：客户口和出口口不能是同一个口 %s。", i+1, r.Inside)
+		}
+		outPfx, outHasPfx := ifacePrefix(outIt)
+		outIP, outHasIP := parseIPv4(outIt.IP)
+		if outOK && outHasPfx && outHasIP {
+			// 池地址 = 出口口自己的地址是这台盒子上实测过的事故形状：NAT 一开，
+			// 所有到该地址的入向包（管理面）被 out2in 的 no translation 丢掉。
+			if len(r.Pool) > 0 {
+				for _, a := range r.Pool {
+					if ip, ok := parseIPv4(a); ok && ip == outIP {
+						add("error", "NAT 第 %d 行：地址池不能包含出口口自己的地址 %s（NAT 一开，到它的入向流量会被丢掉，管理面会失联）。请用同网段里另一个空闲地址。", i+1, ip)
+					}
+				}
+			}
+		}
 		seenPool := map[netip.Addr]bool{}
 		for _, a := range r.Pool {
 			ip, ok := parseIPv4(a)
@@ -190,6 +216,14 @@ func servicesChecks(c *BasicConfig, s *ServicesSet) []ConfigCheck {
 				add("warning", "NAT 第 %d 行：地址池里 %s 重复。", i+1, a)
 			}
 			seenPool[ip] = true
+			if outOK && outHasPfx && !outPfx.Contains(ip) {
+				add("error", "NAT 第 %d 行：地址池地址 %s 不在出口口 %s 的网段 %s 内。", i+1, a, r.Outside, outPfx)
+			}
+			if owner, dup := poolClaim[ip]; dup {
+				add("error", "NAT 第 %d 行：地址池地址 %s 已被第 %d 行使用。", i+1, a, owner)
+			} else {
+				poolClaim[ip] = i + 1
+			}
 		}
 		if r.MSSClamp != 0 && r.MSSClamp < 536 {
 			add("error", "NAT 第 %d 行：MSS 钳制值 %d 低于 TCP 最小值 536。", i+1, r.MSSClamp)

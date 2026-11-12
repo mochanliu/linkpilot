@@ -6,13 +6,8 @@
 //     length, kernel TAP name), so the box only has to write them into
 //     /etc/sdwan/svc.json and signal sr-svc -- sr-svc binds exactly what it is
 //     told and re-derives nothing.
-//   - NAT rows ride along in the artifact but are NOT applied here. 2026-11-12
-//     exp-nat-bare 裁决：VPP 26.06 的 nat44_ei 数据面没有缺陷（裸 VPP + 纯 CLI
-//     客户流量 8/8 通）；卡点是配置形状——pool 用外口自身地址会让所有入向管理
-//     流量（ssh/控制器心跳）被 out2in "no translation" 丢掉，盒子表现为管理面
-//     失联。下发前必须先落定：pool 改专用地址（外口 secondary）、外口改
-//     nat44_ei_add_del_output_interface 注册、盒子自身服务要不要过 NAT 单独设计。
-//     证据与机制账本：test/lab/vmlab/exp-nat-bare/README.md。
+//   - NAT rows are VPP state, so they are reconciled against VPP's own dumps
+//     instead of a file (see nat.go: shape G, measured on CPE4 2026-11-12).
 //
 // The file write happens even when the segment carries empty tables: "删掉最后
 // 一行 DHCP" has to stop sr-svc from serving, and the way that happens is the
@@ -39,12 +34,6 @@ const (
 	// dir) lives with the other artifact names in apply.go.
 	svcFile = "/etc/sdwan/svc.json"
 )
-
-// NatPendingNote is the status note appended when a bundle carries NAT rows.
-// The console shows the same text (cmd/sr-ctrl natPendingText); two sources of
-// truth would drift, so the wording lives in both and says the same measured
-// fact.
-const NatPendingNote = "NAT 行已发布但暂不下发：实测 VPP 26.06 的 NAT44 本身可用（2026-11-12 exp-nat-bare），但产品配置形状未落定——pool 用外口自身地址会丢掉所有入向管理流量，需先改为专用 pool 地址 + 外口 output-interface 注册再下发。"
 
 // svcDHCPRow / svcDNSRow mirror the controller's rendered rows (cmd/sr-ctrl
 // config_render.go). The JSON shapes are the contract: the controller renders,
@@ -105,20 +94,22 @@ func decodeServicesSegment(seg string) (servicesSegment, error) {
 	return doc, nil
 }
 
-// applyServices writes the svc file and reloads sr-svc. It returns a note when
-// something travelled with the bundle that could not be applied (NAT rows).
-func (a *Applier) applyServices(ctx context.Context, inst Installed) (string, error) {
+// applyServices writes the svc file, reloads sr-svc, and reconciles the NAT
+// half of the segment against VPP. It returns the notes that belong in the
+// status: rows that could not be applied (半行 NAT、暂不支持的字段).
+func (a *Applier) applyServices(ctx context.Context, inst, prev Installed) (string, error) {
 	seg, err := decodeServicesSegment(inst.Services)
 	if err != nil {
 		return "", err
 	}
-	var note string
-	if len(seg.NAT) > 0 {
-		note = NatPendingNote
+	natNotes, err := a.applyNAT(ctx, seg.NAT, prev)
+	if err != nil {
+		return "", err
 	}
+	note := strings.Join(natNotes, " ")
 	if a.DryRun {
-		a.Logf("would write %s (dhcp %d 行, dns %d 行, nat %d 行[不下发])",
-			a.SvcConf, len(seg.DHCP), len(seg.DNS), len(seg.NAT))
+		a.Logf("would write %s (dhcp %d 行, dns %d 行)",
+			a.SvcConf, len(seg.DHCP), len(seg.DNS))
 		return note, nil
 	}
 	svc := srSvcConfig{DHCP: seg.DHCP, DNS: seg.DNS}

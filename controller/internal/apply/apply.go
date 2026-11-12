@@ -82,8 +82,8 @@ type Artifacts struct {
 	// 否则"删掉最后一条策略"永远到不了盒子。
 	Policy string `json:"policy,omitempty"`
 	// Services is bundle 第 8 段: 服务面（NAT/DHCP/DNS）。DHCP/DNS 落成
-	// /etc/sdwan/svc.json 交给 sr-svc（见 services.go）；NAT 行只随包携带、
-	// 暂不下发（nat44_ei 数据面缺陷，见 services.go 的头部说明）。
+	// /etc/sdwan/svc.json 交给 sr-svc（见 services.go）；NAT 是 VPP 内存状态，
+	// 由 apply 按 VPP 自己的 dump 对账（见 nat.go）。
 	// omitempty 只放过该段出现之前发布的旧包。
 	Services string `json:"services,omitempty"`
 }
@@ -455,14 +455,21 @@ type Applier struct {
 	DialVRRP func(ctx context.Context, socket string) (vrrpPlane, error)
 	// DialPolicy opens the ACL/ABF plane (7th segment). Same seam, same default.
 	DialPolicy func(ctx context.Context, socket string) (policyPlane, error)
+	// DialNAT opens the nat44_ei plane (the NAT half of the services segment).
+	// Same seam, same default.
+	DialNAT func(ctx context.Context, socket string) (natPlane, error)
+	// IfaceAddrs reads one interface's IPv4 prefixes. Default: vppctl
+	// `show interface address`. A test seam only -- the NAT reconcile needs to
+	// know where the pool addresses hang and which address is the box's own.
+	IfaceAddrs func(ctx context.Context, iface string) ([]vppapi.Prefix, error)
 	// SvcConf is the box's sr-svc config file. The services segment's DHCP/DNS
 	// half lands here (see services.go).
-	SvcConf string
-	Wait    time.Duration
-	DryRun     bool
-	Exec       Executor
-	Sleep      func(time.Duration)
-	TAPExists  func(string) bool
+	SvcConf   string
+	Wait      time.Duration
+	DryRun    bool
+	Exec      Executor
+	Sleep     func(time.Duration)
+	TAPExists func(string) bool
 	// HostPermMAC reads a NIC's burned-in MAC (default: ethtool -P). A test
 	// seam; nil means "use the default".
 	HostPermMAC func(ctx context.Context, netdev string) (mac string, permanent bool)
@@ -492,6 +499,13 @@ func New(store Store) *Applier {
 		},
 		DialVRRP: func(ctx context.Context, socket string) (vrrpPlane, error) {
 			c, err := vppapi.Dial(ctx, socket, "sr-apply-vrrp")
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
+		DialNAT: func(ctx context.Context, socket string) (natPlane, error) {
+			c, err := vppapi.Dial(ctx, socket, "sr-apply-nat")
 			if err != nil {
 				return nil, err
 			}
@@ -644,7 +658,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 		if err := a.applyPolicy(ctx, inst); err != nil {
 			return err
 		}
-		if _, err := a.applyServices(ctx, inst); err != nil {
+		if _, err := a.applyServices(ctx, inst, prev); err != nil {
 			return err
 		}
 		return a.applyVRRP(ctx, inst)
@@ -697,7 +711,7 @@ func (a *Applier) Apply(ctx context.Context, b Bundle, allowBlocking bool) error
 	// Services before VRRP too: DHCP/DNS 是服务面，写文件 + 重载 sr-svc；NAT 行
 	// 只随包携带（见 services.go 的头部说明）。失败同 policy 一样拦住 VRRP。
 	if err == nil {
-		note, serr := a.applyServices(ctx, inst)
+		note, serr := a.applyServices(ctx, inst, prev)
 		if serr != nil {
 			err = serr
 		} else if note != "" {
@@ -758,7 +772,9 @@ func (a *Applier) Boot(ctx context.Context, frrDiff bool) error {
 		err = a.applyPolicy(ctx, inst)
 	}
 	if err == nil {
-		note, serr := a.applyServices(ctx, inst)
+		// 开机重放没有"上一版"：VPP 刚起来，NAT 状态全在内存里、已经没了，
+		// 这一轮只需要把这一版装上（传空 Installed 让 prune/退场都成空操作）。
+		note, serr := a.applyServices(ctx, inst, Installed{})
 		if serr != nil {
 			err = serr
 		} else if note != "" {

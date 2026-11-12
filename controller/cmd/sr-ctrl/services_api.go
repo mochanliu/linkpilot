@@ -32,11 +32,7 @@ type servicesView struct {
 
 	// Ifaces 是可选挂点：客户口（VPP 名 + 地址/掩码 + VPN），页面用它生成
 	// 下拉框并标注这个口能不能当 DHCP/DNS/NAT 的 inside。
-	Ifaces []svcIfaceRow `json:"ifaces"`
-	// NATPending 为真表示服务段里的 NAT 行还没落到盒子（26.06 nat44_ei 数据面
-	// 缺陷，后端落定前 apply 不下发 NAT）。页面把它显示出来而不是假装已生效。
-	NATPending string `json:"nat_pending,omitempty"`
-
+	Ifaces   []svcIfaceRow     `json:"ifaces"`
 	Checks   []ConfigCheck     `json:"checks"`
 	Artifact string            `json:"artifact"`
 	Notes    map[string]string `json:"notes"`
@@ -98,9 +94,6 @@ func (s *server) servicesViewLocked(tenantID string, nodeID uint16, now int64) (
 	normalizeServices(&svc)
 	view.Services = svc
 	view.Artifact = renderServicesArtifact(&cfg, svc)
-	if s.servicesNatBlocked() {
-		view.NATPending = natPendingText
-	}
 
 	for _, it := range cfg.Ifaces {
 		view.Ifaces = append(view.Ifaces, svcIfaceRow{
@@ -121,17 +114,6 @@ func (s *server) servicesViewLocked(tenantID string, nodeID uint16, now int64) (
 	}
 	return view, true
 }
-
-// natPendingText 是 apply 对 NAT 行"不下发"的说明，页面与状态共用一份文案。
-// 2026-11-12 exp-nat-bare 裁决：VPP 26.06 的 nat44_ei 数据面本身没有缺陷
-// （裸 VPP + 纯 CLI，客户流量 8/8 通）；卡点是配置形状——pool 用外口自身地址
-// 会让所有入向管理流量被 out2in "no translation" 丢掉。下发前要先落定
-// pool 语义（专用地址）+ 外口 output-interface 注册，见 exp-nat-bare/README.md。
-const natPendingText = "NAT 行已发布但暂不下发：实测 VPP 26.06 的 NAT44 本身可用（2026-11-12 exp-nat-bare），但产品配置形状未落定——pool 用外口自身地址会丢掉所有入向管理流量，需先改为专用 pool 地址 + 外口 output-interface 注册再下发。"
-
-// servicesNatBlocked 报告 NAT 后端是否仍处于"暂不下发"状态。它是编译期事实
-// （当前这个 build 判死 nat44_ei），不是运行时状态，所以直接返回常量。
-func (s *server) servicesNatBlocked() bool { return true }
 
 type servicesSaveRequest struct {
 	NodeID   uint16      `json:"node_id"`
