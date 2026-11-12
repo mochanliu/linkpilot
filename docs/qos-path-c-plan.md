@@ -546,10 +546,21 @@ A 的判别方式就是 9.2 那张表（`tc filter ... match ip sport 20000 → 
 所以一个声明 `.runs_before = VNET_FEATURES ("wg4-output-tun")` 的节点排在它**前面**，
 就能在加密前拿到**明文内层包**，内层 DSCP、五元组、每隧道计数全都在。
 
-**这是推断，未实测。** 依据三条：① FIB 里到隧道的路由带 `[features]` 标记（说明走
-ip4-output 弧）；② feature 列表里 `wg4-output-tun` 在弧上；③ "之后是死点"的既有实测。
-动手写整形器之前，先花半天写一个 **40 行的计数节点**挂上去，打 10 个 ping 看 counters
-是不是 10——不通过就退回 9.3 的 A 或 B，不要在没验的挂点上写 900 行。
+**已实测通过（2026-11-12 19:3x，CPE4）**，不再是推断：
+
+- `strings`/二进制 grep：`wireguard_plugin.so` 里确有 `ip4-output` 与 `wg4-output-tun`
+  字面量（3 处），说明它确实是这条弧上的 feature 节点；
+- 装上新插件后 `show features` 的 `ip4-output` 弧顺序：
+  `sr-wg4-qos → sr-wg4-encap → ip4-sv-reassembly-output-feature → … → wg4-output-tun → …`
+  —— 我们的节点排在**第一位**，`wg4-output-tun` 在第 11 位；
+- 逐口启用后 `show interface features wg1010` 显示 `ip4-output: sr-wg4-qos, wg4-output-tun`
+  —— 链是 `sr-wg4-qos → wg4-output-tun`，正是"明文 → 加密"的顺序；
+- **真实客户流量被计到**：挂上三条隧道后累计 1159 包，按口分开
+  （wg1010 273 / wg1011 51 / wg1014 38，随后继续增长到千级），全部落 dscp 0 桶。
+
+所以 8 队列整形器可以直接长在 `sr-wg4-qos` 节点上：分类发生在加密前、内层头可读、
+逐隧道可分。**注意**：`vppctl ping` 打到 overlay 地址走的是 main FIB（overlay 路由在
+table 250），不进隧道，所以别用它做注入测试——真实流量才是这里的判据。
 
 ### 9.5 写 C 的真实代价（不美化）
 
@@ -571,7 +582,14 @@ ip4-output 弧）；② feature 列表里 `wg4-output-tun` 在弧上；③ "之�
    不要 ⇒ B 就够（每条隧道一个上限）；要但没有内核洁癖 ⇒ A；要且必须留在 VPP ⇒ C。
 2. 若走 C：先做"每隧道单队列整形"（shaper 形状，约 C 的 1/3 工作量），还是直接
    8 队列 + WRR/LLQ + RED？
-3. 是否接受先花半天验 §9.4 的挂点（我认为这是 C 的**前置门槛**，不是可选项）。
+3. ~~是否接受先花半天验 §9.4 的挂点~~ —— **已验且通过**（见 §9.4 末段）。
+   owner 已拍 **C + 8 队列**，挂点这一关不再是风险项。
+
+> 落地状态（2026-11-12 19:3x）：`vpp-plugin/sr_qos.{c,h}` 已进 `sr_wg_plugin`（节点
+> `sr-wg4-qos`、CLI `set sr-wg qos-hook enable|disable <if>` / `show sr-wg qos-hook`），
+> 已装到 CPE4 `/usr/lib/x86_64-linux-gnu/vpp_plugins/`（旧版留 `.bak-qos-20261112`）。
+> 当前是**第一阶段**：按 (隧道, DSCP) 计数后原样透传，挂点默认关闭。
+> 第二阶段在同一节点上换入队 + 定时 drain + token bucket，不重写弧与 CLI。
 
 ---
 

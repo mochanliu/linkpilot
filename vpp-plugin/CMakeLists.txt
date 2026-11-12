@@ -42,6 +42,7 @@ set(SR_WG_PLUGIN_SOURCES
   sr_wg4_post.c
   sr_wg4_mpls_out.c
   sr_wg_probe.c
+  sr_qos.c
   sr_wg_api.c
   sr_wg_cli.c
   sr_hmac.c

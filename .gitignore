@@ -26,3 +26,4 @@ controller/tools/world-basemap/vendor/
 # 判据脚本在 lab-ctrl 里 go build 的落点（/workspace/controller 是共享挂载，
 # 每台容器再 cp 进自己的 $WORK/bin）：编译产物，不入库
 controller/bin/
+vpp-plugin/build*/

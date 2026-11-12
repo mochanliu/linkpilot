@@ -174,6 +174,24 @@ tunnels     0 条：VPP 里的 wg 口是 sr-agent -tunnels 从**控制器**取�
 （2026-11-05 23:08 实测 sr-route 在 72s 采样里只活着 47.0–49.1s）。复核：
 `ssh CPE1 'systemctl status sr-box --no-pager | tail -12'`。
 
+### 2.6 VPP 插件已换件（2026-11-12 19:3x，仅 CPE4）
+
+`sr_wg_plugin.so` 现在带 QoS 挂点节点 **`sr-wg4-qos`**（`vpp-plugin/sr_qos.{c,h}`）。
+第一阶段只做分类骨架：挂在 `ip4-output` 弧、排在 `wg4-output-tun` **之前**，按
+(出口口, 内层 DSCP) 计数后原样透传，**默认不启用**（`set sr-wg qos-hook enable <if>`）。
+节点存在、弧序、真实流量计数三项已在 CPE4 实测通过（细则 `docs/qos-path-c-plan.md` §9.4）。
+
+- 安装位置：`/usr/lib/x86_64-linux-gnu/vpp_plugins/sr_wg_plugin.so`（该目录下无 `plugins{}`
+  段，VPP 启动时自动装载，**没有运行时加载**）；
+- 旧版留底：`sr_wg_plugin.so.bak-qos-20261112`。回退 = 拷回原名 + `systemctl restart vpp`；
+- 版本号仍是 **1.0.0**（下次连整形器一起 bump，别拿版本号判断有没有这个节点，用
+  `show sr-wg qos-hook`）；
+- **换插件必重启 VPP，而管理口在 VPP 里** ⇒ 换件必须 detached（`systemd-run`）+ 失败自回滚，
+  照 #307 的教训做，不要在前台 ssh 里敲 `systemctl restart vpp`；
+- 构建：`docker run --rm -v "$PWD/vpp-plugin":/workspace/vpp-plugin -w /workspace/vpp-plugin
+  srwg-dev:latest` → `cmake -G Ninja && ninja`，产物在 `build-qos/lib/vpp_plugins/`。
+  镜像里有 `vpp-dev 26.06-release`（`/usr/include/vnet/feature/feature.h` 是 26.06 的路径）。
+
 ---
 
 ## 3. 曾经踩到的三只雷：在跑的产物 ≠ 盘上的产物（2026-11-07 已收口，任务 #277）
@@ -613,6 +631,7 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 | ~~#269 缺陷⑧~~ | **已修（2026-11-07）** | `controller/deploy/sr-box/start.sh` 加了一把 `flock`（`LOCK=${SR_BOX_LOCK:-$RUN/.lock}`）：`run_up`/`run_stop` 都先抢它，非阻塞拿不到就 SKIP；`launch()`/`do_vpp`/`do_apply`/`do_frr` 每个后台子进程带 `9>&-` 关掉锁 fd，否则被 systemd `TimeoutStartSec` 杀掉时锁攥在守护进程手里永不释放。沙盒 5 路并发实测：`sr-agent`/`sr-route`/`sr-fib`/`sr-frr` 各起 1 份，4 份 SKIP 退出 0。**VM 台的物理复测没跑**（要 `systemctl restart vpp` 撞那一秒，属于会影响 lab 现状的动作，等 owner 点头再做）。抬 `sr-route` 到 HEAD 的**并发抢起阻塞已解**，剩下的只是重启本身的 RR 会话抖动 |
 | ~~#268 / #260 产物没装全~~ | **已收口（#277，2026-11-07）** | 四台盘上已换成在跑那一份，`run==disk` 全一致；判据与留底见 §3 和 `exp-277/README.md`。**代码没再动**，这一轮修的是产物一致性 |
 | ~~G-2 隧道表落盘~~ | **产品修复已落地（`cfb3dee` ②）** | sr-agent 心跳节拍自动派生 sr-fib 隧道表（`internal/agent/fibtable.go`），磁盘 0 条是有意设计；残余：agent 启动第一拍推 0 行的瞬态（2026-11-12 实测，见 §5.2/§3 附近那笔），待拍 |
+| **QoS 路径 C（隧道 8 队列）** | **挂点已实测通过（2026-11-12），第一阶段节点已落地**；第二阶段（入队+drain+整形）未开工 | owner 已拍 **C**（VPP 内自研节点）+ **直接 8 队列**。对象是 **WireGuard 隧道**，不是网卡：隧道流量不经主机内核，所以 §6 的主机 tc 对隧道无效。判别符在外层 `udp sport`（wg1010/1011/1014 = 20000/20001/20002，FIB rewrite + tcpdump 双证据）。挂点实测：`sr-wg4-qos` 排在 `wg4-output-tun` **之前** ⇒ 加密前、明文、内层 DSCP 可读；三条隧道实测计到 1159 包。方案与取舍：`docs/qos-path-c-plan.md` §9；换件与回退：本文 §2.6 |
 | NAT 阶梯 #222 + M-4/M-1/M-3/M-5、#211/#213/#244/S8 | 挂着 | 顺序 M-4→M-1→M-2→M-3 |
 
 **#276 切片 B/C（2026-11-08）顺手抓到的 2 条缺口：B3、B4 均已于 2026-11-09 落地并实测收口（B4 的形状 owner 拍的是 (b)）**
