@@ -7,14 +7,24 @@ owner 倾向**升级 VPP** 解 NAT，但要求先重新核对与现有 dataplane
 
 ## 1. 我们在 #302 里实测到的缺陷（升级要解的对象）
 
-CPE1 / VPP v26.06-release / 2G 内存 lab VM，2026-11-11：
+CPE1 / VPP v26.06-release / 2G 内存 lab VM，2026-11-11/12：
 
-1. CLI `nat44 plugin enable` 默认参数 → main heap OOM `os_panic()`，VPP 整个进程死，
-   接管/重放竞态把 lab VM 拖到只剩 VBoxManage reset。
+1. CLI `nat44 plugin enable` 默认参数 → main heap OOM `os_panic()`（/var/crash 里留有
+   SIGABRT core），VPP 整个进程死，接管/重放竞态把 lab VM 拖到只剩 VBoxManage reset。
 2. heap 加大后 CLI enable"成功"但状态不粘（disable 答 already disabled、
    `set interface nat44` 答 add failed）。
-3. **数据面崩**：改走 binary API（`nat.go` 显式 sizing，5 轮 retval=0、配置回读准确），
-   NAT 开着后第一次真实 WAN 流量进来整机卡死（ssh EAGAIN、只有 ICMP 活）。
+3. **数据面**：binary API enable retval=0、dumps 回读准确，但 NAT 开启后**两个 NAT
+   接口上的所有流量被 nat44 特性节点全丢**。2026-11-12 带取证复测 4/4 秒级复现
+   （nat-watch.sh 2s 采样 + nat-deep.sh vppctl 深采样，见 test/lab/vmlab/）：
+   - WAN 口 drops 以背景流量全速上涨（~30pps 全丢），punt/本地交付不受影响
+     （ICMP echo 照答、盒内 vppctl 走 unix socket 照常、lcp pair 与内核地址完好）；
+   - **会话表始终为 0**——cust12→WAN 网关的 transit ping 一个会话都没建出来；
+   - 无资源异常、无 panic、无重启（load/mem/pid 全程平稳）；
+   - 影响面：入向到盒子的 TCP（SSH 管理）与客户 transit 全死；盒内与本地交付幸存。
+   当时的"整机假死"实为管理面失联的误称：VPP 活着，是 TCP 路径全被 NAT 丢包。
+   是否 26.06 nat44-ei 真 bug、缺某个使能旋钮、还是与我们特性弧（ABF/sr_wg）的
+   交互，**待 26.10 金丝雀同一杀器测试裁决**——现在测试有节点级判据（drops 全速/
+   sessions==0），不再是"神秘假死"。
 
 ## 2. 上游现状（2026-11-12 调研）
 
@@ -26,9 +36,12 @@ CPE1 / VPP v26.06-release / 2G 内存 lab VM，2026-11-11：
   - [#3749](https://github.com/FDio/vpp/issues/3749) `nat44 ei del user` SIGSEGV（多 worker）。
   - nat44-ed 族也有未收口 SIGSEGV（#3728 GRE/IPIP ICMP；#3743 地址-only 静态映射按包协议查）。
   - 邮件列表另有 nat44-ei ICMP error 线程索引混淆崩溃的讨论（无单一条目号）。
-- **诚实结论**：我们 #302 第 3 条"首包即整机卡死"没有干净对应到某一条上游 issue ——
-  可能是多个 bug 的合流（OOM 家族 + crash 后接管/重放竞态放大成假死）。26.10 的 174 个
-  fix 里有没有命中我们的那条，**只有装上打流量才知道**。
+- **诚实结论（2026-11-12 取证复测后更新）**：现象已从"神秘假死"收敛为可测形状
+  （§1.3：NAT 接口全丢包 + 会话恒 0 + 无任何资源异常/panic）。它没有干净对应到上表
+  任何一条 open issue——"drop-everything + 0 sessions"更像是**使能路径缺了某个前提**
+  （旋钮/顺序/与我们特性弧的交互）或 26.06 ei 插件的未登记缺陷。所以判定实验保留
+  原样：26.10 金丝雀跑同一杀器测试，节点级判据（drops 是否全速、sessions 是否仍 0）
+  能直接分辨"版本 bug 被修了"还是"我们的用法错了"。
 
 ## 3. 兼容性核对清单（升级前必须逐项过）
 
@@ -50,8 +63,10 @@ CPE1 / VPP v26.06-release / 2G 内存 lab VM，2026-11-11：
 2. **ABI 修补**：按 diff 清单改 `internal/vppapi`（消息布局与大小字段），`go test ./...` 全绿。
 3. **金丝雀盒**：选一台（建议 CPE2，非缺陷臂、非服务面验证机）装 26.10 全套
    （vpp + vpp-plugin-* + 我们的重编插件），`systemctl restart vpp`，跑全量
-   `vm-verify.sh`；**NAT 判据 = `nat-probe -keep` + 真实 WAN 流量打 10 分钟不假死**
-   （#302 的杀手测试，retval=0 不算数）。回滚底：26.06 包留盘、恢复即降级。
+   `vm-verify.sh`；**NAT 判据 = `nat-probe -keep` + 真实 WAN 流量，对照 2026-11-12 的
+   节点级判据**：WAN 口 drops 不得随背景流量全速上涨、`show nat44 ei sessions` 在
+   transit 流量下必须出现会话（retval=0 不算数；取证工具 test/lab/vmlab/nat-watch.sh
+   + nat-deep.sh）。回滚底：26.06 包留盘、恢复即降级。
 4. **解封 NAT 下发**：金丝雀过了才改 `apply.servicesNatBlocked()` → false，控制台发
    NAT 行，CPE1 做 DIA+NAT 全链路（多 VPN 不串 + VPP 重启自愈，dia-nat-dhcp-dns-plan.md §4 判据）。
 

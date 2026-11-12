@@ -254,6 +254,22 @@ done'
 同步）都会在接管时幂等 `ethtool -K <口> tso/gso/gro off`。下次重启起生效，验证法
 `ethtool -k enp0s8 | grep tcp-segmentation`；VPP 升级后两处要一起重估。
 
+**部署程序的教训（2026-11-12 三次开机挂死换来的）**：往盒上覆盖**可执行脚本**必须用
+`install -m 0755 <src> /root/vmlab/underlay.sh`，不能 `scp xxx.new && mv`——scp 落盘 644，
+mv 把执行位一起带走，systemd 下次开机就是 `vmlab-underlay.service ... status=203/EXEC`
+（脚本没执行 = 接管没跑 = VPP 里没有 host-* 口 = sr-apply 开机重放永远卡在接口检查
+= 盒子无地址失联）。`bash -n` 只查语法不查权限位，"检查通过"不代表部署成功；换完
+脚本要 `ls -la` 确认 755。取证/诊断工具见 `test/lab/vmlab/nat-watch.sh`（2s 轻采样）
+与 `nat-deep.sh`（vppctl 节点级深采样，走 unix socket 假死时也能答话）。
+
+**#302 NAT 缺陷定性更新（2026-11-12 带取证 4/4 秒级复现）**：26.06 的 nat44_ei 经
+binary API enable（retval=0、dumps 准确）后，**两个 NAT 接口上的所有包被 nat44 特性
+节点全丢**（WAN 口 drops 以背景流量全速上涨；cust12→WAN 网关 transit 100% 丢、会话表
+恒 0），入向 TCP（SSH）秒死而 ICMP echo/盒内/本地交付全部正常——当日"整机假死"实为
+管理面失联。资源层零异常、无 panic。与 hook 点无关（host-enp0s8/9 就是 af_packet
+转发口），与内存/CPU 无关。详见 docs/vpp-upgrade-compat-2610.md §1.3；金丝雀判据已
+换成节点级（drops 不全速、sessions>0）。
+
 **顺带抓到的一处真实不一致（缺口 G-2，不是本次引入）**：CPE3 的 sr-fib 运行时隧道表 3 条
 （`curl -s http://127.0.0.1:19011/status` 的 `tunnels`），盘上 `/etc/sdwan/fib.json` 写的是 **`tunnels: 0`**
 （CPE2/3/4 全 0，CPE1 是本轮我手工 `PUT /config` 恢复过的 2 条）。这张"下一跳 ↔ 本机 wg 口名 ↔ 颜色"
