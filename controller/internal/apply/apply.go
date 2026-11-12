@@ -965,6 +965,16 @@ func (a *Applier) ensureHostIface(ctx context.Context, netdev, hostIf string) er
 	if out, ierr := a.Exec.Run(ctx, "ip", "link", "set", "dev", netdev, "allmulticast", "on"); ierr != nil {
 		a.Logf("vpp: %s allmulticast 打不开（非致命）: %v: %s", netdev, ierr, strings.TrimSpace(out))
 	}
+	// #302（2026-11-08、2026-11-12 两次现场复发）：内核 TSO/GSO/GRO 开着时，af_packet
+	// 数据面的大包流会确定性卡死（scp/任何 bulk 全挂）。ethtool 的开关不进磁盘配置，
+	// 盒子重启必回 on —— 所以持久化点就落在接管路径上：重启后 VPP 是空的，本函数
+	// 必然走到这里，顺手幂等关掉（非致命）。VPP 升级后 af_packet 若自带 offload
+	// 支持，这里与 lab underlay.sh 那份要一起重估（handover offload 条目）。
+	if out, ierr := a.Exec.Run(ctx, "ethtool", "-K", netdev, "tso", "off", "gso", "off", "gro", "off"); ierr != nil {
+		a.Logf("vpp: %s offload 关不掉（非致命，大包流可能卡死；手工补 ethtool -K %s tso off gso off gro off）: %v: %s", netdev, netdev, ierr, strings.TrimSpace(out))
+	} else {
+		a.Logf("vpp: %s offload 已关（tso/gso/gro，#302）", netdev)
+	}
 	if _, ierr := a.Exec.Run(ctx, "ip", "link", "set", netdev, "up"); ierr != nil {
 		a.Logf("vpp: %s 起不来（非致命，create host-interface 会自己拉起）", netdev)
 	}

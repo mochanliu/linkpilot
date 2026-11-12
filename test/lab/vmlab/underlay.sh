@@ -91,6 +91,17 @@ while IFS= read -r LINE; do
         rc=1; continue
     fi
 
+    # #302（2026-11-08、2026-11-12 两次现场复发）：内核 TSO/GSO/GRO 开着时，af_packet
+    # 数据面的大包流会确定性卡死（scp/任何 bulk 全挂）。ethtool 的开关不进磁盘配置，
+    # 盒子重启必回 on —— 开机接管时在这里顺手幂等关掉（非致命，不置 rc）。
+    # 产品侧同款在 apply.ensureHostIface（接管路径同一位置）；VPP 升级后 af_packet
+    # 若自带 offload 支持，两处要一起重估（handover offload 条目）。
+    if ethtool -K "$IF" tso off gso off gro off >/dev/null 2>&1; then
+        echo "OK  $IF offload 已关（tso/gso/gro，#302）"
+    else
+        echo "WARN $IF offload 关不掉（ethtool 缺席或口名不符）—— 大包流可能卡死，手工补 ethtool -K $IF tso off gso off gro off"
+    fi
+
     # 等 TAP 在内核里出现，再把地址从物理口搬过去（顺序反了就是往不存在的口上加地址）
     i=0
     until ip link show "$TAP" >/dev/null 2>&1; do
