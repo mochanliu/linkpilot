@@ -244,14 +244,15 @@ done'
 
 | 盒 | 件 | 在跑 == 盘上 | 说明 |
 | --- | --- | --- | --- |
-| CPE1 | `sr-agent` | `6cb56276a23bf224` | SIGTERM→watch 补回换件，实测心跳断 ~90s（watch 60s 一轮），数据面 0 扰动。换它的原因：bundle 里新增 services.json 段，老 agent 进程内的 apply 拷贝不认这段会静默丢掉 |
-| CPE1 | `sr-apply` | `c000b288a6efb2bc` | one-shot（agent 每次 apply 时 exec），只装盘即可生效 |
+| CPE1 | `sr-agent` | `1e8c8894e2467fcc`（两次换件：先 `6cb56276` 加 services 段，后加 FibTableSync 首拍守卫 + offload 持久化） | SIGTERM→watch 补回换件，实测心跳断 ~90s（watch 60s 一轮），数据面 0 扰动。换它的原因：bundle 里新增 services.json 段，老 agent 进程内的 apply 拷贝不认这段会静默丢掉 |
+| CPE1 | `sr-apply` | `b2f40c322bd199d6`（盘上，one-shot） | agent 每次 apply 时 exec，含 offload 持久化 |
 | CPE1 | `sr-svc` | `02db9629f312b2b1` | **新 daemon**：DHCP server + DNS 转发器，读 `/etc/sdwan/svc.json`（bundle 第 8 段），状态口 `127.0.0.1:8092/status`，SIGHUP 热换行不丢租约；start.sh 的 svc 步在 svc.json 存在且进程不在时拉起 |
-| CPE2–4 | —— | 未动 | 服务面只在 CPE1 验证过；配置模型/下发路径四台同构 |
+| CPE2–4 | —— | 未动（only `/root/vmlab/underlay.sh` 已换新，含 offload-off） | 服务面只在 CPE1 验证过；配置模型/下发路径四台同构 |
 
-**注意：CPE1 又踩了一次 af_packet offload 雷（#302 的重复）**：00:13 盒子重启后内核 TSO/GSO/GRO 回到 on，
-scp/任何 bulk 全卡；已手工重关（`ethtool -K enp0s8/9 tso off gso off gro off`）。
-**这个 offload-off 至今没有持久化（ensureHostIface/underlay.sh 都没加）——谁重启盒子谁先补一刀。**
+**注意：CPE1 的 af_packet offload 雷（#302）已于 2026-11-12 持久化收口**：`apply.ensureHostIface`
+（产品接管路径）与四台 `/root/vmlab/underlay.sh`（lab 开机清单，仓库 test/lab/vmlab/underlay.sh
+同步）都会在接管时幂等 `ethtool -K <口> tso/gso/gro off`。下次重启起生效，验证法
+`ethtool -k enp0s8 | grep tcp-segmentation`；VPP 升级后两处要一起重估。
 
 **顺带抓到的一处真实不一致（缺口 G-2，不是本次引入）**：CPE3 的 sr-fib 运行时隧道表 3 条
 （`curl -s http://127.0.0.1:19011/status` 的 `tunnels`），盘上 `/etc/sdwan/fib.json` 写的是 **`tunnels: 0`**
@@ -295,6 +296,14 @@ agent.log 的 `sr-fib 隧道表已收敛：N 行`（写的人自报）+ `curl 12
    另记一笔：CPE2 的 sr-fib 隧道表里有一行 `10.250.0.9 color=None`（手工时代 PUT 的残留，
    CPE2-4 今天没换 agent/config，老状态原封不动）—— 这行与台账对不上是 §3/§5 之外的潜在噪音，
    下次给 CPE2-4 发新 bundle（agent 派生整份替换）时会自然自愈。
+4. **§6 口径已重写、回归 gate 已全绿（2026-11-12）**：vm-verify §6 改为"每个下一跳按它
+   隧道颜色折表号核对"（ColorTable=color*1000+主表，颜色 0=主表），顺带全文件把
+   `$var（` 形态统一 `${var}` 括护（本机 bash 把 UTF-8 标点字节并进变量名）。全量
+   **PASS=398 FAIL=0 WARN=0**。瞬态①已由 `4e2c432` 的 FibTableSync 守卫收口
+   （CPE1 sr-agent `1e8c8894`，换件实测首拍 hold、0 次 PUT、表未动）。
+   **NAT 解套**：owner 拍了升级方向 —— 评估与四步落地路径在
+   [docs/vpp-upgrade-compat-2610.md](file:///Users/louis/Documents/QoderCN/2026-10-15/chat-1/sdwan/docs/vpp-upgrade-compat-2610.md)
+   （26.10 已发布但升级不承诺修好 NAT，须 build spike + 金丝雀盒流量实测裁决）。
 
 **仍不一致的那唯一一处（有意留着，不是漏）：** CPE1 的 `sr-fib` 还是 `a9f1bc8c8fd49016` —— 事件版但**没带 B3**，
 它就是 B3 那一族的缺陷臂，抬到 `c213a6ca` 会把手上唯一的对照臂杀掉，所以按 #284 的方案**不动它**。
