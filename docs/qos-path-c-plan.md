@@ -898,7 +898,11 @@ reserved[2] hmac_id(2) path_id(2) timestamp(4) segments[..] hmac(8)
 
 **SR 头 flowID（reserved[2]）**：中转节点唯一能读的载荷之外信息就是外层 IP/UDP＋SR 头（内层在 WG 加密里）。若产品路线要做"中转节点差分调度"，flowID 是正解之一（HMAC 保护防篡改、16 bit 还能兼做逐流统计）。但 reserved 进 HMAC ⇒ 新端写 flowID 后旧端校验必挂 ⇒ 必须版本协商（ver_flags 高 4 位就是为这个留的）。
 
-**MPLS TC/EXP**：CPE4 FIB 里标签栈静态配置 `labels:[[1000 pipe ttl:0 exp:0]]`。三个问题：①在 WG 加密载荷里，中转读不到；②接收端解密后走 mpls-input，虽可比内层 IP 早读到 TC，但省一次 IP 头解析意义不大；③VPP 的 exp 来自 FIB 静态配置，per-packet 按 DSCP 写 exp 需要动 mpls-label DPO 或在自己的 `sr-wg4-mpls-out` 垫片里改写。3 bit=8 类倒是够 4 队列模型用，综合价值最低。
+**MPLS TC/EXP**：CPE4 FIB 里标签栈静态配置 `labels:[[1000 pipe ttl:0 exp:0]]`。"入口按 DSCP 定类别 → 封 MPLS 标签时把类别写进 3 bit TC"这个方案**技术上成立且实现点现成**：MPLS 包进 `sr-wg4-mpls-out`（我们的垫片，见 `sr_wg4_mpls_out.c`）时标签字已由 mpls-label DPO 写好，节点里按 `vnet_buffer(b)->opaque[]` 里存的类别改写标签字的 EXP 3 位即可（DSCP→3bit 一张 64 项静态映射表，RFC 3270 pipe 模式，约 20 行）。但要想清楚**给谁看**：
+  - ① TC 在 WG 加密载荷里，**中转 SR 节点读不到**——中转调度指望不上它；
+  - ② 读它的人只有接收端 CPE 的 mpls-input（WG 解密后、内层 IP 解析前）。对接收端 QoS 有真实价值（在 mpls 弧上就完成分类，不用等解出内层 IP）；对发送端 QoS 零增益（发送端早已用内层 DSCP 分类）；
+  - ③ 当前 lab 只有一跳 MPLS（CPE4↔CPE2），没有中间 LSR。
+结论：如果近期要给**接收端**做 QoS（CPE2 出口向 LAN 的调度），就按这个方案做 TC 映射；只为发送端 QoS 则不做。
 
 **外层 IP DSCP 复制（推荐）**：`sr-wg4-encap` 挂在 underlay 出口弧、外层 IP4/UDP 头已写好且可写（encap 的三步 memmove 就在改这段）。做法：入站 QoS 钩子分类时把 3 bit 类别存进 `vnet_buffer(b)->opaque[]`（同一 buffer 走到 encap），encap 把类别映射进外层 ToS。中转节点按外层 DSCP 调度——RFC 2983 pipe 模式，协议零改动、双端零升级。注意：encap 时内层头已进密文读不到，所以类别必须经 opaque 传递，encap 自己不能重新分类。
 
