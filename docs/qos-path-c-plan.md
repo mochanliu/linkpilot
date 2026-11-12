@@ -870,6 +870,47 @@ CPE4 实测三种形状全对：
 
 ---
 
+## 12. SR 头 flowID 与 MPLS TC 位评估（2026-11-13，纯调研，未改代码）
+
+### 12.1 先说结论
+
+| 载体 | 能否承载 QoS 类别 | 对现有 CPE4 发送端 QoS 的简化 | 兼容性代价 | 建议 |
+|---|---|---|---|---|
+| SR 头 `reserved[2]` 做 flowID | 能（16 bit，HMAC 保护） | **无** | 旧端 HMAC 校验失败 → 必须双端升级/版本协商 | v2 头格式再规划 |
+| SR 头 `action` 高 3 bit | 能（3 bit） | **无** | **零**（数据路径没人读 action，且不在 HMAC 内） | 需要时随时可加 |
+| MPLS TC/EXP（3 bit） | 能，但标签在 WG 加密**里面** | 无 | 要 per-packet 写 exp，得动 mpls DPO/自己的 mpls_out | 不做 |
+| **外层 IP DSCP 复制** | 能（6 bit DSCP） | 无 | **零协议改动**（外层头是我们自己的 encap 可写） | 中转 QoS 的首选 |
+
+核心判断：**flowID/TC 对"发送端 QoS"没有简化作用**。现在的热路径两件事——读内层 DSCP（入口弧上免费）＋判"从哪条隧道出去"（已缓存成一次 hash_get）。flowID 是封装时才写进 SR 头的，入口弧上 SR 头还不存在；而且 flowID 的语义是"业务类别"，不是"出隧道"，消不掉 FIB 解析那一步。真要消掉隧道判定，出路是把排队点挪到隧道身份已知的封装点，那是另一个设计变更，不是加字段。
+
+### 12.2 现有 SR-WG 头格式（`sr_header.h`，唯一权威）
+
+```
+magic(1) ver_flags(1) hdr_len(1) seg_left(1) seg_count(1) action(1)
+reserved[2] hmac_id(2) path_id(2) timestamp(4) segments[..] hmac(8)
+```
+
+- `reserved[2]`：16 bit 空位，**在 HMAC 覆盖内**（见 `sr_hmac.c` "显式跳过 magic/seg_left/action"）。
+- `action`：1 字节，**HMAC 排除**；grep 全插件确认数据路径（`sr_wg4_input`/`sr_wg4_transit`）没有任何地方读它，只被 init 写成 FORWARD=0。
+- `path_id`：已有字段，语义是"路径"不是"类别"——不要拿它当 flowID 用。
+
+### 12.3 各载体详评
+
+**SR 头 flowID（reserved[2]）**：中转节点唯一能读的载荷之外信息就是外层 IP/UDP＋SR 头（内层在 WG 加密里）。若产品路线要做"中转节点差分调度"，flowID 是正解之一（HMAC 保护防篡改、16 bit 还能兼做逐流统计）。但 reserved 进 HMAC ⇒ 新端写 flowID 后旧端校验必挂 ⇒ 必须版本协商（ver_flags 高 4 位就是为这个留的）。
+
+**MPLS TC/EXP**：CPE4 FIB 里标签栈静态配置 `labels:[[1000 pipe ttl:0 exp:0]]`。三个问题：①在 WG 加密载荷里，中转读不到；②接收端解密后走 mpls-input，虽可比内层 IP 早读到 TC，但省一次 IP 头解析意义不大；③VPP 的 exp 来自 FIB 静态配置，per-packet 按 DSCP 写 exp 需要动 mpls-label DPO 或在自己的 `sr-wg4-mpls-out` 垫片里改写。3 bit=8 类倒是够 4 队列模型用，综合价值最低。
+
+**外层 IP DSCP 复制（推荐）**：`sr-wg4-encap` 挂在 underlay 出口弧、外层 IP4/UDP 头已写好且可写（encap 的三步 memmove 就在改这段）。做法：入站 QoS 钩子分类时把 3 bit 类别存进 `vnet_buffer(b)->opaque[]`（同一 buffer 走到 encap），encap 把类别映射进外层 ToS。中转节点按外层 DSCP 调度——RFC 2983 pipe 模式，协议零改动、双端零升级。注意：encap 时内层头已进密文读不到，所以类别必须经 opaque 传递，encap 自己不能重新分类。
+
+### 12.4 什么时候才值得做
+
+现在都不做。触发条件按顺序：
+1. 出现"中转节点要做差分调度"的需求 → 先做外层 DSCP 复制（改动 ≈ encap 节点 20 行＋opaque 约定）；
+2. 需要 HMAC 保护/逐流统计/控制器染色 → SR 头 v2 加 flowID（reserved[2]），带版本协商；
+3. MPLS EXP 永远排最后。
+
+---
+
 ## 8. 这份文档不承诺的东西
 
 - ~~**没有写代码**，也没有改 bundle 段格式。第 5 节的模型是方案，不是已落地形状。~~
