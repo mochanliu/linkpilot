@@ -487,3 +487,69 @@ B 带宽代价离谱，不推荐。**若 owner 本意是 A，整条链路只用 
 2. **② 冗余包标识**：类型位（推荐）还是保留端口？
 3. **③ 首版范围**：XOR-only 四档（推荐，无第三方依赖）？还是本轮就带 RS（引 ISA-L，
    +镜像打包 + 2-3 天，只在抗突发上有增量收益）？
+
+### 9.9 落地记录（2026-11-13，全部完成）
+
+**拍板结果**（§9.8 三点全按推荐）：① 语义 A（1 冗余 : k 数据，XOR-only）；
+② 类型位 0xF0；③ XOR-only 四档，不引 RS。语义细节：1:1 退化为整包复制
+（对端 WG 反回放去重）；编码点在加密之后（encap Step 14.5，异或对象 = WG
+帧），因为含 SR 头的全载荷异或会被中转改写的 seg_left 破坏；冗余包逐字复制
+成员的外层 [IP4|UDP|SR] 头、action 类别位与外层 ToS 清零（都在 HMAC 排除集/
+免签名字段），所以中转照常转发、双跳隧道的 FEC 免费成立；接收侧计数配对
+（数据包不打标不缓冲，无定时器），j==n-1 时用 len_xor 的自反性原地还原；
+FEC 一切失败只丢冗余机会（fail-open）。接收侧已知限制如实记录在 sr_fec.h
+（乱序错配、还原帧 QoS 类别落 BE、单线程假定）。
+
+**插件 1.2.0**（qoslab 容器构建，md5 `5533a392…`）：`sr_fec.{c,h}` +
+encap Step 14.5 + input Step 5.5/5.6 + 新 API `sr_wg_fec_set` + CLI
+`set/show sr-wg fec`。**lab 带出并修掉的三处静默失效缺陷**（都是真实包才
+暴露的）：
+
+1. 冗余包外层 `ip4->length` 漏算 sr_len（下一跳按截断长度解析，冗余包全废）；
+2. 还原帧 `current_length` 多报了 SR_OUTER_HDR_LEN（wg4-input 按虚高长度
+   解析到垃圾，还原帧全被 WG 标签拒——还原"成功"但对端全丢）；
+3. 冗余包处理失败分支没把 next_index 改回 DROP（fec 载荷被当 WG 帧送进
+   wg4-input 刷 Interface error）。
+
+**管理面**：Tunnel.FecRatio（0/1..4，越界状态层与 API 层各挡一次）→ bundle
+TunnelSpec.FecRatio → agent ApplyFec（按值去重；失败只记警告不中断隧道；
+"关"且从没开过的隧道不发消息——否则 1.1.0 盒子每次启动每条隧道刷一条
+"消息不存在"）→ 控制台隧道表单 FEC 下拉 + 表格标签。控制面测试 5 组新增
+（存取/越界/往返、bundle 携带、agent 装/去重/改档/关、老插件降级）。
+
+**容器 lab**（`test/lab/vpp-fec/lab-fec-tunnel.sh`，双 VPP + 真 WG/SR 隧道 +
+b-wan 出向 netem 10% 单向）：判据全过——
+
+| 阶段 | 结果 |
+| --- | --- |
+| 无 FEC 无损基线 | 0% 丢 |
+| 1:2 无损（无害性） | 0% 丢；50 组 = complete 46 + 错配 4（tap 层乱序，还原帧是重复副本被 WG 反回放吞掉，无业务影响）|
+| 1:2 + netem 10% | 丢 3-4%；recovered 增量 ≥10；parity 增量 100/200 帧（精确 1:2）；bad=0 |
+| 1:1 + netem 10% | 丢 0-2%；parity ≈ 帧数 |
+| off + netem 10% | 丢回 9-10%；parity 增量 0（fail-open）|
+
+unrecovered ≈ parity 丢包率（10%）×2 组——丢一个冗余包废掉当组+下一组，
+计数法的固有代价，接受并已记录。
+
+**实机**（四台插件换件，纪律照 §2.6：看门狗 + 备份 + detached）：
+`scp` → `/root/sr_wg_plugin.fec1.so` → `systemd-run` 先 `qos-guard` 后
+`qos-deploy`（CPE4 用 `qos4-deploy.sh`）。四台 `show plugin` 全 1.2.0，
+`show sr-wg fec` 全 off（绑定活着），t9/t10/t11/t13/t14/t16 十二方向
+`vppctl ping` 全 0% 丢（换前换后各测一轮，基线一致）。备份底：
+四台盘上 `.bak-qos4-<HHMMSS>`（换件前的 1.1.0，md5 `c1cec62f…`）。
+
+**实机新坑（记牢）**：CPE4 换件后 `systemctl restart vpp` 本身成功、数据面
+锚点 3 分钟内全通（看门狗判 OK），但 **vpp0（管理口 lcp 对）没有跟着回来**，
+ssh 从 18:46 起失联到手工整机重启为止；干净重启 30 秒内 mgmt 回来、隧道
+自动重建、一切正常。教训：(1) 换件后 ssh 不回来别急着判死——**先用另一台
+盒 ping 它的 WAN IP / 看 vpp.log 是否在响应 CLI**，管理口丢 ≠ 数据面丢；
+(2) 看门狗锚点从 guest 数据面出，判不了管理口死活——"OK"之后仍要人工确认
+ssh；(3) ssh 4 分钟不回来就 `VBoxManage controlvm reset` 整机重启，代价只有
+1-2 分钟隧道重建。vpp.log 里 18:45:29-18:45:56 的 `linux-cp/router: Failed
+to delete neighbor` 刷屏是 vpp0 没回来的伴生症状，可当信号用。
+
+**没做的**：实机不开任何 FEC（造丢包不可行，§8.3）；控制台/agent/控制器
+二进制还没铺到真机——四台跑的 agent 还是旧版（不会发 `sr_wg_fec_set`），
+控制器还是旧版（bundle 里没有 fec_ratio 字段），整条 FEC 链在实机处于
+"插件就位、管理面待铺"状态。下一棒：发新 sr-ctrl + sr-agent 后实机开 1:2
+实测（需要先解决实机造丢包的问题，或靠对端限速造拥塞丢包）。

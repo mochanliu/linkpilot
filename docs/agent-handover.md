@@ -235,6 +235,19 @@ CPE4→目标盒的盒间 HTTP（226KB/s）铺到 `/root/sr_wg_plugin.qos8.so` +
 VPP 重启后 agent 自动重建隧道（~1-2 分钟），期间转发是断的，别误判成换件事故。
 四台现跑 1.1.0（md5 `c1cec62f…`，`show plugin` 版本号可验），
 `show sr-wg qos-hook` / `show sr-wg qos` 确认（CPE4 已由管理面下发开启，见下）。
+（2026-11-13 傍晚已被 1.2.0 换代，见下一条；本段留作换件纪律出处。）
+
+**2026-11-13 傍晚已换代为 1.2.0（FEC，`sr_fec.{c,h}` + `sr_wg_fec_set`）——四台全部换齐**：
+宿主 Mac 构建（qoslab 容器，md5 `5533a392…`）→ `scp` 到 `/root/sr_wg_plugin.fec1.so` →
+`systemd-run` 先 qosguard 后 qosdeploy（CPE4 用 `qos4-deploy.sh`，其余 `qos-deploy.sh`）。
+四台 `show plugin` 全 1.2.0，`show sr-wg fec` 全 off（绑定活着），t9/t10/t11/t13/t14/t16
+十二方向 `vppctl ping` 全 0% 丢（换前换后各测一轮）。回滚底：四台盘上
+`.bak-qos4-<换件时刻>`（= 1.1.0 `c1cec62f…`）。方案/判据/坑：`docs/fec-and-lb-plan.md` §9.9。
+**两个新教训**：(1) CPE4 换件后 `restart vpp` 数据面 3 分钟内全通（看门狗 OK）但 vpp0
+管理口没回来，ssh 失联——"ssh 不回来"≠"换件失败"，先看 vpp.log 是否在响应 CLI /
+从别的盒 ping 它的 WAN IP，4 分钟还不行就整机 `VBoxManage reset`（30 秒恢复）；
+(2) 管理面（新 sr-ctrl/sr-agent）还没铺：四台 agent 仍旧版，不发 `sr_wg_fec_set`，
+实机 FEC 处于"插件就位、管理面待铺"。
 
 **2026-11-13 QoS 配置已经管理面真实下发（CPE4，bundle v5）**：控制台 API（租户会话）
 PUT /api/config 加 `qos:[{ingress:host-enp0s8, egress:host-enp0s9, rate_kbps:1000, llq_pct:0}]` →
