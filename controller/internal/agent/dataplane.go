@@ -113,6 +113,10 @@ type DataPlane interface {
 	SetTunnel(ctx context.Context, b vppapi.TunnelBinding) error
 	ClearTunnel(ctx context.Context, swIfIndex uint32) error
 	Tunnels(ctx context.Context, swIfIndex uint32) ([]vppapi.TunnelInfo, error)
+	// SetFec 设置隧道接口的 FEC 比例（0 = 关，1..4 = 四档）。只有插件 ≥1.2.0
+	// 的盒子认识这条消息：老插件回"message not found"，调用方应当成
+	// "这台盒子还不支持 FEC"记警告并继续（隧道绑定已在前面成功）。
+	SetFec(ctx context.Context, swIfIndex uint32, ratio uint8) error
 
 	Observations(ctx context.Context) ([]vppapi.Observation, error)
 	ClearObservations(ctx context.Context) error
@@ -265,6 +269,40 @@ type Link struct {
 	swIfIndex uint32
 	adopted   bool
 	ready     bool
+	// FEC 上次装的比例与"试过没有"标志（0..4；试过包括失败 —— 老插件
+	// 盒子每轮 reconcile 都报一次"不支持"就是噪音，见 ApplyFec）。
+	fecTried   bool
+	fecApplied uint8
+}
+
+// ApplyFec 装隧道内 FEC 比例（0 = 关，1..4 四档；owner 2026-11-13 拍板）。
+//
+// 幂等去重：同一个比例只在首次（或值变化后）发一次；失败也算"试过"，
+// 下次 reconcile 只有值变了才重试。ready 之前静默跳过 —— sw_if_index
+// 是 Open 给的，隧道没建起来时没有对象可配。"关"且从没开过的隧道也
+// 不发消息：绑定在插件里出生就是关的。
+func (l *Link) ApplyFec(ctx context.Context, ratio uint8) error {
+	if ratio > 4 {
+		return fmt.Errorf("agent: FEC 比例 %d 越界（0..4）", ratio)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.ready || l.swIfIndex == 0 {
+		return nil
+	}
+	// 新的绑定在插件里的 FEC 状态本来就是关：为"关"再发一条消息只会让 1.1.0
+	// 的盒子在每次启动时给每条隧道报一次"消息不存在"。开过再关（fecTried 为
+	// 真）必须发，那才是真的去撤掉数据面上的奇偶校验。
+	if ratio == 0 && !l.fecTried {
+		return nil
+	}
+	if l.fecTried && l.fecApplied == ratio {
+		return nil
+	}
+	err := l.dp.SetFec(ctx, l.swIfIndex, ratio)
+	l.fecTried = true
+	l.fecApplied = ratio
+	return err
 }
 
 // NewLink 校验输入并推出 WG 公钥。校验放在这里而不是等到第一次下发，是因为

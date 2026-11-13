@@ -239,6 +239,9 @@ type underlayTunnelRequest struct {
 	// Dynamic 是"动态 weight"开关（owner 2026-11-13 拍）。指针同上：控制台
 	// 总是提交；其它调用方不带就是"不动这个开关"。
 	Dynamic *bool `json:"dynamic,omitempty"`
+	// FecRatio 是隧道内前向纠错比例（owner 2026-11-13 拍，XOR-only 四档）。
+	// 指针同上：0 = 关（合法值），nil = 不动。>4 由 underlay 层挡。
+	FecRatio *uint8 `json:"fec_ratio,omitempty"`
 }
 
 func strPtr(p *string) string {
@@ -359,6 +362,7 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 			Color:   u8Val(req.Color),
 			Weight:  u8Val(req.Weight),
 			Dynamic: req.Dynamic != nil && *req.Dynamic,
+			FecRatio: u8Val(req.FecRatio),
 			Now:     now,
 		}, views)
 		if err != nil {
@@ -402,6 +406,7 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 		Color:     req.Color,
 		Weight:    req.Weight,
 		Dynamic:   req.Dynamic,
+		FecRatio:  req.FecRatio,
 		Now:       now,
 	}
 	created := ""

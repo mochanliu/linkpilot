@@ -7,6 +7,7 @@
  *   - setup_message_id_table() 来自自动生成的 .api.c
  */
 #include "sr_wg.h"
+#include "sr_fec.h"
 
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
@@ -364,6 +365,21 @@ vl_api_sr_wg_tunnel_dump_t_handler (vl_api_sr_wg_tunnel_dump_t *mp)
 
       vl_api_send_msg (reg, (u8 *) rmp);
     }
+}
+
+/* ==================== FEC API Handlers ==================== */
+
+static void
+vl_api_sr_wg_fec_set_t_handler (vl_api_sr_wg_fec_set_t *mp)
+{
+  vl_api_sr_wg_fec_set_reply_t *rmp;
+  sr_wg_main_t *sm = &sr_wg_main;
+  int rv;
+
+  rv = sr_fec_set (sm, clib_net_to_host_u32 (mp->sw_if_index),
+		   mp->fec_ratio);
+
+  REPLY_MACRO (VL_API_SR_WG_FEC_SET_REPLY);
 }
 
 static void

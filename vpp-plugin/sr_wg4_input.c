@@ -18,6 +18,7 @@
  */
 #include "sr_wg.h"
 #include "sr_qos.h"
+#include "sr_fec.h"
 
 /* ==================== Trace 定义 ==================== */
 
@@ -59,7 +60,8 @@ format_sr_wg4_input_trace (u8 *s, va_list *args)
   _ (BAD_LEN, "header length mismatch")                                  \
   _ (HMAC_FAIL, "hmac verification failed")                              \
   _ (SEG_NOT_ZERO, "seg_left not zero at endpoint")                      \
-  _ (NO_KEY, "no key found for hmac_id")
+  _ (NO_KEY, "no key found for hmac_id")                                 \
+  _ (FEC_BAD, "fec parity unusable")
 
 typedef enum {
 #define _(sym, str) SR_WG4_INPUT_ERROR_##sym,
@@ -150,6 +152,8 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       u32 next_index = SR_WG4_INPUT_NEXT_DROP;
       u8 error = SR_WG4_INPUT_ERROR_NONE;
       u8 bypass = 0;
+      /* 还原帧标志：它填的是上一组的洞，不属于当前配对窗口（Step 5.6） */
+      u8 fec_recovered = 0;
 
       /* current_data 指向 SR Header（udp4-local 已剥掉 eth/ip4/udp） */
       srh = (sr_header_t *) vlib_buffer_get_current (b);
@@ -272,7 +276,54 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       sm->counters.decap_ok++;
       next_index = SR_WG4_INPUT_NEXT_WG4_INPUT;
 
+      /*
+       * Step 5.5: FEC 分流（插件 1.2.0，sr_fec.h 设计 2）。
+       *
+       * 冗余包复制成员的 SR 头、载荷首字节 = SR_FEC_MAGIC(0xF0)：HMAC 天然
+       * 通过（action 类别位是排除字段）、中转照常转发，到这里 SR 头已剥、
+       * current 指向 fec 载荷。还原成功时 buffer 已被原地换成完整 WG 帧
+       * （长度/校验和都已修好），照常交给 wg4-input；还原不了就丢冗余包
+       * 本身 —— 只丢冗余机会，不碰数据面。
+       */
+      if (PREDICT_FALSE (((u8 *) srh)[0] == SR_FEC_MAGIC))
+	{
+	  sr_wg_tunnel_bind_t *fbind =
+	    sr_wg_bind_lookup (sm, clib_net_to_host_u16 (udp->dst_port));
+
+	  if (fbind && fbind->fec_idx &&
+	      sr_fec_rx_parity (sm, fbind, b, outer, udp) == 0)
+	    {
+	      fec_recovered = 1;
+	      goto done;
+	    }
+	  error = SR_WG4_INPUT_ERROR_FEC_BAD;
+	  sm->counters.drop_total++;
+	  /* next_index 在上面的 Step 5 已被置成 WG4_INPUT：不显式改回 DROP，
+	     fec 载荷会被当成 WG 帧送进 wg4-input。 */
+	  next_index = SR_WG4_INPUT_NEXT_DROP;
+	  goto done;
+	}
+
     done:
+      /*
+       * Step 5.6: FEC 接收侧配对（sr_fec.h 设计 4）。
+       *
+       * 解封装成功的 SR 数据包把 WG 帧拷进所属隧道的配对环（计数法：
+       * 冗余包到达时"自上个冗余包以来收到的帧数"决定能不能还原）。
+       * 有 FEC 状态的隧道才拷 —— 每包一次 dst_port 哈希查表 + 最多
+       * 1.5KB memcpy，是这项 feature 的主要收包成本；没开 FEC 的盒子
+       * 由 sr_fec_active_count 的总开关短路。
+       */
+      if (PREDICT_FALSE (!bypass && !fec_recovered &&
+			 next_index == SR_WG4_INPUT_NEXT_WG4_INPUT &&
+			 sr_fec_active_count (sm) > 0))
+	{
+	  sr_wg_tunnel_bind_t *rbind =
+	    sr_wg_bind_lookup (sm, clib_net_to_host_u16 (udp->dst_port));
+	  if (rbind && rbind->fec_idx)
+	    sr_fec_rx_data (rbind, b);
+	}
+
       b->error = error ? node->errors[error] : 0;
 
       /*

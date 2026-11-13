@@ -741,6 +741,13 @@ func (t *TunnelSync) applySpec(ctx context.Context, b wire.UnderlayBundle,
 		t.logf("隧道 %s → node %d（%s）：peer %s", spec.TunnelID, spec.PeerNodeID,
 			spec.PeerEndpoint, change)
 	}
+	// FEC 比例跟着隧道装（owner 2026-11-13 拍：XOR-only 四档）。放在
+	// ApplyPeer 之后：隧道绑定已成功，老插件对 sr_wg_fec_set 回"消息不存在"
+	// 只降级成一条警告，绝不因此中断隧道。
+	if err := l.ApplyFec(ctx, spec.FecRatio); err != nil {
+		t.logf("隧道 %s：FEC 没装上（比例 %d）：%v —— 插件可能低于 1.2.0",
+			spec.TunnelID, spec.FecRatio, err)
+	}
 	// 可达性/质量跟着隧道一起装：BFD 会话的两端就是这条隧道的 overlay /32，
 	// 探针绑在隧道接口上。放在最后一步，前面任何一步失败都不会留下悬空的会话；
 	// 隧道要重建时旧的先撤（见 teardownLink）。

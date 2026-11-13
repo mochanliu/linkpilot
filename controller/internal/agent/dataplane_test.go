@@ -100,12 +100,17 @@ type fakeVPP struct {
 	probes    map[uint32]vppapi.ProbeStats
 	probeDels []uint32
 	bfds      map[string]vppapi.BFDSession
+	// fecRatio 是 SetFec 的落点：接口 -> 最后一次比例（0 = 关）。
+	fecRatio map[uint32]uint8
 	// bfdAddErr / probeErr 让遥测这一半单独失败：用来测"遥测建不起来，隧道
 	// apply 必须整体失败"（静默跳过会让隧道看着通、策略却没有可达性依据）。
 	// probeDumpErr 是读方向：动态 weight 拿不到丢包读数要冻结档位。
 	bfdAddErr    error
 	probeErr     error
 	probeDumpErr error
+	// fecErr 模拟插件 <1.2.0：sr_wg_fec_set 这条消息根本不存在。它是"降级成
+	// 警告"的那条路径，隧道本身必须照旧收敛。
+	fecErr error
 }
 
 func newFakeVPP() *fakeVPP {
@@ -125,6 +130,7 @@ func newFakeVPP() *fakeVPP {
 		mplsCount: map[uint32]int{},
 		probes:    map[uint32]vppapi.ProbeStats{},
 		bfds:      map[string]vppapi.BFDSession{},
+		fecRatio:  map[uint32]uint8{},
 		// underlay 出口按真机的出生样子摆在这儿：af-packet 口 VPP 默认记 9000，
 		// 容器网卡只有 1500。这样"写完读回来"测的才是读回，而不是 map 里本来就对。
 		swIfs: []vppapi.SwInterface{{
@@ -422,6 +428,21 @@ func (f *fakeVPP) ClearTunnel(ctx context.Context, swIfIndex uint32) error {
 		return vppapi.APIError{Op: "sr_wg_tunnel_set_path", Retval: -6}
 	}
 	delete(f.tunnels, swIfIndex)
+	return nil
+}
+
+// SetFec 记录每接口最后一次 FEC 比例（0 = 关）。测试用它断言"applySpec 装了
+// 正确的比例"或"老插件语义下装不上只是警告"。
+func (f *fakeVPP) SetFec(ctx context.Context, swIfIndex uint32, ratio uint8) error {
+	f.log("SetFec iface=%d ratio=%d", swIfIndex, ratio)
+	if f.fecErr != nil {
+		return f.fecErr
+	}
+	if _, ok := f.tunnels[swIfIndex]; !ok {
+		// sr_wg_fec_set：绑定都不存在，插件回 NO_SUCH_ENTRY。
+		return vppapi.APIError{Op: "sr_wg_fec_set", Retval: -6}
+	}
+	f.fecRatio[swIfIndex] = ratio
 	return nil
 }
 

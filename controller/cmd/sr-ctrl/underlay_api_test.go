@@ -159,6 +159,7 @@ type tunnelReq struct {
 	Color     *uint8       `json:"color,omitempty"`
 	Weight    *uint8       `json:"weight,omitempty"`
 	Dynamic   *bool        `json:"dynamic,omitempty"`
+	FecRatio  *uint8       `json:"fec_ratio,omitempty"`
 }
 
 type hopReq struct {
@@ -1051,6 +1052,57 @@ func TestTunnelEndpointStoresAndEditsColor(t *testing.T) {
 	}
 	if got := tunnelFrom(t, putTunnel(t, s, ten, tunnelReq{ID: tv.ID})); got.Color != 0 {
 		t.Fatalf("被拒的改色写进了库: %d", got.Color)
+	}
+}
+
+// FEC 比例列：建的时候带上、编辑时保持/改档/关掉、越界报 400 且不写库。
+// 请求层与状态层各挡一次 —— 请求层的 400 是为了让页面能弹出人话，状态层那次
+// 是给批量/自动建隧道这类不走 HTTP 的入口兜底。
+func TestTunnelEndpointStoresAndEditsFecRatio(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+
+	two := uint8(2)
+	req := manualTunnel(1, 2, "wan0")
+	req.FecRatio = &two
+	rec := createTunnel(t, s, ten, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("带 FEC 创建 = %d (%s)", rec.Code, rec.Body.String())
+	}
+	tv := tunnelFrom(t, rec)
+	if tv.FecRatio != 2 {
+		t.Fatalf("响应里的 fec_ratio = %d, want 2", tv.FecRatio)
+	}
+
+	// 只改端口、不提交 fec_ratio：比例必须原地不动。
+	if keep := putTunnelView(t, s, ten, tunnelReq{ID: tv.ID, A: underlaySpec{Iface: "wan0"}}); keep.FecRatio != 2 {
+		t.Fatalf("不带 fec_ratio 的编辑把它改成了 %d, want 保持 2", keep.FecRatio)
+	}
+
+	four := uint8(4)
+	if up := putTunnelView(t, s, ten, tunnelReq{ID: tv.ID, FecRatio: &four}); up.FecRatio != 4 {
+		t.Fatalf("改成 1:4 失败: %d", up.FecRatio)
+	}
+
+	zero := uint8(0)
+	if off := putTunnelView(t, s, ten, tunnelReq{ID: tv.ID, FecRatio: &zero}); off.FecRatio != 0 {
+		t.Fatalf("关掉 FEC 失败: %d", off.FecRatio)
+	}
+
+	bad := uint8(5)
+	rec = putTunnel(t, s, ten, tunnelReq{ID: tv.ID, FecRatio: &bad})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("越界 FEC 比例 = %d (%s), want 400", rec.Code, rec.Body.String())
+	}
+	if got := tunnelFrom(t, putTunnel(t, s, ten, tunnelReq{ID: tv.ID})); got.FecRatio != 0 {
+		t.Fatalf("被拒的越界比例写进了库: %d", got.FecRatio)
+	}
+
+	// 创建路径同样要挡（页面能提交 1:9 这种值只有一种可能：前端回归了）。
+	badCreate := manualTunnel(1, 3, "wan0")
+	badCreate.FecRatio = &bad
+	if rec := createTunnel(t, s, ten, badCreate); rec.Code != http.StatusBadRequest {
+		t.Fatalf("越界 FEC 比例创建 = %d (%s), want 400", rec.Code, rec.Body.String())
 	}
 }
 

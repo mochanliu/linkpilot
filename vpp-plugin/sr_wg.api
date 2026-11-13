@@ -191,6 +191,22 @@ autoreply define sr_wg_tunnel_set_path
   u16 src_port;
 };
 
+/** \brief 设置隧道接口的 FEC 比例（插件 1.2.0，docs/fec-and-lb-plan.md §9）
+    @param sw_if_index - WG 隧道接口（必须已有 sr_wg_tunnel_set_path 绑定）
+    @param fec_ratio   - 0 = 关；1..4 = 每 ratio 个数据包 1 个异或冗余包
+                         （1 = 整包复制，对端 WG 反回放去重）
+    独立成消息而不是扩 tunnel_set_path：老插件收到这条消息只会报
+    "message not found"，绑定本身照常成功 —— agent 对旧插件的升级窗口内
+    隧道不因 FEC 探测而中断。
+*/
+autoreply define sr_wg_fec_set
+{
+  u32 client_index;
+  u32 context;
+  u32 sw_if_index;
+  u8 fec_ratio;
+};
+
 define sr_wg_tunnel_dump
 {
   u32 client_index;

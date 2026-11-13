@@ -96,6 +96,7 @@
  */
 #include "sr_wg.h"
 #include "sr_qos.h"
+#include "sr_fec.h"
 
 #include <vnet/udp/udp_packet.h>
 #include <vnet/ip/format.h>
@@ -236,6 +237,13 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 fib_index = sm->encap_fib_index;
   /* SR Header 时间戳（秒级）。transit/decap 不做时效校验，取 VPP 时钟即可 */
   u32 now = (u32) vlib_time_now (vm);
+  /*
+   * FEC 冗余包的收集槽（Step 14.5 可能给每个数据包补发一个冗余包）。
+   * 成员包照常走 nexts；冗余包攒够一批后在循环外补一次入队。
+   */
+  u32 extra[VLIB_FRAME_SIZE];
+  u16 extra_next[VLIB_FRAME_SIZE];
+  u32 extra_n = 0;
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
@@ -513,6 +521,32 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       bypass = 0;
       sm->counters.encap_ok++;
 
+      /*
+       * Step 14.5: FEC（插件 1.2.0，sr_fec.h 设计 3）。
+       *
+       * 数据包已经封装完、马上交回 ip4-lookup —— FEC 只顺带把它的 WG 帧
+       * 异或进所属隧道的发送组，组满（第 ratio 个成员）时造一个冗余包
+       * 走同一条出口路径。数据包本身不被修改、不延迟：组不满时这一步只有
+       * 内存异或，流量停在半组时那段就没有冗余（没有定时器，故意）。
+       *
+       * wg_len 从更新过的 udp->length 反推：Step 12 加过 sr_len，所以
+       * WG 帧长 = UDP 总长 - 8 - sr_len。
+       */
+      if (PREDICT_FALSE (bind->fec_ratio > 0))
+	{
+	  u32 parity = sr_fec_tx (vm, sm, bind, b, p, outer_len,
+				  (u16) sr_len,
+				  (u16) (clib_net_to_host_u16 (udp->length) -
+					 8 - sr_len),
+				  fib_index);
+	  if (parity != (u32) ~0 && extra_n < VLIB_FRAME_SIZE)
+	    {
+	      extra[extra_n] = parity;
+	      extra_next[extra_n] = SR_WG4_ENCAP_NEXT_IP4_LOOKUP;
+	      extra_n++;
+	    }
+	}
+
     done:
       if (bypass)
         {
@@ -560,6 +594,11 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
     }
 
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+
+  /* FEC 冗余包补入队（与成员同一条 ip4-lookup 出路） */
+  if (PREDICT_FALSE (extra_n > 0))
+    vlib_buffer_enqueue_to_next (vm, node, extra, extra_next, extra_n);
+
   return frame->n_vectors;
 }
 

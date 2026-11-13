@@ -690,6 +690,20 @@ func (c *Client) SetTunnel(ctx context.Context, b TunnelBinding) error {
 	return c.retval("sr_wg_tunnel_set_path", frame)
 }
 
+// SetFec 设置隧道接口的 FEC 比例（0 = 关，1..4 = 每 ratio 个数据包 1 个异或
+// 冗余包）。这是 1.2.0 插件才有的独立消息（不扩 tunnel_set_path）：老插件
+// 对未知消息名回"message not found"，隧道绑定本身照常成功 —— 升级窗口内
+// 探测 FEC 支持不会打断隧道，调用方把这类失败当"不支持"降级处理即可。
+func (c *Client) SetFec(ctx context.Context, swIfIndex uint32, ratio uint8) error {
+	body := appendU32(nil, swIfIndex)
+	body = append(body, ratio)
+	frame, err := c.call(ctx, "sr_wg_fec_set", "sr_wg_fec_set_reply", body)
+	if err != nil {
+		return err
+	}
+	return c.retval("sr_wg_fec_set", frame)
+}
+
 // ClearTunnel 解绑某接口上的隧道绑定（路径仍在表里，只是不再被这条隧道引用）。
 func (c *Client) ClearTunnel(ctx context.Context, swIfIndex uint32) error {
 	body := make([]byte, tunnelBodyLen)

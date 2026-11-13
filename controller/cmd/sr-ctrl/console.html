@@ -4785,6 +4785,12 @@
       '<div class="field"><label for="und-tun-dynamic">动态 weight</label>' +
       '<select id="und-tun-dynamic" name="dynamic"><option value="0">关（恒用权重）</option>' +
       '<option value="1">开（agent 按丢包调档，1..权重）</option></select></div>' +
+      '<div class="field"><label for="und-tun-fec">FEC 前向纠错</label>' +
+      '<select id="und-tun-fec" name="fec"><option value="0">关</option>' +
+      '<option value="1">1:1（整包复制，最强，带宽×2）</option>' +
+      '<option value="2">1:2（每 2 包 1 冗余，带宽×1.5）</option>' +
+      '<option value="3">1:3（每 3 包 1 冗余）</option>' +
+      '<option value="4">1:4（每 4 包 1 冗余，最省）</option></select></div>' +
       "</div>" + undPathExtraFields(doc, mode, "und-tun", "mHops", [a].concat(peers)) +
       '<div class="hint" style="margin:10px 0 0">物理端口可以留「默认」，由设备上报的出口决定；也可以指定它上报过的其他端口。' +
       "地址留空就用反射器最近一次观测到的外层地址；观测过期时创建会被拒绝，需要手填地址或等设备重新上报。" +
@@ -4798,6 +4804,10 @@
       "权重是这条隧道在颜色表里的分担比例（1–255，默认 1 = 等价 ECMP）：同桶多条路径按比例复制 load-balance 桶、按流分流（UCMP）。" +
       "注意颜色表是跨设备混装的，权重也作用于跨设备分流。开「动态」后权重是基数上限：" +
       "agent 按探针丢包在 1..权重 之间调档（丢包优先、四档、非线性，迟滞 3 拍 × 5 秒），动态生效值不回写本页。" +
+      // FEC 四档的语义与边界（XOR-only）：带宽代价、恢复能力、两端都要 1.2.0。
+      "FEC 前向纠错：开「1:1」每包双发（组内丢任何一个都能救，带宽翻倍）；「1:n」每 n 个数据包" +
+      "异或出 1 个冗余包，组内恰好丢 1 个可恢复、丢 2 个无解；带宽增量约 1/n。" +
+      "需要两端插件 ≥1.2.0（老设备只会在日志里提示不支持，隧道本身照常建）。" +
       // M-3 门禁已抬：同对端可以建第二条（UCMP 的用法）。要说清三件事：
       // 上限、槽号谁定、以及自动编排为什么不补建。
       "同一对设备现在允许建多条隧道（同色不同权重 = UCMP），上限每台设备 8 把密钥即每对 8 条；" +
@@ -4873,7 +4883,9 @@
         // 权重列：空 = 默认 1（等价）；勾了动态给一个标记（生效值在盒子上，
         // 不回写 —— 这里显示的是配置的基数上限）。
         "<td>" + (t.weight ? "<b>×" + t.weight + "</b>" : "1") +
-        (t.dynamic ? '<div class="tag plan">动态</div>' : "") + "</td>" +
+        (t.dynamic ? '<div class="tag plan">动态</div>' : "") +
+        // FEC 标记：显示比例；只在开启时出现，不添噪音。
+        (t.fec_ratio ? '<div class="tag plan">FEC 1:' + t.fec_ratio + "</div>" : "") + "</td>" +
         // 密钥槽列：同对端第 n 条隧道用两端的第 n 把密钥（创建时自动派生，
         // 不可手填）。槽 0 是每台设备的预置密钥，绝大多数隧道都停在这——
         // 只在 >0 时显示，别让整列都是噪音。
@@ -4911,6 +4923,8 @@
     var weight = parseInt(String(f.get("weight")), 10);
     body.weight = (!isNaN(weight) && weight > 0) ? Math.min(weight, 255) : 0;
     body.dynamic = String(f.get("dynamic")) === "1";
+    // FEC：下拉 0..4，总是提交（0 = 关，与 dynamic 同契约）。
+    body.fec_ratio = parseInt(String(f.get("fec")), 10) || 0;
     // 一台对端走单条创建（能指定它的出口端口和地址），两台以上走批量：批量
     // 那套只有 node_id，端口与地址各用设备自己的观测，这是控制器的契约。
     if (peers.length === 1) {
@@ -4990,7 +5004,14 @@
       '<div class="field"><label for="und-edit-dynamic">动态 weight</label>' +
       '<select id="und-edit-dynamic" name="dynamic"><option value="0"' + (!t.dynamic ? " selected" : "") +
       '>关（恒用权重）</option><option value="1"' + (t.dynamic ? " selected" : "") +
-      '>开（agent 按丢包调档，1..权重）</option></select></div>';
+      '>开（agent 按丢包调档，1..权重）</option></select></div>' +
+      '<div class="field"><label for="und-edit-fec">FEC 前向纠错</label>' +
+      '<select id="und-edit-fec" name="fec"><option value="0"' + (!t.fec_ratio ? " selected" : "") +
+      '>关</option><option value="1"' + (t.fec_ratio === 1 ? " selected" : "") +
+      '>1:1（整包复制，最强，带宽×2）</option><option value="2"' + (t.fec_ratio === 2 ? " selected" : "") +
+      '>1:2（每 2 包 1 冗余，带宽×1.5）</option><option value="3"' + (t.fec_ratio === 3 ? " selected" : "") +
+      '>1:3（每 3 包 1 冗余）</option><option value="4"' + (t.fec_ratio === 4 ? " selected" : "") +
+      '>1:4（每 4 包 1 冗余，最省）</option></select></div>';
     if (mode === "inline") {
       h += undHopsEditor(doc, "editHops", { exclude: [t.a.node_id, t.b.node_id] }) +
         '<div class="hint" style="margin-top:8px">改成另一条链是整条替换：新的顺序会一起下发，旧链不会留下一跳。</div>';
@@ -5032,6 +5053,8 @@
     var weight = parseInt(String(f.get("weight")), 10);
     body.weight = (!isNaN(weight) && weight > 0) ? Math.min(weight, 255) : 0;
     body.dynamic = String(f.get("dynamic")) === "1";
+    // FEC 同一个契约：表单总是提交，0 = 关。需要两端插件 ≥1.2.0。
+    body.fec_ratio = parseInt(String(f.get("fec")), 10) || 0;
     // "默认" resolves to the device's own egress port: the API treats an empty
     // iface as "keep", so clearing back to the default has to name it.
     var ndA = undNodeOf(u.doc, t.a.node_id), ndB = undNodeOf(u.doc, t.b.node_id);

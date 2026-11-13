@@ -175,6 +175,13 @@ type Tunnel struct {
 	// 状态，控制器只显示不回读）。
 	Dynamic bool `json:"dynamic,omitempty"`
 
+	// FecRatio 是"隧道内前向纠错"的比例（owner 2026-11-13 拍：XOR-only 四档，
+	// docs/fec-and-lb-plan.md §9）：0 = 关；1..4 = 每 ratio 个数据包 1 个异或
+	// 冗余包（1 = 整包复制，对端 WG 反回放去重；n≥2 = 组内丢 1 可恢复）。
+	// 双端同配：两端各自发冗余包，各向独立生效；组内丢 2 个无解是 XOR 的
+	// 数学边界（要抗突发才引 Reed-Solomon，本版不做）。
+	FecRatio uint8 `json:"fec_ratio,omitempty"`
+
 	Roles     Roles  `json:"roles,omitempty"`
 	BatchID   string `json:"batch_id,omitempty"`
 	CreatedAt int64  `json:"created_at_unix"`

@@ -97,6 +97,15 @@ typedef struct {
   u32 sw_if_index;        /* WG 隧道接口 sw_if_index（配置侧定位用） */
   u16 src_port;           /* 本端外层 UDP 源端口 = 这条隧道的监听端口 */
   u16 path_id;
+
+  /*
+   * FEC（sr_fec.h / 插件 1.2.0）。fec_ratio = 每几个数据包 1 个异或冗余包
+   * （0 = 关，1..4）；fec_idx = sr_fec 状态池下标 + 1（0 = 没有状态）。
+   * 经 sr_wg_fec_set（API）或 `set sr-wg fec`（CLI）设置；绑定原地更新时
+   * 两个值都保留（控制面对账重放不会抹掉 FEC 配置）。
+   */
+  u8  fec_ratio;
+  u32 fec_idx;
 } sr_wg_tunnel_bind_t;
 
 /* 插件主结构 */

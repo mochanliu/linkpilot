@@ -424,3 +424,31 @@ func TestBundleCarriesWeightAndDynamic(t *testing.T) {
 		t.Fatalf("bundle 的 weight/dynamic = %d/%v, want 30/true", b.Tunnels[0].Weight, b.Tunnels[0].Dynamic)
 	}
 }
+
+// fec_ratio 也必须跟着隧道段一起下发：设备侧照它调 sr_wg_fec_set，两端各发
+// 各向的冗余包。关着的时候字段是零值（omitempty），老 agent 的 JSON 解码器
+// 看到的是缺字段 —— 与 weight 同一条向后兼容纪律。
+func TestBundleCarriesFecRatio(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	two := uint8(2)
+	req := manualTunnel(1, 2, "wan0")
+	req.FecRatio = &two
+	if rec := createTunnel(t, s, ten, req); rec.Code == http.StatusBadRequest {
+		t.Fatalf("create 被拒: %s", rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2, 3)
+	b := bundleOf(t, s, "t", 1)
+	if len(b.Tunnels) != 1 || b.Tunnels[0].FecRatio != 2 {
+		t.Fatalf("bundle 的 fec_ratio = %+v, want 2", b.Tunnels)
+	}
+
+	// 改档之后重发的 bundle 立刻是新值（agent 侧按值去重，不会每轮重装）。
+	three := uint8(3)
+	if rec := putTunnel(t, s, ten, tunnelReq{ID: b.Tunnels[0].TunnelID, FecRatio: &three}); rec.Code != http.StatusOK {
+		t.Fatalf("改成 1:3 = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := bundleOf(t, s, "t", 1).Tunnels[0].FecRatio; got != 3 {
+		t.Fatalf("改档后 bundle 的 fec_ratio = %d, want 3", got)
+	}
+}

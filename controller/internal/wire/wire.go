@@ -587,6 +587,12 @@ type TunnelSpec struct {
 	// 四档、非线性，迟滞 3 拍 × 5s，owner 2026-11-13 拍）。
 	Weight  uint8 `json:"weight,omitempty"`
 	Dynamic bool  `json:"dynamic,omitempty"`
+
+	// FecRatio 是隧道内前向纠错的比例（owner 2026-11-13 拍，XOR-only 四档）：
+	// 0 = 关；1..4 = 每 ratio 个数据包 1 个异或冗余包。agent 收到后经
+	// sr_wg_fec_set 装进插件（插件 ≥1.2.0；老插件只是报"消息不存在"，
+	// 隧道本身照常建立）。
+	FecRatio uint8 `json:"fec_ratio,omitempty"`
 }
 
 // TunnelSkip is a configured tunnel that could not be delivered to this device,

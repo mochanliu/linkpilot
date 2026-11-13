@@ -524,3 +524,89 @@ func TestTunnelWeightStoredAndUpdatable(t *testing.T) {
 		t.Fatalf("重启后 weight/dynamic 不对: %+v", bt)
 	}
 }
+
+// FEC 比例走同一套存取纪律（Create 带入、Update 指针语义、0 是合法值），
+// 但多一条硬边界：只有 0..4 五档。越界在 Create/Update 里就挡下来 —— 让
+// 它漏到 agent 去，症状是"控制台显示 1:6、设备上什么都不做"。
+func TestTunnelFecRatioStoredAndUpdatable(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+
+	tun, err := s.Create(CreateRequest{
+		A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+		FecRatio: 2, Now: 1000,
+	}, views)
+	if err != nil {
+		t.Fatalf("带 FEC 建隧道失败: %v", err)
+	}
+	if tun.FecRatio != 2 {
+		t.Fatalf("fec_ratio 应存成 2，实际 %d", tun.FecRatio)
+	}
+
+	// 不带 fec_ratio 的更新是"保持"：页面改端口不该顺手关掉 FEC。
+	got, err := s.Update(tun.ID, UpdateRequest{Now: 1100}, views)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FecRatio != 2 {
+		t.Fatalf("没带 fec_ratio 的更新不该动它，实际 %d", got.FecRatio)
+	}
+
+	// 五档里剩下两档：4（最省）与 0（关）。
+	four := uint8(4)
+	if got, err = s.Update(tun.ID, UpdateRequest{FecRatio: &four, Now: 1150}, views); err != nil {
+		t.Fatal(err)
+	}
+	if got.FecRatio != 4 {
+		t.Fatalf("改成 1:4 失败，实际 %d", got.FecRatio)
+	}
+	zero := uint8(0)
+	if got, err = s.Update(tun.ID, UpdateRequest{FecRatio: &zero, Now: 1200}, views); err != nil {
+		t.Fatal(err)
+	}
+	if got.FecRatio != 0 {
+		t.Fatalf("关掉 FEC 失败，实际 %d", got.FecRatio)
+	}
+
+	// 越界必须被挡，而且不能写库（先开回 3 才能看出"被拒后没动"）。
+	three := uint8(3)
+	if _, err := s.Update(tun.ID, UpdateRequest{FecRatio: &three, Now: 1300}, views); err != nil {
+		t.Fatal(err)
+	}
+	bad := uint8(5)
+	if _, err := s.Update(tun.ID, UpdateRequest{FecRatio: &bad, Now: 1400}, views); err == nil {
+		t.Fatal("FEC 比例 5 应当被拒")
+	}
+	if cur := s.Tunnels[tun.ID]; cur.FecRatio != 3 {
+		t.Fatalf("被拒的越界比例写进了库: %d", cur.FecRatio)
+	}
+
+	// 配置必须活过状态往返（存盘/重启）。
+	blob, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back State
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatal(err)
+	}
+	if bt := back.Tunnels[tun.ID]; bt == nil || bt.FecRatio != 3 {
+		t.Fatalf("重启后 fec_ratio 不对: %+v", bt)
+	}
+}
+
+// 建隧道时的越界同样在这里挡：批量（Fan）与单建共用 create()。
+func TestTunnelCreateRejectsOutOfRangeFec(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+	before := len(s.Tunnels)
+	if _, err := s.Create(CreateRequest{
+		A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+		FecRatio: 5, Now: 1000,
+	}, views); err == nil {
+		t.Fatal("FEC 比例 5 建隧道应当被拒")
+	}
+	if len(s.Tunnels) != before {
+		t.Fatalf("被拒的创建留下了隧道：%d -> %d", before, len(s.Tunnels))
+	}
+}

@@ -82,6 +82,10 @@ type underlayTunnelView struct {
 	Weight  uint8 `json:"weight,omitempty"`
 	Dynamic bool  `json:"dynamic,omitempty"`
 
+	// FecRatio 是隧道内前向纠错比例（0 = 关，1..4 四档；owner 2026-11-13
+	// 拍）。缺省省略——没开 FEC 的隧道保持和老页面逐字节同形。
+	FecRatio uint8 `json:"fec_ratio,omitempty"`
+
 	// Slot 是这条隧道用的密钥槽号（两端第 n 把），创建时自动派生。0 在
 	// JSON 里省略——预置槽上的隧道（绝大多数）保持和老页面逐字节同形。
 	Slot uint8 `json:"slot,omitempty"`
@@ -358,6 +362,7 @@ func buildTunnelView(st *underlay.State, t *underlay.Tunnel, serials map[uint16]
 		Color:        t.Color,
 		Weight:       t.Weight,
 		Dynamic:      t.Dynamic,
+		FecRatio:     t.FecRatio,
 		Slot:         t.Slot,
 		MTU:          t.MTU,
 		MTUIsDefault: t.MTU == 0,

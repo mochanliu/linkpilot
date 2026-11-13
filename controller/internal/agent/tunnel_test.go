@@ -1030,3 +1030,129 @@ func bfdByPeer(f *fakeVPP, peer string) *vppapi.BFDSession {
 	}
 	return nil
 }
+
+// FEC 比例跟着隧道收敛：装一次、同值不重发、改档重发、关掉必须显式发 0。
+// "同值不重发"不是省事 —— 插件每次 set 都把组状态清零，每轮 reconcile 都发
+// 一遍等于永远凑不齐一组，FEC 表面开着却从不生效。
+func TestTunnelSyncAppliesFecRatio(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	spec.FecRatio = 2
+	b := testBundle(spec)
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	ctx := context.Background()
+	if err := ts.Sync(ctx, b.Version); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(f.ifaces) != 1 {
+		t.Fatalf("隧道接口 %d 个，期望 1: %+v", len(f.ifaces), f.ifaces)
+	}
+	swIf := f.ifaces[0].SWIfIndex
+	if got := f.fecRatio[swIf]; got != 2 {
+		t.Fatalf("隧道口 %d 上的 FEC 比例 = %d, want 2", swIf, got)
+	}
+	if n := len(f.callWith("SetFec")); n != 1 {
+		t.Fatalf("FEC 装了 %d 次，期望 1: %v", n, f.callWith("SetFec"))
+	}
+
+	// 同一份配置再收敛一轮：不能再发（会清掉插件里正在攒的组）。
+	if err := ts.Sync(ctx, b.Version); err != nil {
+		t.Fatalf("第二次 Sync: %v", err)
+	}
+	if n := len(f.callWith("SetFec")); n != 1 {
+		t.Fatalf("同值重放又发了 %d 次 SetFec: %v", n, f.callWith("SetFec"))
+	}
+
+	// 改档 1:2 -> 1:4（改比例不是接口身份，隧道不重建，只重发这一次）。
+	b2 := b
+	b2.Version = 4
+	b2.Tunnels[0].FecRatio = 4
+	ts.fetch = func(context.Context) (wire.UnderlayBundle, error) { return b2, nil }
+	if err := ts.Sync(ctx, b2.Version); err != nil {
+		t.Fatalf("Sync(改 FEC 档): %v", err)
+	}
+	if got := f.fecRatio[swIf]; got != 4 {
+		t.Fatalf("改档后的 FEC 比例 = %d, want 4", got)
+	}
+	if len(f.ifaces) != 1 || f.ifaces[0].SWIfIndex != swIf {
+		t.Errorf("改 FEC 比例把隧道重建了（接口 %+v，原 %d）", f.ifaces, swIf)
+	}
+
+	// 关掉：必须真的发一条 0 过去。只把本地标志改成 0 而不发消息，设备上的
+	// 奇偶校验包会一直发下去 —— 页面显示"关"、链路还在多花带宽。
+	b3 := b2
+	b3.Version = 5
+	b3.Tunnels[0].FecRatio = 0
+	ts.fetch = func(context.Context) (wire.UnderlayBundle, error) { return b3, nil }
+	if err := ts.Sync(ctx, b3.Version); err != nil {
+		t.Fatalf("Sync(关 FEC): %v", err)
+	}
+	if got := f.fecRatio[swIf]; got != 0 {
+		t.Fatalf("关 FEC 之后设备上还是 %d", got)
+	}
+}
+
+// 从没开过 FEC 的隧道，收敛不该给插件发任何 FEC 消息：绑定出生就是关的。
+// 这不是省一次调用 —— 1.1.0 的盒子对这条消息回"不存在"，每台机器上每条隧道
+// 都会在启动日志里刷一条警告，把真正的告警埋掉。
+func TestTunnelSyncSkipsFecWhenNeverEnabled(t *testing.T) {
+	f := newFakeVPP()
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	b := testBundle(spec)
+
+	ts, _ := newTunnelSync(t, f, pki, b)
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if calls := f.callWith("SetFec"); len(calls) != 0 {
+		t.Fatalf("没开过 FEC 也发了消息: %v", calls)
+	}
+}
+
+// 插件 <1.2.0：sr_wg_fec_set 这条消息不存在。必须降级成一条警告，隧道照旧
+// 收敛 —— 一条可选的前向纠错装不上，不能让整条隧道连不通。
+func TestTunnelSyncToleratesPluginWithoutFec(t *testing.T) {
+	f := newFakeVPP()
+	// 真插件回的是 VPP 的"消息不存在"（retval -2），走 APIError 这条路径，
+	// 与 retval 无关 —— agent 只看 err != nil。
+	f.fecErr = vppapi.APIError{Op: "sr_wg_fec_set", Retval: -2}
+	pki := newTestPKI(t)
+	spec := tunnelSpec(t, pki, "t1", 3, 1001, 51820,
+		"10.250.0.1/32", "10.250.0.3/32", "10.10.1.3:51820")
+	spec.FecRatio = 1
+	b := testBundle(spec)
+
+	var logs []string
+	id := testIdentity(t, pki, "t1", 1)
+	ts := NewTunnelSync(f, id,
+		func(context.Context) (wire.UnderlayBundle, error) { return b, nil },
+		func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) })
+
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("老插件上装 FEC 失败不该让 Sync 失败: %v", err)
+	}
+	if st := ts.State(); !st.OK || st.Tunnels != 1 || st.Error != "" {
+		t.Fatalf("隧道没有正常收敛: %+v", st)
+	}
+	if len(f.ifaces) != 1 || len(f.peers) != 1 {
+		t.Fatalf("隧道接口/peer 没装上: %+v / %+v", f.ifaces, f.peers)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "FEC 没装上") || !strings.Contains(joined, "1.2.0") {
+		t.Fatalf("缺一条「插件太老」的警告，日志: %s", joined)
+	}
+
+	// 失败也算"试过"：下一轮同值的 reconcile 不再重复报（否则每 5 秒一条）。
+	logs = nil
+	if err := ts.Sync(context.Background(), b.Version); err != nil {
+		t.Fatalf("第二次 Sync: %v", err)
+	}
+	if strings.Contains(strings.Join(logs, "\n"), "FEC 没装上") {
+		t.Fatalf("同一比例重复报警告: %v", logs)
+	}
+}

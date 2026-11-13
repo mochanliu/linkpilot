@@ -162,6 +162,8 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	// 档位函数用，sr-fib 拿到的是算好的有效值。0 = 默认 1。
 	spec.Weight = t.Weight
 	spec.Dynamic = t.Dynamic
+	// fec_ratio 跟着隧道段一起下发（插件 1.2.0 的 sr_wg_fec_set）。
+	spec.FecRatio = t.FecRatio
 	// UnderlayMTU is THIS box's egress link MTU; the controller writes only what
 	// the device itself reported (each side configures its own port). The map is
 	// empty until the agent has reported an inventory, and then the field stays 0

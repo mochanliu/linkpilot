@@ -76,7 +76,9 @@ type CreateRequest struct {
 	// uint8 天然封顶（VPP fib_path.weight 是 u8），JSON 解码层挡超界。
 	Weight  uint8
 	Dynamic bool
-	Now     int64
+	// FecRatio 见 Tunnel.FecRatio（0 = 关；1..4 四档，>4 在这里挡）。
+	FecRatio uint8
+	Now      int64
 }
 
 // Create validates, allocates and stores one tunnel. It runs on a clone, so a
@@ -101,6 +103,9 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	}
 	if err := checkColor(req.Color); err != nil {
 		return Tunnel{}, err
+	}
+	if req.FecRatio > 4 {
+		return Tunnel{}, fmt.Errorf("FEC 比例 %d 越界：只有 0（关）到 4（1 冗余 : 4 数据）四档", req.FecRatio)
 	}
 	slot, err := s.allocPairSlot(req.A.NodeID, req.B.NodeID)
 	if err != nil {
@@ -177,6 +182,7 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 		Color:     req.Color,
 		Weight:    req.Weight,
 		Dynamic:   req.Dynamic,
+		FecRatio:  req.FecRatio,
 		MTU:       mtu,
 		Roles:     req.Roles,
 		BatchID:   req.BatchID,
@@ -205,7 +211,9 @@ type UpdateRequest struct {
 	// 总是提交这两个字段的当前值，所以 nil 只出现在没有带它们的调用方。
 	Weight  *uint8
 	Dynamic *bool
-	Now     int64
+	// FecRatio 同理是指针：0 是合法值（= 关掉 FEC），nil = 保持不变。
+	FecRatio *uint8
+	Now      int64
 }
 
 func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) (Tunnel, error) {
@@ -236,6 +244,12 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 	}
 	if req.Dynamic != nil {
 		t.Dynamic = *req.Dynamic
+	}
+	if req.FecRatio != nil {
+		if *req.FecRatio > 4 {
+			return Tunnel{}, fmt.Errorf("FEC 比例 %d 越界：只有 0（关）到 4（1 冗余 : 4 数据）四档", *req.FecRatio)
+		}
+		t.FecRatio = *req.FecRatio
 	}
 	if req.IfaceA != "" {
 		iface, err := endpointIface("本端", views[t.A.NodeID], req.IfaceA)
