@@ -88,7 +88,7 @@ sr-frr 应答即降级自己的 `lastSeen`（`localReporter.demote()`），拉�
 
 | 件 | pid | 参数要点 |
 | --- | --- | --- |
-| `sr-ctrl` | 40606（已跑 1d10h） | `-data /Users/louis/srvmlab/ctrl/data -listen 0.0.0.0:8444 -tls-san 192.168.1.4 -console 127.0.0.1:8088 -stun 192.168.1.4:3478,3479 -hb 5` |
+| `sr-ctrl` | 50728（2026-11-13 20:56 重启后） | `-data /Users/louis/srvmlab/ctrl/data -listen 0.0.0.0:8444 -tls-san 192.168.1.4 -console 0.0.0.0:8088 -stun 192.168.1.4:3478,3479 -hb 5` |
 | `sr-rr` ×2 | 40616 / 40618 | `-config /Users/louis/srvmlab/state/rr-a.json`、`rr-b.json`，监听 18446+19446 / 18447+19447 |
 
 复核：`ps -eo pid,etime,command | grep -E "sr-ctrl|sr-rr" | grep -v grep` 和
@@ -96,7 +96,22 @@ sr-frr 应答即降级自己的 `lastSeen`（`localReporter.demote()`），拉�
 **注意**：那条 `ps` 里能看到运营方令牌的值 —— 那个值**不许进任何文件、日志、提交信息**（AGENTS.md §3）。
 需要它的时候从 `/Users/louis/srvmlab/ctrl/data/console-token` 读，或者当场 `ps` 看一眼。
 
-Mac 的 LAN 地址是 `192.168.1.4`，控制台在 `127.0.0.1:8088`（只对 loopback 开）。
+Mac 的 LAN 地址是 `192.168.1.4`。
+
+**2026-11-13 晚（owner 拍板）：控制台从 loopback 放到全接口，供外网访问。**
+`-console 0.0.0.0:8088`，`start-sr-ctrl-detached.py` 与
+`~/Library/LaunchAgents/com.louis.sr-ctrl.plist` 两处都已改（备份
+`com.louis.sr-ctrl.plist.bak-20261113`）。Go 在 macOS 上实际是**双栈**绑定
+（`lsof` 显示 `*:8088`），所以 `http://192.168.1.4:8088` 与
+`http://[2408:8207:…]:8088` 都通，实测回环/局域网/公网 IPv6 三种走法均 200、
+登录 `{"ok":true}`，跨机验证从 CPE1 也 200。
+
+**代价（owner 已知情，别再当缺陷报）**：控制台是明文 HTTP，会话 Cookie 只有
+`HttpOnly + SameSite=Strict`、**没有 Secure**（无 TLS 就没法设），12 小时有效；
+登录失败锁定按 `用户名|RemoteAddr` 计数，若日后加反代，所有外部请求的
+RemoteAddr 会塌缩成同一个值，5 次失败就能把账号锁 60 秒。要收口就二选一：
+① 给 sr-ctrl 加 `-console-tls-*` 走 HTTPS；② 前面挂 Caddy/nginx 终止 TLS，
+sr-ctrl 退回 `127.0.0.1:8088`。路由器的端口转发/NAT 由 owner 自己做。
 
 **2026-11-12 增量（实测）：sr-ctrl 的启动方式变了，`~/Library/LaunchAgents/com.louis.sr-ctrl.plist` 是死的。**
 launchd bootstrap 这份 plist 一直报 EIO（历代 sr-ctrl 其实都是脚本 nohup 起的，launchd 从没管过它）；
