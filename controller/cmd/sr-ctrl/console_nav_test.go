@@ -102,8 +102,11 @@ func TestConsoleServicesMovedOutOfOverlay(t *testing.T) {
 	if !strings.Contains(svc, `svcShell("config-services")`) {
 		t.Error("服务配置页没有走 svcShell")
 	}
-	if !strings.Contains(nat, "doc.notes.nat_pending") {
-		t.Error("NAT 页没有显示「暂不下发」的说明：旧页面读的是 doc.nat_pending，这个字段从来不存在")
+	// NAT 已按形状 G 正常下发（7daa66d，exp-nat-bare 裁决配置形状问题）：
+	// 「暂不下发」机制与说明一并删除，页面不得再引用这个死字段——它来自
+	// servicesNatBlocked 时代，留着会把用户引向错误结论。
+	if strings.Contains(nat, "nat_pending") || strings.Contains(nat, "暂不下发") {
+		t.Error("NAT 页还在显示「暂不下发」：该机制已随形状 G 下发落地而删除（7daa66d）")
 	}
 }
 

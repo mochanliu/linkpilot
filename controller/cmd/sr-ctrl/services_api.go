@@ -69,9 +69,6 @@ func (s *server) servicesViewLocked(tenantID string, nodeID uint16, now int64) (
 				"子网内且不能包含口本身的地址；网关与 DNS 留空 = 用客户口地址（DNS 即本机转发器）。",
 			"dns": "一行 = 一个 DNS 转发器，监听客户口地址的 53/udp，按序转发到上游。" +
 				"上游留空 = 只回 SERVFAIL。",
-			"nat_pending": "盒子上 VPP 26.06 自带的 NAT44 插件有数据面崩溃缺陷（2026-11-11 实测：" +
-				"转发路径第一个向量即整机卡死）。发布后 DHCP/DNS 照常下发，NAT 行暂不下发，" +
-				"等后端落定（自研插件或升级 VPP）。",
 			"publish": "保存只写草稿；设备要等「发布到设备」之后才会拿到，发布走基础配置同一条路径。",
 		},
 	}

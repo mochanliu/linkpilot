@@ -159,7 +159,13 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `320f03fc716d6dd23b084c77c7710a76`（2026-11-13 23:05，「基础配置」
+当前代际：sr-ctrl `6c0067538e9c660eb6e9fe0cfb27b2dd`（2026-11-14 06:40，NAT 页残留
+的「暂不下发」说明删除——nat_pending 阻拦机制本已在 7daa66d 随形状 G 下发落地而
+删除，但上一轮拆模块时误把 notes 里的死文案又接回页面（c8423ee 把显示从 doc.
+nat_pending 改读 notes.nat_pending，等于把 7daa66d 已删的旧说明复活了）；本轮删掉
+notes.nat_pending 条目 + 页面横幅 + config_render.go 注释里的过时定性，测试反向
+钉死页面不得再引用 nat_pending。NAT 本身照常下发，与上一代功能面相同）。上一代
+`320f03fc716d6dd23b084c77c7710a76`（2026-11-13 23:05，「基础配置」
 拆成 7 个模块：设备信息 / 接口配置 / 静态路由 / 动态路由 / NAT / QoS / 服务配置；
 服务配置从 Overlay 组移到基础配置组下，NAT 从它里面独立成页，两页共用同一份
 ServicesSet 与同一台当前设备（`svFollowCfg`），侧栏改成 flex+滚动。功能面与上一代
@@ -169,7 +175,8 @@ ServicesSet 与同一台当前设备（`svFollowCfg`），侧栏改成 flex+滚�
 兜底 + store 加 node 不匹配护栏。② 世界底图俄罗斯方向横贯一条直线 —— 生成器
 用全经度矩形裁剪不切日期变更线，改回 d3 默认 antimeridian 裁剪，纬度裁剪改由
 fit 框承担；gen.mjs 加了"框内不得有横向长直线"检查），备份
-`sr-ctrl.prev-modules-20261113`；再往前 `6d775b48…` 是拓扑图嵌 Dashboard 那版，备份
+`sr-ctrl.prev-modules-20261113`；上一代备份 `sr-ctrl.prev-natnote-20261114`；再往前
+`6d775b48…` 是拓扑图嵌 Dashboard 那版，备份
 `sr-ctrl.prev-fix-20261113`；`5e8fe94f…`（LinkPilot 改名）备份
 `sr-ctrl.prev-topo-20261113`、`f5dc4d3a…`（HTTPS）备份
 `sr-ctrl.prev-brand-20261113`、`e2a787e5…`（FEC）备份

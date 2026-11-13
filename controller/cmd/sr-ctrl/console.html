@@ -8544,14 +8544,6 @@
     var h = p.head;
     if (p.o.note) h += undNote(p.o.note);
     h += svBar(p);
-    // NAT 行会被渲染进配置包，但盒子的 applier 在 26.06 的 nat44 缺陷落定前
-    // 只记录、不下发。这条事实必须挂在 NAT 页上——旧页面检查的是 doc.nat_pending
-    // 这个从来不存在于 view 里的字段，等于没显示过。
-    if (doc.notes && doc.notes.nat_pending) {
-      h += '<section class="panel"><header><h2>NAT 暂不下发</h2>' +
-        '<span class="tag stale">已渲染 · 未安装</span></header>' +
-        '<div class="hint">' + esc(doc.notes.nat_pending) + "</div></section>";
-    }
     h += '<section class="panel"><header><h2>NAT 出口</h2>' +
       '<div class="row-actions"><button class="small" type="button" data-sv="nat-add">加一行</button></div></header>' +
       '<div class="hint">' + esc(doc.notes.nat) + "</div>";
@@ -8613,7 +8605,8 @@
     h += '<section class="panel"><header><h2>下发内容（配置包第 8 段）</h2></header>' +
       '<div class="hint">这一段是设备真正读的东西：客户口在发布时解出地址/掩码和内核 TAP 名冻进段里，' +
       "盒子上的 sr-svc 进程读它起 DHCP/DNS 监听（配置改动由 sr-apply 发 SIGHUP 重载，租约不丢）。" +
-      "NAT 行也在同一段里，但盒子在 26.06 的 nat44 缺陷落定前只记录、不下发。</div>" +
+      "NAT 行也在同一段里，由盒子上的 sr-apply 直接对账到 VPP（形状 G：专用池挂外口 " +
+      "secondary + 外口地址身份映射），不走 sr-svc。</div>" +
       '<pre class="cmd">' + esc(doc.artifact || "(空)") + "</pre></section>";
 
     h += svPublishNote(doc);

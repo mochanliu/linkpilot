@@ -371,10 +371,10 @@ type configArtifacts struct {
 	// omitempty only spares bundles published before policy existed.
 	Policy string `json:"policy,omitempty"`
 	// Services is bundle 第 8 段: 服务面（NAT 出口 / DHCP server / DNS 转发器）。
-	// DHCP 与 DNS 落成 /etc/sdwan/svc.json 交给 sr-svc；NAT 行这里照样渲染（地址
-	// 池是租户显式配置的），但 26.06 的 nat44_ei 数据面有崩溃缺陷（2026-11-11 实测，
-	// 见 docs/dia-nat-dhcp-dns-plan.md），盒子的 applier 在后端落定前对 NAT 行只记
-	// 一条 note 不下发。空表也发 —— "删掉最后一行"是指令，不是无操作。
+	// DHCP 与 DNS 落成 /etc/sdwan/svc.json 交给 sr-svc；NAT 行由盒子上的 sr-apply
+	// 直接对账到 VPP（形状 G：专用池挂外口 secondary + 外口地址身份映射，
+	// exp-nat-bare 裁决配置形状问题、26.06 nat44_ei 本身无缺陷）。
+	// 空表也发 —— "删掉最后一行"是指令，不是无操作。
 	// omitempty 只放过该段出现之前发布的旧包。
 	Services string `json:"services,omitempty"`
 }

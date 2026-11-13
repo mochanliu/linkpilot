@@ -86,7 +86,7 @@ QoS 从 SD-WAN 策略挪过来独立成页；DIA 与静态端口映射还没做�
 | 接口配置（`config-ifaces`） | 路由实例（VPN）、客户口、VRRP | `/api/config` |
 | 静态路由（`config-static`） | 静态路由（含 UCMP weight） | `/api/config` |
 | 动态路由（`config-dynamic`） | BGP / OSPF（按 VPN） | `/api/config` |
-| NAT（`config-nat`） | NAT 出口行 + 暂不下发说明 | `/api/services` |
+| NAT（`config-nat`） | NAT 出口行（发布后由 sr-apply 按形状 G 下发到 VPP） | `/api/services` |
 | QoS（`config-qos`） | 物理口出方向调度 | `/api/config` |
 | 服务配置（`config-services`） | DHCP server、DNS 转发器、第 8 段原文 | `/api/services` |
 
