@@ -53,7 +53,7 @@
 
   /* ---------- shell ---------- */
   #app{display:grid;grid-template-columns:198px 1fr;min-height:100vh}
-  /* 侧栏改成 flex 列 + 导航自己滚：基础配置拆成 7 个模块后条目多了，短屏上
+  /* 侧栏改成 flex 列 + 导航自己滚：基础配置拆成 8 个模块后条目多了，短屏上
      绝对定位的页脚会压在最后两项下面。 */
   aside{background:var(--card);border-right:1px solid var(--line);padding:16px 10px;position:sticky;top:0;height:100vh;
     display:flex;flex-direction:column}
@@ -242,7 +242,7 @@
     color:var(--muted);padding:6px 2px;margin:0 14px -1px 0;font-size:13.5px}
   .ltabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:500}
   .ltabs button:hover{background:none;color:var(--ink)}
-  /* 基础配置的 7 个模块：和左侧导航是同一组页面，只是把它们放在页头，
+  /* 基础配置的 8 个模块：和左侧导航是同一组页面，只是把它们放在页头，
      省掉"改一个静态路由要回导航再点一次"的来回。外观沿用 ltabs 的下划线。 */
   .modnav{display:flex;flex-wrap:wrap;gap:2px;border-bottom:1px solid var(--line);margin:0 0 12px}
   .modnav button{border:none;border-bottom:2px solid transparent;border-radius:0;background:none;
@@ -350,6 +350,7 @@
       <div class="sect" data-roles="tenant">基础配置</div>
       <a class="child" href="#config" data-view="config" data-roles="tenant">设备信息</a>
       <a class="child" href="#config-ifaces" data-view="config-ifaces" data-roles="tenant">接口配置</a>
+      <a class="child" href="#config-vrrp" data-view="config-vrrp" data-roles="tenant">VRRP</a>
       <a class="child" href="#config-static" data-view="config-static" data-roles="tenant">静态路由</a>
       <a class="child" href="#config-dynamic" data-view="config-dynamic" data-roles="tenant">动态路由</a>
       <a class="child" href="#config-nat" data-view="config-nat" data-roles="tenant">NAT</a>
@@ -796,20 +797,24 @@
     },
     config: {
       title: "设备信息",
-      sub: "这台设备的身份、主机名，以及它跑的是哪一版配置。主机名写进 FRR，只影响盒子自身。" +
+      sub: "这台设备的身份、主机名，以及它跑的是哪一版配置。主机名只影响盒子自身。" +
         "保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装。" +
-        "接口、路由、NAT、QoS、服务在左侧「基础配置」下的其他页；隧道参数在「Underlay 配置」组",
+        "接口、路由、VRRP、NAT、QoS、服务在左侧「基础配置」下的其他页；隧道参数在「Underlay 配置」组",
       roles: ["tenant"]
     },
     "config-ifaces": {
       title: "接口配置",
-      sub: "路由实例（VPN）、客户口（地址 / MTU / up-down / lcp），和站点里两台盒子的网关冗余（VRRP）。" +
-        "地址交给 FRR 配在内核 TAP 上、由 linux-nl 同步进 VPP；VPP 只管 table、MTU、开关和 lcp",
+      sub: "路由实例（VPN）与客户口（地址 / MTU / up-down）",
+      roles: ["tenant"]
+    },
+    "config-vrrp": {
+      title: "VRRP",
+      sub: "站点里两台盒子的网关冗余：两台各配一条 vr_id 与虚拟地址相同的记录，优先级高的当主。记录挂在基础配置的客户口上",
       roles: ["tenant"]
     },
     "config-static": {
       title: "静态路由",
-      sub: "写进 FRR 的静态路由，由 zebra 装进内核表，linux-nl 同步进对应 VPN 的 VPP table。" +
+      sub: "按 VPN 归属的静态路由。" +
         "同一前缀多行、下一跳不同、各带 weight = 不等价负载均衡（UCMP）",
       roles: ["tenant"]
     },
@@ -830,14 +835,13 @@
       title: "NAT",
       sub: "一行 = 一条 NAT 出口：客户口（VPN 内）的流量经出口口出去，源地址翻译成地址池里的地址。" +
         "池是显式配置的，地址要能收到回程流量；出口口自己的地址不能进池（管理面会失联）。" +
-        "行挂在基础配置的客户口上，地址与掩码在发布时解出来冻进配置包",
+        "行挂在基础配置的客户口上",
       roles: ["tenant"]
     },
     "config-services": {
       title: "服务配置",
       sub: "DHCP server 给客户口子网发地址，DNS 转发器听客户口地址的 53/udp 并转发到上游。" +
-        "行都挂在基础配置的客户口（VPP 名）上，地址、掩码、内核 TAP 名在发布时解出来冻进配置包第 8 段，" +
-        "由盒子上的 sr-svc 用户态进程执行。NAT 在「基础配置 › NAT」页",
+        "行都挂在基础配置的客户口上。NAT 在「基础配置 › NAT」页",
       roles: ["tenant"]
     },
     monitor: {
@@ -893,8 +897,7 @@
     account: { title: "账号设置", sub: "修改自己的登录密码；改完后该账号在其他会话上会被登出" },
     policy: {
       title: "SD-WAN 策略 · 静态",
-      sub: "一行 = 一类流走哪个颜色。颜色对应一张独立的 VPP FIB 表（表号 = 颜色×1000 + VPN），" +
-        "表里的路径由 sr-fib 按隧道与 BFD 状态自己收敛 —— 链路抖动不用改策略。" +
+      sub: "一行 = 一类流走哪个颜色。每个颜色是一组独立的转发路径，设备按链路状态自动收敛 —— 链路抖动不用改策略。" +
         "行号就是匹配顺序，前面的先命中；入口口不用选，一行挂到它所属 VPN 的全部客户口上。" +
         "兜底是每 VRF 每颜色一个开关：勾上 = 该颜色查不到时退到颜色 0（本 VPN 主表）而不是丢掉。" +
         "保存只写草稿，发布走和「基础配置」同一条路径",
@@ -965,6 +968,7 @@
       else if (S.view === "nodes") c = viewNodes(st, isOp);
       else if (S.view === "config") c = viewConfig(st);
       else if (S.view === "config-ifaces") c = viewConfigIfaces(st);
+      else if (S.view === "config-vrrp") c = viewConfigVrrp(st);
       else if (S.view === "config-static") c = viewConfigStatic(st);
       else if (S.view === "config-dynamic") c = viewConfigDynamic(st);
       else if (S.view === "config-qos") c = viewConfigQos(st);
@@ -1453,7 +1457,7 @@
   // 「检测倍数」而这里还印 150 ms，就是页面在造数据。没有下发过配置时也不猜
   // 内置默认值——设备根本没收到过定时器，说什么都是编的。
   function telemetryRuleHint(t) {
-    var quality = "时延、抖动、丢包全部来自隧道内的探针：VPP 的 BFD 会话本身不产出任何质量数字。" +
+    var quality = "时延、抖动、丢包全部来自隧道内的探针。" +
       "丢包取的是探针滑动窗口（最近 128 个采样）里的比例，所以它不会超过 100%，没丢就是 0.0%。";
     if (!t || !t.bfd_min_rx_us || !t.bfd_detect_mult) {
       return "可达性看 BFD：判 down 的规则是「检测倍数 × 最小接收间隔」内没收到包。" +
@@ -2072,13 +2076,14 @@
     if (m) m.innerHTML = cfgMetaText(cs) + cfgDirtyMark(cs);
   }
 
-  // 基础配置按"要改什么"分成 7 个模块，但数据模型没有跟着拆：5 个页面编辑的是
+  // 基础配置按"要改什么"分成 8 个模块，但数据模型没有跟着拆：6 个页面编辑的是
   // 同一份 BasicConfig 草稿（S.cfg），NAT 与 服务配置编辑的是同一份服务面
   // （S.sv）。分组只改变"从哪儿进去"，保存与发布仍是整份提交——把模型也拆成
   // 7 份会让"发布"要凑齐 7 个版本号，那才是真正的事故源。
   var CFG_MODULES = [
     ["config", "设备信息"],
     ["config-ifaces", "接口配置"],
+    ["config-vrrp", "VRRP"],
     ["config-static", "静态路由"],
     ["config-dynamic", "动态路由"],
     ["config-nat", "NAT"],
@@ -2086,10 +2091,10 @@
     ["config-services", "服务配置"]
   ];
 
-  // 由 /api/config（设备草稿）驱动的 5 页。
+  // 由 /api/config（设备草稿）驱动的 6 页。
   function cfgView(v) {
-    return v === "config" || v === "config-ifaces" || v === "config-static" ||
-      v === "config-dynamic" || v === "config-qos";
+    return v === "config" || v === "config-ifaces" || v === "config-vrrp" ||
+      v === "config-static" || v === "config-dynamic" || v === "config-qos";
   }
   // 由 /api/services（NAT / DHCP / DNS 行）驱动的 2 页，共用 S.sv 与它的设备选择。
   function svcView(v) { return v === "config-nat" || v === "config-services"; }
@@ -2144,10 +2149,17 @@
     });
   }
 
-  // 路由实例与客户口是一体的：口必须属于某张表，VRRP 又挂在口上，所以三块同页。
+  // 路由实例与客户口是一体的：口必须属于某张表，所以两块同页。
   function viewConfigIfaces(st) {
     return viewConfigPage(st, "config-ifaces", function (cs) {
-      return cfgVPNPanel(cs.draft) + cfgIfacePanel(cs, cs.draft) + cfgVRRPPanel(cs, cs.draft);
+      return cfgVPNPanel(cs.draft) + cfgIfacePanel(cs, cs.draft);
+    });
+  }
+
+  // VRRP 挂在客户口上，单分一页。
+  function viewConfigVrrp(st) {
+    return viewConfigPage(st, "config-vrrp", function (cs) {
+      return cfgVRRPPanel(cs, cs.draft);
     });
   }
 
@@ -2172,12 +2184,12 @@
       acts += '<button class="small" data-act="cfg-bundle">下载配置包</button>' +
         '<button class="small primary" data-act="cfg-publish">发布到设备</button>';
     }
-    // 长说明只在设备信息页出现一次：7 个页面重复同一段话，读到第三页就没人看了。
+    // 长说明只在设备信息页出现一次：8 个页面重复同一段话，读到第三页就没人看了。
     var hint;
     if (cfgIsPA(cs)) {
       hint = "这台设备还没有入网：保存只写控制器的草稿，没有「发布」也没有配置包，因为接收方还不存在。现场工程师用 <code>sr-agent --preauth 「这台设备的索引」</code> 认领它之后，这份草稿会原样挪到它的 node 上（版本不变），那时候才能发布。";
     } else if (view === "config") {
-      hint = "保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在 -apply 模式下于下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。";
+      hint = "保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。";
     } else {
       hint = "这一页改的是同一份草稿：保存只写控制器，发布后设备在下一次心跳拉取。设备在线与否不拦保存，但只有发布过的版本会被安装。";
     }
@@ -2420,7 +2432,7 @@
       '<div class="fields"><div class="field"><label for="cfg-hostname">hostname</label>' +
       '<input id="cfg-hostname" data-cfg="hostname" value="' + esc(cs.draft.hostname) +
       '" placeholder="如 cpe-sh-01" spellcheck="false" maxlength="63"></div></div>' +
-      '<div class="hint" style="margin:10px 0 0">写进 FRR 的 <code>hostname</code>，只影响盒子自身，不参与转发。' +
+      '<div class="hint" style="margin:10px 0 0">hostname 只影响盒子自身，不参与转发。' +
       "允许字母、数字、连字符，长度 1–63；留空会按默认主机名显示（校验里给警告，不拦保存）。</div>" +
       "</section>";
   }
@@ -2444,8 +2456,8 @@
         "</td></tr>";
     }).join("");
     return '<section class="panel"><header><h2>路由实例（VPN）</h2></header>' +
-      '<div class="hint">VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 被 overlay 占用。' +
-      "每增加一个 VPN，就多一张独立的转发表和一套 BGP/OSPF；客户口与静态路由按 VPN 归属。</div>" +
+      '<div class="hint">VPN 0 是默认表；250 被 overlay 占用。' +
+      "每增加一个 VPN，就多一套独立的转发表和 BGP/OSPF；客户口与静态路由按 VPN 归属。</div>" +
       "<table><thead><tr><th>VPN ID</th><th>名称</th><th>客户口</th><th>静态路由</th><th>说明</th><th></th></tr></thead><tbody>" +
       rows + "</tbody></table>" +
       '<div class="addrow">' +
@@ -2471,7 +2483,7 @@
     }).join("") : '<tr><td colspan="7" class="empty">还没有客户口。没有客户口，客户侧流量就没有入口。</td></tr>';
     return '<section class="panel"><header><h2>客户口</h2>' +
       '<button class="small" data-act="cfg-if-add">添加客户口</button></header>' +
-      '<div class="hint">接口 IP 交给 FRR（配在内核 TAP 上，linux-nl 同步进 VPP）；VPP 只管这张表、MTU、开关和 lcp。</div>' +
+      '<div class="hint">客户口是客户流量的入口：地址按所属 VPN 配置，MTU 与管理状态也按口设置。</div>' +
       (cs.edit && cs.edit.kind === "iface" ? cfgIfaceEditor(cs) : "") +
       "<table><thead><tr><th>VPP 口</th><th>内核 TAP</th><th>地址</th><th>VPN</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>" +
       rows + "</tbody></table></section>";
@@ -2532,9 +2544,8 @@
       '<div class="hint">虚拟地址是这一台盒子在这个客户口上的网关地址：谁优先级高谁回答 ARP，另一台待命。' +
       '没有「主 / 备」开关——优先级就是角色，两台各配一条同 vr_id、虚拟地址相同的记录即可。' +
       '通告间隔留空按 1000 ms。</div>' +
-      '<div class="hint" style="margin:6px 0 0">这一段在设备上是最后下发的，且只走 VPP 的二进制 API。' +
-      '改优先级或间隔会把这条 VR 删了重建、重新选一次主备，客户侧网关会在一段时间内落在另一台上（约 3 倍通告间隔再加一个 skew；双机上的实测时长还没量出来，量到之前这里只给公式）；' +
-      '一次配置只改一台，另一台保持原优先级即可避免双主。</div>' +
+      '<div class="hint" style="margin:6px 0 0">改优先级或间隔会让两台盒子重新选主备，客户侧网关会短暂切换到另一台（约 3 倍通告间隔）。' +
+      '一次只改一台的配置，另一台保持原优先级即可避免双主。</div>' +
       (cs.edit && cs.edit.kind === "vrrp" ? cfgVRRPEditor(cs) : "") +
       "<table><thead><tr><th>VPP 口</th><th>vr_id</th><th>优先级</th><th>通告间隔</th><th>虚拟地址</th><th>标志 / 问题</th><th></th></tr></thead><tbody>" +
       rows + "</tbody></table></section>";
@@ -2683,10 +2694,10 @@
         "</tr>";
     }).join("") : '<tr><td colspan="5" class="empty">还没有静态路由。</td></tr>';
     return '<section class="panel"><header><h2>静态路由</h2></header>' +
-      '<div class="hint">写进 FRR，由 zebra 装进内核表；linux-nl 会把它们同步进对应 VPN 的 VPP table。</div>' +
+      '<div class="hint">静态路由按 VPN 归属；下一跳必须是该 VPN 内可达的地址。</div>' +
       "<table><thead><tr><th>目的前缀</th><th>下一跳</th><th>Weight</th><th>VPN</th><th></th></tr></thead><tbody>" +
       rows + "</tbody></table>" +
-      '<div class="hint">同一前缀写多行、下一跳不同、各带 weight（1–65535，默认 1）＝不等价负载均衡：zebra 聚成一组 UCMP 下一跳，linux-cp 同步进 VPP 后按比例复制 load-balance 桶、按流分流。</div>' +
+      '<div class="hint">同一前缀写多行、下一跳不同、各带 weight（1–65535，默认 1）＝不等价负载均衡：流量按 weight 比例按流分流。</div>' +
       '<div class="addrow">' +
       '<div class="field"><label for="st-prefix">目的前缀</label><input id="st-prefix" placeholder="10.68.99.0/24" spellcheck="false"></div>' +
       '<div class="field"><label for="st-nh">下一跳</label><input id="st-nh" placeholder="10.68.1.2" spellcheck="false"></div>' +
@@ -2732,7 +2743,7 @@
       return '<option value="' + esc(x.id) + '"' + (x.id === vpn.id ? " selected" : "") + ">VPN " +
         esc(x.id) + (x.name ? " · " + esc(x.name) : "") + "</option>";
     }).join("");
-    return '<section class="panel"><header><h2>动态路由（盒内 FRR）</h2>' +
+    return '<section class="panel"><header><h2>动态路由</h2>' +
       '<select id="cfg-vpn" class="ttl" aria-label="路由实例">' + opts + "</select></header>" +
       '<div class="hint">这里只定义「和客户侧谁建会话」。学到的前缀要不要进 overlay、怎么打 tag，是 overlay 层的事。</div>' +
       cfgBgpCard(vpn) + cfgOspfCard(cfg, vpn) + "</section>";
@@ -2831,7 +2842,7 @@
           '" aria-selected="' + (cs.ptab === x[0]) + '" data-act="cfg-ptab" data-ptab="' +
           x[0] + '">' + x[1] + "</button>";
       }).join("") + "</div>" +
-      '<div class="hint">只有基础配置拥有的行：FRR 管主机名、接口地址、静态路由、BGP/OSPF；VPP 管 table、MTU、接口状态与 lcp；开机脚本由设备侧在启动时重放，避免重启后丢掉 VPP 运行时状态。' +
+      '<div class="hint">设备实际收到的配置包原文（按页签查看）。' +
       (cs.dirty ? "当前显示的是已保存草稿 v" + esc(v.version) + " 的产物。" : "") + "</div>" +
       '<pre class="cmd">' + esc(text) + "</pre></section>";
   }
@@ -3042,7 +3053,7 @@
     var cs = S.cfg;
     if (!cs || !cs.draft || !cs.draft.vrrp) return;
     if (!confirm("删除虚拟路由器 " + cs.draft.vrrp[i].vpp + " vr" + cs.draft.vrrp[i].vr_id +
-      "？发布后这台盒子会把它从 VPP 里删掉，虚拟地址由对端接管。")) return;
+      "？发布后这条虚拟路由会从设备上删除，虚拟地址由对端接管。")) return;
     cs.draft.vrrp.splice(i, 1);
     cs.edit = null;
     csMarkDirty();
@@ -3072,7 +3083,7 @@
       return;
     }
     if (!(v.interval_ms >= 100 && v.interval_ms <= 60000) || v.interval_ms % 10 !== 0) {
-      toast("通告间隔需在 100–60000 ms 之间，并且是 10 的整数倍（VPP 按厘秒计数）");
+      toast("通告间隔需在 100–60000 ms 之间，并且是 10 的整数倍");
       return;
     }
     if (!cfgIPv4(v.virtual_addr)) { toast("虚拟地址不是合法 IPv4：" + (v.virtual_addr || "(空)")); return; }
@@ -4973,10 +4984,9 @@
       // 颜色说清三件事：它变成什么、0 意味着可以叠加、以及它今天走到哪里。
       // 最后一条必须写：这一列只写控制器的隧道表，设备上的 FIB 隧道表还是设备
       // 自己那份配置，两边不一致时数据面按设备上的算。
-      "颜色是这条隧道的 SD-WAN 颜色：设备按 230+颜色 写成 VPP 的 preference，颜色 0 最优，" +
+      "颜色是这条隧道的 SD-WAN 颜色：颜色 0 最优，" +
       "0 全 down 时自动抬到存活的最小颜色；同色多条是并用的。" +
-      "这一列今天写的是控制器的隧道表；设备上生效的还是它自己那份 FIB 隧道配置，两边要人工对齐。" +
-      "权重是这条隧道在颜色表里的分担比例（1–255，默认 1 = 等价 ECMP）：同桶多条路径按比例复制 load-balance 桶、按流分流（UCMP）。" +
+      "权重是这条隧道在颜色里的分担比例（1–255，默认 1 = 等价分担）：同色多条按权重比例按流分流（UCMP）。" +
       "注意颜色表是跨设备混装的，权重也作用于跨设备分流。开「动态」后权重是基数上限：" +
       "agent 按探针丢包在 1..权重 之间调档（丢包优先、四档、非线性，迟滞 3 拍 × 5 秒），动态生效值不回写本页。" +
       // FEC 四档的语义与边界（XOR-only）：带宽代价、恢复能力、两端都要 1.2.0。
@@ -5198,9 +5208,7 @@
       '<div class="hint" style="margin:10px 0 0">端口和 overlay /32 不在这里改：端口由池分配，overlay 地址跟着隧道走。' +
       "改成「直连」会丢掉中转；地址留空表示改回使用观测地址。" +
       "物理端口只在改动时提交：选「默认」表示交回设备上报的出口。" +
-      // 实测出来的行为，不是猜测：VPP 原地替换路径时不重算 preference，
-      // 所以改颜色必须删了重加（docs/overlay-design-draft.md §2.2）。
-      "改颜色会把这条隧道上的路由删掉重加，正在走的流量有一个收敛窗口的中断；改权重同理（VPP 按 weight 比例重建 load-balance 桶）。" +
+      "改颜色或权重会让路由重建，正在走的流量有短暂收敛中断。" +
       "</div>" +
       '<div style="margin-top:10px"><button class="primary" type="submit">保存修改</button> ' +
       '<button class="small" type="button" data-act="und-tun-cancel">取消</button></div>' +
@@ -6511,8 +6519,8 @@
       '<label class="chk"><input type="checkbox" id="ov-escape"' + (g.escape ? " checked" : "") +
       "> 主表收全部颜色</label>" +
       '<div class="hint">这里的「主表」是<b>每个 VPN 自己那张表</b>（不是只有 VPN 0）：一条路由按 RT 落进哪张表，' +
-      "开关就作用在哪张表上。打开后每张表除了颜色 0 还收下其它颜色的路径，谁先用由 preference=230+颜色 " +
-      "交给 VPP 原生排序 —— 颜色 0 全 down 时自动抬最小的存活颜色，恢复后自动回落。关掉时每张表只收颜色 0，" +
+      "开关就作用在哪张表上。打开后每张表除了颜色 0 还收下其它颜色的路径，颜色 0 最优先，" +
+      "颜色 0 全 down 时自动抬最小的存活颜色，恢复后自动回落。关掉时每张表只收颜色 0，" +
       "颜色 0 全 down 这条前缀在那张表里就不存在（宁丢，不长期占用昂贵的颜色）。" +
       "注意这里管的是「一张表收哪些颜色」，和「路由能不能进这张表」（那是导通策略配置里 RT 命中）是两件正交的事。</div>" +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center">' +
@@ -7960,18 +7968,15 @@
         ? '<ul class="chk-list">' + doc.checks.map(undCheckRow).join("") + "</ul>"
         : '<div class="empty">没有校验结果。</div>') + "</section>";
 
-    /* --- 第 7 段原文 --- */
-    h += '<section class="panel"><header><h2>下发内容（配置包第 7 段）</h2></header>' +
-      '<div class="hint">这一段是设备真正读的东西：行号进 ACL tag 与 ABF 优先级，' +
-      "attach 是上面那些入口口。设备上的 sr-apply 拿它和 VPP 现状对账（ACL/ABF 只在 VPP 内存里，" +
-      "所以这一段是&#34;对账指令&#34;，不是一个盒子要保存的文件）。</div>" +
+    /* --- 策略原文 --- */
+    h += '<section class="panel"><header><h2>下发内容（策略原文）</h2></header>' +
+      '<div class="hint">这一段是设备真正读到的策略原文：行号决定匹配顺序，attach 是上面那些入口口。</div>' +
       '<pre class="cmd">' + esc(doc.artifact || "(空)") + "</pre></section>";
 
     h += '<section class="panel"><header><h2>这一页与发布的关系</h2></header><div class="hint">' +
-      "保存只写控制器草稿，设备上什么都不变。发布走 <code>POST /api/config/publish</code>（和「基础配置」同一条路径），" +
-      "设备在下一次心跳（≤" + esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
-      " 秒）拉取。兜底那一半由 sr-fib 执行（它是颜色表的 owner）：sr-agent 从这一段里派生出兜底清单推给它，" +
-      "所以勾选框只有一个来源，就是这一页。</div></section>";
+      "保存只写控制器草稿，设备上什么都不变。发布后设备在下一次心跳（≤" +
+      esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
+      " 秒）拉取。兜底开关只有一个来源，就是这一页。</div></section>";
     return h + "</div>";
   }
 
@@ -8531,9 +8536,9 @@
 
   function svPublishNote(doc) {
     return '<section class="panel"><header><h2>这些行怎么走到设备</h2></header><div class="hint">' +
-      esc(doc.notes.publish) + " 发布走 <code>POST /api/config/publish</code>（和基础配置同一条路径），" +
-      "设备在下一次心跳（≤" + esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
-      " 秒）拉取。DHCP/DNS 与 NAT 行在服务端是同一份服务面：这一页保存时提交的是整份，" +
+      esc(doc.notes.publish) +
+      " 设备在下一次心跳（≤" + esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
+      " 秒）拉取。DHCP/DNS 与 NAT 在服务端是同一份：这一页保存时提交的是整份，" +
       "所以 NAT 页上的改动也会一起写进去（反过来也一样）。</div></section>";
   }
 
@@ -8601,12 +8606,9 @@
 
     h += svChecks(doc, p.dirty);
 
-    /* --- 第 8 段原文 --- */
-    h += '<section class="panel"><header><h2>下发内容（配置包第 8 段）</h2></header>' +
-      '<div class="hint">这一段是设备真正读的东西：客户口在发布时解出地址/掩码和内核 TAP 名冻进段里，' +
-      "盒子上的 sr-svc 进程读它起 DHCP/DNS 监听（配置改动由 sr-apply 发 SIGHUP 重载，租约不丢）。" +
-      "NAT 行也在同一段里，由盒子上的 sr-apply 直接对账到 VPP（形状 G：专用池挂外口 " +
-      "secondary + 外口地址身份映射），不走 sr-svc。</div>" +
+    /* --- 服务配置原文 --- */
+    h += '<section class="panel"><header><h2>下发内容（服务配置原文）</h2></header>' +
+      '<div class="hint">这一段是设备真正读到的服务配置原文（NAT、DHCP、DNS）。</div>' +
       '<pre class="cmd">' + esc(doc.artifact || "(空)") + "</pre></section>";
 
     h += svPublishNote(doc);

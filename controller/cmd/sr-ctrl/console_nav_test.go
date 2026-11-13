@@ -7,7 +7,7 @@ package main
 // "点了没反应"或者"点进去一片空白"——上一轮策略页的故障就是这么来的。
 // 所以这里钉三件事：
 //
-//  1. 导航里的 7 个模块与 CFG_MODULES 一一对应、顺序一致（页内切换条和左侧
+//  1. 导航里的 8 个模块与 CFG_MODULES 一一对应、顺序一致（页内切换条和左侧
 //     导航是同一组入口，顺序不同会让人以为自己点错了）；
 //  2. 每个模块在 VIEWS、render 分发、view 函数三处都存在；
 //  3. 服务配置不再挂在 Overlay 组下，且 NAT 与 服务配置共用同一份服务面
@@ -43,12 +43,12 @@ func navSection(t *testing.T, html, title string) [][]string {
 	return navItemRe.FindAllStringSubmatch(rest[:end], -1)
 }
 
-func TestConsoleNavBasicsIsSevenModules(t *testing.T) {
+func TestConsoleNavBasicsIsEightModules(t *testing.T) {
 	html := string(consoleHTML)
 
 	nav := navSection(t, html, "基础配置")
-	if len(nav) != 7 {
-		t.Fatalf("基础配置应有 7 个模块，实际 %d 个: %v", len(nav), nav)
+	if len(nav) != 8 {
+		t.Fatalf("基础配置应有 8 个模块，实际 %d 个: %v", len(nav), nav)
 	}
 
 	m := cfgModulesJS.FindStringSubmatch(html)
@@ -61,7 +61,7 @@ func TestConsoleNavBasicsIsSevenModules(t *testing.T) {
 	}
 
 	// 顺序与文案都要一致：页内切换条是照着这张表画的。
-	want := []string{"设备信息", "接口配置", "静态路由", "动态路由", "NAT", "QoS", "服务配置（DHCP / DNS）"}
+	want := []string{"设备信息", "接口配置", "VRRP", "静态路由", "动态路由", "NAT", "QoS", "服务配置（DHCP / DNS）"}
 	for i, item := range nav {
 		view, label := item[1], strings.TrimSpace(item[2])
 		if view != mods[i][1] {
@@ -140,7 +140,8 @@ func TestConsoleModulePagesOwnTheirPanels(t *testing.T) {
 		panels []string
 	}{
 		{"function viewConfig(", []string{"cfgDevicePanel(", "cfgDeliveryPanel(", "cfgChecksPanel(", "cfgArtifactsPanel("}},
-		{"function viewConfigIfaces(", []string{"cfgVPNPanel(", "cfgIfacePanel(", "cfgVRRPPanel("}},
+		{"function viewConfigIfaces(", []string{"cfgVPNPanel(", "cfgIfacePanel("}},
+		{"function viewConfigVrrp(", []string{"cfgVRRPPanel("}},
 		{"function viewConfigStatic(", []string{"cfgStaticPanel("}},
 		{"function viewConfigDynamic(", []string{"cfgDynamicPanel("}},
 		{"function viewConfigQos(", []string{"cfgQosPanel("}},

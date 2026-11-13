@@ -76,14 +76,15 @@ CPE1 重启 VPP 后按 sr-box 清单自愈（lcp pair 重建、地址回位、sr
 
 ### 2.1 落地（2026-11-13，owner 定的最终模块表）
 
-实际拆成 **7 个模块**，以 owner 这一轮给的清单为准（与上面这张草表的差别：概览改名
+实际拆成 **8 个模块**（VRRP 后从接口配置里单分一页），以 owner 这一轮给的清单为准（与上面这张草表的差别：概览改名
 「设备信息」并合并了发布与版本；NAT 与 DHCP/DNS 拆成两页但**共用一份服务面**；
 QoS 从 SD-WAN 策略挪过来独立成页；DIA 与静态端口映射还没做）：
 
 | 导航项（`data-view`） | 内容 | 后端 |
 |---|---|---|
 | 设备信息（`config`） | 设备身份、hostname、下发到设备、版本历史/diff/回滚、校验、配置包内容 | `/api/config` |
-| 接口配置（`config-ifaces`） | 路由实例（VPN）、客户口、VRRP | `/api/config` |
+| 接口配置（`config-ifaces`） | 路由实例（VPN）、客户口 | `/api/config` |
+| VRRP（`config-vrrp`） | 站点第一跳冗余（挂在客户口上） | `/api/config` |
 | 静态路由（`config-static`） | 静态路由（含 UCMP weight） | `/api/config` |
 | 动态路由（`config-dynamic`） | BGP / OSPF（按 VPN） | `/api/config` |
 | NAT（`config-nat`） | NAT 出口行（发布后由 sr-apply 按形状 G 下发到 VPP） | `/api/services` |
