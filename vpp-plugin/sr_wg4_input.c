@@ -17,6 +17,7 @@
  * 改成了什么"的唯一现场证据。丢包不记（见 Step 6 的注释）。
  */
 #include "sr_wg.h"
+#include "sr_qos.h"
 
 /* ==================== Trace 定义 ==================== */
 
@@ -224,6 +225,19 @@ VLIB_NODE_FN (sr_wg4_input_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           sm->counters.drop_total++;
           goto done;
         }
+
+      /*
+       * Step 4.5: 从 action 高 3bit 恢复 QoS 类别（owner 2026-11-13：必须步骤）。
+       *
+       * action 3bit 是端到端权威类别（运营商可能重标记外层 ToS，载荷不会动）。
+       * 解密后的内层包带着这份元数据（VPP 标准 qos opaque2）走完本地转发，
+       * LAN 出向物理口的 interface-output 调度直接用它分类 —— 接收端**不**
+       * 重新从内层 DSCP 分类："DSCP→类别"的映射决策只在发送端入口做一次，
+       * 链路两端映射表版本不一致也不会类别漂移。
+       * 必须在 Step 5 剥 SR 头之前读（之后 srh 指向的内存被 WG 报文覆盖）。
+       */
+      vnet_buffer2 (b)->qos.bits = sr_qos_action_to_class (srh->action);
+      b->flags |= VNET_BUFFER_F_QOS_DATA_VALID;
 
       /*
        * Step 5: 剥离 SR Header。

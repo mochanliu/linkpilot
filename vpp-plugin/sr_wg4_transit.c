@@ -11,6 +11,7 @@
  * peer 的动态 endpoint 污染到中转。
  */
 #include "sr_wg.h"
+#include "sr_qos.h"
 #include <vnet/udp/udp_packet.h>
 
 /* ==================== Trace 定义 ==================== */
@@ -234,6 +235,25 @@ VLIB_NODE_FN (sr_wg4_transit_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       /* Step 9: 改写外层 UDP dst_port = next_hop.port */
       clib_memcpy_fast (&udp->dst_port, next_hop->port, 2);
+
+      /*
+       * Step 9.5: 从 action 高 3bit 恢复 QoS 类别（owner 2026-11-13：必须步骤）。
+       *
+       * 隧道包中途会过运营商设备，外层 DSCP 可能被重标记（限速/重分类/清零）。
+       * action 在我们的 UDP 载荷里，运营商不动它，是端到端唯一的权威类别。
+       * 所以本机出向调度**不信任收到的外层 DSCP**：
+       *   ① 重写外层 ToS = 类别代表 DSCP（Step 14 会重算 checksum，顺序必须
+       *      在它之前）—— 下一跳/本机出向物理口调度看到的 ToS 重新可信；
+       *   ② 写 buffer 元数据 —— 本机出向 interface-output 调度优先读它。
+       * 这让"中转出向物理口加 QoS 策略"成为可能：类别跟着 SR 头走完整条链。
+       */
+      {
+        u8 cls = sr_qos_action_to_class (srh->action);
+
+        ip4->tos = (u8) (sr_qos_dscp_of_class (cls) << 2);
+        vnet_buffer2 (b)->qos.bits = cls;
+        b->flags |= VNET_BUFFER_F_QOS_DATA_VALID;
+      }
 
       /*
        * Step 10: **外层源（IP 和端口）一个字节都不动。**

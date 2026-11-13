@@ -1,55 +1,53 @@
 /*
- * sr_qos.h - 隧道出口 QoS：挂点、分类、4 队列调度与整形
+ * sr_qos.h - 物理口统一 QoS：入口标记 + 出向调度 + SR 头类别传递
  *
- * ==================== 为什么挂在这里 ====================
+ * ==================== 方案（owner 2026-11-13 拍板，docs/qos-path-c-plan.md §13） ====================
  *
- * QoS 的对象是**隧道**，不是物理网卡（docs/qos-path-c-plan.md §9）。
+ * QoS 的对象是**出方向物理口**，不是隧道：物理口出口是共享资源，上面还有非
+ * WG 流量，只给 WG 调度没有意义。四步：
  *
- * 第一版把节点挂在这条**出口**弧上、排在 wg4-output-tun 之前，结果被实测推翻：
- * 转发流量进隧道走的是 `ip4-lookup → ip4-rewrite → ip4-midchain → wg4-output-tun`，
- * 那条链上没有任何 feature 弧入口，**只有本机自发流量才经过 wg 口的 ip4-output 弧**
- * （docs/qos-path-c-plan.md §10）。所以现在挂在**入口**弧：
+ *   1) 入口标记   sr-wg4-qos（ip4-unicast 弧，按入接口 enable）
+ *                 读内层 DSCP → 3bit 类别 → vnet_buffer2(b)->qos。
+ *                 **只标记，不排队**。旧版在这里做的 FIB 隧道解析（rt_cache、
+ *                 三版判据踩坑）整体删除 —— 类别经 buffer 元数据走到封装点，
+ *                 隧道身份在封装点天然已知，不需要任何查表。
  *
- *   内层包 → ip4-input → ip4-unicast 弧（按**入接口**生效）
- *           → sr-wg4-qos（本节点：查一次 FIB 得到"出哪条隧道"，再分类/排队/整形）
- *           → ip4-lookup → ip4-rewrite → ip4-midchain → wg4-output-tun（加密）
+ *   2) 封装传递   sr-wg4-encap 把类别写进两处：
+ *                 ① SR 头 action 高 3bit（action 在 HMAC 排除集里，不用重签；
+ *                    数据路径没人读；validate 不检查 —— §12.2 已核）
+ *                 ② 最外层 IP ToS（类别代表 DSCP，见 class_dscp 表）
+ *                 内层头此刻已进密文，encap 不能重新分类，只信标记器。
  *
- * 两个要点，改代码前先读：
+ *   3) 物理口调度 sr-wg4-qos-out（interface-output 弧，按出接口 enable，
+ *                 set rate 时自动挂）按**最外层 IP DSCP** 进 4 队列
+ *                 （LLQ + DRR + 令牌桶 + 尾丢，复用旧隧道版实现）。
+ *                 挂点必须用 interface-output 弧：underlay 的 ip4-output 弧上
+ *                 同一条流被经过 ~3.5 次（§10.1），排队会重复排队；
+ *                 interface-output 在一切封装完成后每包恰好一次。
+ *                 速率口径 = **外层字节直配**（含加密 + SR 头 + L2 开销）。
  *
- * 1) **入口弧上还没有"出接口"**。隧道靠 `ip4_fib_table_get_index_for_sw_if_index`
- *    + `ip4_fib_forwarding_lookup` + `adj_get` 反查邻接的 `sw_if_index` 得到，
- *    只认 `IP_LOOKUP_NEXT_MIDCHAIN`（隧道邻接就是 midchain；其它类型一律当"不是
- *    隧道"透传）。这多花一次 mtrie 查表，换的是"内层 DSCP 与隧道同时可得"。
- * 2) **出队回注 `ip4-lookup`**（入口弧的终端），等于让包把原来的路重走一遍；
- *    不碰加密节点、不碰邻接，也就不需要任何"补元数据"的代码。
+ *   4) 逐跳恢复   中转（sr-wg4-transit）与隧道对端解封装（sr-wg4-input）都从
+ *                 action 恢复类别 —— **必须步骤，不是保险**：运营商可能重标记
+ *                 外层 DSCP，端到端权威类别锚在 SR 头 action 3bit 上
+ *                 （UDP 载荷运营商不动）。恢复点重写外层 ToS / 写 qos 元数据。
  *
- * 不要把它挪回 `ip4-output` 弧 —— 那条弧对转发流量是死的，§10.1 有对照实验。
+ * ==================== 队列模型（owner 2026-11-12 拍板，沿用） ====================
  *
- * ==================== 队列模型（owner 2026-11-12 拍板） ====================
+ *   队列 0  LLQ   严格优先，自带速率上限（llq_percent × shaper）
+ *   队列 1        交互
+ *   队列 2        默认
+ *   队列 3        批量（scavenger）
  *
- * 「四个队列够用」+「速率靠配置」+「LLQ 上限给默认值、可配」。
+ * DSCP→类别默认表（owner 2026-11-13 拍板，CLI 可逐项改）：
+ *   EF(46) → 0；AF4x(32..39) → 1；AF3x(24..31) → 2；其余 → 3
+ * 类别→DSCP（封装时写外层 ToS 用）取每类的代表值：0→46，1→34，2→26，3→0。
+ * 往返一致性：外层 DSCP 再过一次 dscp_map 得回同一类别。
  *
- *   队列 0  LLQ     语音与网络控制：EF/CS5/CS6/CS7
- *                   严格优先，但**自带速率上限**（llq_percent × shaper），
- *                   否则一条打满的语音流会把其余三类饿死。
- *   队列 1  交互    CS3/CS4/AF3x/AF4x
- *   队列 2  默认    DF/CS2/AF2x（未标记流量落这里）
- *   队列 3  批量    CS1/AF1x（scavenger，能等）
+ * ==================== 两条安全不变量（沿用） ====================
  *
- * 调度：隧道总速率由 token bucket 卡死（shaper_kbps，来自配置）；
- * 队列 0 先按 LLQ 上限取，剩下的在 1..3 之间按权重做 DRR。
- * 只有 1..3 有「权重」，队列 0 的份额由 llq_percent 决定 —— 这与 Cisco
- * `priority` + `bandwidth percent` 的关系一致：LLQ 是优先且限速，不是按权重分。
- *
- * ==================== 两条安全不变量 ====================
- *
- * 1) shaper_kbps == 0 ⇒ **完全直通**（只计数、不排队、不丢包）。
- *    所以「先把钩子挂上」这个动作永远不会掉流量，限速是显式开的。
- * 2) process 节点没跑起来（proc_ready == 0）⇒ 不入队，直通。
- *    宁可没限速，也不能把包吸进一个没人排空的队列。
- *
- * 注意：本文件不含任何控制面/管理流量的特殊通道 —— 管理走 host-enp0s8/9，
- * 根本不进隧道，也就不过本节点（owner 已确认 LLQ 里没有管理流量）。
+ * 1) shaper_kbps == 0（没 set rate）⇒ 该物理口完全直通，只计数不排队。
+ * 2) process 没跑起来（proc_ready == 0）⇒ 不入队，直通。
+ *    宁可没限速，也不能把包吸进没人排空的队列。
  */
 #ifndef SR_QOS_H
 #define SR_QOS_H
@@ -60,69 +58,94 @@
 extern "C" {
 #endif
 
-#define SR_QOS_ARC      "ip4-unicast"
-#define SR_QOS_NODE     "sr-wg4-qos"
-/* 入口弧的终端节点：出队就往这里送（= 让包重走 ip4-lookup） */
-#define SR_QOS_ARC_END  "ip4-lookup"
+/* ---------- 挂点 ---------- */
+
+/* 标记器：入口弧（内层 DSCP 只在这里可读），按入接口 enable */
+#define SR_QOS_MARK_ARC  "ip4-unicast"
+#define SR_QOS_MARK_NODE "sr-wg4-qos"
+
+/* 出向调度：interface-output 弧（一切封装完成后、进驱动前，每包恰一次），
+ * 按出方向物理口 enable。弧的终点节点是 interface-output-arc-end（容器实测），
+ * 出队重注入目标 = 本 feature 的 next（O3 同款模式，见 sr_qos.c）。 */
+#define SR_QOS_OUT_ARC   "interface-output"
+#define SR_QOS_OUT_NODE  "sr-wg4-qos-out"
+
+/* ---------- 类别 <-> SR 头 action / DSCP ---------- */
 
 #define SR_QOS_N_DSCP 64
+#define SR_QOS_NQ     4
 
-/* 队列数：owner 拍「四个够用」。改这个值要同时改 dscp_map 的默认语义。 */
-#define SR_QOS_NQ 4
+/* 没被标记器碰过的包（本机自发的握手/BFD 等）落批量类，等价 ToS=0 直通 */
+#define SR_QOS_CLASS_UNMARKED 3
 
-/* 默认值（全部可由 CLI 改；速率本身没有默认值 —— 不配就直通） */
-#define SR_QOS_DEF_LLQ_PCT  20 /* LLQ 上限 = shaper 的 20% */
-#define SR_QOS_DEF_DEPTH    128 /* 每队列最多压 128 包 */
-#define SR_QOS_DEF_W1       30 /* 交互 */
-#define SR_QOS_DEF_W2       50 /* 默认 */
-#define SR_QOS_DEF_W3       20 /* 批量 */
+/* 类别存放在 SR 头 action 字节的高 3bit（bit7..5），低 5 位保持 FORWARD=0 */
+#define SR_QOS_ACTION_SHIFT 5
 
-/* DRR：每次 visit 给 weight × QUANTUM 字节的赤字 */
-#define SR_QOS_QUANTUM   1500
-#define SR_QOS_DEFICIT_CAP (4 * SR_QOS_QUANTUM)
-/* drain 的退出闸：小于这个就没必要再试（不是 MTU，避免小包吃不饱） */
-#define SR_QOS_MIN_PKT   64
+/* 每类的代表 DSCP：封装写外层 ToS、中转恢复都用它。
+ * 0→EF 46、1→AF41 34、2→AF31 26、3→DF 0 —— 与默认 dscp_map 往返一致。 */
+static const u8 sr_qos_class_dscp[SR_QOS_NQ] = { 46, 34, 26, 0 };
 
-/* 令牌桶：突发上限 = 速率的 0.5%（5ms），下限两个 MTU */
-#define SR_QOS_BURST_SEC 0.005
-#define SR_QOS_MIN_BURST (2 * 1500)
+always_inline u8
+sr_qos_action_to_class (u8 action)
+{
+  return (action >> SR_QOS_ACTION_SHIFT) & 7;
+}
 
-/* 空闲时的唤醒周期（没有启用整形的隧道就慢下来，别 1ms 空转） */
-#define SR_QOS_TICK     0.001
-#define SR_QOS_IDLE_TICK 0.050
+always_inline u8
+sr_qos_class_to_action (u8 cls)
+{
+  return (u8) ((cls & 7) << SR_QOS_ACTION_SHIFT);
+}
 
-/* 一个**入接口**的分类计数（挂点计数，用来判断"这个口的包有没有被看到"） */
+always_inline u8
+sr_qos_dscp_of_class (u8 cls)
+{
+  return cls < SR_QOS_NQ ? sr_qos_class_dscp[cls] : 0;
+}
+
+/* 标记器写入、其它节点读取的 buffer 元数据（VPP 标准 QoS opaque2 字段） */
+always_inline u8
+sr_qos_class_of_buffer (vlib_buffer_t *b)
+{
+  u8 cls = vnet_buffer2 (b)->qos.bits;
+  return cls < SR_QOS_NQ ? cls : SR_QOS_CLASS_UNMARKED;
+}
+
+/* ---------- 队列参数 ---------- */
+
+#define SR_QOS_DEF_LLQ_PCT  20
+#define SR_QOS_DEF_DEPTH    128
+#define SR_QOS_DEF_W1       30
+#define SR_QOS_DEF_W2       50
+#define SR_QOS_DEF_W3       20
+
+#define SR_QOS_QUANTUM      1500
+#define SR_QOS_DEFICIT_CAP  (4 * SR_QOS_QUANTUM)
+#define SR_QOS_MIN_PKT      64
+
+#define SR_QOS_BURST_SEC    0.005
+#define SR_QOS_MIN_BURST    (2 * 1500)
+
+#define SR_QOS_TICK         0.001
+#define SR_QOS_IDLE_TICK    0.050
+
+/* 一个**入接口**的标记计数（"这个口的包有没有被标记"就看它） */
 typedef struct
 {
   u64 pkts[SR_QOS_N_DSCP]; /* 按内层 DSCP 分桶 */
   u64 bytes[SR_QOS_N_DSCP];
-  u64 total;               /* 该接口进入本节点的总包数 */
-  u64 non_ip;              /* 头部不像 IP4 的包（布局假设被打破的信号） */
-  u64 unclassified;        /* 查表后不是隧道（本机收包/直连路由），正常直通 */
-  /*
-   * 未归隧道的原因分解。真机上"未归隧道"这一个大数字没法定位，按原因拆开：
-   *   0 无（正常） 1 查表无路（无路由/没有 fib） 2 出口不是"配了速率的隧道"
-   *   （直连、WAN 默认路由、隧道没配速率 —— 都属于正常直通）
-   */
-  u64 why[5];
-  /*
-   * 最近一次"未归隧道"时桶 0 的现场：DPO 类型号、load-balance 索引、派发目标
-   * 节点索引。真机上只看计数分不清"是不是类型号没认出来"，把三个号打出来，
-   * 再用 `show sr-wg qos resolve` 对照节点名字，就能判断是判据问题还是配置问题。
-   */
-  u32 last_dpo_type;
-  u32 last_lbi;
-  u32 last_next_node;
+  u64 total;
+  u64 non_ip;              /* 头部不像 IP4（布局假设被打破的信号） */
 } sr_qos_ifc_t;
 
-/* 一条队列：定长环 + 计数。ring 在第一次入队时按 depth 分配。 */
+/* 一条队列：定长环 + 计数（沿用旧实现） */
 typedef struct
 {
-  u32 *ring;  /* vec，长度 = depth（取 2 的幂，热路径用 mask 不用除法） */
+  u32 *ring;
   u32 depth;
-  u32 mask;   /* depth - 1 */
-  u32 head;   /* 环起点 */
-  u32 count;  /* 当前积压包数 */
+  u32 mask;
+  u32 head;
+  u32 count;
   u64 enqueued;
   u64 sent;
   u64 dropped;
@@ -130,7 +153,12 @@ typedef struct
   u64 drop_bytes;
 } sr_qos_queue_t;
 
-/* 一条被整形的隧道 */
+/*
+ * 一个被整形的**出方向物理口**（旧版是隧道，语义换了实现没换）。
+ * drain_next = 出队重注入的绝对节点号 = 本 feature 在弧上的下一个节点
+ * （唯一 feature 时就是 interface-output-arc-end），第一次入队时按运行时
+ * next 表解析一次，防"投给自己"自循环（O3 时代实测踩过的坑）。
+ */
 typedef struct
 {
   u32 sw_if_index;
@@ -138,55 +166,37 @@ typedef struct
   u16 llq_percent;
   u16 pad;
 
-  u32 drain_next; /* 弧上下一节点（= ip4-lookup），入队时缓存 */
-  f64 tokens;     /* 隧道总令牌（字节） */
-  f64 llq_tokens; /* LLQ 自己的令牌桶（字节） */
+  u32 drain_next;
+  f64 tokens;
+  f64 llq_tokens;
   f64 last_refill;
 
-  i32 deficit[SR_QOS_NQ]; /* DRR 赤字，字节 */
+  i32 deficit[SR_QOS_NQ];
   sr_qos_queue_t q[SR_QOS_NQ];
 
   u64 tx_pkts[SR_QOS_NQ];
   u64 tx_bytes[SR_QOS_NQ];
   u64 drop_pkts[SR_QOS_NQ];
-  u32 max_backlog[SR_QOS_NQ]; /* 见过的最大积压，判断深度够不够用 */
-  u64 llq_throttled;          /* LLQ 因上限被压住的次数（不是丢包） */
-} sr_qos_tunnel_t;
+  u32 max_backlog[SR_QOS_NQ];
+  u64 llq_throttled;
+} sr_qos_shaper_t;
 
 typedef struct
 {
-  vlib_main_t *vlib_main; /* init 时存下来：flush 要它才能还缓冲区 */
+  vlib_main_t *vlib_main;
 
-  /* 按 sw_if_index 索引的 vec（稀疏，用 vec_validate 长出来） */
+  /* 标记器：按入接口索引的计数 vec（稀疏） */
   sr_qos_ifc_t *ifs;
-  u64 total_pkts; /* 全插件累计，用来一眼判断"挂上了没" */
+  u64 total_pkts;
   u32 enabled_count;
 
-  /* 隧道状态 */
-  sr_qos_tunnel_t *tunnels; /* pool */
-  u32 *tunnel_by_sw_if;     /* vec：pool index + 1，0 = 没有 */
-  u32 shaped_count;         /* shaper_kbps > 0 的隧道数 */
+  /* 出向调度：按出接口索引的 shaper pool */
+  sr_qos_shaper_t *shapers;   /* pool */
+  u32 *shaper_by_sw_if;       /* vec：pool index + 1，0 = 没有 */
+  u32 shaped_count;
 
-  /*
-   * 隧道判别**不存任何"类型号"**。dpo_type_t / ip_lookup_next_t 是编译期枚举，
-   * 数值随 build 变（CPE4 上同一个桶打出来 type=30 next_node=14，构建镜像里
-   * DPO_ADJACENCY_MIDCHAIN=8、IP_LOOKUP_NEXT_MIDCHAIN=6），拿来做判据线上永远
-   * 不相等。判据只有两个运行时事实：桶的下标在邻接池里活着（adj_is_valid）、
-   * 邻接 rewrite 出来的出接口在我们这张"配过速率的隧道表"里。
-   */
-
-  /*
-   * "目的地址 → 出接口"的缓存：key = (fib_index<<32)|dst.as_u32, value = sw_if_index。
-   *
-   * 这一步走控制面（fib_table_lookup + fib_entry_get_resolving_interface），
-   * 是唯一能穿过 MPLS/SR 栈拿到隧道口的办法，但每包做太重。process 节点每 2 秒
-   * 整体失效一次；路由变化最多 2 秒内自我纠正。
-   */
-  uword *rt_cache;
-  f64 rt_cache_flush;
-
-  /* 全局配置（队列模型本身，不随隧道变） */
-  u8 dscp_map[SR_QOS_N_DSCP];
+  /* 全局配置 */
+  u8 dscp_map[SR_QOS_N_DSCP]; /* DSCP → 队列/类别（CLI 可改） */
   u32 weight[SR_QOS_NQ];
   u32 depth[SR_QOS_NQ];
   u16 llq_percent_default;
@@ -197,23 +207,18 @@ typedef struct
 extern sr_qos_main_t sr_qos_main;
 extern vlib_node_registration_t sr_qos_process_node;
 
-/*
- * 挂/摘本节点在某**入接口**上的 ip4-unicast feature。返回 vnet_feature_enable_disable 的 rv。
- * 语义：<if> 是"包从哪进来"，不是"从哪出去"。隧道由每包的 FIB 查表决定。
- */
+/* 标记器挂/摘（入接口）。旧 CLI `set sr-wg qos-hook` 保留同名。 */
 int sr_qos_hook_enable_disable (u32 sw_if_index, int enable);
-
-/* 该**入接口**当前是否挂着本节点（影子位图，仅在本次 VPP 生命周期内有效） */
 int sr_qos_hook_enabled (u32 sw_if_index);
 
 /*
- * 设置某条隧道的整形速率（kbps）。0 = 关掉整形、回直通并清空积压。
- * 这是**控制面唯一的入口**：不调用它，钩子只计数，永远不掉包。
- * 返回 0 成功；非 0 为 VNET_API_ERROR_*。
+ * 设置某**出方向物理口**的整形速率（kbps，外层字节口径）。
+ * kbps > 0：自动把 sr-wg4-qos-out 挂到该口的 interface-output 弧上；
+ * kbps == 0：摘 feature、清积压、删 shaper（完全直通）。
  */
 int sr_qos_set_rate (u32 sw_if_index, u32 kbps);
 
-/* 设置某条隧道的 LLQ 上限（百分比 1..100）。返回 0 成功，非 0 参数错。 */
+/* 设置某口的 LLQ 上限（百分比 1..100） */
 int sr_qos_set_llq_percent (u32 sw_if_index, u16 pct);
 
 #ifdef __cplusplus

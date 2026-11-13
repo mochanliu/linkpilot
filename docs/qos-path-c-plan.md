@@ -987,8 +987,36 @@ owner 重新明确产品语义：**QoS 做在最终出方向物理口上**。物
 3. 速率口径 = **外层字节直配**（配置值即物理口外层速率，含加密+SR 头开销）；
 4. 逐跳恢复 = **必须**：中转 + 隧道对端 decap（`sr-wg4-input`）都从 action
    恢复，理由见 §13.1 第 4 步（运营商可能重标记外层 DSCP）。
-5. 实施路径（owner 默认同意，未逐条确认）：容器先做"标记 + interface-output
-   物理口调度"原型，lab 通过后换 CPE4；现 O3 版本保留对照，不删。
+5. 实施路径：容器原型已做完并通过（见 §13.4），下一步上 CPE4；
+   O3 版本已打 tag `qos-o3-baseline` 保留对照，不删。
+
+### 13.4 实施结果（2026-11-13 上午，容器双实例 lab PASS）
+
+代码（全部已实现）：
+- `sr_qos.c/h` 重构：标记器（sr-wg4-qos，ip4-unicast，只标记不排队，
+  **FIB 隧道解析模块整体删除**）+ 出向调度器（sr-wg4-qos-out，
+  interface-output 弧，按最外层 DSCP/元数据进 4 队列，shaper 按出方向
+  物理口，`set rate` 自动挂 feature）；默认表 EF→0/AF4x→1/AF3x→2/其余→3。
+- `sr_wg4_encap.c`：action 高 3bit 写类别 + 外层 ToS=代表 DSCP（校验和前）。
+- `sr_wg4_transit.c` Step 9.5 / `sr_wg4_input.c` Step 4.5：从 action 恢复
+  （必须步骤，重断言外层 ToS + 写 qos 元数据）。
+- 出队重注入 = feature 的弧上 next（唯一 feature 时即 interface-output-arc-end，
+  容器实测确认该弧终点节点名）。
+
+lab（`test/lab/vpp-qos/lab-qos-egress.sh`，双 VPP 实例 A/B + linux bridge）：
+- A tap10 标记：dscp46×40→q0、dscp0×190→q3（新默认表 ✔）；
+- A tap11 整形 200kbps：积压峰值 134、LLQ 被上限压 227 次（0 丢包）、
+  q3 tx 222320B ≈ 速率×时长（外层字节口径 ✔）；
+- **外层 ToS 实测写入**（bridge 抓包 tos 0xb8 ×28，= EF 代表值 ✔）；
+- B sr-wg4-input decap 恢复后 **tap13 出向 q0=40 / q3=191** —— 类别经
+  SR 头 action 穿过整条隧道在接收端出向口生效（§13 步骤 4 闭环 ✔）；
+- `rate 0` → feature 摘除、完全直通、ping 正常。
+
+两个 lab 环境坑（与 QoS 无关，记牢）：
+- 双 VPP 实例必须各配独立 `statseg socket-name`（默认抢 /run/vpp/stats.sock）；
+- `wireguard peer add public-key` 必须喂**派生公钥**（`show wireguard
+  interface` 的 public-key 字段），传私钥会握手 Invalid MAC；
+  `wireguard create` 不带 `src` 时握手外层源是垃圾值（ttl 62、src 94.117.0.0）。
 
 ---
 

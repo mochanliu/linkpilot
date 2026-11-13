@@ -95,6 +95,7 @@
  *   node2   → sr-wg4-input 见 seg_left==0 → 剥 SR 头 → wg4-input 解密
  */
 #include "sr_wg.h"
+#include "sr_qos.h"
 
 #include <vnet/udp/udp_packet.h>
 #include <vnet/ip/format.h>
@@ -118,6 +119,7 @@ typedef struct {
   i16 current_data;            /* 封装后 current_data，用于观测 headroom */
   u8  error;
   u8  bypass;
+  u8  qos_cls;                 /* 写进 action/外层 ToS 的 QoS 类别 */
 } sr_wg4_encap_trace_t;
 
 static u8 *
@@ -138,10 +140,12 @@ format_sr_wg4_encap_trace (u8 *s, va_list *args)
                 &t->orig_dst, t->orig_dport, t->error, t->next_index);
   else
     s = format (s, "SR-WG-ENCAP: path_id=%u seg_count=%u seg_left=%u "
-                   "sr_len=%u l2_len=%u src_port=%u endpoint=%U:%u "
+                   "sr_len=%u l2_len=%u src_port=%u qos_cls=%u "
+                   "endpoint=%U:%u "
                    "-> first_hop=%U:%u cd=%d err=%u next=%u",
                 t->path_id, t->seg_count, t->seg_left, t->sr_len, t->l2_len,
-                t->src_port, format_ip4_address, &t->orig_dst, t->orig_dport,
+                t->src_port, t->qos_cls, format_ip4_address,
+                &t->orig_dst, t->orig_dport,
                 format_ip4_address, &t->first_hop_ip, t->first_hop_port,
                 t->current_data, t->error, t->next_index);
   return s;
@@ -262,6 +266,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       u16 orig_dport = 0;
       u16 path_id = 0;
       u8 seg_count = 0, seg_left = 0;
+      u8 qos_cls = SR_QOS_CLASS_UNMARKED; /* 本包的 QoS 类别（Step 7.5 定） */
       u8 error = SR_WG4_ENCAP_ERROR_NONE;
       u8 bypass = 1;   /* 缺省直通：保证 WG 直连模式不受影响 */
 
@@ -388,6 +393,29 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       seg_left = path->relay_count;
       srh.seg_left = seg_left;
 
+      /*
+       * Step 7.5: QoS 类别进 SR 头 action 高 3bit（docs/qos-path-c-plan.md §13）。
+       *
+       * 类别来源：入口标记器（sr-wg4-qos）经 vnet_buffer2(b)->qos 传过来——
+       * 内层头此刻已进密文，encap 自己不可能重新分类，只信标记器；
+       * 没被标记过（QOS_DATA_VALID 没置位，如本机自发的握手/keepalive）落
+       * BULK，等价 ToS=0，行为与未加 QoS 时一致。
+       *
+       * 载体选 action 不选 magic：magic=0x53 被 sr_hdr_validate 和中转校验，
+       * 动不得；action 在 HMAC 排除集（不用重签）、数据路径没人读、
+       * validate 不检查 —— 三重零兼容代价（§12.2 已核）。
+       * 这个字节是端到端权威类别：运营商可能重标记外层 ToS，但不会动我们的
+       * UDP 载荷；中转与对端 decap 都从这里恢复。
+       */
+      {
+        u8 cls = (b->flags & VNET_BUFFER_F_QOS_DATA_VALID)
+                   ? sr_qos_class_of_buffer (b)
+                   : SR_QOS_CLASS_UNMARKED;
+
+        srh.action = SR_ACTION_FORWARD | sr_qos_class_to_action (cls);
+        qos_cls = cls;
+      }
+
       first_hop = &srh.segments[seg_count - 1];
       sr_len = sr_hdr_total_len (seg_count);
 
@@ -433,6 +461,15 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
        * 那对原值），这两次写是等值自写，包内容不变。 */
       clib_memcpy_fast (&ip4->dst_address, first_hop->ip, 4);
       clib_memcpy_fast (&udp->dst_port, first_hop->port, 2);
+
+      /*
+       * Step 11.5: 类别写进最外层 IP ToS（类别代表 DSCP，见 sr_qos.h）。
+       * RFC 3270 pipe 模式：外层 ToS 只服务"本机到下一跳"之间的调度
+       * （含本机出向物理口调度），端到端权威在 action 3bit —— 运营商改了
+       * ToS 也不怕，中转/对端会从 action 重断言。必须写在 Step 13 算校验和
+       * 之前，否则 ToS 改了 checksum 没跟着改，包在下一跳被丢。
+       */
+      ip4->tos = (u8) (sr_qos_dscp_of_class (qos_cls) << 2);
 
       /* Step 12: 长度增加 sr_len */
       ip4->length =
@@ -504,6 +541,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
           tr->current_data = b->current_data;
           tr->error = error;
           tr->bypass = bypass;
+          tr->qos_cls = qos_cls;
           if (!bypass && seg_count)
             {
               clib_memcpy_fast (&tr->first_hop_ip, srh.segments[seg_count - 1].ip,
