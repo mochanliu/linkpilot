@@ -53,10 +53,13 @@
 
   /* ---------- shell ---------- */
   #app{display:grid;grid-template-columns:198px 1fr;min-height:100vh}
-  aside{background:var(--card);border-right:1px solid var(--line);padding:16px 10px;position:sticky;top:0;height:100vh}
+  /* 侧栏改成 flex 列 + 导航自己滚：基础配置拆成 7 个模块后条目多了，短屏上
+     绝对定位的页脚会压在最后两项下面。 */
+  aside{background:var(--card);border-right:1px solid var(--line);padding:16px 10px;position:sticky;top:0;height:100vh;
+    display:flex;flex-direction:column}
   aside .logo{font-weight:500;font-size:15px;letter-spacing:.3px;padding:0 10px 2px}
   aside .logo small{display:block;font-weight:400;color:var(--muted);font-size:11px;letter-spacing:1px}
-  nav{margin-top:14px;display:flex;flex-direction:column;gap:2px}
+  nav{margin-top:14px;display:flex;flex-direction:column;gap:2px;flex:1 1 auto;min-height:0;overflow-y:auto}
   nav a{display:flex;align-items:center;justify-content:space-between;gap:8px;
     padding:7px 10px;border-radius:6px;color:var(--ink);text-decoration:none;font-size:13.5px}
   nav a:hover{background:var(--soft)}
@@ -70,7 +73,7 @@
     padding:7px 10px 7px 22px;border:none;background:none;color:var(--ink);
     border-radius:6px;cursor:pointer}
   nav button.navbtn:hover{background:var(--soft)}
-  aside .foot{position:absolute;bottom:14px;left:10px;right:10px;font-size:12px;color:var(--muted);
+  aside .foot{margin-top:auto;flex:0 0 auto;font-size:12px;color:var(--muted);
     border-top:1px solid var(--line2);padding-top:12px}
   aside .me{font-size:12.5px;line-height:1.4;color:var(--ink);margin-bottom:8px}
   aside .me .who{font-weight:500;word-break:break-all}
@@ -239,6 +242,13 @@
     color:var(--muted);padding:6px 2px;margin:0 14px -1px 0;font-size:13.5px}
   .ltabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:500}
   .ltabs button:hover{background:none;color:var(--ink)}
+  /* 基础配置的 7 个模块：和左侧导航是同一组页面，只是把它们放在页头，
+     省掉"改一个静态路由要回导航再点一次"的来回。外观沿用 ltabs 的下划线。 */
+  .modnav{display:flex;flex-wrap:wrap;gap:2px;border-bottom:1px solid var(--line);margin:0 0 12px}
+  .modnav button{border:none;border-bottom:2px solid transparent;border-radius:0;background:none;
+    color:var(--muted);padding:6px 2px;margin:0 12px -1px 0;font-size:13px}
+  .modnav button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  .modnav button:hover{background:none;color:var(--ink)}
   .subcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px}
   .subhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
   .subhead .sp{color:var(--muted);font-size:12.5px}
@@ -337,7 +347,14 @@
     <div class="logo">LinkPilot<small>SD-WAN CONTROLLER</small></div>
     <nav id="nav">
       <a href="#dashboard" data-view="dashboard">Dashboard</a>
-      <a href="#config" data-view="config" data-roles="tenant">基础配置</a>
+      <div class="sect" data-roles="tenant">基础配置</div>
+      <a class="child" href="#config" data-view="config" data-roles="tenant">设备信息</a>
+      <a class="child" href="#config-ifaces" data-view="config-ifaces" data-roles="tenant">接口配置</a>
+      <a class="child" href="#config-static" data-view="config-static" data-roles="tenant">静态路由</a>
+      <a class="child" href="#config-dynamic" data-view="config-dynamic" data-roles="tenant">动态路由</a>
+      <a class="child" href="#config-nat" data-view="config-nat" data-roles="tenant">NAT</a>
+      <a class="child" href="#config-qos" data-view="config-qos" data-roles="tenant">QoS</a>
+      <a class="child" href="#config-services" data-view="config-services" data-roles="tenant">服务配置（DHCP / DNS）</a>
       <div class="sect" data-roles="tenant">Underlay 配置</div>
       <a class="child" href="#underlay-settings" data-view="underlay-settings" data-roles="tenant">全局配置</a>
       <a class="child" href="#underlay-tunnels" data-view="underlay-tunnels" data-roles="tenant">隧道配置</a>
@@ -347,7 +364,6 @@
       <a class="child" href="#leak-to-sdwan" data-view="leak-to-sdwan" data-roles="tenant">路由泄露 · CPE-SDWAN</a>
       <a class="child" href="#leak-to-cpe" data-view="leak-to-cpe" data-roles="tenant">路由泄露 · SDWAN-CPE</a>
       <a class="child" href="#policy" data-view="policy" data-roles="tenant">SD-WAN 策略</a>
-      <a class="child" href="#services" data-view="services" data-roles="tenant">服务配置（NAT / DHCP / DNS）</a>
       <div class="sect" data-roles="tenant">监控与管理</div>
       <a class="child" href="#monitor" data-view="monitor" data-roles="tenant">监控</a>
       <a class="child" href="#ops" data-view="ops" data-roles="tenant">台账与告警</a>
@@ -726,10 +742,10 @@
           if (S.view === "monitor") loadMetrics();
           if (S.view === "ops") loadOps();
           if (S.view === "diag") loadDiag();
-          // The config page shows published vs applied, so a device report or a
-          // publish must reach it. A dirty draft still wins: reloading would
-          // throw away what the tenant is typing, and "重新载入" is right there.
-          if (S.view === "config" && S.cfg && S.cfg.view && !S.cfg.dirty) loadConfig();
+          // 基础配置组的 5 个草稿页都显示「已发布 vs 设备已装」，设备回报或发布
+          // 必须能到达它们。有未保存改动时重新载入会让位：那等于把租户正在打的
+          // 字冲掉，而「重新载入」就在页头上。
+          if (cfgView(S.view) && S.cfg && S.cfg.view && !S.cfg.dirty) loadConfig();
           // Same for the underlay pages: a device reporting which tunnel version
           // it installed changes the 「隧道下发」 column. loadUnderlay keeps the
           // tenant's unsaved form, so this cannot eat an edit in progress.
@@ -779,8 +795,49 @@
       tenantSub: "你的设备；入网只建立归属。基础参数在「基础配置」、隧道参数在「Underlay 配置」，发布后由设备自己拉取（agent 需 -apply），也可以下载配置包手工安装；站点位置就在下表每行的「站点」列里选"
     },
     config: {
-      title: "基础配置",
-      sub: "只编辑设备的基础配置：主机名、VPN、接口地址、静态路由、BGP/OSPF 开关。保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装。隧道参数在「Underlay 配置」组；路由导入导出属于「Overlay 配置」，那组还没规划好，这里不放入口",
+      title: "设备信息",
+      sub: "这台设备的身份、主机名，以及它跑的是哪一版配置。主机名写进 FRR，只影响盒子自身。" +
+        "保存只写草稿，发布后设备在下一次心跳拉取（agent 需 -apply），也可以下载配置包手工安装。" +
+        "接口、路由、NAT、QoS、服务在左侧「基础配置」下的其他页；隧道参数在「Underlay 配置」组",
+      roles: ["tenant"]
+    },
+    "config-ifaces": {
+      title: "接口配置",
+      sub: "路由实例（VPN）、客户口（地址 / MTU / up-down / lcp），和站点里两台盒子的网关冗余（VRRP）。" +
+        "地址交给 FRR 配在内核 TAP 上、由 linux-nl 同步进 VPP；VPP 只管 table、MTU、开关和 lcp",
+      roles: ["tenant"]
+    },
+    "config-static": {
+      title: "静态路由",
+      sub: "写进 FRR 的静态路由，由 zebra 装进内核表，linux-nl 同步进对应 VPN 的 VPP table。" +
+        "同一前缀多行、下一跳不同、各带 weight = 不等价负载均衡（UCMP）",
+      roles: ["tenant"]
+    },
+    "config-dynamic": {
+      title: "动态路由",
+      sub: "和客户侧谁建会话：BGP（eBGP 必须直连，iBGP 要能递归到邻居）与 OSPF（每个 VPN 一个实例）。" +
+        "学到的前缀进不进 overlay、怎么打 tag，是「Overlay 配置」那组的事，不在这里",
+      roles: ["tenant"]
+    },
+    "config-qos": {
+      title: "QoS",
+      sub: "出方向物理口调度：入口按内层 DSCP 打 3bit 类别，类别随 SR 头端到端传递；" +
+        "出方向按最外层 DSCP 进 4 队列（LLQ + DRR + 令牌桶 + 尾丢）。速率是外层字节口径" +
+        "（含加密与 SR 头，约为内层的 1.06 倍）；仅对 sr_wg 插件 ≥ 1.1.0 的盒子生效",
+      roles: ["tenant"]
+    },
+    "config-nat": {
+      title: "NAT",
+      sub: "一行 = 一条 NAT 出口：客户口（VPN 内）的流量经出口口出去，源地址翻译成地址池里的地址。" +
+        "池是显式配置的，地址要能收到回程流量；出口口自己的地址不能进池（管理面会失联）。" +
+        "行挂在基础配置的客户口上，地址与掩码在发布时解出来冻进配置包",
+      roles: ["tenant"]
+    },
+    "config-services": {
+      title: "服务配置",
+      sub: "DHCP server 给客户口子网发地址，DNS 转发器听客户口地址的 53/udp 并转发到上游。" +
+        "行都挂在基础配置的客户口（VPP 名）上，地址、掩码、内核 TAP 名在发布时解出来冻进配置包第 8 段，" +
+        "由盒子上的 sr-svc 用户态进程执行。NAT 在「基础配置 › NAT」页",
       roles: ["tenant"]
     },
     monitor: {
@@ -840,15 +897,6 @@
         "表里的路径由 sr-fib 按隧道与 BFD 状态自己收敛 —— 链路抖动不用改策略。" +
         "行号就是匹配顺序，前面的先命中；入口口不用选，一行挂到它所属 VPN 的全部客户口上。" +
         "兜底是每 VRF 每颜色一个开关：勾上 = 该颜色查不到时退到颜色 0（本 VPN 主表）而不是丢掉。" +
-        "保存只写草稿，发布走和「基础配置」同一条路径",
-      roles: ["tenant"]
-    },
-    services: {
-      title: "服务配置 · NAT / DHCP / DNS",
-      sub: "一行 = 一条服务：NAT 出口把客户口的流量翻译到地址池地址，DHCP server 给客户口子网发地址，" +
-        "DNS 转发器听客户口地址的 53。行都挂在基础配置里的客户口（VPP 名）上，" +
-        "地址、掩码、内核 TAP 名在发布时解出来冻进配置包。DHCP/DNS 由盒子上的 sr-svc 用户态进程执行，" +
-        "NAT 行因 VPP 26.06 NAT44 插件的数据面缺陷暂不下发（页面上会标明）。" +
         "保存只写草稿，发布走和「基础配置」同一条路径",
       roles: ["tenant"]
     }
@@ -916,6 +964,12 @@
       else if (S.view === "enroll") c = viewEnroll(st, isOp);
       else if (S.view === "nodes") c = viewNodes(st, isOp);
       else if (S.view === "config") c = viewConfig(st);
+      else if (S.view === "config-ifaces") c = viewConfigIfaces(st);
+      else if (S.view === "config-static") c = viewConfigStatic(st);
+      else if (S.view === "config-dynamic") c = viewConfigDynamic(st);
+      else if (S.view === "config-qos") c = viewConfigQos(st);
+      else if (S.view === "config-nat") c = viewConfigNAT();
+      else if (S.view === "config-services") c = viewConfigServices();
       else if (S.view === "underlay-settings") c = viewUnderlaySettings();
       else if (S.view === "underlay-tunnels") c = viewUnderlayTunnels();
       else if (S.view === "underlay-topology") c = viewUnderlayTopology();
@@ -924,7 +978,6 @@
       else if (S.view === "leak-to-sdwan") c = viewLeakToSDWAN();
       else if (S.view === "leak-to-cpe") c = viewLeakToCPE();
       else if (S.view === "policy") c = viewPolicy();
-      else if (S.view === "services") c = viewServices();
       else if (S.view === "monitor") c = viewMonitor();
       else if (S.view === "ops") c = viewOps();
       else if (S.view === "diag") c = viewDiag();
@@ -2019,7 +2072,43 @@
     if (m) m.innerHTML = cfgMetaText(cs) + cfgDirtyMark(cs);
   }
 
-  function viewConfig(st) {
+  // 基础配置按"要改什么"分成 7 个模块，但数据模型没有跟着拆：5 个页面编辑的是
+  // 同一份 BasicConfig 草稿（S.cfg），NAT 与 服务配置编辑的是同一份服务面
+  // （S.sv）。分组只改变"从哪儿进去"，保存与发布仍是整份提交——把模型也拆成
+  // 7 份会让"发布"要凑齐 7 个版本号，那才是真正的事故源。
+  var CFG_MODULES = [
+    ["config", "设备信息"],
+    ["config-ifaces", "接口配置"],
+    ["config-static", "静态路由"],
+    ["config-dynamic", "动态路由"],
+    ["config-nat", "NAT"],
+    ["config-qos", "QoS"],
+    ["config-services", "服务配置"]
+  ];
+
+  // 由 /api/config（设备草稿）驱动的 5 页。
+  function cfgView(v) {
+    return v === "config" || v === "config-ifaces" || v === "config-static" ||
+      v === "config-dynamic" || v === "config-qos";
+  }
+  // 由 /api/services（NAT / DHCP / DNS 行）驱动的 2 页，共用 S.sv 与它的设备选择。
+  function svcView(v) { return v === "config-nat" || v === "config-services"; }
+  function baseView(v) { return cfgView(v) || svcView(v); }
+
+  // 页内的模块切换条。和左侧导航是同一组入口，放在页头只是为了少走一趟导航，
+  // 不是第二套路由——点击仍然走 data-act="goto"。
+  function cfgModules(cur) {
+    return '<div class="modnav" role="tablist" aria-label="基础配置模块">' + CFG_MODULES.map(function (m) {
+      var on = m[0] === cur;
+      return '<button type="button" role="tab" aria-selected="' + (on ? "true" : "false") +
+        '" class="' + (on ? "on" : "") + '" data-act="goto" data-view="' + m[0] + '">' +
+        esc(m[1]) + "</button>";
+    }).join("") + "</div>";
+  }
+
+  // 5 个草稿页共用的页头（设备选择 + 动作 + 模块条）。返回的字符串已经包含
+  // 空状态：没有设备、草稿还没读到，都由这里统一说话。
+  function viewConfigPage(st, view, body) {
     var pas = cfgPreAuths();
     if (!st.nodes.length && !pas.length) {
       return '<section class="panel"><div class="empty">还没有设备，也还没有预授权。' +
@@ -2031,19 +2120,50 @@
       openConfig();
       return '<section class="panel"><div class="empty">正在读取配置…</div></section>';
     }
-    var h = cfgBar(st, cs);
+    var h = cfgBar(st, cs, view);
     if (cs.note) h += cfgNote(cs.note);
-    h += cfgDeliveryPanel(cs);
     if (!cs.view) {
       return h + '<section class="panel"><div class="empty">' +
         (cs.loading ? "正在读取配置…" : "还没有读到配置。") + "</div></section>";
     }
-    // 版本历史 / diff / 回滚是设备才有的（预授权没有发布过任何东西）。
-    if (!cfgIsPA(cs) && cs.nodeID) h += cfgVersionsPanel(cs);
-    return h + cfgBase(cs);
+    return h + body(cs);
   }
 
-  function cfgBar(st, cs) {
+  // 设备信息 = 这台是谁 + 它跑的是哪一版 + 校验与产物。跨模块的东西都留在这里，
+  // 其余 6 页只管自己那一段行。
+  function viewConfig(st) {
+    return viewConfigPage(st, "config", function (cs) {
+      var h = cfgDevicePanel(cs);
+      h += cfgDeliveryPanel(cs);
+      // 版本历史 / diff / 回滚是设备才有的（预授权没有发布过任何东西）。
+      if (!cfgIsPA(cs) && cs.nodeID) h += cfgVersionsPanel(cs);
+      h += cfgChecksPanel(cs);
+      h += cfgArtifactsPanel(cs);
+      h += cfgBundlePanel(cs);
+      return h;
+    });
+  }
+
+  // 路由实例与客户口是一体的：口必须属于某张表，VRRP 又挂在口上，所以三块同页。
+  function viewConfigIfaces(st) {
+    return viewConfigPage(st, "config-ifaces", function (cs) {
+      return cfgVPNPanel(cs.draft) + cfgIfacePanel(cs, cs.draft) + cfgVRRPPanel(cs, cs.draft);
+    });
+  }
+
+  function viewConfigStatic(st) {
+    return viewConfigPage(st, "config-static", function (cs) { return cfgStaticPanel(cs.draft); });
+  }
+
+  function viewConfigDynamic(st) {
+    return viewConfigPage(st, "config-dynamic", function (cs) { return cfgDynamicPanel(cs, cs.draft); });
+  }
+
+  function viewConfigQos(st) {
+    return viewConfigPage(st, "config-qos", function (cs) { return cfgQosPanel(cs.draft); });
+  }
+
+  function cfgBar(st, cs, view) {
     var items = dpNodeItems(st.nodes).concat(dpPreAuthItems(cfgPreAuths()));
     var acts = '<button class="small" data-act="cfg-reload">重新载入</button>' +
       '<button class="small" data-act="cfg-save">保存草稿</button>';
@@ -2052,18 +2172,24 @@
       acts += '<button class="small" data-act="cfg-bundle">下载配置包</button>' +
         '<button class="small primary" data-act="cfg-publish">发布到设备</button>';
     }
+    // 长说明只在设备信息页出现一次：7 个页面重复同一段话，读到第三页就没人看了。
+    var hint;
+    if (cfgIsPA(cs)) {
+      hint = "这台设备还没有入网：保存只写控制器的草稿，没有「发布」也没有配置包，因为接收方还不存在。现场工程师用 <code>sr-agent --preauth 「这台设备的索引」</code> 认领它之后，这份草稿会原样挪到它的 node 上（版本不变），那时候才能发布。";
+    } else if (view === "config") {
+      hint = "保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在 -apply 模式下于下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。";
+    } else {
+      hint = "这一页改的是同一份草稿：保存只写控制器，发布后设备在下一次心跳拉取。设备在线与否不拦保存，但只有发布过的版本会被安装。";
+    }
     return '<section class="panel">' +
+      cfgModules(view) +
       '<div class="cfg-bar haspick">' +
       dpHtml("cfg-node", "", items, cfgTarget(cs)) +
       '<div class="cfg-side">' +
       '<span class="muted" style="font-size:12.5px" id="cfg-meta">' + cfgMetaText(cs) + cfgDirtyMark(cs) + "</span>" +
       '<div>' + acts + "</div>" +
       "</div></div>" +
-      '<div class="hint" style="margin:0">' +
-      (cfgIsPA(cs)
-        ? "这台设备还没有入网：保存只写控制器的草稿，没有「发布」也没有配置包，因为接收方还不存在。现场工程师用 <code>sr-agent --preauth 「这台设备的索引」</code> 认领它之后，这份草稿会原样挪到它的 node 上（版本不变），那时候才能发布。"
-        : "保存只写控制器的草稿；「发布到设备」把已保存的草稿固化成目标版本，设备在 -apply 模式下于下一次心跳拉取并安装。也可以下载配置包，在设备上执行 <code>sr-apply apply --bundle &lt;文件&gt;</code> 手工安装。") +
-      "VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 被 overlay 占用。</div>" +
+      '<div class="hint" style="margin:0">' + hint + "</div>" +
       "</section>";
   }
 
@@ -2169,21 +2295,6 @@
       "</section>";
   }
 
-  function cfgBase(cs) {
-    var cfg = cs.draft;
-    var h = cfgHostPanel(cfg);
-    h += cfgVPNPanel(cfg);
-    h += cfgIfacePanel(cs, cfg);
-    h += cfgVRRPPanel(cs, cfg);
-    h += cfgStaticPanel(cfg);
-    h += cfgQosPanel(cfg);
-    h += cfgDynamicPanel(cs, cfg);
-    h += cfgChecksPanel(cs);
-    h += cfgArtifactsPanel(cs);
-    h += cfgBundlePanel(cs);
-    return h;
-  }
-
   /* ---------------- 版本历史 / diff / 回滚 ---------------- */
 
   // loadVersions 拉这台设备的版本清单。进页、发布、回滚后各拉一次，不进 5s
@@ -2285,12 +2396,33 @@
     return h;
   }
 
-  function cfgHostPanel(cfg) {
-    return '<section class="panel"><header><h2>主机名</h2></header>' +
+  // 设备信息页的头：这台是谁 + 主机名。主机名是这一页唯一可改的东西，所以它紧跟
+  // 在身份后面 —— 分成"身份卡"和"主机名卡"两张只会让可改的那一行更难找。
+  function cfgDevicePanel(cs) {
+    var v = cs.view || {};
+    var n = null;
+    ((S.state && S.state.nodes) || []).forEach(function (x) {
+      if (!cfgIsPA(cs) && x.node_id === cs.nodeID) n = x;
+    });
+    var facts = [];
+    facts.push('<span class="mono">' + (cfgIsPA(cs) ? "预授权 " + esc(cs.pa || "") : "node-" + esc(cs.nodeID)) + "</span>");
+    if (v.serial) facts.push("序列号 <span class=\"mono\">" + esc(v.serial) + "</span>");
+    // 站点（经纬度）归「资产 › 设备」页管：这里只说它有没有放过位置，免得租户
+    // 在基础配置里找一个永远不会出现的输入框。状态只在页头出现一次。
+    if (n) {
+      facts.push(n.runtime && n.runtime.site_id
+        ? "站点已设置"
+        : '<span class="muted">还没有站点位置</span> <button class="small" data-act="goto" data-view="nodes">去设备页选站点</button>');
+    }
+    return '<section class="panel"><header><h2>设备与主机名</h2>' +
+      (n && n.status ? statusTag(n.status) : "") + "</header>" +
+      '<div class="hint" style="margin:0 0 10px">' + facts.join(" · ") + "</div>" +
       '<div class="fields"><div class="field"><label for="cfg-hostname">hostname</label>' +
-      '<input id="cfg-hostname" data-cfg="hostname" value="' + esc(cfg.hostname) +
+      '<input id="cfg-hostname" data-cfg="hostname" value="' + esc(cs.draft.hostname) +
       '" placeholder="如 cpe-sh-01" spellcheck="false" maxlength="63"></div></div>' +
-      '<div class="hint" style="margin:10px 0 0">写进 FRR 的 hostname；只影响盒子自身，不参与转发。</div></section>';
+      '<div class="hint" style="margin:10px 0 0">写进 FRR 的 <code>hostname</code>，只影响盒子自身，不参与转发。' +
+      "允许字母、数字、连字符，长度 1–63；留空会按默认主机名显示（校验里给警告，不拦保存）。</div>" +
+      "</section>";
   }
 
   function cfgVPNPanel(cfg) {
@@ -2311,8 +2443,9 @@
           : '<button class="small danger" data-act="cfg-vpn-del" data-id="' + esc(v.id) + '">删除</button>') +
         "</td></tr>";
     }).join("");
-    return '<section class="panel"><header><h2>VPN / 路由实例</h2></header>' +
-      '<div class="hint">每增加一个 VPN，就多一张独立的转发表和一套 BGP/OSPF；客户口与静态路由按 VPN 归属。</div>' +
+    return '<section class="panel"><header><h2>路由实例（VPN）</h2></header>' +
+      '<div class="hint">VPN ID 就是这张转发表在 VPP 里的 table 号，VPN 0 是默认表；250 被 overlay 占用。' +
+      "每增加一个 VPN，就多一张独立的转发表和一套 BGP/OSPF；客户口与静态路由按 VPN 归属。</div>" +
       "<table><thead><tr><th>VPN ID</th><th>名称</th><th>客户口</th><th>静态路由</th><th>说明</th><th></th></tr></thead><tbody>" +
       rows + "</tbody></table>" +
       '<div class="addrow">' +
@@ -8197,11 +8330,16 @@
     r[f] = el.value;
   }
 
-  /* ---------------- 服务配置：NAT 出口 / DHCP server / DNS 转发器 ---------------- */
+  /* ---------------- 服务面：NAT 出口 / DHCP server / DNS 转发器 ---------------- */
   //
   // 和策略页同一套交互骨架：按设备读、整份草稿、整份保存、发布走 /api/config/publish。
   // 行的挂点是基础配置里的客户口（VPP 名），所以 VPN 不让手填 —— 选了口就从口的
   // VPN 带出来，"VPN 与客户口不一致"这类校验错误根本没机会产生。
+  //
+  // 分成两页（基础配置 › NAT、基础配置 › 服务配置）但**共用一份服务面**：
+  // NAT 行与 DHCP/DNS 行在服务端是同一个 ServicesSet、同一个 PUT，拆成两个
+  // 请求会把对方那份一起写掉。页面分开只是让人按"我要配 NAT 还是 DHCP"找入口；
+  // 保存仍然提交整份 —— 所以两页拿的必须是同一个 doc、同一台设备。
   //
   // 输入框的 input 只写 S.sv.draft 不重画（重画弹光标）；结构性动作（加行/删行/
   // 换设备/保存后刷新）才走 render()。校验是服务端算的，只反映已保存那一版。
@@ -8217,11 +8355,30 @@
     return ((S.state && S.state.nodes) || []).slice().sort(function (a, b) { return a.node_id - b.node_id; });
   }
 
+  // 基础配置组共用一台"当前设备"：S.cfg 是权威（那 5 页的草稿按设备存），
+  // 服务面跟着它走。不这样的话，在 NAT 页切了设备、回到接口配置还是上一台，
+  // 两份草稿会各说各的设备。
+  function svFollowCfg() {
+    var o = svStore();
+    var cs = S.cfg;
+    if (!cs || cfgIsPA(cs) || !cs.nodeID) return false;
+    if (o.node === cs.nodeID) return true;
+    o.node = cs.nodeID;
+    o.doc = null;
+    o.draft = null;
+    o.mismatch = false;
+    o.note = null;
+    return true;
+  }
+
   function ensureServices() {
     var o = svStore();
     if (!svRole()) return o;
-    var ns = svNodes();
-    if (!o.node && ns.length) o.node = ns[0].node_id;
+    if (!svFollowCfg()) {
+      // 没有 S.cfg（还没进过基础配置）时退回到"第一台设备"，与旧行为一致。
+      var ns = svNodes();
+      if (!o.node && ns.length) o.node = ns[0].node_id;
+    }
     if (o.node && o.doc && o.doc.node_id !== o.node) { o.doc = null; o.draft = null; }
     // 与策略页同一个护栏：node 对不上时清 doc 重拉是个微任务死环（见 ensurePolicy）。
     if (o.node && !o.loading && !o.mismatch && (!o.doc || nowSec() - o.at >= 10)) svLoad(false);
@@ -8320,25 +8477,32 @@
     return h;
   }
 
-  function viewServices() {
+  // NAT 与 服务配置两页共用的外壳：模块条 → 角色/设备/doc 的三种空状态。
+  // 空状态也带模块条，否则"这一页没东西可配"会让人连换一页的入口都没有。
+  function svcShell(view) {
+    var head = '<div id="sv-root">' + cfgModules(view);
     var o = ensureServices();
-    if (!svRole()) return '<section class="panel"><div class="empty">只有租户账号能配置服务。</div></section>';
+    if (!svRole()) return { html: head + '<section class="panel"><div class="empty">只有租户账号能配置服务。</div></section></div>' };
+    if (S.cfg && cfgIsPA(S.cfg)) {
+      return { html: head + '<section class="panel"><div class="empty">这台设备还没有入网（预授权）：' +
+        "NAT / DHCP / DNS 都要挂在客户口上，入网之后才有口可挂。把页头的目标切到一台已入网的设备再回来。</div></section></div>" };
+    }
     var ns = svNodes();
-    if (!ns.length) {
-      return '<section class="panel"><div class="empty">这个租户还没有设备：先入网一台，服务才有地方落。</div></section>';
-    }
+    if (!ns.length) return { html: head + '<section class="panel"><div class="empty">这个租户还没有设备：先入网一台，服务才有地方落。</div></section></div>' };
     if (!o.doc || o.doc.node_id !== o.node) {
-      return '<section class="panel"><div class="empty">' +
-        esc(o.note ? o.note.text : "正在读取服务配置…") + "</div></section>";
+      return { html: head + '<section class="panel"><div class="empty">' +
+        esc(o.note ? o.note.text : "正在读取服务配置…") + "</div></section></div>" };
     }
-    var doc = o.doc, d = o.draft, dirty = svDirty(o);
-    var h = '<div id="sv-root">';
-    if (o.note) h += undNote(o.note);
+    return { head: head, o: o, doc: o.doc, d: o.draft, dirty: svDirty(o) };
+  }
 
-    /* --- 顶栏：选设备 + 版本 + 两个按钮 --- */
-    h += '<section class="panel"><header><h2>设备</h2></header><div class="pl-bar">' +
+  // 顶栏：选设备 + 版本 + 保存/发布。设备列表与「设备信息」页是同一个选择
+  // （见 svFollowCfg）：在这里换设备，基础配置那 5 页跟着换。
+  function svBar(p) {
+    var o = p.o, doc = p.doc;
+    return '<section class="panel"><div class="pl-bar">' +
       '<div class="field"><label for="sv-node">设备</label><select id="sv-node" data-sv-node>' +
-      ns.map(function (n) {
+      svNodes().map(function (n) {
         return '<option value="' + n.node_id + '"' + (n.node_id === o.node ? " selected" : "") + ">" +
           esc("node-" + n.node_id + " · " + n.serial) + "</option>";
       }).join("") + "</select></div>" +
@@ -8350,16 +8514,44 @@
       '<button class="primary" type="button" data-sv="save"' + (o.busy ? " disabled" : "") + ">保存草稿</button>" +
       '<button type="button" data-sv="publish"' + (o.busy ? " disabled" : "") + ">发布到设备</button>" +
       "</div></div>" +
-      (dirty ? '<div class="hint"><span class="tag plan">页面上的改动还没保存</span></div>' : "") +
+      (p.dirty ? '<div class="hint"><span class="tag plan">页面上的改动还没保存</span></div>' : "") +
       "</section>";
+  }
 
-    /* --- NAT 暂不下发的说明 --- */
-    if (doc.nat_pending) {
-      h += '<section class="panel"><header><h2>NAT 暂不下发</h2></header>' +
-        '<div class="hint">' + esc(doc.nat_pending) + "</div></section>";
+  // 校验面板：NAT 与 DHCP/DNS 是同一份服务面、同一批校验，两页各显示一次
+  // （改 NAT 时也要能看见 DHCP 的错误，它们一起挡住发布）。
+  function svChecks(doc, dirty) {
+    return '<section class="panel"><header><h2>校验</h2></header>' +
+      (dirty ? '<div class="hint">下面是<b>已保存那一版</b>的校验结果。改动保存后会重新校验 —— ' +
+        "没保存的改动在这一页上不受校验约束。</div>" : "") +
+      (doc.checks && doc.checks.length
+        ? '<ul class="chk-list">' + doc.checks.map(undCheckRow).join("") + "</ul>"
+        : '<div class="empty">没有校验结果。</div>') + "</section>";
+  }
+
+  function svPublishNote(doc) {
+    return '<section class="panel"><header><h2>这些行怎么走到设备</h2></header><div class="hint">' +
+      esc(doc.notes.publish) + " 发布走 <code>POST /api/config/publish</code>（和基础配置同一条路径），" +
+      "设备在下一次心跳（≤" + esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
+      " 秒）拉取。DHCP/DNS 与 NAT 行在服务端是同一份服务面：这一页保存时提交的是整份，" +
+      "所以 NAT 页上的改动也会一起写进去（反过来也一样）。</div></section>";
+  }
+
+  function viewConfigNAT() {
+    var p = svcShell("config-nat");
+    if (p.html) return p.html;
+    var doc = p.doc, d = p.d;
+    var h = p.head;
+    if (p.o.note) h += undNote(p.o.note);
+    h += svBar(p);
+    // NAT 行会被渲染进配置包，但盒子的 applier 在 26.06 的 nat44 缺陷落定前
+    // 只记录、不下发。这条事实必须挂在 NAT 页上——旧页面检查的是 doc.nat_pending
+    // 这个从来不存在于 view 里的字段，等于没显示过。
+    if (doc.notes && doc.notes.nat_pending) {
+      h += '<section class="panel"><header><h2>NAT 暂不下发</h2>' +
+        '<span class="tag stale">已渲染 · 未安装</span></header>' +
+        '<div class="hint">' + esc(doc.notes.nat_pending) + "</div></section>";
     }
-
-    /* --- NAT 出口 --- */
     h += '<section class="panel"><header><h2>NAT 出口</h2>' +
       '<div class="row-actions"><button class="small" type="button" data-sv="nat-add">加一行</button></div></header>' +
       '<div class="hint">' + esc(doc.notes.nat) + "</div>";
@@ -8372,6 +8564,20 @@
         "</tbody></table>";
     }
     h += "</section>";
+    h += svChecks(doc, p.dirty);
+    h += '<section class="panel"><div class="meta" style="margin:0">' +
+      '<span class="muted" style="font-size:12.5px">DHCP server 与 DNS 转发器在「基础配置 › 服务配置」页；第 8 段原文也在那边。</span>' +
+      '<button class="small" data-act="goto" data-view="config-services">去服务配置</button></div></section>';
+    return h + "</div>";
+  }
+
+  function viewConfigServices() {
+    var p = svcShell("config-services");
+    if (p.html) return p.html;
+    var doc = p.doc, d = p.d;
+    var h = p.head;
+    if (p.o.note) h += undNote(p.o.note);
+    h += svBar(p);
 
     /* --- DHCP server --- */
     h += '<section class="panel"><header><h2>DHCP server</h2>' +
@@ -8401,24 +8607,16 @@
     }
     h += "</section>";
 
-    /* --- 校验 --- */
-    h += '<section class="panel"><header><h2>校验</h2></header>' +
-      (dirty ? '<div class="hint">下面是<b>已保存那一版</b>的校验结果。改动保存后会重新校验 —— ' +
-        "没保存的改动在这一页上不受校验约束。</div>" : "") +
-      (doc.checks && doc.checks.length
-        ? '<ul class="chk-list">' + doc.checks.map(undCheckRow).join("") + "</ul>"
-        : '<div class="empty">没有校验结果。</div>') + "</section>";
+    h += svChecks(doc, p.dirty);
 
     /* --- 第 8 段原文 --- */
     h += '<section class="panel"><header><h2>下发内容（配置包第 8 段）</h2></header>' +
       '<div class="hint">这一段是设备真正读的东西：客户口在发布时解出地址/掩码和内核 TAP 名冻进段里，' +
-      "盒子上的 sr-svc 进程读它起 DHCP/DNS 监听（配置改动由 sr-apply 发 SIGHUP 重载，租约不丢）。</div>" +
+      "盒子上的 sr-svc 进程读它起 DHCP/DNS 监听（配置改动由 sr-apply 发 SIGHUP 重载，租约不丢）。" +
+      "NAT 行也在同一段里，但盒子在 26.06 的 nat44 缺陷落定前只记录、不下发。</div>" +
       '<pre class="cmd">' + esc(doc.artifact || "(空)") + "</pre></section>";
 
-    h += '<section class="panel"><header><h2>这一页与发布的关系</h2></header><div class="hint">' +
-      esc(doc.notes.publish) + " 发布走 <code>POST /api/config/publish</code>（和「基础配置」同一条路径），" +
-      "设备在下一次心跳（≤" + esc((S.state && S.state.controller && S.state.controller.heartbeat_sec) || 30) +
-      " 秒）拉取。</div></section>";
+    h += svPublishNote(doc);
     return h + "</div>";
   }
 
@@ -8556,7 +8754,15 @@
     if (!el || !el.getAttribute) return;
     var o = svStore();
     if (el.getAttribute("data-sv-node") != null) {
-      o.node = Number(el.value);
+      var want = Number(el.value) || 0;
+      // 基础配置组共用一台"当前设备"：在这里换设备要连那 5 页的草稿一起换，
+      // 否则 NAT 页改的是 node-3、接口页改的还是 node-1。selectCfgTarget 会先
+      // 问"要不要丢掉未保存的改动"，用户取消就什么都不切。
+      if (S.cfg && (S.cfg.pa || S.cfg.nodeID !== want)) {
+        selectCfgTarget(String(want));
+        if (S.cfg.pa || S.cfg.nodeID !== want) return;
+      }
+      o.node = want;
       o.doc = null;
       o.draft = null;
       o.note = null;
@@ -9190,7 +9396,7 @@
         else if (act === "goto") {
           if (S.view === "enroll") S.codeReveal = null;
           S.view = el.getAttribute("data-view");
-          if (S.view === "config") openConfig();
+          if (baseView(S.view)) openConfig();
           render();
         }
         else if (act === "copy") copyText(el.getAttribute("data-text"));
@@ -9517,7 +9723,9 @@
         // 一次性码只在该页面上保留；离开就等于放弃这次查看，要回看只能重新生成。
         if (S.view === "enroll" && v !== "enroll") S.codeReveal = null;
         S.view = v;
-        if (v === "config") openConfig();
+        // 基础配置组 7 页共用一个草稿、一台当前设备：进组就把它读起来（已经读过
+        // 且有未保存改动时 openConfig 自己会让位，不会覆盖输入）。
+        if (baseView(v)) openConfig();
         render();
       };
     });

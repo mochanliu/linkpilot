@@ -63,7 +63,7 @@ func (s *server) servicesViewLocked(tenantID string, nodeID uint16, now int64) (
 		Checks:   []ConfigCheck{},
 		Notes: map[string]string{
 			"nat": "一行 = 一条 NAT 出口：客户口(VPN 内)的流量经出口口出去，源地址翻译成" +
-				"地址池里的地址。池是**显式配置**的——要用出口口自己的地址就把那个地址写进池里；" +
+				"地址池里的地址。池是显式配置的——要用出口口自己的地址就把那个地址写进池里；" +
 				"池里的地址必须能收到回程流量，否则翻译出去就回不来。",
 			"dhcp": "一行 = 一台 DHCP server，绑定客户口自己的地址。可分配池必须落在客户口" +
 				"子网内且不能包含口本身的地址；网关与 DNS 留空 = 用客户口地址（DNS 即本机转发器）。",

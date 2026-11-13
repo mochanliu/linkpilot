@@ -74,6 +74,30 @@ CPE1 重启 VPP 后按 sr-box 清单自愈（lcp pair 重建、地址回位、sr
 导航上建议：`基础配置` 从"一个叶子"变成"一个分组"，子项 = 上面 8 个模块 + `发布与版本`。
 这样以后加"QoS 策略"（owner 已定的位置在 SD-WAN 策略下）不会再把某一页撑爆。
 
+### 2.1 落地（2026-11-13，owner 定的最终模块表）
+
+实际拆成 **7 个模块**，以 owner 这一轮给的清单为准（与上面这张草表的差别：概览改名
+「设备信息」并合并了发布与版本；NAT 与 DHCP/DNS 拆成两页但**共用一份服务面**；
+QoS 从 SD-WAN 策略挪过来独立成页；DIA 与静态端口映射还没做）：
+
+| 导航项（`data-view`） | 内容 | 后端 |
+|---|---|---|
+| 设备信息（`config`） | 设备身份、hostname、下发到设备、版本历史/diff/回滚、校验、配置包内容 | `/api/config` |
+| 接口配置（`config-ifaces`） | 路由实例（VPN）、客户口、VRRP | `/api/config` |
+| 静态路由（`config-static`） | 静态路由（含 UCMP weight） | `/api/config` |
+| 动态路由（`config-dynamic`） | BGP / OSPF（按 VPN） | `/api/config` |
+| NAT（`config-nat`） | NAT 出口行 + 暂不下发说明 | `/api/services` |
+| QoS（`config-qos`） | 物理口出方向调度 | `/api/config` |
+| 服务配置（`config-services`） | DHCP server、DNS 转发器、第 8 段原文 | `/api/services` |
+
+两条不允许破的约束：
+
+1. **模型不跟着拆**。5 个页面编辑同一份 `BasicConfig` 草稿、保存时提交整份；
+   NAT 与服务配置共用同一个 `ServicesSet`，服务端只有一次 `PUT /api/services`
+   —— 拆成两个 doc 会把对方的行写空。
+2. **一台当前设备**。`S.cfg` 是权威，服务面跟着它走（`svFollowCfg`）。否则在
+   NAT 页换了设备、回到接口配置还是上一台。
+
 ---
 
 ## 3. 数据模型（字段级，`controller/cmd/sr-ctrl/config.go`）
