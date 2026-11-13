@@ -340,3 +340,24 @@ func TestFIBValidation(t *testing.T) {
 		}
 	}
 }
+
+// weight 在 fib_path 里的偏移是 12（sw_if_index 0-3, table_id 4-7, rpf_id 8-11,
+// weight 12, preference 13）。这里锁三件事：缺省写 1（ECMP）、显式值原样写、
+// 读回取原值（readFIBPath 不做 0→1 归一，读到 1 就说明 VPP 收的是 1）。
+func TestFIBPathWeightEncoding(t *testing.T) {
+	b := appendFIBPath(nil, FIBPath{SWIfIndex: 7, NextHop: netip.MustParseAddr("10.0.0.1")})
+	if b[12] != 1 {
+		t.Errorf("缺省 weight 应写 1（ECMP），得到 %d", b[12])
+	}
+	b = appendFIBPath(nil, FIBPath{SWIfIndex: 7, NextHop: netip.MustParseAddr("10.0.0.1"), Weight: 30})
+	if b[12] != 30 {
+		t.Errorf("weight 30 应原样写进字节 12，得到 %d", b[12])
+	}
+	p := readFIBPath(b)
+	if p.Weight != 30 {
+		t.Errorf("readFIBPath weight = %d, want 30", p.Weight)
+	}
+	if p.Preference != b[13] {
+		t.Errorf("readFIBPath preference = %d, want %d", p.Preference, b[13])
+	}
+}

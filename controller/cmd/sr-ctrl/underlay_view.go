@@ -77,6 +77,11 @@ type underlayTunnelView struct {
 	// column and the one the device turns into a VPP preference (10+颜色).
 	Color uint8 `json:"color"`
 
+	// Weight 是分担权重（0 = 默认 1，页面上显示成空）；Dynamic 是"动态
+	// weight"开关。配置值只是基数上限，动态生效值在盒子上、不回写这里。
+	Weight  uint8 `json:"weight,omitempty"`
+	Dynamic bool  `json:"dynamic,omitempty"`
+
 	// MTU 0 means no device on this tunnel has reported a link MTU; delivery then
 	// uses wire.DefaultTunnelMTU, and MTUIsDefault says so instead of pretending
 	// the number was computed.
@@ -347,6 +352,8 @@ func buildTunnelView(st *underlay.State, t *underlay.Tunnel, serials map[uint16]
 		A:            buildEndpointView(views, t.A),
 		B:            buildEndpointView(views, t.B),
 		Color:        t.Color,
+		Weight:       t.Weight,
+		Dynamic:      t.Dynamic,
 		MTU:          t.MTU,
 		MTUIsDefault: t.MTU == 0,
 		Roles:        t.Roles,

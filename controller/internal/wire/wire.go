@@ -577,6 +577,16 @@ type TunnelSpec struct {
 	// when neither end has reported it.
 	MTU         uint16 `json:"mtu"`
 	UnderlayMTU uint16 `json:"underlay_mtu,omitempty"`
+
+	// Weight 是这条隧道在颜色表里的分担权重（VPP fib_path.weight，u8）。
+	// 0 = 默认 1；Dynamic 开着时它是 agent 动态档位的**基数上限**（agent 只在
+	// 1..Weight 之间调）。不是指针：weight 0 与"老控制器没发过"是同一个事实
+	// （都是等价分担），不需要区分 —— 这一点与 Color 不同，颜色 0 是真实
+	// 颜色而"没发过颜色"会整表拒派生。
+	// Dynamic 是"动态 weight"开关：开 = agent 按探针 SLA 调档（丢包优先、
+	// 四档、非线性，迟滞 3 拍 × 5s，owner 2026-11-13 拍）。
+	Weight  uint8 `json:"weight,omitempty"`
+	Dynamic bool  `json:"dynamic,omitempty"`
 }
 
 // TunnelSkip is a configured tunnel that could not be delivered to this device,
@@ -1110,8 +1120,8 @@ type TelemetryView struct {
 // dials the box (it is behind NAT), so the command rides the heartbeat down and
 // the result comes back as its own POST.
 type DiagCommand struct {
-	ID     string `json:"id"` // diag_<seq>, unique per controller process
-	Tool   string `json:"tool"` // ping | traceroute | vpp-show
+	ID     string `json:"id"`               // diag_<seq>, unique per controller process
+	Tool   string `json:"tool"`             // ping | traceroute | vpp-show
 	Target string `json:"target,omitempty"` // host/IP for ping & traceroute
 	// Count for ping (1..10). Zero is stored as the default on issue.
 	Count int `json:"count,omitempty"`
@@ -1121,7 +1131,7 @@ type DiagCommand struct {
 	Iface string `json:"iface,omitempty"`
 	// VppShow is the exact vppctl command for tool=vpp-show; the agent accepts
 	// only prefixes from its own whitelist.
-	VppShow string `json:"vpp_show,omitempty"`
+	VppShow  string `json:"vpp_show,omitempty"`
 	IssuedBy string `json:"issued_by,omitempty"`
 	IssuedAt int64  `json:"issued_at_unix"`
 }

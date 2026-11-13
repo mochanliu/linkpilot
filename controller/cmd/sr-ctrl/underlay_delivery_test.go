@@ -366,3 +366,26 @@ func TestBundleCarriesTenantTelemetryPolicy(t *testing.T) {
 		t.Errorf("同一租户两端策略不一致: %+v vs %+v", other, got)
 	}
 }
+
+// weight / dynamic 必须跟着隧道段一起下发（G-2 同一条契约）：设备侧的 sr-fib
+// 隧道表要 weight 才能把 UCMP 写进 VPP 路径；dynamic 只归 agent 的档位函数。
+func TestBundleCarriesWeightAndDynamic(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	w := uint8(30)
+	on := true
+	req := manualTunnel(1, 2, "wan0")
+	req.Weight = &w
+	req.Dynamic = &on
+	if rec := createTunnel(t, s, ten, req); rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", rec.Code, rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2, 3)
+	b := bundleOf(t, s, "t", 1)
+	if len(b.Tunnels) != 1 {
+		t.Fatalf("tunnels = %+v", b.Tunnels)
+	}
+	if b.Tunnels[0].Weight != 30 || !b.Tunnels[0].Dynamic {
+		t.Fatalf("bundle 的 weight/dynamic = %d/%v, want 30/true", b.Tunnels[0].Weight, b.Tunnels[0].Dynamic)
+	}
+}

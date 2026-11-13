@@ -157,6 +157,11 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	// 颜色 0 是合法颜色，"老控制器没发过 color"必须能和它区分开。
 	color := t.Color
 	spec.Color = &color
+	// weight / dynamic 跟着隧道段一起下发（weight 的唯一契约改动）。设备侧的
+	// sr-fib 隧道表要 weight 才能把 UCMP 写进 VPP 路径；dynamic 只归 agent 的
+	// 档位函数用，sr-fib 拿到的是算好的有效值。0 = 默认 1。
+	spec.Weight = t.Weight
+	spec.Dynamic = t.Dynamic
 	// UnderlayMTU is THIS box's egress link MTU; the controller writes only what
 	// the device itself reported (each side configures its own port). The map is
 	// empty until the agent has reported an inventory, and then the field stays 0

@@ -79,6 +79,10 @@ type tunnelConfig struct {
 	NextHop   string `json:"next_hop"`
 	Interface string `json:"interface"`
 	Color     uint8  `json:"color,omitempty"`
+	// Weight 是这条隧道的分担权重（VPP fib_path.weight，u8；0 = 默认 1）。
+	// agent 派生隧道表时写进来，静态是配置值、动态是档位函数的输出——
+	// 本进程不区分来历，weight 变了路径身份就变了，重下发由 Applier 负责。
+	Weight uint8 `json:"weight,omitempty"`
 }
 
 const defaultVPPSocket = "/run/vpp/api.sock"
@@ -89,7 +93,7 @@ const defaultVPPSocket = "/run/vpp/api.sock"
 func fibTunnels(cfgs []tunnelConfig) []fib.Tunnel {
 	out := make([]fib.Tunnel, 0, len(cfgs))
 	for _, t := range cfgs {
-		out = append(out, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color})
+		out = append(out, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color, Weight: t.Weight})
 	}
 	return out
 }
@@ -172,7 +176,7 @@ func configOf(c liveConfig) configDoc {
 	}
 	ts := make([]tunnelConfig, 0, len(c.Tunnels))
 	for _, t := range c.Tunnels {
-		ts = append(ts, tunnelConfig{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color})
+		ts = append(ts, tunnelConfig{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color, Weight: t.Weight})
 	}
 	fbs := make([]fallbackConfig, 0, len(c.Fallbacks))
 	for _, f := range c.Fallbacks {
@@ -191,7 +195,7 @@ func (d configDoc) live() (liveConfig, error) {
 	}
 	ts := make([]fib.Tunnel, 0, len(d.Tunnels))
 	for _, t := range d.Tunnels {
-		ts = append(ts, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color})
+		ts = append(ts, fib.Tunnel{NextHop: t.NextHop, Interface: t.Interface, Color: t.Color, Weight: t.Weight})
 	}
 	c := liveConfig{VRFs: vs, Tunnels: ts, Escape: d.EscapeAllColors, Fallbacks: fibFallbacks(d.Fallbacks)}
 	if err := validateLive(c); err != nil {

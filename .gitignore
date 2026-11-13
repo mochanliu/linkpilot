@@ -27,3 +27,16 @@ controller/tools/world-basemap/vendor/
 # 每台容器再 cp 进自己的 $WORK/bin）：编译产物，不入库
 controller/bin/
 vpp-plugin/build*/
+# 历次换件留在工作树里的临时构建落点（2026-11-13 补：它们被 git add -A 误收过一次）
+.out-*/
+.build-*/
+.out/
+.out-*/
+statprobe/
+controller/.out-*/
+controller/nat-probe
+controller/out-*
+controller/out/
+controller/sr-ctrl
+controller/sr-svc
+.statprobe/

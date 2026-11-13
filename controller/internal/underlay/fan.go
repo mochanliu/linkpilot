@@ -16,6 +16,10 @@ type FanRequest struct {
 	// Color applies to every tunnel this batch creates; a batch that recolors
 	// one peer would otherwise have to be edited peer by peer.
 	Color uint8
+	// Weight / Dynamic apply to every tunnel this batch creates, same rule as
+	// Color（weight 0 = 默认 1；Dynamic 开时 Weight 是动态档位的基数上限）。
+	Weight  uint8
+	Dynamic bool
 	// BatchID labels the whole fan; empty means Fan makes one, so the page can
 	// always say which batch a tunnel came from.
 	BatchID string
@@ -80,6 +84,8 @@ func (s *State) Fan(req FanRequest, views map[uint16]NodeView) (FanResult, error
 			// sharing one *TunnelPath would both move if either is edited later.
 			Path:    clonePath(req.Path),
 			Color:   req.Color,
+			Weight:  req.Weight,
+			Dynamic: req.Dynamic,
 			BatchID: batchID,
 			Roles:   req.Roles,
 			Now:     req.Now,

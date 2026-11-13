@@ -232,3 +232,58 @@ af_packet 入 → [FEC 解码] → sr-wg4_input（解密）→ ip4-lookup
 - VPP 桶数 = 比例量化：3:1 → 4 桶；比例更悬殊时桶数更多、量化粒度更粗。
 - 这只是管理面这一棒。**探测联动**（probe 劣化 → 降 weight / 摘路）与
   **多径分流比例实测**（iperf 多流验证桶分布）还没做，是 UCMP 的下一步。
+
+---
+
+## 6. UCMP 第二棒落地：隧道 weight 链 + 选路器自愈（2026-11-13）
+
+> owner 拍板的三条：①丢包优先、四档非线性；②underlay 配置手填 weight + "动态"
+> 复选框，配置值是**基数上限**，不回写；③迟滞 3 个周期、每周期 5 秒。
+> 本节是第二棒（静态 weight 链），第三棒（动态分档）未开工。
+
+### 6.1 链路（全部落地，`daff3a4` 之后的工作树）
+
+```
+sr-ctrl  Tunnel.Weight/Dynamic（create/update/fanout/API/console 列）
+   └─ wire.TunnelSpec.Weight/Dynamic → sr-agent TunnelSync（按隧道随 bundle 下发）
+        └─ agent.FibTableSync → fib.json（FibTunnelRow.Weight，0/省略 = 与老配置逐字节同形）
+             └─ sr-fib tunnelConfig.Weight → fib.PlanFrom → Path.Weight
+                  └─ pathIdentityEqual 把 Weight 当身份（改 weight = 改路由 = 重应用）
+                       └─ vppapi FIBPath 第 12 字节（u8，0→1）→ VPP load-balance 桶复制
+```
+
+- 语义：同对端同颜色多隧道默认 ECMP（weight 全 1）；不同 weight = UCMP，
+  VPP 桶数按比例量化、按流哈希（无逐包乱序）。weight 应用到该隧道出现的
+  每一张表（颜色表跨设备混对端，owner 已接受）。
+- 前置：同对端第二条隧道的创建门（M-3 的 409）还没抬——链路已就绪，门一抬即可用。
+
+### 6.2 顺手修掉的实机缺陷：sla 选路器重启后永不重写（CPE1 跨站全黑）
+
+- 现场：CPE1 的 VPP 重启（插件换装）后，apply 管道把选路表 10001 的 0/0 重种成
+  drop；agent 内存里 `written=true`、决策没变、表里"有 0/0"——旧跳过条件
+  `exists && written && color==current` 永远为真，选路器一行日志不再打，
+  0/0 落 dpo-drop，该行动态策略的所有客户流量黑洞。
+- 修法（`internal/sla/selector.go`）：**连接代数**。`planeConn` 每次成功重拨
+  `gen++`；`rowState` 记 `writtenGen`；跳过条件加 `writtenGen == gen`。
+  重拨必然换代，换代必然幂等重写一次（ip_route_add_del 的替换语义），盖掉 drop。
+  2026-11-13 CPE1 重启实测复现了同一签名（retval=-3 连打五拍后成功
+  "行 1 → 颜色 2"），修复后六方向 loopback 源互 ping 0% 丢包。
+- 回归测试：`TestSeedDropRouteReplacedAfterVPPRestart`（复现实机序列：
+  写 → 表被清+重种 drop + 连接断一拍 → 换代重写 → 稳定后不再写）。
+
+### 6.3 部署与验证（2026-11-13 傍晚实测）
+
+- 四台 sr-agent `abca7697b55144f83d7cc8cf1221a624` + sr-fib
+  `d07ba51e3ff991b52d44a3fde789231d`；host sr-ctrl darwin
+  `2d7911e9dbc985b0a79dca68713d3f68`（detached 脚本起，pid 会话无关）。
+- 验证：cust12↔cust4、cust12↔cust3、cust3↔cust4 六方向 `ping -I 172.16.x.1`
+  全 0% 丢包；四节点心跳恢复；sr-ctrl observe 行持续。
+- 两个环境教训进了 agent-handover §2.1：CPE1 磁盘满导致 guest 僵死；
+  客户机连通性必须绑 loopback 源（LAN 子网源不在 overlay 宣告里）。
+
+### 6.4 第三棒待办（owner 已拍参数）
+
+- loss-first 四档非线性映射（0~config.Weight 上限内取档），agent 端算
+  effectiveWeight 写 fib.json，sr-fib 仍只做对账器（不读探针）。
+- "动态"档迟滞：3 周期 × 5s/周期；配置 weight 只是基数上限，不回写。
+- 控制台动态档仅展示。前置：先抬同对端多隧道门（M-3 的 409 + Slot 分配）。

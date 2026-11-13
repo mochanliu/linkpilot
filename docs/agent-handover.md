@@ -104,11 +104,21 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `bab09756a60d125bb314ae5b4464325c`（2026-11-13 下午，含 QoS 配置面板
-+ 静态路由 weight（UCMP）列，备份 `sr-ctrl.prev-20261113ucmp`，上一代备份
-`sr-ctrl.prev-20261113qos`；sr-ctrl 全套测试跑在 qoslab 容器里，
-交叉编译 `GOOS=darwin go build`，`go test ./...` 全 PASS）。同日新增服务面：`/api/services` GET/PUT + 控制台「服务配置」页 +
+当前代际：sr-ctrl `2d7911e9dbc985b0a79dca68713d3f68`（2026-11-13 傍晚，含隧道 weight/动态
+（UCMP 第二棒）与 sla 选路器连接代数修复，备份 `sr-ctrl.prev-selgen-20261113`，上一代
+`bab09756a60d125bb314ae5b4464325c` 备份 `sr-ctrl.prev-20261113ucmp`；sr-ctrl 全套测试跑在
+qoslab 容器里，交叉编译 `GOOS=darwin go build`）。同日新增服务面：`/api/services` GET/PUT + 控制台「服务配置」页 +
 bundle 第 8 段（NAT/DHCP/DNS）；CPE1 盒内新增 daemon `sr-svc`（DHCP server + DNS 转发器，状态口 127.0.0.1:8092）。
+
+**2026-11-13 傍晚换件（实测）**：四台 CPE 盒 sr-agent `abca7697b55144f83d7cc8cf1221a624`
++ sr-fib `d07ba51e3ff991b52d44a3fde789231d`（隧道 weight 链 + sla 选路器"连接代数"修复：
+重拨换代后强制幂等重写选路表，盖掉 apply 重种的 0/0 drop——CPE1 实机那次跨站全黑就是它）。
+盒上备份 `.prev-agent-20261113selgen` / `.prev-fib-20261113selgen`。换 CPE1 时撞上**磁盘满**
+（2.4G 的盘被历代 .prev/.prerun 备份塞死，guest 直接僵死、连 ARP 都不回，VBox 硬复位救回），
+已把 `/usr/local/bin` 里老世代备份清掉（191M）——**抬盒前先 `df -h` 看一眼**。
+客户机测跨站连通性必须**绑 loopback 源**（`ping -I 172.16.x.1`）：LAN 子网源（172.31.x.x）
+不在 overlay 宣告里，靠它测必然 100% 丢，那是路径不存在，不是坏了（2026-11-13 实测教训，
+浪费了半小时以为数据面全黑——其实只有 CPE1 选路表那一处）。
 
 ### 2.2 被测现场是 VirtualBox 那 7 台
 

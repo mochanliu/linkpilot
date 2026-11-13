@@ -66,6 +66,10 @@ type FIBPath struct {
 	NextHop    netip.Addr
 	Labels     []uint32
 	Preference uint8
+	// Weight 是分担权重（VPP fib_path.weight，u8）。0 按协议缺省写成 1：
+	// 同桶多路径等价（ECMP）就是"全部写 1"这一种情况，>1 时按比例复制
+	// load-balance 桶（UCMP，按流分流）。读回（readFIBPath）取原值，不归一。
+	Weight uint8
 }
 
 // IPRoute 是 ip_route_details 读回来的一条（只保留本系统会写的那些字段）。
@@ -103,7 +107,12 @@ func appendFIBPath(b []byte, p FIBPath) []byte {
 	b = appendU32(b, p.SWIfIndex)
 	b = appendU32(b, p.TableID)
 	b = appendU32(b, 0) // rpf_id
-	b = append(b, 1)    // weight = 1
+	// weight：0 = 调用方没填 = 协议缺省 1（ECMP）。UCMP 就是这里写 >1。
+	w := p.Weight
+	if w == 0 {
+		w = 1
+	}
+	b = append(b, w)
 	b = append(b, p.Preference)
 	b = appendU32(b, 0) // type = FIB_API_PATH_TYPE_NORMAL
 	b = appendU32(b, 0) // flags = FIB_API_PATH_FLAG_NONE
@@ -339,6 +348,7 @@ func readFIBPath(b []byte) FIBPath {
 	p := FIBPath{
 		SWIfIndex:  binary.BigEndian.Uint32(b[0:4]),
 		TableID:    binary.BigEndian.Uint32(b[4:8]),
+		Weight:     b[12],
 		Preference: b[13],
 	}
 	var nh [16]byte

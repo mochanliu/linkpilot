@@ -137,6 +137,11 @@ type Tunnel struct {
 	NextHop   string
 	Interface string
 	Color     uint8
+	// Weight 是这条隧道的分担权重（VPP fib_path.weight，u8；0 = 默认 1）。
+	// 它跟着 Path 进颜色表/主表的路由桶：同桶内按比例复制 load-balance 桶
+	// （UCMP，按流）。注意 weight 作用于这条隧道出现的一切桶——颜色表是
+	// 跨设备混装的，所以它也影响跨设备分流（owner 2026-11-13 知情接受）。
+	Weight uint8
 }
 
 // Path 是一条可下发的路径。Label 是压入的 VPN 标签。
@@ -151,7 +156,10 @@ type Path struct {
 	Interface  string
 	Label      uint32
 	Preference uint8
-	Deag       bool
+	// Weight 是分担权重（0 = 默认 1）。它在路径身份里（pathIdentityEqual）：
+	// weight 变了就是一次重下发，而不是静默沿用旧桶。
+	Weight uint8
+	Deag   bool
 	// LookupTable 只在 Deag 时有效：要重查的那张表。
 	LookupTable uint32
 }
@@ -356,7 +364,7 @@ func PlanFrom(vrfs []uint8, routes []RIBRoute, tunnels []Tunnel, down map[netip.
 				warn("%s: 下一跳 %s 的 BFD 会话不是 Up，该路径跳过", prefix, nh)
 				continue
 			}
-			c := cand{Path: Path{NextHop: nh, Interface: t.Interface, Label: label, Preference: PrefBase + t.Color}, rd: rd}
+			c := cand{Path: Path{NextHop: nh, Interface: t.Interface, Label: label, Preference: PrefBase + t.Color, Weight: t.Weight}, rd: rd}
 			// §4.3 第 5 步：主表收哪些颜色由逃生开关决定。关（默认）⇒ 只收颜色 0，
 			// 于是"颜色 0 全 down"时这个前缀在主表里就不存在了（宁丢不占昂贵颜色）；
 			// 开 ⇒ 全部颜色都进主表，靠 preference=10+颜色 让 VPP 自己排（§2.1 实测
@@ -648,7 +656,7 @@ func fibPaths(r Route, ifMap map[string]uint32) []vppapi.FIBPath {
 			paths = append(paths, vppapi.FIBPath{SWIfIndex: ^uint32(0), TableID: p.LookupTable})
 			continue
 		}
-		fp := vppapi.FIBPath{SWIfIndex: ifMap[p.Interface], NextHop: p.NextHop, Preference: p.Preference}
+		fp := vppapi.FIBPath{SWIfIndex: ifMap[p.Interface], NextHop: p.NextHop, Preference: p.Preference, Weight: p.Weight}
 		if p.Label != 0 {
 			fp.Labels = []uint32{p.Label}
 		}
@@ -678,7 +686,8 @@ func pathIdentityEqual(a, b []Path) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].Interface != b[i].Interface || a[i].NextHop != b[i].NextHop || a[i].Label != b[i].Label {
+		if a[i].Interface != b[i].Interface || a[i].NextHop != b[i].NextHop || a[i].Label != b[i].Label ||
+			a[i].Weight != b[i].Weight {
 			return false
 		}
 	}

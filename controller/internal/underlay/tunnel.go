@@ -72,7 +72,11 @@ type CreateRequest struct {
 	Roles   Roles
 	// Color is the tunnel's SD-WAN color; see Tunnel.Color.
 	Color uint8
-	Now   int64
+	// Weight 是分担权重（0 = 默认 1）；Dynamic 见 Tunnel.Dynamic。值域由
+	// uint8 天然封顶（VPP fib_path.weight 是 u8），JSON 解码层挡超界。
+	Weight  uint8
+	Dynamic bool
+	Now     int64
 }
 
 // Create validates, allocates and stores one tunnel. It runs on a clone, so a
@@ -171,6 +175,8 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 		B:         Endpoint{NodeID: req.B.NodeID, Iface: ifaceB, Addr: addrB, Port: portB, Overlay: ovB},
 		Path:      clonePath(req.Path),
 		Color:     req.Color,
+		Weight:    req.Weight,
+		Dynamic:   req.Dynamic,
 		MTU:       mtu,
 		Roles:     req.Roles,
 		BatchID:   req.BatchID,
@@ -194,7 +200,12 @@ type UpdateRequest struct {
 	// Color is a pointer because 0 is a real color: "keep the current color" and
 	// "recolor this tunnel to 0" cannot both be written as a zero value.
 	Color *uint8
-	Now   int64
+	// Weight / Dynamic 是指针：weight 0 是合法值（= 回到默认 1），dynamic
+	// false 是合法值（= 关掉动态）——"保持不变"只能用 nil 表达。控制台表单
+	// 总是提交这两个字段的当前值，所以 nil 只出现在没有带它们的调用方。
+	Weight  *uint8
+	Dynamic *bool
+	Now     int64
 }
 
 func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) (Tunnel, error) {
@@ -219,6 +230,12 @@ func (s *State) Update(id string, req UpdateRequest, views map[uint16]NodeView) 
 			return Tunnel{}, err
 		}
 		t.Color = *req.Color
+	}
+	if req.Weight != nil {
+		t.Weight = *req.Weight
+	}
+	if req.Dynamic != nil {
+		t.Dynamic = *req.Dynamic
 	}
 	if req.IfaceA != "" {
 		iface, err := endpointIface("本端", views[t.A.NodeID], req.IfaceA)

@@ -70,7 +70,11 @@ type TunnelSync struct {
 	localOf map[string]netip.Prefix
 	// colors 记每条隧道在 bundle 里的颜色（spec.Color；nil = 老控制器没发过
 	// color 字段）。sr-fib 隧道表的派生（FibTableSync）读同一份，不另立状态。
+	// weights/dynamics 同理：weight 0 = 默认 1，dynamic = "weight 是动态档位
+	// 的基数上限"开关（owner 2026-11-13）。派生与档位函数都从这读。
 	colors   map[string]*uint8
+	weights  map[string]uint8
+	dynamics map[string]bool
 	skipped  map[string]string
 	state    wire.TunnelState
 	applying bool
@@ -98,12 +102,14 @@ func NewTunnelSync(dp DataPlane, id *Identity,
 	t := &TunnelSync{
 		dp: dp, id: id, fetch: fetch, logf: logf, now: time.Now,
 		retryMin: 5 * time.Second, retryMax: 5 * time.Minute,
-		links:   map[string]*Link{},
-		peerOf:  map[string]uint16{},
-		localOf: map[string]netip.Prefix{},
-		colors:  map[string]*uint8{},
-		skipped: map[string]string{},
-		state:   wire.TunnelState{Capable: true},
+		links:    map[string]*Link{},
+		peerOf:   map[string]uint16{},
+		localOf:  map[string]netip.Prefix{},
+		colors:   map[string]*uint8{},
+		weights:  map[string]uint8{},
+		dynamics: map[string]bool{},
+		skipped:  map[string]string{},
+		state:    wire.TunnelState{Capable: true},
 	}
 	// 遥测每次现取当前连接：VPP 重启后 reconciler 会换一条 api 连接，BFD/探针
 	// 不能抱着死句柄（和 DataPlane() 是同一个理由）。
@@ -187,7 +193,7 @@ func (t *TunnelSync) getLink(id string) *Link {
 	return t.links[id]
 }
 
-func (t *TunnelSync) setLink(id string, l *Link, peer uint16, local netip.Prefix, color *uint8) {
+func (t *TunnelSync) setLink(id string, l *Link, peer uint16, local netip.Prefix, color *uint8, weight uint8, dynamic bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.links[id] = l
@@ -199,6 +205,16 @@ func (t *TunnelSync) setLink(id string, l *Link, peer uint16, local netip.Prefix
 		c := *color
 		t.colors[id] = &c
 	}
+	if weight == 0 {
+		delete(t.weights, id)
+	} else {
+		t.weights[id] = weight
+	}
+	if dynamic {
+		t.dynamics[id] = true
+	} else {
+		delete(t.dynamics, id)
+	}
 }
 
 func (t *TunnelSync) delLink(id string) {
@@ -208,6 +224,8 @@ func (t *TunnelSync) delLink(id string) {
 	delete(t.peerOf, id)
 	delete(t.localOf, id)
 	delete(t.colors, id)
+	delete(t.weights, id)
+	delete(t.dynamics, id)
 }
 
 func (t *TunnelSync) takeLinks() map[string]*Link {
@@ -285,6 +303,11 @@ type FibTunnelRow struct {
 	// 量，行里写的 peer 得在这里对上号。t.peerOf 在 setLink 时就存了，这里是
 	// 把它也带出来。
 	Peer uint16
+	// Weight 是这条隧道的分担权重（bundle 里的配置值，0 = 默认 1）；Dynamic
+	// 是"weight 是动态档位基数上限"开关。FibTableSync 用它们折算 fib.json
+	// tunnels 行的 weight：静态 = 配置值，动态 = 档位函数的输出（task 56）。
+	Weight  uint8
+	Dynamic bool
 }
 
 // FibRows 是"这台盒子现在跑着哪些隧道"的读数，给 FibTableSync 派生 sr-fib 的
@@ -308,6 +331,8 @@ func (t *TunnelSync) FibRows() []FibTunnelRow {
 			Color:     t.colors[id],
 			SWIfIndex: idx,
 			Peer:      t.peerOf[id],
+			Weight:    t.weights[id],
+			Dynamic:   t.dynamics[id],
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -683,10 +708,10 @@ func (t *TunnelSync) applySpec(ctx context.Context, b wire.UnderlayBundle,
 		// attempt continues from this object instead of creating a second
 		// interface for the same instance.
 	}
-	// 每次收敛都刷新一遍这条记录，不只建 Link 那一次：颜色是控制台随时可改的
-	// 属性，改色不重建接口（VPP preference 归 sr-fib），但派生出来的隧道表必须
-	// 当场跟上，否则主备换了颜色而 FIB 还是旧优先级。
-	t.setLink(spec.TunnelID, l, spec.PeerNodeID, cfg.LocalOverlay, spec.Color)
+	// 每次收敛都刷新一遍这条记录，不只建 Link 那一次：颜色与 weight 都是控制
+	// 台随时可改的属性，改它们不重建接口（preference 与 load-balance 桶归
+	// sr-fib），但派生出来的隧道表必须当场跟上，否则 UCMP 分流比例还是旧值。
+	t.setLink(spec.TunnelID, l, spec.PeerNodeID, cfg.LocalOverlay, spec.Color, spec.Weight, spec.Dynamic)
 
 	keys, err := linkKeys(b.PKeys)
 	if err != nil {

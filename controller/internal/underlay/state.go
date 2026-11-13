@@ -153,6 +153,21 @@ type Tunnel struct {
 	// wire.DefaultTunnelMTU and says so instead of pretending.
 	MTU uint16 `json:"mtu,omitempty"`
 
+	// Weight 是这条隧道在颜色表里的分担权重（VPP fib_path.weight，u8）。
+	// 0/缺省 = 1：同色同前缀的多条隧道等价分担（ECMP，按流）；>1 时与同桶
+	// 其它路径按比例复制 load-balance 桶（UCMP，2026-11-13 CPE4 实测
+	// weight 10:30 → 1:3 → 4 桶）。注意颜色表是跨设备混装的：weight 作用于
+	// 这条隧道出现的一切路由桶，包括跨设备的分流。Dynamic 打开时它是
+	// **基数上限**：agent 只在 1..Weight 之间按探针 SLA 调档（owner
+	// 2026-11-13 拍：丢包优先、四档、非线性，迟滞 3 拍 × 5s）。
+	Weight uint8 `json:"weight,omitempty"`
+
+	// Dynamic 是"动态 weight"开关（owner 2026-11-13 拍）。开 = agent 按探针
+	// SLA 在 1..Weight 之间调有效 weight；关 = 恒用 Weight（0 = 1）。
+	// 动态生效值不回写控制器（同动态策略 current_color 的先例：盒内运行时
+	// 状态，控制器只显示不回读）。
+	Dynamic bool `json:"dynamic,omitempty"`
+
 	Roles     Roles  `json:"roles,omitempty"`
 	BatchID   string `json:"batch_id,omitempty"`
 	CreatedAt int64  `json:"created_at_unix"`

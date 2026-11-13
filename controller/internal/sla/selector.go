@@ -20,7 +20,12 @@
 //   - Preempt（owner 2026-11-11 补）：默认**粘住** —— 当前隧道还达标就一直用，
 //     更优的候选不抢；勾了抢占才永远追最优。切换本身有迟滞：新颜色要连续赢
 //     holdRounds 拍才切；但当前颜色 100% 丢包（探针全判丢）时立即切，不等迟滞；
-//   - 选路表空（VPP 重启过、路由没了）时立即恢复写入，不经过迟滞。
+//   - 选路表空（VPP 重启过、路由没了）时立即恢复写入，不经过迟滞；
+//   - 每次（重）连上 VPP 后强制重写一遍（连接代数，2026-11-11 实机补）：VPP 重启
+//     会换掉整套表，apply 管道会把选路表的 0/0 重新种成 drop。此时"表里有 0/0"
+//     为真、内存里的 written 也为真、决策也没变 —— 只看存在性会把种子 drop 路由
+//     当成自己写的，永远不再写，实机 CPE1 就这样黑了。所以落表记录"写在第几代
+//     连接上"，只有同代才允许跳过；重拨必然换代，换代必然重写一次（幂等替换）。
 //
 // 宿主是 sr-agent：它已经拥有探针会话的生命周期、隧道→对端→颜色的映射和到控制
 // 器的上报通道，单独起进程得把这三样再实现一遍，还会出现两个客户端抢同一批会话。
@@ -90,12 +95,16 @@ type Plane interface {
 
 // rowState 是一行在两次 Tick 之间的记忆。
 type rowState struct {
-	current   uint8  // 当前生效的颜色（与选路表里的路由一致）
-	written   bool   // 这个值真的写下去过（false = 还没写过任何路由）
-	pending   uint8  // 连续赢着的新候选（迟滞计数的对象）
-	pendingN  int    // 已连续赢的拍数
-	reason    string // 最近一次决策的人话解释
-	updatedAt time.Time
+	current uint8 // 当前生效的颜色（与选路表里的路由一致）
+	written bool  // 这个值真的写下去过（false = 还没写过任何路由）
+	// writtenGen 是 written 那次写入所在的连接代数。跳过条件要求它与 Selector.gen
+	// 同代：重拨（VPP 重启、连接出错后恢复）换代，换代后哪怕决策没变、表里也有
+	// 0/0（可能是 apply 重种的 drop），也要幂等重写一次，把自己的颜色路由盖回去。
+	writtenGen uint64
+	pending    uint8  // 连续赢着的新候选（迟滞计数的对象）
+	pendingN   int    // 已连续赢的拍数
+	reason     string // 最近一次决策的人话解释
+	updatedAt  time.Time
 }
 
 // Selector 是一台盒子上的选路决策器。Tick 必须串行（内部锁保证）；
@@ -103,7 +112,8 @@ type rowState struct {
 type Selector struct {
 	mu      sync.Mutex
 	dial    func(context.Context) (Plane, error)
-	client  Plane // 上一次拨成功的连接；任何一次 API 失败都把它置回 nil，下一拍重拨
+	client  Plane  // 上一次拨成功的连接；任何一次 API 失败都把它置回 nil，下一拍重拨
+	gen     uint64 // 连接代数：每成功拨一次 +1。换代后所有行强制幂等重写
 	logf    func(string, ...any)
 	now     func() time.Time
 	rows    []Row
@@ -126,7 +136,8 @@ func NewSelector(dial func(context.Context) (Plane, error), logf func(string, ..
 	}
 }
 
-// plane 取当前连接；坏了就重拨。
+// plane 取当前连接；坏了就重拨。每次成功拨号新开一代（gen++）—— 上一代写下去
+// 的路由属于旧连接背后的那个 VPP 世界，换代后必须重写一遍才算数。
 func (s *Selector) planeConn(ctx context.Context) (Plane, error) {
 	if s.client != nil {
 		return s.client, nil
@@ -136,6 +147,7 @@ func (s *Selector) planeConn(ctx context.Context) (Plane, error) {
 		return nil, err
 	}
 	s.client = p
+	s.gen++
 	return p, nil
 }
 
@@ -208,14 +220,16 @@ func (s *Selector) Tick(ctx context.Context) error {
 		color, reason := s.decide(r, byIf, st)
 		st.reason = reason
 		st.updatedAt = s.now()
-		// 落表：决策变了、或者表空了（VPP 重启/路由被冲掉）才写。表空不能只信
-		// 内存里的 written —— 重启之后 written 还是 true，但 VPP 里什么都没有，
-		// 所以每一拍都查一次存在性。
+		// 落表：决策变了、表空了（VPP 重启/路由被冲掉）、或者换代了（重拨后
+		// 第一次落表机会）才写。表空不能只信内存里的 written —— 重启之后
+		// written 还是 true，但 VPP 里什么都没有，所以每一拍都查一次存在性。
+		// 存在性也只说明"有个 0/0"：VPP 重启后 apply 会把 0/0 重种成 drop，
+		// 所以重拨之后（writtenGen != gen）哪怕决策没变也要重写一次盖掉它。
 		exists, err := s.routeExists(ctx, r.SelectorTable)
 		if err != nil {
 			return fmt.Errorf("sla: 行 %d 读选路表 %d: %w", r.ID, r.SelectorTable, err)
 		}
-		if exists && st.written && color == st.current {
+		if exists && st.written && st.writtenGen == s.gen && color == st.current {
 			continue
 		}
 		if err := s.writeRoute(ctx, r, color); err != nil {
@@ -438,6 +452,7 @@ func (s *Selector) writeRoute(ctx context.Context, r Row, color uint8) error {
 	if st != nil {
 		st.current = color
 		st.written = true
+		st.writtenGen = s.gen
 	}
 	return nil
 }

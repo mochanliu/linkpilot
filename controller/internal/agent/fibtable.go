@@ -122,6 +122,11 @@ type fibRowDoc struct {
 	NextHop   string `json:"next_hop"`
 	Interface string `json:"interface"`
 	Color     uint8  `json:"color,omitempty"`
+	// Weight 是这条隧道的分担权重（VPP fib_path.weight，u8）。omitempty：
+	// 1（默认等价）不写，与老配置字节同形 —— diff 不翻行。动态档位（task 56）
+	// 也写这一格：sr-fib 是纯对账者，它只需要"现在用多少"，不需要知道是
+	// 配置的还是算出来的。
+	Weight uint8 `json:"weight,omitempty"`
 }
 
 // fibConfigDoc is the GET/PUT /config body of sr-fib. Whole-replacement: the
@@ -210,7 +215,8 @@ func (f *FibTableSync) Sync(ctx context.Context) error {
 			skipped = append(skipped, fmt.Sprintf("%s(sw_if_index %d 不在接口表里)", r.TunnelID, r.SWIfIndex))
 			continue
 		}
-		tunnels = append(tunnels, fibRowDoc{NextHop: r.NextHop, Interface: name, Color: *r.Color})
+		tunnels = append(tunnels, fibRowDoc{NextHop: r.NextHop, Interface: name, Color: *r.Color,
+			Weight: effectiveWeight(r)})
 	}
 	sort.Slice(tunnels, func(i, j int) bool { return tunnels[i].NextHop < tunnels[j].NextHop })
 
@@ -481,4 +487,15 @@ func fibStatusBase(path string) (string, error) {
 		}
 	}
 	return "http://" + addr, nil
+}
+
+// effectiveWeight 把一行隧道读数折成 fib.json 里要写的 weight。
+// task 54（2026-11-13，本轮）：静态 —— 配置值原样（0 = 默认 1，omitempty
+// 落成"不写"，与老配置字节同形）。
+// task 56（owner 已拍未做）：Dynamic 开时由档位函数按探针 SLA 输出 1..Weight
+// 的有效值（丢包优先、四档、非线性，迟滞 3 拍 × 5s，一拍一个评估周期）；
+// Dynamic 关 = 恒配置值。sr-fib 对两者一视同仁：weight 变了 → 路径身份变了
+// → 重下发，它不需要知道值的来历。
+func effectiveWeight(r FibTunnelRow) uint8 {
+	return r.Weight
 }

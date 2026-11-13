@@ -4780,6 +4780,11 @@
       '<select id="und-tun-pathmode">' + undPathModeOptions(mode) + "</select></div>" +
       '<div class="field"><label for="und-tun-color">颜色</label>' +
       '<select id="und-tun-color" name="color">' + undColorOptions(doc, 0) + "</select></div>" +
+      '<div class="field"><label for="und-tun-weight">权重（1–255，留空=1）</label>' +
+      '<input id="und-tun-weight" name="weight" type="number" min="1" max="255" placeholder="1" style="width:110px"></div>' +
+      '<div class="field"><label for="und-tun-dynamic">动态 weight</label>' +
+      '<select id="und-tun-dynamic" name="dynamic"><option value="0">关（恒用权重）</option>' +
+      '<option value="1">开（agent 按丢包调档，1..权重）</option></select></div>' +
       "</div>" + undPathExtraFields(doc, mode, "und-tun", "mHops", [a].concat(peers)) +
       '<div class="hint" style="margin:10px 0 0">物理端口可以留「默认」，由设备上报的出口决定；也可以指定它上报过的其他端口。' +
       "地址留空就用反射器最近一次观测到的外层地址；观测过期时创建会被拒绝，需要手填地址或等设备重新上报。" +
@@ -4790,6 +4795,9 @@
       "颜色是这条隧道的 SD-WAN 颜色：设备按 230+颜色 写成 VPP 的 preference，颜色 0 最优，" +
       "0 全 down 时自动抬到存活的最小颜色；同色多条是并用的。" +
       "这一列今天写的是控制器的隧道表；设备上生效的还是它自己那份 FIB 隧道配置，两边要人工对齐。" +
+      "权重是这条隧道在颜色表里的分担比例（1–255，默认 1 = 等价 ECMP）：同桶多条路径按比例复制 load-balance 桶、按流分流（UCMP）。" +
+      "注意颜色表是跨设备混装的，权重也作用于跨设备分流。开「动态」后权重是基数上限：" +
+      "agent 按探针丢包在 1..权重 之间调档（丢包优先、四档、非线性，迟滞 3 拍 × 5 秒），动态生效值不回写本页。" +
       (batch ? "批量创建时对端用各自的观测地址与默认出口端口，逐台指定请只选一台对端。" +
         "已经有隧道的对端会被跳过并列在结果里，不会让整批失败。" : "") + "</div>" +
       '<div style="margin-top:10px"><button class="primary" type="submit">' +
@@ -4848,7 +4856,7 @@
       return h + '<div class="empty">还没有隧道。' +
         (doc.configured ? "用上面的自动编排或手动表单创建。" : "先发布全局配置。") + "</div></section>";
     }
-    h += "<table><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>颜色</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>";
+    h += "<table><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>颜色</th><th>权重</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>";
     doc.tunnels.forEach(function (t) {
       h += "<tr>" +
         "<td>" + undEndpointCell(t.a, doc) + "</td>" +
@@ -4857,6 +4865,10 @@
         // 颜色单独一列：同一对设备的多条隧道、一条链上的几条隧道，运营只看这一列
         // 判断「这几条是并用的还是备胎」。
         "<td><b>" + (t.color || 0) + "</b></td>" +
+        // 权重列：空 = 默认 1（等价）；勾了动态给一个标记（生效值在盒子上，
+        // 不回写 —— 这里显示的是配置的基数上限）。
+        "<td>" + (t.weight ? "<b>×" + t.weight + "</b>" : "1") +
+        (t.dynamic ? '<div class="tag plan">动态</div>' : "") + "</td>" +
         "<td>" + undMTUCell(t, doc) + "</td>" +
         "<td>" + undStateTag(doc.state_note) +
         '<div class="muted" style="font-size:12px">' + esc(t.id) + " · " + esc(clock(t.created_at_unix)) +
@@ -4886,6 +4898,10 @@
     };
     var color = parseInt(String(f.get("color")), 10);
     body.color = isNaN(color) ? 0 : color;
+    // weight：清空/非法 = 0 = 默认 1；dynamic：下拉 0/1。
+    var weight = parseInt(String(f.get("weight")), 10);
+    body.weight = (!isNaN(weight) && weight > 0) ? Math.min(weight, 255) : 0;
+    body.dynamic = String(f.get("dynamic")) === "1";
     // 一台对端走单条创建（能指定它的出口端口和地址），两台以上走批量：批量
     // 那套只有 node_id，端口与地址各用设备自己的观测，这是控制器的契约。
     if (peers.length === 1) {
@@ -4959,7 +4975,13 @@
       '<div class="field"><label for="und-edit-pathmode">路径</label>' +
       '<select id="und-edit-pathmode">' + undPathModeOptions(mode) + "</select></div>" +
       '<div class="field"><label for="und-edit-color">颜色</label>' +
-      '<select id="und-edit-color" name="color">' + undColorOptions(doc, t.color || 0) + "</select></div>";
+      '<select id="und-edit-color" name="color">' + undColorOptions(doc, t.color || 0) + "</select></div>" +
+      '<div class="field"><label for="und-edit-weight">权重（1–255，清空=默认1）</label>' +
+      '<input id="und-edit-weight" name="weight" type="number" min="1" max="255" value="' + (t.weight || "") + '" placeholder="1"></div>' +
+      '<div class="field"><label for="und-edit-dynamic">动态 weight</label>' +
+      '<select id="und-edit-dynamic" name="dynamic"><option value="0"' + (!t.dynamic ? " selected" : "") +
+      '>关（恒用权重）</option><option value="1"' + (t.dynamic ? " selected" : "") +
+      '>开（agent 按丢包调档，1..权重）</option></select></div>';
     if (mode === "inline") {
       h += undHopsEditor(doc, "editHops", { exclude: [t.a.node_id, t.b.node_id] }) +
         '<div class="hint" style="margin-top:8px">改成另一条链是整条替换：新的顺序会一起下发，旧链不会留下一跳。</div>';
@@ -4973,7 +4995,7 @@
       "物理端口只在改动时提交：选「默认」表示交回设备上报的出口。" +
       // 实测出来的行为，不是猜测：VPP 原地替换路径时不重算 preference，
       // 所以改颜色必须删了重加（docs/overlay-design-draft.md §2.2）。
-      "改颜色会把这条隧道上的路由删掉重加，正在走的流量有一个收敛窗口的中断。" +
+      "改颜色会把这条隧道上的路由删掉重加，正在走的流量有一个收敛窗口的中断；改权重同理（VPP 按 weight 比例重建 load-balance 桶）。" +
       "</div>" +
       '<div style="margin-top:10px"><button class="primary" type="submit">保存修改</button> ' +
       '<button class="small" type="button" data-act="und-tun-cancel">取消</button></div>' +
@@ -4996,6 +5018,11 @@
     // 请求里是不同的数字，后端那个 *uint8 就是为这个准备的。
     var color = parseInt(String(f.get("color")), 10);
     body.color = isNaN(color) ? (t.color || 0) : color;
+    // 权重与颜色同一个契约：表单总是提交，后端用指针区分"没带"（其它的
+    // 调用方）和"带了 0"（重置为默认 1）。
+    var weight = parseInt(String(f.get("weight")), 10);
+    body.weight = (!isNaN(weight) && weight > 0) ? Math.min(weight, 255) : 0;
+    body.dynamic = String(f.get("dynamic")) === "1";
     // "默认" resolves to the device's own egress port: the API treats an empty
     // iface as "keep", so clearing back to the default has to name it.
     var ndA = undNodeOf(u.doc, t.a.node_id), ndB = undNodeOf(u.doc, t.b.node_id);

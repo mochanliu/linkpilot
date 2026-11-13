@@ -438,3 +438,54 @@ func TestFanAppliesOneColorToTheWholeBatch(t *testing.T) {
 		t.Fatalf("越界颜色的批量不该建任何隧道，%d -> %d", before, len(s.Tunnels))
 	}
 }
+
+// weight / dynamic 与 color 同一套存取纪律：Create 带入、Update 指针语义
+// （nil = 保持）、0/false 是合法值（= 回默认 / 关）、随状态往返存盘。
+func TestTunnelWeightStoredAndUpdatable(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+
+	tun, err := s.Create(CreateRequest{
+		A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2},
+		Color: 3, Weight: 30, Dynamic: true, Now: 1000,
+	}, views)
+	if err != nil {
+		t.Fatalf("带权重建隧道失败: %v", err)
+	}
+	if tun.Weight != 30 || !tun.Dynamic {
+		t.Fatalf("weight/dynamic 应存成 30/true，实际 %d/%v", tun.Weight, tun.Dynamic)
+	}
+
+	// 不带这两个字段的更新是"保持"：页面只改路径/端口时不许静默清掉权重。
+	got, err := s.Update(tun.ID, UpdateRequest{Now: 1100}, views)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Weight != 30 || !got.Dynamic {
+		t.Fatalf("没带 weight 的更新不该动权重，实际 %d/%v", got.Weight, got.Dynamic)
+	}
+
+	// 0 是合法值（= 回到默认 1，等价分担），false 是合法值（= 关动态）。
+	zero := uint8(0)
+	off := false
+	got, err = s.Update(tun.ID, UpdateRequest{Weight: &zero, Dynamic: &off, Now: 1200}, views)
+	if err != nil {
+		t.Fatalf("重置权重失败: %v", err)
+	}
+	if got.Weight != 0 || got.Dynamic {
+		t.Fatalf("weight/dynamic 应重置成 0/false，实际 %d/%v", got.Weight, got.Dynamic)
+	}
+
+	// 配置必须活过状态往返（存盘/重启）。
+	blob, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back State
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatal(err)
+	}
+	if bt := back.Tunnels[tun.ID]; bt == nil || bt.Weight != 0 || bt.Dynamic {
+		t.Fatalf("重启后 weight/dynamic 不对: %+v", bt)
+	}
+}

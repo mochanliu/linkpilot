@@ -231,6 +231,13 @@ type underlayTunnelRequest struct {
 	// Color is the tunnel's SD-WAN color. Pointer because 0 is a real color: on
 	// update "absent" means keep while "0" means recolor this tunnel to 0.
 	Color *uint8 `json:"color,omitempty"`
+	// Weight 是分担权重（VPP fib_path.weight，u8；0 = 默认 1）。指针与 Color
+	// 同一个理由：update 时"没带"是保持，"带了 0"是重置为默认——控制台表单
+	// 总是提交（清空 = 提交 0）。Dynamic 开着时它是动态档位的基数上限。
+	Weight *uint8 `json:"weight,omitempty"`
+	// Dynamic 是"动态 weight"开关（owner 2026-11-13 拍）。指针同上：控制台
+	// 总是提交；其它调用方不带就是"不动这个开关"。
+	Dynamic *bool `json:"dynamic,omitempty"`
 }
 
 func strPtr(p *string) string {
@@ -345,11 +352,13 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 			return
 		}
 		tun, err := st.Create(underlay.CreateRequest{
-			A:     underlay.EndpointSpec{NodeID: req.A.NodeID, Iface: req.A.Iface, Addr: strPtr(req.A.Addr), Port: req.A.Port},
-			B:     underlay.EndpointSpec{NodeID: req.B.NodeID, Iface: req.B.Iface, Addr: strPtr(req.B.Addr), Port: req.B.Port},
-			Path:  path,
-			Color: u8Val(req.Color),
-			Now:   now,
+			A:       underlay.EndpointSpec{NodeID: req.A.NodeID, Iface: req.A.Iface, Addr: strPtr(req.A.Addr), Port: req.A.Port},
+			B:       underlay.EndpointSpec{NodeID: req.B.NodeID, Iface: req.B.Iface, Addr: strPtr(req.B.Addr), Port: req.B.Port},
+			Path:    path,
+			Color:   u8Val(req.Color),
+			Weight:  u8Val(req.Weight),
+			Dynamic: req.Dynamic != nil && *req.Dynamic,
+			Now:     now,
 		}, views)
 		if err != nil {
 			if created != "" {
@@ -359,8 +368,15 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 			return
 		}
 		s.save()
+		weightTxt := ""
+		if tun.Weight > 0 {
+			weightTxt = fmt.Sprintf("，权重 %d", tun.Weight)
+			if tun.Dynamic {
+				weightTxt += "（动态基数上限）"
+			}
+		}
 		s.appendOps("underlay.change", id.TenantID, 0, id.Username, "info",
-			fmt.Sprintf("新建隧道 %s：设备 %d ↔ %d，颜色 %d", tun.ID, tun.A.NodeID, tun.B.NodeID, tun.Color))
+			fmt.Sprintf("新建隧道 %s：设备 %d ↔ %d，颜色 %d%s", tun.ID, tun.A.NodeID, tun.B.NodeID, tun.Color, weightTxt))
 		writeJSONStatus(w, http.StatusCreated, map[string]any{
 			"ok":       true,
 			"tunnel":   buildTunnelView(st, &tun, serialMap(views), views),
@@ -383,6 +399,8 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 		PortA: req.A.Port, PortB: req.B.Port,
 		ClearPath: req.ClearPath,
 		Color:     req.Color,
+		Weight:    req.Weight,
+		Dynamic:   req.Dynamic,
 		Now:       now,
 	}
 	created := ""
@@ -403,8 +421,17 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 		return
 	}
 	s.save()
+	weightTxt := ""
+	if req.Weight != nil && *req.Weight > 0 {
+		weightTxt = fmt.Sprintf("，权重 %d", *req.Weight)
+		if req.Dynamic != nil && *req.Dynamic {
+			weightTxt += "（动态基数上限）"
+		}
+	} else if req.Dynamic != nil {
+		weightTxt = "，动态 weight " + map[bool]string{true: "开", false: "关"}[*req.Dynamic]
+	}
 	s.appendOps("underlay.change", id.TenantID, 0, id.Username, "info",
-		fmt.Sprintf("修改隧道 %s（颜色 %d）", tun.ID, tun.Color))
+		fmt.Sprintf("修改隧道 %s（颜色 %d%s）", tun.ID, tun.Color, weightTxt))
 	writeJSON(w, map[string]any{
 		"ok":       true,
 		"tunnel":   buildTunnelView(st, &tun, serialMap(views), views),
@@ -423,11 +450,13 @@ func (s *server) saveUnderlayTunnel(w http.ResponseWriter, r *http.Request, id c
 func (s *server) saveUnderlayFan(w http.ResponseWriter, id consoleIdentity, st *underlay.State,
 	views map[uint16]underlay.NodeView, req underlayTunnelRequest, path *underlay.TunnelPath, createdTmpl string, now int64) {
 	res, err := st.Fan(underlay.FanRequest{
-		Local: underlay.EndpointSpec{NodeID: req.A.NodeID, Iface: req.A.Iface, Addr: strPtr(req.A.Addr), Port: req.A.Port},
-		Peers: req.Peers,
-		Path:  path,
-		Color: u8Val(req.Color),
-		Now:   now,
+		Local:   underlay.EndpointSpec{NodeID: req.A.NodeID, Iface: req.A.Iface, Addr: strPtr(req.A.Addr), Port: req.A.Port},
+		Peers:   req.Peers,
+		Path:    path,
+		Color:   u8Val(req.Color),
+		Weight:  u8Val(req.Weight),
+		Dynamic: req.Dynamic != nil && *req.Dynamic,
+		Now:     now,
 	}, views)
 	if err != nil {
 		if createdTmpl != "" {

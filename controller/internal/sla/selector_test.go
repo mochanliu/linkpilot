@@ -2,6 +2,7 @@ package sla
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"testing"
 
@@ -13,9 +14,10 @@ type fakePlane struct {
 	probes []vppapi.ProbeStats
 	routes map[uint32]map[netip.Prefix]bool
 	// deag[table] = 最近一次写进这张选路表的默认路由指向的表号（即选中的颜色表）。
-	deag     map[uint32]uint32
-	probeErr error
-	written  int
+	deag      map[uint32]uint32
+	probeErr  error
+	routesErr error // 模拟连接断开（VPP 重启中）：IPRoutes 报错
+	written   int
 }
 
 // newSelectorWith 把 fakePlane 接进选择器（dial 形状与生产一致）。
@@ -31,6 +33,9 @@ func (f *fakePlane) Probes(context.Context) ([]vppapi.ProbeStats, error) {
 }
 
 func (f *fakePlane) IPRoutes(_ context.Context, table uint32) ([]netip.Prefix, error) {
+	if f.routesErr != nil {
+		return nil, f.routesErr
+	}
 	out := make([]netip.Prefix, 0, len(f.routes[table]))
 	for p := range f.routes[table] {
 		out = append(out, p)
@@ -291,5 +296,48 @@ func TestNoCandidatesKeepsCurrent(t *testing.T) {
 	}
 	if p.written != 1 {
 		t.Fatalf("决策不变不应重写，实际 %d 次", p.written)
+	}
+}
+
+// 实机缺陷复现（CPE1 2026-11-11，跨站客户流量全黑）：VPP 重启后 apply 管道把
+// 选路表的 0/0 重种成 drop，表"存在"了；而 agent 内存里 written 还是 true、
+// 决策也没变 —— 只看存在性会把种子 drop 当成自己写的路由，永远不再写，
+// 0/0 落 dpo-drop。连接代数修复：重拨换代后必须幂等重写一次，盖掉 drop。
+func TestSeedDropRouteReplacedAfterVPPRestart(t *testing.T) {
+	f := &fakePlane{}
+	s := newSelectorWith(f)
+	s.Reconcile([]Row{row(1, 10001)}, []Tunnel{tunnel(10, 3, 2)})
+	f.probes = []vppapi.ProbeStats{probe(10, 100, 0, 8_000, 1_000)}
+	p := f
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if p.written != 1 {
+		t.Fatalf("首拍应写一次路由，实际 %d", p.written)
+	}
+	// VPP 重启：表清空 → apply 重种 drop 0/0；连接断开一拍（读表报错）。
+	seed := netip.MustParsePrefix("0.0.0.0/0")
+	p.routes = map[uint32]map[netip.Prefix]bool{10001: {seed: true}}
+	p.routesErr = errors.New("vpp 重启中")
+	if err := s.Tick(context.Background()); err == nil {
+		t.Fatal("连接断开时这一拍应报错")
+	}
+	// VPP 回来了：连接重拨（换代），表里有 drop 0/0。
+	p.routesErr = nil
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if p.written != 2 {
+		t.Fatalf("换代后应幂等重写盖掉 drop 路由，实际写了 %d 次", p.written)
+	}
+	if got := p.deag[10001]; got != 2000 {
+		t.Fatalf("选路表 10001 应指向颜色表 2000（drop 被盖掉），实际 %v", got)
+	}
+	// 稳定后不再多写。
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if p.written != 2 {
+		t.Fatalf("稳定后不应重写，实际 %d 次", p.written)
 	}
 }

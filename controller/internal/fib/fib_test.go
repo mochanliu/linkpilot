@@ -1221,3 +1221,58 @@ func containsTable(ts []uint32, want uint32) bool {
 	}
 	return false
 }
+
+// UCMP：weight 跟着隧道进 Path（fibPaths 再写进 vl_api_fib_path_t 的 weight
+// 字节）。同桶两条路径 10:30 就是 10:30——比例由 VPP 复制桶时兑现。
+func TestPlanFromWeightPropagation(t *testing.T) {
+	plan, err := planFrom(
+		[]uint8{100},
+		[]RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2", "10.255.0.3")},
+		[]Tunnel{
+			{NextHop: "10.255.0.2", Interface: "wg0", Weight: 10},
+			{NextHop: "10.255.0.3", Interface: "wg1", Weight: 30},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := mustRoute(t, plan, 100, "10.1.0.0/24").Paths
+	if len(paths) != 2 {
+		t.Fatalf("paths = %+v, want 2 条", paths)
+	}
+	if paths[0].Weight != 10 || paths[1].Weight != 30 {
+		t.Errorf("weights = %d/%d, want 10/30", paths[0].Weight, paths[1].Weight)
+	}
+
+	// 默认：没配 weight 的隧道 Path.Weight = 0（vppapi 写协议缺省 1），
+	// 0 与"没填"是同一个事实，不需要区分。
+	plan, err = planFrom(
+		[]uint8{100},
+		[]RIBRoute{ribOne(100, "10.1.0.0/24", "10.255.0.2")},
+		[]Tunnel{{NextHop: "10.255.0.2", Interface: "wg0"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := mustRoute(t, plan, 100, "10.1.0.0/24").Paths[0]; p.Weight != 0 {
+		t.Errorf("默认 weight = %d, want 0（下发时折成 1）", p.Weight)
+	}
+}
+
+// weight 必须在路径身份里：改权重不改身份的后果是配置发布成功但桶不重建，
+// "显示 UCMP 实际 ECMP"这种最安静的错法。
+func TestPathIdentityIncludesWeight(t *testing.T) {
+	a := []Path{{NextHop: netip.MustParseAddr("10.255.0.2"), Interface: "wg0", Label: 1100}}
+	b := append([]Path(nil), a...)
+	b[0].Weight = 30
+	if pathIdentityEqual(a, b) {
+		t.Error("weight 变了 pathIdentityEqual 还说相等——UCMP 不会生效")
+	}
+	if equalPaths(a, b) {
+		t.Error("weight 变了 equalPaths 还说相等——增量判断会漏掉这次下发")
+	}
+	b[0].Weight = 0
+	if !pathIdentityEqual(a, b) {
+		t.Error("weight 相同（含同为 0）应视为相等")
+	}
+}

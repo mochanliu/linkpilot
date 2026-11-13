@@ -621,3 +621,24 @@ func TestHealthTickRedialsDeadVPPWithoutAnyEvent(t *testing.T) {
 		t.Fatalf("/status 没如实说恢复成功: %+v", st.Last)
 	}
 }
+
+// weight 从隧道表到 fib.Tunnel 到 configDoc 往返不丢（UCMP 的唯一入口）。
+// 注意发放纪律：本进程的 JSON 解码是 DisallowUnknownFields —— 老版本收到带
+// weight 的 PUT 会整份拒绝，所以升级顺序必须先 sr-fib 后 agent。
+func TestTunnelWeightPlumbing(t *testing.T) {
+	out := fibTunnels([]tunnelConfig{{NextHop: "10.255.0.2", Interface: "wg0", Color: 2, Weight: 30}})
+	if len(out) != 1 || out[0].Weight != 30 {
+		t.Fatalf("fibTunnels 丢了 weight: %+v", out)
+	}
+	doc := configOf(liveConfig{VRFs: []uint8{10}, Tunnels: out})
+	if len(doc.Tunnels) != 1 || doc.Tunnels[0].Weight != 30 {
+		t.Fatalf("configOf 丢了 weight: %+v", doc.Tunnels)
+	}
+	back, err := doc.live()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Tunnels) != 1 || back.Tunnels[0].Weight != 30 {
+		t.Fatalf("live() 丢了 weight: %+v", back.Tunnels)
+	}
+}

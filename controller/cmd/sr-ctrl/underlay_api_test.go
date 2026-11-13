@@ -157,6 +157,8 @@ type tunnelReq struct {
 	Path      *pathReq     `json:"path,omitempty"`
 	ClearPath bool         `json:"clear_path,omitempty"`
 	Color     *uint8       `json:"color,omitempty"`
+	Weight    *uint8       `json:"weight,omitempty"`
+	Dynamic   *bool        `json:"dynamic,omitempty"`
 }
 
 type hopReq struct {

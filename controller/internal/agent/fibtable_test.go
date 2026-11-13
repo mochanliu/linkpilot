@@ -343,3 +343,33 @@ func TestFibTablePushesEmptyAfterSyncedOnce(t *testing.T) {
 		t.Fatalf("tunnels = %+v, want 空（控制器删光了）", doc.Tunnels)
 	}
 }
+
+// weight 行：0/1 不写字节（与老配置同形，diff 不翻行），>1 原样写。
+// sr-fib 是 DisallowUnknownFields 的，键名与它的 tunnelConfig 逐字对齐。
+func TestFibRowWeightJSON(t *testing.T) {
+	b, err := json.Marshal(fibRowDoc{NextHop: "10.0.0.1", Interface: "wg0", Color: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "weight") {
+		t.Errorf("默认权重不该出现 weight 键（字节要和老配置同形）: %s", b)
+	}
+	b, err = json.Marshal(fibRowDoc{NextHop: "10.0.0.1", Interface: "wg0", Color: 2, Weight: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"weight":30`) {
+		t.Errorf("weight 30 应写成 \"weight\":30: %s", b)
+	}
+}
+
+// task 54 的口径：effectiveWeight = 配置值原样（0 = 默认 1，落成"不写"）。
+// task 56 接管后 Dynamic 开的行由档位函数输出——那条路径由它自己的测试钉。
+func TestEffectiveWeightStatic(t *testing.T) {
+	if got := effectiveWeight(FibTunnelRow{Weight: 30}); got != 30 {
+		t.Errorf("effectiveWeight(30) = %d, want 30", got)
+	}
+	if got := effectiveWeight(FibTunnelRow{}); got != 0 {
+		t.Errorf("effectiveWeight(缺省) = %d, want 0", got)
+	}
+}
