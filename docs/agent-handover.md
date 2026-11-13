@@ -159,7 +159,11 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `a8346c270413418e86c294f304222640`（2026-11-14 08:00，监控页
+当前代际：sr-ctrl `fbf68651e26cdee1aaf706938c08d4ba`（2026-11-14 08:35，趋势图加
+第二级隧道选择器（hist-tq/hist-tpick，可搜索，匹配对端/颜色）：单设备可能上千条
+隧道全画没法看；隧道清单来自当前设备采样，选中就地重画不重拉；histCharts 按
+"对端/颜色" 键过滤，换设备清零隧道选择；两个选择器共享冻结位）。
+上一代 `a8346c270413418e86c294f304222640`（2026-11-14 08:00，监控页
 趋势图设备选择改搜索选择器 + 冻结护栏：/api/history 按台过滤本就正常，「图不变」
 是图上不标设备 + 5s 轮询把展开的下拉拆掉没点完的选择；面板标题带设备名、图例
 反查对端序列号、S.freeze 展开期间冻结重绘切页解冻、mousedown 选中，测试钉五处）。
