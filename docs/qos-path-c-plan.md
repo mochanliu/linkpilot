@@ -1018,6 +1018,45 @@ lab（`test/lab/vpp-qos/lab-qos-egress.sh`，双 VPP 实例 A/B + linux bridge�
   interface` 的 public-key 字段），传私钥会握手 Invalid MAC；
   `wireguard create` 不带 `src` 时握手外层源是垃圾值（ttl 62、src 94.117.0.0）。
 
+### 13.5 实机部署 + 精确整形测量（2026-11-13 上午，CPE4，版本 1.1.0）
+
+**部署（换件纪律第四次执行，零失联）**：容器重建 → 1.1.0（md5 `c1cec62f…`，
+`scp` 到 `/root/sr_wg_plugin.qos8.so`，不动盘上原件）→ `systemd-run` 先起
+`qosguard`（180s 判活，三锚点）再起 `qos4-deploy.sh`（备份 `.bak-qos4-HHMMSS`
+→ install → restart vpp → 快照）。result.txt=OK，插件 1.1.0 在跑，
+`sr-wg4-qos-out` 实测挂在 interface-output 弧，标记器/调度器默认全关直通。
+
+**精确整形测量（cust4→CPE4→隧道→cust12，受控 UDP 洪泛 1200B×~10k pps，
+CPE4 秒级采样 `show sr-wg qos` 的队列 tx 字节）**：
+
+| 测试 | 流量 | 实测 | 目标 | 结论 |
+| --- | --- | --- | --- | --- |
+| T1 BE 洪泛 | DSCP0→q3 | 平台期 959.8~1016.2 kbps，均值 **≈985 kbps**（20+ 秒逐秒） | 1000 kbps | 98.4%，符合（令牌粒度+5ms burst 桶量化）；洪泛结束 1s 内跌回 ~30 kbps 背景，排空干净 |
+| T2 EF 洪泛 | DSCP46→q0 | 均值 **209.8 kbps**，LLQ 压限 22,576 次、压住的包留队列不丢 | 20%×1000=200 | LLQ 上限生效（偏差 ~5%，含采样噪声）；超额部分尾部丢 |
+| T3 EF+BE 并发 | 双流 | q0 **213.8** + q3 **833.1** ≈ 1047 kbps | 200+800 | 调度器分带宽正确（总和≈shaper 上限，偏差含采样噪声） |
+| T4 rate=0 直通 | BE 洪泛 | feature 自动摘除（对照项，未取到干净数——见下面环境问题） | — | 直通路径本身已被 T1 前后背景流量与昨晚容器 lab 验证 |
+
+尾部丢包与积压符合设计：T1 期间 q3 积压顶满 16/16（为保护隧道 BFD 有意
+把 q3 深度调到 16），40 万+ 包尾部丢弃，洪泛结束立即排空、0 残留；
+q0/q1/q2 无误伤（q0 drop 全部来自 T2 的 EF 超额）。
+
+**当天踩到的两个环境问题（都与插件无关，判据已固定）**：
+1. **`trace add` 大容量（3000/20000）会把这台 VPP 打崩**：09:28:05 SIGABRT，
+   栈顶 = `vlib_add_trace → vec_realloc → clib_mem_heap_realloc_aligned` 堆耗尽
+   → os_panic（VPP 主堆 256M，插件帧不在栈上）。结论：CPE4 上排查流量一律用
+   `pcap trace` 或 `trace add <node> ≤100`，重启后 agent（vpp.log 的
+   `lcp lcp-sync`/`set interface state up` 批量命令）会自动重建隧道，约 1~2 分钟。
+2. **cust4↔CPE4 的 L2 段突发丢包（VirtualBox 内部网，间歇性）**：洪泛期间
+   VPP `host-enp0s8` rx 计数不动（包根本没进 VPP），cust4 侧 NIC 0 drop 全部
+   发出；单包正常、10k pps 突发时好时坏；同批进 VPP 的包 wg1014 累计转发
+   144MB 无异常。判据：**接口 rx 计数不动 = 丢在 VPP 之前**，与插件无关
+   （插件只能碰已进 VPP 的包）。T1~T3 测量值不受影响——整形速率只由
+   队列出队决定，入口侧丢多少都只影响"能不能打满"，本测试远超打满所需。
+
+**部署后状态**：rate=0、hook 关、队列深度还原 128（默认全关直通）；
+BFD 3 会话在配置，双向连通验证通过（cust4 单探针到 cust12 ✓，
+cust12→172.16.4.1 反向 ✓）。console/重标记 CLI 仍未做（§13.3 待办）。
+
 ---
 
 ## 8. 这份文档不承诺的东西

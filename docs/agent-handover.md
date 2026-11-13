@@ -191,8 +191,16 @@ tunnels     0 条：VPP 里的 wg 口是 sr-agent -tunnels 从**控制器**取�
 **当晚深夜同一版本又部署了 4 次，全部健康**（`/var/log/qos-deploy/result.txt` 全 `OK`），
 容器里 6 案例复现也全 PASS（`test/lab/vpp-qos/lab-o3-repro.sh`）。所以 §10.6 的
 "上盒即瘫"**不能归因于 O3 的弧选择**，根因仍未明；纪律从"O3 禁部署"改成
-**"换件必须带看门狗 + 备份"**（见下）。CPE4 现在跑的就是 O3 版（md5 见 `deploy.log`），
-`show sr-wg qos-hook` 可确认节点在、钩子默认全关。
+**"换件必须带看门狗 + 备份"**（见下）。
+
+**2026-11-13 上午已换代为 §13 版（1.1.0，qos8）**：物理口统一调度
+（`sr-wg4-qos` 退化成标记器 + 新增 `sr-wg4-qos-out` 挂 interface-output 弧，
+CLI 全默认关）。实机精确测量与两个环境坑记在 `docs/qos-path-c-plan.md` §13.5。
+**在 CPE4 上排查流量别用大容量 `trace add`（>100 会把 256M 主堆的 VPP 打崩，
+栈=`vlib_add_trace` 堆耗尽）**，用 `pcap trace` 或小容量 trace；
+VPP 重启后 agent 自动重建隧道（~1-2 分钟），期间转发是断的，别误判成换件事故。
+CPE4 现跑 1.1.0（md5 `c1cec62f…`，`show plugin` 版本号可验），
+`show sr-wg qos-hook` / `show sr-wg qos` 确认默认全关。
 
 **换件流程（2026-11-12 夜定型，4 次零失联）**
 
