@@ -1,13 +1,17 @@
-# SD-WAN CPE 数据面架构
+# LinkPilot SD-WAN CPE 数据面架构
 
 ## 系统概览
 
-本项目实现一套基于 VPP（Vector Packet Processing）的高性能 SD-WAN CPE 数据面，
+LinkPilot 实现一套基于 VPP（Vector Packet Processing）的高性能 SD-WAN CPE 数据面，
 结合 SR（Source Routing）源路由与 WireGuard 加密隧道，由 Go 控制器统一管理。
+
+> **产品名**：LinkPilot。界面文案与文档叙述提到这套产品时用 LinkPilot；
+> 代码标识符、二进制名、文件名与环境变量保留原有的 `sr-*` / `vbond` 写法（内部代号，
+> 不随产品名改），历史实验记录里的旧称也保留原样。
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    vBOND Controller (sr-ctrl)                 │
+│               LinkPilot Controller (sr-ctrl)                │
 │  ┌──────────┐  ┌──────────────┐  ┌───────────────────────┐  │
 │  │Enroll/CA │  │Registry+Watch│  │  Tunnel Param Push    │  │
 │  └────┬─────┘  └──────┬───────┘  └───────────────────────┘  │
@@ -40,7 +44,7 @@
 使用 VPP 内置或第三方 WG 插件完成 Noise IK 握手与数据加密。
 SR Header 位于 WG 加密载荷之外（明文），保证中转节点可路由但不可篡改（HMAC 保护）。
 
-### 3. Go Controller（controller/）—— 项目内简称 vBOND
+### 3. Go Controller（controller/）—— LinkPilot 控制器
 
 独立 Go 模块 `sdwan/controller`，**零第三方依赖**（VPP 侧走 vppctl，不引 govpp）。
 职责 = CPE 安全入网 + NAT 地址发现 + 隧道参数下发，协议是 JSON over mTLS：
@@ -58,7 +62,7 @@ SR Header 位于 WG 加密载荷之外（明文），保证中转节点可路由
 - **test/scripts/test-vbond.sh**：acceptance harness（复用数据面实验室的 `docker_net_ctrl`）。
 - **test/scripts/vbond-client.sh**：openssl+curl 的手工客户端，不依赖 agent。
 
-#### vBOND 的三条定案（2026-10-17）
+#### LinkPilot 控制器的三条定案（2026-10-17）
 
 1. **地址发现不另开探针 socket**：探针就是 WG 自己的 persistent-keepalive。CPE 把已入网的
    观测节点配成一个 WG peer，keepalive 从数据面真正要用的那个 socket 出去；观测节点记录

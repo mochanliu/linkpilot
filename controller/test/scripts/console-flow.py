@@ -13,7 +13,7 @@ A 段输出：
   unauth_state=401          没有会话读状态必须被拒
   bad_login=401             错误 token 必须被拒
   login=200                 正确 token 换到会话 cookie
-  page=SROU 控制台           单页控制台能取到
+  page=LinkPilot 控制台        单页控制台能取到
   state_tenants=<n>         登录后能读到状态
   tenant=tenant-new         建租户
   tenant_account=...        建租户同时得到第一个租户账号
@@ -278,7 +278,7 @@ if code != 200:
 
 # 4. 控制台页面
 code, raw = call("GET", CONSOLE + "/")
-say("page", "SROU 控制台" if code == 200 and "SROU 控制台".encode() in raw else "missing")
+say("page", "LinkPilot 控制台" if code == 200 and "LinkPilot 控制台".encode() in raw else "missing")
 
 # 5. 登录后读状态
 code, raw = call("GET", CONSOLE + "/api/state")

@@ -187,7 +187,7 @@ cfeq() {  # cfeq <key> <expected> <message>
 cfeq unauth_state 401 "无会话读控制台状态被 401 拒绝"
 cfeq bad_login 401 "错误 token 登录被 401 拒绝"
 cfeq login 200 "正确 token 换到控制台会话"
-cfeq page "SROU 控制台" "控制台单页能取到"
+cfeq page "LinkPilot 控制台" "控制台单页能取到"
 cfeq tenant tenant-new "控制台创建租户 tenant-new"
 cfeq tenant_account tenant-new-admin "建租户同时开出该租户的登录账号"
 cfeq grant_has_code false "下发的授权里没有 code 字段（运营方看不到码）"

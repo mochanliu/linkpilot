@@ -22,7 +22,7 @@
 
   <rect class="bg" x="0" y="0" width="1240" height="1224"/>
 
-  <text class="h1" x="40" y="38">SROU 控制面架构</text>
+  <text class="h1" x="40" y="38">LinkPilot 控制面架构</text>
   <text class="h2" x="40" y="62">实线 = 已实现 · 虚线 = 计划中 · 控制器不在转发路径上（控制面失效时，已有隧道继续转发）</text>
 
   <text class="sec" x="40" y="98">北向 / 运维</text>

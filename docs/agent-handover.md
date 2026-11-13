@@ -159,9 +159,10 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `e2a787e572730e3553ccfb7315912edf`（2026-11-13 晚，FEC 全链 +
-控制台勾选框；上一代 `b1a4ccd14aba134b66221be4c483f141` 只差页面那 20 行，
-备份 `sr-ctrl.prev-fecui-20261113` / `sr-ctrl.prev-fec-20261113`）。上一代功能面：
+当前代际：sr-ctrl `5e8fe94fce4495f85b679c45391bbc6b`（2026-11-13 21:45，只改界面文案：
+SROU → LinkPilot，功能面与上一代逐字相同；上一代 `f5dc4d3a1c105e46bdf3cf726ffec95b`
+是控制台 HTTPS 那版，备份 `sr-ctrl.prev-brand-20261113`；再上一代 `e2a787e5…`
+是 FEC 全链 + 控制台勾选框，备份 `sr-ctrl.prev-fecui-20261113` / `sr-ctrl.prev-fec-20261113`）。上一代功能面：
 sr-ctrl `76f9c959f0ca0a9fba33e5e50542ebb7`（2026-11-13 深夜，M-3 抬门：
 同对端第二条隧道走密钥槽派生 `allocPairSlot`（上限 8，`ErrPairFull` 409）、
 Tunnel 视图/控制台新增 slot 字段、Fan 每对仍只建一条；实机 1↔4 对 t10(w10)+t16(w30)
