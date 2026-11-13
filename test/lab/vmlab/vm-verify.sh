@@ -232,12 +232,14 @@ fib_check() {     # <node> <host>；证据行写到 $WORKDIR/fib-<node>.note
 #   ① 磁盘 fib.json 里还是 0 条（派生器只改内存、不落盘，见 fibtable.go 的注释）；
 #   ② 盒里现在非空（人没插手的话，非空只可能来自运行时 PUT）；
 #   ③ agent.log 最后一条「隧道表已收敛：N 行」的 N 等于盒里条数（写的人自报）。
+# 2026-11-13：agent.log 里混进了二进制字节，不带 -a 的 grep 会在中途静默截断
+# 匹配输出（实测：只吐到 2026/11/12 16:13 那行，把最后一推误读成 0 行 → 假 FAIL）。
 fib_source_check() {   # <node> <host>
     local n=$1 h=$2 mem disk lin last
     mem=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])).get("tunnels") or []))' \
           "$WORKDIR/fib-$n.json" 2>/dev/null)
     disk=$(ssh_run "$h" "python3 -c 'import json;d=json.load(open(\"/etc/sdwan/fib.json\"));print(len(d.get(\"tunnels\") or []))'" 2>/dev/null)
-    lin=$(ssh_run "$h" "grep '隧道表已收敛：' /var/log/sr-box/agent.log 2>/dev/null | tail -1")
+    lin=$(ssh_run "$h" "grep -a '隧道表已收敛：' /var/log/sr-box/agent.log 2>/dev/null | tail -1")
     last=$(printf '%s' "$lin" | sed -n 's/.*隧道表已收敛：\([0-9]*\) 行.*/\1/p')
     if [ -z "${mem:-}" ] || [ -z "${disk:-}" ]; then
         bad "$h: 反向取证取不到数（盒里 ${mem:-?} 条、磁盘 ${disk:-?} 条）"

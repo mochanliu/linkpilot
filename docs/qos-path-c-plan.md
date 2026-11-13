@@ -1096,6 +1096,16 @@ tap 内联 L2 跳）：重写外层 ToS 并**重算 IP 校验和**，真实模�
 sr-ctrl 已换装上线（md5 `6bfdfccd4c016ce05737c4411a4b61cf`，备份
 `sr-ctrl.prev-20261113qos`），控制台 QoS 面板已可编辑。
 
+**落地实况（2026-11-13 下午，全部按上述纪律执行）**：
+- **插件 1.1.0 四台换齐**（CPE1/2/3 当天上午，CPE4 上午已在）：盒间 HTTP 铺件（226KB/s）
+  + 移植版看门狗（BAK 在 sleep 后解析、锚点按盒定制），三台 result.txt 全 OK、
+  隧道自动重建、BFD 0% 丢、`show sr-wg qos-hook` 默认关。换后 `exp-273/six.sh` 六方向 0% 丢。
+- **QoS 配置经管理面真实下发（CPE4，v5）**：API PUT/发布 → agent 拉取 → sr-apply 执行 →
+  hook 挂 host-enp0s8、host-enp0s9 shaper 1000kbps 生效（突发过流 q3、0 丢、积压排空），
+  boot 重放 v5 幂等 ok。CPE1/2/3 **有意不下发速率**（无实测基线，配小掐 BFD）。
+- **vm-verify 口径修复**：agent.log 混有二进制字节，`fib_source_check` 的 grep 不带 `-a`
+  会静默截断输出、把「最后一推 3 行」误读成 0 行造成假 FAIL；修复后全量 **406/0/0**。
+
 ---
 
 ## 8. 这份文档不承诺的东西

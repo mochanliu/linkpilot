@@ -195,14 +195,29 @@ tunnels     0 条：VPP 里的 wg 口是 sr-agent -tunnels 从**控制器**取�
 "上盒即瘫"**不能归因于 O3 的弧选择**，根因仍未明；纪律从"O3 禁部署"改成
 **"换件必须带看门狗 + 备份"**（见下）。
 
-**2026-11-13 上午已换代为 §13 版（1.1.0，qos8）**：物理口统一调度
+**2026-11-13 已换代为 §13 版（1.1.0，qos8）——四台全部换齐（CPE1/2/3 当天上午，零失联）**：物理口统一调度
 （`sr-wg4-qos` 退化成标记器 + 新增 `sr-wg4-qos-out` 挂 interface-output 弧，
 CLI 全默认关）。实机精确测量与两个环境坑记在 `docs/qos-path-c-plan.md` §13.5。
+CPE1/2/3 的换件用的是 CPE4 同款纪律的移植版：脚本与 `.so`（md5 `c1cec62f…`）经
+CPE4→目标盒的盒间 HTTP（226KB/s）铺到 `/root/sr_wg_plugin.qos8.so` + `/root/qos-{guard,deploy}.sh`
+（guard 与 CPE4 版的差异：BAK 在 sleep 180 **之后**才解析 `bak-qos4-*`——换件先起看门狗时盘上还没有备份；
+锚点按盒定制：CPE1/2=192.168.1.1+172.16.12.1，CPE3=192.168.1.1+172.16.3.1，预检实测可达），
+`systemd-run` 先 qosguard 后 qosdeploy，三台 result.txt 全 OK、wg 隧道自动重建、BFD 0% 丢。
+四台回滚底都是盘上 `sr_wg_plugin.so.bak-qos4-*`。
 **在 CPE4 上排查流量别用大容量 `trace add`（>100 会把 256M 主堆的 VPP 打崩，
 栈=`vlib_add_trace` 堆耗尽）**，用 `pcap trace` 或小容量 trace；
 VPP 重启后 agent 自动重建隧道（~1-2 分钟），期间转发是断的，别误判成换件事故。
-CPE4 现跑 1.1.0（md5 `c1cec62f…`，`show plugin` 版本号可验），
-`show sr-wg qos-hook` / `show sr-wg qos` 确认默认全关。
+四台现跑 1.1.0（md5 `c1cec62f…`，`show plugin` 版本号可验），
+`show sr-wg qos-hook` / `show sr-wg qos` 确认（CPE4 已由管理面下发开启，见下）。
+
+**2026-11-13 QoS 配置已经管理面真实下发（CPE4，bundle v5）**：控制台 API（租户会话）
+PUT /api/config 加 `qos:[{ingress:host-enp0s8, egress:host-enp0s9, rate_kbps:1000, llq_pct:0}]` →
+POST /api/config/publish → agent 心跳拉取 → sr-apply 执行 → 实测 hook 挂上
+host-enp0s8（按内层 DSCP 标记）、host-enp0s9 shaper 1000kbps 生效（q3 过流 0 丢），
+`sr-apply boot` 重放 v5 也 ok（幂等）。CPE1/2/3 **有意不下发速率**——没有实测基线，
+速率配小了会掐 BFD/业务，等 owner 拍各盒口径。**vm-verify 的 `fib_source_check` 修了一处
+测试口径缺陷：agent.log 里混有二进制字节，不带 `-a` 的 grep 会静默截断匹配输出，
+把「最后一推 3 行」误读成「0 行」造成假 FAIL（2026-11-13 实测，修复后 406/0/0）**。
 
 **换件流程（2026-11-12 夜定型，4 次零失联）**
 
