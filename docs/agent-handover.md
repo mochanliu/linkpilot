@@ -159,7 +159,11 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `6588070e49f01dfda3bf8cfd04ccadd1`（2026-11-14 07:30，两件事：
+当前代际：sr-ctrl `a8346c270413418e86c294f304222640`（2026-11-14 08:00，监控页
+趋势图设备选择改搜索选择器 + 冻结护栏：/api/history 按台过滤本就正常，「图不变」
+是图上不标设备 + 5s 轮询把展开的下拉拆掉没点完的选择；面板标题带设备名、图例
+反查对端序列号、S.freeze 展开期间冻结重绘切页解冻、mousedown 选中，测试钉五处）。
+上一代 `6588070e49f01dfda3bf8cfd04ccadd1`（2026-11-14 07:30，两件事：
 ① 基础配置第 8 个模块——VRRP 从接口配置页独立成页 `config-vrrp`，模型不拆，
 接线五处照旧由 console_nav_test 钉住；② 界面文案删掉实现机制/修改过程说明
 （FRR/zebra/linux-nl/VPP 内部、sr-svc/sr-fib 分工、配置包第 N 段、
@@ -182,7 +186,7 @@ ServicesSet 与同一台当前设备（`svFollowCfg`），侧栏改成 flex+滚�
 用全经度矩形裁剪不切日期变更线，改回 d3 默认 antimeridian 裁剪，纬度裁剪改由
 fit 框承担；gen.mjs 加了"框内不得有横向长直线"检查），备份
 `sr-ctrl.prev-modules-20261113`；上一代备份 `sr-ctrl.prev-natnote-20261114`、
-`sr-ctrl.prev-vrrppage-20261114`；再往前
+`sr-ctrl.prev-vrrppage-20261114`、`sr-ctrl.prev-histpick-20261114`；再往前
 `6d775b48…` 是拓扑图嵌 Dashboard 那版，备份
 `sr-ctrl.prev-fix-20261113`；`5e8fe94f…`（LinkPilot 改名）备份
 `sr-ctrl.prev-topo-20261113`、`f5dc4d3a…`（HTTPS）备份
