@@ -64,6 +64,14 @@ type FibTableSync struct {
 	mu       sync.Mutex
 	busy     bool
 	lastNote string // 只在 mu 内读写：同一句原因不每拍刷一行
+
+	// 动态 weight 状态（task 56）：隧道 id → 迟滞状态机。MaybeRun 的 busy
+	// 拼合保证同一时刻只有一轮 Sync 在跑，但 Sync 在自己的 goroutine 里、
+	// 测试也会顺序多轮调用，稳妥起见仍上一把锁。probeErr 是"探针读不到"
+	// 的一次性告警旗（恢复时喊一声，别每拍刷屏）。
+	dynMu    sync.Mutex
+	levels   map[string]*levelTracker
+	probeErr bool
 }
 
 // NewFibTableSync wires the deriver. logf may be nil.
@@ -77,6 +85,7 @@ func NewFibTableSync(ts *TunnelSync, routeConfPath, fibConfPath string, logf fun
 		fibConfPath:   fibConfPath,
 		hc:            &http.Client{Timeout: 5 * time.Second},
 		logf:          logf,
+		levels:        map[string]*levelTracker{},
 	}
 	f.readVRFs = func() ([]int, error) { return readRouteVRFs(routeConfPath) }
 	f.readFB = func() ([]FibFallback, error) { return nil, nil }
@@ -206,6 +215,15 @@ func (f *FibTableSync) Sync(ctx context.Context) error {
 	for _, i := range ifaces {
 		byIdx[i.SWIfIndex] = i.Name
 	}
+	// 动态行需要探针丢包率：有动态行才读（纯静态盒子不多跑一趟 dump）。
+	// nil = 读不到，动态行本轮全部冻结在上一档（见 applyDynamic）。
+	var lossByIf map[uint32]uint32
+	for _, r := range rows {
+		if r.Dynamic {
+			lossByIf = f.readLoss(ctx)
+			break
+		}
+	}
 	tunnels := make([]fibRowDoc, 0, len(rows))
 	var skipped []string
 	for _, r := range rows {
@@ -215,9 +233,14 @@ func (f *FibTableSync) Sync(ctx context.Context) error {
 			skipped = append(skipped, fmt.Sprintf("%s(sw_if_index %d 不在接口表里)", r.TunnelID, r.SWIfIndex))
 			continue
 		}
+		weight := effectiveWeight(r)
+		if r.Dynamic {
+			weight = f.applyDynamic(r, lossByIf)
+		}
 		tunnels = append(tunnels, fibRowDoc{NextHop: r.NextHop, Interface: name, Color: *r.Color,
-			Weight: effectiveWeight(r)})
+			Weight: weight})
 	}
+	f.pruneLevelTrackers(rows)
 	sort.Slice(tunnels, func(i, j int) bool { return tunnels[i].NextHop < tunnels[j].NextHop })
 
 	base, err := f.baseURL()
@@ -489,13 +512,195 @@ func fibStatusBase(path string) (string, error) {
 	return "http://" + addr, nil
 }
 
-// effectiveWeight 把一行隧道读数折成 fib.json 里要写的 weight。
-// task 54（2026-11-13，本轮）：静态 —— 配置值原样（0 = 默认 1，omitempty
-// 落成"不写"，与老配置字节同形）。
-// task 56（owner 已拍未做）：Dynamic 开时由档位函数按探针 SLA 输出 1..Weight
-// 的有效值（丢包优先、四档、非线性，迟滞 3 拍 × 5s，一拍一个评估周期）；
-// Dynamic 关 = 恒配置值。sr-fib 对两者一视同仁：weight 变了 → 路径身份变了
-// → 重下发，它不需要知道值的来历。
+// effectiveWeight 把一行**静态**隧道读数折成 fib.json 里要写的 weight：
+// 配置值原样（0 = 默认 1，omitempty 落成"不写"，与老配置字节同形）。
+// 动态行（Dynamic 开）不走这里 —— 走 applyDynamic：丢包四档非线性、
+// 迟滞 3 拍 × 5s。sr-fib 对两者一视同仁：weight 变了 → 路径身份变了
+// → 重下发，它不需要知道值的来历（纯对账者）。
 func effectiveWeight(r FibTunnelRow) uint8 {
 	return r.Weight
+}
+
+// ==================== 动态 weight（task 56，owner 拍板参数） ====================
+//
+// owner 定案（2026-11-13）：
+//   - 丢包优先：档位只看探针 LossPermille，RTT/抖动不参与降档；
+//   - 四档非线性：丢包门槛 50/200/500‰ 间距非线性，份额 1 : ⅔ : ⅓ : 底也非线性；
+//   - 配置 weight 是**基数上限**：有效 weight ∈ [1, base]，不回写配置；
+//   - 迟滞：候选档位连续 3 拍成立才生效（一拍 = 一轮心跳 = 5s，共 15s）。
+//     探针的 128 槽滑窗本身有 ~38s 惯性（见 sr_wg_probe.h：300ms×128），
+//     再叠 15s 迟滞，瞬时抖动翻不动档位；
+//   - sr-fib 是纯对账者：它只看到 weight 数字变了（路径身份变了 → 重下发），
+//     不读探针、不知道档位的存在。
+const (
+	// 动态档位的丢包门槛（‰）。档 0 是"没有值得降档的丢包"，只有三个门槛。
+	dynLossL1Permille uint32 = 50
+	dynLossL2Permille uint32 = 200
+	dynLossL3Permille uint32 = 500
+	// 迟滞：候选档位连续成立多少拍才生效。一拍一轮心跳（-hb 5 → 5s）。
+	dynConfirmRounds = 3
+)
+
+// lossLevel 把探针丢包率折成档位 0..3（纯函数，边界由测试钉住）。
+func lossLevel(lossPermille uint32) uint8 {
+	switch {
+	case lossPermille >= dynLossL3Permille:
+		return 3
+	case lossPermille >= dynLossL2Permille:
+		return 2
+	case lossPermille >= dynLossL1Permille:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// weightForLevel 把（基数上限，档位）折成写进 fib.json 的有效 weight。
+// base 0 = 配置没填 weight = 默认 1 → 上限就是 1，四档全是 1："动态"开在
+// 没填 weight 的隧道上没有降档空间，这是"基数上限"语义的自然结果，不是缺陷。
+func weightForLevel(base uint8, level uint8) uint8 {
+	if base == 0 {
+		return 1
+	}
+	switch level {
+	case 1:
+		return u8ceil((uint16(base)*2 + 2) / 3) // ceil(⅔·base)
+	case 2:
+		return u8ceil((uint16(base) + 2) / 3) // ceil(⅓·base)
+	case 3:
+		return 1
+	default:
+		return base
+	}
+}
+
+func u8ceil(v uint16) uint8 {
+	if v < 1 {
+		return 1
+	}
+	if v > 255 {
+		return 255
+	}
+	return uint8(v)
+}
+
+// levelTracker 是一条隧道的档位状态机（迟滞所在）。
+type levelTracker struct {
+	seen  bool  // 已有首轮读数
+	eff   uint8 // 生效档位
+	cand  uint8 // 观察中的候选档位
+	agree int   // 候选已连续成立的拍数
+}
+
+// observe 喂入这一拍的档位读数，返回"生效档位是否变了"。
+//
+//   - 首轮：agent 重启后没有可恢复的状态（sr-fib 里的表是上代际推的，本轮
+//     派生要用一个起点），从**观察真值**起步 —— 从档 0 起步等于捏造一条
+//     "没丢包"的读数，重启恰好赶上链路劣化时会把满权重压到坏路径上。
+//   - 其后：候选与生效不同才计数，连续 dynConfirmRounds 拍成立即生效；
+//     中途读数跳走就重新数；候选与生效相同的拍清零重来。
+func (tr *levelTracker) observe(level uint8) bool {
+	if !tr.seen {
+		tr.seen, tr.eff, tr.cand, tr.agree = true, level, level, 0
+		return true
+	}
+	if level == tr.eff {
+		tr.cand, tr.agree = level, 0
+		return false
+	}
+	if level == tr.cand {
+		tr.agree++
+	} else {
+		tr.cand, tr.agree = level, 1
+	}
+	if tr.agree >= dynConfirmRounds {
+		tr.eff, tr.cand, tr.agree = level, level, 0
+		return true
+	}
+	return false
+}
+
+// readLoss 读全表探针会话，折成 sw_if_index → LossPermille。读不到返回 nil：
+// 动态行本轮全部冻结在上一档（测不到 ≠ 没丢包，也 ≠ 丢包变多），原因喊一次。
+func (f *FibTableSync) readLoss(ctx context.Context) map[uint32]uint32 {
+	dp := f.ts.DataPlane()
+	if dp == nil {
+		f.warnNoProbes("还没有数据面连接")
+		return nil
+	}
+	tel, ok := dp.(TelemetryPlane)
+	if !ok {
+		f.warnNoProbes("数据面连接 %T 不提供探针 API", dp)
+		return nil
+	}
+	probes, err := tel.Probes(ctx)
+	if err != nil {
+		f.warnNoProbes("读探针会话: %v", err)
+		return nil
+	}
+	f.warnNoProbes("")
+	out := make(map[uint32]uint32, len(probes))
+	for _, p := range probes {
+		out[p.SwIfIndex] = p.LossPermille
+	}
+	return out
+}
+
+// warnNoProbes 探针读不到喊一次，恢复后喊一次。每拍都喊会把心跳日志刷成瀑布。
+func (f *FibTableSync) warnNoProbes(format string, args ...any) {
+	f.dynMu.Lock()
+	defer f.dynMu.Unlock()
+	if format == "" {
+		if f.probeErr {
+			f.probeErr = false
+			f.logf("动态 weight：探针读数恢复，档位重新跟随")
+		}
+		return
+	}
+	if !f.probeErr {
+		f.probeErr = true
+		f.logf("动态 weight：本轮档位冻结（维持上一档）："+format, args...)
+	}
+}
+
+// applyDynamic 算一行动态隧道的有效 weight：档位由探针丢包决定，迟滞在此。
+// lossByIf == nil 或本行没有探针读数 = 无法测量 = 档位冻结（维持上一档，
+// 不推进迟滞计数）。
+func (f *FibTableSync) applyDynamic(r FibTunnelRow, lossByIf map[uint32]uint32) uint8 {
+	f.dynMu.Lock()
+	defer f.dynMu.Unlock()
+	tr := f.levels[r.TunnelID]
+	if tr == nil {
+		tr = &levelTracker{}
+		f.levels[r.TunnelID] = tr
+	}
+
+	loss, measured := lossByIf[r.SWIfIndex]
+	if !measured {
+		return weightForLevel(r.Weight, tr.eff)
+	}
+	before := tr.eff
+	tr.observe(lossLevel(loss))
+	if tr.eff != before {
+		f.logf("动态 weight：隧道 %s 档位 %d → %d（丢包 %d‰），weight %d → %d（基数上限 %d，迟滞 %d 拍）",
+			r.TunnelID, before, tr.eff, loss,
+			weightForLevel(r.Weight, before), weightForLevel(r.Weight, tr.eff), r.Weight, dynConfirmRounds)
+	}
+	return weightForLevel(r.Weight, tr.eff)
+}
+
+// pruneLevelTrackers 清掉已不在隧道表里的状态机：隧道删了，档位跟着走。
+// 隧道重建（同 id）从首轮真值重新起步，不带旧状态。
+func (f *FibTableSync) pruneLevelTrackers(rows []FibTunnelRow) {
+	live := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		live[r.TunnelID] = true
+	}
+	f.dynMu.Lock()
+	defer f.dynMu.Unlock()
+	for id := range f.levels {
+		if !live[id] {
+			delete(f.levels, id)
+		}
+	}
 }

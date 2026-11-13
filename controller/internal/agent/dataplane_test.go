@@ -102,8 +102,10 @@ type fakeVPP struct {
 	bfds      map[string]vppapi.BFDSession
 	// bfdAddErr / probeErr 让遥测这一半单独失败：用来测"遥测建不起来，隧道
 	// apply 必须整体失败"（静默跳过会让隧道看着通、策略却没有可达性依据）。
-	bfdAddErr error
-	probeErr  error
+	// probeDumpErr 是读方向：动态 weight 拿不到丢包读数要冻结档位。
+	bfdAddErr    error
+	probeErr     error
+	probeDumpErr error
 }
 
 func newFakeVPP() *fakeVPP {
@@ -1888,6 +1890,9 @@ func (f *fakeVPP) DelProbe(_ context.Context, swIfIndex uint32) error {
 }
 
 func (f *fakeVPP) Probes(context.Context) ([]vppapi.ProbeStats, error) {
+	if f.probeDumpErr != nil {
+		return nil, f.probeDumpErr
+	}
 	out := make([]vppapi.ProbeStats, 0, len(f.probes))
 	for _, st := range f.probes {
 		out = append(out, st)

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -363,13 +364,250 @@ func TestFibRowWeightJSON(t *testing.T) {
 	}
 }
 
-// task 54 的口径：effectiveWeight = 配置值原样（0 = 默认 1，落成"不写"）。
-// task 56 接管后 Dynamic 开的行由档位函数输出——那条路径由它自己的测试钉。
+// task 54 的口径：静态行 effectiveWeight = 配置值原样（0 = 默认 1，落成"不写"）。
+// 动态行不走它 —— 档位链路（lossLevel → levelTracker → weightForLevel）由下面的测试钉。
 func TestEffectiveWeightStatic(t *testing.T) {
 	if got := effectiveWeight(FibTunnelRow{Weight: 30}); got != 30 {
 		t.Errorf("effectiveWeight(30) = %d, want 30", got)
 	}
 	if got := effectiveWeight(FibTunnelRow{}); got != 0 {
 		t.Errorf("effectiveWeight(缺省) = %d, want 0", got)
+	}
+}
+
+// 档位门槛：50/200/500‰ 三道，间距非线性（owner 拍板"四档非线性"）。
+func TestLossLevelMapping(t *testing.T) {
+	cases := []struct {
+		loss uint32
+		want uint8
+	}{
+		{0, 0}, {49, 0}, {50, 1}, {199, 1}, {200, 2}, {499, 2}, {500, 3}, {1000, 3},
+	}
+	for _, c := range cases {
+		if got := lossLevel(c.loss); got != c.want {
+			t.Errorf("lossLevel(%d‰) = %d, want %d", c.loss, got, c.want)
+		}
+	}
+}
+
+// 有效 weight ∈ [1, base]：满档 = 基数，⅔ 档 / ⅓ 档向上取整，底档 = 1。
+// base 0（配置没填 weight）= 上限就是默认 1，四档全是 1。
+func TestWeightForLevelMapping(t *testing.T) {
+	cases := []struct {
+		base, level, want uint8
+	}{
+		{30, 0, 30}, {30, 1, 20}, {30, 2, 10}, {30, 3, 1},
+		{10, 1, 7}, {10, 2, 4},
+		{1, 1, 1}, {1, 3, 1},
+		{0, 0, 1}, {0, 2, 1}, {0, 3, 1},
+		{2, 1, 2}, {2, 2, 1}, {2, 3, 1},
+	}
+	for _, c := range cases {
+		if got := weightForLevel(c.base, c.level); got != c.want {
+			t.Errorf("weightForLevel(%d, %d) = %d, want %d", c.base, c.level, got, c.want)
+		}
+	}
+}
+
+// 迟滞：首轮从观察真值起步；换档要连续 3 拍成立；中途跳走重新数。
+func TestLevelTrackerHysteresis(t *testing.T) {
+	var tr levelTracker
+	if !tr.observe(2) {
+		t.Fatal("首轮读数必须立即生效（从真值起步，不从捏造的档 0 起步）")
+	}
+	if tr.eff != 2 || tr.observe(2) {
+		t.Fatalf("首轮后 eff=%d；同档复读不该报变化", tr.eff)
+	}
+	// 0 档候选连续 3 拍才生效
+	if tr.observe(0) {
+		t.Fatal("第 1 拍不该生效")
+	}
+	if tr.observe(0) {
+		t.Fatal("第 2 拍不该生效")
+	}
+	if !tr.observe(0) || tr.eff != 0 {
+		t.Fatalf("第 3 拍应生效，eff=%d", tr.eff)
+	}
+	// 候选跳走就重新数：3 → 0 → 3，永远凑不满连续 3 拍
+	if tr.observe(3) || tr.observe(0) || tr.observe(3) {
+		t.Fatal("候选来回跳不该生效")
+	}
+	if tr.eff != 0 {
+		t.Fatalf("来回跳期间 eff 被改成了 %d", tr.eff)
+	}
+	// 稳定的 3 档最终生效。先回一拍 0 清掉跳走时凑下的半截计数，再数整 3 拍。
+	if tr.observe(0) {
+		t.Fatal("回到生效档不该报变化")
+	}
+	if tr.observe(3) || tr.observe(3) {
+		t.Fatal("连续成立未满 3 拍不该生效")
+	}
+	if !tr.observe(3) || tr.eff != 3 {
+		t.Fatalf("连续第 3 拍应生效，eff=%d", tr.eff)
+	}
+}
+
+// dynFixture：一条隧道（weight/dynamic 可调）+ 探针读数可调 + 假 sr-fib。
+func dynFixture(t *testing.T, weight uint8, dynamic bool, probes map[uint32]vppapi.ProbeStats, current string) (
+	*FibTableSync, *fibStub, *[]string, *fakeVPP) {
+
+	t.Helper()
+	dp := newFakeVPP()
+	dp.dumpIfs = []vppapi.SwInterface{{SWIfIndex: 12, Name: "wg1002"}}
+	for k, v := range probes {
+		dp.probes[k] = v
+	}
+	l := &Link{cfg: LinkConfig{PeerOverlay: netip.MustParsePrefix("10.250.0.2/32")}}
+	l.swIfIndex = 12
+	c := uint8(3)
+	ts := &TunnelSync{
+		links:    map[string]*Link{"t1": l},
+		colors:   map[string]*uint8{"t1": &c},
+		peerOf:   map[string]uint16{"t1": 2},
+		localOf:  map[string]netip.Prefix{},
+		weights:  map[string]uint8{"t1": weight},
+		dynamics: map[string]bool{"t1": dynamic},
+	}
+	ts.dp = dp
+	if current == "" {
+		current = `{"vrfs":[0],"tunnels":[],"escape_all_colors":true}`
+	}
+	stub := &fibStub{current: current}
+	srv := httptest.NewServer(stub)
+	t.Cleanup(srv.Close)
+
+	var logs []string
+	var mu sync.Mutex
+	f := NewFibTableSync(ts, "/nonexistent/route.json", "/nonexistent/fib.json", func(format string, args ...any) {
+		mu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	})
+	f.readVRFs = func() ([]int, error) { return []int{0}, nil }
+	f.baseURL = func() (string, error) { return srv.URL, nil }
+	return f, stub, &logs, dp
+}
+
+// putWeightOf 取最后一次 PUT 的 tunnels[0].weight（无 PUT 时返回 ok=false）。
+func putWeightOf(t *testing.T, stub *fibStub) (uint8, bool) {
+	t.Helper()
+	bodies := stub.putBodies()
+	if len(bodies) == 0 {
+		return 0, false
+	}
+	var doc fibConfigDoc
+	if err := json.Unmarshal([]byte(bodies[len(bodies)-1]), &doc); err != nil {
+		t.Fatalf("PUT 体不是 JSON: %v", err)
+	}
+	if len(doc.Tunnels) != 1 {
+		t.Fatalf("tunnels = %+v, want 1 行", doc.Tunnels)
+	}
+	return doc.Tunnels[0].Weight, true
+}
+
+// 动态行首轮：没有状态就从探针真值起步。重丢包（600‰ = 档 3）的首拍就把
+// weight 压到 1 —— 重启恰好赶上链路劣化时，不能把满权重再压 15 秒。
+func TestDynamicWeightAdoptsObservedLevelImmediately(t *testing.T) {
+	f, stub, logs, _ := dynFixture(t, 30, true,
+		map[uint32]vppapi.ProbeStats{12: {SwIfIndex: 12, LossPermille: 600}}, "")
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if w, ok := putWeightOf(t, stub); !ok || w != 1 {
+		t.Fatalf("首轮动态 weight = %d (ok=%v), want 1（档 3 立即生效）", w, ok)
+	}
+	joined := strings.Join(*logs, "")
+	if !strings.Contains(joined, "档位 0 → 3") || !strings.Contains(joined, "600‰") {
+		t.Fatalf("档位变化没进日志：%q", joined)
+	}
+}
+
+// 迟滞端到端：恢复（0‰）要连续 3 拍才把 weight 从 1 抬回 30。
+func TestDynamicWeightRestoresAfterThreeConsecutiveRounds(t *testing.T) {
+	probes := map[uint32]vppapi.ProbeStats{12: {SwIfIndex: 12, LossPermille: 600}}
+	f, stub, _, dp := dynFixture(t, 30, true, probes, "")
+	// 首轮：档 3 立即生效（上一条测试钉过），之后 sr-fib 已是目标态、不再 PUT
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	dp.probes[12] = vppapi.ProbeStats{SwIfIndex: 12, LossPermille: 0}
+	for i := 1; i <= 2; i++ {
+		if err := f.Sync(context.Background()); err != nil {
+			t.Fatalf("恢复第 %d 拍: %v", i, err)
+		}
+		if w, ok := putWeightOf(t, stub); ok && w != 1 {
+			t.Fatalf("恢复第 %d 拍就 PUT 了 weight %d（迟滞没顶住）", i, w)
+		}
+	}
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("恢复第 3 拍: %v", err)
+	}
+	if w, ok := putWeightOf(t, stub); !ok || w != 30 {
+		t.Fatalf("连续第 3 拍应恢复满档 weight 30，实到 %d (ok=%v)", w, ok)
+	}
+}
+
+// 探针读数缺失 = 档位冻结：维持上一档，不推进迟滞计数，也不假装健康。
+func TestDynamicWeightFreezesWithoutProbeReadings(t *testing.T) {
+	// 先把档位推到 3（weight 1）
+	probes := map[uint32]vppapi.ProbeStats{12: {SwIfIndex: 12, LossPermille: 600}}
+	f, stub, _, dp := dynFixture(t, 30, true, probes, "")
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	// 探针会话消失：两拍之后 weight 仍是 1（若当成"健康"会走 3 拍迟滞回 30）
+	delete(dp.probes, 12)
+	for i := 0; i < 2; i++ {
+		if err := f.Sync(context.Background()); err != nil {
+			t.Fatalf("冻结第 %d 拍: %v", i+1, err)
+		}
+	}
+	if w, ok := putWeightOf(t, stub); ok && w != 1 {
+		t.Fatalf("探针消失后 weight 变成了 %d，want 冻结在 1", w)
+	}
+	// 探针恢复、丢包还在：下一拍立刻回到档 3 的 weight（冻结期间不推进迟滞，
+	// 但恢复读数的第一拍仍是档 3 的复读 → 无变化 → 无 PUT）
+	dp.probes[12] = vppapi.ProbeStats{SwIfIndex: 12, LossPermille: 600}
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("探针恢复拍: %v", err)
+	}
+	if w, ok := putWeightOf(t, stub); ok && w != 1 {
+		t.Fatalf("探针恢复拍 weight = %d, want 维持 1", w)
+	}
+}
+
+// 探针 dump 整体失败 = 全部动态行冻结 + 喊一次（恢复时再喊一声）。
+func TestDynamicWeightSurvivesProbeDumpFailure(t *testing.T) {
+	f, _, logs, dp := dynFixture(t, 30, true,
+		map[uint32]vppapi.ProbeStats{12: {SwIfIndex: 12, LossPermille: 600}}, "")
+	dp.probeDumpErr = errors.New("vpp api 断了")
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if joined := strings.Join(*logs, ""); !strings.Contains(joined, "冻结") {
+		t.Fatalf("探针读不到没喊原因：%q", joined)
+	}
+	dp.probeDumpErr = nil
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("恢复拍: %v", err)
+	}
+	joined := strings.Join(*logs, "")
+	if strings.Count(joined, "冻结") != 1 {
+		t.Fatalf("冻结告警应该只喊一次：%q", joined)
+	}
+	if !strings.Contains(joined, "恢复") {
+		t.Fatalf("恢复没喊一声：%q", joined)
+	}
+}
+
+// 动态关 = 行为与 task 54 完全一致：配置值原样，哪怕探针已经报了全丢。
+func TestDynamicOffKeepsConfiguredWeight(t *testing.T) {
+	f, stub, _, _ := dynFixture(t, 30, false,
+		map[uint32]vppapi.ProbeStats{12: {SwIfIndex: 12, LossPermille: 999}}, "")
+	if err := f.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if w, ok := putWeightOf(t, stub); !ok || w != 30 {
+		t.Fatalf("动态关的 weight = %d (ok=%v), want 30", w, ok)
 	}
 }

@@ -124,6 +124,17 @@ bundle 第 8 段（NAT/DHCP/DNS）；CPE1 盒内新增 daemon `sr-svc`（DHCP se
 不在 overlay 宣告里，靠它测必然 100% 丢，那是路径不存在，不是坏了（2026-11-13 实测教训，
 浪费了半小时以为数据面全黑——其实只有 CPE1 选路表那一处）。
 
+**2026-11-13 深夜换件（实测）**：四台 CPE 盒 sr-agent `3f237ac9e7f7d6d50b0b59711b89b495`
+（动态 weight 第三棒：丢包四档非线性 + 3×5s 迟滞，见 fec-and-lb-plan §8；盒上备份
+`.prev-agent-20261113dyn`）。sr-fib `d07ba51e3ff991b52d44a3fde789231d` 与 host sr-ctrl
+`76f9c959f0ca0a9fba33e5e50542ebb7` 未动。**lab 现存演示对**：t10（w10 静态）+
+t16（w30 动态，slot 2）——CPE1 表 3000 实测分流 25.9%:74.1%，动态档在 CPE4 VPP 崩溃
+窗口里实机走了六次降/恢复。两条硬教训：① **这台 26.06 的 acl 插件挂接口即崩 VPP**
+（acl_interface_set_acl_list，acls=[0] 和 [1] 都崩，CPE4 硬复位两次）——别再试；
+② 死地址端点（填 192.168.1.250 这类）造不出永久丢包：**VPP WG 有端点学习**，
+对端握手一到就自愈。另：VPP 崩过之后盒上接口的 sw_if_index 会变，工具按老索引
+操作前先 `show interface` 确认。
+
 ### 2.2 被测现场是 VirtualBox 那 7 台
 
 ```
