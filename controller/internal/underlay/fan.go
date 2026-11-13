@@ -76,6 +76,15 @@ func (s *State) Fan(req FanRequest, views map[uint16]NodeView) (FanResult, error
 
 	out := FanResult{BatchID: batchID, Created: []Tunnel{}, Skipped: []FanSkip{}}
 	for _, peer := range peers {
+		// Fan is an auto batch: one tunnel per pair, ever. A pair that already
+		// has a tunnel is skipped even though Create would now happily allocate
+		// a second key slot — stacking duplicates is a manual, deliberate act
+		// (UCMP), not something a re-run of a full-mesh batch should do silently.
+		if id, ok := s.pairTunnel(req.Local.NodeID, peer); ok {
+			out.Skipped = append(out.Skipped, FanSkip{NodeID: peer,
+				Reason: fmt.Sprintf("设备对之间已有隧道 %s（编排批次每对只建一条，第二条请手动创建）", id)})
+			continue
+		}
 		c := s.Clone()
 		t, err := c.create(CreateRequest{
 			A: req.Local,

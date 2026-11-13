@@ -65,6 +65,7 @@ func writeUnderlayErr(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, underlay.ErrPathInUse),
 		errors.Is(err, underlay.ErrPairTaken),
+		errors.Is(err, underlay.ErrPairFull),
 		errors.Is(err, underlay.ErrPortExhausted),
 		errors.Is(err, underlay.ErrOverlayExhausted):
 		http.Error(w, err.Error(), http.StatusConflict)

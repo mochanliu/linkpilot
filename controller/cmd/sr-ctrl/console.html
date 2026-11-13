@@ -4798,6 +4798,11 @@
       "权重是这条隧道在颜色表里的分担比例（1–255，默认 1 = 等价 ECMP）：同桶多条路径按比例复制 load-balance 桶、按流分流（UCMP）。" +
       "注意颜色表是跨设备混装的，权重也作用于跨设备分流。开「动态」后权重是基数上限：" +
       "agent 按探针丢包在 1..权重 之间调档（丢包优先、四档、非线性，迟滞 3 拍 × 5 秒），动态生效值不回写本页。" +
+      // M-3 门禁已抬：同对端可以建第二条（UCMP 的用法）。要说清三件事：
+      // 上限、槽号谁定、以及自动编排为什么不补建。
+      "同一对设备现在允许建多条隧道（同色不同权重 = UCMP），上限每台设备 8 把密钥即每对 8 条；" +
+      "密钥槽自动派生不可手填（第一条用预置槽 0，之后取最小空槽），批量编排对已有隧道的对端仍然跳过、" +
+      "第二条要在这里手动创建。" +
       (batch ? "批量创建时对端用各自的观测地址与默认出口端口，逐台指定请只选一台对端。" +
         "已经有隧道的对端会被跳过并列在结果里，不会让整批失败。" : "") + "</div>" +
       '<div style="margin-top:10px"><button class="primary" type="submit">' +
@@ -4856,7 +4861,7 @@
       return h + '<div class="empty">还没有隧道。' +
         (doc.configured ? "用上面的自动编排或手动表单创建。" : "先发布全局配置。") + "</div></section>";
     }
-    h += "<table><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>颜色</th><th>权重</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>";
+    h += "<table><thead><tr><th>本端</th><th>对端</th><th>路径</th><th>颜色</th><th>权重</th><th>槽</th><th>MTU</th><th>状态</th><th></th></tr></thead><tbody>";
     doc.tunnels.forEach(function (t) {
       h += "<tr>" +
         "<td>" + undEndpointCell(t.a, doc) + "</td>" +
@@ -4869,6 +4874,10 @@
         // 不回写 —— 这里显示的是配置的基数上限）。
         "<td>" + (t.weight ? "<b>×" + t.weight + "</b>" : "1") +
         (t.dynamic ? '<div class="tag plan">动态</div>' : "") + "</td>" +
+        // 密钥槽列：同对端第 n 条隧道用两端的第 n 把密钥（创建时自动派生，
+        // 不可手填）。槽 0 是每台设备的预置密钥，绝大多数隧道都停在这——
+        // 只在 >0 时显示，别让整列都是噪音。
+        "<td>" + (t.slot ? '<span class="tag plan">槽' + t.slot + "</span>" : '<span class="muted">0</span>') + "</td>" +
         "<td>" + undMTUCell(t, doc) + "</td>" +
         "<td>" + undStateTag(doc.state_note) +
         '<div class="muted" style="font-size:12px">' + esc(t.id) + " · " + esc(clock(t.created_at_unix)) +

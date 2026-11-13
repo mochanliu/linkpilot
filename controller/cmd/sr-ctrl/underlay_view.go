@@ -82,6 +82,10 @@ type underlayTunnelView struct {
 	Weight  uint8 `json:"weight,omitempty"`
 	Dynamic bool  `json:"dynamic,omitempty"`
 
+	// Slot 是这条隧道用的密钥槽号（两端第 n 把），创建时自动派生。0 在
+	// JSON 里省略——预置槽上的隧道（绝大多数）保持和老页面逐字节同形。
+	Slot uint8 `json:"slot,omitempty"`
+
 	// MTU 0 means no device on this tunnel has reported a link MTU; delivery then
 	// uses wire.DefaultTunnelMTU, and MTUIsDefault says so instead of pretending
 	// the number was computed.
@@ -354,6 +358,7 @@ func buildTunnelView(st *underlay.State, t *underlay.Tunnel, serials map[uint16]
 		Color:        t.Color,
 		Weight:       t.Weight,
 		Dynamic:      t.Dynamic,
+		Slot:         t.Slot,
 		MTU:          t.MTU,
 		MTUIsDefault: t.MTU == 0,
 		Roles:        t.Roles,

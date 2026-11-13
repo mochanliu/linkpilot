@@ -132,8 +132,9 @@ func TestBundleSkipsAPeerWithNoBinding(t *testing.T) {
 // 对端担保的第 m 把。n != m 装上去就是"这条隧道用的是别条隧道的密钥"，
 // agent 那一侧会整条拒绝（见 internal/agent/tunnel.go 的 applySpec）。
 //
-// 这一段的期望值是"两边都 0"：本增量只把槽号打通，同设备对仍然只放开一条隧道，
-// 而槽 0 就是升级前磁盘上那把 —— 存量隧道的公钥因此一个字节都没变。
+// 第一条隧道两边都是槽 0：槽 0 就是升级前磁盘上那把预置密钥 —— 存量隧道的
+// 公钥一个字节都没变。第二条（M-3 抬门后）拿槽 1，下发的担保也换成对端的
+// 第 1 把 —— 同一条下发链路按槽取担保，不需要任何特判。
 func TestBundleSpecCarriesTheTunnelsKeySlot(t *testing.T) {
 	s, ten, _ := underlayFixture(t)
 	publishDefault(t, s, ten)
@@ -149,13 +150,47 @@ func TestBundleSpecCarriesTheTunnelsKeySlot(t *testing.T) {
 		}
 		spec := b.Tunnels[0]
 		if spec.Slot != 0 {
-			t.Errorf("node %d: 本端槽号 %d，同设备对只放开一条隧道时期望 0", node, spec.Slot)
+			t.Errorf("node %d: 本端槽号 %d，对端第一条隧道应落预置槽 0", node, spec.Slot)
 		}
 		if spec.PeerBinding == nil {
 			t.Fatalf("node %d: 对端担保为空", node)
 		}
 		if spec.PeerBinding.Slot != spec.Slot {
 			t.Errorf("node %d: 本端用槽 %d，对端担保却是槽 %d", node, spec.Slot, spec.PeerBinding.Slot)
+		}
+	}
+}
+
+// 同对端第二条隧道：两端规格都点名槽 1，对端担保也换成第 1 把 —— 同一
+// 下发链路原样工作，只是槽号变了。这一条是 UCMP 的密钥前提。
+func TestBundleSpecCarriesSlotForThePairSecondTunnel(t *testing.T) {
+	s, ten, _ := underlayFixture(t)
+	publishDefault(t, s, ten)
+	if rec := createTunnel(t, s, ten, manualTunnel(1, 2, "wan0")); rec.Code != http.StatusCreated {
+		t.Fatalf("first tunnel = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := createTunnel(t, s, ten, manualTunnel(2, 1, "wan0")); rec.Code != http.StatusCreated {
+		t.Fatalf("second tunnel = %d (%s)", rec.Code, rec.Body.String())
+	}
+	giveIdentity(t, s, "t", 1, 2)
+
+	for _, node := range []uint16{1, 2} {
+		b := bundleOf(t, s, "t", node)
+		if len(b.Tunnels) != 2 {
+			t.Fatalf("node %d: %d tunnel(s), skipped=%+v", node, len(b.Tunnels), b.Skipped)
+		}
+		bySlot := map[uint8]wire.TunnelSpec{}
+		for _, spec := range b.Tunnels {
+			bySlot[spec.Slot] = spec
+		}
+		if _, ok := bySlot[1]; !ok {
+			t.Fatalf("node %d: 第二条隧道应带槽 1，实际槽号集合 %v", node, bySlot)
+		}
+		if bySlot[1].PeerBinding == nil || bySlot[1].PeerBinding.Slot != 1 {
+			t.Fatalf("node %d: 槽 1 隧道的对端担保应是第 1 把，实际 %+v", node, bySlot[1].PeerBinding)
+		}
+		if bySlot[0].PeerBinding == nil || bySlot[0].PeerBinding.Slot != 0 {
+			t.Fatalf("node %d: 槽 0 隧道的对端担保应是第 0 把，实际 %+v", node, bySlot[0].PeerBinding)
 		}
 	}
 }

@@ -104,8 +104,12 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `2d7911e9dbc985b0a79dca68713d3f68`（2026-11-13 傍晚，含隧道 weight/动态
-（UCMP 第二棒）与 sla 选路器连接代数修复，备份 `sr-ctrl.prev-selgen-20261113`，上一代
+当前代际：sr-ctrl `76f9c959f0ca0a9fba33e5e50542ebb7`（2026-11-13 深夜，M-3 抬门：
+同对端第二条隧道走密钥槽派生 `allocPairSlot`（上限 8，`ErrPairFull` 409）、
+Tunnel 视图/控制台新增 slot 字段、Fan 每对仍只建一条；实机 1↔4 对 t10(w10)+t16(w30)
+CPE1 实测分流 25.9%:74.1%（期望 25:75），见 fec-and-lb-plan §7。备份
+`sr-ctrl.prev-m3-20261113`；上一代 `2d7911e9dbc985b0a79dca68713d3f68`（隧道 weight/
+动态第二棒 + sla 连接代数修复）备份 `sr-ctrl.prev-selgen-20261113`，再上一代
 `bab09756a60d125bb314ae5b4464325c` 备份 `sr-ctrl.prev-20261113ucmp`；sr-ctrl 全套测试跑在
 qoslab 容器里，交叉编译 `GOOS=darwin go build`）。同日新增服务面：`/api/services` GET/PUT + 控制台「服务配置」页 +
 bundle 第 8 段（NAT/DHCP/DNS）；CPE1 盒内新增 daemon `sr-svc`（DHCP server + DNS 转发器，状态口 127.0.0.1:8092）。

@@ -3,9 +3,11 @@ package underlay
 import (
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 
+	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/wire"
 )
 
@@ -242,31 +244,64 @@ func TestUpdateAndDelete(t *testing.T) {
 	}
 }
 
-// The pair gate is still closed: one tunnel per device pair. It used to be
-// forced by the dataplane (VPP dedupes its peer pool by public key, so a second
-// tunnel to the same peer with the same key is refused with -116). M-2 gave every
-// device eight WireGuard keys and put the slot number on the tunnel, so that
-// collision is no longer the reason -- what is left is this gate, which M-3 opens.
-// Until then the controller must refuse up front, not let the device fail at
-// apply time, and the refusal must name the tunnel that occupies the pair.
-func TestCreateRejectsSecondTunnelOnSamePair(t *testing.T) {
+// The M-3 gate is open: a device pair may hold up to keybinding.WGKeySlots
+// tunnels (same-color multi-tunnel is what ECMP/UCMP runs on). The pair's n-th
+// tunnel takes key slot n on BOTH ends -- derived at creation, never typed --
+// and the first tunnel of a pair always lands on slot 0, where each device's
+// pre-slot key already lives, so old single-tunnel pairs cost no re-handshake.
+// Deleting a tunnel frees its slot; the next create reuses the lowest free one.
+func TestSamePairTunnelsGetDistinctKeySlots(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2)
 	first := mustCreate(t, s, views, 1, 2, nil)
-
-	_, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 2}, B: EndpointSpec{NodeID: 1}, Now: 2000}, views)
-	if err == nil || !errors.Is(err, ErrPairTaken) || !strings.Contains(err.Error(), first.ID) {
-		t.Fatalf("同对设备第二条隧道应被拒绝并点名占了这一对的那条，实际 %v", err)
+	if first.Slot != 0 {
+		t.Fatalf("同对端第一条隧道应落在预置槽 0，实际 %d", first.Slot)
 	}
-	if len(s.Tunnels) != 1 {
-		t.Fatalf("被拒的请求不该留下隧道: %d", len(s.Tunnels))
+	second := mustCreate(t, s, views, 2, 1, nil)
+	if second.Slot != 1 {
+		t.Fatalf("同对端第二条隧道应拿槽 1，实际 %d", second.Slot)
 	}
-	// Deleting the first frees the pair again.
+	if len(s.Tunnels) != 2 {
+		t.Fatalf("同对端第二条隧道现在应被接受: %d", len(s.Tunnels))
+	}
+	// Deleting the first frees slot 0; the next create reuses it instead of
+	// climbing to 2 (slots stay dense, live tunnels are never renumbered).
 	if err := s.Delete(first.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Now: 3000}, views); err != nil {
-		t.Fatalf("删掉后应该能重建: %v", err)
+	third := mustCreate(t, s, views, 1, 2, nil)
+	if third.Slot != 0 {
+		t.Fatalf("删掉槽 0 的隧道后新建应复用最小空槽 0，实际 %d", third.Slot)
+	}
+}
+
+// The cap is the key count itself: WGKeySlots tunnels per pair, then ErrPairFull.
+func TestSamePairTunnelsCapAtKeySlots(t *testing.T) {
+	s := newTestState(t, "10.9.0.0/24")
+	views := testViews(1, 2)
+	for i := 0; i < keybinding.WGKeySlots; i++ {
+		if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Now: int64(1000 + i)}, views); err != nil {
+			t.Fatalf("第 %d 条应能建: %v", i+1, err)
+		}
+	}
+	_, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Now: 9999}, views)
+	if err == nil || !errors.Is(err, ErrPairFull) {
+		t.Fatalf("超过 %d 把密钥后应拒绝并返回 ErrPairFull，实际 %v", keybinding.WGKeySlots, err)
+	}
+	if len(s.Tunnels) != keybinding.WGKeySlots {
+		t.Fatalf("被拒的请求不该留下隧道: %d", len(s.Tunnels))
+	}
+	// Freeing one slot makes room again.
+	last := make([]string, 0)
+	for id := range s.Tunnels {
+		last = append(last, id)
+	}
+	sort.Strings(last)
+	if err := s.Delete(last[len(last)-1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 1}, B: EndpointSpec{NodeID: 2}, Now: 10000}, views); err != nil {
+		t.Fatalf("腾出一个槽后应能再建: %v", err)
 	}
 }
 

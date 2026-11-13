@@ -117,7 +117,7 @@ func TestFanSkipsTakenPairsAndKeepsTheRest(t *testing.T) {
 	if len(res.Created) != 2 || len(res.Skipped) != 1 {
 		t.Fatalf("built %d skipped %d", len(res.Created), len(res.Skipped))
 	}
-	if res.Skipped[0].NodeID != 3 || !strings.Contains(res.Skipped[0].Reason, "只能有一条隧道") {
+	if res.Skipped[0].NodeID != 3 || !strings.Contains(res.Skipped[0].Reason, "已有隧道") {
 		t.Fatalf("跳过的原因没说是哪台、为什么: %+v", res.Skipped[0])
 	}
 	// The pre-existing tunnel is the one that was there, not the one the batch

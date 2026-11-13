@@ -287,3 +287,46 @@ sr-ctrl  Tunnel.Weight/Dynamic（create/update/fanout/API/console 列）
   effectiveWeight 写 fib.json，sr-fib 仍只做对账器（不读探针）。
 - "动态"档迟滞：3 周期 × 5s/周期；配置 weight 只是基数上限，不回写。
 - 控制台动态档仅展示。前置：先抬同对端多隧道门（M-3 的 409 + Slot 分配）。
+
+## 7. UCMP 第三棒前置：同对端多隧道门已抬（M-3）+ 实机 25:75 验证（2026-11-13）
+
+### 7.1 抬门语义（`Tunnel.Slot`）
+
+- 同对端（无中继的第二条直连隧道）原本被 `ErrPairTaken` 409 拒绝；现在改为
+  **密钥槽派生**：每台设备持 8 把已认证密钥（WGKeySlots=8），对端第 n 条
+  隧道两端各占第 n 号槽，无需密钥环交换。
+- `create()` 走 `allocPairSlot`（最低空闲槽，上限 8 → 新哨兵 `ErrPairFull`
+  仍映射 409）；`ErrPairTaken` 降为 Fan 专用哨兵：**编排批次（Fan）每对仍
+  只建一条**（跳过理由"设备对之间已有隧道 %s"），第二条是人工的、有意识的
+  行为，只放手动 Create。
+- 槽永不重编号：第一条恒为 0；删除中间槽后新隧道补最低空闲位。
+- API/控制台：tunnel 视图新增 `slot` 字段，表格加"槽"列（槽 0 灰显），
+  表单提示写明 8 槽上限与 Fan 行为。
+- 回归：`TestSamePairTunnelsGetDistinctKeySlots`（0→1，删除复用）、
+  `TestSamePairTunnelsCapAtKeySlots`（第 9 条 `ErrPairFull`）、
+  `TestSecondTunnelOnTheSamePairGetsFreshPortsAndOverlay`（新端口 +
+  overlay route.json tunnels 第 4 段新增一行）、bundle/spec 携带 Slot、
+  Fan 跳过理由、409 映射。
+
+### 7.2 实机链路（1↔4 对，颜色 3）
+
+- t10（槽 0，weight 10）+ t16（槽 2，weight 30）→ 逐节点
+  `POST /api/config/publish` 后 overlay route.json tunnels 段出现两行
+  next hop（10.250.0.3 / 10.250.0.13），RIB 每隧道一个下一跳。
+- CPE1 表 3000 `172.16.4.1/32`：`dpo-load-balance buckets:4`，
+  **[0-2] → wg1016（w30），[3] → wg1010（w10）**，桶布局 1:3 精确。
+- 注意：新隧道只进 route.json 于 re-publish 之后；sr-fib 在探针会话
+  建立（BFD Up）前跳过该下一跳并告警，属预期。
+- 环境坑：t15 一度建在宿主 enp0s8（客户口/LAN）上，WG peer endpoint
+  172.31.12.1:20002 不可达，BFD 永不 Up——删掉重建到 enp0s9 即好。
+
+### 7.3 分流比实测（2026-11-13，/tmp/ucmp_measure.py 方法论）
+
+- 关键认知：**每条 UDP 五元组整流落进一个桶**（VPP 按流哈希），10 条流
+  × 4 桶的量化方差极大（此前 58:42 的假象）；要测的是**大量互异五元组的
+  总量比**，且探针流量用等长空闲窗基线扣除。
+- 结果：50 流 × 100 包（源/目的端口互异，2ms 步进防 VBox L2 丢突发），
+  14s 基线探针 delta ≈151/152 包；扣基线后
+  **wg1010 1394 : wg1016 3991 = 25.9% : 74.1%**（期望 25%:75%，误差 <1pp）。
+- 残余噪声：ssh 心跳与 ICMP 回包不计入 CPE1 TX 方向，扣基线后可忽略。
+- 实验脚本留存：/tmp/ucmp_measure.py（基线窗 + 50 流发送 + TX 计数差减）。

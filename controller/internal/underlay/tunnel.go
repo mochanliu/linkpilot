@@ -102,10 +102,9 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 	if err := checkColor(req.Color); err != nil {
 		return Tunnel{}, err
 	}
-	if id, ok := s.pairTunnel(req.A.NodeID, req.B.NodeID); ok {
-		return Tunnel{}, fmt.Errorf("%w %s：设备 %d 和 %d 之间只能有一条隧道。每台设备已经有 %d 把 WireGuard 密钥、"+
-			"隧道也带上了密钥槽号，同设备对的第二条只差这一道门禁（任务 M-3）；先删掉现有隧道再建",
-			ErrPairTaken, id, req.A.NodeID, req.B.NodeID, keybinding.WGKeySlots)
+	slot, err := s.allocPairSlot(req.A.NodeID, req.B.NodeID)
+	if err != nil {
+		return Tunnel{}, err
 	}
 	va, err := viewOf(views, "本端", req.A.NodeID)
 	if err != nil {
@@ -174,6 +173,7 @@ func (s *State) create(req CreateRequest, views map[uint16]NodeView) (Tunnel, er
 		A:         Endpoint{NodeID: req.A.NodeID, Iface: ifaceA, Addr: addrA, Port: portA, Overlay: ovA},
 		B:         Endpoint{NodeID: req.B.NodeID, Iface: ifaceB, Addr: addrB, Port: portB, Overlay: ovB},
 		Path:      clonePath(req.Path),
+		Slot:      slot,
 		Color:     req.Color,
 		Weight:    req.Weight,
 		Dynamic:   req.Dynamic,
@@ -321,14 +321,13 @@ func (s *State) Delete(id string) error {
 	return nil
 }
 
-// pairTunnel returns the tunnel already connecting two devices, so a second
-// one can be refused before any port or overlay address is allocated.
+// pairTunnel returns the tunnel already connecting two devices, if any.
 //
-// This is a hard limit of the delivery shape, not a policy choice: the
-// controller holds ONE attested WireGuard static key per device, and VPP's peer
-// table dedupes public keys across interfaces -- installing the same peer on a
-// second interface fails with -116. Per-tunnel keys would lift it; until then
-// the device pair is the unit this dataplane can carry.
+// It is NO LONGER a create gate: a pair may hold up to keybinding.WGKeySlots
+// tunnels (one per key slot), which is what UCMP needs. What is left of it is
+// the Fan contract — an auto batch builds one tunnel per pair and must not
+// duplicate an existing one on a re-run — so Fan skips peers that already have
+// a tunnel while manual Create allocates the next free slot.
 func (s *State) pairTunnel(a, b uint16) (string, bool) {
 	ids := make([]string, 0, len(s.Tunnels))
 	for id := range s.Tunnels {
@@ -342,6 +341,33 @@ func (s *State) pairTunnel(a, b uint16) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// allocPairSlot picks the key slot for a NEW tunnel between two devices: the
+// lowest slot not already used by the pair's live tunnels. Both ends keep
+// WGKeySlots attested keys and the pair's n-th tunnel uses key n on BOTH ends,
+// so the two ends never have to exchange a keyring to agree
+// (docs/nat-tunnel-ladder-plan.md §10). Derived at creation, never typed.
+//
+// Slot 0 is where a device's pre-slot key already lives, so the first tunnel of
+// every pair lands there and old single-tunnel pairs cost no re-handshake.
+// Deleting a tunnel frees its slot; the next create reuses the lowest free one,
+// which keeps slots dense without any renumbering of live tunnels. The cap is
+// WGKeySlots itself: out of slots means ErrPairFull.
+func (s *State) allocPairSlot(a, b uint16) (uint8, error) {
+	used := map[uint8]bool{}
+	for _, t := range s.Tunnels {
+		if (t.A.NodeID == a && t.B.NodeID == b) || (t.A.NodeID == b && t.B.NodeID == a) {
+			used[t.Slot] = true
+		}
+	}
+	for slot := uint8(0); slot < keybinding.WGKeySlots; slot++ {
+		if !used[slot] {
+			return slot, nil
+		}
+	}
+	return 0, fmt.Errorf("%w：设备 %d 和 %d 之间已有 %d 条隧道，每台设备只有 %d 把 WireGuard 密钥（槽 0..%d）"+
+		"；要先删一条才能再建", ErrPairFull, a, b, keybinding.WGKeySlots, keybinding.WGKeySlots, keybinding.WGKeySlots-1)
 }
 
 func viewOf(views map[uint16]NodeView, what string, node uint16) (NodeView, error) {

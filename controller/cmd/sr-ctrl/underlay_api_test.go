@@ -696,8 +696,8 @@ func TestFanEndpointSkipsTakenPeersAndKeepsWhatItBuilt(t *testing.T) {
 		t.Fatalf("该建的没建全: %+v", out.Tunnels)
 	}
 	if len(out.Skipped) != 1 || out.Skipped[0].NodeID != 3 ||
-		!strings.Contains(out.Skipped[0].Reason, "只能有一条隧道") {
-		t.Fatalf("跳过项要指名设备 3 并说清是一对设备只能一条: %+v", out.Skipped)
+		!strings.Contains(out.Skipped[0].Reason, "已有隧道") {
+		t.Fatalf("跳过项要指名设备 3 并说清是编排批次每对只建一条: %+v", out.Skipped)
 	}
 	// 已有那条不会因为这一批被改动或删除。
 	if len(out.Underlay.Tunnels) != 2 {
@@ -859,10 +859,10 @@ func TestFanSaveAsTemplateMovesTheWholeBatchOnLaterEdit(t *testing.T) {
 
 // ------------------------------------------------------------------ topology
 
-// One edge per device pair. A second tunnel on the same pair is refused with a
-// conflict rather than drawn as a parallel edge: one static WG key per device
-// makes it uninstallable in the dataplane (-116).
-func TestUnderlayTopologyBundlesOneTunnelPerPairAndShowsRelays(t *testing.T) {
+// One bundle per device pair, however many tunnels run on it: the M-3 gate is
+// lifted, so a pair's second tunnel is created (slot 1) and the two edges show
+// up as one bundle with Count 2. Relay chains still get their own bundle.
+func TestUnderlayTopologyBundlesMultiTunnelPairsAndShowsRelays(t *testing.T) {
 	s, ten, _ := underlayFixture(t)
 	publishDefault(t, s, ten)
 
@@ -870,11 +870,14 @@ func TestUnderlayTopologyBundlesOneTunnelPerPairAndShowsRelays(t *testing.T) {
 		t.Fatalf("tunnel = %d (%s)", rec.Code, rec.Body.String())
 	}
 	rec := createTunnel(t, s, ten, manualTunnel(2, 1, "wan0"))
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("同一对设备的第二条隧道应回 409，实际 %d (%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("同对端第二条隧道应创建成功（M-3 门禁已抬），实际 %d (%s)", rec.Code, rec.Body.String())
 	}
-	if body := rec.Body.String(); !strings.Contains(body, "只能有一条隧道") {
-		t.Fatalf("拒绝里没说清原因: %s", body)
+	// The second tunnel took key slot 1 (slot 0 belongs to the pre-slot key of
+	// the first one) -- and both slots must show in the API view.
+	second := tunnelFrom(t, rec)
+	if second.Slot != 1 {
+		t.Fatalf("第二条隧道应拿密钥槽 1，实际 %d", second.Slot)
 	}
 	rec = createTunnel(t, s, ten, tunnelReq{
 		A:    underlaySpec{NodeID: 2, Iface: "wan0"},
@@ -896,8 +899,15 @@ func TestUnderlayTopologyBundlesOneTunnelPerPairAndShowsRelays(t *testing.T) {
 		t.Fatalf("topology has %d bundles; two pairs are two edges", len(topo.Bundles))
 	}
 	bundle := topo.Bundles[0]
-	if bundle.A != 1 || bundle.B != 2 || bundle.Count != 1 || len(bundle.Tunnels) != 1 {
-		t.Fatalf("first bundle = %+v", bundle)
+	if bundle.A != 1 || bundle.B != 2 || bundle.Count != 2 || len(bundle.Tunnels) != 2 {
+		t.Fatalf("first bundle should carry the pair's two tunnels = %+v", bundle)
+	}
+	slots := map[uint8]bool{}
+	for _, tv := range bundle.Tunnels {
+		slots[tv.Slot] = true
+	}
+	if !slots[0] || !slots[1] {
+		t.Fatalf("bundle 应同时包含槽 0 与槽 1 的隧道: %+v", slots)
 	}
 	if bundle.State != "unknown" {
 		t.Fatalf("bundle state = %q", bundle.State)
@@ -910,13 +920,14 @@ func TestUnderlayTopologyBundlesOneTunnelPerPairAndShowsRelays(t *testing.T) {
 	}
 
 	// A relay-only device has no edge of its own, so it is visible on the graph
-	// only through these per-node counts.
+	// only through these per-node counts. The pair's two tunnels give node 1 two
+	// of its own listening ports (one per tunnel) on top of the transit port.
 	n1 := nodeByID(t, topo.Nodes, 1)
-	if n1.TunnelCount != 1 || n1.RelayFor != 1 || n1.TransitPort != 15000 || len(n1.Ports) != 1 {
+	if n1.TunnelCount != 2 || n1.RelayFor != 1 || n1.TransitPort != 15000 || len(n1.Ports) != 2 {
 		t.Fatalf("relay device row = %+v", n1)
 	}
-	if n2 := nodeByID(t, topo.Nodes, 2); n2.TunnelCount != 2 {
-		t.Fatalf("device 2 tunnel count = %d, want 2", n2.TunnelCount)
+	if n2 := nodeByID(t, topo.Nodes, 2); n2.TunnelCount != 3 {
+		t.Fatalf("device 2 tunnel count = %d, want 3", n2.TunnelCount)
 	}
 }
 

@@ -17,11 +17,17 @@ var (
 	ErrPortExhausted    = errors.New("端口池没有空闲端口")
 	ErrPathInUse        = errors.New("路径模板仍被隧道引用")
 	ErrNotFound         = errors.New("隧道不存在")
-	// ErrPairTaken means this device pair already has a tunnel. It is a conflict
-	// with existing state, not a malformed request: one static WG key per device
-	// makes a second tunnel on the same pair uninstallable (VPP dedupes peers by
-	// pubkey across interfaces, -116).
+	// ErrPairTaken used to gate "one tunnel per device pair" (M-3). The gate is
+	// lifted: each device holds WGKeySlots attested keys and a pair's n-th
+	// tunnel uses key n on both ends, so a pair can carry WGKeySlots tunnels.
+	// It survives as the conflict sentinel for callers that need "this pair
+	// already has a tunnel" (fan skip bookkeeping); manual create past the key
+	// capacity answers ErrPairFull instead.
 	ErrPairTaken = errors.New("设备对之间已经有隧道")
+	// ErrPairFull means the pair's WGKeySlots key slots are all in use. Like
+	// ErrPairTaken it is a conflict with existing state, not a malformed
+	// request: the API layer answers both with 409.
+	ErrPairFull = errors.New("设备对之间的隧道已达密钥槽上限")
 )
 
 // Endpoint is one end of a tunnel.
@@ -116,9 +122,9 @@ type Roles struct {
 // ID is controller-internal: the user never types or sees it as an identity,
 // but the API needs a stable handle for edit/delete.
 //
-// One tunnel per device pair for now: Create refuses a second one (see
-// pairTunnel). That is a policy gate, not a key limit -- a device now holds
-// keybinding.WGKeySlots keys, and the gate is what still says one.
+// One tunnel per device pair was the old shape; since the M-3 gate lift a pair
+// may hold up to keybinding.WGKeySlots tunnels (same-color multi-tunnel is what
+// ECMP/UCMP runs on). Fan still builds at most one per pair per batch.
 type Tunnel struct {
 	ID   string      `json:"id"`
 	A    Endpoint    `json:"a"`
@@ -127,10 +133,11 @@ type Tunnel struct {
 
 	// Slot is which key pair of the two devices this tunnel uses: the pair's
 	// n-th tunnel uses key n on BOTH ends, so the two ends never have to exchange
-	// a keyring to agree (docs/nat-tunnel-ladder-plan.md §10). Derived at creation,
-	// never typed. It is always 0 while the pair gate allows one tunnel per pair,
-	// and 0 is exactly where a device's pre-slot key already lives -- which is why
-	// introducing this field costs no re-handshake on running tunnels.
+	// a keyring to agree (docs/nat-tunnel-ladder-plan.md §10). Derived at creation
+	// (lowest slot free at that moment), never typed. The first tunnel of a pair
+	// always gets 0 -- where a device's pre-slot key already lives -- which is why
+	// introducing this field costs no re-handshake on running tunnels; tunnels
+	// created before the gate lift all keep Slot 0 forever.
 	Slot uint8 `json:"slot,omitempty"`
 
 	// Color is the tunnel's SD-WAN color. It is the only thing the data plane

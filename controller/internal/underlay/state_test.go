@@ -107,24 +107,26 @@ func TestOverlayExhaustionIsAnError(t *testing.T) {
 	}
 }
 
-// One static WG key per device: a second tunnel on the same pair cannot be
-// installed (VPP dedupes peers by pubkey across interfaces, -116), so it is
-// refused at creation rather than at apply time.
-func TestSecondTunnelOnTheSamePairIsRefused(t *testing.T) {
+// A different pair, so what runs out is the address pool -- not the pair rule.
+// (The one-tunnel-per-pair gate was lifted with M-3; see tunnel_test.go for the
+// slot allocation and the WGKeySlots cap.)
+
+// Each device keeps one transit port for its whole lifetime; a pair's second
+// tunnel therefore needs NEW ports for both ends, not a re-use of the first
+// tunnel's. This is the allocation order guarantee the agent's keyring and
+// VPP listener setup rely on: ports stay unique per device.
+func TestSecondTunnelOnTheSamePairGetsFreshPortsAndOverlay(t *testing.T) {
 	s := newTestState(t, "10.9.0.0/24")
 	views := testViews(1, 2)
 	first := mustCreate(t, s, views, 1, 2, nil)
-	if _, err := s.Create(CreateRequest{A: EndpointSpec{NodeID: 2}, B: EndpointSpec{NodeID: 1}, Now: 1000}, views); !errors.Is(err, ErrPairTaken) {
-		t.Fatalf("同一对设备的第二条隧道应被拒（ErrPairTaken），实际 %v", err)
+	second := mustCreate(t, s, views, 2, 1, nil)
+	if first.A.Port == second.A.Port || first.B.Port == second.B.Port {
+		t.Fatalf("同对端第二条隧道两端端口都不能撞第一条：first=%d/%d second=%d/%d",
+			first.A.Port, first.B.Port, second.A.Port, second.B.Port)
 	}
-	if len(s.Tunnels) != 1 {
-		t.Fatalf("被拒的创建不该留下任何东西，实际 %d 条", len(s.Tunnels))
+	if first.A.Overlay == second.A.Overlay || first.B.Overlay == second.B.Overlay {
+		t.Fatalf("同对端第二条隧道两端 overlay 地址不能撞第一条")
 	}
-	// The pair becomes usable again once the tunnel is gone.
-	if err := s.Delete(first.ID); err != nil {
-		t.Fatal(err)
-	}
-	mustCreate(t, s, views, 1, 2, nil)
 }
 
 // Ports are unique per DEVICE: both ends may hold 20000, and a second tunnel on
