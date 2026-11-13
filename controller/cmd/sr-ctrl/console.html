@@ -429,6 +429,10 @@
     // 历史最多 30s 一次）。
     alerts: null, ledger: null, ledgerFilter: { kind: "", hours: 48, node: 0 },
     history: null, histNode: 0, histAt: 0,
+    // histT 是趋势图选中的隧道（"对端/颜色" 键，空串 = 全部）。单台设备可能有
+    // 上千条隧道，全画一张图没人看得清——先选设备、再选隧道。histTQ 是隧道
+    // 选择器的搜索词。
+    histT: "", histTQ: "",
     // histQ 是趋势图设备选择器的搜索词；freeze=true 表示选择器正开着——
     // 这段时间 render() 直接返回，不然 5s 轮询会把展开中的列表整个拆掉，
     // 用户的选择就落空了（freezeView 记录冻结时的页面，切页即解冻）。
@@ -1596,19 +1600,27 @@
 
     // 24 小时趋势：台账里的 tunnel.sample 采样（10 秒一条）画成折线。
     // 数据独立于上面的实时窗口——实时窗口说"现在"，这里说"过去一天"。
-    // 设备用搜索选择器挑（设备多了下拉里翻不到）；标题带上当前设备，
-    // 否则换一台图没变就真的看不出来——同一站点几台盒子的质量曲线几乎长一样。
+    // 设备用搜索选择器挑（设备多了下拉里翻不到）；单台设备可能有上千条隧道，
+    // 全画一张图没人看得清，所以还有第二级隧道选择器——选一条单独看。
     var histSel = S.histNode || (nodes[0] ? nodes[0].node_id : 0);
     var cur = null;
     nodes.forEach(function (n) { if (n.node_id === histSel) cur = n; });
+    var tun = histTunnelLabel(S.histT || "");
     h += '<section class="panel"><header><h2>24 小时隧道质量 · node-' + esc(histSel) +
-      (cur && cur.serial ? "（" + esc(cur.serial) + "）" : "") + '</h2>' +
+      (cur && cur.serial ? "（" + esc(cur.serial) + "）" : "") +
+      (S.histT ? " · " + esc(tun) : " · 全部隧道") + '</h2>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
       '<div class="pick" id="hist-pick">' +
       '<input id="hist-q" data-keep autocomplete="off" spellcheck="false" placeholder="搜索设备（node 号 / 序列号）" value="' + esc(S.histQ || "") + '">' +
-      '<div id="hist-list"></div></div></header>' +
+      '<div id="hist-list"></div></div>' +
+      '<div class="pick" id="hist-tpick">' +
+      '<input id="hist-tq" data-keep autocomplete="off" spellcheck="false" placeholder="选隧道（对端 / 颜色），留空 = 全部" value="' + esc(S.histTQ || "") + '">' +
+      '<div id="hist-tlist"></div></div>' +
+      "</div></header>" +
       '<div class="hint">来自控制器的台账采样，一条线 = 到一个对端的隧道（图例带颜色号）。' +
+      '单台设备的隧道可能有上千条，先用右边的选择器挑一条单独看；' +
       '设备失联的时间段自然是空的——空档本身就是发生过事情的证据。</div>' +
-      histCharts(S.history, histSel, nodes) +
+      histCharts(S.history, histSel, nodes, S.histT || "") +
       "</section>";
 
     h += '<section class="panel"><header><h2>设备健康</h2>' +
@@ -1676,13 +1688,82 @@
     }).join("") : '<div class="pick-none">没有匹配的设备</div>';
   }
 
+  // histTunnelKey 是隧道的唯一键（对端/颜色），与 histCharts 分组用的键一致。
+  function histTunnelKey(peer, color) { return peer + "/" + (color || 0); }
+
+  // histTunnelLabel 把隧道键翻成人话（node-2（CPE2）·颜色 0）。serial 从
+  // /api/metrics 的设备列表反查；查不到就只给 node 号。
+  function histTunnelLabel(key) {
+    var p = key.split("/"), peer = Number(p[0]) || 0, color = Number(p[1]) || 0;
+    var m = S.metrics, name = "";
+    ((m && m.nodes) || []).forEach(function (n) {
+      if (n.node_id === peer) name = n.serial || "";
+    });
+    return "node-" + peer + (name ? "（" + name + "）" : "") + "·颜色 " + color;
+  }
+
+  // histTunnels 从已拉到的采样里数当前设备出现过的隧道（对端/颜色各一条），
+  // 按 对端、颜色 排序。隧道清单只来自采样本身——设备没报过的对端不在列表里。
+  function histTunnels(node) {
+    var seen = {};
+    var out = [];
+    ((S.history && S.history.samples) || []).forEach(function (s) {
+      if (!node || s.node !== node) return;
+      (s.rows || []).forEach(function (r) {
+        var k = histTunnelKey(r.peer, r.color);
+        if (!seen[k]) { seen[k] = true; out.push({ peer: r.peer, color: r.color || 0 }); }
+      });
+    });
+    out.sort(function (a, b) { return a.peer - b.peer || a.color - b.color; });
+    return out;
+  }
+
+  // histTPickList 按 S.histTQ 过滤隧道、画进第二级选择器。搜索词匹配对端
+  // node 号、序列号或颜色号。第一项固定是「全部隧道」（清空选择）。
+  function histTPickList() {
+    var box = $("hist-tlist");
+    if (!box) return;
+    var sel = S.histNode || 0;
+    var m = S.metrics;
+    var nodes = (m && m.nodes) || [];
+    var q = (S.histTQ || "").trim().toLowerCase();
+    var names = {};
+    nodes.forEach(function (n) { names[n.node_id] = n.serial || ""; });
+    var items = histTunnels(sel).filter(function (t) {
+      if (!q) return true;
+      return ("node-" + t.peer).indexOf(q) >= 0 ||
+        String(names[t.peer] || "").toLowerCase().indexOf(q) >= 0 ||
+        String(t.color).indexOf(q) >= 0;
+    });
+    var html = '<div class="pick-it' + (!S.histT ? " on" : "") + '" data-hist-tunnel="">全部隧道' +
+      (!S.histT ? "　✓" : "") + "</div>";
+    html += items.length ? items.map(function (t) {
+      var k = histTunnelKey(t.peer, t.color);
+      var on = S.histT === k;
+      return '<div class="pick-it' + (on ? " on" : "") + '" data-hist-tunnel="' + esc(k) + '">' +
+        esc(histTunnelLabel(k)) + (on ? "　✓" : "") + "</div>";
+    }).join("") : '<div class="pick-none">这台设备还没有采样，或没有匹配的隧道</div>';
+    box.innerHTML = html;
+  }
+
   // histCharts 把台账采样画成两张小图（延迟 / 丢包）。samples 形如
   // {samples:[{at, node, rows:[{peer,color,rtt_ms,loss_permille}]}]}，只画
-  // node 过滤后的那台。空数据说清原因，不画一张空坐标系装样子。
-  function histCharts(h, node, nodes) {
+  // node 过滤后的那台；tunnel 是 "对端/颜色" 键，非空则只画这一条隧道。
+  // 空数据说清原因，不画一张空坐标系装样子。
+  function histCharts(h, node, nodes, tunnel) {
     var samples = ((h && h.samples) || []).filter(function (s) {
       return !node || s.node === node;
     });
+    if (tunnel) {
+      // 只留选中那条隧道的行。map 出新采样对象——filter 里改局部变量不会
+      // 改到数组本身，split() 拿到的还是全量行（这个坑已经踩过一次）。
+      samples = samples.map(function (s) {
+        return { at: s.at, node: s.node,
+          rows: (s.rows || []).filter(function (r) {
+            return histTunnelKey(r.peer, r.color) === tunnel;
+          }) };
+      }).filter(function (s) { return s.rows.length > 0; });
+    }
     if (!samples.length) {
       return '<div class="empty">还没有采样。设备每 10 秒落一条，上报几分钟后再来看就有线了。</div>';
     }
@@ -9272,9 +9353,17 @@
     if (opsNodeSel) opsNodeSel.addEventListener("change", function () {
       S.ledgerFilter.node = Number(opsNodeSel.value) || 0; loadOps();
     });
-    // 监控页趋势图的设备搜索选择器：聚焦/输入即展开并冻结整页重绘，
-    // 选中立即重拉历史（绕过 30s 节流）。mousedown 而不是 click：它先于
-    // input 的 blur 触发，preventDefault 保住焦点，列表不会闪没。
+    // 监控页趋势图的设备 / 隧道搜索选择器：聚焦/输入即展开并冻结整页重绘，
+    // 选中立即重拉历史（设备）或就地重画（隧道，数据本地就有）。mousedown
+    // 而不是 click：它先于 input 的 blur 触发，preventDefault 保住焦点，
+    // 列表不会闪没。两个选择器共享冻结位：关一个之前先看另一个还开不开着，
+    // 不然设备框 blur 的一下会把还开着的隧道列表冻态一起拆了。
+    var histFreezeBusy = function () {
+      return ["hist-pick", "hist-tpick"].some(function (id) {
+        var p = $(id);
+        return p && p.className.indexOf("open") >= 0;
+      });
+    };
     var hq = $("hist-q");
     if (hq) {
       var hopen = function () {
@@ -9285,9 +9374,9 @@
         histPickList();
       };
       var hclose = function () {
-        S.freeze = false;
         var p = $("hist-pick");
         if (p) p.className = "pick";
+        if (!histFreezeBusy()) S.freeze = false;
       };
       hq.addEventListener("focus", hopen);
       hq.addEventListener("input", function () {
@@ -9308,9 +9397,49 @@
         if (e.preventDefault) e.preventDefault();
         S.histNode = Number(t.getAttribute("data-hist-node")) || 0;
         S.histQ = "";
+        // 换设备 = 换一批隧道，隧道选择跟着清零，不然选中的键多半不在新设备上。
+        S.histT = "";
+        S.histTQ = "";
         S.freeze = false;
         S.histAt = 0;
         loadHistory();
+        render();
+      });
+    }
+    var htq = $("hist-tq");
+    if (htq) {
+      var topen = function () {
+        S.freeze = true;
+        S.freezeView = S.view;
+        var p = $("hist-tpick");
+        if (p) p.className = "pick open";
+        histTPickList();
+      };
+      var tclose = function () {
+        var p = $("hist-tpick");
+        if (p) p.className = "pick";
+        if (!histFreezeBusy()) S.freeze = false;
+      };
+      htq.addEventListener("focus", topen);
+      htq.addEventListener("input", function () {
+        S.histTQ = htq.value;
+        topen();
+      });
+      htq.addEventListener("blur", function () { setTimeout(tclose, 180); });
+      htq.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") { S.histTQ = ""; htq.blur(); }
+      });
+      var tl = $("hist-tlist");
+      if (tl) tl.addEventListener("mousedown", function (e) {
+        var t = e.target;
+        while (t && t !== tl && !(t.getAttribute && t.hasAttribute("data-hist-tunnel"))) {
+          t = t.parentNode;
+        }
+        if (!t || t === tl || !t.getAttribute) return;
+        if (e.preventDefault) e.preventDefault();
+        S.histT = t.getAttribute("data-hist-tunnel") || "";
+        S.histTQ = "";
+        S.freeze = false;
         render();
       });
     }

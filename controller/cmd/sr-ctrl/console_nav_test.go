@@ -124,8 +124,11 @@ func TestConsoleMonitorHistPicker(t *testing.T) {
 	if strings.Contains(mon, `id="hist-node"`) {
 		t.Error("监控页还在用旧的裸下拉 hist-node")
 	}
-	if !strings.Contains(mon, "histCharts(S.history, histSel, nodes)") {
-		t.Error("趋势图没有把设备列表传给 histCharts：图例反查不出对端序列号")
+	if !strings.Contains(mon, "histCharts(S.history, histSel, nodes, S.histT || \"\")") {
+		t.Error("趋势图没有把设备列表和隧道选择传给 histCharts：图例反查不出对端序列号，隧道也筛不掉")
+	}
+	if !strings.Contains(mon, `id="hist-tq"`) || !strings.Contains(mon, "hist-tpick") {
+		t.Error("监控页没有隧道搜索选择器（hist-tq / hist-tpick）：单设备上千条隧道时图没法看")
 	}
 	r := funcBody(t, html, "function render(")
 	if !strings.Contains(r, "S.freeze") {
@@ -133,7 +136,13 @@ func TestConsoleMonitorHistPicker(t *testing.T) {
 	}
 	bd := funcBody(t, html, "function bind(")
 	if !strings.Contains(bd, "histPickList()") || !strings.Contains(bd, "data-hist-node") {
-		t.Error("bind() 没有接选择器事件：搜索与选中都不会有反应")
+		t.Error("bind() 没有接设备选择器事件：搜索与选中都不会有反应")
+	}
+	if !strings.Contains(bd, "histTPickList()") || !strings.Contains(bd, "data-hist-tunnel") {
+		t.Error("bind() 没有接隧道选择器事件：选隧道不会有反应")
+	}
+	if !strings.Contains(bd, "S.histT = \"\"") {
+		t.Error("bind() 换设备时没有清掉隧道选择：选中的键多半不在新设备上")
 	}
 }
 
