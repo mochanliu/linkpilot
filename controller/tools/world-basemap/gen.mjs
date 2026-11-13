@@ -73,7 +73,6 @@ if (!d3 || !d3.geoNaturalEarth1 || !topojson || !topojson.merge) {
   process.exit(1);
 }
 
-const crop = () => d3.geoClipRectangle(-Math.PI, (LAT_MIN_DEG * Math.PI) / 180, Math.PI, Math.PI / 2);
 const countries = readJSON('countries-110m.json');
 const land110 = readJSON('land-110m.json');
 const land50 = readJSON('land-50m.json');
@@ -85,14 +84,35 @@ const landGeo50 = topojson.feature(land50, land50.objects.land).features[0].geom
 // stroke would then be visibly darker along shared edges.
 const borderGeo = topojson.merge(countries, countries.objects.countries.geometries);
 
-const projection = d3.geoNaturalEarth1().preclip(crop());
-projection.fitExtent([[PAD, PAD], [W - PAD, H - PAD]], {
+// PRE-CLIP: d3's default for this projection, geoClipAntimeridian. It SPLITS a
+// ring where it crosses the dateline, which is what makes Chukotka and Fiji end
+// at the seam instead of being joined by a straight line.
+//
+// This used to be geoClipRectangle(-180, LAT_MIN, 180, 90), chosen to crop the
+// latitude. That rectangle covers the whole 360 degrees of longitude, so both
+// sides of the seam are "inside" and nothing is ever split: every ring crossing
+// 180 got one long horizontal segment across the entire map -- a stripe through
+// Russia at 65-71N and through Fiji at 16S, while the rest of the coastline was
+// fine. Cropping is now done by the FIT below, not by the clipper.
+const projection = d3.geoNaturalEarth1();
+
+// FIT: the crop rectangle's outline, as three polylines (bottom edge and the two
+// meridians). Only its bounds are used. The meridians stop a thousandth of a
+// degree short of 180 so no vertex sits exactly on the seam, and they run
+// through the equator, where the projection is widest -- fitting the outline is
+// therefore the same as fitting "the whole world down to LAT_MIN_DEG".
+// Land below LAT_MIN_DEG (the Antarctic shelf edge) is simply projected below
+// the frame and clipped by the viewport, which is exactly the crop we want.
+const E = 179.999;
+const frameOutlines = {
   type: 'FeatureCollection',
   features: [
-    { type: 'Feature', properties: {}, geometry: landGeo110 },
-    { type: 'Feature', properties: {}, geometry: borderGeo },
-  ],
-});
+    [[-E, LAT_MIN_DEG], [E, LAT_MIN_DEG]],
+    [[E, LAT_MIN_DEG], [E, 90]],
+    [[-E, LAT_MIN_DEG], [-E, 90]],
+  ].map((coordinates) => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates } })),
+};
+projection.fitExtent([[PAD, PAD], [W - PAD, H - PAD]], frameOutlines);
 const geoPath = d3.geoPath(projection);
 const feature = (geometry) => ({ type: 'Feature', properties: {}, geometry });
 
@@ -107,6 +127,46 @@ const layers110 = {
   graticule: render(d3.geoGraticule().step([20, 20])()),
 };
 const layers50 = { land: render(landGeo50) };
+
+// A ring that wraps the map instead of being split at the seam shows up as one
+// segment thousands of pixels wide at constant y -- a horizontal stripe through
+// the whole map. That is precisely the bug this file used to ship (a stripe
+// through Russia at 65-71N), and it is invisible to the projection check above,
+// so it gets its own check: no segment inside one subpath may run wider than a
+// quarter of the frame without changing latitude.
+const widestRun = (d) => {
+  let worst = 0, where = null;
+  for (const sub of d.split('M').slice(1)) {
+    const pts = [...sub.matchAll(/(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/g)].map((m) => [+m[1], +m[2]]);
+    for (let i = 1; i < pts.length; i++) {
+      const [x0, y0] = pts[i - 1], [x1, y1] = pts[i];
+      // Only what the viewport can show counts. Antarctica's closing edge at the
+      // south pole is such a run, and it lands below y=H by construction.
+      if (y0 < 0 || y0 > H) continue;
+      if (Math.abs(y1 - y0) < 1 && Math.abs(x1 - x0) > worst) {
+        worst = Math.abs(x1 - x0);
+        where = [x0, y0, x1, y1];
+      }
+    }
+  }
+  return { worst, where };
+};
+let widest = 0;
+for (const [name, layers] of [['110m', layers110], ['50m', layers50]]) {
+  for (const [layer, d] of Object.entries(layers)) {
+    const { worst, where } = widestRun(d);
+    widest = Math.max(widest, worst);
+    if (worst > W / 4) {
+      console.error(`  ${name} ${layer}: a ring runs ${worst.toFixed(0)} px without changing latitude ` +
+        `(${where.map((v) => v.toFixed(0)).join(', ')}); the dateline is not being split`);
+    }
+  }
+}
+console.log(`  widest horizontal run inside one subpath = ${widest.toFixed(0)} px (frame ${W})`);
+if (widest > W / 4) {
+  console.error('the basemap still has a wrapped ring; a stripe will show up across the map');
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------- the check
 // The console places devices with this hand-rolled forward form of the same

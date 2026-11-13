@@ -49,10 +49,13 @@ type policyRowView struct {
 	Match   string   `json:"match"`
 
 	// 动态行专属。静态行这些键是零值，页面按 Mode 分支渲染。
+	// Colors 必须是 []int：Go 的 []uint8 就是 []byte，encoding/json 会把它编成
+	// base64 字符串（"AgM="），页面对它 forEach/join/indexOf 时整页 render 直接
+	// 抛 TypeError —— 表现是点「SD-WAN 策略」没有任何反应。见 policy_api_json_test.go。
 	Mode          string     `json:"mode,omitempty"`
 	Peer          uint16     `json:"peer,omitempty"`
 	PeerName      string     `json:"peer_name,omitempty"`
-	Colors        []uint8    `json:"colors,omitempty"`
+	Colors        []int      `json:"colors,omitempty"`
 	SLA           *PolicySLA `json:"sla,omitempty"`
 	Preempt       bool       `json:"preempt,omitempty"`
 	SelectorTable uint32     `json:"selector_table,omitempty"`
@@ -63,9 +66,19 @@ type policyRowView struct {
 
 // policyPeerRow 是动态行的对端下拉框：这台设备到每台对端各有哪些颜色。
 type policyPeerRow struct {
-	NodeID uint16  `json:"node_id"`
-	Name   string  `json:"name,omitempty"`
-	Colors []uint8 `json:"colors"`
+	NodeID uint16 `json:"node_id"`
+	Name   string `json:"name,omitempty"`
+	Colors []int  `json:"colors"`
+}
+
+// policyColorInts 把存储层的颜色集合转成 JSON 数组。颜色值域是 0..7，[]int 没有
+// 精度损失；用 []uint8 承载的话上面那条 base64 问题就回来了。
+func policyColorInts(cs []uint8) []int {
+	out := make([]int, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, int(c))
+	}
+	return out
 }
 
 // policyVPNRow 是 VPN 选择框的一项。IfaceCount 为 0 的 VPN 在页面上要标出来：
@@ -266,7 +279,7 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 	peerColors, hasPeers := s.nodeTunnelPeersLocked(tenantID, nodeID)
 	if hasPeers {
 		for peer, colors := range peerColors {
-			row := policyPeerRow{NodeID: peer, Colors: colors}
+			row := policyPeerRow{NodeID: peer, Colors: policyColorInts(colors)}
 			if n := s.state.Nodes[key(tenantID, peer)]; n != nil {
 				row.Name = n.Serial
 			}
@@ -299,7 +312,7 @@ func (s *server) policyViewLocked(tenantID string, nodeID uint16, now int64) (po
 			if n := s.state.Nodes[key(tenantID, r.Peer)]; n != nil {
 				row.PeerName = n.Serial
 			}
-			row.Colors = r.Colors
+			row.Colors = policyColorInts(r.Colors)
 			row.SLA = r.SLA
 			row.Preempt = r.Preempt
 			if st, err := fib.SelectorTable(r.ID); err == nil {

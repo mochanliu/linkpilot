@@ -904,27 +904,36 @@
     // 随之丢失，拖动变成跳跃。
     if (undMapDragging()) return;
 
+    // 视图函数抛异常时不能把异常放出去：render 是唯一的重绘入口，导航点击、
+    // 10 秒轮询、SSE 推送全都走它。放出去的结果是整页停在上一个画面、
+    // 每次轮询再抛一次 —— 看起来就是"点了没反应，卡住了"。把异常变成一条
+    // 看得见的错误（带堆栈），这页坏得明明白白，其他页照常能切。
     var c = "";
-    if (S.view === "dashboard") c = viewDashboard(st, online, isOp);
-    else if (S.view === "tenants") c = viewTenants(st);
-    else if (S.view === "accounts") c = viewAccounts(st);
-    else if (S.view === "enroll") c = viewEnroll(st, isOp);
-    else if (S.view === "nodes") c = viewNodes(st, isOp);
-    else if (S.view === "config") c = viewConfig(st);
-    else if (S.view === "underlay-settings") c = viewUnderlaySettings();
-    else if (S.view === "underlay-tunnels") c = viewUnderlayTunnels();
-    else if (S.view === "underlay-topology") c = viewUnderlayTopology();
-    else if (S.view === "overlay-settings") c = viewOverlaySettings();
-    else if (S.view === "overlay-groups") c = viewOverlayGroups();
-    else if (S.view === "leak-to-sdwan") c = viewLeakToSDWAN();
-    else if (S.view === "leak-to-cpe") c = viewLeakToCPE();
-    else if (S.view === "policy") c = viewPolicy();
-    else if (S.view === "services") c = viewServices();
-    else if (S.view === "monitor") c = viewMonitor();
-    else if (S.view === "ops") c = viewOps();
-    else if (S.view === "diag") c = viewDiag();
-    else if (S.view === "account") c = viewAccount();
-    else c = viewPlaceholder();
+    try {
+      if (S.view === "dashboard") c = viewDashboard(st, online, isOp);
+      else if (S.view === "tenants") c = viewTenants(st);
+      else if (S.view === "accounts") c = viewAccounts(st);
+      else if (S.view === "enroll") c = viewEnroll(st, isOp);
+      else if (S.view === "nodes") c = viewNodes(st, isOp);
+      else if (S.view === "config") c = viewConfig(st);
+      else if (S.view === "underlay-settings") c = viewUnderlaySettings();
+      else if (S.view === "underlay-tunnels") c = viewUnderlayTunnels();
+      else if (S.view === "underlay-topology") c = viewUnderlayTopology();
+      else if (S.view === "overlay-settings") c = viewOverlaySettings();
+      else if (S.view === "overlay-groups") c = viewOverlayGroups();
+      else if (S.view === "leak-to-sdwan") c = viewLeakToSDWAN();
+      else if (S.view === "leak-to-cpe") c = viewLeakToCPE();
+      else if (S.view === "policy") c = viewPolicy();
+      else if (S.view === "services") c = viewServices();
+      else if (S.view === "monitor") c = viewMonitor();
+      else if (S.view === "ops") c = viewOps();
+      else if (S.view === "diag") c = viewDiag();
+      else if (S.view === "account") c = viewAccount();
+      else c = viewPlaceholder();
+    } catch (err) {
+      if (window.console && console.error) console.error("view " + S.view + " failed", err);
+      c = viewCrash(S.view, err);
+    }
     if (me.initial_password) c = initialPassBanner() + c;
 
     // 结构没变就只刷新相对时间，不重建 DOM：重建会让正在点的按钮在半路
@@ -3198,6 +3207,18 @@
 
   function viewPlaceholder() {
     return '<section class="panel"><div class="empty">这个页面不存在。</div></section>';
+  }
+
+  // 一个视图函数抛异常时的落脚点：把堆栈亮出来，而不是让整页无声地停在上一个
+  // 画面。render 的 catch 是唯一调用方 —— 那里放行异常的话，导航点击、10 秒轮询、
+  // SSE 推送全都跟着抛，页面看起来就是"点了没反应，卡住了"。
+  function viewCrash(view, err) {
+    return '<section class="panel"><header><h2>这一页渲染失败</h2></header>' +
+      '<div class="hint">视图 <code>' + esc(view) + "</code> 在浏览器里抛了异常。" +
+      "控制器没有问题，其他页面不受影响；刷新页面可以恢复。请把下面的堆栈一起报上来。</div>" +
+      '<pre class="mono" style="white-space:pre-wrap;word-break:break-word;background:var(--warn-bg);' +
+      'border:1px solid var(--line);border-radius:8px;padding:10px;font-size:12px;margin-top:10px">' +
+      esc(String((err && (err.stack || err.message)) || err)) + "</pre></section>";
   }
 
   function resultBox() {
@@ -7627,7 +7648,7 @@
   // 而不是拿旧结论给新输入背书。
 
   function plStore() {
-    if (!S.pl) S.pl = { node: 0, doc: null, at: 0, loading: false, note: null, draft: null, busy: false };
+    if (!S.pl) S.pl = { node: 0, doc: null, at: 0, loading: false, mismatch: false, note: null, draft: null, busy: false };
     return S.pl;
   }
 
@@ -7643,7 +7664,10 @@
     var ns = plNodes();
     if (!o.node && ns.length) o.node = ns[0].node_id;
     if (o.node && o.doc && o.doc.node_id !== o.node) { o.doc = null; o.draft = null; }
-    if (o.node && !o.loading && (!o.doc || nowSec() - o.at >= 10)) plLoad(false);
+    // o.mismatch：服务端对 node=N 回了一份 node≠N 的文档。这时绝不能"清 doc →
+    // 再拉 → 又对不上"地重试 —— 那是一个只在微任务里打转的环，计时器永远排不上，
+    // 浏览器整页卡死（比抛异常糟糕得多）。停下来等用户换设备。
+    if (o.node && !o.loading && !o.mismatch && (!o.doc || nowSec() - o.at >= 10)) plLoad(false);
     return o;
   }
 
@@ -7655,6 +7679,13 @@
     api("GET", "/api/policy?node=" + o.node).then(function (doc) {
       o.loading = false;
       if (!doc) { render(); return; }
+      if (doc.node_id !== o.node) {
+        o.mismatch = true;
+        o.note = { kind: "bad", fromLoad: true, text: "控制器对 node-" + o.node + " 返回的是 node-" +
+          doc.node_id + " 的策略，两边对不上；这一页停止重试。刷新页面或换一台设备再试。" };
+        render();
+        return;
+      }
       plSetDoc(doc);
       if (o.note && o.note.fromLoad) o.note = null;
       render();
@@ -8068,6 +8099,7 @@
       o.doc = null;
       o.draft = null;
       o.note = null;
+      o.mismatch = false; // 换了设备：上一台的"对不上"不再约束这一台
       blurContent();
       plLoad(true);
       return;
@@ -8175,7 +8207,7 @@
   // 换设备/保存后刷新）才走 render()。校验是服务端算的，只反映已保存那一版。
 
   function svStore() {
-    if (!S.sv) S.sv = { node: 0, doc: null, at: 0, loading: false, note: null, draft: null, busy: false };
+    if (!S.sv) S.sv = { node: 0, doc: null, at: 0, loading: false, mismatch: false, note: null, draft: null, busy: false };
     return S.sv;
   }
 
@@ -8191,7 +8223,8 @@
     var ns = svNodes();
     if (!o.node && ns.length) o.node = ns[0].node_id;
     if (o.node && o.doc && o.doc.node_id !== o.node) { o.doc = null; o.draft = null; }
-    if (o.node && !o.loading && (!o.doc || nowSec() - o.at >= 10)) svLoad(false);
+    // 与策略页同一个护栏：node 对不上时清 doc 重拉是个微任务死环（见 ensurePolicy）。
+    if (o.node && !o.loading && !o.mismatch && (!o.doc || nowSec() - o.at >= 10)) svLoad(false);
     return o;
   }
 
@@ -8203,6 +8236,13 @@
     api("GET", "/api/services?node=" + o.node).then(function (doc) {
       o.loading = false;
       if (!doc) { render(); return; }
+      if (doc.node_id !== o.node) {
+        o.mismatch = true;
+        o.note = { kind: "bad", fromLoad: true, text: "控制器对 node-" + o.node + " 返回的是 node-" +
+          doc.node_id + " 的服务配置，两边对不上；这一页停止重试。刷新页面或换一台设备再试。" };
+        render();
+        return;
+      }
       svSetDoc(doc);
       if (o.note && o.note.fromLoad) o.note = null;
       render();
@@ -8520,6 +8560,7 @@
       o.doc = null;
       o.draft = null;
       o.note = null;
+      o.mismatch = false; // 换了设备：上一台的"对不上"不再约束这一台
       blurContent();
       svLoad(true);
       return;

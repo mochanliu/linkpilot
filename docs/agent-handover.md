@@ -159,11 +159,16 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `6d775b481b67850882afb338c3373136`（2026-11-13 22:14，拓扑图嵌进
-Dashboard + 同站点设备聚簇散开 + 明细海岸线阈值 4.5×→2.5×；上一代
-`5e8fe94fce4495f85b679c45391bbc6b` 只改界面文案 SROU → LinkPilot，备份
-`sr-ctrl.prev-topo-20261113`；再上一代 `f5dc4d3a…` 是控制台 HTTPS 那版，备份
-`sr-ctrl.prev-brand-20261113`；更早的 FEC 代 `e2a787e5…` 备份
+当前代际：sr-ctrl `b0e7a0b8a379da9dbe6cfd39834810c8`（2026-11-13 22:47，修两件事：
+① SD-WAN 策略页打不开 —— /api/policy 的 colors 是 []uint8，JSON 编成了 base64
+字符串，前端 render 抛 TypeError 整页冻结；DTO 改 []int + render 加 viewCrash
+兜底 + store 加 node 不匹配护栏。② 世界底图俄罗斯方向横贯一条直线 —— 生成器
+用全经度矩形裁剪不切日期变更线，改回 d3 默认 antimeridian 裁剪，纬度裁剪改由
+fit 框承担；gen.mjs 加了"框内不得有横向长直线"检查。上一代
+`6d775b481b67850882afb338c3373136` 是拓扑图嵌 Dashboard 那版，备份
+`sr-ctrl.prev-fix-20261113`；再往前 `5e8fe94f…`（LinkPilot 改名）备份
+`sr-ctrl.prev-topo-20261113`、`f5dc4d3a…`（HTTPS）备份
+`sr-ctrl.prev-brand-20261113`、`e2a787e5…`（FEC）备份
 `sr-ctrl.prev-fecui-20261113` / `sr-ctrl.prev-fec-20261113`）。上一代功能面：
 sr-ctrl `76f9c959f0ca0a9fba33e5e50542ebb7`（2026-11-13 深夜，M-3 抬门：
 同对端第二条隧道走密钥槽派生 `allocPairSlot`（上限 8，`ErrPairFull` 409）、
