@@ -2327,11 +2327,20 @@ func main() {
 		listen   = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
 		hbSec    = flag.Int("hb", 5, "heartbeat interval advertised to agents")
 		extraSAN = flag.String("tls-san", "", "comma-separated extra SANs for the server certificate")
-		// The console is a SEPARATE, PLAIN-HTTP listener. A browser cannot present
-		// a device certificate, so it cannot use the mTLS listener without making
-		// every operator install one; the console therefore has its own token
-		// session and is meant to be published on loopback only.
-		consoleAddr = flag.String("console", "127.0.0.1:8088", "console listen address (plain HTTP; empty disables the console)")
+		// The console is a SEPARATE listener. A browser cannot present a device
+		// certificate, so it cannot use the mTLS listener without making every
+		// operator install one; the console therefore has its own token session.
+		// It stays on loopback by default; -console-tls is what makes it safe to
+		// publish further out (see console_tls.go for why the cert is self-signed).
+		consoleAddr = flag.String("console", "127.0.0.1:8088", "console listen address (plain HTTP unless -console-tls; empty disables the console)")
+		consoleTLS  = flag.Bool("console-tls", false, "serve the console over HTTPS (self-signed cert under <data>/console-tls unless -console-cert/-console-key)")
+		consoleCert = flag.String("console-cert", "", "console TLS certificate (PEM); pair with -console-key")
+		consoleKey  = flag.String("console-key", "", "console TLS private key (PEM); pair with -console-cert")
+		consoleSAN  = flag.String("console-san", "", "extra console certificate SANs, comma separated (public IP or domain)")
+		// A second, plain-HTTP listener for local tooling. It shares the handler
+		// and the session store with the TLS one, so scripts that speak
+		// http://127.0.0.1:8088 keep working while the outside world gets HTTPS.
+		consoleHTTP = flag.String("console-http", "", "additional plain-HTTP console listener for loopback tooling (e.g. 127.0.0.1:8088)")
 		adminTokenF = flag.String("admin-token", "", "console login token; empty reads $SR_CTRL_ADMIN_TOKEN, else generates one and prints it once")
 		// How long a telemetry window stays readable after its last report. It is
 		// a read-side policy, not a dataplane setting: the probe cadence comes from
@@ -2463,16 +2472,56 @@ func main() {
 			generated = true
 		}
 		s.admin = newAdminHub()
-		adminSrv = &http.Server{Addr: *consoleAddr, Handler: s.adminHandler()}
+		var consoleTLSConf *tls.Config
+		if *consoleTLS {
+			info, err := loadConsoleCert(*dataDir, *consoleCert, *consoleKey, *consoleSAN)
+			if err != nil {
+				log.Fatalf("console TLS: %v", err)
+			}
+			consoleTLSConf = &tls.Config{
+				Certificates: []tls.Certificate{info.cert},
+				MinVersion:   tls.VersionTLS12,
+			}
+			state := "reused"
+			if !info.reused {
+				state = "generated"
+			}
+			// SAN 打全：操作员要靠这一行知道该把哪个名字写进浏览器、哪张证书
+			// 装进钥匙串，报"证书不对"的时候也先看这里。
+			log.Printf("console TLS cert %s: %s", state, strings.Join(info.sans, ", "))
+		}
+		handler := s.adminHandler()
+		adminSrv = &http.Server{Addr: *consoleAddr, Handler: handler, TLSConfig: consoleTLSConf}
 		go func() {
-			log.Printf("console listening on http://%s/", *consoleAddr)
+			if consoleTLSConf != nil {
+				log.Printf("console listening on https://%s/", *consoleAddr)
+			} else {
+				log.Printf("console listening on http://%s/", *consoleAddr)
+			}
 			if generated {
 				log.Printf("console login token (generated, shown once): %s", s.adminToken)
 			}
-			if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			var err error
+			if consoleTLSConf != nil {
+				// 证书已经在 TLSConfig 里，两个空参数是 http.Server 的既有约定
+				// （它会去翻 TLSConfig.Certificates）。
+				err = adminSrv.ListenAndServeTLS("", "")
+			} else {
+				err = adminSrv.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
 				log.Printf("console listener stopped: %v", err)
 			}
 		}()
+		if *consoleHTTP != "" {
+			plain := &http.Server{Addr: *consoleHTTP, Handler: handler}
+			go func() {
+				log.Printf("console (plain, for local tooling) listening on http://%s/", *consoleHTTP)
+				if err := plain.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					log.Printf("plain console listener stopped: %v", err)
+				}
+			}()
+		}
 	} else {
 		// Publishing to a hub with no subscribers keeps s.admin.publish safe on
 		// the enrollment/heartbeat paths without a nil check at every call site.

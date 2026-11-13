@@ -233,7 +233,10 @@ func (s *server) session(r *http.Request) consoleIdentity {
 	return id
 }
 
-func (s *server) newSession(w http.ResponseWriter, id consoleIdentity) {
+// newSession 发会话 cookie。Secure 只看这条请求是不是走 TLS：同一个控制器
+// 可能同时开着 HTTPS 监听器和 loopback 的明文监听器（后者给本机脚本用），
+// 用一个全局开关会让其中一边要么写不进 cookie、要么白白丢掉一层保护。
+func (s *server) newSession(w http.ResponseWriter, r *http.Request, id consoleIdentity) {
 	sid := randToken()
 	id.expires = time.Now().Add(12 * time.Hour)
 	s.admin.mu.Lock()
@@ -244,6 +247,7 @@ func (s *server) newSession(w http.ResponseWriter, id consoleIdentity) {
 		Value:    sid,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r != nil && r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   12 * 3600,
 	})
@@ -441,7 +445,7 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid token", 401)
 			return
 		}
-		s.newSession(w, consoleIdentity{Role: roleOperator, Username: "operator", Via: "token"})
+		s.newSession(w, r, consoleIdentity{Role: roleOperator, Username: "operator", Via: "token"})
 		log.Printf("console login ok via operator token")
 		writeJSON(w, map[string]any{"ok": true})
 		return
@@ -499,7 +503,7 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	s.save()
 	s.mu.Unlock()
 
-	s.newSession(w, consoleIdentity{
+	s.newSession(w, r, consoleIdentity{
 		Role: acc.Role, TenantID: acc.TenantID, Username: acc.Username, Via: "password",
 	})
 	log.Printf("console login ok username=%s role=%s tenant=%s", acc.Username, acc.Role, acc.TenantID)
@@ -1442,7 +1446,7 @@ func (s *server) handleAdminPassword(w http.ResponseWriter, r *http.Request) {
 	// Re-issue the caller's own session after dropping every session of the
 	// account, so changing a password on one machine logs out the others.
 	s.dropSessions(id.Username)
-	s.newSession(w, consoleIdentity{
+	s.newSession(w, r, consoleIdentity{
 		Role: id.Role, TenantID: id.TenantID, Username: id.Username, Via: "password",
 	})
 	log.Printf("console: password changed for %q", id.Username)

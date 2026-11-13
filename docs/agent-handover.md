@@ -88,7 +88,7 @@ sr-frr 应答即降级自己的 `lastSeen`（`localReporter.demote()`），拉�
 
 | 件 | pid | 参数要点 |
 | --- | --- | --- |
-| `sr-ctrl` | 50728（2026-11-13 20:56 重启后） | `-data /Users/louis/srvmlab/ctrl/data -listen 0.0.0.0:8444 -tls-san 192.168.1.4 -console 0.0.0.0:8088 -stun 192.168.1.4:3478,3479 -hb 5` |
+| `sr-ctrl` | 52092（2026-11-13 21:06 起，HTTPS 版） | `-data /Users/louis/srvmlab/ctrl/data -listen 0.0.0.0:8444 -tls-san 192.168.1.4 -console 0.0.0.0:8443 -console-tls -console-san 203.0.113.10 -console-http 127.0.0.1:8088 -stun 192.168.1.4:3478,3479 -hb 5` |
 | `sr-rr` ×2 | 40616 / 40618 | `-config /Users/louis/srvmlab/state/rr-a.json`、`rr-b.json`，监听 18446+19446 / 18447+19447 |
 
 复核：`ps -eo pid,etime,command | grep -E "sr-ctrl|sr-rr" | grep -v grep` 和
@@ -98,20 +98,60 @@ sr-frr 应答即降级自己的 `lastSeen`（`localReporter.demote()`），拉�
 
 Mac 的 LAN 地址是 `192.168.1.4`。
 
-**2026-11-13 晚（owner 拍板）：控制台从 loopback 放到全接口，供外网访问。**
-`-console 0.0.0.0:8088`，`start-sr-ctrl-detached.py` 与
-`~/Library/LaunchAgents/com.louis.sr-ctrl.plist` 两处都已改（备份
-`com.louis.sr-ctrl.plist.bak-20261113`）。Go 在 macOS 上实际是**双栈**绑定
-（`lsof` 显示 `*:8088`），所以 `http://192.168.1.4:8088` 与
-`http://[2408:8207:…]:8088` 都通，实测回环/局域网/公网 IPv6 三种走法均 200、
-登录 `{"ok":true}`，跨机验证从 CPE1 也 200。
+**2026-11-13 晚（owner 拍板）：控制台改 HTTPS，供外网访问。**
 
-**代价（owner 已知情，别再当缺陷报）**：控制台是明文 HTTP，会话 Cookie 只有
-`HttpOnly + SameSite=Strict`、**没有 Secure**（无 TLS 就没法设），12 小时有效；
-登录失败锁定按 `用户名|RemoteAddr` 计数，若日后加反代，所有外部请求的
-RemoteAddr 会塌缩成同一个值，5 次失败就能把账号锁 60 秒。要收口就二选一：
-① 给 sr-ctrl 加 `-console-tls-*` 走 HTTPS；② 前面挂 Caddy/nginx 终止 TLS，
-sr-ctrl 退回 `127.0.0.1:8088`。路由器的端口转发/NAT 由 owner 自己做。
+先是把 `-console` 放到 `0.0.0.0:8088`（明文），owner 随即要求上 TLS，于是同一个
+晚上做成：`sr-ctrl` 自带 TLS 监听器，不引反代。启动参数（`start-sr-ctrl-detached.py`
+与 `~/Library/LaunchAgents/com.louis.sr-ctrl.plist` 两处都改，plist 备份
+`com.louis.sr-ctrl.plist.bak-20261113`）：
+
+```
+-console 0.0.0.0:8443  -console-tls  -console-san 203.0.113.10
+-console-http 127.0.0.1:8088
+```
+
+三条监听器同时存在，各管一段：
+
+| 监听 | 协议 | 谁用 |
+| --- | --- | --- |
+| `0.0.0.0:8443` | HTTPS（自签） | 外网/局域网浏览器，**唯一对外入口** |
+| `127.0.0.1:8088` | 明文 HTTP | 本机脚本（`test/lab/vmlab/*.sh`、临时 curl）不用改 |
+| `0.0.0.0:8444` | TLS+mTLS | 设备面，未变 |
+
+**证书**：`<data>/console-tls/cert.pem|key.pem`（私钥 0600），首次启动自签、之后
+复用（重启换指纹会把已经信任它的浏览器反复踢回警告页）。自签是唯一现实解 ——
+没有域名就没有 ACME；证书带 `IsCA + KeyUsageCertSign`，**就是为了能装进钥匙串
+当根证书**，装完浏览器不再报警：
+
+```sh
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \
+  /Users/louis/srvmlab/ctrl/data/console-tls/cert.pem
+```
+
+SAN 自动收本机名字：`localhost`、主机名、`127.0.0.1`、`::1`、所有网卡地址
+（`192.168.1.4`、两个 `2408:8207:…` 公网 v6、`…::2`），再加 `-console-san` 点名的
+公网 v4。**公网 v4 是动态的**，变了要改 `-console-san` 并删掉 `console-tls/`
+重启重签（日志会明说"证书里没有 X"）；同一张证书在 IPv6 那条路上不受影响。
+
+**会话 cookie**：`Secure` 由**每条请求的 TLS 状态**决定，不是全局开关 ——
+否则 loopback 明文口写不进 cookie、或者反过来白白少一层保护。实测 HTTPS 登录
+返回 `Set-Cookie: …; HttpOnly; Secure; SameSite=Strict`，走 8088 明文则没有
+`Secure`（`console_tls_test.go` 两个方向都钉住）。
+
+**验证（2026-11-13 21:06，全部通过）**
+
+| 项 | 结果 |
+| --- | --- |
+| 回环 / LAN IP / 公网 IPv6 | 均 200；后两者用 `--cacert` 校验通过（SAN 正确，不是靠 `-k`） |
+| 协议 | `HTTP/2`（Go 的 ListenAndServeTLS 自动开 h2） |
+| 明文打 8443 | `HTTP/1.0 400 Bad Request`（Go 的"你对着 HTTPS 端口说了 HTTP"），明文服务不存在 |
+| 跨机 | CPE1 → `https://192.168.1.4:8443` 200、登录 `{"ok":true}` |
+| 副作用 | 控制通道断 ~5 秒后四节点重连；6 条隧道在、t10 FEC 仍 1:2（parity=seq）、抽测 0% 丢 |
+
+**已知取舍**：① 自签证书在**没装钥匙串的客户端**上仍会报警一次，这是自签的
+本质，不是配置错；② 没加 HSTS —— 自签 + 动态 IP 下 HSTS 会把"证书过期后回退
+明文"这条路堵死，等有域名再上；③ 登录失败锁定按 `用户名|RemoteAddr`，直连
+（当前形态）是真实客户端 IP，将来若加反代就会塌缩成同一个桶。
 
 **2026-11-12 增量（实测）：sr-ctrl 的启动方式变了，`~/Library/LaunchAgents/com.louis.sr-ctrl.plist` 是死的。**
 launchd bootstrap 这份 plist 一直报 EIO（历代 sr-ctrl 其实都是脚本 nohup 起的，launchd 从没管过它）；

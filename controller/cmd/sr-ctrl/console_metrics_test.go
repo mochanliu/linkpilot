@@ -31,7 +31,8 @@ func consoleSession(t *testing.T, s *server, id consoleIdentity) string {
 		s.admin = newAdminHub()
 	}
 	rec := httptest.NewRecorder()
-	s.newSession(rec, id)
+	// 明文请求：Secure 标志由这条请求的 TLS 状态决定，测试用的是普通 recorder。
+	s.newSession(rec, httptest.NewRequest(http.MethodGet, "/", nil), id)
 	for _, c := range rec.Result().Cookies() {
 		if c.Name == sessionCookie {
 			return c.Value
