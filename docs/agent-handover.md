@@ -104,7 +104,10 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `76f9c959f0ca0a9fba33e5e50542ebb7`（2026-11-13 深夜，M-3 抬门：
+当前代际：sr-ctrl `e2a787e572730e3553ccfb7315912edf`（2026-11-13 晚，FEC 全链 +
+控制台勾选框；上一代 `b1a4ccd14aba134b66221be4c483f141` 只差页面那 20 行，
+备份 `sr-ctrl.prev-fecui-20261113` / `sr-ctrl.prev-fec-20261113`）。上一代功能面：
+sr-ctrl `76f9c959f0ca0a9fba33e5e50542ebb7`（2026-11-13 深夜，M-3 抬门：
 同对端第二条隧道走密钥槽派生 `allocPairSlot`（上限 8，`ErrPairFull` 409）、
 Tunnel 视图/控制台新增 slot 字段、Fan 每对仍只建一条；实机 1↔4 对 t10(w10)+t16(w30)
 CPE1 实测分流 25.9%:74.1%（期望 25:75），见 fec-and-lb-plan §7。备份
@@ -127,7 +130,8 @@ bundle 第 8 段（NAT/DHCP/DNS）；CPE1 盒内新增 daemon `sr-svc`（DHCP se
 **2026-11-13 深夜换件（实测）**：四台 CPE 盒 sr-agent `3f237ac9e7f7d6d50b0b59711b89b495`
 （动态 weight 第三棒：丢包四档非线性 + 3×5s 迟滞，见 fec-and-lb-plan §8；盒上备份
 `.prev-agent-20261113dyn`）。sr-fib `d07ba51e3ff991b52d44a3fde789231d` 与 host sr-ctrl
-`76f9c959f0ca0a9fba33e5e50542ebb7` 未动。**lab 现存演示对**：t10（w10 静态）+
+`76f9c959f0ca0a9fba33e5e50542ebb7` 未动。（当晚 FEC 管理面又换了一代：
+sr-agent `8cd9e311…` + sr-ctrl `e2a787e5…`，见 §2.1 末段。）**lab 现存演示对**：t10（w10 静态）+
 t16（w30 动态，slot 2）——CPE1 表 3000 实测分流 25.9%:74.1%，动态档在 CPE4 VPP 崩溃
 窗口里实机走了六次降/恢复。两条硬教训：① **这台 26.06 的 acl 插件挂接口即崩 VPP**
 （acl_interface_set_acl_list，acls=[0] 和 [1] 都崩，CPE4 硬复位两次）——别再试；
@@ -246,8 +250,21 @@ VPP 重启后 agent 自动重建隧道（~1-2 分钟），期间转发是断的�
 **两个新教训**：(1) CPE4 换件后 `restart vpp` 数据面 3 分钟内全通（看门狗 OK）但 vpp0
 管理口没回来，ssh 失联——"ssh 不回来"≠"换件失败"，先看 vpp.log 是否在响应 CLI /
 从别的盒 ping 它的 WAN IP，4 分钟还不行就整机 `VBoxManage reset`（30 秒恢复）；
-(2) 管理面（新 sr-ctrl/sr-agent）还没铺：四台 agent 仍旧版，不发 `sr_wg_fec_set`，
+(2) 管理面（新 sr-ctrl/sr-agent）当时还没铺：四台 agent 仍旧版，不发 `sr_wg_fec_set`，
 实机 FEC 处于"插件就位、管理面待铺"。
+
+**2026-11-13 晚 FEC 管理面铺设完毕（四台 agent + host sr-ctrl，t10 已开 1:2）**：
+`sr-agent` 换到 `8cd9e311…`（含 `ApplyFec`，盒上回滚底 `.prev-agent-20261113fec`
+= 动态 weight 那代 `3f237ac9…`），host `sr-ctrl` 换到 `e2a787e5…`
+（`b1a4ccd1…` 是 FEC 全链那版，`e2a787e5…` 另带控制台勾选框改动；回滚底
+`sr-ctrl.prev-fec-20261113` / `sr-ctrl.prev-fecui-20261113`）。四台 delivery v46 全 `ok`。
+控制台隧道表单从"下拉里塞个关"改成 **勾选框「启用」+ 档位下拉 1:1…1:4**。
+实机 `PUT {id:t10,fec_ratio:2}` → 5 秒内两端 `show sr-wg fec` 都是 `ratio 2`，
+`parity` 与组序号严格 1:1、十二方向 0% 丢、关掉后 parity 计数立即不动（fail-open）。
+**CPE1 换 agent 时又踩了 vpp0**（ssh 失联、数据面正常、看门狗 pass），复位后 20 秒
+恢复；CPE2/3/4 没有复发 —— 这条脆性属 vpp0/lcp，不是换件的必然结果。
+细节与"无损链路上的窗口错配（20 pps 对齐 / 200 pps 1.9%）"见
+`docs/fec-and-lb-plan.md` §9.10。
 
 **2026-11-13 QoS 配置已经管理面真实下发（CPE4，bundle v5）**：控制台 API（租户会话）
 PUT /api/config 加 `qos:[{ingress:host-enp0s8, egress:host-enp0s9, rate_kbps:1000, llq_pct:0}]` →

@@ -4745,6 +4745,28 @@
     return h;
   }
 
+  // FEC 比例只有 1..4 四档：**开关是旁边那个勾选框**，下拉只表达档位，所以这里
+  // 没有「关」这一项。带宽代价直接写进标签，操作者不用去翻文档算 1+1/n。
+  function undFecOptions(sel) {
+    var opts = [
+      [1, "1:1（整包复制，最强，带宽×2）"],
+      [2, "1:2（每 2 包 1 冗余，带宽×1.5）"],
+      [3, "1:3（每 3 包 1 冗余，带宽×1.33）"],
+      [4, "1:4（每 4 包 1 冗余，带宽×1.25）"]
+    ];
+    return opts.map(function (o) {
+      return '<option value="' + o[0] + '"' + (Number(sel) === o[0] ? " selected" : "") + ">" + o[1] + "</option>";
+    }).join("");
+  }
+
+  // 勾选框是唯一开关：没勾 = 0（关）；勾了但还没挑过档位按 1:2 算（四档里
+  // 性价比最好的那一档）。locked 的下拉不会进 FormData，所以只能在"勾了"的
+  // 分支里读它 —— 这也是这里不用 f.get("fec") 兜底的原因。
+  function undFecValue(f) {
+    if (!f.get("fec_on")) return 0;
+    return parseInt(String(f.get("fec")), 10) || 2;
+  }
+
   // undManualPanel 一次可以只建一条，也可以「本端一台 + 对端多台 + 同一条路径」
   // 建一批。对端的物理端口/外层地址只对一条隧道有意义，所以选了多台时这两个
   // 字段就不出现：批量里每台用各自的观测地址与默认出口端口，这是控制器的行为，
@@ -4785,12 +4807,10 @@
       '<div class="field"><label for="und-tun-dynamic">动态 weight</label>' +
       '<select id="und-tun-dynamic" name="dynamic"><option value="0">关（恒用权重）</option>' +
       '<option value="1">开（agent 按丢包调档，1..权重）</option></select></div>' +
-      '<div class="field"><label for="und-tun-fec">FEC 前向纠错</label>' +
-      '<select id="und-tun-fec" name="fec"><option value="0">关</option>' +
-      '<option value="1">1:1（整包复制，最强，带宽×2）</option>' +
-      '<option value="2">1:2（每 2 包 1 冗余，带宽×1.5）</option>' +
-      '<option value="3">1:3（每 3 包 1 冗余）</option>' +
-      '<option value="4">1:4（每 4 包 1 冗余，最省）</option></select></div>' +
+      '<div class="field"><label for="und-tun-fec-on">FEC 前向纠错</label>' +
+      '<div style="display:flex;align-items:center;gap:8px">' +
+      '<label class="chk"><input type="checkbox" id="und-tun-fec-on" name="fec_on" data-fec-toggle="und-tun-fec"> 启用</label>' +
+      '<select id="und-tun-fec" name="fec" disabled>' + undFecOptions(2) + "</select></div></div>" +
       "</div>" + undPathExtraFields(doc, mode, "und-tun", "mHops", [a].concat(peers)) +
       '<div class="hint" style="margin:10px 0 0">物理端口可以留「默认」，由设备上报的出口决定；也可以指定它上报过的其他端口。' +
       "地址留空就用反射器最近一次观测到的外层地址；观测过期时创建会被拒绝，需要手填地址或等设备重新上报。" +
@@ -4805,8 +4825,9 @@
       "注意颜色表是跨设备混装的，权重也作用于跨设备分流。开「动态」后权重是基数上限：" +
       "agent 按探针丢包在 1..权重 之间调档（丢包优先、四档、非线性，迟滞 3 拍 × 5 秒），动态生效值不回写本页。" +
       // FEC 四档的语义与边界（XOR-only）：带宽代价、恢复能力、两端都要 1.2.0。
-      "FEC 前向纠错：开「1:1」每包双发（组内丢任何一个都能救，带宽翻倍）；「1:n」每 n 个数据包" +
-      "异或出 1 个冗余包，组内恰好丢 1 个可恢复、丢 2 个无解；带宽增量约 1/n。" +
+      "FEC 前向纠错：勾上「启用」再挑比例。「1:1」是每包双发（组内丢任何一个都能救，带宽翻倍）；" +
+      "「1:n」每 n 个数据包异或出 1 个冗余包，组内恰好丢 1 个可恢复、丢 2 个无解；带宽增量约 1/n。" +
+      "冗余包按隧道走同一条路径，中转隧道也照常成立。关掉是立即生效的（下一拍就不再多发），不影响业务。" +
       "需要两端插件 ≥1.2.0（老设备只会在日志里提示不支持，隧道本身照常建）。" +
       // M-3 门禁已抬：同对端可以建第二条（UCMP 的用法）。要说清三件事：
       // 上限、槽号谁定、以及自动编排为什么不补建。
@@ -4923,8 +4944,8 @@
     var weight = parseInt(String(f.get("weight")), 10);
     body.weight = (!isNaN(weight) && weight > 0) ? Math.min(weight, 255) : 0;
     body.dynamic = String(f.get("dynamic")) === "1";
-    // FEC：下拉 0..4，总是提交（0 = 关，与 dynamic 同契约）。
-    body.fec_ratio = parseInt(String(f.get("fec")), 10) || 0;
+    // FEC：勾选框决定开/关，下拉只给档位；总是提交（0 = 关，与 dynamic 同契约）。
+    body.fec_ratio = undFecValue(f);
     // 一台对端走单条创建（能指定它的出口端口和地址），两台以上走批量：批量
     // 那套只有 node_id，端口与地址各用设备自己的观测，这是控制器的契约。
     if (peers.length === 1) {
@@ -5005,13 +5026,12 @@
       '<select id="und-edit-dynamic" name="dynamic"><option value="0"' + (!t.dynamic ? " selected" : "") +
       '>关（恒用权重）</option><option value="1"' + (t.dynamic ? " selected" : "") +
       '>开（agent 按丢包调档，1..权重）</option></select></div>' +
-      '<div class="field"><label for="und-edit-fec">FEC 前向纠错</label>' +
-      '<select id="und-edit-fec" name="fec"><option value="0"' + (!t.fec_ratio ? " selected" : "") +
-      '>关</option><option value="1"' + (t.fec_ratio === 1 ? " selected" : "") +
-      '>1:1（整包复制，最强，带宽×2）</option><option value="2"' + (t.fec_ratio === 2 ? " selected" : "") +
-      '>1:2（每 2 包 1 冗余，带宽×1.5）</option><option value="3"' + (t.fec_ratio === 3 ? " selected" : "") +
-      '>1:3（每 3 包 1 冗余）</option><option value="4"' + (t.fec_ratio === 4 ? " selected" : "") +
-      '>1:4（每 4 包 1 冗余，最省）</option></select></div>';
+      '<div class="field"><label for="und-edit-fec-on">FEC 前向纠错</label>' +
+      '<div style="display:flex;align-items:center;gap:8px">' +
+      '<label class="chk"><input type="checkbox" id="und-edit-fec-on" name="fec_on" data-fec-toggle="und-edit-fec"' +
+      (t.fec_ratio ? " checked" : "") + "> 启用</label>" +
+      '<select id="und-edit-fec" name="fec"' + (t.fec_ratio ? "" : " disabled") + ">" +
+      undFecOptions(t.fec_ratio || 2) + "</select></div></div>";
     if (mode === "inline") {
       h += undHopsEditor(doc, "editHops", { exclude: [t.a.node_id, t.b.node_id] }) +
         '<div class="hint" style="margin-top:8px">改成另一条链是整条替换：新的顺序会一起下发，旧链不会留下一跳。</div>';
@@ -5053,8 +5073,8 @@
     var weight = parseInt(String(f.get("weight")), 10);
     body.weight = (!isNaN(weight) && weight > 0) ? Math.min(weight, 255) : 0;
     body.dynamic = String(f.get("dynamic")) === "1";
-    // FEC 同一个契约：表单总是提交，0 = 关。需要两端插件 ≥1.2.0。
-    body.fec_ratio = parseInt(String(f.get("fec")), 10) || 0;
+    // FEC 同一个契约：勾选框 + 档位，表单总是提交，0 = 关。需要两端插件 ≥1.2.0。
+    body.fec_ratio = undFecValue(f);
     // "默认" resolves to the device's own egress port: the API treats an empty
     // iface as "keep", so clearing back to the default has to name it.
     var ndA = undNodeOf(u.doc, t.a.node_id), ndB = undNodeOf(u.doc, t.b.node_id);
@@ -8976,6 +8996,16 @@
       svRoot.addEventListener("change", svChange);
       svRoot.addEventListener("input", svInput);
     }
+
+    // FEC 勾选框 ↔ 比例下拉：勾上才放开档位，取消就锁回去（档位保留，再勾回来
+    // 不用重挑）。提交值由 undFecValue 从"勾没勾"算 —— 锁着的下拉不进 FormData，
+    // 所以这里的 enabled/disabled 只影响手感，不影响提交的正确性。
+    document.querySelectorAll("#content input[data-fec-toggle]").forEach(function (el) {
+      var sel = $(el.getAttribute("data-fec-toggle"));
+      var sync = function () { if (sel) sel.disabled = !el.checked; };
+      sync();
+      el.addEventListener("change", sync);
+    });
 
     document.querySelectorAll("#content [data-act]").forEach(function (el) {
       el.addEventListener("click", function () {
