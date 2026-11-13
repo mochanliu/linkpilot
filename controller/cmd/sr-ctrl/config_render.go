@@ -245,6 +245,27 @@ func renderVPP(c *BasicConfig) string {
 	if len(c.Ifaces) > 0 {
 		line("lcp lcp-sync on")
 	}
+	// §13 物理口统一调度：标记器挂在客户口（ip4-unicast），调度器由
+	// `set sr-wg qos rate` 自动挂到出方向物理口（interface-output 弧）。
+	// llq 必须写在 rate 之前：rate 建桶时才把 llq 百分比带上（插件语义）。
+	// 命令全部幂等，boot 重放与重推都安全。
+	for _, q := range c.Qos {
+		if q.Ingress == "" && q.Egress == "" {
+			continue
+		}
+		if q.Ingress != "" {
+			line("")
+			line("# QoS：入口标记（内层 DSCP -> 3bit 类别）")
+			line("set sr-wg qos-hook enable %s", q.Ingress)
+		}
+		if q.Egress != "" && q.RateKbps > 0 {
+			if q.LLQPct != 0 && q.LLQPct != qosDefaultLLQPct {
+				line("set sr-wg qos llq %s percent %d", q.Egress, q.LLQPct)
+			}
+			line("# QoS：出方向物理口 4 队列调度（外层字节口径）")
+			line("set sr-wg qos rate %s %d", q.Egress, q.RateKbps)
+		}
+	}
 	return b.String()
 }
 

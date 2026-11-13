@@ -2166,6 +2166,7 @@
     h += cfgIfacePanel(cs, cfg);
     h += cfgVRRPPanel(cs, cfg);
     h += cfgStaticPanel(cfg);
+    h += cfgQosPanel(cfg);
     h += cfgDynamicPanel(cs, cfg);
     h += cfgChecksPanel(cs);
     h += cfgArtifactsPanel(cs);
@@ -2552,6 +2553,33 @@
       "</div></section>";
   }
 
+  function cfgQosPanel(cfg) {
+    var rows = (cfg.qos || []).length ? (cfg.qos || []).map(function (r, i) {
+      return "<tr>" +
+        '<td class="mono">' + esc(r.ingress) + "</td>" +
+        '<td class="mono">' + esc(r.egress) + "</td>" +
+        '<td class="num">' + esc(r.rate_kbps) + "</td>" +
+        '<td class="num">' + esc(r.llq_pct || 20) + "</td>" +
+        '<td class="row-actions"><button class="small danger" data-act="cfg-qos-del" data-i="' + i + '">删除</button></td>' +
+        "</tr>";
+    }).join("") : '<tr><td colspan="5" class="empty">未配置 QoS：物理口出向全部直通。</td></tr>';
+    return '<section class="panel"><header><h2>QoS（出方向物理口调度）</h2></header>' +
+      '<div class="hint">入口按内层 DSCP 打 3bit 类别，类别随 SR 头 action 端到端传递；出方向物理口按最外层 DSCP 进 4 队列（LLQ+DRR+令牌桶+尾丢）。速率是外层字节口径（含加密与 SR 头开销，约为内层 1.06 倍）。仅对已升级 sr_wg 插件 ≥ 1.1.0 的盒子生效。</div>' +
+      "<table><thead><tr><th>入接口（标记）</th><th>出方向物理口</th><th>速率 kbps</th><th>LLQ %</th><th></th></tr></thead><tbody>" +
+      rows + "</tbody></table>" +
+      '<div class="addrow">' +
+      '<div class="field"><label for="qos-in">入接口</label><select id="qos-in">' +
+      (cfg.ifaces.length ? cfg.ifaces.map(function (x) {
+        return '<option value="' + esc(x.vpp) + '">' + esc(x.vpp) + (x.ip ? " · " + esc(x.ip) + "/" + esc(x.prefix_len) : "") + "</option>";
+      }).join("") : '<option value="">（本节点还没有客户口）</option>') +
+      "</select></div>" +
+      '<div class="field"><label for="qos-out">出方向物理口</label><input id="qos-out" placeholder="host-enp0s9" spellcheck="false"></div>' +
+      '<div class="field"><label for="qos-rate">速率 kbps</label><input id="qos-rate" type="number" min="1" max="100000000" placeholder="100000 = 100M" style="width:150px"></div>' +
+      '<div class="field"><label for="qos-llq">LLQ %</label><input id="qos-llq" type="number" min="1" max="100" placeholder="20" style="width:90px"></div>' +
+      '<button class="small primary" data-act="cfg-qos-add">添加</button>' +
+      "</div></section>";
+  }
+
   function cfgDynamicPanel(cs, cfg) {
     var vpn = cfgVPNOf(cfg, cs.vpn) || cfg.vpns[0];
     var opts = cfg.vpns.map(function (x) {
@@ -2934,6 +2962,31 @@
     var cs = S.cfg;
     if (!cs || !cs.draft) return;
     cs.draft.statics.splice(i, 1);
+    csMarkDirty();
+    render();
+  }
+
+  function cfgAddQos() {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    if (!cs.draft.qos) cs.draft.qos = [];
+    var ing = cfgVal("qos-in"), out = (cfgVal("qos-out") || "").trim();
+    var rate = Number(cfgVal("qos-rate")), llq = Number(cfgVal("qos-llq") || 20);
+    if (!ing) { toast("先给本节点配至少一个客户口"); return; }
+    if (!out) { toast("出方向物理口不能为空"); return; }
+    if (!(rate >= 1 && rate <= 100000000)) { toast("速率应为 1–100000000 kbps"); return; }
+    if (!(llq >= 1 && llq <= 100)) { toast("LLQ % 应为 1–100"); return; }
+    var dup = cs.draft.qos.some(function (r) { return r.egress === out; });
+    if (dup) { toast("出方向物理口 " + out + " 已有 QoS 规则"); return; }
+    cs.draft.qos.push({ ingress: ing, egress: out, rate_kbps: Math.trunc(rate), llq_pct: Math.trunc(llq) });
+    csMarkDirty();
+    render();
+  }
+
+  function cfgDelQos(i) {
+    var cs = S.cfg;
+    if (!cs || !cs.draft) return;
+    cs.draft.qos.splice(i, 1);
     csMarkDirty();
     render();
   }
@@ -9029,6 +9082,8 @@
         else if (act === "cfg-vr-save") cfgSaveVR();
         else if (act === "cfg-st-add") cfgAddStatic();
         else if (act === "cfg-st-del") cfgDelStatic(Number(el.getAttribute("data-i")));
+        else if (act === "cfg-qos-add") cfgAddQos();
+        else if (act === "cfg-qos-del") cfgDelQos(Number(el.getAttribute("data-i")));
         else if (act === "cfg-nb-add") cfgAddNeighbor();
         else if (act === "cfg-nb-del") cfgDelNeighbor(Number(el.getAttribute("data-i")));
         else if (act === "und-reload") undReload();

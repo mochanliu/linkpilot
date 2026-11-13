@@ -34,7 +34,13 @@ const (
 	cfgMaxStatics   = 512
 	cfgMaxNeighbors = 64
 	cfgMaxVRRP      = 64
+	cfgMaxQos       = 16
 	cfgMaxBody      = 1 << 20
+
+	// QoS（§13 物理口统一调度）：插件侧的硬上限与默认值，这里保持一致。
+	// 100G 是插件 CLI 自己的"明显填错"上限；LLQ 默认 20% 与插件出厂一致。
+	qosMaxRateKbps   = 100000000
+	qosDefaultLLQPct = 20
 
 	// VRRP ranges come from the plugin's own types: vr_id and priority are u8,
 	// and RFC 5798 reserves priority 0 (a backup stops advertising) and 255 (the
@@ -64,6 +70,20 @@ type BasicConfig struct {
 	Ifaces   []ConfigIface  `json:"ifaces"`
 	Statics  []ConfigStatic `json:"statics"`
 	VRRP     []ConfigVRRP   `json:"vrrp"`
+	Qos      []ConfigQos    `json:"qos"`
+}
+
+// ConfigQos is one §13 physical-port unified scheduling rule. Ingress is a
+// customer port carrying the marker (inner DSCP -> 3-bit class); egress is the
+// WAN physical port running the 4-queue scheduler. RateKbps is the OUTER byte
+// scale (encryption + SR header included, ~1.06x inner), matching the plugin
+// CLI semantics; 0 would mean bypass but we simply omit the rule instead.
+// LLQPct 0 means the plugin default (20).
+type ConfigQos struct {
+	Ingress  string `json:"ingress"`
+	Egress   string `json:"egress"`
+	RateKbps uint32 `json:"rate_kbps"`
+	LLQPct   uint32 `json:"llq_pct,omitempty"`
 }
 
 // ConfigVPN is a routing instance. BGP and OSPF are scoped per VPN because
@@ -280,6 +300,10 @@ func normalizeBasicConfig(c *BasicConfig) {
 			c.VRRP[i].IntervalMS = vrrpDefaultIntervalMS
 		}
 	}
+	for i := range c.Qos {
+		c.Qos[i].Ingress = strings.TrimSpace(c.Qos[i].Ingress)
+		c.Qos[i].Egress = strings.TrimSpace(c.Qos[i].Egress)
+	}
 	if len(c.VPNs) == 0 {
 		c.VPNs = defaultBasicConfig().VPNs
 	}
@@ -302,6 +326,9 @@ func normalizeBasicConfig(c *BasicConfig) {
 	}
 	if c.VRRP == nil {
 		c.VRRP = []ConfigVRRP{}
+	}
+	if c.Qos == nil {
+		c.Qos = []ConfigQos{}
 	}
 	// A VR row has no order meaning, so it is canonicalised: two drafts that
 	// differ only in row order must render the same artifact bytes, or "publish

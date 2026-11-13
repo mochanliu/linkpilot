@@ -358,5 +358,40 @@ func validateBasicConfig(c *BasicConfig) []ConfigCheck {
 	if len(out) == 0 {
 		add("info", "没有发现冲突：接口、静态路由与动态路由会话一致。")
 	}
+	// QoS（§13）：出方向物理口一条规则一个 shaper，重复配置不是"覆盖"而是
+	// 渲染出两条 rate 命令，最后一次生效——这是配置漂移的来源，直接拒绝。
+	seenQosEgress := map[string]bool{}
+	for i, q := range c.Qos {
+		n := i + 1
+		if !validIfaceName(q.Ingress) {
+			add("error", "QoS 第 %d 条：入接口名 %q 非法。", n, q.Ingress)
+		} else {
+			found := false
+			for _, it := range c.Ifaces {
+				if it.VPP == q.Ingress {
+					found = true
+					break
+				}
+			}
+			if !found {
+				add("warning", "QoS 第 %d 条：入接口 %s 不在本节点客户口里，标记器会空挂。", n, q.Ingress)
+			}
+		}
+		if !validIfaceName(q.Egress) {
+			add("error", "QoS 第 %d 条：出方向物理口名 %q 非法。", n, q.Egress)
+		} else if seenQosEgress[q.Egress] {
+			add("error", "QoS 出方向物理口 %s 重复配置。", q.Egress)
+		} else {
+			seenQosEgress[q.Egress] = true
+		}
+		if q.RateKbps == 0 {
+			add("error", "QoS 第 %d 条：速率 0 等于直通，删掉这条规则即可，不要配 0。", n)
+		} else if q.RateKbps > qosMaxRateKbps {
+			add("error", "QoS 第 %d 条：速率 %d 超过插件上限 %d kbps。", n, q.RateKbps, qosMaxRateKbps)
+		}
+		if q.LLQPct > 100 {
+			add("error", "QoS 第 %d 条：LLQ %% 不能超过 100。", n)
+		}
+	}
 	return out
 }

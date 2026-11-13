@@ -455,3 +455,106 @@ func TestConfigBundleAPI(t *testing.T) {
 		t.Fatalf("error checks did not reach the bundle: %+v", b.Checks)
 	}
 }
+
+func TestRenderVPPQos(t *testing.T) {
+	cfg := defaultBasicConfig()
+	cfg.Ifaces = []ConfigIface{{VPP: "host-eth2", LCP: "lcp-x0", Up: true}}
+	cfg.Qos = []ConfigQos{
+		{Ingress: "host-eth2", Egress: "host-enp0s9", RateKbps: 100000},
+		{Ingress: "host-eth2", Egress: "host-enp0s10", RateKbps: 50000, LLQPct: 30},
+	}
+
+	vpp := renderVPP(&cfg)
+	for _, want := range []string{
+		"set sr-wg qos-hook enable host-eth2",
+		"set sr-wg qos rate host-enp0s9 100000",
+		"set sr-wg qos llq host-enp0s10 percent 30",
+		"set sr-wg qos rate host-enp0s10 50000",
+	} {
+		if !strings.Contains(vpp, want) {
+			t.Errorf("VPP artifact missing %q\n%s", want, vpp)
+		}
+	}
+	// 默认 LLQ（20%）不渲染 llq 行：插件侧本来就是默认值
+	if strings.Contains(vpp, "llq host-enp0s9") {
+		t.Errorf("default LLQ%% must not emit an llq line:\n%s", vpp)
+	}
+	// llq 必须先于同口的 rate：rate 建桶时才把 llq 百分比带上（插件语义）
+	llq := strings.Index(vpp, "llq host-enp0s10")
+	rate := strings.Index(vpp, "rate host-enp0s10")
+	if llq < 0 || rate < 0 || llq > rate {
+		t.Errorf("llq line must precede rate line for the same port\n%s", vpp)
+	}
+}
+
+func TestRenderVPPQosEmpty(t *testing.T) {
+	cfg := defaultBasicConfig()
+	cfg.Ifaces = []ConfigIface{{VPP: "host-eth2", LCP: "lcp-x0", Up: true}}
+	vpp := renderVPP(&cfg)
+	if strings.Contains(vpp, "sr-wg qos") {
+		t.Errorf("no QoS config must render no QoS commands:\n%s", vpp)
+	}
+}
+
+func TestValidateQos(t *testing.T) {
+	base := func() BasicConfig {
+		c := defaultBasicConfig()
+		c.Ifaces = []ConfigIface{{VPP: "host-eth2", LCP: "lcp-x0", IP: "10.79.1.2", PrefixLen: 24, MTU: 1500, Up: true}}
+		return c
+	}
+
+	// 合法：无 error
+	c := base()
+	c.Qos = []ConfigQos{{Ingress: "host-eth2", Egress: "host-enp0s9", RateKbps: 100000}}
+	if checks := validateBasicConfig(&c); countSeverity(checks, "error") > 0 {
+		t.Errorf("valid qos should produce no errors: %+v", checks)
+	}
+
+	// 出方向物理口重复 → error
+	c = base()
+	c.Qos = []ConfigQos{
+		{Ingress: "host-eth2", Egress: "host-enp0s9", RateKbps: 100000},
+		{Ingress: "host-eth2", Egress: "host-enp0s9", RateKbps: 200000},
+	}
+	if checks := validateBasicConfig(&c); !hasCheck(checks, "error", "重复配置") {
+		t.Errorf("duplicate egress must error: %+v", checks)
+	}
+
+	// 速率 0 → error
+	c = base()
+	c.Qos = []ConfigQos{{Ingress: "host-eth2", Egress: "host-enp0s9", RateKbps: 0}}
+	if checks := validateBasicConfig(&c); !hasCheck(checks, "error", "速率 0") {
+		t.Errorf("rate 0 must error: %+v", checks)
+	}
+
+	// 速率超上限 → error
+	c = base()
+	c.Qos = []ConfigQos{{Ingress: "host-eth2", Egress: "host-enp0s9", RateKbps: qosMaxRateKbps + 1}}
+	if checks := validateBasicConfig(&c); !hasCheck(checks, "error", "上限") {
+		t.Errorf("rate over max must error: %+v", checks)
+	}
+
+	// 入接口不在客户口里 → warning（不是 error：可能是 underlay 口挂标记）
+	c = base()
+	c.Qos = []ConfigQos{{Ingress: "host-eth9", Egress: "host-enp0s9", RateKbps: 100000}}
+	checks := validateBasicConfig(&c)
+	if !hasCheck(checks, "warning", "不在本节点客户口") {
+		t.Errorf("ingress not among ifaces must warn: %+v", checks)
+	}
+	if countSeverity(checks, "error") > 0 {
+		t.Errorf("out-of-iface ingress must not error: %+v", checks)
+	}
+}
+
+func TestNormalizeQos(t *testing.T) {
+	c := BasicConfig{Qos: nil}
+	normalizeBasicConfig(&c)
+	if c.Qos == nil {
+		t.Errorf("nil Qos must normalise to empty slice")
+	}
+	c = BasicConfig{Qos: []ConfigQos{{Ingress: " host-eth2 ", Egress: " host-enp0s9 ", RateKbps: 1}}}
+	normalizeBasicConfig(&c)
+	if c.Qos[0].Ingress != "host-eth2" || c.Qos[0].Egress != "host-enp0s9" {
+		t.Errorf("qos iface names must be trimmed: %+v", c.Qos)
+	}
+}

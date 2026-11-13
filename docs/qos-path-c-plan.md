@@ -1055,7 +1055,46 @@ q0/q1/q2 无误伤（q0 drop 全部来自 T2 的 EF 超额）。
 
 **部署后状态**：rate=0、hook 关、队列深度还原 128（默认全关直通）；
 BFD 3 会话在配置，双向连通验证通过（cust4 单探针到 cust12 ✓，
-cust12→172.16.4.1 反向 ✓）。console/重标记 CLI 仍未做（§13.3 待办）。
+cust12→172.16.4.1 反向 ✓）。console/重标记 CLI 已完成（§13.6）。
+
+
+### 13.6 管理面配置 + 中转/末端恢复判别性验证（2026-11-13 中午，commit c6938b2 及后续）
+
+**中转 + 隧道末端恢复的判别性 lab（`test/lab/vpp-qos/lab-qos-transit.sh`，PASS）**。
+三实例 A(encap)→T(transit)→B(decap)，中间夹**用户态 mangler**（`lab-qos-mangler.py`，
+tap 内联 L2 跳）：重写外层 ToS 并**重算 IP 校验和**，真实模拟运营商重标记。
+- **为什么不用 tc pedit**：pedit 改 ToS 不修正 IPv4 校验和，包被 VPP `ip4-input`
+  以 bad ip4 checksum 丢光（实测 40/40 全丢，T 错误计数器实锤）。容器里也没有
+  iptables/nft/br_netfilter 可用。用户态 tap 桥是唯一既改 ToS 又保校验和的路子。
+- **Phase 1（A→T 清零）**：wanbr2 侧确认 T 收到全 0x0（55 包）、a-wan 确认 A 发出
+  全 0xb8（40 包）→ wanbr3（T 出向、mangler 之前）抓到 **40 个 tos 0xb8** —— 只有
+  Step 9.5（action 恢复 + 重断言 ToS）能解释，纯透传是 0x00。T 出向调度
+  q0=80/q3=86，分类来自恢复后的元数据。
+- **Phase 2（T→B 也清零）**：B 收到的外层 ToS=0，EF 流仍进 B LAN 出向 q0
+  （q0=80/q3=87）—— 只有 Step 4.5（decap 从 action 恢复）能解释。
+  transit_ok=166，hmac_fail=0，decap_ok=166，端到端 ping 恢复。
+- 实验工程坑：WG 握手 A↔B 要过 T 的普通转发，**必须先预热到 0% loss 再灌流**，
+  否则 EF 包全被 A 的 WG 层丢掉（没有会话密钥不能加密），现象酷似 restore 失效。
+
+**管理面配置（console/config/applier 全链）**：
+- `BasicConfig.Qos []ConfigQos{Ingress,Egress,RateKbps,LLQPct}`；normalize trim+nil 化；
+- `renderVPP` 逐条渲染：`set sr-wg qos-hook enable <入接口>` +
+  （llq≠默认 20 时先）`set sr-wg qos llq <口> percent <n>` + `set sr-wg qos rate <口> <kbps>`。
+  llq 必须在 rate 之前（rate 建桶时才带 llq 百分比——插件语义）。全部幂等，
+  boot 重放与重推安全；
+- 校验：出方向物理口重复→error（重复渲染两条 rate 是配置漂移来源）、rate=0/超
+  100G 上限→error、LLQ>100→error、入接口不在客户口列表→warning（允许在
+  underlay 口挂标记）；
+- 控制台「配置」页新增 QoS 面板（入接口下拉=客户口列表，出物理口/速率/LLQ 手填，
+  删除按钮），node --check 通过；测试 6 个新用例全 PASS（render/validate/normalize）；
+- **applier 兼容性（重要）**：sr-apply 逐行跑 vppctl 且**单条失败整体失败**——
+  QoS 配置**只能推给 sr_wg 插件 ≥ 1.1.0 的盒子**，老插件（1.0.0）收到
+  `set sr-wg qos-hook` 会 "unknown input" 并阻断整个 bundle 应用。上线顺序：
+  先换插件，再推 QoS 配置。插件 CLI 的成功回显不含 error/failed 关键字，
+  不会被 vppError 启发式误判。
+
+sr-ctrl 已换装上线（md5 `6bfdfccd4c016ce05737c4411a4b61cf`，备份
+`sr-ctrl.prev-20261113qos`），控制台 QoS 面板已可编辑。
 
 ---
 
