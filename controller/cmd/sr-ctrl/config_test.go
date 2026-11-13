@@ -558,3 +558,62 @@ func TestNormalizeQos(t *testing.T) {
 		t.Errorf("qos iface names must be trimmed: %+v", c.Qos)
 	}
 }
+
+func TestRenderStaticWeight(t *testing.T) {
+	cfg := defaultBasicConfig()
+	cfg.Ifaces = []ConfigIface{{VPP: "host-eth2", LCP: "lcp-x0", IP: "10.79.1.2", PrefixLen: 24, MTU: 1500, Up: true}}
+	cfg.Statics = []ConfigStatic{
+		// UCMP 组：同一前缀两个下一跳，weight 10:30（1:3 比例）
+		{Prefix: "10.68.99.0/24", NextHop: "10.79.1.2", VPN: 0, Weight: 10},
+		{Prefix: "10.68.99.0/24", NextHop: "10.79.1.3", VPN: 0, Weight: 30},
+		// weight 0/1 = 默认权重，不渲染 weight 后缀（与老配置同形，diff 不翻行）
+		{Prefix: "10.68.100.0/24", NextHop: "10.79.1.2", VPN: 0},
+		{Prefix: "10.68.101.0/24", NextHop: "10.79.1.2", VPN: 0, Weight: 1},
+	}
+
+	frr := renderFRR(&cfg, nil)
+	if !strings.Contains(frr, "ip route 10.68.99.0/24 10.79.1.2 weight 10") {
+		t.Errorf("weighted static missing weight suffix:\n%s", frr)
+	}
+	if !strings.Contains(frr, "ip route 10.68.99.0/24 10.79.1.3 weight 30") {
+		t.Errorf("second UCMP nexthop missing weight suffix:\n%s", frr)
+	}
+	if strings.Contains(frr, "ip route 10.68.100.0/24 10.79.1.2 weight") {
+		t.Errorf("weight 0 must render bare:\n%s", frr)
+	}
+	if strings.Contains(frr, "ip route 10.68.101.0/24 10.79.1.2 weight") {
+		t.Errorf("weight 1 must render bare:\n%s", frr)
+	}
+}
+
+func TestValidateStaticWeight(t *testing.T) {
+	base := func() BasicConfig {
+		c := defaultBasicConfig()
+		c.Ifaces = []ConfigIface{{VPP: "host-eth2", LCP: "lcp-x0", IP: "10.79.1.2", PrefixLen: 24, MTU: 1500, Up: true}}
+		c.Statics = []ConfigStatic{{Prefix: "10.68.99.0/24", NextHop: "10.79.1.2", VPN: 0, Weight: 30}}
+		return c
+	}
+
+	// 合法：weight 1–65535 内无 error（同前缀多下一跳是 UCMP 的表达方式，不算重复）
+	c := base()
+	c.Statics = append(c.Statics, ConfigStatic{Prefix: "10.68.99.0/24", NextHop: "10.79.1.3", VPN: 0, Weight: 10})
+	if checks := validateBasicConfig(&c); countSeverity(checks, "error") > 0 {
+		t.Errorf("ucmp statics (same prefix, different nexthops) should produce no errors: %+v", checks)
+	}
+
+	// weight 0 / 1 = 默认，合法
+	for _, w := range []uint32{0, 1, 255, 65535} {
+		c := base()
+		c.Statics[0].Weight = w
+		if checks := validateBasicConfig(&c); countSeverity(checks, "error") > 0 {
+			t.Errorf("weight %d should be valid: %+v", w, checks)
+		}
+	}
+
+	// weight 超 FRR 值域 → error
+	c = base()
+	c.Statics[0].Weight = 65536
+	if checks := validateBasicConfig(&c); !hasCheck(checks, "error", "weight") {
+		t.Errorf("weight 65536 must error: %+v", checks)
+	}
+}

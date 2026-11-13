@@ -32,6 +32,9 @@ const (
 	cfgMaxVPNs      = 64
 	cfgMaxIfaces    = 64
 	cfgMaxStatics   = 512
+	// 静态路由下一跳 weight 上限 = FRR staticd 的值域上限（1–65535）。
+	// zebra 装内核时会归一化到 8 位口径、比例保留，所以 65535 只是"明显填错"线。
+	staticMaxWeight = 65535
 	cfgMaxNeighbors = 64
 	cfgMaxVRRP      = 64
 	cfgMaxQos       = 16
@@ -138,6 +141,12 @@ type ConfigStatic struct {
 	Prefix  string `json:"prefix"`
 	NextHop string `json:"next_hop"`
 	VPN     uint32 `json:"vpn"`
+	// Weight 是这条下一跳的不等价负载均衡权重（UCMP）。0/1 = 不带 weight 渲染，
+	// 等价于 weight 1。同一前缀写多行、各配不同下一跳和 weight，zebra 会聚成
+	// 一组不等价下一跳（FRR staticd 值域 1–65535；zebra 装内核时归一化到 8 位
+	// 口径、比例保留——2026-11-13 在 CPE4 上实测 10:30 → 85:255）。
+	// linux-cp 会把 weight 同步进 VPP 的 load-balance（按比例复制桶，per-flow 分流）。
+	Weight uint32 `json:"weight"`
 }
 
 // ConfigVRRP is one virtual router on one customer port: the LAN-side first-hop

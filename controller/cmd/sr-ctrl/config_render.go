@@ -90,10 +90,16 @@ func renderFRR(c *BasicConfig, toCPE []leakRenderRule) string {
 				line("vrf %s", vrfName(vpn))
 			}
 			for _, r := range byVPN[vpn] {
+				// weight 后缀只在 >1 时渲染：同一前缀的下一跳组里，1 就是
+				// "普通"权重，不写与老配置完全同形（diff 不会无谓翻动整行）。
+				w := ""
+				if r.Weight > 1 {
+					w = fmt.Sprintf(" weight %d", r.Weight)
+				}
 				if vpn == 0 {
-					line("ip route %s %s", r.Prefix, r.NextHop)
+					line("ip route %s %s%s", r.Prefix, r.NextHop, w)
 				} else {
-					line(" ip route %s %s", r.Prefix, r.NextHop)
+					line(" ip route %s %s%s", r.Prefix, r.NextHop, w)
 				}
 			}
 			if vpn != 0 {

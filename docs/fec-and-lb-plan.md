@@ -195,3 +195,40 @@ af_packet 入 → [FEC 解码] → sr-wg4_input（解密）→ ip4-lookup
 - `ip4_compute_flow_hash` 是 VPP 内部函数（不在 `/usr/include` 里），
   本节关于"hash 缓存在 `vnet_buffer`"的说法来自 VPP 源码阅读，本轮**没有在盒子上
   用计数器逐包验证**。
+
+---
+
+## 5. 不等价负载均衡第一棒落地：静态路由 weight（2026-11-13）
+
+> owner 拍板：先做不等价负载均衡（UCMP），从静态路由开始；逐包 LB 不做。
+> DIA 口径同步修正：静态路由 + NAT 即 DIA，本文档之外 gap-scan 的 S0-2 **不算缺口**。
+
+### 5.1 判别性实测（CPE4，前缀 198.18.55.0/24，测完即清）
+
+四棒全过，UCMP 经"staticd → zebra → linux-cp → VPP"端到端成立：
+
+1. **staticd**：`ip route <pfx> <gw> weight <n>` 关键字存在（FRR 10.7.1，vtysh 补全
+   实测 "weight Set weight of nexthop"，值域 **1–65535**；0 被拒）。
+2. **zebra**：同前缀两行不同下一跳聚成一组 UCMP（两个下一跳都 active +
+   fib-installed）；weight 归一化到内核 8 位口径、**比例保留**（10:30 → 85:255）。
+3. **linux-cp**：weight 同步进 VPP path（`show ip fib detail` 见 `weight=84` /
+   `weight=254`，~1:3）。
+4. **VPP load-balance 按比例复制桶**：`buckets:4`，大权重占 3 桶小权重占 1 桶
+   = 75%/25% **按流**分流（flow-hash 缓存，无逐包乱序问题）。
+
+### 5.2 实现（管理面，零 agent/数据面改动）
+
+- `ConfigStatic.Weight`（0/1 = 默认权重，不渲染 weight 后缀——与老配置完全同形，
+  frr diff 不会无谓翻行）；渲染 `ip route %s %s weight %d`（仅 weight>1）。
+- 校验：weight > 65535 → error；同前缀多下一跳本来合法（去重键 = VPN|prefix|nexthop）。
+- 控制台静态路由面板加 Weight 列与输入（提示语写明 UCMP 语义）。
+- 测试：`TestRenderStaticWeight`（带/不带 weight 后缀）、`TestValidateStaticWeight`
+  （0/1/255/65535 合法、65536 报错、UCMP 组无 error）；sr-ctrl 全套 PASS。
+- sr-ctrl 已上线（md5 `bab09756a60d125bb314ae5b4464325c`，备份
+  `sr-ctrl.prev-20261113ucmp`）。
+
+### 5.3 注意点
+
+- VPP 桶数 = 比例量化：3:1 → 4 桶；比例更悬殊时桶数更多、量化粒度更粗。
+- 这只是管理面这一棒。**探测联动**（probe 劣化 → 降 weight / 摘路）与
+  **多径分流比例实测**（iperf 多流验证桶分布）还没做，是 UCMP 的下一步。

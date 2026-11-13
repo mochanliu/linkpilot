@@ -135,6 +135,9 @@ func validateBasicConfig(c *BasicConfig) []ConfigCheck {
 		if !ok {
 			add("error", "静态路由 %s 的下一跳不是合法 IPv4。", r.Prefix)
 		}
+		if r.Weight > staticMaxWeight {
+			add("error", "静态路由 %s 的 weight %d 超过上限 %d（FRR staticd 值域 1–%d）。", r.Prefix, r.Weight, staticMaxWeight, staticMaxWeight)
+		}
 		if !seenVPN[r.VPN] {
 			add("error", "静态路由 %s 指向不存在的 VPN %d。", r.Prefix, r.VPN)
 		}

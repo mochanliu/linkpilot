@@ -2534,17 +2534,20 @@
       return "<tr>" +
         '<td class="mono">' + esc(r.prefix) + "</td>" +
         '<td class="mono">' + esc(r.next_hop) + "</td>" +
+        '<td class="num">' + esc(r.weight || 1) + "</td>" +
         '<td class="num">' + esc(r.vpn) + "</td>" +
         '<td class="row-actions"><button class="small danger" data-act="cfg-st-del" data-i="' + i + '">删除</button></td>' +
         "</tr>";
-    }).join("") : '<tr><td colspan="4" class="empty">还没有静态路由。</td></tr>';
+    }).join("") : '<tr><td colspan="5" class="empty">还没有静态路由。</td></tr>';
     return '<section class="panel"><header><h2>静态路由</h2></header>' +
       '<div class="hint">写进 FRR，由 zebra 装进内核表；linux-nl 会把它们同步进对应 VPN 的 VPP table。</div>' +
-      "<table><thead><tr><th>目的前缀</th><th>下一跳</th><th>VPN</th><th></th></tr></thead><tbody>" +
+      "<table><thead><tr><th>目的前缀</th><th>下一跳</th><th>Weight</th><th>VPN</th><th></th></tr></thead><tbody>" +
       rows + "</tbody></table>" +
+      '<div class="hint">同一前缀写多行、下一跳不同、各带 weight（1–65535，默认 1）＝不等价负载均衡：zebra 聚成一组 UCMP 下一跳，linux-cp 同步进 VPP 后按比例复制 load-balance 桶、按流分流。</div>' +
       '<div class="addrow">' +
       '<div class="field"><label for="st-prefix">目的前缀</label><input id="st-prefix" placeholder="10.68.99.0/24" spellcheck="false"></div>' +
       '<div class="field"><label for="st-nh">下一跳</label><input id="st-nh" placeholder="10.68.1.2" spellcheck="false"></div>' +
+      '<div class="field"><label for="st-weight">Weight</label><input id="st-weight" type="number" min="1" max="65535" placeholder="1" style="width:90px"></div>' +
       '<div class="field"><label for="st-vpn">VPN</label><select id="st-vpn">' + cfg.vpns.map(function (x) {
         return '<option value="' + esc(x.id) + '">VPN ' + esc(x.id) +
           (x.name ? " · " + esc(x.name) : "") + "</option>";
@@ -2946,6 +2949,7 @@
     var cs = S.cfg;
     if (!cs || !cs.draft) return;
     var pfx = cfgVal("st-prefix"), nh = cfgVal("st-nh"), vpn = Number(cfgVal("st-vpn"));
+    var weight = Number(cfgVal("st-weight") || 0);
     if (!/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(pfx)) {
       toast("目的前缀格式应为 a.b.c.d/len，例如 10.68.99.0/24");
       return;
@@ -2953,7 +2957,8 @@
     if (!cfgIPv4(nh)) { toast("下一跳不是合法 IPv4"); return; }
     if (!cfgVPNExists(cs.draft, vpn)) { toast("VPN " + vpn + " 不存在"); return; }
     if (cs.draft.statics.length >= 512) { toast("静态路由最多 512 条"); return; }
-    cs.draft.statics.push({ prefix: pfx, next_hop: nh, vpn: vpn });
+    if (weight > 65535) { toast("weight 应在 1–65535（留空 = 默认 1）"); return; }
+    cs.draft.statics.push({ prefix: pfx, next_hop: nh, vpn: vpn, weight: Math.trunc(weight) });
     csMarkDirty();
     render();
   }
