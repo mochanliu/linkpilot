@@ -18,7 +18,7 @@ VLIB_REGISTER_LOG_CLASS (sr_wg_log) = {
 /* ==================== 插件注册 ==================== */
 
 VLIB_PLUGIN_REGISTER () = {
-  .version = "1.0.0",
+  .version = "1.1.0",
   .version_required = VPP_BUILD_VER,
   .load_after = "wireguard_plugin.so",
   .description = "SR-WG: Segment Routing over WireGuard transit/encap/decap",
