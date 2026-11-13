@@ -1064,6 +1064,7 @@
   // Dashboard 只给数字和该去哪儿，不再重复一遍表。
   function viewDashboard(st, online, isOp) {
     return cards(st, online, isOp) +
+      undDashboardMap() +
       (isOp ? operatorAttention(st) : tenantAttention(st)) +
       (isOp ? operatorSteps() : tenantSteps());
   }
@@ -5264,6 +5265,10 @@
 
   var MAP_K_MIN = 1, MAP_K_MAX = 14;
   var MAP_L1 = 1.8, MAP_L2 = 4.5;
+  // 明细海岸线按"看起来粗不粗"切，不跟隧道明细档走：适应设备后缩放通常落在
+  // 2.5~4.5 之间，这时 110m 海岸线把渤海湾画成一个团、山东半岛缺一半，
+  // 贴着它的设备点看起来就像漂出了海岸——不是投影错了，是底图太糙。
+  var MAP_GEO50 = 2.5;
 
   function loadScript(src) {
     return new Promise(function (resolve, reject) {
@@ -5293,8 +5298,8 @@
     }).then(function (wd) {
       MAP.loading = null;
       // The whole panel depends on whether the frame exists now, so it is a
-      // structure change, not a redraw.
-      if (S.view === "underlay-topology") render();
+      // structure change, not a redraw. Dashboard embeds the same panel.
+      if (S.view === "underlay-topology" || S.view === "dashboard") render();
       return wd;
     });
     return MAP.loading;
@@ -5368,11 +5373,31 @@
   function undMapPos(doc, geo) {
     var out = {}, unplaced = [];
     if (geo) {
+      // 同一站点（或坐标完全相同）的几台设备直接画就是一个点压一个点，
+      // 看起来像少了几台。按站点聚簇，簇内成员绕真实位置散开一圈：
+      // 点仍在站点附近，但每一台都看得见、点得到。散开半径用 inv（屏幕
+      // 恒定），缩放时间距跟着放大，不会缩回去重新叠住。
+      var t0 = undTopoStore();
+      var inv = undMapUnit() / (t0.k || 1);
+      var groups = {};
       doc.nodes.forEach(function (nd) {
-        if (nd.has_location) out[nd.node_id] = mapProject(MAP.world, nd.lon, nd.lat);
-        else unplaced.push(nd);
+        if (!nd.has_location) { unplaced.push(nd); return; }
+        var key = nd.site_id || (nd.lon.toFixed(4) + "," + nd.lat.toFixed(4));
+        (groups[key] = groups[key] || { lon: nd.lon, lat: nd.lat, ids: [] }).ids.push(nd.node_id);
       });
-      return { pos: out, unplaced: unplaced };
+      var cluster = {};
+      Object.keys(groups).forEach(function (key) {
+        var g = groups[key], n = g.ids.length;
+        var c = mapProject(MAP.world, g.lon, g.lat);
+        if (n === 1) { out[g.ids[0]] = c; return; }
+        var R = 13 * inv;
+        g.ids.sort(function (a, b) { return a - b; }).forEach(function (id, i) {
+          cluster[id] = true;
+          var ang = (i / n) * Math.PI * 2 - Math.PI / 2;
+          out[id] = [c[0] + Math.cos(ang) * R, c[1] + Math.sin(ang) * R];
+        });
+      });
+      return { pos: out, unplaced: unplaced, cluster: cluster };
     }
     var order = doc.nodes.slice().sort(function (a, b) {
       return (b.tunnel_count || 0) - (a.tunnel_count || 0);
@@ -5383,7 +5408,7 @@
       var ang = (i / order.length) * Math.PI * 2 - Math.PI / 2;
       out[nd.node_id] = order.length === 1 ? [cx, cy] : [cx + Math.cos(ang) * rx, cy + Math.sin(ang) * ry];
     });
-    return { pos: out, unplaced: [] };
+    return { pos: out, unplaced: [], cluster: {} };
   }
 
   function r1(v) { return Math.round(v * 10) / 10; }
@@ -5505,7 +5530,7 @@
       mx: (a[0] + b[0]) / 2, my: (a[1] + b[1]) / 2 };
   }
 
-  function undMapNodes(doc, pos, lv, inv, sel) {
+  function undMapNodes(doc, pos, lv, inv, cluster, sel) {
     var out = [], labels = [];
     // 隧道多的设备最后画：它们的标签最该占住位置，也最容易被邻居挡住。
     var order = doc.nodes.slice().sort(function (a, b) {
@@ -5542,9 +5567,11 @@
         g.push('<text x="' + r1(lx) + '" y="' + r1(ly) + '" font-size="' + r1((lv === 0 ? 11 : 12) * inv) +
           '" font-weight="500" fill="#1f2328" text-anchor="middle" stroke="#eef4f9" paint-order="stroke" ' +
           'stroke-width="' + r1(4.5 * inv) + '" stroke-linejoin="round">' + esc(undTrunc(name, 22)) + "</text>");
-      } else if (lv >= 2) {
+      } else if (lv >= 2 || (cluster && cluster[nd.node_id])) {
         // 挤不下的名字往下挪一行而不是删掉：一个点没有标签，运维只会以为那台设备
-        // 不在图上；标签压在海岸线上至少还是个可见的取舍。
+        // 不在图上；标签压在海岸线上至少还是个可见的取舍。同站点聚簇的成员
+        // 任何缩放档都不许被吞：两台盒子挤在一个站上，正是"图上少了一台"
+        // 误会的来源。
         g.push('<text x="' + r1(lx) + '" y="' + r1(ly + 14 * inv) + '" font-size="' + r1(10.5 * inv) +
           '" fill="#57606a" text-anchor="middle" stroke="#eef4f9" paint-order="stroke" stroke-width="' +
           r1(4 * inv) + '">' + esc(undTrunc(name, 22)) + "</text>");
@@ -5578,7 +5605,7 @@
       parts.push('<path d="' + wd.graticule + '" fill="none" stroke="#d8e2ea" stroke-opacity="' +
         (lv === 0 ? "0.9" : "0.6") + '"/>');
       // 50m 海岸线只在放大到看得出差别的那一档才叠上去，画在 110m 同一坐标系里。
-      if (lv >= 2 && MAP.world50) {
+      if (t.k >= MAP_GEO50 && MAP.world50) {
         parts.push('<path d="' + MAP.world50.land + '" fill="#fbfcfd" stroke="#c9d1d9" stroke-width="' +
           r1(1.1 * inv) + '"/>');
       } else {
@@ -5587,7 +5614,7 @@
       }
     }
     parts.push(undMapEdges(doc, spot.pos, lv, inv, t.sel));
-    parts.push(undMapNodes(doc, spot.pos, lv, inv, t.sel));
+    parts.push(undMapNodes(doc, spot.pos, lv, inv, spot.cluster || {}, t.sel));
     svg.setAttribute("viewBox", "0 0 " + f.w + " " + f.h);
     svg.innerHTML = '<g transform="translate(' + r1(t.x) + "," + r1(t.y) + ") scale(" + r1(t.k) + ')">' +
       parts.join("") + "</g>";
@@ -5620,7 +5647,7 @@
     var bx = (vb[0] - t.x) / t.k, by = (vb[1] - t.y) / t.k;
     t.k = k; t.x = vb[0] - bx * t.k; t.y = vb[1] - by * t.k;
     undMapClamp();
-    if (t.view === "geo" && MAP.world && t.k >= MAP_L2) ensureWorld50();
+    if (t.view === "geo" && MAP.world && t.k >= MAP_GEO50) ensureWorld50();
     undMapDraw();
   }
 
@@ -5724,7 +5751,7 @@
       blurContent();
       render();
     });
-    if (S.topo.view === "geo" && MAP.world && S.topo.k >= MAP_L2) ensureWorld50();
+    if (S.topo.view === "geo" && MAP.world && S.topo.k >= MAP_GEO50) ensureWorld50();
     undMapDraw();
   }
 
@@ -5865,33 +5892,32 @@
     return h2 + "</tbody></table></section>";
   }
 
-  function viewUnderlayTopology() {
-    var t = ensureTopo();
-    var doc = t.doc;
-    if (!doc) {
-      return '<section class="panel"><div class="empty">' +
-        esc(t.err ? "读取拓扑失败：" + t.err : "正在读取拓扑…") + "</div></section>";
-    }
+  // 横幅三兄弟（没发布 / 底图出错 / 底图加载中）：拓扑页和 Dashboard 都可能
+  // 出现同一句话，口径只能有一处。
+  function undTopoBanners(doc, t) {
     var h = "";
     if (!doc.configured) {
       h += '<div class="banner"><span>全局配置还没有发布：拓扑里不会有隧道。</span>' +
         '<button class="small" data-act="goto" data-view="underlay-settings">去全局配置</button></div>';
     }
-    if (!doc.nodes.length) {
-      return h + '<section class="panel"><header><h2>拓扑</h2></header>' +
-        '<div class="empty">还没有设备。设备入网后才会出现在拓扑里。</div></section>';
-    }
-    var geo = t.view === "geo";
-    var placed = doc.nodes.length - doc.unplaced_nodes;
-    if (geo && MAP.err) {
+    if (t.view === "geo" && MAP.err) {
       h += '<div class="banner"><span>' + esc(MAP.err) +
         "。地理视图需要底图里的投影参数才能摆放设备，所以现在画的是逻辑视图。</span>" +
         '<button class="small" data-act="topo-world-retry">重试加载</button></div>';
-    } else if (geo && !MAP.world) {
+    } else if (t.view === "geo" && !MAP.world) {
       h += '<div class="banner"><span>世界底图加载中（132 KB，编译在控制器里，只加载一次）。' +
         "在加载好之前先画逻辑视图。</span></div>";
     }
-    h += '<section class="panel"><header><h2>' + (geo && MAP.world ? "地理视图" : "逻辑视图") + "</h2>" +
+    return h;
+  }
+
+  // 地图面板：拓扑页和 Dashboard 共用同一块。视图切换、缩放、图例、计数都是
+  // 同一份字符串——两块长得不一样的地图只会让运维怀疑两处读的不是同一份数据。
+  // <svg> 的 id 只在当前视图里存在（render 每次整页重建），两个页面不会同时出现。
+  function undMapPanel(doc, t) {
+    var geo = t.view === "geo";
+    var placed = doc.nodes.length - doc.unplaced_nodes;
+    return '<section class="panel"><header><h2>' + (geo && MAP.world ? "地理视图" : "逻辑视图") + "</h2>" +
       '<div class="meta">' + undMapViewSeg() +
       '<span class="muted" style="font-size:12.5px">滚轮或 + − 缩放 · 拖动平移 · 双击放大</span>' +
       '<span class="tag pending" id="tp-level">缩略</span>' +
@@ -5917,10 +5943,46 @@
       '<span><span class="k">未定位</span> <b>' + doc.unplaced_nodes + "</b> 台</span></div>" +
       '<div class="hint" style="margin-top:10px">每组连线是一个设备对：同一设备对之间只能有一条隧道' +
       "（每台设备只有一把 WireGuard 静态密钥，第二条会被数据面以 -116 拒掉），要换端口或路径就编辑或删了重建。" +
-      "外圈虚线环 = 这台设备在为别的隧道做中转。</div></section>";
+      "外圈虚线环 = 这台设备在为别的隧道做中转。同一站点的几台设备会在站点位置附近散开，都看得见。</div></section>";
+  }
+
+  function viewUnderlayTopology() {
+    var t = ensureTopo();
+    var doc = t.doc;
+    if (!doc) {
+      return '<section class="panel"><div class="empty">' +
+        esc(t.err ? "读取拓扑失败：" + t.err : "正在读取拓扑…") + "</div></section>";
+    }
+    var h = undTopoBanners(doc, t);
+    if (!doc.nodes.length) {
+      return h + '<section class="panel"><header><h2>拓扑</h2></header>' +
+        '<div class="empty">还没有设备。设备入网后才会出现在拓扑里。</div></section>';
+    }
+    h += undMapPanel(doc, t);
     h += undTopoDetail(doc);
     h += '<div class="und-cols">' + undZoomTierTable() + undUnplacedPanel(doc) + "</div>";
     h += undSitePanel(doc);
+    return h;
+  }
+
+  // Dashboard 上的拓扑：underlay 本来就是租户侧的东西，运营方 Dashboard 不放。
+  // 与拓扑页共用 undMapPanel 与同一份 S.topo 状态——在这页点「适应设备」、
+  // 切去拓扑页，看到的是同一个视口，不是两份会漂移的副本。
+  function undDashboardMap() {
+    if (!undRole()) return "";
+    var t = ensureTopo();
+    if (t.err) {
+      return '<div class="banner"><span>读取拓扑失败：' + esc(t.err) + "</span>" +
+        '<button class="small" data-act="goto" data-view="underlay-topology">去拓扑图页看详情</button></div>';
+    }
+    if (!t.doc) return '<section class="panel"><div class="empty">正在读取拓扑…</div></section>';
+    var doc = t.doc;
+    if (!doc.nodes.length) return "";
+    var h = undTopoBanners(doc, t);
+    h += undMapPanel(doc, t);
+    h += '<section class="panel"><div class="meta" style="margin-top:2px">' +
+      '<span class="muted" style="font-size:12.5px">站点的经纬度在「Underlay 配置 › 拓扑图」页维护；同站点多台设备会在图上散开并各自标注。</span>' +
+      '<button class="small" data-act="goto" data-view="underlay-topology">打开完整拓扑图</button></div></section>';
     return h;
   }
 
@@ -8968,7 +9030,8 @@
     // zooming must repaint at pointer rate, and a 10s frame that rebuilds
     // #content from HTML would throw the viewport away. The shell above is the
     // string; this attaches the behaviour and paints the canvas from S.topo.
-    if (S.view === "underlay-topology") undMapAttach();
+    // 拓扑页和 Dashboard 都嵌同一块地图：attach 的条件跟着页面走，不跟导航项走。
+    if (S.view === "underlay-topology" || S.view === "dashboard") undMapAttach();
 
     // The leak pages replace only their inner containers on filter typing, so
     // the handlers live on #lk-root: it is rebuilt by every full render (and
