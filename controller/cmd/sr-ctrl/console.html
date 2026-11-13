@@ -249,6 +249,19 @@
     color:var(--muted);padding:6px 2px;margin:0 12px -1px 0;font-size:13px}
   .modnav button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
   .modnav button:hover{background:none;color:var(--ink)}
+  /* 监控页趋势图的设备搜索选择器：输入即过滤；列表浮在页面上层，
+     选中前冻结整页重绘（5s 轮询会在选到一半时把下拉整个拆掉）。 */
+  .pick{position:relative;display:inline-block;min-width:240px}
+  .pick input{width:100%;font:inherit;font-size:13px;padding:4px 8px;
+    border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)}
+  .pick>div{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:30;
+    max-height:240px;overflow-y:auto;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.35)}
+  .pick.open>div{display:block}
+  .pick-it{padding:6px 10px;font-size:13px;cursor:pointer}
+  .pick-it:hover{background:var(--soft)}
+  .pick-it.on{font-weight:600;color:var(--accent)}
+  .pick-none{padding:8px 10px;font-size:12.5px;color:var(--muted)}
   .subcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px}
   .subhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
   .subhead .sp{color:var(--muted);font-size:12.5px}
@@ -416,6 +429,10 @@
     // 历史最多 30s 一次）。
     alerts: null, ledger: null, ledgerFilter: { kind: "", hours: 48, node: 0 },
     history: null, histNode: 0, histAt: 0,
+    // histQ 是趋势图设备选择器的搜索词；freeze=true 表示选择器正开着——
+    // 这段时间 render() 直接返回，不然 5s 轮询会把展开中的列表整个拆掉，
+    // 用户的选择就落空了（freezeView 记录冻结时的页面，切页即解冻）。
+    histQ: "", freeze: false, freezeView: null,
     // 远程诊断页：records 来自 /api/diag?node=，diagNode 是当前选中的设备，
     // diagTool 决定表单里显示哪几个输入框。记录表 5s 快速轮询里一起刷。
     diag: null, diagNode: 0, diagTool: "ping",
@@ -930,6 +947,12 @@
   function render() {
     var st = S.state;
     if (!st) return;
+    // 选择器开着时不重绘：内容被 innerHTML 换掉，展开中的下拉会立刻消失，
+    // 用户还没点中的那一下就丢了。切到别的页面则解除冻结照常画新页。
+    if (S.freeze) {
+      if (S.freezeView === S.view) return;
+      S.freeze = false;
+    }
     var me = S.me || {};
     var isOp = me.role === "operator";
     if (!VIEWS[S.view]) S.view = "dashboard";
@@ -1573,16 +1596,19 @@
 
     // 24 小时趋势：台账里的 tunnel.sample 采样（10 秒一条）画成折线。
     // 数据独立于上面的实时窗口——实时窗口说"现在"，这里说"过去一天"。
-    var nodeOpts = nodes.map(function (n) {
-      return '<option value="' + n.node_id + '"' +
-        (Number(S.histNode || 0) === n.node_id || (!S.histNode && n.node_id === (nodes[0] || {}).node_id)
-          ? " selected" : "") + ">node-" + esc(n.node_id) + "</option>";
-    }).join("");
-    h += '<section class="panel"><header><h2>24 小时隧道质量</h2>' +
-      '<select id="hist-node" style="font:inherit;font-size:13px">' + nodeOpts + "</select></header>" +
+    // 设备用搜索选择器挑（设备多了下拉里翻不到）；标题带上当前设备，
+    // 否则换一台图没变就真的看不出来——同一站点几台盒子的质量曲线几乎长一样。
+    var histSel = S.histNode || (nodes[0] ? nodes[0].node_id : 0);
+    var cur = null;
+    nodes.forEach(function (n) { if (n.node_id === histSel) cur = n; });
+    h += '<section class="panel"><header><h2>24 小时隧道质量 · node-' + esc(histSel) +
+      (cur && cur.serial ? "（" + esc(cur.serial) + "）" : "") + '</h2>' +
+      '<div class="pick" id="hist-pick">' +
+      '<input id="hist-q" data-keep autocomplete="off" spellcheck="false" placeholder="搜索设备（node 号 / 序列号）" value="' + esc(S.histQ || "") + '">' +
+      '<div id="hist-list"></div></div></header>' +
       '<div class="hint">来自控制器的台账采样，一条线 = 到一个对端的隧道（图例带颜色号）。' +
       '设备失联的时间段自然是空的——空档本身就是发生过事情的证据。</div>' +
-      histCharts(S.history, S.histNode || (nodes[0] ? nodes[0].node_id : 0)) +
+      histCharts(S.history, histSel, nodes) +
       "</section>";
 
     h += '<section class="panel"><header><h2>设备健康</h2>' +
@@ -1629,10 +1655,31 @@
 
   var HIST_COLORS = ["#3b82f6", "#f97316", "#10b981", "#a855f7", "#eab308", "#64748b", "#ec4899"];
 
+  // histPickList 按 S.histQ 过滤设备、把候选画进选择器列表。搜索词匹配
+  // node 号或序列号；当前选中的那条加高亮。
+  function histPickList() {
+    var box = $("hist-list");
+    if (!box) return;
+    var m = S.metrics;
+    var nodes = (m && m.nodes) || [];
+    var q = (S.histQ || "").trim().toLowerCase();
+    var sel = S.histNode || (nodes[0] ? nodes[0].node_id : 0);
+    var items = nodes.filter(function (n) {
+      if (!q) return true;
+      return ("node-" + n.node_id).indexOf(q) >= 0 ||
+        String(n.serial || "").toLowerCase().indexOf(q) >= 0;
+    });
+    box.innerHTML = items.length ? items.map(function (n) {
+      var on = n.node_id === sel;
+      return '<div class="pick-it' + (on ? " on" : "") + '" data-hist-node="' + n.node_id + '">node-' +
+        esc(n.node_id) + (n.serial ? " · " + esc(n.serial) : "") + (on ? "　✓" : "") + "</div>";
+    }).join("") : '<div class="pick-none">没有匹配的设备</div>';
+  }
+
   // histCharts 把台账采样画成两张小图（延迟 / 丢包）。samples 形如
   // {samples:[{at, node, rows:[{peer,color,rtt_ms,loss_permille}]}]}，只画
   // node 过滤后的那台。空数据说清原因，不画一张空坐标系装样子。
-  function histCharts(h, node) {
+  function histCharts(h, node, nodes) {
     var samples = ((h && h.samples) || []).filter(function (s) {
       return !node || s.node === node;
     });
@@ -1692,10 +1739,15 @@
       return out;
     }
     function legend(series) {
+      // peer 名从设备列表反查：图例里只有 node 号的话，换一台设备图例一字不变，
+      // 看图的人没法确认自己看的到底是哪台。
+      var names = {};
+      (nodes || []).forEach(function (n) { names[n.node_id] = n.serial || ""; });
       return series.map(function (sr, i) {
         var c = HIST_COLORS[i % HIST_COLORS.length];
         return '<span style="color:' + c + '">▬</span> node-' + esc(sr.peer) +
-          (sr.color ? "（颜色 " + sr.color + "）" : "");
+          (names[sr.peer] ? "（" + esc(names[sr.peer]) + "）" : "") +
+          (sr.color ? "·颜色 " + sr.color : "");
       }).join("　");
     }
     return '<div style="margin-top:6px">' +
@@ -9220,13 +9272,48 @@
     if (opsNodeSel) opsNodeSel.addEventListener("change", function () {
       S.ledgerFilter.node = Number(opsNodeSel.value) || 0; loadOps();
     });
-    // 监控页趋势图的设备下拉：切设备立即重拉历史（绕过 30s 节流）。
-    var histSel = $("hist-node");
-    if (histSel) histSel.addEventListener("change", function () {
-      S.histNode = Number(histSel.value) || 0;
-      S.histAt = 0;
-      loadHistory();
-    });
+    // 监控页趋势图的设备搜索选择器：聚焦/输入即展开并冻结整页重绘，
+    // 选中立即重拉历史（绕过 30s 节流）。mousedown 而不是 click：它先于
+    // input 的 blur 触发，preventDefault 保住焦点，列表不会闪没。
+    var hq = $("hist-q");
+    if (hq) {
+      var hopen = function () {
+        S.freeze = true;
+        S.freezeView = S.view;
+        var p = $("hist-pick");
+        if (p) p.className = "pick open";
+        histPickList();
+      };
+      var hclose = function () {
+        S.freeze = false;
+        var p = $("hist-pick");
+        if (p) p.className = "pick";
+      };
+      hq.addEventListener("focus", hopen);
+      hq.addEventListener("input", function () {
+        S.histQ = hq.value;
+        hopen();
+      });
+      hq.addEventListener("blur", function () { setTimeout(hclose, 180); });
+      hq.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") { S.histQ = ""; hq.blur(); }
+      });
+      var hl = $("hist-list");
+      if (hl) hl.addEventListener("mousedown", function (e) {
+        var t = e.target;
+        while (t && t !== hl && !(t.getAttribute && t.getAttribute("data-hist-node"))) {
+          t = t.parentNode;
+        }
+        if (!t || t === hl || !t.getAttribute) return;
+        if (e.preventDefault) e.preventDefault();
+        S.histNode = Number(t.getAttribute("data-hist-node")) || 0;
+        S.histQ = "";
+        S.freeze = false;
+        S.histAt = 0;
+        loadHistory();
+        render();
+      });
+    }
 
     // 远程诊断页：设备与工具切换。
     var diagNodeSel = $("diag-node");

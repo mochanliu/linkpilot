@@ -110,6 +110,33 @@ func TestConsoleServicesMovedOutOfOverlay(t *testing.T) {
 	}
 }
 
+// 监控页趋势图的设备选择必须是搜索选择器，而不是裸下拉：设备一多，
+// 下拉里翻不到要看的设备；且 5s 轮询会在下拉展开时整页重绘，把没点完的
+// 选择整个拆掉（owner 实测"换设备图不变"的体感就是这么来的——另一并因素
+// 是图上不写当前设备是谁，几台盒子曲线几乎一样）。冻结护栏与 mousedown
+// 选中是这条体验的两半，缺一半都会退化回旧问题。
+func TestConsoleMonitorHistPicker(t *testing.T) {
+	html := string(consoleHTML)
+	mon := funcBody(t, html, "function viewMonitor(")
+	if !strings.Contains(mon, `id="hist-q"`) {
+		t.Error("监控页没有设备搜索选择器（hist-q）")
+	}
+	if strings.Contains(mon, `id="hist-node"`) {
+		t.Error("监控页还在用旧的裸下拉 hist-node")
+	}
+	if !strings.Contains(mon, "histCharts(S.history, histSel, nodes)") {
+		t.Error("趋势图没有把设备列表传给 histCharts：图例反查不出对端序列号")
+	}
+	r := funcBody(t, html, "function render(")
+	if !strings.Contains(r, "S.freeze") {
+		t.Error("render() 没有冻结护栏：选择器展开时会被 5s 轮询整页重绘拆掉")
+	}
+	bd := funcBody(t, html, "function bind(")
+	if !strings.Contains(bd, "histPickList()") || !strings.Contains(bd, "data-hist-node") {
+		t.Error("bind() 没有接选择器事件：搜索与选中都不会有反应")
+	}
+}
+
 // 基础配置组共用一台当前设备：服务面必须跟随 S.cfg，否则在 NAT 页换设备之后，
 // 接口配置页显示的还是上一台。
 func TestConsoleServicesFollowSelectedDevice(t *testing.T) {
