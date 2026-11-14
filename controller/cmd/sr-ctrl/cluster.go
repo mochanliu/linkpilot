@@ -468,13 +468,13 @@ func (s *server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "这个加入码已经用过了（成员已存在）", 409)
 		return
 	}
-	// 地址不能被两个成员同时占着：那会让 EndpointOf 有歧义，请求会打到
-	// 一台机器上而以为在跟另一台说话。
-	for _, m := range s.membersSnapshot() {
-		if m.ID != p.Member && m.Endpoint == p.Endpoint && m.Status == memberActive {
-			http.Error(w, fmt.Sprintf("地址 %s 已被成员「%s」占用", p.Endpoint, m.Name), 409)
-			return
-		}
+	// 地址不能被两个成员同时占着：那会让 EndpointOf 有歧义，请求会打到一台
+	// 机器上而以为在跟另一台说话。规则只有一份（endpointConflict，签发加入码时
+	// 也走它），否则"签发时放行、加入时拒绝"这种自相矛盾迟早会出现 —— 替换场景
+	// 就是：旧机器坏了、新机器直接接管它原来的 IP，签发要放行，加入也必须放行。
+	if msg := endpointConflict(s.membersSnapshot(), p.Endpoint, p.Replaces); msg != "" {
+		http.Error(w, msg, 409)
+		return
 	}
 
 	nm := ClusterMember{ID: p.Member, Name: p.Name, Endpoint: p.Endpoint,
@@ -779,6 +779,11 @@ func (s *server) issueJoinToken(kind, name, endpoint, console, replace string) (
 	if name == "" {
 		name = "控制器 " + fmt.Sprint(len(cur.Members)+1)
 	}
+	// 同一个地址只能有一个成员（见 endpointConflict 的注释）。这一步放在签发之前：
+	// 让错误停在"点生成加入码"这一下，而不是等新机器跑起来、日志一路报奇怪的东西。
+	if msg := endpointConflict(s.membersSnapshot(), endpoint, replace); msg != "" {
+		return "", p, errors.New(msg)
+	}
 	p = joinPayload{
 		Cluster: cur.ID, Member: newMemberID(), Name: name, Endpoint: endpoint,
 		Console: console, Replaces: replace,
@@ -792,6 +797,36 @@ func (s *server) issueJoinToken(kind, name, endpoint, console, replace string) (
 		return "", p, errors.New("集群密钥缺失（cluster/secret），请检查数据目录")
 	}
 	return signJoinToken(sec, p), p, nil
+}
+
+// endpointConflict 回答"这个地址还能不能拿来加入"，返回空串表示没冲突。
+//
+// 为什么必须拦：两个成员指向同一个地址，多数派就算不清了。leader 会把 append
+// 发给同一个进程两次，那个进程只认自己这一个成员 id，另一份永远追不上 ——
+// 成员表看着像 4 台，其实只有 3 台机器，learner 卡在落后状态，sweep 也就永远
+// 不会提升它，客户看到的是"加了一台，一直不变成投票成员"。
+//
+// 两种合理的复用要放行：
+//   - 替换（replaceID 指的正是占着这个地址的旧成员）：旧机器坏了，新机器直接
+//     接管它的 IP 是最常见的现场做法。
+//   - 已下线的成员：行留着做审计，地址早就不占了。
+func endpointConflict(members []ClusterMember, endpoint, replaceID string) string {
+	ep := normEndpoint(endpoint)
+	if ep == "" {
+		return ""
+	}
+	for _, m := range members {
+		if m.Status != memberActive || normEndpoint(m.Endpoint) != ep || m.ID == replaceID {
+			continue
+		}
+		return fmt.Sprintf("地址 %s 已经是成员 %s（%s）的；换一台机器接管这个地址请用「替换」，"+
+			"同一台机器重新加入请先清空它的数据目录", endpoint, m.Name, m.ID)
+	}
+	return ""
+}
+
+func normEndpoint(s string) string {
+	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), "/")))
 }
 
 func newMemberID() string {

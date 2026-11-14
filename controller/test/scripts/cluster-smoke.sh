@@ -3,9 +3,9 @@
 #
 # 走的是客户会走的那条路：
 #   1. 一台单机 → 控制台点「开启集群」
-#   2. 用加入码把第 2、3 台接进来（learner → voter）
+#   2. 用加入码把第 2、3 台接进来（learner → voter）；同一个地址加第二次要被拒
 #   3. kill -9 掉 leader：剩下的两台要能选出新主，写还要能提交
-#   4. 把挂掉的那台装回来（同一份数据目录）：它要自己追上
+#   4. 把挂掉的那台装回来（同一份数据目录，命令行里还留着旧加入码）：它要自己追上
 #   5. 替换一台：新机器跑一条命令，旧的那台自动下线
 #   6. 下线一台
 #
@@ -139,6 +139,22 @@ caught_up() { # applied 追平 commit
 	[ -n "$a" ] && [ -n "$c" ] && [ "$a" -ge "$c" ]
 }
 
+endpoint_refused() { # <n> <endpoint> —— 期望签发被拒（地址已被某个活跃成员占着）
+	api "$1" POST /api/cluster \
+		"{\"action\":\"token\",\"name\":\"dup\",\"endpoint\":\"$2\"}" 2>/dev/null |
+		grep -q "已经是成员"
+}
+
+ignored_stale_join() { # 日志里要有"忽略 -join"
+	grep -q "忽略 -join" "$WORK/c$1.log"
+}
+
+replace_addr_ok() { # <n> <旧成员 id> <旧地址> —— 替换场景要能签发加入码
+	api "$1" POST /api/cluster \
+		"{\"action\":\"token\",\"kind\":\"replace\",\"replace_id\":\"$2\",\"name\":\"tmpx\",\"endpoint\":\"$3\"}" \
+		2>/dev/null | grep -q '"token"'
+}
+
 # 写一笔真实数据（建租户）：既是硬状态的一行，也是客户最常做的动作。
 # 写到 leader 上 —— follower 会把写 307 给 leader，curl 不带 -L 不跟（浏览器会跟，
 # 这一条单独用 redirected_to_leader 验）。
@@ -199,10 +215,22 @@ for n in 2 3; do
 	tok=$(api 1 POST /api/cluster "{\"action\":\"token\",\"name\":\"c$n\",\"endpoint\":\"127.0.0.1:$(p_port "$n")\",\"console\":\"127.0.0.1:$(c_port "$n")\"}" | pick token)
 	if [ -z "$tok" ] || [ "$tok" = None ]; then bad "签发 c$n 的加入码失败"; continue; fi
 	ok "拿到 c$n 的加入码"
+	TOKS[$n]=$tok
 	start_node "$n" "c$n" -join "https://127.0.0.1:$(p_port 1)" -join-token "$tok"
 	waitfor 30 "c$n 成为 voter" is_voter 1 "c$n"
 done
 waitfor 20 "三台都是活跃 voter" has_voters 1 3
+
+say "2.1 同一个地址不能被两个成员占着"
+# 两个成员指向同一个地址会把多数派算虚（leader 发给同一台两次，另一份永远追不上），
+# 所以这一步要在"点生成加入码"时就拒掉，而不是等新机器跑起来再猜。
+waitfor 10 "撞已有地址的加入码被拒" endpoint_refused 1 "127.0.0.1:$(p_port 2)"
+
+say "2.2 替换可以接管旧机器的地址"
+# 现场最常见的换机方式：旧机器坏了，新机器直接用它原来的 IP。签发与加入两边
+# 都必须放行（以前加入侧只认"地址属于活着的成员"，会把这条路堵死）。
+cid=$(member_field 1 c3 id)
+waitfor 10 "替换目标可以复用地址" replace_addr_ok 1 "$cid" "127.0.0.1:$(p_port 3)"
 
 say "3. kill -9 掉 leader"
 old=$(view 1 | pick leader)
@@ -217,9 +245,13 @@ waitfor 10 "切换期间写还能提交" write_ok smoke-b
 waitfor 10 "写的内容已经复制到另一台" write_matches "$s2" smoke-b
 waitfor 10 "follower 上的写被 307 到 leader" redirected_to_leader
 
-say "4. 把挂掉的那台装回来"
-start_node "$lnode" "c$lnode"
+say "4. 把挂掉的那台装回来（命令行里还留着上一次的加入码）"
+# 部署时把 -join 顺手写进 systemd 单元是常见写法。加入码是一次性的、30 分钟过期，
+# 重放一定被拒 —— 如果进程在这上面 log.Fatal，这台机器就再也起不来了。所以这里
+# 故意带着旧加入码重启：它必须忽略它、接着跑，并在日志里说清楚。
+start_node "$lnode" "c$lnode" -join "https://127.0.0.1:$(p_port 1)" -join-token "${TOKS[$lnode]:-stale-token}"
 waitfor 30 "重启的节点追上日志" caught_up "$lnode"
+waitfor 5 "旧的 -join 被忽略（不是 fatal）" ignored_stale_join "$lnode"
 
 say "5. 替换一台"
 L=$(leader_idx); L=${L:-$s1}

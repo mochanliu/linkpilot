@@ -2523,6 +2523,17 @@ func main() {
 	s.cert.Store(&srvCert)
 
 	// ---- 集群：要么加入别人，要么把已有的成员表捡起来继续跑。
+	//
+	// "已经在集群里"的节点，即使命令行还带着 -join 也不能再加入一次。部署时把
+	// 那条加入命令顺手写进 systemd 单元是很常见的写法，机器一重启就会拿着一个
+	// 已经用过的加入码重放：加入码一次性、30 分钟过期，重放必然被 leader 拒，
+	// 而这台机器本来只需要接着跑 —— 结果是自己把自己弄得起不来。
+	// 所以这里只警告并丢掉落参数，让它走"捡起已有成员表"那条路。
+	if st.Cluster != nil && (*joinURL != "" || *joinTok != "") {
+		log.Printf("cluster: 本机已经在集群 %q 里，忽略 -join/-join-token（加入码一次性，"+
+			"别写进 systemd 单元）；要重新加入请先清空数据目录 %s", st.Cluster.ID, *dataDir)
+		*joinURL, *joinTok = "", ""
+	}
 	if *joinURL != "" || *joinTok != "" {
 		if *joinURL == "" || *joinTok == "" {
 			log.Fatal("加入集群需要同时给 -join（leader 地址）和 -join-token（控制台签发的加入码）")
@@ -2539,6 +2550,12 @@ func main() {
 		if st.Cluster != nil {
 			if err := s.startRaft(); err != nil {
 				log.Fatalf("cluster: %v", err)
+			}
+			// 被下线的那台重启后仍然会起来（它只是不投票），但日志里必须说清楚，
+			// 否则现场会以为"它回来了"，其实成员表里它还是 decommissioned。
+			if s.raft != nil && !s.raft.IsVoter() {
+				log.Printf("cluster: 本机不在 voter 集合里（已下线，或仍是 learner）：只接日志、不参选；" +
+					"如果是被下线的那台，要重新加入请清空数据目录后换新加入码")
 			}
 			s.tlsAddrs = s.memberEndpoints()
 		}
