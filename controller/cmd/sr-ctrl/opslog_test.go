@@ -120,7 +120,8 @@ func TestAlertRaiseUnderServerLock(t *testing.T) {
 	s.mu.Unlock()
 }
 
-func TestAlertRaiseClearDedup(t *testing.T) {	s := newTestServerWithOps(t)
+func TestAlertRaiseClearDedup(t *testing.T) {
+	s := newTestServerWithOps(t)
 	s.raiseAlertLocked("tunnel.loss", "tenant-a", 1, "3", "warn", "丢包 300‰")
 	s.raiseAlertLocked("tunnel.loss", "tenant-a", 1, "3", "warn", "丢包 500‰")
 	if len(s.alerts) != 1 {
@@ -197,5 +198,48 @@ func TestAlertSettingsDefaults(t *testing.T) {
 	as = s.alertSettingsLocked("tenant-a")
 	if as.LossPermille != 100 || as.WebhookURL != "http://x/y" {
 		t.Fatalf("设置读取失真: %+v", as)
+	}
+}
+
+// TestLedgerPruneFollowsSetting：保留期不是常量了，清理得跟着设置走——
+// 改小立刻删，改大不会把已经删掉的变回来（也不需要它变）。
+func TestLedgerPruneFollowsSetting(t *testing.T) {
+	s := newTestServerWithOps(t)
+	now := time.Now()
+	mk := func(d time.Time) string {
+		name := d.Format("2006-01-02") + ".jsonl"
+		if err := os.WriteFile(filepath.Join(s.ops.dir, name), []byte("{}\n"), 0600); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+		return name
+	}
+	old := mk(now.AddDate(0, 0, -40))
+	mid := mk(now.AddDate(0, 0, -10))
+	today := mk(now)
+	exists := func(name string) bool {
+		_, err := os.Stat(filepath.Join(s.ops.dir, name))
+		return err == nil
+	}
+
+	s.mu.Lock()
+	s.state.LedgerRetentionDays = 7
+	s.pruneLedgerIfDueLocked(now.Unix())
+	s.mu.Unlock()
+	if exists(old) || exists(mid) {
+		t.Fatal("保留 7 天时，40 天前和 10 天前的文件都该删掉")
+	}
+	if !exists(today) {
+		t.Fatal("今天的台账文件不该被删")
+	}
+
+	// 同一天再调一次（sweeper 每 2s 一拍）不该重复扫目录——用"记下来的
+	// 那一天已经等于今天"来验，顺带证明改大保留期会重新触发一次。
+	s.mu.Lock()
+	s.state.LedgerRetentionDays = 30
+	s.pruneLedgerIfDueLocked(now.Unix())
+	days, day := s.opsPruneDays, s.opsPruneDay
+	s.mu.Unlock()
+	if days != 30 || day != now.Format("2006-01-02") {
+		t.Fatalf("保留期改了应重新清一次，现在是 %d 天 / %s", days, day)
 	}
 }

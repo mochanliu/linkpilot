@@ -162,3 +162,76 @@ func TestOpsLedgerTenantIsolation(t *testing.T) {
 	}
 	_ = fmt.Sprint()
 }
+
+// TestAlertsRetentionAPI：「台账与告警」页上的保留天数——读得出默认、改得动、
+// 越界拒、被拒的请求不会留下半份告警设置。
+func TestAlertsRetentionAPI(t *testing.T) {
+	s, h, user, _ := newOpsHttpServer(t)
+	s.opsLogin(t, h, user) // 放一个会话进 hub，下面的请求带上同一个 cookie
+
+	get := func() map[string]any {
+		t.Helper()
+		r := httptest.NewRequest("GET", "/api/alerts", nil)
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: "smoke-sid"})
+		code, body := doReq(t, h, r)
+		if code != 200 {
+			t.Fatalf("GET alerts: %d %s", code, body)
+		}
+		var d map[string]any
+		if err := json.Unmarshal(body, &d); err != nil {
+			t.Fatalf("alerts 不是 JSON: %s", body)
+		}
+		return d
+	}
+
+	d := get()
+	ret := d["retention"].(map[string]any)
+	if ret["days"].(float64) != float64(opsDefaultRetentionDays) {
+		t.Fatalf("没配过时应报默认 %d 天: %v", opsDefaultRetentionDays, ret)
+	}
+	if ret["min_days"].(float64) != float64(opsMinRetentionDays) ||
+		ret["max_days"].(float64) != float64(opsMaxRetentionDays) {
+		t.Fatalf("区间没给全，页面画不出输入框: %v", ret)
+	}
+
+	put := func(body string) int {
+		t.Helper()
+		r := httptest.NewRequest("PUT", "/api/alerts", strings.NewReader(body))
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: "smoke-sid"})
+		r.Header.Set("Content-Type", "application/json")
+		code, _ := doReq(t, h, r)
+		return code
+	}
+
+	if code := put(`{"webhook_url":"http://127.0.0.1:9/x","loss_permille":150,"retention_days":7}`); code != 200 {
+		t.Fatalf("改保留期应 200，得到 %d", code)
+	}
+	if s.state.LedgerRetentionDays != 7 {
+		t.Fatalf("保留期没落库: %d", s.state.LedgerRetentionDays)
+	}
+	if got := get()["retention"].(map[string]any)["days"].(float64); got != 7 {
+		t.Fatalf("读回来不是 7 天: %v", got)
+	}
+
+	// 越界：拒，而且不能把同一份请求里的 webhook 改掉（半份生效最坑）。
+	if code := put(`{"webhook_url":"http://127.0.0.1:9/y","retention_days":0}`); code != 400 {
+		t.Fatalf("0 天应 400，得到 %d", code)
+	}
+	if code := put(`{"webhook_url":"http://127.0.0.1:9/y","retention_days":400}`); code != 400 {
+		t.Fatalf("%d 天应 400，得到 %d", opsMaxRetentionDays+35, code)
+	}
+	if as := s.alertSettingsLocked("tenant-vm"); as.WebhookURL != "http://127.0.0.1:9/x" || as.LossPermille != 150 {
+		t.Fatalf("被拒的请求改了告警设置: %+v", as)
+	}
+	if s.state.LedgerRetentionDays != 7 {
+		t.Fatalf("被拒的请求改了保留期: %d", s.state.LedgerRetentionDays)
+	}
+
+	// 不带 retention_days 的老请求（只改 webhook）不该把保留期打回默认。
+	if code := put(`{"webhook_url":"http://127.0.0.1:9/z","loss_permille":250}`); code != 200 {
+		t.Fatalf("只改告警设置应 200，得到 %d", code)
+	}
+	if s.state.LedgerRetentionDays != 7 {
+		t.Fatalf("只改 webhook 把保留期冲掉了: %d", s.state.LedgerRetentionDays)
+	}
+}

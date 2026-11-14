@@ -301,6 +301,38 @@ func TestConsoleTunnelTableWiring(t *testing.T) {
 	}
 }
 
+// TestConsoleLedgerRetentionWiring 钉住「台账与告警」页上的保留天数：
+// 输入框要有、保存动作要分发、请求体要带 retention_days，缩短期要先问一句。
+// 少任何一处，用户看到的是"填了数字、点了保存、什么也没发生"。
+func TestConsoleLedgerRetentionWiring(t *testing.T) {
+	html := string(consoleHTML)
+	ops := funcBody(t, html, "function viewOps()")
+	for _, want := range []string{`id="ops-keep"`, `data-act="retention-save"`, "rt.min_days", "rt.max_days"} {
+		if !strings.Contains(ops, want) {
+			t.Errorf("台账与告警页缺少 %s", want)
+		}
+	}
+	// 动作分发是一条 else-if 链：取本分支到自己结束、下一个分支开始为止。
+	i := strings.Index(html, `else if (act === "retention-save") {`)
+	if i < 0 {
+		t.Fatal("动作分发里没有 retention-save：按钮点了没反应")
+	}
+	rest := html[i:]
+	if j := strings.Index(rest, `else if (act === "diag-refresh")`); j > 0 {
+		rest = rest[:j]
+	}
+	for _, want := range []string{"retention_days", "confirm(", "webhook_url", "loss_permille"} {
+		if !strings.Contains(rest, want) {
+			t.Errorf("保存保留天数的分支缺少 %s", want)
+		}
+	}
+	// 只改告警设置的老路径不能把页面上已经读到的保留期弄丢（否则一保存
+	// webhook，页面上那个数字就变回默认值，看起来像被重置了）。
+	if !strings.Contains(funcBody(t, html, `else if (act === "alert-save") {`), "res.retention") {
+		t.Error("保存告警设置后没有把 retention 一起带回 S.alerts")
+	}
+}
+
 // funcBody 取一个函数体：从签名到下一个顶格两空格的 "}" 行。
 func funcBody(t *testing.T, html, sig string) string {
 	t.Helper()

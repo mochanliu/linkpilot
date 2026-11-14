@@ -346,6 +346,13 @@ type State struct {
 	// tenant id. Configuration, not state: it survives a restart because a
 	// webhook that silently vanished after an upgrade is worse than no webhook.
 	Alerts map[string]*AlertSettings `json:"alert_settings,omitempty"`
+
+	// LedgerRetentionDays is how many days of 运维台账 to keep. One number for
+	// the whole controller, not per tenant: the ledger is a directory of day
+	// files that every tenant's rows share, so "tenant A keeps 7 days" would
+	// physically delete tenant B's history. 0 means "never configured" and
+	// falls back to opsDefaultRetentionDays.
+	LedgerRetentionDays int `json:"ledger_retention_days,omitempty"`
 }
 
 // Account is one console login. Passwords are stored only as PBKDF2 hashes
@@ -442,9 +449,9 @@ func seedState() *State {
 		Underlays:   map[string]*UnderlayConfig{},
 		Overlays:    map[string]*OverlayConfig{},
 		LeakConfigs: map[string]*LeakConfig{},
-		Sites:        map[string]*Site{},
-		PreAuths:     map[string]*PreAuth{},
-		Alerts:       map[string]*AlertSettings{},
+		Sites:       map[string]*Site{},
+		PreAuths:    map[string]*PreAuth{},
+		Alerts:      map[string]*AlertSettings{},
 
 		PreAuthConfigs: map[string]*DeviceConfig{},
 	}
@@ -774,9 +781,13 @@ type server struct {
 	lastSampleAt  map[string]int64
 	lastSelection map[string]uint8
 
-	// opsPruneDay is the last day the ledger prune ran (local date), so the
-	// 2s sweeper does directory work once per day instead of once per tick.
-	opsPruneDay string
+	// opsPruneDay is the last day the ledger prune ran (local date), and
+	// opsPruneDays the retention it ran with. Together they let the 2s sweeper
+	// do directory work once per day instead of once per tick -- and again the
+	// moment someone changes the retention, so lowering it from 30 to 3 days in
+	// the console takes effect now rather than at the next midnight.
+	opsPruneDay  string
+	opsPruneDays int
 
 	// diagRecs holds the remote-diagnosis records (diag.go), keyed by node key
 	// like obs/tel: a pending command that outlives a controller restart is
@@ -1194,9 +1205,9 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	rec.CertPEM = certPEM
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
 	s.save()
-		s.admin.publish("node.enrolled", tenant, rec)
-		s.appendOps("node.enrolled", tenant, rec.NodeID, "", "info",
-			fmt.Sprintf("设备入网：node %d，serial %s，授权 %s", rec.NodeID, req.Serial, claim.ID))
+	s.admin.publish("node.enrolled", tenant, rec)
+	s.appendOps("node.enrolled", tenant, rec.NodeID, "", "info",
+		fmt.Sprintf("设备入网：node %d，serial %s，授权 %s", rec.NodeID, req.Serial, claim.ID))
 	if transitAssigned {
 		// The 全局配置 page lists every device's transit port; it just changed.
 		s.admin.publish("node.underlay", tenant, rec)
@@ -2308,11 +2319,7 @@ func (s *server) ttlSweeper(ctx context.Context) {
 			s.expireTelemetryLocked(now)
 			s.expireClaimCodesLocked(now)
 			s.sweepTelemetryGapLocked(now)
-			// 台账清理按天跑一次：日期变了才扫目录，平时这一拍零开销。
-			if d := time.Unix(now, 0).Format("2006-01-02"); d != s.opsPruneDay {
-				s.opsPruneDay = d
-				s.ops.prune(time.Unix(now, 0), opsRetentionDays)
-			}
+			s.pruneLedgerIfDueLocked(now)
 			s.save()
 			s.mu.Unlock()
 		}

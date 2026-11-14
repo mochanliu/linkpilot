@@ -44,8 +44,15 @@ const (
 	// 报一次（探针 300ms 一发，窗口聚合），窗口比这短没有画图价值，还把文件
 	// 写爆。10s 一条，一台设备一天 8640 行，7 天也是小文件。
 	opsSampleThrottleSec = 10
-	// opsRetentionDays 是台账文件的保留期。超期文件由 ttlSweeper 每天删一次。
-	opsRetentionDays = 30
+	// opsDefaultRetentionDays 是台账文件的默认保留期。实际值由
+	// State.LedgerRetentionDays 决定（台账与告警页可改），超期文件由每天
+	// 一次的清理删掉。
+	opsDefaultRetentionDays = 30
+	// opsMinRetentionDays / opsMaxRetentionDays 是允许设置的区间。下界 1 天
+	// 是"至少留下今天和昨天能对比"的底线；上界 365 天是因为更久的台账本来
+	// 也没人翻，而按天一个文件的管理成本已经开始明显。
+	opsMinRetentionDays = 1
+	opsMaxRetentionDays = 365
 	// opsDefaultLossPermille 是隧道丢包告警的默认门槛（‰）。可在
 	// /api/alerts/settings 按租户改。
 	opsDefaultLossPermille = 200
@@ -144,35 +151,35 @@ func (l *opsLedger) query(from, to int64, kinds map[string]bool, tenant string, 
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-		toDay := time.Unix(to, 0).Format("2006-01-02")
-		for day := time.Unix(from, 0).Format("2006-01-02"); day <= toDay; day = advanceDay(day) {
-			f, err := os.Open(filepath.Join(l.dir, day+".jsonl"))
-			if err != nil {
-				continue // 没有这一天：不是错误，只是还没有东西可读
-			}
-			sc := bufio.NewScanner(f)
-			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-			for sc.Scan() {
-				var e opsEntry
-				if json.Unmarshal(sc.Bytes(), &e) != nil {
-					continue
-				}
-				if e.At < from || e.At > to {
-					continue
-				}
-				if len(kinds) > 0 && !kinds[e.Kind] {
-					continue
-				}
-				if tenant != "" && e.Tenant != tenant {
-					continue
-				}
-				if node != 0 && e.Node != node {
-					continue
-				}
-				out = append(out, e)
-			}
-			f.Close()
+	toDay := time.Unix(to, 0).Format("2006-01-02")
+	for day := time.Unix(from, 0).Format("2006-01-02"); day <= toDay; day = advanceDay(day) {
+		f, err := os.Open(filepath.Join(l.dir, day+".jsonl"))
+		if err != nil {
+			continue // 没有这一天：不是错误，只是还没有东西可读
 		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			var e opsEntry
+			if json.Unmarshal(sc.Bytes(), &e) != nil {
+				continue
+			}
+			if e.At < from || e.At > to {
+				continue
+			}
+			if len(kinds) > 0 && !kinds[e.Kind] {
+				continue
+			}
+			if tenant != "" && e.Tenant != tenant {
+				continue
+			}
+			if node != 0 && e.Node != node {
+				continue
+			}
+			out = append(out, e)
+		}
+		f.Close()
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].At < out[j].At })
 	return out
 }
@@ -209,6 +216,19 @@ func (l *opsLedger) prune(now time.Time, keepDays int) {
 			}
 		}
 	}
+}
+
+// pruneLedgerIfDueLocked 每天清一次台账，另外保留期一改也立刻清一次——用户
+// 在页面上把 30 天改成 3 天，不该等到下一个零点才看到效果。必须持有 s.mu
+// （调用方 2s sweeper 本来就持着）。
+func (s *server) pruneLedgerIfDueLocked(now int64) {
+	days := s.ledgerRetentionDaysLocked()
+	day := time.Unix(now, 0).Format("2006-01-02")
+	if day == s.opsPruneDay && days == s.opsPruneDays {
+		return
+	}
+	s.opsPruneDay, s.opsPruneDays = day, days
+	s.ops.prune(time.Unix(now, 0), days)
 }
 
 // ------------------------------------------------------------------ alerts
@@ -262,6 +282,23 @@ func (s *server) alertSettingsLocked(tenant string) *AlertSettings {
 		out.LossPermille = opsDefaultLossPermille
 	}
 	return &out
+}
+
+// ledgerRetentionDaysLocked 返回生效的台账保留天数。0 表示还没配过，取默认；
+// 越界的值（改坏了 State 文件、或者从旧版本升上来）夹回合法区间，而不是
+// 让清理逻辑拿到一个 0 或负数把自己关掉。必须持有 s.mu。
+func (s *server) ledgerRetentionDaysLocked() int {
+	d := s.state.LedgerRetentionDays
+	if d == 0 {
+		return opsDefaultRetentionDays
+	}
+	if d < opsMinRetentionDays {
+		return opsMinRetentionDays
+	}
+	if d > opsMaxRetentionDays {
+		return opsMaxRetentionDays
+	}
+	return d
 }
 
 // raiseAlertLocked 升起一条告警：已活动就刷新时间戳（不再通知——同一条问题
@@ -652,7 +689,8 @@ func opsQueryParams(w http.ResponseWriter, r *http.Request, def int) (int, uint1
 	return hours, node
 }
 
-// handleAdminAlerts 是告警的读 + 配置面：GET 返回活动告警和设置，PUT 改设置。
+// handleAdminAlerts 是告警的读 + 配置面：GET 返回活动告警、设置和台账保留
+// 期，PUT 改设置。
 func (s *server) handleAdminAlerts(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireTenant(w, r)
 	if !ok {
@@ -674,9 +712,10 @@ func (s *server) handleAdminAlerts(w http.ResponseWriter, r *http.Request) {
 			}
 			return active[i].RaisedAt < active[j].RaisedAt
 		})
-		writeJSON(w, map[string]any{"active": active, "settings": s.alertSettingsLocked(id.TenantID)})
+		writeJSON(w, map[string]any{"active": active, "settings": s.alertSettingsLocked(id.TenantID),
+			"retention": s.retentionViewLocked()})
 	case http.MethodPut:
-		var req AlertSettings
+		var req alertSettingsPut
 		if !decodeJSONBody(w, r, &req) {
 			return
 		}
@@ -689,18 +728,53 @@ func (s *server) handleAdminAlerts(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "loss_permille must be 0..1000", http.StatusBadRequest)
 			return
 		}
+		// 保留期先校验再落任何东西：先写告警设置再发现保留期越界，会留下
+		// "告警设置改了、却被 400 说成整份没生效"的半份状态。
+		if req.RetentionDays != nil && (*req.RetentionDays < opsMinRetentionDays || *req.RetentionDays > opsMaxRetentionDays) {
+			// 越界直接拒，而不是悄悄夹一下：用户以为设了 90 天、实际被记成
+			// 365 天，比报错更难发现。
+			http.Error(w, fmt.Sprintf("retention_days must be %d..%d",
+				opsMinRetentionDays, opsMaxRetentionDays), http.StatusBadRequest)
+			return
+		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.state.Alerts == nil {
 			s.state.Alerts = map[string]*AlertSettings{}
 		}
-		s.state.Alerts[id.TenantID] = &req
+		settings := req.AlertSettings
+		s.state.Alerts[id.TenantID] = &settings
+		msg := fmt.Sprintf("更新告警设置（webhook=%t，丢包门槛=%d‰）", url != "", req.LossPermille)
+		if req.RetentionDays != nil {
+			msg += fmt.Sprintf("，台账保留=%d 天", *req.RetentionDays)
+			s.state.LedgerRetentionDays = *req.RetentionDays
+		}
 		s.save()
-		s.appendOps("audit", id.TenantID, 0, id.Username, "info",
-			fmt.Sprintf("更新告警设置（webhook=%t，丢包门槛=%d‰）", url != "", req.LossPermille))
-		writeJSON(w, map[string]any{"ok": true, "settings": s.alertSettingsLocked(id.TenantID)})
+		s.appendOps("audit", id.TenantID, 0, id.Username, "info", msg)
+		writeJSON(w, map[string]any{"ok": true, "settings": s.alertSettingsLocked(id.TenantID),
+			"retention": s.retentionViewLocked()})
 	default:
 		methodNotAllowed(w, "GET, PUT")
+	}
+}
+
+// alertSettingsPut 是 PUT /api/alerts 的请求体：告警设置本身按租户存，台账
+// 保留期是整台控制器一个数（台账是所有人共用的一份目录），所以两者放在同
+// 一个请求里但落到不同的地方。retention_days 用指针区分"没提这件事"和
+// "设成 0"。
+type alertSettingsPut struct {
+	AlertSettings
+	RetentionDays *int `json:"retention_days,omitempty"`
+}
+
+// retentionViewLocked 是保留期的读视图：当前值 + 合法区间，页面据此画输入框
+// 和提示，不用把常量抄一份到 JS 里。
+func (s *server) retentionViewLocked() map[string]any {
+	return map[string]any{
+		"days":         s.ledgerRetentionDaysLocked(),
+		"default_days": opsDefaultRetentionDays,
+		"min_days":     opsMinRetentionDays,
+		"max_days":     opsMaxRetentionDays,
 	}
 }
 

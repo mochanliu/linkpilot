@@ -159,7 +159,13 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `90f4dabfd6c233d5586d6ecd9a9509dd`（2026-11-14 10:30，
+当前代际：sr-ctrl `c9d99da3c88f0432ad1351482f2df4a3`（2026-11-14 19:55，
+台账保留期可设置：`State.LedgerRetentionDays`（全站一个数，1–365 天，0=默认 30）；
+`GET/PUT /api/alerts` 带 `retention` 视图 / 可选 `retention_days`（越界 400 且整份不动）；
+页面「台账与告警」新增「台账保留」面板，改小先 confirm，2s sweeper 用
+`pruneLedgerIfDueLocked`（日期变了或保留期变了都清）。测试 `TestLedgerPruneFollowsSetting`、
+`TestAlertsRetentionAPI`、`TestConsoleLedgerRetentionWiring`。备份 `sr-ctrl.prev-retention-20261114`。
+上一代 `90f4dabfd6c233d5586d6ecd9a9509dd`（2026-11-14 10:30，
 隧道表格批量配置：`GET /api/underlay/tunnels/csv` 导出当前隧道表（15 列，UTF-8 BOM），
 `POST /api/underlay/tunnels/import` 上传改过的表。一行一条隧道：隧道ID 空着=新增、
 填着=修改、「操作」列写删除（或勾「以文件为准」，文件里没提到的现有隧道一并删）；
@@ -217,7 +223,8 @@ ServicesSet 与同一台当前设备（`svFollowCfg`），侧栏改成 flex+滚�
 fit 框承担；gen.mjs 加了"框内不得有横向长直线"检查），备份
 `sr-ctrl.prev-modules-20261113`；上一代备份 `sr-ctrl.prev-natnote-20261114`、
 `sr-ctrl.prev-vrrppage-20261114`、`sr-ctrl.prev-histpick-20261114`、
-`sr-ctrl.prev-picklag-20261114`、`sr-ctrl.prev-focusguard-20261114`；再往前
+`sr-ctrl.prev-picklag-20261114`、`sr-ctrl.prev-focusguard-20261114`、
+`sr-ctrl.prev-csv-20261114`、`sr-ctrl.prev-retention-20261114`；再往前
 `6d775b48…` 是拓扑图嵌 Dashboard 那版，备份
 `sr-ctrl.prev-fix-20261113`；`5e8fe94f…`（LinkPilot 改名）备份
 `sr-ctrl.prev-topo-20261113`、`f5dc4d3a…`（HTTPS）备份

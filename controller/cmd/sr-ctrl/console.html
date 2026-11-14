@@ -892,7 +892,7 @@
     },
     ops: {
       title: "台账与告警",
-      sub: "活动告警、告警通知设置，和按时间倒排的运维台账（设备上下线、配置发布、选路切换、控制台操作审计）。台账按天落盘保留 30 天；告警推送到下面配置的 webhook",
+      sub: "活动告警、告警通知设置，和按时间倒排的运维台账（设备上下线、配置发布、选路切换、控制台操作审计）。台账按天落盘，保留天数在下面改；告警推送到下面配置的 webhook",
       roles: ["tenant"]
     },
     diag: {
@@ -1939,6 +1939,22 @@
       '<label>webhook 地址<br><input id="ops-webhook" type="text" style="width:340px" value="' + esc(st.webhook_url || "") + '" placeholder="http://…（留空不推送）"></label>' +
       '<label>丢包门槛 ‰<br><input id="ops-loss" type="number" min="0" max="1000" style="width:90px" value="' + esc(st.loss_permille || "") + '" placeholder="200"></label>' +
       '<button class="small" data-act="alert-save">保存告警设置</button></div>' +
+      "</section>";
+
+    // 台账保留：一个数管整台控制器。台账文件按天存、所有租户共用一份目录，
+    // 所以它不放在上面的告警设置里（那是按租户存的）——写清楚免得用户以为
+    // 只影响自己。
+    var rt = (a && a.retention) || {};
+    var keep = rt.days || 30, keepMin = rt.min_days || 1, keepMax = rt.max_days || 365;
+    h += '<section class="panel"><header><h2>台账保留</h2></header>' +
+      '<div class="hint">台账按天存一个文件，超过保留天数的文件由控制器清掉；改成更短的天数立刻生效，' +
+      '删掉的历史找不回来。这个保留期是整台控制器共用的——台账目录所有租户一份，改了对所有人都生效。</div>' +
+      '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">' +
+      '<label>保留天数<br><input id="ops-keep" type="number" min="' + keepMin + '" max="' + keepMax +
+      '" style="width:90px" value="' + esc(keep) + '"></label>' +
+      '<button class="small" data-act="retention-save">保存保留天数</button>' +
+      '<span class="muted" style="font-size:12px">默认 ' + (rt.default_days || 30) + ' 天，可设 ' +
+      keepMin + '–' + keepMax + ' 天</span></div>' +
       "</section>";
 
     // 台账：过滤 + 表。行来自 /api/ledger，最新在前，最多 2000 行。
@@ -9821,8 +9837,38 @@
             loss_permille: Number(($("ops-loss") || {}).value) || 0
           };
           api("PUT", "/api/alerts", body).then(function (res) {
-            S.alerts = { active: (S.alerts && S.alerts.active) || [], settings: res.settings };
+            S.alerts = { active: (S.alerts && S.alerts.active) || [], settings: res.settings,
+              retention: res.retention || (S.alerts && S.alerts.retention) };
             toast("告警设置已保存");
+            render();
+          }).catch(function (err) { toast(err.message); });
+        }
+        else if (act === "retention-save") {
+          var keepEl = $("ops-keep");
+          if (!keepEl) return;
+          var rt = (S.alerts && S.alerts.retention) || {};
+          var lo = rt.min_days || 1, hi = rt.max_days || 365;
+          var days = Math.round(Number(keepEl.value));
+          if (!isFinite(days) || days < lo || days > hi) {
+            toast("保留天数要填 " + lo + "–" + hi);
+            return;
+          }
+          // 缩短期是删数据的操作：先问一句，别让手滑把一季度台账清空。
+          if (rt.days && days < rt.days &&
+              !confirm("保留期从 " + rt.days + " 天缩短到 " + days + " 天，超期的台账文件会立即删除，" +
+                "删掉的历史找不回来。继续？")) {
+            return;
+          }
+          // 同一份设置一起提交：服务端 PUT 是整份替换，只带保留期会把
+          // webhook 和门槛清空。
+          api("PUT", "/api/alerts", {
+            webhook_url: ($("ops-webhook") || {}).value || "",
+            loss_permille: Number(($("ops-loss") || {}).value) || 0,
+            retention_days: days
+          }).then(function (res) {
+            S.alerts = { active: (S.alerts && S.alerts.active) || [], settings: res.settings,
+              retention: res.retention };
+            toast("台账保留已设为 " + res.retention.days + " 天");
             render();
           }).catch(function (err) { toast(err.message); });
         }
