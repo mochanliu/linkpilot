@@ -225,6 +225,82 @@ func TestConsoleModulePagesOwnTheirPanels(t *testing.T) {
 	}
 }
 
+// 隧道表格的接线：下载按钮、上传框、「以文件为准」、以及预览里那两条
+// 「确认 / 取消」。少接一处的结果不是报错，而是按钮点了没反应——所以这里
+// 按「点了会发生什么」逐条钉住。
+func TestConsoleTunnelTableWiring(t *testing.T) {
+	html := string(consoleHTML)
+
+	view := funcBody(t, html, "function viewUnderlayTunnels(")
+	if !strings.Contains(view, "undCSVPanel(doc, u)") {
+		t.Fatal("隧道页没有画表格面板（undCSVPanel）")
+	}
+
+	panel := funcBody(t, html, "function undCSVPanel(")
+	for _, want := range []string{
+		`data-act="und-csv-download"`,
+		`data-act="und-csv-pick"`,
+		`id="und-csv-file"`,
+		`id="und-csv-prune"`,
+		"undCSVLegend(doc)",
+		"undCSVResult(u)",
+	} {
+		if !strings.Contains(panel, want) {
+			t.Errorf("表格面板缺少 %s", want)
+		}
+	}
+	// 列说明由后端给（doc.csv.columns），页面自己再抄一份就会和表头对不上。
+	legend := funcBody(t, html, "function undCSVLegend(")
+	if !strings.Contains(legend, "doc.csv") || !strings.Contains(legend, ".hint") {
+		t.Error("表格格式说明没有从后端拿列定义（doc.csv.columns）")
+	}
+
+	// 上传：读字节、问控制器、先预览。
+	loaded := funcBody(t, html, "function undCSVLoaded(")
+	if !strings.Contains(loaded, "readAsArrayBuffer") {
+		t.Error("上传按文本读文件了：GBK 会被浏览器先糟蹋一遍，错误就指错了地方")
+	}
+	post := funcBody(t, html, "function undCSVPost(")
+	for _, want := range []string{"/api/underlay/tunnels/import", "undCSVB64(", "prune:", "dry:", "Content-Type"} {
+		if !strings.Contains(post, want) {
+			t.Errorf("上传请求缺少 %s", want)
+		}
+	}
+	// 错误也带 plan：行错误要能一次看全，而不是只留一句「失败」。
+	if !strings.Contains(post, "o.plan") {
+		t.Error("上传没有接住返回的计划：行错误会看不到")
+	}
+	// 同一个文件改完再选一次也要触发 change。
+	if !strings.Contains(loaded, "input.value") {
+		t.Error("选完文件没有清空 input：改完再选同一个文件不会触发 change")
+	}
+
+	download := funcBody(t, html, "function undCSVDownload(")
+	if !strings.Contains(download, "/api/underlay/tunnels/csv") || !strings.Contains(download, "download") {
+		t.Error("下载按钮没有走 /api/underlay/tunnels/csv 并保存文件")
+	}
+
+	// 预览上的两个动作 + 勾选「以文件为准」要重算预览。
+	bd := funcBody(t, html, "function bind(")
+	if !strings.Contains(bd, "undCSVLoaded(ucf)") {
+		t.Error("bind() 没有接文件选择：选了文件没反应")
+	}
+	if !strings.Contains(bd, "undCSVPost(true)") {
+		t.Error("bind() 改了「以文件为准」却没有重算预览：删除条数会停在旧口径")
+	}
+	// 预览上的两个动作也在这条链上：按钮没有分发就是死按钮。
+	for _, want := range []string{"undCSVApply()", "undCSVCancel()", "undCSVPick()", "undCSVDownload()"} {
+		if !strings.Contains(bd, want) {
+			t.Errorf("动作分发里没有 %s：按钮点了没反应", want)
+		}
+	}
+	// 上传结果是异步回来的，此时文件输入框往往还带着焦点；render 的焦点护栏
+	// 会整帧跳过，预览就不出现——必须先失焦。
+	if !strings.Contains(post, "blurContent()") {
+		t.Error("上传回调没有先失焦：焦点护栏会吞掉预览那一帧")
+	}
+}
+
 // funcBody 取一个函数体：从签名到下一个顶格两空格的 "}" 行。
 func funcBody(t *testing.T, html, sig string) string {
 	t.Helper()

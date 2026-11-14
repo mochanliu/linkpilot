@@ -159,7 +159,22 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `d73329f9bc167272ad7f66d6c68c1749`（2026-11-14 10:20，
+当前代际：sr-ctrl `90f4dabfd6c233d5586d6ecd9a9509dd`（2026-11-14 10:30，
+隧道表格批量配置：`GET /api/underlay/tunnels/csv` 导出当前隧道表（15 列，UTF-8 BOM），
+`POST /api/underlay/tunnels/import` 上传改过的表。一行一条隧道：隧道ID 空着=新增、
+填着=修改、「操作」列写删除（或勾「以文件为准」，文件里没提到的现有隧道一并删）；
+先 dry 预览再确认写入；任何一行有错整份拒绝（半份落库后文件就不再描述控制器）。
+列定义只在 `underlayCSVColumns()` 一处（导出表头、解析校验、页面图例三处共用，
+console 测试钉住不漂移）。上传走 base64+JSON——requireSession 规定控制台 POST
+必须 JSON，同时 base64 才能让控制器对着真实文件说「这不是 UTF-8」（GBK 另存会被
+明说拒绝）；设备可按序列号 / node-N / 纯数字指名，中转路径三写法：空=直连、
+`模板:名称`=引用共享模板（表格不创建模板）、`a>b>c`=内联链。页面在
+Underlay › 隧道配置 新增「表格批量配置」面板；`underlay_csv_test.go` 十个用例
+（回传不变、一文件三改、prune opt-in、坏行阻断、分配器拒绝原子性、
+租户隔离、歧义设备名、模板按名、坏文件四类）。真浏览器（Playwright+chromium，
+脚本 /tmp/lp-pw/csv.mjs）实测：下载 6 行 → 原样回传 6 keep → 改1删1增1 预览
+逐行正确 → 取消不写。备份 `sr-ctrl.prev-csv-20261114`。上一代
+`d73329f9bc167272ad7f66d6c68c1749`（2026-11-14 10:20，
 选中条目画面不动：render 的焦点护栏（焦点在 #content 输入控件上整帧跳过）
 吞掉了选中那一帧——条目 mousedown 的 preventDefault 让输入框一直带焦点；
 两个选中回调改为先 blur 再 render（histBlurForRender）。此 bug 由 headless
@@ -201,7 +216,8 @@ ServicesSet 与同一台当前设备（`svFollowCfg`），侧栏改成 flex+滚�
 用全经度矩形裁剪不切日期变更线，改回 d3 默认 antimeridian 裁剪，纬度裁剪改由
 fit 框承担；gen.mjs 加了"框内不得有横向长直线"检查），备份
 `sr-ctrl.prev-modules-20261113`；上一代备份 `sr-ctrl.prev-natnote-20261114`、
-`sr-ctrl.prev-vrrppage-20261114`、`sr-ctrl.prev-histpick-20261114`；再往前
+`sr-ctrl.prev-vrrppage-20261114`、`sr-ctrl.prev-histpick-20261114`、
+`sr-ctrl.prev-picklag-20261114`、`sr-ctrl.prev-focusguard-20261114`；再往前
 `6d775b48…` 是拓扑图嵌 Dashboard 那版，备份
 `sr-ctrl.prev-fix-20261113`；`5e8fe94f…`（LinkPilot 改名）备份
 `sr-ctrl.prev-topo-20261113`、`f5dc4d3a…`（HTTPS）备份

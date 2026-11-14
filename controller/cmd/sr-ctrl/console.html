@@ -203,6 +203,14 @@
   .hop-list input{flex:1 1 190px;min-width:150px;padding:4px 7px;font-size:12.5px}
   .hop-list .hop-ops{display:flex;gap:4px;margin-left:auto}
   .hop-add{margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  /* 隧道表格：动作条一行放下，格式说明收在 details 里——它很长，但需要的时候
+     得在手边，而不是去翻文档。 */
+  .csv-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:10px}
+  .csv-bar .chk{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)}
+  .csv-spec{margin-top:10px}
+  .csv-spec>summary{cursor:pointer;font-size:12.5px;color:var(--muted)}
+  .csv-spec table{margin-top:8px}
+  .csv-spec td{font-size:12.5px;vertical-align:top}
   .usage{display:flex;flex-wrap:wrap;gap:8px 26px;margin-top:4px;font-size:13px}
   .usage b{font-variant-numeric:tabular-nums}
   .usage .k{color:var(--muted);font-size:12.5px}
@@ -3596,7 +3604,9 @@
         note: null, auto: null, autoSel: [], autoMode: "full-mesh", autoHub: 0,
         autoSpoke: "none", mPath: "direct", mA: 0, mPeers: [], batch: null,
         mHops: [], editHops: null, editTun: null,
-        editPathMode: null, editPath: null, pHops: [], pEditHops: [] };
+        editPathMode: null, editPath: null, pHops: [], pEditHops: [],
+        // 表格批量配置：上传的字节、要不要以文件为准、上一次的计划。
+        csvBytes: null, csvName: "", csvPrune: false, csvPlan: null, csvApplied: false };
     }
     return S.und;
   }
@@ -5196,6 +5206,221 @@
     return t.path.template_id ? "template" : "inline";
   }
 
+  /* ---------------- 隧道表格：下载 → 改 → 上传 ----------------
+   *
+   * 自动编排适合整片新建，手动表单适合一条，表格适合「一批改动一次落库」——
+   * 尤其是一次改几十条的颜色、权重、FEC。一份文件里三件事同时成立：隧道ID
+   * 空着是新增，填着是修改，操作写「删除」是删除；勾了「以文件为准」，文件里
+   * 没有的现有隧道也一起删。
+   *
+   * 预览是强制的第二步：行错误、以及「这一改会删掉 12 条」，都必须在写入前
+   * 看见。列的定义由后端给（doc.csv.columns），页面只负责摆。
+   */
+  function undCSVPanel(doc, u) {
+    var bar = '<div class="csv-bar">' +
+      '<button class="small" data-act="und-csv-download">下载隧道表</button>' +
+      '<button class="small primary" data-act="und-csv-pick">上传表格…</button>' +
+      '<input type="file" id="und-csv-file" accept=".csv,text/csv" hidden>' +
+      '<label class="chk"><input type="checkbox" id="und-csv-prune"' +
+      (u.csvPrune ? " checked" : "") + "> 以文件为准：文件里没有的现有隧道一并删除</label>" +
+      (u.csvName ? '<span class="muted" style="font-size:12.5px">已选 ' + esc(u.csvName) + "</span>" : "") +
+      "</div>";
+    return '<section class="panel"><header><h2>表格批量配置</h2>' +
+      '<span class="muted" style="font-size:12.5px">一个文件里同时新增、修改、删除</span></header>' +
+      '<div class="hint">下载当前隧道表，在 Excel / WPS 里改完再传回来。一行是一条隧道：' +
+      "<b>新增</b>把「隧道ID」留空，<b>修改</b>直接改那一行的单元格，" +
+      "<b>删除</b>在「操作」列写「删除」（或把整行删掉并勾上「以文件为准」）。" +
+      "上传后先给一份预览，确认了才写入。" +
+      "空单元格取默认值：颜色 0、权重 1、动态关、FEC 关、接口用设备上报的出口端口、" +
+      "地址用观测到的外层地址、端口自动分配。" +
+      "「中转路径」留空是直连，「模板:名称」引用下面的路径模板（表格不创建模板），" +
+      "「a>b>c」是内联中转链、按写的顺序走，每跳可以写成「a@地址」。" +
+      "文件存成「CSV UTF-8（逗号分隔）」；中文 Windows 上的「CSV（逗号分隔）」是 GBK，会被拒绝。" +
+      "整份文件全有或全无：任何一行有错，所有行都不写入。</div>" +
+      bar + undCSVLegend(doc) + undCSVResult(u) + "</section>";
+  }
+
+  function undCSVLegend(doc) {
+    var c = doc.csv || {};
+    var cols = c.columns || [];
+    if (!cols.length) return "";
+    return '<details class="csv-spec"><summary>表格格式 · ' + cols.length + " 列（点开看每一列怎么填）</summary>" +
+      "<table><thead><tr><th>列</th><th>怎么填</th></tr></thead><tbody>" +
+      cols.map(function (x) {
+        return "<tr><td><b>" + esc(x.title) + "</b></td><td>" + esc(x.hint) + "</td></tr>";
+      }).join("") + "</tbody></table>" +
+      '<div class="hint" style="margin-top:8px">上限 ' + esc(c.max_rows || 0) + " 行。" +
+      "行首是 # 的行当作备注，导入时忽略。</div></details>";
+  }
+
+  function undCSVOpTag(op) {
+    var m = {
+      add: ["plan", "新增"], update: ["pending", "修改"], delete: ["revoked", "删除"],
+      keep: ["", "不变"], error: ["stale", "有问题"]
+    }[op] || ["", op || "—"];
+    return '<span class="tag ' + m[0] + '">' + esc(m[1]) + "</span>";
+  }
+
+  function undCSVResult(u) {
+    var p = u.csvPlan;
+    if (!p) return "";
+    var total = "新增 " + p.add + " · 修改 " + p.update + " · 删除 " + p.delete + " · 不变 " + p.keep +
+      (p.errors ? " · 有问题 " + p.errors : "");
+    var h = '<div class="subcard"><div class="subhead"><b>' +
+      (u.csvApplied ? "已按表格写入" : "预览 · 还没有写入") + "</b>" +
+      '<span class="sp">' + esc(total) + "</span></div>" +
+      "<table><thead><tr><th>行</th><th>操作</th><th>隧道</th><th>两端 / 路径</th><th>说明</th></tr></thead><tbody>";
+    p.rows.forEach(function (r) {
+      h += "<tr><td>" + (r.line ? esc(r.line) : "—") + "</td><td>" + undCSVOpTag(r.op) + "</td>" +
+        '<td class="mono">' + esc(r.id || "") + "</td><td>" + esc(r.text || "") + "</td>" +
+        '<td class="muted">' + esc(r.msg || "") + "</td></tr>";
+    });
+    h += "</tbody></table>";
+    if (u.csvApplied) {
+      h += '<div style="margin-top:10px"><button class="small" data-act="und-csv-cancel">收起</button></div>';
+    } else {
+      // 有错行时按钮只是禁用，仍然画出来：操作者要能看到「这里本来有个
+      // 确认写入」，以及为什么现在按不动（上面那一行说有几行不能执行）。
+      var n = p.add + p.update + p.delete;
+      h += '<div style="margin-top:10px">' +
+        '<button class="small primary" data-act="und-csv-apply"' +
+        (p.errors || !n ? " disabled" : "") + ">" +
+        (n ? "确认写入" : "确认写入（无改动）") + "</button> " +
+        '<button class="small" data-act="und-csv-cancel">取消</button></div>';
+    }
+    return h + "</div>";
+  }
+
+  // 走 fetch 下载而不是链接跳转：会话过期时拿到的是一个登录页，fetch 至少
+  // 能把它说成一句「下载失败」。
+  function undCSVDownload() {
+    fetch("/api/underlay/tunnels/csv", { credentials: "same-origin" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (t) {
+      var name = "underlay-tunnels.csv";
+      var url = URL.createObjectURL(new Blob([t], { type: "text/csv;charset=utf-8" }));
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+      toast("已下载 " + name);
+    }).catch(function (err) { toast("下载失败：" + err.message); });
+  }
+
+  function undCSVPick() {
+    var f = $("und-csv-file");
+    if (f) f.click();
+  }
+
+  // 按字节读、不按文本读：编码对不对由控制器判断。浏览器替它猜一遍只会把
+  // GBK 变成一串问号，然后在「设备名不存在」上报错——那个报错指向了错的
+  // 地方。
+  function undCSVLoaded(input) {
+    var u = S.und;
+    var file = input.files && input.files[0];
+    if (!u || !file) return;
+    var max = (u.doc && u.doc.csv && u.doc.csv.max_bytes) || 1048576;
+    if (file.size > max) {
+      toast("表格太大（上限 " + Math.round(max / 1024) + " KiB）");
+      input.value = "";
+      return;
+    }
+    u.csvName = file.name;
+    var rd = new FileReader();
+    rd.onload = function () {
+      u.csvBytes = new Uint8Array(rd.result);
+      u.csvPlan = null;
+      u.csvApplied = false;
+      undCSVPost(true);
+    };
+    rd.onerror = function () { toast("读不了这个文件"); };
+    rd.readAsArrayBuffer(file);
+    // 同一个文件改完再选一次也要触发 change。
+    input.value = "";
+  }
+
+  // base64 走 JSON 请求体：控制台每个 POST 都带 JSON（别的形状会被挡在门外），
+  // 而 base64 是唯一能让文件字节原样到控制器手里的写法——它要能对着真实的
+  // GBK 文件说「这不是 UTF-8」，而不是对着浏览器猜过的乱码说。
+  function undCSVB64(bytes) {
+    var s = "", chunk = 0x8000;
+    for (var i = 0; i < bytes.length; i += chunk) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(s);
+  }
+
+  function undCSVPost(dry) {
+    var u = S.und;
+    if (!u || !u.csvBytes) return;
+    var pruneEl = $("und-csv-prune");
+    if (pruneEl) u.csvPrune = !!pruneEl.checked;
+    var body = { csv: undCSVB64(u.csvBytes), dry: !!dry, prune: !!u.csvPrune };
+    fetch("/api/underlay/tunnels/import", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.text().then(function (t) { return { ok: r.ok, text: t }; });
+    }).then(function (res) {
+      var o = null;
+      try { o = JSON.parse(res.text); } catch (_) {}
+      blurContent();
+      if (!o) {
+        u.note = { kind: "bad", text: "导入失败：" + (res.text || "HTTP 错误") };
+        render();
+        return;
+      }
+      if (o.plan) u.csvPlan = o.plan;
+      if (!o.ok) {
+        // 行错误也带着完整的计划：留在页面上，一次改完再传。
+        u.note = { kind: "bad", text: o.error || "表格没有通过" };
+        render();
+        return;
+      }
+      if (dry) {
+        u.note = null;
+        render();
+        toast("表格读完了，确认后再写入");
+        return;
+      }
+      u.csvApplied = true;
+      u.note = { kind: "", text: "已按表格写入：新增 " + o.plan.add + "、修改 " + o.plan.update +
+        "、删除 " + o.plan.delete + "、不变 " + o.plan.keep + "。" +
+        "隧道段随心跳下发，开着 -tunnels 的设备下一轮心跳会拉走新的隧道表。" };
+      undSetDoc(o.underlay);
+      toast("已写入");
+    }).catch(function (err) { toast("导入失败：" + err.message); });
+  }
+
+  function undCSVApply() {
+    var u = S.und;
+    if (!u || !u.csvBytes || !u.csvPlan) { toast("先上传一份表格"); return; }
+    var p = u.csvPlan;
+    if (p.errors) { toast("表格里还有问题，先改完再传"); return; }
+    if (p.add + p.update + p.delete === 0) { toast("这份表格没有任何改动"); return; }
+    if (!confirm("按表格写入：新增 " + p.add + "、修改 " + p.update + "、删除 " + p.delete + "？\n\n" +
+      "隧道段随心跳下发，开着 -tunnels 的设备下一轮心跳会拉走新的隧道表；" +
+      "删除的隧道两端 overlay /32 退回地址池队尾。")) return;
+    undCSVPost(false);
+  }
+
+  function undCSVCancel() {
+    var u = S.und;
+    if (!u) return;
+    u.csvPlan = null;
+    u.csvBytes = null;
+    u.csvName = "";
+    u.csvApplied = false;
+    blurContent();
+    render();
+  }
+
   function undTunnelOf(doc, id) {
     for (var i = 0; i < doc.tunnels.length; i++) if (doc.tunnels[i].id === id) return doc.tunnels[i];
     return null;
@@ -5553,6 +5778,7 @@
     }
     if (u.editTun) h += undTunnelEditor(doc, u);
     h += undTunnelTable(doc);
+    h += undCSVPanel(doc, u);
     h += undPathPanel(doc, u);
     return h;
   }
@@ -9235,8 +9461,7 @@
     if (upf) upf.addEventListener("submit", function (e) {
       e.preventDefault();
       undSavePath(upf, "");
-    });
-    var upef = $("und-path-edit-form");
+    });    var upef = $("und-path-edit-form");
     if (upef) upef.addEventListener("submit", function (e) {
       e.preventDefault();
       if (S.und) undSavePath(upef, S.und.editPath);
@@ -9259,6 +9484,19 @@
         var slot = $(f.id.replace("-form", "-err"));
         if (slot) slot.textContent = "";
       });
+    });
+
+    // 表格：文件选择框与「以文件为准」。改了勾选就重算一次预览——预览上的
+    // 删除条数是操作者唯一的确认依据，不能停留在上一次的口径上。
+    var ucf = $("und-csv-file");
+    if (ucf) ucf.addEventListener("change", function () { undCSVLoaded(ucf); });
+    var ucp = $("und-csv-prune");
+    if (ucp) ucp.addEventListener("change", function () {
+      if (!S.und) return;
+      S.und.csvPrune = !!ucp.checked;
+      blurContent();
+      if (S.und.csvBytes) undCSVPost(true);
+      else render();
     });
 
     var pnf = $("pa-new-form");
@@ -9928,6 +10166,10 @@
           render();
         }
         else if (act === "und-path-del") undDeletePath(el.getAttribute("data-id"));
+        else if (act === "und-csv-download") undCSVDownload();
+        else if (act === "und-csv-pick") undCSVPick();
+        else if (act === "und-csv-apply") undCSVApply();
+        else if (act === "und-csv-cancel") undCSVCancel();
         else if (act === "topo-view") {
           // 换视图 = 换整套摆法，缩放与平移对它没有意义，所以回到全图；
           // 选中项留着，两视图里指的是同一台设备。

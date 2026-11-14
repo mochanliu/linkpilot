@@ -190,6 +190,11 @@ type underlayView struct {
 	// the table-number formula and the u8 preference were checked against.
 	MaxTunnelColor uint8 `json:"max_tunnel_color"`
 
+	// CSV is the tunnel table's column legend. The page renders it instead of
+	// keeping its own copy: the download header, the upload parser and the
+	// legend are then one list of columns (see underlay_csv.go).
+	CSV underlayCSVDoc `json:"csv"`
+
 	Nodes   []underlayNodeView     `json:"nodes"`
 	Tunnels []underlayTunnelView   `json:"tunnels"`
 	Paths   []underlayTemplateView `json:"paths"`
@@ -247,6 +252,7 @@ func (s *server) underlayViewLocked(tenant string, now int64) underlayView {
 		RelayHopLimit:    underlay.MaxRelayHops,
 		RelayHopNote:     relayHopNote(),
 		MaxTunnelColor:   underlay.MaxTunnelColor,
+		CSV:              newUnderlayCSVDoc(),
 		Changes:          []string{},
 		Checks:           []ConfigCheck{},
 		Nodes:            []underlayNodeView{},

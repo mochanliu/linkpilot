@@ -346,6 +346,10 @@ func (s *server) adminHandler() http.Handler {
 	mux.HandleFunc("/api/underlay/settings", s.handleAdminUnderlaySettings)
 	mux.HandleFunc("/api/underlay/settings/publish", s.handleAdminUnderlayPublish)
 	mux.HandleFunc("/api/underlay/tunnels", s.handleAdminUnderlayTunnels)
+	// The tunnel table: download the current one, upload an edited one. Same
+	// gate as the rest of the underlay layer -- it is a customer's network.
+	mux.HandleFunc("/api/underlay/tunnels/csv", s.handleAdminUnderlayTunnelCSV)
+	mux.HandleFunc("/api/underlay/tunnels/import", s.handleAdminUnderlayTunnelImport)
 	mux.HandleFunc("/api/underlay/auto/plan", s.handleAdminUnderlayAutoPlan)
 	mux.HandleFunc("/api/underlay/auto/apply", s.handleAdminUnderlayAutoApply)
 	mux.HandleFunc("/api/underlay/paths", s.handleAdminUnderlayPaths)
