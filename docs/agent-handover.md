@@ -159,7 +159,11 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `fbf68651e26cdee1aaf706938c08d4ba`（2026-11-14 08:35，趋势图加
+当前代际：sr-ctrl `c32a8e703fd2d1c8d288dc5e4c78ec8b`（2026-11-14 09:10，选择器
+卡顿三连修：loadHistory 只拉当前设备（默认全量 18MB，WAN 上堵死交互）；
+选择器冻结提前到 mousedown（histHold）+ render 加 freezeAt 60s 过期安全阀；
+换设备清 S.history 并显示「正在拉取」提示）。
+上一代 `fbf68651e26cdee1aaf706938c08d4ba`（2026-11-14 08:35，趋势图加
 第二级隧道选择器（hist-tq/hist-tpick，可搜索，匹配对端/颜色）：单设备可能上千条
 隧道全画没法看；隧道清单来自当前设备采样，选中就地重画不重拉；histCharts 按
 "对端/颜色" 键过滤，换设备清零隧道选择；两个选择器共享冻结位）。
