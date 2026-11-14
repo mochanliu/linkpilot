@@ -428,7 +428,7 @@
     // histNode 是监控页趋势图选中的设备，histAt 节流历史拉取（5s 心跳里
     // 历史最多 30s 一次）。
     alerts: null, ledger: null, ledgerFilter: { kind: "", hours: 48, node: 0 },
-    history: null, histNode: 0, histAt: 0,
+    history: null, histNode: 0, histAt: 0, histLoading: false,
     // histT 是趋势图选中的隧道（"对端/颜色" 键，空串 = 全部）。单台设备可能有
     // 上千条隧道，全画一张图没人看得清——先选设备、再选隧道。histTQ 是隧道
     // 选择器的搜索词。
@@ -436,7 +436,9 @@
     // histQ 是趋势图设备选择器的搜索词；freeze=true 表示选择器正开着——
     // 这段时间 render() 直接返回，不然 5s 轮询会把展开中的列表整个拆掉，
     // 用户的选择就落空了（freezeView 记录冻结时的页面，切页即解冻）。
-    histQ: "", freeze: false, freezeView: null,
+    // freezeAt 是冻结开始时间：blur 意外丢了（比如点了列表外的空处被重绘
+    // 撞上）冻结会卡死整页，render 里拿它做过期安全阀。
+    histQ: "", freeze: false, freezeView: null, freezeAt: 0,
     // 远程诊断页：records 来自 /api/diag?node=，diagNode 是当前选中的设备，
     // diagTool 决定表单里显示哪几个输入框。记录表 5s 快速轮询里一起刷。
     diag: null, diagNode: 0, diagTool: "ping",
@@ -694,17 +696,27 @@
 
   // loadHistory 拉趋势采样。5s 的轮询里它最多 30s 跑一次（S.histAt 节流），
   // 切进监控页的那一下（S.histAt=0）总是立刻拉。
+  // 只拉当前选中的那台设备（没选就取第一台）：视图本来就是按设备看的，
+  // 全量响应 18 MB，WAN 上能把页面卡住好几秒，别的设备的采样也用不上。
+  // metrics 还没回来时先不拉——等它给出设备列表，避免第一拍打全量。
   function loadHistory() {
     if (!(S.me && S.me.role === "tenant")) return Promise.resolve();
-    if (S.view !== "monitor") return Promise.resolve();
+    if (S.view !== "monitor" || !S.metrics) return Promise.resolve();
     var now = Date.now();
     if (S.histAt && now - S.histAt < 30000) return Promise.resolve();
     S.histAt = now;
-    return api("GET", "/api/history?hours=24" + (S.histNode ? "&node=" + S.histNode : ""))
+    var nodes = S.metrics.nodes || [];
+    var n = S.histNode || (nodes[0] ? nodes[0].node_id : 0);
+    S.histLoading = true;
+    return api("GET", "/api/history?hours=24" + (n ? "&node=" + n : ""))
       .then(function (h) {
         S.history = h;
+        S.histLoading = false;
         render();
-      }).catch(function () { /* 趋势图拉不到不打扰页面，下次轮询再试 */ });
+      }).catch(function () {
+        S.histLoading = false;
+        /* 趋势图拉不到不打扰页面，下次轮询再试 */
+      });
   }
 
   // loadDiag 拉远程诊断记录（跟随 5s 快速轮询）。节点为 0 时取设备列表里
@@ -953,8 +965,11 @@
     if (!st) return;
     // 选择器开着时不重绘：内容被 innerHTML 换掉，展开中的下拉会立刻消失，
     // 用户还没点中的那一下就丢了。切到别的页面则解除冻结照常画新页。
+    // 安全阀：blur 意外丢了冻结会卡死整页（点了什么都没反应，直到切页），
+    // 冻结超过 60s 就当它过期放行。
     if (S.freeze) {
-      if (S.freezeView === S.view) return;
+      if (S.freezeAt && Date.now() - S.freezeAt > 60000) S.freeze = false;
+      if (S.freeze && S.freezeView === S.view) return;
       S.freeze = false;
     }
     var me = S.me || {};
@@ -1765,7 +1780,10 @@
       }).filter(function (s) { return s.rows.length > 0; });
     }
     if (!samples.length) {
-      return '<div class="empty">还没有采样。设备每 10 秒落一条，上报几分钟后再来看就有线了。</div>';
+      // 拉取中（刚换设备 / 刚进页面）要说清，不然看起来像「点了没反应」。
+      return '<div class="empty">' + (S.histLoading
+        ? "正在拉取过去 24 小时的采样…（几秒后自动出图，不用刷新）"
+        : "还没有采样。设备每 10 秒落一条，上报几分钟后再来看就有线了。") + "</div>";
     }
     if (samples.length < 3) {
       return '<div class="empty">采样刚开始积累，过几分钟再来。</div>';
@@ -9364,13 +9382,20 @@
         return p && p.className.indexOf("open") >= 0;
       });
     };
+    var histHold = function (pickId) {
+      // 冻结在 mousedown 就压上，不等 focus：5s 轮询的重绘若恰好落在
+      // mousedown 和 focus 之间，点击会被整页替换吃掉（点了没反应）。
+      // focus() 是同步的，直接补上展开，不依赖浏览器补发 focus 事件。
+      S.freeze = true;
+      S.freezeView = S.view;
+      S.freezeAt = Date.now();
+      var p = $(pickId);
+      if (p) p.className = "pick open";
+    };
     var hq = $("hist-q");
     if (hq) {
       var hopen = function () {
-        S.freeze = true;
-        S.freezeView = S.view;
-        var p = $("hist-pick");
-        if (p) p.className = "pick open";
+        histHold("hist-pick");
         histPickList();
       };
       var hclose = function () {
@@ -9378,6 +9403,7 @@
         if (p) p.className = "pick";
         if (!histFreezeBusy()) S.freeze = false;
       };
+      hq.addEventListener("mousedown", function () { histHold("hist-pick"); });
       hq.addEventListener("focus", hopen);
       hq.addEventListener("input", function () {
         S.histQ = hq.value;
@@ -9397,9 +9423,11 @@
         if (e.preventDefault) e.preventDefault();
         S.histNode = Number(t.getAttribute("data-hist-node")) || 0;
         S.histQ = "";
-        // 换设备 = 换一批隧道，隧道选择跟着清零，不然选中的键多半不在新设备上。
+        // 换设备 = 换一批隧道，隧道选择跟着清零，不然选中的键多半不在新设备上；
+        // 上一台的采样也不能留着画——看起来像图没换。先给「拉取中」的空态。
         S.histT = "";
         S.histTQ = "";
+        S.history = null;
         S.freeze = false;
         S.histAt = 0;
         loadHistory();
@@ -9409,10 +9437,7 @@
     var htq = $("hist-tq");
     if (htq) {
       var topen = function () {
-        S.freeze = true;
-        S.freezeView = S.view;
-        var p = $("hist-tpick");
-        if (p) p.className = "pick open";
+        histHold("hist-tpick");
         histTPickList();
       };
       var tclose = function () {
@@ -9420,6 +9445,7 @@
         if (p) p.className = "pick";
         if (!histFreezeBusy()) S.freeze = false;
       };
+      htq.addEventListener("mousedown", function () { histHold("hist-tpick"); });
       htq.addEventListener("focus", topen);
       htq.addEventListener("input", function () {
         S.histTQ = htq.value;

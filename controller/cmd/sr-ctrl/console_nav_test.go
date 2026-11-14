@@ -144,6 +144,19 @@ func TestConsoleMonitorHistPicker(t *testing.T) {
 	if !strings.Contains(bd, "S.histT = \"\"") {
 		t.Error("bind() 换设备时没有清掉隧道选择：选中的键多半不在新设备上")
 	}
+	if !strings.Contains(bd, `histHold("hist-pick")`) || !strings.Contains(bd, `addEventListener("mousedown"`) {
+		t.Error("bind() 没有在 mousedown 就压冻结：5s 重绘落在 mousedown 和 focus 之间会吃掉点击")
+	}
+	if !strings.Contains(r, "S.freezeAt") {
+		t.Error("render() 没有 freezeAt 过期安全阀：blur 丢了冻结会卡死整页")
+	}
+	lh := funcBody(t, html, "function loadHistory(")
+	if !strings.Contains(lh, "S.metrics.nodes") || !strings.Contains(lh, `"&node="`) {
+		t.Error("loadHistory 没有按台拉取：默认全量响应 18MB，WAN 上卡住交互")
+	}
+	if !strings.Contains(html, "S.histLoading") || !strings.Contains(html, "正在拉取过去 24 小时的采样") {
+		t.Error("没有拉取中提示：换设备后空图看起来像点了没反应")
+	}
 }
 
 // 基础配置组共用一台当前设备：服务面必须跟随 S.cfg，否则在 NAT 页换设备之后，
