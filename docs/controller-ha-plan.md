@@ -344,17 +344,16 @@ docker run --rm -v "$PWD/controller":/src -w /src srwg-dev \
   之前先问一圈"你会投我吗"（`voteReq.PreVote`，不改 term/votedFor），正在收心跳的节点
   一律回"不投"。实测：重启一台 follower，term 16→16、日志里 0 次选举；重启原来那台
   leader，term 17 保持不变、它回来当 follower。切主本身不受影响（实测 2.45s）。
-- **CA 仍是三节点共用一份 `ca.key`**（§11 拍板记录第 3 条未定）。加入码把 CA 私钥交出去，
-  风险等价于"把 `ca.key` 拷到三台机器"。
+- ~~CA 仍是三节点共用一份 `ca.key`~~ → **2026-11-14 第三轮改掉，见 §9.8（三）**。
+  加入码不再携带 CA 私钥：节点密钥对在加入方本地生成，证书由 leader 代签；
+  CA 私钥在节点**被接纳之后**、提升 voter 之前经认证通道单独补送。
 - **4 台 voter 不会更耐故障。** 多数派是 ⌈(n+1)/2⌉：3 台要 2 票（容 1 台坏），4 台要 3 票
   （还是容 1 台坏）而每次写多等一台。控制台不阻止 4 台（客户可能就是在 4 台上跑起来的），
   但**卖的口径仍是 3 台**（§11 拍板第 1 条）。
-- **P3 没做**：审计/事件还不进共识，节点之间也不合并查询 —— 所以"从任一节点能查到全部
-  历史"目前不成立，只有当前节点的台账。
-- **`last_seen` 是各节点的本地软状态。** 设备只跟一台控制器说话，另外两台的
-  `/api/state` 里这台设备看起来就是旧的（启动日志里那句 `ttl: node 4 stale after 856s`
-  就是这么来的）。控制台的设备在线状态因此**取决于你登的是哪一台**；要"任一台都看到同一份
-  在线状态"，得把心跳读数按周期软同步给别的节点 —— 没做，记在 P3。
+- ~~P3 没做：审计/事件不进共识~~ → **2026-11-14 第三轮补掉，见 §9.8（二）**。
+  事件/审计现在经共识复制，"从任一节点查全部历史"成立。
+- ~~`last_seen` 是各节点的本地软状态~~ → **2026-11-14 第三轮补掉，见 §9.8（一）**。
+  leader 把设备活跃度表搭在复制心跳上发给其余节点，三台控制台看到的设备在线状态是同一份。
 
 ### 9.6 真机 lab：三节点 + 4 台设备（2026-11-14 深夜）
 
@@ -470,6 +469,66 @@ Mac 差着 8 小时，拿盒子时间戳相减是负的，第一版数据就是�
 记录、不再参选，leader 确认后停止复制）。`cluster-smoke.sh` 第 6 步补了两条断言：
 "c4 自己知道被下线了"、"c4 的进程自己退出"。
 
+### 9.8 第三轮收口：stale 可见、台账进共识、CA 私钥退出加入码（2026-11-14 深夜第三轮）
+
+§9.5 剩下的三条边界一次补掉。做法都是业界现成答案（调研过再动手）：
+活跃度同步学 Vault HA 的 standby 模型（standby 不评估规则，读数由 active 喂）；
+台账进共识学 Vault 的 audit log（single writer，各节点只对自己**亲手服务的**请求记账）；
+CA 改造学 kubeadm 的 TLS bootstrap（引导凭据只用来提交申请，私钥永远不出本机，
+控制面成员事后经认证通道拿根密钥）。
+
+**（一）last_seen：leader 搭车，不是设备多跑一趟**
+
+设备只跟 leader 心跳，这条不动（动它等于把设备做成三播）。leader 把
+`{tenant|node → last_seen}` 表**搭在 append 请求上**发给其余两台（`appendReq.Live`）：
+软状态、不进日志、每次 append 都带最新的一份，丢一拍毫无代价。接收侧按**大的算**
+（append 可能乱序，旧时间戳不许把新的顶回去），并把换主前留下的 `Stale` 标志翻回来。
+follower 不再自己判定失联（ttlSweeper 的 stale/告警/forgetTarget/清遥测全部 leader-only），
+控制台显示按 last_seen 年龄推导（`nodeStatusForView`，公式与 sweeper 同一份）。
+
+**（二）台账进共识：leader 单写者，各节点只记自己亲手服务的**
+
+事件/审计行排队（1024 缓冲）→ 每 800ms 或攒满 256 条 `ProposeOps` 一批
+（`raftEntry.Ops`，不与设备写混流）→ 多数派提交 → **每台** apply 时写自己的本地 JSONL。
+结果：三台台账内容一致，任一节点都能查全部历史；单台磁盘坏了，历史还在另外两台。
+配合两条去重规则：转发给 leader 的写请求（`proxyToLeader`）由 leader 记账，请求带
+`X-Cluster-Forwarded` 标记，follower 的审计中间件跳过 —— 同一笔写只记一次。
+已知取舍：apply 崩溃重放半批会有重复行（人工看的台账，不为此上幂等键）。
+
+**（三）CA：私钥退出加入码（kubeadm 式）**
+
+改前：加入码里塞着 `ca.key`，谁能拿到加入码谁就有根签发权。改后分三步：
+
+1. **加入方本地生成** ed25519 密钥对，join 请求只带公钥（`NodePub`）；
+2. leader 用集群 CA **代签** server 证书（SAN：endpoint + 控制台地址）随响应发回 ——
+   加入码从此只含公开材料（CA 证书 + 一次性 secret）；
+3. leader 在 sweep 里、**提升 voter 之前**，把 CA 私钥（PKCS8）POST 到
+   `/v1/cluster/ca`（X-Cluster-Secret 认证）补送给被接纳的节点；接收方先核对
+   私钥与本地 `ca.pem` 的公钥一致才落盘。learner 追日志阶段没有私钥也无所谓 ——
+   它还不需要签发任何东西。
+
+**（四）这轮踩的最大坑：把 `s.mu` 带回复制热路径**
+
+第一版实现里，leader 的 `sendAppend` 取活跃度表要拿 `s.mu`，而写路径的 `commit()`
+正持着 `s.mu` 等多数派（最长 3s）—— 复制 ctx（500ms）整段烧掉，follower 收不到心跳
+就发起选举，容器 smoke 里 term 一路爬到 64、偶发全绿偶发风暴。这正是 §9.3 立过的
+规矩（**复制热路径上不许拿 `s.mu`**）被自己亲手违反。修法两条都无锁：
+
+- 发送侧：快照放 `atomic.Pointer`（`liveSnap`），ttlSweeper 每 2s 持锁重建一次，
+  sendAppend 只读指针；
+- 接收侧：handleAppend 应答路径只做一次**非阻塞**投递（队列满即丢），
+  真正合并进软状态由独立的 `liveApplier` 协程持锁做 —— append 应答晚一拍，
+  leader 的复制 ctx 又要烧。
+
+修完的验收数字：容器 smoke **4 连过**，全程选举 2 次（单机自选 term=1 +
+kill -9 后的正常重选 term=2），**max term=2**（风暴版本是 64）；新成员 c4 的日志里
+"集群 CA 私钥已补送 → 已收到，签发能力就绪"先于 voter 提升；`go test -race` 全绿。
+
+**测试**：`raft_test.go` 新增 `TestRaftOpsReplicated`（三节点 ProposeOps 有序到达）、
+`TestRaftLivenessPiggyback`（两台 follower 都收到搭车表）、`TestApplyLivenessMaxWins`
+（乱序旧包不许覆盖）；新增 `cluster_ca_test.go`（私钥匹配才收、外来的密钥拒收、
+无 secret 拒绝、被转发的请求审计不重复记账）。
+
 ---
 
 ## 10. 改动点清单
@@ -488,6 +547,10 @@ Mac 差着 8 小时，拿盒子时间戳相减是负的，第一版数据就是�
 | `raft.go` | pre-vote（`voteReq.PreVote`，不改 term/votedFor）+ 给被摘掉的对端补日志直到确认（`retiring`） | P2 收口 |
 | `cluster_runtime.go` / `cluster.go` | `retireSelf`（停共识 → 设备侧 503 → 10s 后退出）、`deviceGuard`、启动时拒绝已下线的本机、视图 `retired` | P2 收口 |
 | `opslog.go` | 事件类入共识、样本类本地 + 广播；查询合并 | P3 |
+| `raft.go` | `raftEntry.Ops`（台账批量）与 `appendReq.Live`（活跃度搭车，不进日志）；`ProposeOps`；两个回调（`liveness`/`onLive`/`onOps`）**都必须无锁**（见 §9.8（四）） | P3 |
+| `cluster_runtime.go` | `opsShipper`（800ms/256 条批量）、`liveApplier`、`livenessSnapshot`（atomic）、`pushCAKey`、`signWithCA` | P3 |
+| `cluster.go` | join 改为只交公钥、leader 代签证书；`/v1/cluster/ca` 补送根密钥（X-Cluster-Secret） | P3 |
+| `admin.go` / `console_metrics.go` | `nodeStatusForView`：follower 显示按 last_seen 年龄推导 | P3 |
 
 ---
 
@@ -495,7 +558,10 @@ Mac 差着 8 小时，拿盒子时间戳相减是负的，第一版数据就是�
 
 1. **卖几台？** —— **已拍板（2026-11-14 owner）：3 台，热切换，无 witness 折中。** 部署文档和报价按 3 台写。
 2. **台账保留多久？** —— **已实现（2026-11-14）**：不再写死 30 天，`State.LedgerRetentionDays` 一个全站数值，在「台账与告警」页设置（1–365 天，改小立即清、删除前有确认）。样本和事件仍在同一条流水里，进共识的只有事件（P3 不变）。
-3. **CA 谁管？** —— 待拍板。三节点共用一份 `ca.key`，等于三份根密钥。要不要在 P2 之后换成"节点证书由集群根签发、根密钥离线"，或者引入外部 CA（step-ca / Vault）。
+3. **CA 谁管？** —— **方案已落地（2026-11-14，§9.8（三））**：加入码不再携带 `ca.key`
+   （节点密钥本地生成、leader 代签证书、根密钥在被接纳后经认证通道补送）。
+   根密钥仍最终存在于三台控制器上（0600）；要不要进一步做成"根密钥离线/外部 CA
+   （step-ca / Vault）"，等有客户提出合规要求再议。
 
 ---
 

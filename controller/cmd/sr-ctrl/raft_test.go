@@ -652,3 +652,136 @@ func TestRaftRemovedNodeLearnsItWasRemoved(t *testing.T) {
 		t.Fatal("对端已经确认，leader 还在给它补日志")
 	}
 }
+
+// ---------------------------------------------------------------- 台账进共识
+
+// TestRaftOpsReplicated 验收 P3：台账行经 raft 复制，三台机器的 onOps 都收到
+// 同一批行、按同一顺序。台账不进 State、走独立载荷（raftEntry.Ops），
+// apply 侧由 server 写进本机文件。
+func TestRaftOpsReplicated(t *testing.T) {
+	fastRaft(t)
+	_, peers, stop := joinTestCluster(t, 3)
+	defer stop()
+	waitFor(t, "选出 leader", 3*time.Second, func() bool { return findLeader(peers) != nil })
+	lead := findLeader(peers)
+
+	got := map[string][]opsEntry{}
+	var mu sync.Mutex
+	for _, p := range peers {
+		p.r.mu.Lock()
+		p.r.onOps = func(ents []opsEntry) {
+			mu.Lock()
+			got[p.id] = append(got[p.id], ents...)
+			mu.Unlock()
+		}
+		p.r.mu.Unlock()
+	}
+	batch := []opsEntry{
+		{At: 1, Kind: "audit", Actor: "admin", Msg: "POST /api/config"},
+		{At: 2, Kind: "node.online", Tenant: "t1", Node: 7, Msg: "设备上线"},
+	}
+	if err := lead.r.ProposeOps(batch); err != nil {
+		t.Fatalf("提议台账失败: %v", err)
+	}
+	waitFor(t, "三台都应用了台账", 2*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, p := range peers {
+			if len(got[p.id]) < 2 {
+				return false
+			}
+		}
+		return true
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range peers {
+		if got[p.id][0].Kind != "audit" || got[p.id][1].Kind != "node.online" {
+			t.Fatalf("%s 的台账顺序不对: %s, %s", p.id, got[p.id][0].Kind, got[p.id][1].Kind)
+		}
+	}
+}
+
+// ---------------------------------------------------------------- 活跃度搭车
+
+// TestRaftLivenessPiggyback 验收"leader 把设备心跳时间带给 follower"：
+// leader 的 sendAppend 带上 liveness 表，follower 收到后回调 onLive。
+func TestRaftLivenessPiggyback(t *testing.T) {
+	fastRaft(t)
+	_, peers, stop := joinTestCluster(t, 3)
+	defer stop()
+	waitFor(t, "选出 leader", 3*time.Second, func() bool { return findLeader(peers) != nil })
+	lead := findLeader(peers)
+
+	lead.r.mu.Lock()
+	lead.r.liveness = func() map[string]int64 {
+		return map[string]int64{"t1|7": 1699999999}
+	}
+	lead.r.mu.Unlock()
+
+	received := make(chan map[string]int64, 8)
+	for _, p := range peers {
+		if p.id == lead.id {
+			continue
+		}
+		p.r.mu.Lock()
+		p.r.onLive = func(live map[string]int64) {
+			select {
+			case received <- live:
+			default:
+			}
+		}
+		p.r.mu.Unlock()
+	}
+	lead.r.broadcastAppend()
+
+	waitFor(t, "两台 follower 都收到活跃度表", 2*time.Second, func() bool {
+		return len(received) >= 2
+	})
+	for i := 0; i < 2; i++ {
+		live := <-received
+		if live["t1|7"] != 1699999999 {
+			t.Fatalf("活跃度表内容不对: %v", live)
+		}
+	}
+}
+
+// TestApplyLivenessMaxWins 守住并发语义：append 会乱序到达，旧时间戳不许把
+// 新的顶回去。走真实的入队路径（enqueueLiveness → liveCh → liveApplier）。
+func TestApplyLivenessMaxWins(t *testing.T) {
+	s := &server{hbSec: 5, liveCh: make(chan map[string]int64, 16),
+		state: &State{Nodes: map[string]*NodeRecord{
+			"t1|7": {TenantID: "t1", NodeID: 7},
+		}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.liveApplier(ctx)
+
+	waitFor := func(t *testing.T, want int64) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			s.mu.Lock()
+			got := s.state.Nodes["t1|7"].LastSeen
+			s.mu.Unlock()
+			if got == want {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("LastSeen 迟迟没变成 %d", want)
+	}
+
+	s.enqueueLiveness(map[string]int64{"t1|7": 100})
+	waitFor(t, 100)
+	s.enqueueLiveness(map[string]int64{"t1|7": 50}) // 乱序旧包，必须被丢弃
+	time.Sleep(50 * time.Millisecond)
+	s.mu.Lock()
+	got := s.state.Nodes["t1|7"].LastSeen
+	s.mu.Unlock()
+	if got != 100 {
+		t.Fatalf("旧时间戳把新的顶回去了: %d", got)
+	}
+	s.enqueueLiveness(map[string]int64{"t1|7": 200})
+	waitFor(t, 200)
+}

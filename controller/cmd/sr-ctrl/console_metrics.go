@@ -104,7 +104,7 @@ func (s *server) handleAdminMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		row := consoleNodeMetrics{
 			NodeID: n.NodeID, Serial: n.Serial, AgentVer: n.AgentVer,
-			Status: nodeStatus(n), LastSeen: n.LastSeen, UptimeSec: n.UptimeSec,
+			Status: s.nodeStatusForView(n, now), LastSeen: n.LastSeen, UptimeSec: n.UptimeSec,
 			UDPMapping: n.UDPMapping, VpnPort: n.VpnPort,
 			Tunnels: []wire.TunnelMetrics{},
 		}

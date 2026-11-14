@@ -179,6 +179,9 @@ func (s *server) startRaftAt(snap *raftSnapshot) error {
 
 func (s *server) wireRaft(r *raftNode) {
 	r.onRetire = s.retireSelf
+	r.onOps = s.writeOpsLocal
+	r.liveness = s.livenessSnapshot
+	r.onLive = s.enqueueLiveness
 	r.applyRows = func(rows []HardRow) error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -312,6 +315,77 @@ func (s *server) noteApplied() {
 	s.admin.publish("state.applied", "", nil)
 }
 
+// ---------------------------------------------------------------- 活跃度搭车
+
+// livenessSnapshot 是 leader 侧的搭车载荷：设备最近一次心跳的时间表。
+//
+// **必须无锁**：sendAppend 在复制热路径上调它，而写路径 commit() 持着 s.mu
+// 等多数派（最长 3s）—— 热路径在这里等锁，500ms 的复制 ctx 会整段烧掉，
+// follower 收不到心跳就发起选举，集群进入风暴（2026-11-14 容器 smoke 实测，
+// term 一路爬到 64）。快照由 ttlSweeper 每 2s 在持锁状态下重建，这里只读
+// 一个 atomic pointer。
+func (s *server) livenessSnapshot() map[string]int64 {
+	if m := s.liveSnap.Load(); m != nil {
+		return *m
+	}
+	return nil
+}
+
+// rebuildLivenessLocked 在持锁状态下重建快照。调用点：ttlSweeper（本来就
+// 持着 s.mu，每 2s 一次，设备规模下是几十个键）。
+func (s *server) rebuildLivenessLocked() {
+	m := make(map[string]int64, len(s.state.Nodes))
+	for _, rec := range s.state.Nodes {
+		if rec.LastSeen > 0 {
+			m[key(rec.TenantID, rec.NodeID)] = rec.LastSeen
+		}
+	}
+	s.liveSnap.Store(&m)
+}
+
+// enqueueLiveness 是 follower 侧的落点：handleAppend 的**应答路径**只做一次
+// 非阻塞投递。真正合并进本机软状态（要拿 s.mu）由 liveApplier 协程完成 ——
+// append 应答晚到一拍，leader 的复制 ctx 就可能超时，所以队列满直接丢：
+// 下一次 append 还会带新的表，丢一拍显示数据毫无代价。
+func (s *server) enqueueLiveness(live map[string]int64) {
+	if len(live) == 0 || s.liveCh == nil {
+		return
+	}
+	select {
+	case s.liveCh <- live:
+	default:
+	}
+}
+
+// liveApplier 把搭车来的活跃度表并进本机内存。只动 LastSeen（和过期的
+// Stale），不落盘、不进共识 —— 这份表的真身一直在 leader 上，切换后 5 秒内
+// 设备自己会把新的报上来。时间戳按大的算：append 可能并发乱序到达，谁新信谁。
+func (s *server) liveApplier(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case live := <-s.liveCh:
+			now := time.Now().Unix()
+			s.mu.Lock()
+			for k, ts := range live {
+				rec := s.state.Nodes[k]
+				if rec == nil || ts <= rec.LastSeen {
+					continue
+				}
+				rec.LastSeen = ts
+				// 换主前的旧账：本机当过 leader 时可能把这台标了失联。新的
+				// 时间戳说明设备还活着，把标志翻回来（台账/告警的正式恢复
+				// 仍由 leader 记录并复制过来）。
+				if rec.Stale && now-ts <= int64(s.staleTTL()) {
+					rec.Stale = false
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
 // ---------------------------------------------------------------- 证书
 
 // ensureServerCert 重新签发本节点的服务端证书，SAN 覆盖给定地址。
@@ -342,6 +416,27 @@ func (s *server) ensureServerCert(sans []string) error {
 // writeServerCert 覆盖写服务端证书（loadOrCreateServerCert 只在文件不存在时
 // 生成，集群成员变了必须重签）。
 func writeServerCert(dir string, ca *x509.Certificate, caKey ed25519.PrivateKey, sans []string) error {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	der, err := signWithCA(ca, caKey, pub, sans)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.pem"),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+		return err
+	}
+	kb, _ := x509.MarshalPKCS8PrivateKey(priv)
+	return os.WriteFile(filepath.Join(dir, "server.key"),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kb}), 0600)
+}
+
+// signWithCA 用集群 CA 给一把公钥签控制器服务端证书，返回证书 DER。SAN 覆盖
+// 给定地址（host:port 只取主机部分），外加回环 —— 与 loadOrCreateServerCert
+// 的模板保持一致，两台机器签出来的证书互认。
+func signWithCA(ca *x509.Certificate, caKey ed25519.PrivateKey, pub ed25519.PublicKey, sans []string) ([]byte, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: newSerial(),
 		Subject:      pkix.Name{CommonName: "srou-controller"},
@@ -361,27 +456,18 @@ func writeServerCert(dir string, ca *x509.Certificate, caKey ed25519.PrivateKey,
 		}
 		tmpl.DNSNames = append(tmpl.DNSNames, san)
 	}
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return err
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, pub, caKey)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(dir, "server.pem"),
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
-		return err
-	}
-	kb, _ := x509.MarshalPKCS8PrivateKey(priv)
-	return os.WriteFile(filepath.Join(dir, "server.key"),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kb}), 0600)
+	return x509.CreateCertificate(rand.Reader, tmpl, ca, pub, caKey)
 }
 
 // reloadCA 在加入集群之后重新读一次 CA：加入方原本用的是自己生成的 CA，
 // 换掉之后设备证书才对得上。
+//
+// ca.key 可能还没有（新流程里它由 leader 在提升为 voter 之前经集群内部通道
+// 补送，见 clusterSweep 的 pushCAKey）：那就只装证书。签发动作（设备入网、
+// RR 证书、服务端证书重签）在这台机器上是不可用的，但它们要么走 leader，
+// 要么等 key 到位 —— 控制台和设备侧照常工作。
 func (s *server) reloadCA() error {
-	ca, key, pool, err := loadOrCreateCA(s.dataDir)
+	ca, key, pool, err := loadClusterCA(s.dataDir)
 	if err != nil {
 		return err
 	}
@@ -550,6 +636,10 @@ func (s *server) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, io.LimitReader(resp.Body, leaderProxyMaxBody))
+	// 打上"leader 已经记过台账"的标记（auditMiddleware 会检查它）：这次写
+	// 真正执行的地方是 leader，它的 auditMiddleware 会落一条台账并复制到
+	// 全体成员。本机再记一条，任何一台控制台上都会出现两行重复。
+	r.Header.Set(xClusterForwarded, "1")
 	return true
 }
 

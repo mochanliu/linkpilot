@@ -253,8 +253,20 @@ func alertKey(kind, tenant string, node uint16, ident string) string {
 }
 
 // appendOps 记一条台账。入口对 s.ops == nil 安全（见文件头）。
+//
+// 去向由"我是谁"决定（P3，台账进共识）：
+//   - leader：先排进 opsQ，由 opsShipper 攒批提议进 raft —— 提交后 apply 路径
+//     把它写回本机文件，同时复制到全部成员。控制台上"从任一节点查全部历史"
+//     就靠这条（§9.5/§9.7 的欠账）。
+//   - follower / 单机：直接落本机文件。follower 见到的设备事件本来就少
+//     （心跳都由 leader 记录并复制过来），它自己产生的多半是"我服务过的
+//     请求"（登录失败这类 nodeLocal 审计）—— 那就该留在这台机器的文件里，
+//     这与 Vault HA 的做法一致：每台节点记录自己经手的请求。
+//
+// 排队是非阻塞的：raiseAlert 全在持锁路径上，台账没提交之前不能让告警等
+// 多数派（那是 P0 立过的规矩）。队列满退回本地落盘并丢计数。
 func (s *server) appendOps(kind, tenant string, node uint16, actor, sev, msg string) {
-	s.ops.append(opsEntry{Kind: kind, Tenant: tenant, Node: node, Actor: actor, Sev: sev, Msg: msg})
+	s.opsOut(opsEntry{Kind: kind, Tenant: tenant, Node: node, Actor: actor, Sev: sev, Msg: msg})
 }
 
 func (s *server) appendOpsData(kind, tenant string, node uint16, sev, msg string, data any) {
@@ -262,7 +274,72 @@ func (s *server) appendOpsData(kind, tenant string, node uint16, sev, msg string
 	if err != nil {
 		return
 	}
-	s.ops.append(opsEntry{Kind: kind, Tenant: tenant, Node: node, Sev: sev, Msg: msg, Data: b})
+	s.opsOut(opsEntry{Kind: kind, Tenant: tenant, Node: node, Sev: sev, Msg: msg, Data: b})
+}
+
+// opsOut 是台账行的唯一出口。
+func (s *server) opsOut(e opsEntry) {
+	if s.ops == nil {
+		return
+	}
+	if s.raft != nil && s.raft.IsLeader() && s.opsQ != nil {
+		select {
+		case s.opsQ <- e:
+			return
+		default:
+			log.Printf("opslog: 队列满，这条退回本机落盘（不做共识）: %s %s", e.Kind, e.Msg)
+		}
+	}
+	s.ops.append(e)
+}
+
+// writeOpsLocal 是 apply 路径的落点：这些行已经有多数派确认，写进本机文件。
+func (s *server) writeOpsLocal(ents []opsEntry) {
+	for _, e := range ents {
+		s.ops.append(e)
+	}
+}
+
+// opsShipper 把队列里的行攒批提议进 raft。800ms 或 256 行触发一次：台账是
+// 给人看的历史，半秒的延迟没有观察者能感觉到，而攒批把"每条一个提交"压成
+// "每 800ms 至多一个提交"，空闲集群不会因为心跳读数刷出持续的 commit。
+func (s *server) opsShipper(ctx context.Context) {
+	const batchMax = 256
+	batch := make([]opsEntry, 0, batchMax)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if s.raft == nil {
+			s.writeOpsLocal(batch)
+			batch = batch[:0]
+			return
+		}
+		if err := s.raft.ProposeOps(batch); err != nil {
+			// 没有多数派（丢了 leader / 失去 quorum）：这些行退回本机文件，
+			// 而不是丢掉。它们会与复制来的行并存 —— 台账页可能看到重复或
+			// 乱序，比静默丢掉一条"谁发布的配置"诚实。
+			log.Printf("opslog: %d 行台账无法提交（%v），退回本机落盘", len(batch), err)
+			s.writeOpsLocal(batch)
+		}
+		batch = batch[:0]
+	}
+	t := time.NewTicker(800 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case e := <-s.opsQ:
+			batch = append(batch, e)
+			if len(batch) >= batchMax {
+				flush()
+			}
+		case <-t.C:
+			flush()
+		}
+	}
 }
 
 // alertSettings 是租户的告警配置（State 持久化）。字段零值 = 用默认。
@@ -804,6 +881,11 @@ func (sw *auditStatusWriter) Flush() {
 // audit 台账（actor=登录名，空 = 未登录就撞上来的）。一个钩子覆盖全部
 // 现在和将来的写端点，新增 handler 不用记得埋点。登录请求也在内——
 // 谁登进来的、失败的尝试，都是台账该有的东西。
+//
+// 被转发给 leader 的请求不记：真正执行写的是 leader，它的这层中间件会落
+// 一条并随共识复制到全体成员（含本机）；本机再落就是每个控制台上两行重复。
+// 转发失败（没有 leader、leader 没应答）则照记 —— 请求没到 leader，只有
+// 本机见过这次尝试，这正是 Vault HA"每台节点记录自己经手的请求"的边界。
 func (s *server) auditMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/") ||
@@ -813,6 +895,10 @@ func (s *server) auditMiddleware(next http.Handler) http.Handler {
 		}
 		sw := &auditStatusWriter{ResponseWriter: w, code: http.StatusOK}
 		next.ServeHTTP(sw, r)
+		// 标记是 leaderGuard（内层）在转发成功后打上去的，所以只能在这里查。
+		if r.Header.Get(xClusterForwarded) != "" {
+			return
+		}
 		id := s.session(r)
 		actor := id.Username
 		if actor == "" {

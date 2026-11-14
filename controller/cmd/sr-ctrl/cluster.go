@@ -23,12 +23,18 @@ package main
 //   - 节点之间走 mTLS（共用一套 CA），外加 X-Cluster-Secret 头。
 //   - 加入码（join token）是 HMAC 签名的短期凭证，由 leader 签发，绑定
 //     cluster id + 成员 id + 地址 + 过期时间。它只能用来加入一次。
-//   - 加入应答里会带 CA 私钥：集群必须共用同一套 CA，否则 A 发的设备证书 B
-//     不认（docs/controller-ha-plan.md §6）。这一步的风险与"把 ca.key 拷到
-//     三台机器"完全等价 —— 集群里本来就没有"只在一台上存在的根"。
+//   - 加入码里只有 CA **证书**（公开材料，用来验证 leader 的身份）。CA 私钥
+//     不进加入码、也不进加入应答：新节点本地生成密钥、leader 用集群 CA 给它
+//     签服务端证书（kubeadm TLS bootstrap 的同款约定）；CA 私钥在本机被提升
+//     为 voter 之前经 X-Cluster-Secret 认证的内部通道补送（/v1/cluster/ca），
+//     让"任何一台成员都能当选 leader 并给设备签证书"依然成立。集群里仍然
+//     没有离线的根（要做得更干净是"根 CA 离线 + 每节点中间证书"，需要 owner
+//     拍板一次签发仪式，见 controller-ha-plan.md §11-3）—— 但拿到加入码的
+//     人不再等价于拿到集群根。
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -37,6 +43,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -427,16 +434,25 @@ type joinRequest struct {
 	// ConsoleTLS 由加入方自报：只有它自己知道自己的控制台是 https 还是明文，
 	// leader 拿它写进成员表，之后 follower 的 307 才知道该用哪个 scheme。
 	ConsoleTLS bool `json:"console_tls,omitempty"`
+	// NodePub 是加入方**本地生成**的服务端公钥（base64 ed25519）。leader 用
+	// 集群 CA 给它签证书。私钥不出门 —— 这是 kubeadm TLS bootstrap 的同款
+	// 约定：引导凭证只负责"你有资格来领一张证书"，密钥材料从来不经网络。
+	NodePub string `json:"node_pub,omitempty"`
 }
 
 type joinResponse struct {
-	ClusterID string          `json:"cluster_id"`
-	MemberID  string          `json:"member_id"`
-	Secret    string          `json:"secret"`
-	CAPEM     string          `json:"ca_pem"`
-	CAKey     string          `json:"ca_key"`
-	Members   []ClusterMember `json:"members"`
-	Snapshot  raftSnapshot    `json:"snapshot"`
+	ClusterID string `json:"cluster_id"`
+	MemberID  string `json:"member_id"`
+	Secret    string `json:"secret"`
+	CAPEM     string `json:"ca_pem"`
+	// ServerCertPEM 是给 NodePub 签的服务端证书。**这里没有 CA 私钥**：
+	// 旧版把 ca.key 放进加入应答，风险等价于"把 ca.key 拷到三台机器"，而
+	// 拿到加入码的人（本来只该有一次入群资格）就能在 30 分钟窗口内把集群
+	// 根整个带走。现在 CA 私钥只在成员入群、被提升为 voter 之前，由 leader
+	// 经 X-Cluster-Secret 认证的内部通道补送（clusterSweep → /v1/cluster/ca）。
+	ServerCertPEM string          `json:"server_cert_pem,omitempty"`
+	Members       []ClusterMember `json:"members"`
+	Snapshot      raftSnapshot    `json:"snapshot"`
 }
 
 // handleClusterJoin 是"新控制器把自己接进来"的唯一入口。它只接受加入码，
@@ -498,7 +514,6 @@ func (s *server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
-	caKey, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.key"))
 	b, _ := json.Marshal(s.state)
 	members := []ClusterMember{}
 	if s.state.Cluster != nil {
@@ -508,13 +523,42 @@ func (s *server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 	snap := s.raft.Snapshot(b, members)
 	s.mu.Unlock()
 
+	// 给加入方本地生成的公钥签服务端证书。它没有 CA 私钥（见 joinResponse
+	// 的注释），所以这一步只能在这里做；SAN 覆盖它自己报的地址。
+	if req.NodePub == "" {
+		http.Error(w, "加入请求里没有 node_pub：新节点必须本地生成服务端密钥再入群", 400)
+		return
+	}
+	pub, err := base64.StdEncoding.DecodeString(req.NodePub)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		http.Error(w, "node_pub 不是合法的 base64 ed25519 公钥", 400)
+		return
+	}
+	s.mu.Lock()
+	caKey := s.caKey
+	s.mu.Unlock()
+	if caKey == nil {
+		http.Error(w, "集群 CA 私钥不在本机（本机是被旧流程加入的？），无法签发新成员证书", 500)
+		return
+	}
+	sans := append([]string{"localhost", "127.0.0.1", "::1"}, p.Endpoint)
+	if p.Console != "" && p.Console != p.Endpoint {
+		sans = append(sans, p.Console)
+	}
+	der, err := signWithCA(s.caCert, caKey, ed25519.PublicKey(pub), sans)
+	if err != nil {
+		http.Error(w, "签发成员证书失败："+err.Error(), 500)
+		return
+	}
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+
 	log.Printf("cluster: 成员 %s（%s）已加入为 learner，等它追上日志后提升为 voter", nm.Name, nm.Endpoint)
 	// 提升与替换的收尾交给 sweep：它同时覆盖"控制台加的"和"进程直接加入的"。
 	s.kickClusterSweep()
 
 	writeJSON(w, joinResponse{
 		ClusterID: cid, MemberID: nm.ID, Secret: s.clusterSecret(),
-		CAPEM: string(caPEM), CAKey: string(caKey), Members: members, Snapshot: snap,
+		CAPEM: string(caPEM), ServerCertPEM: certPEM, Members: members, Snapshot: snap,
 	})
 }
 
@@ -1043,6 +1087,16 @@ func (s *server) clusterSweep(ctx context.Context) {
 			if promoteStreak[m.ID] < 3 {
 				continue
 			}
+			// 提升之前先把 CA 私钥送到：voter 有资格当选 leader，而 leader 要
+			// 给设备签证书、给新成员签证书。一台没有 CA 私钥的 voter 一旦当选，
+			// 第一次入网/换证书就会失败。推送走集群内部通道（X-Cluster-Secret
+			// + 集群 CA 签发的 TLS），不在加入码/加入应答里送（那里只有一次
+			// 入群资格的人看得到，这里只有已成成员的机器到得了）。
+			if err := s.pushCAKey(m); err != nil {
+				log.Printf("cluster: 给 %s 补送 CA 私钥失败（下一轮重试，暂缓提升）: %v", m.Name, err)
+				promoteStreak[m.ID] = 2 // 下一拍重新计满，推送重试
+				continue
+			}
 			delete(promoteStreak, m.ID)
 			log.Printf("cluster: %s 已追上日志（%d/%d），提升为 voter", m.Name, match, commit)
 			if err := s.applyMembershipChange("promote", m.ID, "", func(ms []ClusterMember) []ClusterMember {
@@ -1085,6 +1139,100 @@ func (s *server) kickClusterSweep() {
 	}
 }
 
+// pushCAKey 把集群 CA 私钥送给一台还没有它的成员。幂等：对端已经有一致的
+// 私钥就回 ok，什么都不写。失败不致命 —— sweep 下一轮再试，反正提升被暂缓。
+func (s *server) pushCAKey(m ClusterMember) error {
+	s.mu.Lock()
+	caKey := s.caKey
+	s.mu.Unlock()
+	if caKey == nil {
+		return errors.New("本机没有集群 CA 私钥，无法补送")
+	}
+	kb, err := x509.MarshalPKCS8PrivateKey(caKey)
+	if err != nil {
+		return err
+	}
+	body, _ := json.Marshal(map[string]string{"ca_key": string(pem.EncodeToMemory(
+		&pem.Block{Type: "PRIVATE KEY", Bytes: kb}))})
+	target := m.Endpoint
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+target+"/v1/cluster/ca",
+		strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Cluster-Secret", s.clusterSecret())
+	resp, err := s.clusterHTTP().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b := make([]byte, 256)
+		n, _ := resp.Body.Read(b)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b[:n])))
+	}
+	log.Printf("cluster: 集群 CA 私钥已补送给 %s（%s）", m.Name, target)
+	return nil
+}
+
+// handleClusterCA 是 CA 私钥的接收入口：只有集群成员（X-Cluster-Secret）能调，
+// 而且只收"与本机 ca.pem 相配"的私钥 —— 验过公钥匹配才落盘。
+func (s *server) handleClusterCA(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	if !s.clusterAuth(w, r) {
+		return
+	}
+	var req struct {
+		CAKey string `json:"ca_key"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil || req.CAKey == "" {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	blk, _ := pem.Decode([]byte(req.CAKey))
+	if blk == nil {
+		http.Error(w, "ca_key 不是有效的 PEM", 400)
+		return
+	}
+	k, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
+	if err != nil {
+		http.Error(w, "ca_key 解不开: "+err.Error(), 400)
+		return
+	}
+	priv, ok := k.(ed25519.PrivateKey)
+	if !ok {
+		http.Error(w, "ca_key 不是 ed25519 私钥", 400)
+		return
+	}
+	s.mu.Lock()
+	ca := s.caCert
+	s.mu.Unlock()
+	if ca == nil {
+		http.Error(w, "本机还没有集群 CA 证书", 409)
+		return
+	}
+	if !priv.Public().(ed25519.PublicKey).Equal(ca.PublicKey) {
+		http.Error(w, "ca_key 与本机的集群 CA 证书不匹配，拒绝写入", 400)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(s.dataDir, "ca.key"), []byte(req.CAKey), 0600); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := s.reloadCA(); err != nil {
+		http.Error(w, "重新加载 CA 失败: "+err.Error(), 500)
+		return
+	}
+	log.Printf("cluster: 已收到集群 CA 私钥，签发能力就绪")
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 // ---------------------------------------------------------------- 加入方引导
 
 // joinCluster 在启动时执行：把本机接进一个已有集群。它做的事和"新设备入网"
@@ -1108,7 +1256,14 @@ func (s *server) joinCluster(leaderURL, token string, version string) error {
 	} else {
 		return errors.New("加入码里没有 CA，无法安全地验证 leader；请用控制台重新生成")
 	}
-	body, _ := json.Marshal(joinRequest{Token: token, Version: version, ConsoleTLS: s.consoleTLS})
+	// 服务端密钥在本地生成，只把公钥发出去（见 joinRequest.NodePub 的注释）。
+	// 失败的话什么都不落盘 —— 启动时生成的临时证书/密钥仍然自洽。
+	nodePub, nodePriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	body, _ := json.Marshal(joinRequest{Token: token, Version: version,
+		ConsoleTLS: s.consoleTLS, NodePub: base64.StdEncoding.EncodeToString(nodePub)})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", url+"/v1/cluster/join", strings.NewReader(string(body)))
@@ -1132,13 +1287,14 @@ func (s *server) joinCluster(leaderURL, token string, version string) error {
 	if err := json.NewDecoder(resp.Body).Decode(&jr); err != nil {
 		return err
 	}
-	// 1. 共用 CA（设备证书互认的前提）。
+	// 1. 共用 CA（设备证书互认的前提）。**私钥不写**：它由 leader 在提升本机
+	// 为 voter 之前经集群内部通道补送（/v1/cluster/ca）。如果这里残留着本机
+	// 启动时自己生成的 CA 私钥（loadOrCreateCA 的产物），删掉 —— 它签的东西
+	// 从这一刻起不作数，留着只会让人误会。
 	if err := os.WriteFile(filepath.Join(s.dataDir, "ca.pem"), []byte(jr.CAPEM), 0644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(s.dataDir, "ca.key"), []byte(jr.CAKey), 0600); err != nil {
-		return err
-	}
+	_ = os.Remove(filepath.Join(s.dataDir, "ca.key"))
 	// 2. 自己的身份与集群密钥。
 	if err := s.writeNodeID(jr.MemberID); err != nil {
 		return err
@@ -1162,11 +1318,13 @@ func (s *server) joinCluster(leaderURL, token string, version string) error {
 	s.resetHardIndex()
 	s.publishPeerAddrsLocked()
 	s.mu.Unlock()
-	// 换掉内存里的 CA：写盘不算数，ensureServerCert 签的是内存里那份。
+	// 换掉内存里的 CA：写盘不算数，签发动作认的是内存里那份。此刻只有证书，
+	// 私钥等 leader 补送 —— reloadCA 对此是显式容忍的。
 	if err := s.reloadCA(); err != nil {
 		return fmt.Errorf("加载集群 CA 失败: %w", err)
 	}
-	// 4. 自己签一张服务端证书：共用 CA 之后，SAN 必须覆盖自己的地址。
+	// 4. 服务端证书 = leader 用集群 CA 给本机公钥签的那张（应答里带回来）。
+	// 私钥在本地生成、从未离机。旧路径的 ensureServerCert 只服务单机/首节点。
 	var self ClusterMember
 	for _, m := range jr.Members {
 		if m.ID == jr.MemberID {
@@ -1176,9 +1334,23 @@ func (s *server) joinCluster(leaderURL, token string, version string) error {
 	if self.Endpoint == "" {
 		return errors.New("加入应答里没有本机成员记录")
 	}
-	if err := s.ensureServerCert([]string{self.Endpoint}); err != nil {
-		return fmt.Errorf("签发服务端证书失败: %w", err)
+	if jr.ServerCertPEM == "" {
+		return errors.New("加入应答里没有本机证书（leader 是旧版本？）")
 	}
+	kb, _ := x509.MarshalPKCS8PrivateKey(nodePriv)
+	if err := os.WriteFile(filepath.Join(s.dataDir, "server.pem"), []byte(jr.ServerCertPEM), 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(s.dataDir, "server.key"),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kb}), 0600); err != nil {
+		return err
+	}
+	cert, err := tls.LoadX509KeyPair(filepath.Join(s.dataDir, "server.pem"),
+		filepath.Join(s.dataDir, "server.key"))
+	if err != nil {
+		return fmt.Errorf("载入集群签发的服务端证书失败: %w", err)
+	}
+	s.cert.Store(&cert)
 	// 5. 共识从快照点起跑。
 	if err := s.startRaftAt(&jr.Snapshot); err != nil {
 		return err

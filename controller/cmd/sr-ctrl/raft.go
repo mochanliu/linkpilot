@@ -62,15 +62,17 @@ const (
 	raftLeader    raftRole = "leader"
 )
 
-// raftEntry 是一条日志。三种形态共用一张表：
+// raftEntry 是一条日志。四种形态共用一张表：
 //   - Rows 非空：硬状态的一批行（最常见）
 //   - Members 非 nil：成员配置（voters/learners 的完整快照）
+//   - Ops 非空：一批台账行（P3：审计/事件进共识，任一节点查得到全部历史）
 //   - Noop：leader 上任时追加的空条目，用来把上一个任期的条目推成已提交
 type raftEntry struct {
 	Index   uint64          `json:"i"`
 	Term    uint64          `json:"t"`
 	Rows    []HardRow       `json:"rows,omitempty"`
 	Members []ClusterMember `json:"m,omitempty"`
+	Ops     []opsEntry      `json:"ops,omitempty"`
 	Noop    bool            `json:"noop,omitempty"`
 }
 
@@ -110,6 +112,13 @@ type appendReq struct {
 	PrevTerm     uint64      `json:"prev_term"`
 	Entries      []raftEntry `json:"entries,omitempty"`
 	LeaderCommit uint64      `json:"leader_commit"`
+	// Live 是搭车消息：设备最近一次心跳的时间（键 tenant|node），**软状态、
+	// 不进日志**。只有 leader 见得到设备心跳，而 follower 的控制台也要显示
+	// "这台设备几分钟前还在线" —— 让 leader 在每一次复制/心跳里把这份表
+	// 顺带给出去（Vault HA 的 standby 转发请求给 active 是同一件事的另一种
+	// 走法；我们在复制热路径上白送，不占额外的 RPC）。缺失的键不动本地值，
+	// 重复值按时间戳大的算：append 可能并发乱序到达，时间戳是绝对值，谁新信谁。
+	Live map[string]int64 `json:"live,omitempty"`
 }
 
 type appendResp struct {
@@ -148,6 +157,13 @@ type raftNode struct {
 	applyRows    func([]HardRow) error
 	applyMembers func([]ClusterMember) error
 	applyState   func(json.RawMessage) error
+	// onOps 把一批复制的台账行落进本机台账（apply goroutine 上调用）。
+	onOps func([]opsEntry)
+	// liveness 只有 leader 用：发起复制前取一份设备活跃度表搭车带出去；
+	// onLive 只有 follower 用：收到 append 后把这份表并进本机软状态。
+	// 两个都可为 nil（单测、单机模式）。
+	liveness func() map[string]int64
+	onLive   func(map[string]int64)
 
 	role     raftRole
 	term     uint64
@@ -819,6 +835,12 @@ func (r *raftNode) broadcastAppend() {
 // sendAppend 是单播：从 nextIndex 开始，最多带 64 条。被拒绝就用对端报回的
 // matchIndex 快速回退，而不是一格一格试。
 func (r *raftNode) sendAppend(ctx context.Context, peer string) (uint64, error) {
+	// 设备活跃度表在锁外取：它要拿 server 的锁，而提交路径是 s.mu → raft.mu，
+	// 这里持着 raft.mu 再去拿 s.mu 就是把锁序反过来（会死锁）。
+	var live map[string]int64
+	if r.liveness != nil {
+		live = r.liveness()
+	}
 	for attempt := 0; attempt < 8; attempt++ {
 		r.mu.Lock()
 		if r.role != raftLeader {
@@ -842,7 +864,7 @@ func (r *raftNode) sendAppend(ctx context.Context, peer string) (uint64, error) 
 			}
 		}
 		req := appendReq{Term: r.term, Leader: r.id, PrevIndex: prev,
-			PrevTerm: prevTerm, Entries: entries, LeaderCommit: r.commit}
+			PrevTerm: prevTerm, Entries: entries, LeaderCommit: r.commit, Live: live}
 		// 记下"这一包到底带了哪个提交点"：判断对端是否已经知道"你被移出"
 		// 必须看它收到的那一包，而不是我此刻的 commit —— 别的复制协程可能
 		// 刚把它推上去，于是我以为它知道了，其实它停在删除项之前。
@@ -1080,6 +1102,36 @@ func (r *raftNode) Propose(rows []HardRow) error {
 	return r.waitCommit(idx, ch, nil)
 }
 
+// ProposeOps 追加一批台账行并等多数派确认。与 Propose 的差别只在载荷：
+// 台账不进 State（它有自己的文件），所以不走 applyRows，走 onOps。
+func (r *raftNode) ProposeOps(ents []opsEntry) error {
+	if len(ents) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	if r.role != raftLeader {
+		who := r.leader
+		r.mu.Unlock()
+		if who == "" {
+			return errors.New("集群没有 leader（可能已失去多数派）")
+		}
+		return fmt.Errorf("这台不是 leader（当前 leader 是 %s）", who)
+	}
+	idx := r.lastIndex() + 1
+	e := raftEntry{Index: idx, Term: r.term, Ops: ents}
+	if err := r.disk.appendLog(e); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	r.log = append(r.log, e)
+	ch := make(chan error, 1)
+	r.waiters[idx] = ch
+	r.mu.Unlock()
+
+	r.broadcastAppend()
+	return r.waitCommit(idx, ch, nil)
+}
+
 // noteRemovedLocked 记下"这份新成员表把谁摘掉了"，好让 leader 继续把那条移除
 // 记录送到它手上。只在它确认收到之后才放手（见 sendAppend）。
 //
@@ -1285,6 +1337,17 @@ func (r *raftNode) applyEntry(e raftEntry) error {
 		return nil
 	case e.Rows != nil:
 		return r.applyRows(e.Rows)
+	case len(e.Ops) > 0:
+		// 台账行：不碰 State，只把它写进本机的台账文件。应用即落盘，重放也
+		// 幂等吗？不 —— append-only 文件重复应用会出重复行。防线在调用侧：
+		// applied 推进之前一条只应用一次（applyLoop 的 batch 是按 commit 截的），
+		// 崩溃后 applied 回退最多重放半批 —— 台账页多出半批重复行可接受，
+		// 比为它加"已应用台账指纹"这类状态便宜（那是 P0 立过的规矩：台账是
+		// 人看的历史，不是机器对齐的硬状态）。
+		if r.onOps != nil {
+			r.onOps(e.Ops)
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -1393,7 +1456,16 @@ func (r *raftNode) handleVote(req voteReq) voteResp {
 
 func (r *raftNode) handleAppend(req appendReq) appendResp {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Live 是软状态，落进本机内存就行；回调要拿 server 的锁，必须等这里的
+	// raft.mu 释放之后再调（defer 的顺序保证它最后跑）。
+	var liveCb func(map[string]int64)
+	var live map[string]int64
+	defer func() {
+		r.mu.Unlock()
+		if liveCb != nil {
+			liveCb(live)
+		}
+	}()
 	resp := appendResp{Term: r.term}
 	if req.Term < r.term {
 		return resp
@@ -1411,6 +1483,9 @@ func (r *raftNode) handleAppend(req appendReq) appendResp {
 	// 标成"失联"（lab 实测 2026-11-14：三台健康，每台 follower 都把别人报失联）。
 	if req.Leader != r.id {
 		r.lastHeard[req.Leader] = time.Now()
+	}
+	if len(req.Live) > 0 && r.onLive != nil {
+		liveCb, live = r.onLive, req.Live
 	}
 	r.resetElection()
 	resp.Term = r.term

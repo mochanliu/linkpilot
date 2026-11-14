@@ -778,6 +778,34 @@ func nodeStatus(n *NodeRecord) string {
 	}
 }
 
+// nodeStatusForView 是控制台视图用的状态判定，在 nodeStatus 的基础上补一条
+// "年龄推导"：失联的正式判定（rec.Stale + 告警 + 台账）只有 leader 做，但
+// follower 也要显示对 —— 它的 rec.Stale 永远是 false（判定动作在 leader 上），
+// 而 last_seen 通过复制热路径搭车过来是新的。心跳年龄一旦超过 ttl，不翻
+// Stale 标志、不记台账、不喊告警，只把这一格显示成 stale：显示归显示，
+// 事实归 leader。
+func (s *server) nodeStatusForView(n *NodeRecord, now int64) string {
+	switch {
+	case n.LastSeen == 0:
+		return "pending"
+	case n.Stale:
+		return "stale"
+	case now-n.LastSeen > int64(s.staleTTL()):
+		return "stale"
+	default:
+		return "online"
+	}
+}
+
+// staleTTL 是"多久没心跳算失联"的秒数（与 ttlSweeper 同一公式）。
+func (s *server) staleTTL() int {
+	ttl := s.hbSec * 3
+	if ttl < 6 {
+		ttl = 6
+	}
+	return ttl
+}
+
 // ------------------------------------------------------------------ tenants
 
 type createTenantRequest struct {

@@ -29,6 +29,11 @@ import (
 
 const clusterSessionHeader = "X-Cluster-Session"
 
+// xClusterForwarded 是本机内部标记（不出网）：proxyToLeader 成功转发后打在
+// 请求对象上，auditMiddleware 据此跳过本地台账 —— 这次写的审计行由 leader
+// 记录并复制过来，本机再记就是每个控制台上两行重复。
+const xClusterForwarded = "X-Cluster-Forwarded"
+
 // sessionAssertionTTL 只覆盖"重定向这一下"。页面的每一次写都会重新 307 一次，
 // 所以不需要长；短一点，泄露的窗口就小一点。
 const sessionAssertionTTL = 60 * time.Second

@@ -807,6 +807,24 @@ type server struct {
 	opsPruneDay  string
 	opsPruneDays int
 
+	// opsQ 是台账行的出站队列（P3：台账进共识）。leader 把 appendOps 产出的行
+	// 推进来，opsShipper 攒批提议进 raft，提交后由 apply 路径写回本机文件 ——
+	// 于是三台机器的台账文件逐行一致，换主后历史跟着多数派走。队列满就退回
+	// 本地落盘：台账宁可"这台机器有一份别人没有的行"，也不能把写路径堵死。
+	opsQ chan opsEntry
+
+	// liveSnap 是设备活跃度表的**只读快照**（leader 搭车带出去的那份），由
+	// ttlSweeper 每 2s 在持锁状态下重建。它必须是无锁读的：sendAppend 在复制
+	// 热路径上取它，而写路径的 commit() 持 s.mu 等多数派 —— 热路径再去抢 s.mu
+	// 就是 P1 立过的那条规矩的反面（复制等提交、提交等复制，实测把 append 的
+	// 500ms ctx 全部烧完，集群直接进入选举风暴）。
+	liveSnap atomic.Pointer[map[string]int64]
+	// liveCh 承接对端搭车带来的活跃度表：handleAppend 的应答路径只做一次
+	// 非阻塞投递，真正的合并（要拿 s.mu）在 liveApplier 协程里做 —— 应答
+	// 延迟一毫秒都可能让 leader 的复制超时，所以这里宁可丢弃（下一拍还有
+	// 新的表），绝不等待。
+	liveCh chan map[string]int64
+
 	// diagRecs holds the remote-diagnosis records (diag.go), keyed by node key
 	// like obs/tel: a pending command that outlives a controller restart is
 	// dropped on purpose (nobody is watching the console for it anymore), and
@@ -925,27 +943,10 @@ func loadOrCreateCA(dir string) (*x509.Certificate, ed25519.PrivateKey, *x509.Ce
 	keyPath := filepath.Join(dir, "ca.key")
 
 	if _, err := os.Stat(certPath); err == nil {
-		cb, err := os.ReadFile(certPath)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		kb, err := os.ReadFile(keyPath)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		cblk, _ := pem.Decode(cb)
-		cert, err := x509.ParseCertificate(cblk.Bytes)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		kblk, _ := pem.Decode(kb)
-		key, err := x509.ParsePKCS8PrivateKey(kblk.Bytes)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		pool := x509.NewCertPool()
-		pool.AddCert(cert)
-		return cert, key.(ed25519.PrivateKey), pool, nil
+		// 证书在而私钥不在是新流程的常态（见 reloadCA：CA 私钥由 leader 经
+		// 集群内部通道补送，加入方先有证书、后有私钥）。只装证书继续跑，
+		// 签发动作等 key 到位。
+		return loadClusterCA(dir)
 	}
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -981,6 +982,38 @@ func loadOrCreateCA(dir string) (*x509.Certificate, ed25519.PrivateKey, *x509.Ce
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 	return cert, priv, pool, nil
+}
+
+// loadClusterCA 只读集群 CA：证书必须存在，私钥可以还没有（nil）。它不生成
+// 任何东西 —— 生成自己的 CA 是 loadOrCreateCA（单机/首节点）的事。
+func loadClusterCA(dir string) (*x509.Certificate, ed25519.PrivateKey, *x509.CertPool, error) {
+	cb, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cblk, _ := pem.Decode(cb)
+	if cblk == nil {
+		return nil, nil, nil, fmt.Errorf("ca.pem 不是有效的 PEM")
+	}
+	cert, err := x509.ParseCertificate(cblk.Bytes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	kb, err := os.ReadFile(filepath.Join(dir, "ca.key"))
+	if err != nil {
+		// 私钥还没送到：这台机器先以"只信、不签"的身份工作。
+		pool := x509.NewCertPool()
+		pool.AddCert(cert)
+		return cert, nil, pool, nil
+	}
+	kblk, _ := pem.Decode(kb)
+	key, err := x509.ParsePKCS8PrivateKey(kblk.Bytes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return cert, key.(ed25519.PrivateKey), pool, nil
 }
 
 // loadOrCreateServerCert issues the controller's own certificate. The SAN
@@ -2370,50 +2403,60 @@ func (s *server) ttlSweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			ttl := int64(s.hbSec * 3)
-			if ttl < 6 {
-				ttl = 6
-			}
-			now := time.Now().Unix()
 			s.mu.Lock()
-			for _, rec := range s.state.Nodes {
-				if rec.LastSeen == 0 || rec.Stale {
-					continue
+			// 活跃度快照每拍重建（无锁读的那份，见 liveSnap）。
+			s.rebuildLivenessLocked()
+			// 失联判定与告警只在 leader 上做（单一写者，Vault HA 的 standby
+			// 同样不评估规则）。follower 的设备活跃度从复制热路径搭车过来
+			// （appendReq.Live），控制台的显示按 last_seen 年龄推导
+			// （nodeStatusForView）；但 rec.Stale、台账的 node.stale 行、
+			// forgetTarget / 清遥测这些动作都只属于 leader。 follower 跑
+			// 这一段的后果在 lab 里见过：last_seen 全空 → 全员"失联"。
+			if s.raft == nil || s.raft.IsLeader() {
+				ttl := int64(s.staleTTL())
+				now := time.Now().Unix()
+				for _, rec := range s.state.Nodes {
+					if rec.LastSeen == 0 || rec.Stale {
+						continue
+					}
+					if now-rec.LastSeen > ttl {
+						rec.Stale = true
+						log.Printf("ttl: node %d (tenant %s) stale after %ds idle",
+							rec.NodeID, rec.TenantID, now-rec.LastSeen)
+						s.appendOps("node.stale", rec.TenantID, rec.NodeID, "", "warn",
+							fmt.Sprintf("设备失联：心跳 %d 秒没有上报", now-rec.LastSeen))
+						s.raiseAlertLocked("node.stale", rec.TenantID, rec.NodeID, "", "crit",
+							fmt.Sprintf("设备失联：心跳超过 %d 秒没有上报", ttl))
+						// Its address stops being a fact the moment its agent stops
+						// answering: whatever a peer saw 40 seconds ago describes a
+						// binding that may already be gone.
+						s.forgetTargetLocked(rec.TenantID, rec.NodeID)
+						// Telemetry describes the same box. If its heartbeats lapsed,
+						// its last window is not a fact any more either.
+						delete(s.tel, key(rec.TenantID, rec.NodeID))
+						s.broadcastLocked(rec.TenantID, wire.WatchEvent{
+							Type: "stale", Peer: s.toPeerInfoLocked(rec, 0),
+							SentAt: now, Message: "heartbeat lapsed",
+						})
+						// Console-facing: the health table just changed without any
+						// request arriving. Waiting for the 10s poll would show a dead
+						// device as online for up to that long.
+						s.admin.publish("node.stale", rec.TenantID, rec)
+					}
 				}
-				if now-rec.LastSeen > ttl {
-					rec.Stale = true
-					log.Printf("ttl: node %d (tenant %s) stale after %ds idle",
-						rec.NodeID, rec.TenantID, now-rec.LastSeen)
-					s.appendOps("node.stale", rec.TenantID, rec.NodeID, "", "warn",
-						fmt.Sprintf("设备失联：心跳 %d 秒没有上报", now-rec.LastSeen))
-					s.raiseAlertLocked("node.stale", rec.TenantID, rec.NodeID, "", "crit",
-						fmt.Sprintf("设备失联：心跳超过 %d 秒没有上报", ttl))
-					// Its address stops being a fact the moment its agent stops
-					// answering: whatever a peer saw 40 seconds ago describes a
-					// binding that may already be gone.
-					s.forgetTargetLocked(rec.TenantID, rec.NodeID)
-					// Telemetry describes the same box. If its heartbeats lapsed,
-					// its last window is not a fact any more either.
-					delete(s.tel, key(rec.TenantID, rec.NodeID))
-					s.broadcastLocked(rec.TenantID, wire.WatchEvent{
-						Type: "stale", Peer: s.toPeerInfoLocked(rec, 0),
-						SentAt: now, Message: "heartbeat lapsed",
-					})
-					// Console-facing: the health table just changed without any
-					// request arriving. Waiting for the 10s poll would show a dead
-					// device as online for up to that long.
-					s.admin.publish("node.stale", rec.TenantID, rec)
-				}
+				s.expireObservationsLocked()
+				s.expireTelemetryLocked(now)
+				s.expireClaimCodesLocked(now)
+				s.sweepTelemetryGapLocked(now)
+				s.pruneLedgerIfDueLocked(now)
+				// saveIfLeader 而不是 save：这一轮的结论（谁失联、哪条遥测过期）本来
+				// 就是 leader 定的。follower 提交只会得到"这台不是 leader"，每 2 秒
+				// 往日志里写一行（lab 实测：健康集群里每台 follower 都在刷这句）。
+				s.saveIfLeader()
+			} else {
+				// follower 也要清自己的台账旧文件（文件是每台各自一份的）。
+				s.pruneLedgerIfDueLocked(time.Now().Unix())
 			}
-			s.expireObservationsLocked()
-			s.expireTelemetryLocked(now)
-			s.expireClaimCodesLocked(now)
-			s.sweepTelemetryGapLocked(now)
-			s.pruneLedgerIfDueLocked(now)
-			// saveIfLeader 而不是 save：这一轮的结论（谁失联、哪条遥测过期）本来
-			// 就是 leader 定的。follower 提交只会得到"这台不是 leader"，每 2 秒
-			// 往日志里写一行（lab 实测：健康集群里每台 follower 都在刷这句）。
-			s.saveIfLeader()
 			s.mu.Unlock()
 		}
 	}
@@ -2537,6 +2580,8 @@ func main() {
 		adminToken:    *adminTokenF,
 		retireExit:    *retireExitF,
 		ops:           ops,
+		opsQ:          make(chan opsEntry, 1024),
+		liveCh:        make(chan map[string]int64, 16),
 		alerts:        map[string]*alertRecord{},
 		alertStrikes:  map[string]int{},
 		lastSampleAt:  map[string]int64{},
@@ -2601,6 +2646,10 @@ func main() {
 
 	go s.ttlSweeper(ctx)
 
+	go s.opsShipper(ctx)
+
+	go s.liveApplier(ctx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/enroll", s.handleEnroll)
 	mux.HandleFunc("/v1/heartbeat", s.handleHeartbeat)
@@ -2619,6 +2668,7 @@ func main() {
 	mux.HandleFunc("/v1/cluster/append", s.handleClusterAppend)
 	mux.HandleFunc("/v1/cluster/snapshot", s.handleClusterSnapshot)
 	mux.HandleFunc("/v1/cluster/join", s.handleClusterJoin)
+	mux.HandleFunc("/v1/cluster/ca", s.handleClusterCA)
 
 	hs := &http.Server{
 		Addr:    *listen,
