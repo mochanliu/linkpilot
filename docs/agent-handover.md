@@ -166,10 +166,11 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 `pruneLedgerIfDueLocked`（日期变了或保留期变了都清）。测试 `TestLedgerPruneFollowsSetting`、
 `TestAlertsRetentionAPI`、`TestConsoleLedgerRetentionWiring`。备份 `sr-ctrl.prev-retention-20261114`。
 
-**注意：集群代码已经上过真机台了（2026-11-14 深夜）。** 台子上跑的是三个 `sr-ctrl`
-进程（`~/srvmlab/out-ha-lab-20261114/`，mac-1 8444 / mac-2 8544 / mac-5 8844，控制台各带自签 TLS），
+**注意：集群代码已经上过真机台了（2026-11-14 深夜）。** 台子上跑着三个 `sr-ctrl`
+进程（`~/srvmlab/out-ha-lab-20261114/`，mac-1 8444 / mac-2 8544 / mac-6 8944，控制台各带自签 TLS；
+mac-3/4/5 是这一轮里被替换/下线的，成员表里留着 `decommissioned` 记录），
 `~/srvmlab/ctrl/data` 那份是 mac-1 的成员目录 —— **它现在是集群快照，不再是单机 `state.json`**。
-数字与全流程见 `docs/controller-ha-plan.md` §9.6；容器 smoke 命令见本文 §8。
+数字与全流程见 `docs/controller-ha-plan.md` §9.6，下线自退场与 pre-vote 见 §9.7；容器 smoke 命令见本文 §8。
 **动它不等于普通换件**：在控制台点一次「开启集群」，这台就写了 node id / 集群密钥 / 成员表，
 退回单机不是"杀进程重起"能撤销的（要动数据目录，且只能走 `controller-ha-deploy.md` §7）。
 要动之前先 `cp -a ~/srvmlab/ctrl/data ~/srvmlab/ctrl/data.prev-cluster-$(date +%Y%m%d)` 留一份。
@@ -888,9 +889,9 @@ UI 类改动另加一条：**必须在真浏览器里点过并截图**，不能�
 # 宿主机那份 go 是 1.19.2，编不过 internal/agent 里的 crypto/ecdh —— 一律进容器（lab 规矩）
 # -race 要 cgo，所以这条不能加 CGO_ENABLED=0（加了直接报 "-race requires cgo"）
 docker run --rm -v "$PWD":/src -w /src/controller -e CGO_ENABLED=1 --entrypoint go \
-  srwg-dev test ./cmd/sr-ctrl/ -count=1 -race          # 含 5 条 raft 单测
+  srwg-dev test ./cmd/sr-ctrl/ -count=1 -race          # 含 8 条 raft 单测（预投票 2 条、下线通知 1 条）
 docker run --rm -v "$PWD/controller":/src -w /src srwg-dev \
-  sh -c 'bash test/scripts/cluster-smoke.sh /tmp/cl-smoke'   # 端到端，2026-11-14 实测 23s
+  sh -c 'bash test/scripts/cluster-smoke.sh /tmp/cl-smoke'   # 端到端，2026-11-14 实测 55s
 ```
 （脚本自己 `go build` 到 `/tmp/sr-ctrl`；同机要跑第二套就 `P_BASE=19443 C_BASE=19081` 错开端口。）
 
@@ -898,8 +899,10 @@ docker run --rm -v "$PWD/controller":/src -w /src srwg-dev \
 **所有断言只经控制台 HTTP 接口**：开启集群 → 加入第 2、3 台（learner→追上→voter）→
 `kill -9` leader（新主在 20s 断言窗口内出现 —— 选举超时 1.2–2.4s，窗口留的是容器被抢占的余量，
 **"≤5s" 那条设计目标没有单独计时**；写仍提交并复制、follower 上的写被代理到 leader 成功）→
-重启那台追上日志 → **替换**一台（新的自动成 voter、旧的自动 `decommissioned`）→ **下线**一台。
-连跑三次全过。它验的是**控制面自己的状态机**，验不到设备侧 —— 设备侧那条
+重启那台追上日志 → **替换**一台（新的自动成 voter、旧的自动 `decommissioned`）→ **下线**一台
+（被下线那台必须自己知道：视图 `retired:true`，随后进程退出）。
+连跑五次全过（最后一次 55s，多了"等它自己退出"这一步）。它验的是**控制面自己的状态机**，
+验不到设备侧 —— 设备侧那条
 **2026-11-14 深夜用真机 lab 补上了**（三个进程 + 4 台真 CPE：切主 2.24s、设备恢复 0.93–4.93s，
 全流程含 init/新增/替换/下线；数字与这一轮改掉的六个现场问题见
 `docs/controller-ha-plan.md` §9.6，脚本留在 `~/srvmlab/out-ha-lab-20261114/`）。
@@ -912,7 +915,7 @@ docker run --rm -v "$PWD/controller":/src -w /src srwg-dev \
 
 | 任务 | 状态 | 一句话现状 |
 | --- | --- | --- |
-| **控制器 HA（3 台热切换）** | **真机 lab 已验收（2026-11-14 深夜）**：P0 状态分层 / P1 raft + 三节点 / P2 设备侧端点列表都在；容器 smoke 连跑四次全过，真机三节点 + 4 台真 CPE 跑完 init→新增→替换→下线→kill -9→重启，**切主 2.24s、设备侧恢复 0.93–4.93s**（`docs/controller-ha-plan.md` §9.6） | 控制台「集群」页完成**开启 / 新增 / 替换 / 下线**四个动作，不需要登后台也不动老节点：`POST /api/cluster` 的 `init｜token｜remove`，加入方只跑一条 `sr-ctrl -join https://leader:8443 -join-token <码> -node-name ...`（码带集群 CA、30 分钟、一次性）。共识层是手写 raft（零第三方，`raft.go` 1398 行），**五个坑全写在 `docs/controller-ha-plan.md` §9.3**，最贵的两个：①**配置项在 append 时就生效，不等提交** —— 否则替换掉老 leader 之后新节点"不知道自己有票"，剩下的人凑不齐多数派，集群停在无主；②**复制热路径上不许拿 `s.mu`** —— 写路径持锁等多数派、复制又要读成员地址，自锁的症状是 leader 冻住 + `context deadline exceeded` + 无限选举（现在走 `peerAddr`/`clusterCli` 两个 atomic）。**这一轮现场改掉的六个问题**（跨节点 307 打到 TLS 端口 / follower 写 401 改成服务端代理 / follower 假报"无多数派" / follower 把 leader 报"失联" / ttlSweeper 每 2s 在 follower 上刷提交失败 / RR 时间戳进共识）记在 §9.6。**仍欠**：被下线的那台要把进程停掉（它不参选，但视图停在删除项之前、照样接设备心跳）；重启一台会抢一次主（无 pre-vote）；`last_seen` 是本地软状态，控制台的设备在线状态取决于登的是哪台；CA 仍三节点共用一份 `ca.key`（拍板记录第 3 条未定）；P3 台账入共识没做。4 台 voter 不比 3 台耐故障（多数派 3 票，仍只容 1 台坏，每次写多等一台）—— 控制台不拦，但口径按 3 台。**现场手册**：[`docs/controller-ha-deploy.md`](controller-ha-deploy.md)（装/加/换/下线/回退/故障剧本；§7 是退回单机的唯一路径，§8 是"别做的六件事"，包括别把 `-join` 写进 systemd） |
+| **控制器 HA（3 台热切换）** | **真机 lab 已验收（2026-11-14 深夜）**：P0 状态分层 / P1 raft + 三节点 / P2 设备侧端点列表都在；容器 smoke 连跑四次全过，真机三节点 + 4 台真 CPE 跑完 init→新增→替换→下线→kill -9→重启，**切主 2.24s、设备侧恢复 0.93–4.93s**（`docs/controller-ha-plan.md` §9.6）；同夜补的**下线自退场**（被摘掉那台 0.89s 自己知道、设备侧 503、10s 后退出、重启拒绝启动）与 **pre-vote**（重启不再抢主，实测 term 不动；切主 2.45s）记在 §9.7 | 控制台「集群」页完成**开启 / 新增 / 替换 / 下线**四个动作，不需要登后台也不动老节点：`POST /api/cluster` 的 `init｜token｜remove`，加入方只跑一条 `sr-ctrl -join https://leader:8443 -join-token <码> -node-name ...`（码带集群 CA、30 分钟、一次性）。共识层是手写 raft（零第三方，`raft.go` 约 1650 行），**五个坑全写在 `docs/controller-ha-plan.md` §9.3**，最贵的两个：①**配置项在 append 时就生效，不等提交** —— 否则替换掉老 leader 之后新节点"不知道自己有票"，剩下的人凑不齐多数派，集群停在无主；②**复制热路径上不许拿 `s.mu`** —— 写路径持锁等多数派、复制又要读成员地址，自锁的症状是 leader 冻住 + `context deadline exceeded` + 无限选举（现在走 `peerAddr`/`clusterCli` 两个 atomic）。**这一轮现场改掉的六个问题**（跨节点 307 打到 TLS 端口 / follower 写 401 改成服务端代理 / follower 假报"无多数派" / follower 把 leader 报"失联" / ttlSweeper 每 2s 在 follower 上刷提交失败 / RR 时间戳进共识）记在 §9.6。**仍欠**：`last_seen` 是本地软状态，控制台的设备在线状态取决于登的是哪台（设备只跟 leader 说话，follower 上看着就是 stale —— **别当故障**）；CA 仍三节点共用一份 `ca.key`（拍板记录第 3 条未定）；P3 台账入共识没做。4 台 voter 不比 3 台耐故障（多数派 3 票，仍只容 1 台坏，每次写多等一台）—— 控制台不拦，但口径按 3 台。**现场手册**：[`docs/controller-ha-deploy.md`](controller-ha-deploy.md)（装/加/换/下线/回退/故障剧本；§7 是退回单机的唯一路径，§8 是"别做的六件事"，包括别把 `-join` 写进 systemd） |
 | **#275** `resolvable` 改吃活动隧道 | **已落地（2026-11-08）**，单测 6 条绿；**e2e 已随 #284 抬盒跑过（2026-11-09）**，四台十二件 run==盘、`vm-verify.sh` 398/0/0、六方向 0% 丢包 | 门换成"配置 && 活着"：`reachableLocked()` 先看 `nextHops`（配置层，未配置=不可达，同旧），再看 `peerBFD[peer]`（活动层）。活动层是 agent 每次 `metricsLoop` 上报的 BFD 结果经 sr-route 新端点 `PUT /tunnel-state` 灌进来的；`sr-agent` 端接线在 `internal/agent/routestate.go`，`RouteStatePusher` 读 `route.json` 里的 `status_addr` 定位到本机 sr-route，把原始 `wire.TunnelMetrics` 行透传过去，聚合逻辑（同 peer 多隧道 any-up-wins、absent=没有信息）全在 `internal/route` 里。细则见 `docs/queue-plan-next.md` §二 落地实况。**四条 pin 的实际选择**：pin1 采用**内部/fib/reach.go 的 fail-open 口径**（"没跑 BFD 的 CPE 不该因为本包而黑洞所有路由"），与 §二 原方案里"严格 fail-closed"那条相反 —— 若 owner 拍要改回 fail-closed，只需调 `reachableLocked` 里 `!s.Known` 那行，代价是刚入网的前几秒（agent 第一次上报之前）本机路由会全部 pending；pin3 按 **peer 粗粒度 any-up-wins**（照 reach.go 的注释"路由只带对端地址，没有本地源，挑不了更细"），不是 §二 建议的 next-hop 精细；pin2 hold-down **本次未做**，交给 #262（那条本来就管"亚秒抖动放大"）；pin5 RR 侧本次未做，交给 #272 |
 | **#276** 收敛改事件驱动 | **切片 A+B+C 全部落地（2026-11-08）**：A=提交 a8083d2（sr-frr→sr-route delta + 10ms 合并 + 重连全量），B=sr-route→sr-fib 的 SSE `/watch`（每前缀一条事件、10ms 合并、背压丢读端、订阅位独占 409、断流立即重挂+INIT 全量），C=判据与实测成文于 `test/lab/vmlab/exp-276/README.md`。新增单测 25 条全绿、`go test ./...` 全绿、`vm-verify.sh` 392/0/0、`exp-273/six.sh` 六方向 0% 丢包。**实测**（同一台 CPE1、同一注入 `systemctl restart frr`、两臂 sr-route 同一份 `26044f78f7969935`）：摘路边 ≤456/593ms → **≤40/41/45ms**，装路边 868/978ms → **201/294/755ms**；sr-route 发射端延迟直接量到（摘 ≤142ms、装 ≤84ms），残余在 sr-fib 一轮收敛 + VPP 装表那侧，本轮秒级日志拆不下去，已登记。**只剩 B2（三条口共用一套 transport identity）没做**。**2026-11-09 现场复核（#284 抬盒之后，以 §3 那张 run/disk 表为准）**：B3、B4 两条硬前置都已落地并实测收口（见下面两行）；**CPE2/CPE3/CPE4 三台现在都是"事件 + B3 + B4"**（`sr-route 1161534d`、`sr-fib c213a6ca`、`sr-frr 626b126a`），**CPE1 是有意留的缺陷臂**：`sr-route`/`sr-frr` 抬了，`sr-fib` 停在 `a9f1bc8c`（事件版、没带 B3），抬上去就没有对照了。抬盒之前那句"CPE2/CPE4 仍是轮询版"已作废 | 细则见 `docs/queue-plan-next.md` §三 落地实况（切片 B+C）。**这一片顺手抓到两条要 owner 拍的缺口：B3 watch 模式下隧道/BFD 状态变化没有任何收敛触发（`client.go:1142/1169` 的隧道门 + `cmd/sr-fib/main.go:301` 才读 BFD + 三个触发点 `main.go:509`/`watch.go:215/233/253`，现场证据 poll2 那一枪靠下一轮 1s 轮询救回）；B4 sr-route 重启后本地前缀集没人重建（`cmd/sr-frr/main.go:745-776` 变更驱动，本轮实测把 vm-verify 打出 5 条 FAIL，靠再换一枪 sr-frr 才补回）。**两条均已于 2026-11-09 收口，B4 按 owner 拍的形状 (b) 落地，判据与三臂数字在 `test/lab/vmlab/exp-b4/README.md`** |
 | #272 跨盒回灌 | 待拍 | 注入的 K 路由进了客户 area0 后被别的盒当 `local` 上报 |

@@ -3,6 +3,7 @@
 2026-11-14。目标：控制器支持多机 HA。
 **状态（2026-11-14 深夜）：P0/P1/P2 已落地并跑过真机 lab**，代码在 `controller/cmd/sr-ctrl/{raft,cluster,cluster_runtime,cluster_session,hardstate}.go`。
 容器 smoke（§9.4）+ 真机三节点 lab 全流程（§9.6）都过了，含实测数字：**切主 2.24s、设备侧 0.93–4.93s**。
+同一天夜里又补了两个现场会咬人的口子（§9.7）：**被下线的那台自己知道并退场**、**重启不再抢主（pre-vote）**。
 §1–§8 是设计与验收口径，§9 是落地实况与偏差。
 **现场部署与运维见 [controller-ha-deploy.md](controller-ha-deploy.md)**（装/加/换/下线/回退/故障剧本都在那一份）。
 2026-11-14 晚 owner 拍板：**3 台，热切换**（§11-1 已关闭）；台账保留期改为可设置（§11-2 已关闭，当天实现）。
@@ -332,15 +333,17 @@ docker run --rm -v "$PWD/controller":/src -w /src srwg-dev \
   进程在同一台 Mac 上（各自的 data 目录 + mTLS 端口），加 4 台真 CPE 的新版 `sr-agent`。
   init → 新增 → 替换 → 下线 → kill -9 → 重启 全过；设备侧切主实测 **0.93–4.93s**，
   设计口径 ≤30s、目标 <2s —— 落在两者之间，**卡在设备 5s 心跳周期上，不是卡在控制面**。
-- **被下线的那台机器如果把进程留着，它会一直"活着但不在集群里"。** 它不会参选
-  （删除自己的那个配置项已经进了它的日志，`voters` 不含自己，`tick()` 里那句
-  `contains(r.voters, r.id)` 就是闸），术语上不会再搅集群；但它 **提交点停在删除项之前**，
-  于是控制台在它上面还在显示"四台都在、自己是 voter"、`tls_addrs` 里还带着自己的地址，
-  而且照样接设备心跳。所以下线之后**必须把那一台的进程停掉**（或清数据目录后重新加入）。
-  真要让它自己体面退场，leader 在删除项提交后还得给它补一次"你被摘了"的通知 —— 那是 P3。
-- **重启一台会顺手抢一次主。** 重启的节点在收到 leader 心跳之前先超时（1.2–2.4s），
-  于是 `term+1`、全群重新选一次；实测重启 mac-3 时 term 13→14，代价是一次约 2s 的写空窗。
-  pre-vote（先问"我能不能赢"再真选）能消掉，没做。
+- ~~被下线的那台机器如果把进程留着，它会一直"活着但不在集群里"~~ → **2026-11-14 深夜修掉，
+  见 §9.7**。根因不是"没人通知"，而是 **leader 在配置项提交的瞬间就把对端从复制名单里
+  摘掉了**：那台永远收不到"你被移出"，提交点停在删除项之前，于是控制台还显示自己是
+  voter、`tls_addrs` 里还带着自己的地址、设备继续往它心跳。现在 leader 会继续给被摘掉的
+  对端补日志，直到它确认收到**那条移除记录 + 覆盖它的提交点**，对端应用后进入 retired：
+  停共识、设备侧一律 503（带 `X-Cluster-Leader`）、10s 后进程退出（`-retire-exit=false`
+  只停服务不退进程），重启时会拒绝启动并让人清数据目录。
+- ~~重启一台会顺手抢一次主~~ → **2026-11-14 深夜修掉（pre-vote）**。重启的节点在翻任期
+  之前先问一圈"你会投我吗"（`voteReq.PreVote`，不改 term/votedFor），正在收心跳的节点
+  一律回"不投"。实测：重启一台 follower，term 16→16、日志里 0 次选举；重启原来那台
+  leader，term 17 保持不变、它回来当 follower。切主本身不受影响（实测 2.45s）。
 - **CA 仍是三节点共用一份 `ca.key`**（§11 拍板记录第 3 条未定）。加入码把 CA 私钥交出去，
   风险等价于"把 `ca.key` 拷到三台机器"。
 - **4 台 voter 不会更耐故障。** 多数派是 ⌈(n+1)/2⌉：3 台要 2 票（容 1 台坏），4 台要 3 票
@@ -406,6 +409,67 @@ Mac 差着 8 小时，拿盒子时间戳相减是负的，第一版数据就是�
 脚本都留在 `~/srvmlab/out-ha-lab-20261114/`：`run-cN.sh` 起节点、`failover-run.sh` 做一次
 切主量测、`analyze-failover.py` 把采样算成上面那张表、`hapi.py` 是控制台小把手。
 
+### 9.7 两个收口：被下线那台自己退场、重启不再抢主（2026-11-14 深夜，同一天的第二轮）
+
+§9.5 里当时留下的两条边界都不该留给现场，所以当天夜里补掉了。都在同一台 Mac 的
+三节点 lab 上验过，`gofmt` / `go vet` / `go test -race` 全绿，容器 smoke 五连过。
+
+**（一）下线是一个完整动作，不是"发条通知，然后记得去那台机器上停进程"**
+
+三层改动，缺一层都不成立：
+
+1. **leader 继续给被摘掉的对端补日志**（`raft.go` 的 `retiring`）——只在它确认收到
+   **移除记录本身 + 覆盖该下标的提交点**之后才放手（判据是"那一包 append 带的
+   `LeaderCommit`"，不是此刻的 commit；用后者会在并发复制里提前放手，对端就停在
+   删除项之前 —— 这正是第一版跑出来的样子）。30s 没回应则放弃，不为一台关机的机器
+   永远惦记。
+2. **对端自己认账**（`applyEntry`）：应用到一个不含自己的成员表 → `retired`，停参选、
+   停复制，回调 `server.retireSelf`。
+3. **server 侧的三个动作**：停共识 → 设备侧全部 503（带 `X-Cluster-Leader`，让设备
+   按地址表直接跳过去；回 200 才是真正的坑）→ `retireDelay`（10s）后 `os.Exit(0)`。
+   加 `-retire-exit=false` 只做前两件。另外**启动时就拒绝**：数据目录里的成员表里
+   自己已被标记 `decommissioned` 的话，进程打一行人话就退出，不再"起得来但不在集群里"。
+
+实测（mac-5，`remove` 之后）：
+
+| 观察点 | 结果 |
+|---|---|
+| 控制台 POST `remove` → 它自己视图 `retired:true` | **0.89s** |
+| 设备侧 `POST /v1/config/bundle`（无设备证书） | 下线前 `401` → 下线后 **`503` + `x-cluster-leader: 192.168.1.4:8444`**（1s 内） |
+| 4 台真 CPE 的心跳 | 全程 1–3s，**没有人去动它们** |
+| 进程 | 10s 后自己退出，端口释放；再起一次 → 打印"已被移出成员表，不再启动"后退出 |
+
+**（二）pre-vote：让"我刚重启"不再等于"换一次主"**
+
+`startElection` 现在先跑一轮预投票（不改 term、不写 meta），拿到多数派"会投你"才真的
+翻任期；应答方在 `time.Since(lastAppend) < raftElectionMin` 时一律拒绝（"我这台还听得见
+集群，不给你票"）。为此外加了两件事：`handleAppend` 和 leader 自己的 `broadcastAppend`
+都要刷新 `lastAppend` —— 只刷 follower 的话，当了 1.2s 主的节点就会开始给落后的重启节点
+投赞成票（第一版就是这么错的，测试直接抓住）。
+
+实测：
+
+| 场景 | 改前 | 改后 |
+|---|---|---|
+| 重启一台 follower | term 13→14，全群重选，约 2s 写空窗 | **term 16→16**，该节点日志里 0 次"发起选举" |
+| 重启原来那台 leader（term 17） | 回来就抢主 | **term 17 不变**，以 follower 身份挂回去 |
+| `kill -9` 当前 leader | +2.24s | **+2.45s**（多一次预投票往返，term 17→18，单轮即出结果） |
+
+**顺带的两处工程债**（都是这轮才暴出来的）：
+
+- 节点间 RPC 原先用 `context.Background()`，`Stop()` 之后在途请求还会继续发。现在每个
+  raft 节点有自己的 ctx，`Stop()` 先取消再等它们退出；顺带把 `broadcastAppend` / 投票
+  的 goroutine 纳入 `rpcs` 等待组（测试里"夹具撤了还有人在读时间常量"就是这么来的）。
+- `run()` 里先起 applyLoop 再赋值派生 ctx，闭包读的是变量 —— `-race` 直接报。改为先派生
+  再起协程。
+
+**测试**：`raft_test.go` 新增三个用例 —— `TestRaftRestartedNodeDoesNotStealLeadership`
+（单向静默 + 强制超时，必须一次 term 都不涨）、`TestRaftPreVoteDoesNotBumpTerm`
+（预投票不许改 term/leader，而且要等真的收到过心跳再问，否则测的是"集群刚选完主"那个
+合法窗口）、`TestRaftRemovedNodeLearnsItWasRemoved`（被摘掉那台必须收到通知、应用移除
+记录、不再参选，leader 确认后停止复制）。`cluster-smoke.sh` 第 6 步补了两条断言：
+"c4 自己知道被下线了"、"c4 的进程自己退出"。
+
 ---
 
 ## 10. 改动点清单
@@ -421,6 +485,8 @@ Mac 差着 8 小时，拿盒子时间戳相减是负的，第一版数据就是�
 | `admin.go` 写处理器 | follower 上 307 / 503 + `X-Leader`；**例外**：`/api/login`、`/api/logout`、`/api/session`、`/api/password` 是节点本地的，不重定向 | P1 |
 | `wire.EnrollResponse` / `HeartbeatResponse` | `tls_addrs` 扩到心跳（另加 `leader`，让设备少走一次 307） | P2 |
 | `sr-agent/main.go:204` + 新增 `addrs.go` | 端点列表 + 轮换；`--ctrl` 退化为种子地址 | P2 |
+| `raft.go` | pre-vote（`voteReq.PreVote`，不改 term/votedFor）+ 给被摘掉的对端补日志直到确认（`retiring`） | P2 收口 |
+| `cluster_runtime.go` / `cluster.go` | `retireSelf`（停共识 → 设备侧 503 → 10s 后退出）、`deviceGuard`、启动时拒绝已下线的本机、视图 `retired` | P2 收口 |
 | `opslog.go` | 事件类入共识、样本类本地 + 广播；查询合并 | P3 |
 
 ---

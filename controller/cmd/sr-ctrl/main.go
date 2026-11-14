@@ -844,6 +844,12 @@ type server struct {
 	// 在 s.mu 上取地址就是自己把自己锁死（现象：leader 一边等提交、一边看着
 	// follower 因为收不到心跳而改选，两边来回换主）。
 	peerAddr atomic.Pointer[peerAddrs]
+	// retired 表示本机已被移出成员表（下线 / 被替换）。之后设备侧一律 503 ——
+	// 一台"已经被开除、还在给设备回心跳"的控制器是最难发现的那种故障：
+	// 设备以为自己好好的，运维在 leader 上也看不出异常。
+	retired     atomic.Bool
+	retiredNote string
+	retireExit  bool
 	// ctx 是进程的取消信号，共识与 sweep 都挂在它上面。
 	ctx context.Context
 }
@@ -2452,6 +2458,11 @@ func main() {
 		joinURL  = flag.String("join", "", "join an existing controller cluster: https://leader:8443（配合 -join-token）")
 		joinTok  = flag.String("join-token", "", "控制台签发的加入码（一次性，30 分钟有效）")
 		nodeName = flag.String("node-name", "", "本控制器在集群里的名字（默认用主机名）")
+		// 被下线之后要不要自己退出。默认退出：一台已经不在成员表里的控制器
+		// 继续跑，是最难发现的那种故障（设备以为自己好好的、leader 上也看不出
+		// 异常）。要留在现场看日志就 -retire-exit=false —— 它会照样停共识、
+		// 照样对设备返回 503，只是进程不退。
+		retireExitF = flag.Bool("retire-exit", true, "被移出集群后自动退出进程（false: 只停共识并拒绝设备请求）")
 	)
 
 	flag.Parse()
@@ -2524,6 +2535,7 @@ func main() {
 		tel:           map[string]*nodeTelemetry{},
 		telTTLSec:     *metricsTTL,
 		adminToken:    *adminTokenF,
+		retireExit:    *retireExitF,
 		ops:           ops,
 		alerts:        map[string]*alertRecord{},
 		alertStrikes:  map[string]int{},
@@ -2563,6 +2575,15 @@ func main() {
 	} else {
 		s.loadLocalClusterIdentity(*nodeName)
 		if st.Cluster != nil {
+			// 已经被下线（或被人替换掉）的那台不许再起来：它没有票、没有日志、
+			// 没有任何一台会来找它，唯一的作用是继续接设备心跳 —— 一台
+			// "看起来正常"的幽灵控制器。要它回来，清空数据目录换新加入码。
+			if m := st.Cluster.Members[s.nodeID]; m == nil || m.Status == memberDecommissioned {
+				log.Printf("cluster: 本机（%s）在集群 %q 里已被移出成员表，不再启动。"+
+					"重新加入请清空数据目录 %s 后在控制台签一张新的加入码",
+					s.nodeID, st.Cluster.ID, *dataDir)
+				return
+			}
 			if err := s.startRaft(); err != nil {
 				log.Fatalf("cluster: %v", err)
 			}
@@ -2601,7 +2622,7 @@ func main() {
 
 	hs := &http.Server{
 		Addr:    *listen,
-		Handler: mux,
+		Handler: s.deviceGuard(mux),
 		// VerifyClientCertIfGiven: enrollment has no cert yet; every other
 		// handler enforces identity via peerTenantFromCert. TLS client auth
 		// cannot vary per path at handshake time, so enforcement lives in one

@@ -178,6 +178,7 @@ func (s *server) startRaftAt(snap *raftSnapshot) error {
 }
 
 func (s *server) wireRaft(r *raftNode) {
+	r.onRetire = s.retireSelf
 	r.applyRows = func(rows []HardRow) error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -224,6 +225,85 @@ func (s *server) wireRaft(r *raftNode) {
 		s.noteApplied()
 		return s.store.Save(&st)
 	}
+}
+
+// ---------------------------------------------------------------- 被下线
+
+// retireDelay 是"知道自己被移出成员表"到"进程退出"之间的时间。留一点余量让
+// 日志和控制台那一帧先出去；设备心跳是 5s 一拍，10s 够它们全部换走。
+var retireDelay = 10 * time.Second
+
+// retireSelf 在本机被移出成员表的那一刻执行一次，做三件事：
+//
+//  1. 停共识 —— 它已经没有票，也没有人会再给它发日志；
+//  2. 设备侧立刻 503：设备按地址表换到别的节点，下一拍就走（回 200 会让它
+//     一直留在一台已经不该服务的机器上 —— lab 里正是这样，一台被下线的节点
+//     照样收着四台 CPE 的心跳，谁都没发现）；
+//  3. 过一会儿自己退出：现场看到的是"进程停了"，不是一台还在监听、看起来
+//     一切正常的幽灵节点。-retire-exit=false 可以只做前两件事。
+//
+// 为什么由它自己做、而不是让操作员去 kill：控制台上的"下线"是一个动作，
+// 不是"发一条通知，然后记得去某台机器上停进程"。
+func (s *server) retireSelf(reason string) {
+	if !s.retired.CompareAndSwap(false, true) {
+		return
+	}
+	// reason 要在锁里写：控制台的视图读它（clusterViewLocked 持 s.mu）。
+	s.mu.Lock()
+	s.retiredNote = reason
+	s.mu.Unlock()
+	if s.raft != nil {
+		// 先停共识：它会顺带把 role/leader 清掉，控制台那一帧立刻变得诚实。
+		s.raft.Stop()
+	}
+	if s.admin != nil {
+		s.admin.publish("cluster.retired", "", nil)
+	}
+	if !s.retireExit {
+		log.Printf("cluster: 本机已被移出集群（%s）：已停止共识，设备侧改为 503；"+
+			"进程保留（-retire-exit=false），不会再参与任何集群动作", reason)
+		return
+	}
+	log.Printf("cluster: 本机已被移出集群（%s）：已停止共识，设备侧改为 503，%s 后进程退出",
+		reason, retireDelay)
+	go func() {
+		select {
+		case <-time.After(retireDelay):
+		case <-s.ctx.Done():
+			return
+		}
+		log.Printf("cluster: 已被移出集群，进程退出。要重新加入请清空数据目录后换新加入码")
+		os.Exit(0)
+	}()
+}
+
+// deviceGuard 让"本机已被下线"对设备侧立刻可见。用 503 而不是 200：
+// 代理/地址簿的规则是"失败就试下一个地址"（cmd/sr-agent/addrs.go），
+// 设备一拍就能换走。
+func (s *server) deviceGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.retired.Load() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 节点间 RPC 照旧放行：新的 leader 可能还在给"被替换的那台"补日志，
+		// 而且控制台要能读到它自己的状态。
+		if strings.HasPrefix(r.URL.Path, "/v1/cluster/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if ep := s.memberLeaderEndpoint(); ep != "" {
+			w.Header().Set("X-Cluster-Leader", ep)
+		}
+		http.Error(w, "this controller has been decommissioned; use another endpoint",
+			http.StatusServiceUnavailable)
+	})
+}
+
+func (s *server) memberLeaderEndpoint() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leaderEndpointLocked()
 }
 
 // noteApplied 是"对端刚应用了一批行"的通知点：控制台开着的页面会在下一次

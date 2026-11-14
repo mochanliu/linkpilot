@@ -600,6 +600,9 @@ type clusterView struct {
 	TLSAddrs  []string            `json:"tls_addrs"`
 	// Reason 是"为什么现在不能用集群功能"的人话（没开集群 / 不是 leader ...）。
 	Reason string `json:"reason,omitempty"`
+	// Retired 表示本机已经被移出成员表：这台机器上的一切都还在，但它不再是
+	// 集群的一部分，也不该再服务设备。
+	Retired bool `json:"retired,omitempty"`
 }
 
 func (s *server) clusterViewLocked() clusterView {
@@ -679,6 +682,13 @@ func (s *server) clusterViewLocked() clusterView {
 		v.Quorum = v.Leader != ""
 	}
 	v.Degraded = s.commitErr
+	if s.retired.Load() {
+		// 这台的成员记录可能还写着 voter（成员表是 leader 写的，它自己只是
+		// 照着旧表显示）—— 所以这一句必须压过一切别的说法。
+		v.Reason = "本机已被移出集群（" + s.retiredNote + "）：已停止共识，" +
+			"设备侧返回 503，进程稍后退出"
+		v.Retired = true
+	}
 	if s.state.Cluster != nil && s.state.Cluster.ID == "" {
 		v.Reason = "集群配置损坏（cluster id 为空）"
 	}

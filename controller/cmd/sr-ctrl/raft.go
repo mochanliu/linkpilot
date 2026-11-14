@@ -93,6 +93,9 @@ type voteReq struct {
 	Candidate string `json:"candidate"`
 	LastIndex uint64 `json:"last_index"`
 	LastTerm  uint64 `json:"last_term"`
+	// PreVote 是"如果我现在真的参选，你会投我吗"：不翻任期、不记投票。
+	// 它唯一的用途是拦住"刚重启的节点把 term 抬高、逼健康的主下台"（§9.6）。
+	PreVote bool `json:"pre_vote,omitempty"`
 }
 
 type voteResp struct {
@@ -168,6 +171,17 @@ type raftNode struct {
 
 	electionAt time.Time
 	lastBeat   time.Time
+	// lastAppend 是最近一次收到任一条 append（含心跳）的时刻。预投票靠它判断
+	// "我这台还能听见集群"，所以它必须在任何 append 上刷新，而不仅仅是 leader 侧。
+	lastAppend time.Time
+
+	// retiring 是"已经不在成员表里、但还没确认收到那条移除记录"的对端。
+	// 不保留它的话，配置项一提交 leader 就把对端从复制名单里摘掉，于是那台
+	// 永远学不到"你被下线了"（lab 实测 2026-11-14：它的提交点停在删除项之前，
+	// 控制台还自称 voter，设备继续往它心跳）。
+	retiring map[string]retireTarget
+	onRetire func(reason string) // 本机被移出集群时回调一次（在 apply goroutine 上）
+	retired  bool
 
 	pendingCfg  []string // 未提交配置项的新 voter 集合
 	pendMembers []ClusterMember
@@ -179,11 +193,27 @@ type raftNode struct {
 	runwg    sync.WaitGroup
 	wake     chan struct{}
 	needSnap bool
+	// ctx/cancel 是节点自己的生命周期，Stop() 会取消它：在途的复制、选举、
+	// 拉快照都跟着结束。没有它，一个已经停下来的节点还能继续发好几个 RPC，
+	// 而这些 RPC 的 goroutine 谁也等不到（测试里表现为"夹具撤了还在读常量"）。
+	ctx    context.Context
+	cancel context.CancelFunc
+	// rpcs 是在途的节点间请求。Stop 会先取消 ctx 再等它们退出：不留一个
+	// "已经停下来的节点还在发 append"的窗口。
+	rpcs    sync.WaitGroup
+	closing bool
 
 	// 成员变更驱动器的进度：一次只跑一个，控制台靠它显示"同步中"。
 	op *memberOp
 
 	lastSnapshotFetch time.Time
+}
+
+// retireTarget 是一次"请对端确认自己被移出"的复制任务。Index 是那条移除记录
+// 的下标：对端 matchIndex 到了这里，才说明它真的看过了，可以彻底放手。
+type retireTarget struct {
+	Index uint64
+	Since time.Time
 }
 
 // memberOp 是一次成员变更的进度。它是 leader 的运行时状态，不进共识：
@@ -206,6 +236,8 @@ type raftStatus struct {
 	Applied uint64                `json:"applied"`
 	Members map[string]memberPeer `json:"members"`
 	Op      *memberOp             `json:"op,omitempty"`
+	// Retired 表示本机已经不在成员表里了（被下线或被替换）。
+	Retired bool `json:"retired,omitempty"`
 }
 
 type memberPeer struct {
@@ -223,6 +255,7 @@ func newRaftNode(id string, tr raftTransport, disk *raftDisk) *raftNode {
 		nextIndex:  map[string]uint64{},
 		matchIndex: map[string]uint64{},
 		lastHeard:  map[string]time.Time{},
+		retiring:   map[string]retireTarget{},
 		waiters:    map[uint64]chan error{},
 		stopc:      make(chan struct{}),
 		wake:       make(chan struct{}, 1),
@@ -420,13 +453,18 @@ func clamp(v, lo, hi uint64) uint64 {
 
 // ------------------------------------------------ 主循环
 
-func (r *raftNode) run(ctx context.Context) {
+func (r *raftNode) run(parent context.Context) {
+	// 先派生自己的 ctx，再起 applyLoop：闭包捕获的是变量，先起 goroutine 后赋值
+	// 会让它读到另一个 ctx（-race 会当场报出来）。
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	r.runwg.Add(2)
 	go func() { defer r.runwg.Done(); r.applyLoop(ctx) }()
 	defer r.runwg.Done()
 	t := time.NewTicker(40 * time.Millisecond)
 	defer t.Stop()
 	r.mu.Lock()
+	r.ctx, r.cancel = ctx, cancel
 	r.resetElection()
 	r.mu.Unlock()
 	for {
@@ -449,9 +487,33 @@ func (r *raftNode) Stop() {
 		if r.role == raftLeader {
 			r.role, r.leader = raftFollower, ""
 		}
+		r.closing = true
+		cancel := r.cancel
 		r.mu.Unlock()
+		if cancel != nil {
+			// 在途的复制/选举立刻结束：它们不该在节点已经停下之后还发请求。
+			cancel()
+		}
 		close(r.stopc)
+		// 等它们真的退出（ctx 已取消，最多几十毫秒）。不等的话，一个已经
+		// 停下的节点还能在 Stop 返回之后去敲别人的 handleAppend。
+		r.rpcs.Wait()
 	})
+}
+
+// spawnRPC 起一个节点间请求。只在这里起，Stop 才等得到它们。
+func (r *raftNode) spawnRPC(fn func()) {
+	r.mu.Lock()
+	if r.closing {
+		r.mu.Unlock()
+		return
+	}
+	r.rpcs.Add(1)
+	r.mu.Unlock()
+	go func() {
+		defer r.rpcs.Done()
+		fn()
+	}()
 }
 
 // Wait 等 run / applyLoop 真正退出。进程退出和测试里都有用：只关 stopc 不知道
@@ -463,9 +525,26 @@ func (r *raftNode) resetElection() {
 	r.electionAt = time.Now().Add(d)
 }
 
+// rpcCtx 给节点间 RPC 一个归属：Stop 之后在途请求立刻取消，而不是继续跟一个
+// 已经停下来的节点说话（那些 goroutine 谁也等不到）。
+func (r *raftNode) rpcCtx(d time.Duration) (context.Context, context.CancelFunc) {
+	r.mu.Lock()
+	base := r.ctx
+	r.mu.Unlock()
+	if base == nil {
+		base = context.Background()
+	}
+	return context.WithTimeout(base, d)
+}
+
 func (r *raftNode) tick() {
 	r.mu.Lock()
 	role := r.role
+	if r.retired {
+		// 已被移出成员表：不再参选、不再复制。进程稍后会自己退出（见 server.retireSelf）。
+		r.mu.Unlock()
+		return
+	}
 	now := time.Now()
 	needBeat := role == raftLeader && now.Sub(r.lastBeat) >= raftHeartbeat
 	stale := role == raftLeader && now.Sub(r.lastQuorum) > 3*raftElectionMax
@@ -499,14 +578,92 @@ func (r *raftNode) stepDown() {
 	r.mu.Unlock()
 }
 
+// preVote 问一圈"如果我现在参选，你会投我吗"。它不改任何状态：不写 meta、
+// 不记 votedFor、不动 term —— 这正是它和真选举的区别，也是它能拦住"重启抢主"
+// 的原因：失败的一方连一次 term 都没花出去。
+func (r *raftNode) preVote(term, lastIdx, lastTerm uint64, voters []string) bool {
+	r.mu.Lock()
+	role := r.role
+	r.mu.Unlock()
+	if role == raftLeader {
+		// 已经自认为是主：不需要问，也不该问（问出来的只会是对自己的否定）。
+		return true
+	}
+	if !contains(voters, r.id) {
+		return false
+	}
+	majority := len(voters)/2 + 1
+	if majority <= 1 {
+		return true
+	}
+	ch := make(chan bool, len(voters))
+	for _, p := range voters {
+		if p == r.id {
+			continue
+		}
+		peer := p
+		r.spawnRPC(func() {
+			ctx, cancel := r.rpcCtx(raftHeartbeat * 3)
+			defer cancel()
+			var out voteResp
+			err := r.tr.Call(ctx, r.tr.EndpointOf(peer), "/v1/cluster/vote",
+				voteReq{Term: term, Candidate: r.id, LastIndex: lastIdx, LastTerm: lastTerm,
+					PreVote: true}, &out)
+			ch <- err == nil && out.Granted
+		})
+	}
+	votes := 1
+	// 预算比正式选举短：预投票只是个探路，慢了不如让下一轮重新来。
+	deadline := time.After(raftElectionMin)
+	for pending := len(voters) - 1; pending > 0; pending-- {
+		select {
+		case ok := <-ch:
+			if ok {
+				votes++
+			}
+		case <-deadline:
+			return false
+		case <-r.stopc:
+			return false
+		}
+		if votes >= majority {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *raftNode) startElection() {
 	r.mu.Lock()
+	// 先把闹钟推后：预投票没通过也要等下一轮。不推的话 tick 每 40ms 就会再来
+	// 一次，一台被隔离的机器会变成投票机关枪。
+	r.resetElection()
+	baseTerm, lastIdx, lastTerm := r.term, r.lastIndex(), r.lastTerm()
+	voters := append([]string(nil), r.voters...)
+	r.mu.Unlock()
+
+	// 预投票（raft §9.6）：先问一圈"你会投我吗"，没人答应就原地不动。
+	//
+	// 这条路径存在的唯一原因是一个实测过的偏差：一台机器重启后不认识任何人
+	// （lastHeard 是内存里的），选举超时一到就 term++ 参选，把正在服务的主
+	// 逼下台（lab 实测 term 13→14，约 2s 写空窗）。现在它连 term 都翻不了：
+	// 其余节点正在收心跳，会直接拒绝这份"你会投我吗"。
+	if !r.preVote(baseTerm+1, lastIdx, lastTerm, voters) {
+		return
+	}
+
+	r.mu.Lock()
+	// 预投票这几百毫秒里情况可能变了：收到心跳、别人已经当选、或者自己成了主。
+	// 这时候再翻任期就是白白制造一次换主。
+	if r.term != baseTerm || r.role == raftLeader {
+		r.mu.Unlock()
+		return
+	}
 	r.role = raftCandidate
 	r.term++
 	r.votedFor = r.id
 	r.leader = ""
-	term, lastIdx, lastTerm := r.term, r.lastIndex(), r.lastTerm()
-	voters := append([]string(nil), r.voters...)
+	term := r.term
 	r.resetElection()
 	meta := r.metaLocked()
 	r.mu.Unlock()
@@ -529,14 +686,15 @@ func (r *raftNode) startElection() {
 		if p == r.id {
 			continue
 		}
-		go func(peer string) {
-			ctx, cancel := context.WithTimeout(context.Background(), raftHeartbeat*3)
+		peer := p
+		r.spawnRPC(func() {
+			ctx, cancel := r.rpcCtx(raftHeartbeat * 3)
 			defer cancel()
 			var out voteResp
 			err := r.tr.Call(ctx, r.tr.EndpointOf(peer), "/v1/cluster/vote",
 				voteReq{Term: term, Candidate: r.id, LastIndex: lastIdx, LastTerm: lastTerm}, &out)
 			ch <- err == nil && out.Granted
-		}(p)
+		})
 	}
 	deadline := time.After(raftElectionMax)
 	for pending := len(voters) - 1; pending > 0; pending-- {
@@ -571,6 +729,7 @@ func (r *raftNode) becomeLeader(term uint64) {
 	r.role = raftLeader
 	r.leader = r.id
 	r.lastQuorum = time.Now()
+	r.lastAppend = time.Now()
 	for _, p := range append(append([]string{}, r.voters...), r.learners...) {
 		r.nextIndex[p] = r.lastIndex() + 1
 		if p == r.id {
@@ -620,20 +779,37 @@ func (r *raftNode) broadcastAppend() {
 		return
 	}
 	r.lastBeat = time.Now()
+	// 自己也记一笔：预投票问的是"集群还活着吗"，一个正在发心跳的 leader
+	// 显然活着。不刷新的话当了 1.2s 主之后它就会开始给别人投赞成票，
+	// 而"别人"往往是刚重启、日志还落后的那台。
+	r.lastAppend = r.lastBeat
 	peers := append(append([]string{}, r.voters...), r.learners...)
+	// 被移出成员表的对端继续收日志，直到它确认看过那条移除记录（默认 30s 后放弃，
+	// 对端已经关机的情况不该让 leader 永远惦记着它）。
+	for id, rt := range r.retiring {
+		if time.Since(rt.Since) > 30*time.Second {
+			delete(r.retiring, id)
+			log.Printf("raft: 放弃等待 %s 确认被移出（%s 没有回应）", id, 30*time.Second)
+			continue
+		}
+		if !contains(peers, id) {
+			peers = append(peers, id)
+		}
+	}
 	r.mu.Unlock()
 
 	for _, p := range peers {
 		if p == r.id {
 			continue
 		}
-		go func(peer string) {
-			ctx, cancel := context.WithTimeout(context.Background(), raftHeartbeat*2)
+		peer := p
+		r.spawnRPC(func() {
+			ctx, cancel := r.rpcCtx(raftHeartbeat * 2)
 			defer cancel()
 			if _, err := r.sendAppend(ctx, peer); err != nil {
 				log.Printf("raft: %s → %s 复制失败: %v", r.id, peer, err)
 			}
-		}(p)
+		})
 	}
 	// 单节点集群没有对端可等：多数派就是自己，这一条必须就地提交，否则
 	// Propose 会一直等到超时，lastQuorum 也不会续租（leader 会把自己选下台）。
@@ -667,6 +843,10 @@ func (r *raftNode) sendAppend(ctx context.Context, peer string) (uint64, error) 
 		}
 		req := appendReq{Term: r.term, Leader: r.id, PrevIndex: prev,
 			PrevTerm: prevTerm, Entries: entries, LeaderCommit: r.commit}
+		// 记下"这一包到底带了哪个提交点"：判断对端是否已经知道"你被移出"
+		// 必须看它收到的那一包，而不是我此刻的 commit —— 别的复制协程可能
+		// 刚把它推上去，于是我以为它知道了，其实它停在删除项之前。
+		sentCommit := req.LeaderCommit
 		term := r.term
 		r.mu.Unlock()
 
@@ -701,6 +881,13 @@ func (r *raftNode) sendAppend(ctx context.Context, peer string) (uint64, error) 
 			}
 			r.nextIndex[peer] = r.matchIndex[peer] + 1
 			r.lastHeard[peer] = time.Now()
+			if rt, ok := r.retiring[peer]; ok && r.matchIndex[peer] >= rt.Index && sentCommit >= rt.Index {
+				// 它不光收到了那条移除记录，还收到了"这条已提交"的提交点 ——
+				// 缺一不可：只发记录不发提交点，它会停在这一条之前的 commit 上，
+				// 永远不应用、也就永远不知道自己被下线（这正是 lab 里看到的现象）。
+				delete(r.retiring, peer)
+				log.Printf("raft: %s 已确认自己被移出成员表（日志 %d）", peer, rt.Index)
+			}
 			r.mu.Unlock()
 			r.advanceCommit()
 			return match, nil
@@ -893,6 +1080,24 @@ func (r *raftNode) Propose(rows []HardRow) error {
 	return r.waitCommit(idx, ch, nil)
 }
 
+// noteRemovedLocked 记下"这份新成员表把谁摘掉了"，好让 leader 继续把那条移除
+// 记录送到它手上。只在它确认收到之后才放手（见 sendAppend）。
+//
+// 为什么必须有这一步：raft 只要求 leader 复制给成员，成员表一变它就名正言顺地
+// 停止了。于是被摘掉的那台永远停在删除项之前的提交点上，控制台还自称 voter，
+// 设备还在往它心跳 —— 一台"看起来正常、其实已经被开除"的控制器。
+func (r *raftNode) noteRemovedLocked(idx uint64, members []ClusterMember) {
+	nv, nl := votersOf(members), learnersOf(members)
+	for _, id := range append(append([]string{}, r.voters...), r.learners...) {
+		if id == r.id || contains(nv, id) || contains(nl, id) {
+			continue
+		}
+		if _, ok := r.retiring[id]; !ok {
+			r.retiring[id] = retireTarget{Index: idx, Since: time.Now()}
+		}
+	}
+}
+
 // ProposeConfig 提议一次成员变更。members 必须是完整的成员表（含自己）。
 func (r *raftNode) ProposeConfig(members []ClusterMember) error {
 	r.mu.Lock()
@@ -907,6 +1112,7 @@ func (r *raftNode) ProposeConfig(members []ClusterMember) error {
 		return err
 	}
 	r.log = append(r.log, e)
+	r.noteRemovedLocked(idx, members)
 	r.pendingCfg = votersOf(members)
 	r.pendMembers = members
 	r.pendingIdx = idx
@@ -931,12 +1137,20 @@ func (r *raftNode) ProposeConfig(members []ClusterMember) error {
 }
 
 // waitPeersHave 等所有成员都收到下标 idx 之前的日志（最多等 d）。
+// 被移出成员表的那台也算在里面：控制台说"已下线"的时候，最好它自己也已经知道了
+// （否则它会继续接设备心跳，直到下一次复制才反应过来）—— 上限仍是 d，不等它。
 func (r *raftNode) waitPeersHave(idx uint64, d time.Duration) {
 	deadline := time.Now().Add(d)
 	for {
 		r.mu.Lock()
 		ok := true
-		for _, p := range append(append([]string{}, r.voters...), r.learners...) {
+		peers := append(append([]string{}, r.voters...), r.learners...)
+		for id := range r.retiring {
+			if !contains(peers, id) {
+				peers = append(peers, id)
+			}
+		}
+		for _, p := range peers {
 			if p == r.id {
 				continue
 			}
@@ -1045,11 +1259,29 @@ func (r *raftNode) applyEntry(e raftEntry) error {
 		// 的节点永远不参选 —— leader 一死，集群就停在"没有 leader"，直到原来
 		// 那台机器被人重新拉起来。
 		r.mu.Lock()
+		// 换主之后接手处理这次变更的新 leader 也要知道"有人该被通知"。
+		if r.role == raftLeader {
+			r.noteRemovedLocked(e.Index, e.Members)
+		}
 		r.voters = votersOf(e.Members)
 		r.learners = learnersOf(e.Members)
 		r.seedPeerIndexLocked(r.voters, r.learners)
 		r.pendingCfg, r.pendMembers, r.pendingIdx = nil, nil, 0
+		// 这份成员表里已经没有本机：我被下线（或被人替换）了。
+		// 从这一刻起不再参选，也不再接活 —— 但先让进程把自己该做的收尾做完。
+		selfOut := len(r.voters) > 0 && !contains(r.voters, r.id) && !contains(r.learners, r.id)
+		becameRetired := selfOut && !r.retired
+		if becameRetired {
+			r.retired = true
+			if r.role == raftLeader {
+				r.role, r.leader = raftFollower, ""
+			}
+		}
+		cb := r.onRetire
 		r.mu.Unlock()
+		if becameRetired && cb != nil {
+			cb(fmt.Sprintf("成员表（日志 %d）里已经没有本机", e.Index))
+		}
 		return nil
 	case e.Rows != nil:
 		return r.applyRows(e.Rows)
@@ -1117,6 +1349,22 @@ func (r *raftNode) handleVote(req voteReq) voteResp {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	resp := voteResp{Term: r.term}
+	if req.PreVote {
+		// 预投票绝不能改 term / votedFor：改了就等于"预投票也翻任期"，
+		// 正好毁掉它存在的意义。
+		if req.Term < r.term {
+			return resp
+		}
+		// 刚刚还在跟 leader（或某个候选人）打交道，说明集群是活的：
+		// 不给你票。这一条是"重启不再抢主"的关键 —— 重启的那台只是
+		// 自己内存里没有 lastHeard，不是集群真的没主了。
+		if time.Since(r.lastAppend) < raftElectionMin {
+			return resp
+		}
+		resp.Granted = req.LastTerm > r.lastTerm() ||
+			(req.LastTerm == r.lastTerm() && req.LastIndex >= r.lastIndex())
+		return resp
+	}
 	if req.Term < r.term {
 		return resp
 	}
@@ -1157,6 +1405,7 @@ func (r *raftNode) handleAppend(req appendReq) appendResp {
 		r.disk.saveMeta(r.metaLocked())
 	}
 	r.leader = req.Leader
+	r.lastAppend = time.Now()
 	// follower 也要记一笔"我刚收到 leader 的包"。lastHeard 原本只在 leader 收到
 	// append 应答时才写，于是 follower 上永远是空表，控制台就把活着的 leader
 	// 标成"失联"（lab 实测 2026-11-14：三台健康，每台 follower 都把别人报失联）。
@@ -1269,7 +1518,7 @@ func (r *raftNode) maybeFetchSnapshot(leader string) {
 	if !need || recent {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := r.rpcCtx(10 * time.Second)
 	defer cancel()
 	s, err := r.tr.Fetch(ctx, r.tr.EndpointOf(leader))
 	if err != nil {
@@ -1288,7 +1537,8 @@ func (r *raftNode) Status() raftStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := raftStatus{Role: string(r.role), Leader: r.leader, Term: r.term,
-		Commit: r.commit, Applied: r.applied, Members: map[string]memberPeer{}}
+		Commit: r.commit, Applied: r.applied, Members: map[string]memberPeer{},
+		Retired: r.retired}
 	fill := func(ids []string, voter bool) {
 		for _, id := range ids {
 			p := st.Members[id]

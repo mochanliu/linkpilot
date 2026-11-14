@@ -7,7 +7,7 @@
 #   3. kill -9 掉 leader：剩下的两台要能选出新主，写还要能提交
 #   4. 把挂掉的那台装回来（同一份数据目录，命令行里还留着旧加入码）：它要自己追上
 #   5. 替换一台：新机器跑一条命令，旧的那台自动下线
-#   6. 下线一台
+#   6. 下线一台：被下线的那台自己要**知道**（视图标记 retired），随后进程退出
 #
 # 每一步都用控制台的 HTTP API 判定，不读状态文件、不改数据 —— 断言的是"控制台
 # 里看到的样子"，也就是客户看到的样子。
@@ -138,6 +138,12 @@ caught_up() { # applied 追平 commit
 	a=$(view "$1" | pick applied); c=$(view "$1" | pick commit)
 	[ -n "$a" ] && [ -n "$c" ] && [ "$a" -ge "$c" ]
 }
+
+# 被下线／被替换掉的那台，自己的视图必须说真话（retired），而不是继续自称 voter。
+retired_self() { [ "$(view "$1" 2>/dev/null | pick retired)" = true ]; }
+# 而且它应该自己退出（-retire-exit 默认开）：现场看到的是"进程停了"，
+# 不是一台还在监听、看起来一切正常的幽灵控制器。
+node_exited() { grep -q "已被移出集群，进程退出" "$WORK/c$1.log"; }
 
 endpoint_refused() { # <n> <endpoint> —— 期望签发被拒（地址已被某个活跃成员占着）
 	api "$1" POST /api/cluster \
@@ -291,6 +297,11 @@ cid=$(member_field "$L" c4 id)
 if [ -n "$cid" ]; then
 	api "$L" POST /api/cluster "{\"action\":\"remove\",\"id\":\"$cid\"}" >/dev/null
 	waitfor 20 "c4 已下线" is_gone "$L" c4
+	# 这一条是 lab 里的漏洞：被摘掉的那台从来没收到"你被移出"（leader 在配置
+	# 提交的瞬间就把它从复制名单里删了），于是它停在删除项之前的提交点上，
+	# 照样自称 voter、照样接设备心跳。
+	waitfor 20 "c4 自己知道被下线了" retired_self 4
+	waitfor 25 "c4 的进程自己退出" node_exited 4
 fi
 info "现在活跃 voter：$(voters "$L") 台"
 

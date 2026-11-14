@@ -29,10 +29,13 @@ type memNet struct {
 	mu    sync.Mutex
 	peers map[string]*memPeer
 	down  map[string]bool
+	// silent 是"单向丢包"：这台还发得出去，别人的 append 进不来。它模拟的是
+	// lab 里那个真实场景 —— 进程刚起来、心跳还没到，它以为自己被孤立了。
+	silent map[string]bool
 }
 
 func newMemNet() *memNet {
-	return &memNet{peers: map[string]*memPeer{}, down: map[string]bool{}}
+	return &memNet{peers: map[string]*memPeer{}, down: map[string]bool{}, silent: map[string]bool{}}
 }
 
 func (n *memNet) EndpointOf(id string) string { return id }
@@ -69,6 +72,15 @@ func (n *memNet) Call(ctx context.Context, target, path string, in, out any) err
 		if err := json.Unmarshal(body, &req); err != nil {
 			return err
 		}
+		if n.isSilent(target) {
+			// 包到了门口被丢掉：调用方看到的是超时，而不是"你被开除了"。
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+				return fmt.Errorf("%s timed out", target)
+			}
+		}
 		b, _ := json.Marshal(p.r.handleAppend(req))
 		return json.Unmarshal(b, out)
 	}
@@ -95,6 +107,18 @@ func (n *memNet) drop(id string, down bool) {
 	n.mu.Lock()
 	n.down[id] = down
 	n.mu.Unlock()
+}
+
+func (n *memNet) setSilent(id string, on bool) {
+	n.mu.Lock()
+	n.silent[id] = on
+	n.mu.Unlock()
+}
+
+func (n *memNet) isSilent(id string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.silent[id]
 }
 
 // joinTestCluster 起一个 n 节点的集群。所有节点从同一份成员表和同一个空状态
@@ -208,6 +232,10 @@ func fastRaft(t *testing.T) {
 	raftElectionMax = 240 * time.Millisecond
 	raftCommitTimeout = 1500 * time.Millisecond
 	t.Cleanup(func() {
+		// 停下来的节点可能还有一条 in-flight 的广播（它们不在 runwg 里），
+		// 那条广播会读 raftElection* —— 先放干净再改回常量，否则 -race 报的是
+		// "夹具自己"的数据竞争，看上去像是内核有问题。
+		time.Sleep(80 * time.Millisecond)
 		raftHeartbeat, raftElectionMin, raftElectionMax, raftCommitTimeout = oldH, oldMin, oldMax, oldCommit
 	})
 }
@@ -425,10 +453,20 @@ func TestRaftMembershipAddPromoteRemove(t *testing.T) {
 		if p.id == lead.id {
 			continue
 		}
-		waitFor(t, p.id+" 的 voter 集合同步", 3*time.Second, func() bool {
+		deadline := time.Now().Add(3 * time.Second)
+		for {
 			vv, _ := p.r.voterSet()
-			return len(vv) == 3 && contains(vv, "c4") && !contains(vv, "c3")
-		})
+			if len(vv) == 3 && contains(vv, "c4") && !contains(vv, "c3") {
+				break
+			}
+			if time.Now().After(deadline) {
+				ll := p.r.learners
+				st := p.r.Status()
+				t.Fatalf("%s voters=%v learners=%v commit=%d applied=%d retired=%v role=%s",
+					p.id, vv, ll, st.Commit, st.Applied, st.Retired, st.Role)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 
 	// 回归：把 leader 拔掉，剩下的必须能自己选出一个新的（含被提升过的那台）。
@@ -455,4 +493,162 @@ func leadMembers(t *testing.T, p *memPeer) []ClusterMember {
 		t.Fatal("测试节点没有成员表")
 	}
 	return p.st.Cluster.sorted()
+}
+
+// ---------------------------------------------------------------- 预投票
+
+// TestRaftRestartedNodeDoesNotStealLeadership 对应 lab 里的那个偏差：一台机器
+// 重启后收不到任何心跳，选举超时一到就把 term 抬起来参选，把正在服务的主逼
+// 下台（实测 term 13→14，约 2s 写空窗）。
+//
+// 预投票让它在"翻任期"之前就被拒掉：其余节点正在收心跳，会直接回答"不投"。
+func TestRaftRestartedNodeDoesNotStealLeadership(t *testing.T) {
+	fastRaft(t)
+	net, peers, stop := joinTestCluster(t, 3)
+	defer stop()
+	waitFor(t, "选出 leader", 3*time.Second, func() bool { return findLeader(peers) != nil })
+	lead := findLeader(peers)
+	if err := lead.r.Propose([]HardRow{{Table: "Epoch", Data: json.RawMessage("1")}}); err != nil {
+		t.Fatalf("提议失败: %v", err)
+	}
+
+	var f *memPeer
+	for _, p := range peers {
+		if p.id != lead.id {
+			f = p
+			break
+		}
+	}
+	term0 := lead.r.Status().Term
+	// 单向静默：它发得出去，心跳进不来 —— 正是"刚重启、还没接上"的那几秒。
+	net.setSilent(f.id, true)
+	defer net.setSilent(f.id, false)
+
+	f.r.mu.Lock()
+	f.r.electionAt = time.Now().Add(-time.Millisecond)
+	f.r.mu.Unlock()
+
+	time.Sleep(600 * time.Millisecond)
+	if got := lead.r.Status().Term; got != term0 {
+		t.Fatalf("重启的节点把 term 从 %d 抬到了 %d：预投票没拦住", term0, got)
+	}
+	if l := findLeader(peers); l != lead {
+		t.Fatalf("leader 从 %s 换成了 %v：重启抢主", lead.id, l)
+	}
+}
+
+// TestRaftPreVoteDoesNotBumpTerm 守住预投票的定义：它问完就走，不改任何状态。
+// 改了就等于"预投票也翻任期"，正好毁掉它存在的意义。
+func TestRaftPreVoteDoesNotBumpTerm(t *testing.T) {
+	fastRaft(t)
+	_, peers, stop := joinTestCluster(t, 3)
+	defer stop()
+	waitFor(t, "选出 leader", 3*time.Second, func() bool { return findLeader(peers) != nil })
+	lead := findLeader(peers)
+	var f *memPeer
+	for _, p := range peers {
+		if p.id != lead.id {
+			f = p
+			break
+		}
+	}
+	before := f.r.Status().Term
+	// 等它真的收到过一拍心跳再问：集群刚选出主的那一瞬间，follower 的
+	// lastAppend 还是零值，"我刚跟 leader 说过话"这句话还不成立 —— 预投票
+	// 会（正确地）答应，那不是我们要守的性质。
+	waitFor(t, "follower 收到心跳", 2*time.Second, func() bool {
+		f.r.mu.Lock()
+		defer f.r.mu.Unlock()
+		return time.Since(f.r.lastAppend) < 40*time.Millisecond
+	})
+	f.r.mu.Lock()
+	li, lt := f.r.lastIndex(), f.r.lastTerm()
+	f.r.mu.Unlock()
+	resp := f.r.handleVote(voteReq{Term: before + 7, Candidate: "c99",
+		LastIndex: li, LastTerm: lt, PreVote: true})
+	if resp.Granted {
+		t.Fatal("集群还活着，居然答应了预投票")
+	}
+	if after := f.r.Status().Term; after != before {
+		t.Fatalf("预投票把 term 从 %d 改成了 %d", before, after)
+	}
+	if v := f.r.Leader(); v != lead.id {
+		t.Fatalf("预投票把 leader 从 %s 改成了 %q", lead.id, v)
+	}
+}
+
+// ---------------------------------------------------------------- 被下线
+
+// TestRaftRemovedNodeLearnsItWasRemoved 验收"下线"是一个完整动作：
+// 被摘掉的那台必须知道，而不是停在删除项之前的提交点上继续自称 voter。
+func TestRaftRemovedNodeLearnsItWasRemoved(t *testing.T) {
+	fastRaft(t)
+	_, peers, stop := joinTestCluster(t, 3)
+	defer stop()
+	waitFor(t, "选出 leader", 3*time.Second, func() bool { return findLeader(peers) != nil })
+	lead := findLeader(peers)
+	var victim *memPeer
+	for _, p := range peers {
+		if p.id != lead.id {
+			victim = p
+			break
+		}
+	}
+
+	retired := make(chan string, 4)
+	victim.r.mu.Lock()
+	victim.r.onRetire = func(reason string) {
+		select {
+		case retired <- reason:
+		default:
+		}
+	}
+	victim.r.mu.Unlock()
+
+	members := leadMembers(t, lead)
+	for i := range members {
+		if members[i].ID == victim.id {
+			members[i].Status = memberDecommissioned
+			members[i].Role = ""
+		}
+	}
+	if err := lead.r.ProposeConfig(members); err != nil {
+		t.Fatalf("下线: %v", err)
+	}
+
+	select {
+	case reason := <-retired:
+		t.Logf("被下线的那台知道了：%s", reason)
+	case <-time.After(3 * time.Second):
+		t.Fatal("被下线的那台永远没学到自己被移出成员表（控制台会一直谎报 voter、设备继续往它心跳）")
+	}
+
+	// 它的成员表必须跟着变成 decommissioned：之前它停在删除项之前的提交点上。
+	waitFor(t, "被下线的节点应用了移除记录", 2*time.Second, func() bool {
+		victim.mu.Lock()
+		defer victim.mu.Unlock()
+		m := victim.st.Cluster.Members[victim.id]
+		return m != nil && m.Status == memberDecommissioned
+	})
+	if !victim.r.Status().Retired {
+		t.Fatal("raft 没把自己标成 retired")
+	}
+
+	// 它不该再参选：把选举闹钟拨到过去，term 也不能动。
+	tv := victim.r.Status().Term
+	victim.r.mu.Lock()
+	victim.r.electionAt = time.Now().Add(-time.Second)
+	victim.r.mu.Unlock()
+	time.Sleep(300 * time.Millisecond)
+	if got := victim.r.Status().Term; got != tv {
+		t.Fatalf("被下线的节点还在参选：term %d → %d", tv, got)
+	}
+
+	// leader 确认它收到之后就该放手，别再对着一个死人发日志。
+	lead.r.mu.Lock()
+	_, still := lead.r.retiring[victim.id]
+	lead.r.mu.Unlock()
+	if still {
+		t.Fatal("对端已经确认，leader 还在给它补日志")
+	}
 }
