@@ -913,6 +913,10 @@ docker run --rm -v "$PWD/controller":/src -w /src srwg-dev \
 —— §9.3 那条规矩（热路径不许拿 `s.mu`）对新增的 raft 回调（`liveness`/`onLive`/`onOps`）
 同样生效，动这一片之前先读 §9.8（四）。验收：`go test -race` 全绿 + 容器 smoke 4 连过、
 全程 max term=2。
+**真机 lab 已滚动换件到 `sr-ctrl.lab7` 并验证（2026-11-15）**：follower 的设备 last_seen
+从 8.4h 前变成 0–5s 三台一致；台账连续行三台逐字节一致；leader 重启时 mac-6 代理了
+9s 主（term 20）→ mac-1 接任（term 21），4 台 CPE 心跳没断。备份：
+`ctrl/data.prev-cluster-20261115`、`c2/c6.prev-lab6`。残余取舍记在 plan §9.8 末尾。
 
 ---
 
