@@ -410,9 +410,17 @@ func (s *server) adminHandler() http.Handler {
 	// 远程诊断（diag.go）：往盒子上发 ping/traceroute/vpp-show，命令随设备
 	// 心跳下去，结果回 /v1/diag。租户专属，operator 角色不进客户的盒子。
 	mux.HandleFunc("/api/diag", s.handleAdminDiag)
+	// 控制器集群：成员表、加入码、替换、下线。operator 专属 —— 它决定的是
+	// 控制面本身跑在哪几台机器上，与某个租户的网络无关。
+	mux.HandleFunc("/api/cluster", s.handleAdminCluster)
 	// 审计中间件包在最外层：/api/* 的写请求记一条 audit 台账，一个钩子
 	// 覆盖现在和将来的全部写端点，新增 handler 不用记得埋点。
-	return s.auditMiddleware(mux)
+	//
+	// 往里三层各有明确职责：
+	//   audit     记"最终"状态码（所以它必须在最外层）
+	//   leaderGuard 写请求不在 leader 上 → 307，连处理器都不用进
+	//   commitGuard 处理器回了 2xx 但提交失败 → 改成 500
+	return s.auditMiddleware(s.leaderGuard(s.commitGuard(mux)))
 }
 
 func (s *server) handleConsolePage(w http.ResponseWriter, r *http.Request) {
@@ -656,7 +664,10 @@ type consoleState struct {
 	// PreAuths is tenant-only, like Runtime: an operator sees that a grant has
 	// seats held, never which devices the customer named.
 	PreAuths []consolePreAuth `json:"preauths"`
-	NowUnix  int64            `json:"now_unix"`
+	// Cluster is operator-only: 控制器集群的成员与健康度。租户不需要知道
+	// 控制面跑在几台机器上（对他们来说就是"一个控制器"）。
+	Cluster *clusterView `json:"cluster,omitempty"`
+	NowUnix int64        `json:"now_unix"`
 }
 
 func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
@@ -729,6 +740,10 @@ func (s *server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 	// unplaced device, or a pending heartbeat anywhere in the page.
 	if id.Role == roleTenant {
 		out.PreAuths = s.preAuthListLocked(id.TenantID)
+	}
+	if id.Role == roleOperator {
+		cv := s.clusterViewLocked()
+		out.Cluster = &cv
 	}
 	s.mu.Unlock()
 	out.NowUnix = time.Now().Unix()

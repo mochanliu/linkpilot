@@ -333,6 +333,100 @@ func TestConsoleLedgerRetentionWiring(t *testing.T) {
 	}
 }
 
+// TestConsoleClusterPageWiring 钉住「控制器集群」页的三种玩家动作：
+// 开启集群（单机 → 第 1 台）、加人（第 2、3 台）、替换一台、下线一台。
+//
+// 这一页的价值全在"点了会发生什么"上：按钮没有分发、请求少带一个字段、
+// 少一个 confirm，症状都不是报错，而是"点了没反应"或者"点了，集群少了一票"。
+func TestConsoleClusterPageWiring(t *testing.T) {
+	html := string(consoleHTML)
+
+	// 入口只给运营账号：成员地址属于运营侧信息，租户不该看到。
+	if !strings.Contains(html, `data-view="cluster" data-roles="operator"`) {
+		t.Error("导航里没有「控制器集群」（或没有按运营角色隐藏）")
+	}
+	if !strings.Contains(html, `S.view === "cluster") c = viewCluster(st)`) {
+		t.Error("render 没有把 cluster 这一页接到 viewCluster")
+	}
+
+	view := funcBody(t, html, "function viewCluster(st)")
+	// 单机：开启集群就等于填本机地址 + 一个明确的按钮。
+	for _, want := range []string{`id="cl-init-endpoint"`, `id="cl-init-console"`,
+		`id="cl-init-name"`, `data-act="cluster-init"`, "cv.mode"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("开启集群面板缺少 %s", want)
+		}
+	}
+	// 集群：概览要有"有多数派"，成员表每一行要能下线/替换，加入码要能复制。
+	for _, want := range []string{"cv.quorum", "data-act=\"cluster-remove\"",
+		"data-act=\"cluster-replace\"", `id="cl-endpoint"`, `id="cl-console"`,
+		`data-act="cluster-token"`, `data-act="cluster-copy"`, "S.clusterTok", ".command",
+		"clusterRoleTag(m)", "behind"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("集群视图缺少 %s", want)
+		}
+	}
+	// 加入码只显示一次：界面必须说清楚，否则用户关掉页面再来要，只能重新生成。
+	if !strings.Contains(view, "只显示这一次") {
+		t.Error("加入码面板没有提醒「只显示这一次」")
+	}
+
+	// 动作分发
+	init := actBranch(t, html, "cluster-init")
+	for _, want := range []string{`"/api/cluster"`, `action: "init"`, "endpoint", "confirm("} {
+		if !strings.Contains(init, want) {
+			t.Errorf("开启集群缺少 %s", want)
+		}
+	}
+	tok := actBranch(t, html, "cluster-token")
+	for _, want := range []string{`action: "token"`, "replace_id", "kind", "S.clusterReplace"} {
+		if !strings.Contains(tok, want) {
+			t.Errorf("生成加入码缺少 %s", want)
+		}
+	}
+	// 替换是"同一张表单换个目标"：地址照填，只是多带一个 replace_id。
+	if !strings.Contains(tok, `? "replace" : "add"`) || !strings.Contains(tok, "replace_id: rep") {
+		t.Error("加入码没有区分 add / replace：替换会退化成「又多一台」")
+	}
+	rep := actBranch(t, html, "cluster-replace")
+	if !strings.Contains(rep, `data-id`) || !strings.Contains(rep, "S.clusterReplace") {
+		t.Error("「替换」按钮没有记住目标成员")
+	}
+	if !strings.Contains(actBranch(t, html, "cluster-replace-clear"), `S.clusterReplace = ""`) {
+		t.Error("「取消替换」没有清掉目标")
+	}
+	rm := actBranch(t, html, "cluster-remove")
+	for _, want := range []string{`action: "remove"`, "confirm(", "id: mid"} {
+		if !strings.Contains(rm, want) {
+			t.Errorf("下线缺少 %s", want)
+		}
+	}
+	// 下线会消耗一票：必须先把"剩下的还占多数吗"讲清楚，而不是只问一句确定。
+	if !strings.Contains(rm, "多数派") {
+		t.Error("下线的确认框没有说明它会从多数派里拿走一票")
+	}
+
+	// 提交失败的红条：这是"客户以为发布成功了"的唯一出口。
+	if !strings.Contains(html, "st.cluster.degraded") || !strings.Contains(html, `class="banner danger"`) {
+		t.Error("提交失败时页面没有红条（改动没落盘却看不出）")
+	}
+}
+
+// actBranch 取一条 `else if (act === "name")` 分支，到下一个分支为止。
+func actBranch(t *testing.T, html, name string) string {
+	t.Helper()
+	marker := `else if (act === "` + name + `") {`
+	i := strings.Index(html, marker)
+	if i < 0 {
+		t.Fatalf("动作分发里没有 %s：按钮点了没反应", name)
+	}
+	rest := html[i+len(marker):]
+	if j := strings.Index(rest, "\n        else "); j > 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
 // funcBody 取一个函数体：从签名到下一个顶格两空格的 "}" 行。
 func funcBody(t *testing.T, html, sig string) string {
 	t.Helper()

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"sdwan/controller/internal/wire"
 )
@@ -49,24 +50,63 @@ func StatusOf(err error) int {
 // 这个客户端**故意不设 http.Client.Timeout**：watch 是长连接，一个全局超时
 // 会把正常运行的流在固定秒数后掐断。所有请求的期限由调用方传入的 context 决定。
 type Client struct {
+	// base / hc 可换：控制器的地址不是常量。集群里 leader 会换、节点会加，
+	// 心跳应答每次都带一份最新地址表，agent 自己轮换（见 cmd/sr-agent 的心跳
+	// 循环）。换地址必须同时换 http.Client：TLS 的校验目标是公钥基础设施里
+	// 的那张证书，不是"某个 IP"。
+	mu     sync.RWMutex
 	base   string
 	nodeID uint16
 	hc     *http.Client
+	id     *Identity
+}
+
+// endpoint 取当前地址与客户端。所有请求都从这里取，不要直接读字段。
+func (c *Client) endpoint() (string, *http.Client) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.base, c.hc
+}
+
+// SetBase 换控制器地址。失败（比如 base 不含主机名）时保持原样。
+func (c *Client) SetBase(base string) error {
+	if _, err := serverNameFromURL(base); err != nil {
+		return err
+	}
+	tc, err := c.id.TLSConfig("")
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.base = base
+	c.hc = &http.Client{Transport: &http.Transport{TLSClientConfig: tc}}
+	c.mu.Unlock()
+	return nil
+}
+
+// Base 是当前在用的控制器地址（日志用）。
+func (c *Client) Base() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.base
 }
 
 // NewClient 用已 enroll 的身份建一个 mTLS 客户端。
 func NewClient(base string, id *Identity) (*Client, error) {
-	name, err := serverNameFromURL(base)
-	if err != nil {
+	if _, err := serverNameFromURL(base); err != nil {
 		return nil, err
 	}
-	tc, err := id.TLSConfig(name)
+	// 不钉 ServerName：集群里 leader 会换，307 会把请求转到另一个成员，
+	// 钉住原主机名会让"换主"变成"证书校验失败"。留空由 net/http 按 URL
+	// 的主机名/地址校验（证书里两个都有）。
+	tc, err := id.TLSConfig("")
 	if err != nil {
 		return nil, err
 	}
 	return &Client{
 		base:   base,
 		nodeID: id.NodeID(),
+		id:     id,
 		hc:     &http.Client{Transport: &http.Transport{TLSClientConfig: tc}},
 	}, nil
 }
@@ -80,13 +120,12 @@ func Enroll(ctx context.Context, base string, roots *x509.CertPool, req wire.Enr
 	if roots == nil {
 		return wire.EnrollResponse{}, errors.New("agent: enroll 需要预先固定控制器 CA")
 	}
-	name, err := serverNameFromURL(base)
-	if err != nil {
+	if _, err := serverNameFromURL(base); err != nil {
 		return wire.EnrollResponse{}, err
 	}
 	c := &Client{
 		base: base,
-		hc:   &http.Client{Transport: &http.Transport{TLSClientConfig: enrollTLS(roots, name)}},
+		hc:   &http.Client{Transport: &http.Transport{TLSClientConfig: enrollTLS(roots, "")}},
 	}
 	var resp wire.EnrollResponse
 	if err := c.post(ctx, "/v1/enroll", req, &resp); err != nil {
@@ -198,11 +237,12 @@ const maxBundleBytes = 4 << 20
 // 解码交给调用方用 apply.DecodeBundle —— 与设备侧 CLI 同一个解析器：
 // 两种解析器是"同一份 JSON 被两边读出不同含义"的经典入口。
 func (c *Client) ConfigBundle(ctx context.Context) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/config/bundle", nil)
+	base, hc := c.endpoint()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/config/bundle", nil)
 	if err != nil {
 		return nil, err
 	}
-	res, err := c.hc.Do(req)
+	res, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("agent: 拉取配置包: %w", err)
 	}
@@ -230,7 +270,8 @@ var ErrNoUnderlay = errors.New("agent: 控制器还没有可下发的隧道配�
 // 别的节点的隧道。
 func (c *Client) UnderlayBundle(ctx context.Context) (wire.UnderlayBundle, error) {
 	var b wire.UnderlayBundle
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/underlay/bundle", nil)
+	base, _ := c.endpoint()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/underlay/bundle", nil)
 	if err != nil {
 		return b, err
 	}
@@ -256,7 +297,8 @@ type RegistryView struct {
 // Registry 拉全量视图。日常靠 Watch，这个只用于对账与启动时自检。
 func (c *Client) Registry(ctx context.Context) (RegistryView, error) {
 	var v RegistryView
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/registry", nil)
+	base, _ := c.endpoint()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/registry", nil)
 	if err != nil {
 		return v, err
 	}
@@ -278,11 +320,12 @@ type WatchStream struct {
 
 // Watch 打开推送流。调用方负责 Close；ctx 取消会让正在阻塞的 Next 返回错误。
 func (c *Client) Watch(ctx context.Context) (*WatchStream, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/watch", nil)
+	base, hc := c.endpoint()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/watch", nil)
 	if err != nil {
 		return nil, err
 	}
-	res, err := c.hc.Do(req)
+	res, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("agent: 打开 watch: %w", err)
 	}
@@ -320,7 +363,8 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	if err != nil {
 		return fmt.Errorf("agent: 编 %s 请求体: %w", path, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+	base, _ := c.endpoint()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -329,7 +373,8 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 }
 
 func (c *Client) do(req *http.Request, out any) error {
-	res, err := c.hc.Do(req)
+	_, hc := c.endpoint()
+	res, err := hc.Do(req)
 	if err != nil {
 		return fmt.Errorf("agent: %s: %w", req.URL.Path, err)
 	}

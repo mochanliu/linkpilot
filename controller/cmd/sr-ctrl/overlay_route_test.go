@@ -253,6 +253,7 @@ func TestOverlaySegmentSurvivesPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	file := &fileStore{path: path}
 	s.store = file
+	s.hardIndex = nil // 换 store = 模拟另一次启动，基线要从零建
 	s.save()
 	st, err := file.Load()
 	if err != nil {

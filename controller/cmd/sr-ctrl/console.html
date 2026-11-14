@@ -144,6 +144,13 @@
   .banner{display:flex;align-items:center;justify-content:space-between;gap:12px;
     border:1px solid rgba(210,153,34,.4);background:var(--warn-bg);border-radius:8px;padding:10px 14px;
     font-size:13px;margin-top:14px}
+  .banner.danger{border-color:rgba(248,81,73,.45);background:var(--bad-bg);color:var(--bad)}
+  .banner.danger button.small{color:var(--bad);border-color:rgba(248,81,73,.45)}
+  /* 集群成员表里的"这台"标记：一眼看出自己在看谁，少一个误下线自己人的机会。 */
+  .me-tag{display:inline-block;margin-left:6px;padding:0 6px;border-radius:999px;font-size:11px;
+    border:1px solid var(--line);color:var(--muted)}
+  .join-token{font-family:var(--mono);font-size:12px;word-break:break-all;
+    background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:8px}
 
   .result{display:none;margin-top:14px;border:1px solid rgba(63,185,80,.4);background:var(--ok-bg);
     border-radius:8px;padding:14px 16px}
@@ -395,6 +402,7 @@
       <a class="child" href="#nodes" data-view="nodes">设备 <span class="n" id="n-devices">0</span></a>
       <a class="child" href="#enroll" data-view="enroll">入网授权 <span class="n" id="n-claims">0</span></a>
       <a class="child" href="#tenants" data-view="tenants" data-roles="operator">租户 <span class="n" id="n-tenants">0</span></a>
+      <a class="child" href="#cluster" data-view="cluster" data-roles="operator">控制器集群 <span class="n" id="n-cluster"></span></a>
       <div class="sect">账号管理</div>
       <a class="child" href="#accounts" data-view="accounts" data-roles="operator">账号 <span class="n" id="n-accounts">0</span></a>
       <a class="child" href="#account" data-view="account" id="nav-account">账号设置</a>
@@ -453,7 +461,10 @@
     // 基础配置页的版本历史 / diff / 回滚：vers 是 /api/config/versions 的
     // 版本清单，verDiff 是最近一次 /api/config/diff 的结果，diffA/diffB 是
     // 对比下拉当前的选择。
-    vers: null, verDiff: null, diffA: "", diffB: "draft" };
+    vers: null, verDiff: null, diffA: "", diffB: "draft",
+    // 控制器集群：clusterTok 是一次性加入码（生成后只显示这一次）；
+    // clusterReplace 是"正在替换谁"，表单里显示成一个可清除的标记。
+    clusterTok: null, clusterReplace: "" };
 
   // Only a placeholder for the input; the server owns the real default.
   var CLAIM_DEFAULT_USES = 10;
@@ -890,6 +901,13 @@
       sub: "设备存活与隧道内遥测：两端各自上报，不合并，没有上报就明说",
       roles: ["tenant"]
     },
+    cluster: {
+      title: "控制器集群",
+      sub: "控制面自己跑在几台机器上：只有 leader 接受写，其余节点只读并把设备的心跳接住。" +
+        "新增 / 替换 / 下线都在这一页完成 —— 新机器只要跑一条带加入码的命令，不需要后台部署。" +
+        "设备不需要 VIP：心跳应答里带着完整地址表，agent 自己轮换",
+      roles: ["operator"]
+    },
     ops: {
       title: "台账与告警",
       sub: "活动告警、告警通知设置，和按时间倒排的运维台账（设备上下线、配置发布、选路切换、控制台操作审计）。台账按天落盘，保留天数在下面改；告警推送到下面配置的 webhook",
@@ -993,6 +1011,10 @@
     $("n-tenants").textContent = st.tenants.length;
     $("n-accounts").textContent = S.accounts ? S.accounts.length : 0;
     $("n-claims").textContent = liveGrants(st).length;
+    if ($("n-cluster")) {
+      var cv0 = st.cluster;
+      $("n-cluster").textContent = (cv0 && cv0.mode === "cluster") ? cv0.members.length : "";
+    }
     $("n-devices").textContent = online + "/" + st.nodes.length;
     $("ctrl-line").textContent = (st.controller.tls_addrs || []).join(" · ");
 
@@ -1013,6 +1035,7 @@
     try {
       if (S.view === "dashboard") c = viewDashboard(st, online, isOp);
       else if (S.view === "tenants") c = viewTenants(st);
+      else if (S.view === "cluster") c = viewCluster(st);
       else if (S.view === "accounts") c = viewAccounts(st);
       else if (S.view === "enroll") c = viewEnroll(st, isOp);
       else if (S.view === "nodes") c = viewNodes(st, isOp);
@@ -1042,6 +1065,13 @@
       c = viewCrash(S.view, err);
     }
     if (me.initial_password) c = initialPassBanner() + c;
+    // 控制面自己出问题时必须在每一页顶上红着：这时候"发布成功"是不可信的，
+    // 而操作员多半正停在别的页面上干活。
+    if (isOp && st.cluster && st.cluster.degraded) {
+      c = '<div class="banner danger"><span>写保护：最近的改动没有提交到多数派（' +
+        esc(st.cluster.degraded) + '）。修好集群后重试，或到「控制器集群」页看详情。</span>' +
+        '<button class="small" data-act="goto" data-view="cluster">去看看</button></div>' + c;
+    }
 
     // 结构没变就只刷新相对时间，不重建 DOM：重建会让正在点的按钮在半路
     // 被替换掉（点击丢失），也会闪。心跳只改变「x 秒前」的文字，结构不变。
@@ -1999,6 +2029,124 @@
       if (entries.length >= 2000) {
         h += '<div class="hint">结果超过 2000 行被截断——缩小时间范围或按类型过滤。</div>';
       }
+    }
+    h += "</section>";
+    return h;
+  }
+
+  /* ---------------- 控制器集群 ---------------- */
+
+  // viewCluster 是「控制器集群」页，对应 owner 2026-11-14 的场景：
+  //   单机 → 上 HA（加两台）/ 坏一台换掉 / 用不着 4 台退一台。
+  // 三种操作在这里都是"点一下 + 一条命令"，不需要登到机器上改配置。
+  function clusterRoleTag(m) {
+    if (m.live_role === "leader") return '<span class="tag online">leader</span>';
+    if (m.live_role === "learner") return '<span class="tag plan">同步中</span>';
+    if (m.live_role === "follower") return '<span class="tag online">follower</span>';
+    if (m.live_role === "失联") return '<span class="tag stale">失联</span>';
+    if (m.status === "decommissioned") return '<span class="tag revoked">已下线</span>';
+    return '<span class="tag">' + esc(m.live_role || m.status) + "</span>";
+  }
+
+  function viewCluster(st) {
+    var cv = st.cluster || null;
+    var h = "";
+    if (!cv) {
+      return '<section class="panel"><div class="empty">这台不是运营账号，看不到控制器集群。</div></section>';
+    }
+    if (cv.mode !== "cluster") {
+      // 单机：把"开启"写成一次明确的动作，并解释代价（会重签一张证书）。
+      h += '<section class="panel"><header><h2>开启集群</h2></header>' +
+        '<div class="hint">现在这台控制器是<b>单机</b>：没有共识，也没有第二份数据。' +
+        '开启之后它成为集群的第 1 台，之后可以在下面用加入码把第 2、3 台接进来 —— ' +
+        '三台里坏一台，写不会停。</div>' +
+        '<div class="hint">这里填的是<b>这台机器对外的地址</b>（其它控制器和设备都用它访问）。' +
+        '开启时会用集群 CA 重签一张覆盖该地址的服务端证书。</div>' +
+        '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:8px">' +
+        '<label>本机地址 host:port<br><input id="cl-init-endpoint" type="text" style="width:200px" placeholder="192.168.1.10:8443"></label>' +
+        '<label>控制台地址 host:port<br><input id="cl-init-console" type="text" style="width:200px" placeholder="192.168.1.10:8443"></label>' +
+        '<label>名称<br><input id="cl-init-name" type="text" style="width:150px" placeholder="控制器 1"></label>' +
+        '<button class="small" data-act="cluster-init">开启集群</button></div>' +
+        (cv.reason ? '<div class="hint" style="margin-top:10px">' + esc(cv.reason) + "</div>" : "") +
+        "</section>";
+      return h;
+    }
+
+    // ---- 集群：一帧概览
+    var quorum = cv.quorum
+      ? '<span class="tag online">有多数派</span>'
+      : '<span class="tag revoked">无多数派 · 只读</span>';
+    var voters = cv.members.filter(function (m) { return m.role === "voter" && m.status === "active"; }).length;
+    h += '<section class="panel"><header><h2>集群状态</h2><div>' + quorum + "</div></header>" +
+      '<div class="cards">' +
+      '<div class="card"><div class="k">本机角色</div><div class="v">' + esc(cv.role) + "</div></div>" +
+      '<div class="card"><div class="k">Leader</div><div class="v" style="font-size:15px">' + esc(cv.leader || "—") + "</div></div>" +
+      '<div class="card"><div class="k">投票成员</div><div class="v">' + voters + " <small>台</small></div></div>" +
+      '<div class="card"><div class="k">提交点</div><div class="v">' + esc(cv.commit) + " <small>term " + esc(cv.term) + "</small></div></div>" +
+      "</div>" +
+      '<div class="hint">成员的加入/移除是共识写：多数派落盘之后才生效。' +
+      '新成员先当 learner（不参与多数派）把日志追平，再提升为 voter —— 这样"加一台"不会让集群短暂失去多数派。</div>';
+    if (cv.op) {
+      h += '<div class="hint" style="margin-top:8px">正在处理：' + esc(cv.op.kind) + " · " +
+        esc(cv.op.member_id) + " · " + esc(cv.op.phase) +
+        (cv.op.err ? "（失败：" + esc(cv.op.err) + "）" : "") + "</div>";
+    }
+    h += "</section>";
+
+    // ---- 成员表
+    h += '<section class="panel"><header><h2>成员</h2>' +
+      '<button class="small" data-act="refresh">刷新</button></header>';
+    if (!cv.members.length) {
+      h += '<div class="empty">没有成员记录。</div>';
+    } else {
+      h += "<table><thead><tr><th>名称</th><th>地址</th><th>角色</th><th>落后</th><th>最后联系</th><th></th></tr></thead><tbody>";
+      cv.members.forEach(function (m) {
+        var behind = m.behind > 0 ? (m.behind + " 条") : "—";
+        h += "<tr><td>" + esc(m.name || m.id) +
+          (m.self ? '<span class="me-tag">这台</span>' : "") +
+          (m.replaces ? '<div class="muted">替换 ' + esc(m.replaces) + "</div>" : "") +
+          (m.note ? '<div class="muted">' + esc(m.note) + "</div>" : "") + "</td>" +
+          '<td class="mono">' + esc(m.endpoint) + "</td>" +
+          "<td>" + clusterRoleTag(m) + "</td>" +
+          '<td class="muted">' + esc(behind) + "</td>" +
+          '<td class="muted"><span data-ago="' + esc(m.last_heard_unix || "") + '"></span></td>' +
+          '<td class="row-actions">' +
+          (m.status === "active"
+            ? '<button class="small" data-act="cluster-remove" data-id="' + esc(m.id) + '" data-name="' + esc(m.name || m.id) + '">下线</button>'
+            : "") +
+          (m.status !== "decommissioned"
+            ? '<button class="small" data-act="cluster-replace" data-id="' + esc(m.id) + '" data-name="' + esc(m.name || m.id) + '">替换</button>'
+            : "") +
+          "</td></tr>";
+      });
+      h += "</tbody></table>";
+      h += '<div class="hint">「下线」把成员从投票集合里去掉（它不再参与多数派，设备也不会再拿到它的地址）。' +
+        '「替换」= 先加新机器、等它追平、再自动下线旧的；旧机器坏着也能替换，因为它不参与新成员的加入表决。</div>';
+    }
+    h += "</section>";
+
+    // ---- 加入码
+    var rep = S.clusterReplace || "";
+    var repName = "";
+    if (rep) {
+      cv.members.forEach(function (m) { if (m.id === rep) repName = m.name || m.id; });
+    }
+    h += '<section class="panel"><header><h2>' + (rep ? "替换控制器" : "添加控制器") + "</h2></header>" +
+      '<div class="hint">' + (rep
+        ? "新机器接进来之后，旧的那台（" + esc(repName) + "）会被自动下线。加入码 30 分钟有效、只能用一次。"
+        : "在另一台机器上跑一条命令，它自己会把这个集群的状态拉过去，然后作为 learner 追上日志。") + "</div>" +
+      (rep ? '<div class="hint">替换目标：<b>' + esc(repName) + '</b> <button class="small" data-act="cluster-replace-clear">取消替换</button></div>' : "") +
+      '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:8px">' +
+      '<label>名称<br><input id="cl-name" type="text" style="width:150px" placeholder="控制器 ' + (cv.members.length + 1) + '"></label>' +
+      '<label>新机器地址 host:port<br><input id="cl-endpoint" type="text" style="width:200px" placeholder="192.168.1.11:8443"></label>' +
+      '<label>它的控制台 host:port<br><input id="cl-console" type="text" style="width:200px" placeholder="192.168.1.11:8443"></label>' +
+      '<button class="small" data-act="cluster-token">生成加入码</button></div>';
+    if (S.clusterTok) {
+      var t = S.clusterTok;
+      h += '<div class="join-token">' + esc(t.command) + "</div>" +
+        '<div class="hint">加入码：<span class="mono">' + esc(t.token) + "</span><br>" +
+        "有效期到 " + esc(clock(t.expires_at)) + "（只显示这一次，关掉页面就找不回来了）" +
+        ' <button class="small" data-act="cluster-copy">复制命令</button></div>';
     }
     h += "</section>";
     return h;
@@ -9826,6 +9974,65 @@
           load().then(function () { toast("已刷新"); });
           if (S.view === "monitor") { loadMetrics(); S.histAt = 0; loadHistory(); }
           if (S.view === "ops") loadOps();
+        }
+        else if (act === "cluster-init") {
+          var ep0 = ((($("cl-init-endpoint") || {}).value) || "").trim();
+          if (!ep0) { toast("先填这台机器对外的地址"); return; }
+          if (!confirm("开启集群会用集群 CA 重签本机的服务端证书，控制台会短暂重连一次。继续？")) return;
+          api("POST", "/api/cluster", {
+            action: "init", endpoint: ep0,
+            console: (((($("cl-init-console") || {}).value) || "").trim()),
+            name: (((($("cl-init-name") || {}).value) || "").trim())
+          }).then(function () {
+            toast("集群已开启，现在可以添加第 2、3 台");
+            return load();
+          }).then(render).catch(function (err) { toast(err.message); });
+        }
+        else if (act === "cluster-token") {
+          var ep = ((($("cl-endpoint") || {}).value) || "").trim();
+          if (!ep) { toast("先填新机器的地址（host:port）"); return; }
+          var rep = S.clusterReplace || "";
+          api("POST", "/api/cluster", {
+            action: "token", kind: rep ? "replace" : "add",
+            replace_id: rep,
+            name: (((($("cl-name") || {}).value) || "").trim()),
+            endpoint: ep,
+            console: (((($("cl-console") || {}).value) || "").trim())
+          }).then(function (res) {
+            S.clusterTok = res;
+            S.clusterReplace = "";
+            toast("加入码已生成（30 分钟内有效，只能用一次）");
+            render();
+          }).catch(function (err) { toast(err.message); });
+        }
+        else if (act === "cluster-copy") {
+          if (!S.clusterTok) return;
+          var cmd = S.clusterTok.command;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(cmd).then(function () { toast("命令已复制"); },
+              function () { toast("复制失败，请手动选中"); });
+          } else { toast("这个浏览器不支持剪贴板，请手动选中"); }
+        }
+        else if (act === "cluster-replace") {
+          S.clusterReplace = el.getAttribute("data-id") || "";
+          S.clusterTok = null;
+          render();
+          toast("填上新机器的地址，生成加入码即可替换");
+        }
+        else if (act === "cluster-replace-clear") {
+          S.clusterReplace = "";
+          render();
+        }
+        else if (act === "cluster-remove") {
+          var mid = el.getAttribute("data-id") || "";
+          var mname = el.getAttribute("data-name") || mid;
+          if (!confirm("下线「" + mname + "」？\n\n它会被移出投票集合：设备不再拿到它的地址，" +
+              "它也不再参与多数派。剩下的成员必须仍然占多数，否则写会停。")) return;
+          api("POST", "/api/cluster", { action: "remove", id: mid }).then(function () {
+            toast("已下线 " + mname);
+            S.clusterTok = null;
+            return load();
+          }).then(render).catch(function (err) { toast(err.message); });
         }
         else if (act === "ops-refresh") {
           S.histAt = 0;

@@ -59,6 +59,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -353,6 +354,13 @@ type State struct {
 	// physically delete tenant B's history. 0 means "never configured" and
 	// falls back to opsDefaultRetentionDays.
 	LedgerRetentionDays int `json:"ledger_retention_days,omitempty"`
+
+	// Cluster is the controller cluster's membership table (cluster.go). nil =
+	// 单机控制器，没有共识、没有投票权；一旦在控制台"开启集群"就有了。
+	//
+	// 它进共识但不进"行复制"（hardstate.go 里显式跳过）：成员变更由配置项
+	// 唯一拥有，否则一次发布和一次加节点会互相覆盖。
+	Cluster *ClusterConfig `json:"cluster,omitempty"`
 }
 
 // Account is one console login. Passwords are stored only as PBKDF2 hashes
@@ -796,6 +804,38 @@ type server struct {
 	diagRecs map[string][]*diagRecord
 	// diagSeq mints diag ids. Only touched under s.mu.
 	diagSeq int
+
+	// ---- 集群（cluster.go / cluster_runtime.go / raft.go）
+	//
+	// raft 是共识引擎；nil = 单机模式，commit() 退回直接写 state.json。
+	// 两种模式共用同一条提交路径，所以写处理器不需要知道自己跑在哪种模式下。
+	raft     *raftNode
+	raftDisk *raftDisk
+	// hardIndex 是"已提交"的硬状态指纹表，commit() 拿它算 diff。
+	hardIndex map[string]string
+	// commitErr 是最近一次提交失败的原因；非空时控制台挂横幅、写请求 500。
+	commitErr    string
+	commitErrSeq uint64
+	// clusterOps 串行化成员变更：两个控制台同时点"添加"会各自算一份成员表，
+	// 后者会把前者覆盖掉（成员表是整表替换）。
+	clusterOps sync.Mutex
+	sweepKick  chan struct{}
+	secret     string // 节点间共享密钥，也用来签加入码
+	nodeID     string // 本机成员 id（cluster/node-id）
+	caPool     *x509.CertPool
+	// clusterCli 是节点间用的 HTTP 客户端。用原子指针：加入集群要换成集群 CA，
+	// 而它每次复制都要取一次 —— 挂在 s.mu 上就会和"持锁等提交"互相卡死。
+	clusterCli atomic.Pointer[http.Client]
+	// cert 是当前服务端证书。用原子指针而不是启动时的固定证书：加入集群后
+	// 要用集群 CA 重签一张覆盖本机地址的证书，监听器必须立刻换过去。
+	cert atomic.Pointer[tls.Certificate]
+	// peerAddr 是"成员 id → 地址"的一份只读快照，节点间复制每次都要查。
+	// 它不能走 s.mu：写路径持着 s.mu 等多数派确认，而确认本身要发 append，
+	// 在 s.mu 上取地址就是自己把自己锁死（现象：leader 一边等提交、一边看着
+	// follower 因为收不到心跳而改选，两边来回换主）。
+	peerAddr atomic.Pointer[peerAddrs]
+	// ctx 是进程的取消信号，共识与 sweep 都挂在它上面。
+	ctx context.Context
 }
 
 // pendingObs is an observation the controller could not name yet, kept with the
@@ -822,9 +862,16 @@ type attributedObs struct {
 	seenAt   int64 // controller clock, at report time -- used for expiry
 }
 
+// save 是"硬状态改了"的唯一出口（历史上叫 save，语义从"整份落盘"变成
+// "把这几行提交给多数派"）。名字保留是为了让 60 个调用点一行不改 —— 它们
+// 写的确实都是硬状态。
+//
+// 失败不在这里退出：控制台写请求由 commitGuard 改成 500，设备侧的关键路径
+// （入网）自己检查返回值。进程退出留给 raft 里的"落盘失败"——那是另一回事。
 func (s *server) save() {
-	if err := s.store.Save(s.state); err != nil {
-		log.Printf("store save failed: %v", err)
+	if err := s.commit(); err != nil {
+		// commit() 已经记下 commitErr 并打了日志，这里只需要让控制台红起来。
+		s.admin.publish("cluster.commit_failed", "", nil)
 	}
 }
 
@@ -1045,6 +1092,13 @@ func peerTenantFromCert(r *http.Request) (tenant string, nodeID uint16, err erro
 func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	// Enrollment is the ONE endpoint that accepts an unauthenticated caller:
 	// the device has no certificate yet. The claim code is the authorization.
+	//
+	// 入网是写：它会分配 node_id、签证书，这些都必须落在多数派上。落到
+	// follower 上等于两台机器各发一个 node_id —— 所以先转给 leader。307
+	// 会把 body 一起重放，设备端不需要改。
+	if s.redirectToLeader(w, r) {
+		return
+	}
 	var req wire.EnrollRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json", 400)
@@ -1204,7 +1258,13 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.CertPEM = certPEM
 	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
-	s.save()
+	// 入网这一步必须落盘/落多数派：设备拿着证书就再也回不来了，而 node_id
+	// 是数据面的身份。提交失败就回 500，让设备重试 —— 重投一次比发一个
+	// "在控制台看得见、切换后消失"的设备便宜得多。
+	if err := s.commit(); err != nil {
+		http.Error(w, "identity could not be committed: "+err.Error(), 500)
+		return
+	}
 	s.admin.publish("node.enrolled", tenant, rec)
 	s.appendOps("node.enrolled", tenant, rec.NodeID, "", "info",
 		fmt.Sprintf("设备入网：node %d，serial %s，授权 %s", rec.NodeID, req.Serial, claim.ID))
@@ -1362,7 +1422,15 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("underlay: tenant=%s node=%d 心跳补分配中转端口 %d", tenant, nodeID, port)
 		transitAssigned = true
 	}
-	s.save()
+	// 心跳不落盘、不进共识（P0 的核心改动）。它改的全是软状态：LastSeen、
+	// 设备自报的配置、隧道读数、接口清单 —— 重启后 5 秒内设备自己会再报一遍。
+	// 唯一可能变硬状态的是"补分配中转端口"，那一次必须提交，否则两台控制器
+	// 会给同一台设备发同一个端口。
+	if transitAssigned || configChanged {
+		s.saveIfLeader()
+	} else {
+		s.saveSoft()
+	}
 
 	// Coming back from stale, or offering key material peers have not seen, are
 	// both events peers need: their view of this node just changed.
@@ -1399,6 +1467,12 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		BindingErr:    bindingErr,
 		ConfigVersion: s.desiredConfigVersionLocked(tenant, nodeID),
 		TunnelVersion: s.underlayVersionLocked(tenant),
+		// 集群地址表 + leader 提示。设备不需要 VIP：心跳应答里就有完整列表，
+		// agent 自己轮换（P2）。leader 单独给一个，是因为"写"只在 leader 上
+		// 成立 —— 设备连到 follower 也能活，但入网、补端口这类硬变更会被
+		// 307 到 leader，多一次往返。
+		TLSAddrs: s.memberEndpointsLocked(),
+		Leader:   s.leaderEndpointLocked(),
 		// Every beat, not just enrollment: a restarted agent already has an
 		// identity and so never asks again, and a controller that started its
 		// reflector after this device enrolled must still reach it. The heartbeat
@@ -2360,6 +2434,11 @@ func main() {
 		// bound AND advertised verbatim -- see parseStunAddrs for why the host
 		// part can never be left out.
 		stunAddrs = flag.String("stun", "", "comma-separated ip:port UDP addresses to answer STUN on (empty disables address discovery; two entries are what makes the symmetric-NAT verdict measurable)")
+		// 集群：初始的加入只发生在启动时（一条命令），之后的加/替换/下线都在
+		// 控制台完成，不需要再碰命令行。
+		joinURL  = flag.String("join", "", "join an existing controller cluster: https://leader:8443（配合 -join-token）")
+		joinTok  = flag.String("join-token", "", "控制台签发的加入码（一次性，30 分钟有效）")
+		nodeName = flag.String("node-name", "", "本控制器在集群里的名字（默认用主机名）")
 	)
 
 	flag.Parse()
@@ -2423,6 +2502,7 @@ func main() {
 		reflectors:    reflectors,
 		caCert:        ca,
 		caKey:         caKey,
+		caPool:        caPool,
 		dataDir:       *dataDir,
 		obs:           map[string]observerView{},
 		pendingObs:    map[string]map[string]*pendingObs{},
@@ -2435,7 +2515,36 @@ func main() {
 		lastSampleAt:  map[string]int64{},
 		lastSelection: map[string]uint8{},
 		diagRecs:      map[string][]*diagRecord{},
+		sweepKick:     make(chan struct{}, 1),
+		ctx:           ctx,
 	}
+	// 服务端证书用原子指针挂上去：加入集群之后要用集群 CA 重签一张覆盖本机
+	// 地址的证书，监听器必须立刻换过去，否则对端校验会一直失败到进程重启。
+	s.cert.Store(&srvCert)
+
+	// ---- 集群：要么加入别人，要么把已有的成员表捡起来继续跑。
+	if *joinURL != "" || *joinTok != "" {
+		if *joinURL == "" || *joinTok == "" {
+			log.Fatal("加入集群需要同时给 -join（leader 地址）和 -join-token（控制台签发的加入码）")
+		}
+		if err := s.joinCluster(*joinURL, *joinTok, ctrlVersion); err != nil {
+			log.Fatalf("cluster join: %v", err)
+		}
+		if err := s.reloadCA(); err != nil {
+			log.Fatalf("cluster join: 载入集群 CA 失败: %v", err)
+		}
+		ca, caKey, caPool = s.caCert, s.caKey, s.caPool
+	} else {
+		s.loadLocalClusterIdentity(*nodeName)
+		if st.Cluster != nil {
+			if err := s.startRaft(); err != nil {
+				log.Fatalf("cluster: %v", err)
+			}
+			s.tlsAddrs = s.memberEndpoints()
+		}
+	}
+	s.resetHardIndex()
+	go s.clusterSweep(ctx)
 
 	go s.ttlSweeper(ctx)
 
@@ -2452,6 +2561,11 @@ func main() {
 	mux.HandleFunc("/v1/reach", s.handleReach)
 	mux.HandleFunc("/v1/registry", s.handleRegistry)
 	mux.HandleFunc("/v1/watch", s.handleWatch)
+	// 节点间 RPC：选票、日志、快照、加入。全部走共享密钥，不认设备证书。
+	mux.HandleFunc("/v1/cluster/vote", s.handleClusterVote)
+	mux.HandleFunc("/v1/cluster/append", s.handleClusterAppend)
+	mux.HandleFunc("/v1/cluster/snapshot", s.handleClusterSnapshot)
+	mux.HandleFunc("/v1/cluster/join", s.handleClusterJoin)
 
 	hs := &http.Server{
 		Addr:    *listen,
@@ -2461,10 +2575,12 @@ func main() {
 		// cannot vary per path at handshake time, so enforcement lives in one
 		// function instead of being spread across handlers.
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{srvCert},
-			ClientAuth:   tls.VerifyClientCertIfGiven,
-			ClientCAs:    caPool,
-			MinVersion:   tls.VersionTLS12,
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return s.cert.Load(), nil
+			},
+			ClientAuth: tls.VerifyClientCertIfGiven,
+			ClientCAs:  caPool,
+			MinVersion: tls.VersionTLS12,
 		},
 	}
 

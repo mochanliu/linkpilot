@@ -432,6 +432,10 @@ func main() {
 	// Heartbeat loop. A failure is logged and retried on the same cadence: the
 	// controller has its own staleness timer, and a device that exits on the
 	// first blip can never come back on its own.
+	//
+	// 集群之后还有第二条路：换端点。心跳应答带着完整地址表和当前 leader，
+	// 连不上就立刻试下一个（不退避），只有整张表都试过一轮才回到 2s→30s。
+	book := newAddrBook(base)
 	backoff := time.Duration(0)
 	for {
 		hbctx, hbcancel := context.WithTimeout(ctx, 10*time.Second)
@@ -460,10 +464,26 @@ func main() {
 				log.Printf("identity rejected by the controller; wipe %s to re-enroll", *idDir)
 				return
 			}
+			// 先换端点，再谈退避：leader 挂了的情况下，等 2 秒就是白等。
+			if next, ok := book.next(); ok {
+				was := client.Base()
+				if err := client.SetBase(next); err == nil {
+					log.Printf("controller %s unreachable, switching to %s", was, next)
+					continue
+				}
+			}
 			backoff = nextBackoff(backoff)
 		} else {
 			st.markOK(resp)
 			backoff = 0
+			book.ok()
+			// 地址表 + leader 提示：写只在 leader 上成立，跟着它走少一次 307。
+			if next := book.learn(resp.TLSAddrs, resp.Leader); next != "" {
+				if err := client.SetBase(next); err == nil {
+					log.Printf("controller leader is %s, switching (%d endpoint(s) known)",
+						next, book.size())
+				}
+			}
 			// The controller may start its reflector service after this box already
 			// enrolled, and a restarted agent never enrolls again -- so the list
 			// rides every ack, and a changed list makes the loop take a new round.

@@ -742,6 +742,19 @@ type HeartbeatResponse struct {
 	// enrolls again, must still find out. The agent keeps one probe socket for
 	// its lifetime, so a changed list is re-probed rather than appended to.
 	Reflectors []string `json:"reflectors,omitempty"`
+	// TLSAddrs is the current controller endpoint list (every active cluster
+	// member's mTLS address). It rides every beat, not just enrollment, so a
+	// device that is already enrolled learns about a NEW controller without
+	// anyone touching its configuration or its command line: the agent keeps
+	// the list and rotates to the next address when the current one stops
+	// answering. An empty list means "single controller, keep using what you
+	// have" -- an older controller simply does not send it.
+	TLSAddrs []string `json:"tls_addrs,omitempty"`
+	// Leader is the address of the controller that currently accepts writes.
+	// The agent prefers it for the next beat (enrollment, port assignment and
+	// every other hard change happen there); a follower still answers the beat,
+	// so a device never goes silent just because it picked the "wrong" node.
+	Leader string `json:"leader,omitempty"`
 	// Diag is one queued remote-diagnosis command, delivered here instead of a
 	// separate pull because the beat is already the reliable downlink. nil =
 	// nothing pending (or the agent said it is busy). Delivery is pop-once:
