@@ -57,7 +57,7 @@
 | S1-1 | 安全 | Fortinet 一体机 NGFW+IPS+URL；PAN App-ID+ZTNA；Cisco Umbrella | VPP 有 acl-plugin，但**没有建模成"防火墙策略"页面**；无 IPS/URL/AV；无 ZTNA/SASE 对接【码】 | 要么补一条安全线，要么明确"不做，对接第三方" |
 | S1-2 | 链路增强 | VeloCloud DMPO（逐包）、Aruba Boost（FEC/去重/压缩）、PAN 包复制 | 无 FEC/去重/包序纠正/逐包分担；只有按流按颜色选路【码，grep 无命中】 | 弱网（丢包 1–3%）场景体验差距明显，是"贵的那部分"卖点 |
 | S1-3 | 云/SaaS 接入 | Cloud OnRamp（AWS/Azure/GCP/阿里云）、SaaS 加速、全球 PoP | 无云网关、无 SaaS 加速、无 PoP；只有自建 CPE 组网【码】 | 大客户/多云场景必需；中小可后置 |
-| S1-4 | 高可用 | CPE 双机（会话同步）、控制器集群、RR 多活 | CPE 侧只有 LAN 的 VRRP VIP，**无隧道/会话状态同步**；sr-ctrl 单实例（RR 有分组）【码，grep leader/standby 无命中】 | 金融/运营商招标的硬门槛 |
+| S1-4 | 高可用 | CPE 双机（会话同步）、控制器集群、RR 多活（控制器方案见 `controller-ha-plan.md`） | CPE 侧只有 LAN 的 VRRP VIP，**无隧道/会话状态同步**；sr-ctrl 单实例（RR 有分组）【码，grep leader/standby 无命中】 | 金融/运营商招标的硬门槛 |
 | S1-5 | 升级体系 | A/B 分区 + 分批灰度 + 不断流升级 | 手工换二进制，客户可见断流 ~4s；无固件包管理/版本编排【码，#293 实测 4.2s】 | 规模化运维的痛点，也是"可信交付"的门面 |
 | S1-6 | 可观测性深度 | per-app/per-user/per-path、IPFIX 导出、合成拨测（HTTP/DNS/MOS）、30 天+、对接 Prometheus/SNMP | 有隧道级指标 + 24h；**无 flow/IPFIX、无 per-app、无 top talker、无合成拨测、无 SNMP/syslog 导出**【码】 | 排障时"客户说慢"我们只能给隧道 RTT，给不出"哪个应用慢" |
 | S1-7 | IPv6 | 主流已双栈（含 IPv6 隧道、v6 策略、VRRPv3） | 配置模型/隧道/策略全无 v6（只有 diag 白名单里有 `ip6 fib` 只读命令）【码】 | 政企/运营商逐步强制 |
