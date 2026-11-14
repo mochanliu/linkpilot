@@ -159,7 +159,14 @@ agent 会话里直接 `restart-ctrl.sh`（内部 nohup）起的进程会**随 ag
 现在改用 **`python3 /Users/louis/srvmlab/start-sr-ctrl-detached.py`**（double-fork + setsid，token 从
 `~/srvmlab/state/console-token` 读，不进命令行）。换件步骤：`install` 新二进制到 `~/srvmlab/ctrl/bin/sr-ctrl`
 （先 `cp -p` 一份 `.prev-*` 备份）→ `kill -TERM $(pgrep -x sr-ctrl)` → 跑上面那个脚本 → 30 秒内四节点重连。
-当前代际：sr-ctrl `c32a8e703fd2d1c8d288dc5e4c78ec8b`（2026-11-14 09:10，选择器
+当前代际：sr-ctrl `d73329f9bc167272ad7f66d6c68c1749`（2026-11-14 10:20，
+选中条目画面不动：render 的焦点护栏（焦点在 #content 输入控件上整帧跳过）
+吞掉了选中那一帧——条目 mousedown 的 preventDefault 让输入框一直带焦点；
+两个选中回调改为先 blur 再 render（histBlurForRender）。此 bug 由 headless
+Chromium + CDP 监听器检查定位，jsdom 抓不到（手动 focus 不改 activeElement）；
+调试件在 /tmp/lpevt/（jsdom 事件模拟 sim.mjs + Playwright live*.mjs，
+chromium 在 /tmp/pw-browsers）。上一代
+`c32a8e703fd2d1c8d288dc5e4c78ec8b`（2026-11-14 09:10，选择器
 卡顿三连修：loadHistory 只拉当前设备（默认全量 18MB，WAN 上堵死交互）；
 选择器冻结提前到 mousedown（histHold）+ render 加 freezeAt 60s 过期安全阀；
 换设备清 S.history 并显示「正在拉取」提示）。
