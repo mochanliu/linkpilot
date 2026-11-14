@@ -9382,6 +9382,15 @@
         return p && p.className.indexOf("open") >= 0;
       });
     };
+    // 选中条目后必须先把焦点从输入框上拿掉再 render()：render 有焦点护栏
+    // （焦点在 #content 的 INPUT/SELECT/TEXTAREA 上就整帧跳过，保护表单不被
+    // 轮询重绘冲掉），而条目的 mousedown preventDefault 恰好让输入框一直
+    // 带着焦点——不清掉，选中的那帧就被护栏吞了，状态变了画面不动，
+    // 用户要点一下空白处（失焦后的下一拍轮询）才看得到生效。
+    var histBlurForRender = function () {
+      var a = document.activeElement;
+      if (a && a.blur) a.blur();
+    };
     var histHold = function (pickId) {
       // 冻结在 mousedown 就压上，不等 focus：5s 轮询的重绘若恰好落在
       // mousedown 和 focus 之间，点击会被整页替换吃掉（点了没反应）。
@@ -9431,6 +9440,7 @@
         S.freeze = false;
         S.histAt = 0;
         loadHistory();
+        histBlurForRender();
         render();
       });
     }
@@ -9466,6 +9476,7 @@
         S.histT = t.getAttribute("data-hist-tunnel") || "";
         S.histTQ = "";
         S.freeze = false;
+        histBlurForRender();
         render();
       });
     }

@@ -147,6 +147,12 @@ func TestConsoleMonitorHistPicker(t *testing.T) {
 	if !strings.Contains(bd, `histHold("hist-pick")`) || !strings.Contains(bd, `addEventListener("mousedown"`) {
 		t.Error("bind() 没有在 mousedown 就压冻结：5s 重绘落在 mousedown 和 focus 之间会吃掉点击")
 	}
+	// render 的焦点护栏（焦点在 #content 输入控件上整帧跳过）会吞掉选中后
+	// 的那一帧重绘：条目 mousedown 的 preventDefault 让输入框一直带着焦点，
+	// 状态变了画面不动，要点空白处失焦后才生效。两个选中回调必须先 blur。
+	if !strings.Contains(bd, "histBlurForRender") || strings.Count(bd, "histBlurForRender();") < 2 {
+		t.Error("bind() 选中回调没有先 blur 再 render：焦点护栏会吞掉选中那一帧，点了条目要等下一拍轮询才生效")
+	}
 	if !strings.Contains(r, "S.freezeAt") {
 		t.Error("render() 没有 freezeAt 过期安全阀：blur 丢了冻结会卡死整页")
 	}
