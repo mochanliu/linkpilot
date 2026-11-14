@@ -1157,6 +1157,12 @@ func (r *raftNode) handleAppend(req appendReq) appendResp {
 		r.disk.saveMeta(r.metaLocked())
 	}
 	r.leader = req.Leader
+	// follower 也要记一笔"我刚收到 leader 的包"。lastHeard 原本只在 leader 收到
+	// append 应答时才写，于是 follower 上永远是空表，控制台就把活着的 leader
+	// 标成"失联"（lab 实测 2026-11-14：三台健康，每台 follower 都把别人报失联）。
+	if req.Leader != r.id {
+		r.lastHeard[req.Leader] = time.Now()
+	}
 	r.resetElection()
 	resp.Term = r.term
 	// 新 leader 上任了：我之前记的"自己提的条目"不再作数，否则换主后会漏应用。

@@ -328,9 +328,13 @@ func TestRRConfigPeersAndLastFetch(t *testing.T) {
 		t.Fatalf("peer addr = %q", out.Peers[0].Addr)
 	}
 
-	row := s.state.RRs.get(first)
-	if row.LastFetchAt == 0 || row.LastFetchAddr != "198.51.100.7" {
-		t.Fatalf("last fetch = %d/%q", row.LastFetchAt, row.LastFetchAddr)
+	// 这一笔只在内存里（读数是读数，写进硬状态就是每 5 秒一轮共识），
+	// 但页面必须看得到 —— 下面那条 /api/rrs 的断言才是这条要求的落点。
+	if f := s.rrFetch[first]; f.At == 0 || f.Addr != "198.51.100.7" {
+		t.Fatalf("last fetch = %d/%q", f.At, f.Addr)
+	}
+	if row := s.state.RRs.get(first); row.LastFetchAt != 0 {
+		t.Fatalf("last fetch 不该进状态：%d", row.LastFetchAt)
 	}
 
 	// The earned fetch signal is what the row shows, so it must survive the

@@ -11,6 +11,7 @@ package main
 // 而是在唯一的持久化出口上换一个实现。
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -22,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -330,6 +332,7 @@ func (s *server) redirectToLeader(w http.ResponseWriter, r *http.Request) bool {
 		leaderID = s.raft.Leader()
 	}
 	var target string
+	var targetTLS bool
 	if leaderID != "" && s.state.Cluster != nil {
 		if m := s.state.Cluster.Members[leaderID]; m != nil {
 			if strings.HasPrefix(r.URL.Path, "/api/") {
@@ -337,8 +340,10 @@ func (s *server) redirectToLeader(w http.ResponseWriter, r *http.Request) bool {
 				if target == "" {
 					target = m.Endpoint
 				}
+				targetTLS = m.ConsoleTLS
 			} else {
 				target = m.Endpoint
+				targetTLS = true
 			}
 		}
 	}
@@ -348,13 +353,123 @@ func (s *server) redirectToLeader(w http.ResponseWriter, r *http.Request) bool {
 			http.StatusServiceUnavailable)
 		return true
 	}
+	// scheme 必须跟着**目标**走，不能跟着这次请求走：同一台机器上 TLS 控制台
+	// 和明文回环口是并存的，从明文口进来的写请求一样要 307 到 leader 的 https。
 	scheme := "https://"
-	if strings.HasPrefix(r.URL.Path, "/api/") && r.TLS == nil {
+	if strings.HasPrefix(r.URL.Path, "/api/") && !targetTLS {
 		scheme = "http://"
+	}
+	// 会话不跨节点：把"这个请求是谁"签一张 60 秒的断言带上，否则 leader 只会
+	// 看到一个它没见过的 cookie，回 401（lab 实测，见 cluster_session.go）。
+	if a := s.signSession(s.session(r)); a != "" {
+		w.Header().Set(clusterSessionHeader, a)
 	}
 	u := scheme + target + r.URL.RequestURI()
 	log.Printf("cluster: %s %s 不在 leader 上，307 → %s", r.Method, r.URL.Path, u)
 	http.Redirect(w, r, u, http.StatusTemporaryRedirect)
+	return true
+}
+
+// ---------------------------------------------------------------- 写转发
+
+// leaderProxyMaxBody 是能转发的请求体上限。配置表整份上传是这里最大的合法
+// 请求（CSV 走 base64 塞在 JSON 里），几 MB；留 16 MB 有余量，也挡住"谁把
+// 一个 G 的 body 打到 follower 上"。
+const leaderProxyMaxBody = 16 << 20
+
+// leaderProxyClient 专门用来把控制台写请求转给 leader。
+//
+// 控制台证书是每台自签的（和集群 CA 不是一条链），所以这里不做链校验。这是
+// 集群内部的回环流量，且断言本身有 HMAC：能读到的只有成员。**待办**：把控制台
+// 证书也纳入集群 CA，或按成员钉指纹，就没有这条 InsecureSkipVerify 了。
+var leaderProxyClient = &http.Client{
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+	},
+}
+
+// proxyToLeader 把这一次写请求原样转给 leader，并把应答原样带回来。
+//
+// 返回 true 表示"已经答完了"。返回 false 只有两种情况：我就是 leader，或者
+// 这个进程还没进集群 —— 那时照旧走本地处理器。
+func (s *server) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if s.raft == nil || s.raft.IsLeader() {
+		return false
+	}
+	// 两台对"谁是 leader"的判断不一致时，转来转去会打成死循环。见第二跳就拒。
+	if r.Header.Get("X-Cluster-Hop") != "" {
+		http.Error(w, "写请求在控制器之间来回转：两台对谁是 leader 的判断不一致，请到集群页确认成员状态", http.StatusServiceUnavailable)
+		return true
+	}
+	s.mu.Lock()
+	leaderID := ""
+	if s.state.Cluster != nil {
+		leaderID = s.raft.Leader()
+	}
+	var target string
+	var targetTLS bool
+	if leaderID != "" && s.state.Cluster != nil {
+		if m := s.state.Cluster.Members[leaderID]; m != nil {
+			target, targetTLS = m.Console, m.ConsoleTLS
+			if target == "" {
+				target, targetTLS = m.Endpoint, true
+			}
+		}
+	}
+	s.mu.Unlock()
+	if target == "" {
+		http.Error(w, "这台不是 leader，而且集群暂时没有 leader（可能已失去多数派）；请在恢复多数派后重试",
+			http.StatusServiceUnavailable)
+		return true
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, leaderProxyMaxBody+1))
+	if err != nil {
+		http.Error(w, "读取请求体失败："+err.Error(), http.StatusBadRequest)
+		return true
+	}
+	if len(body) > leaderProxyMaxBody {
+		http.Error(w, "请求体超过 16 MB，拒绝转发", http.StatusRequestEntityTooLarge)
+		return true
+	}
+	scheme := "https://"
+	if !targetTLS {
+		scheme = "http://"
+	}
+	u := scheme + target + r.URL.RequestURI()
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, r.Method, u, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "构造转发请求失败："+err.Error(), http.StatusInternalServerError)
+		return true
+	}
+	req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
+	req.Header.Set("X-Cluster-Hop", "1")
+	if a := s.signSession(s.session(r)); a != "" {
+		req.Header.Set(clusterSessionHeader, a)
+	}
+	resp, err := leaderProxyClient.Do(req)
+	if err != nil {
+		http.Error(w, "leader（"+target+"）没有应答："+err.Error(), http.StatusBadGateway)
+		return true
+	}
+	defer resp.Body.Close()
+	for k, vs := range resp.Header {
+		// Set-Cookie 不能透传：那是 leader 域名下的会话 id，本机不认，
+		// 透传只会把浏览器手里这张好用的 cookie 覆盖掉。
+		if strings.EqualFold(k, "Set-Cookie") || strings.EqualFold(k, "Connection") {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, io.LimitReader(resp.Body, leaderProxyMaxBody))
 	return true
 }
 
@@ -431,11 +546,17 @@ func (s *server) commitGuard(next http.Handler) http.Handler {
 //
 // 读留在本地：follower 的状态可能落后几百毫秒，但一次刷新就追上了；而写必须
 // 只有一个入口，否则两台机器会各自写出一份"客户以为已经生效"的配置。
+//
+// 为什么是**服务端代理**而不是 307：控制台是个 SPA，页面用 fetch 交 JSON。
+// 浏览器跟 307 的时候，跨源（同机不同端口）的 fetch 默认不带 cookie，而会话
+// 又是每个节点各自内存里的 —— 结果就是"在 follower 上点发布 → 跳到 leader →
+// 401"（2026-11-14 lab 实测）。服务端转发没有这一层：浏览器始终跟发起请求的
+// 那台说话，身份由本机会话决定，再签给 leader 验。
 func (s *server) leaderGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead &&
 			strings.HasPrefix(r.URL.Path, "/api/") && !nodeLocalPath(r.URL.Path) {
-			if s.redirectToLeader(w, r) {
+			if s.proxyToLeader(w, r) {
 				return
 			}
 		}

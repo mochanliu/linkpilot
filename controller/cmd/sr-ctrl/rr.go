@@ -72,8 +72,11 @@ type RRItem struct {
 	// asked for its peers. The controller still never dials Addr, so a fresh
 	// fetch says "the RR can reach the controller", nothing about the RR-to-RR
 	// paths.
-	LastFetchAt   int64  `json:"last_fetch_at_unix,omitempty"`
-	LastFetchAddr string `json:"last_fetch_addr,omitempty"`
+	//
+	// 这两个字段**不进状态**（json:"-"）：它们每 5 秒就变一次，属于读数而不是
+	// 配置。落进硬状态就等于让集群为"谁刚来过"持续提交（见 server.rrFetch）。
+	LastFetchAt   int64  `json:"-"`
+	LastFetchAddr string `json:"-"`
 
 	CreatedAt int64 `json:"created_at_unix"`
 	UpdatedAt int64 `json:"updated_at_unix,omitempty"`
@@ -394,12 +397,27 @@ func (s *server) rrRowOfLocked(it RRItem) rrRow {
 	if devices == nil {
 		devices = []rrBindRef{}
 	}
+	fetch := s.rrFetch[it.ID]
 	return rrRow{
 		ID: it.ID, Name: it.Name, Addr: it.Addr, Location: it.Location,
 		Devices: devices, Identity: it.Identity, NeedsResign: it.resignReason(),
-		LastFetchAt: it.LastFetchAt, LastFetchAddr: it.LastFetchAddr,
+		LastFetchAt: fetch.At, LastFetchAddr: fetch.Addr,
 		CreatedAt: it.CreatedAt, UpdatedAt: it.UpdatedAt,
 	}
+}
+
+// rrFetchInfo 是"这台 RR 最后一次来取配置"的读数。只在本机内存里，理由见
+// server.rrFetch 的注释：这是读数，不是配置，不该为此提交一轮共识。
+type rrFetchInfo struct {
+	At   int64
+	Addr string
+}
+
+func (s *server) noteRRFetchLocked(id string, at int64, addr string) {
+	if s.rrFetch == nil {
+		s.rrFetch = map[string]rrFetchInfo{}
+	}
+	s.rrFetch[id] = rrFetchInfo{At: at, Addr: addr}
 }
 
 // validRRAddr accepts what the device can dial: a hostname or an IP literal with

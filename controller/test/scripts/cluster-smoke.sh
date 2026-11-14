@@ -156,8 +156,8 @@ replace_addr_ok() { # <n> <旧成员 id> <旧地址> —— 替换场景要能�
 }
 
 # 写一笔真实数据（建租户）：既是硬状态的一行，也是客户最常做的动作。
-# 写到 leader 上 —— follower 会把写 307 给 leader，curl 不带 -L 不跟（浏览器会跟，
-# 这一条单独用 redirected_to_leader 验）。
+# 写到 leader 上 —— follower 上的写会由**服务端代理**转给 leader（见
+# write_via_follower：浏览器不会跟着 307 把会话带过去，所以这里不靠重定向）。
 write_ok() { # <tenant_id>
 	local l; l=$(leader_idx)
 	[ -z "$l" ] && return 1
@@ -173,19 +173,30 @@ print("yes" if any(t.get("tenant_id")==sys.argv[1] for t in (d.get("tenants") or
 ' "$2" | grep -qx yes
 }
 
-redirected_to_leader() { # 任一 follower：写请求必须 307 到 leader 的控制台
-	local n l out code loc
+# 在 follower 的控制台上写：会话是本机的，写由 follower 代理给 leader 提交，
+# 应答原样回来。客户看到的是"任何一台都能改"，不需要知道谁是 leader。
+# follower 上的"有多数派"必须和 leader 说的一致。
+# 走进 lab 之前这条是错的：lastHeard 只有 leader 会打点，follower 按同一套算法
+# 数永远只数到自己 → 一切正常也喊"无多数派 · 只读"（2026-11-14 实测）。
+follower_quorum() {
+	local n l
+	l=$(leader_idx); [ -z "$l" ] && return 1
+	for n in 1 2 3; do
+		[ "$n" = "$l" ] && continue
+		view "$n" | grep -q '"quorum":true' || return 1
+	done
+	return 0
+}
+
+write_via_follower() {
+	local n l out
 	l=$(leader_idx); [ -z "$l" ] && return 1
 	for n in 1 2 3; do
 		[ "$n" = "$l" ] && continue
 		view "$n" >/dev/null 2>&1 || continue
-		out=$(curl -sS -m 10 -o /dev/null -w '%{http_code} %{redirect_url}' -b "$WORK/jar$n" \
-			-X POST -H 'Content-Type: application/json' -d '{"tenant_id":"smoke-z"}' \
-			"http://127.0.0.1:$(c_port "$n")/api/tenants")
-		code=${out%% *}; loc=${out##* }
-		if [ "$code" = 307 ] && printf '%s' "$loc" | grep -q "127.0.0.1:$(c_port "$l")"; then
-			return 0
-		fi
+		out=$(api "$n" POST /api/tenants '{"tenant_id":"smoke-proxy","name":"经 follower 写"}')
+		printf '%s' "$out" | grep -q '"tenant_id"' || continue
+		api "$l" GET /api/state | grep -q 'smoke-proxy' && return 0
 	done
 	return 1
 }
@@ -219,7 +230,8 @@ for n in 2 3; do
 	start_node "$n" "c$n" -join "https://127.0.0.1:$(p_port 1)" -join-token "$tok"
 	waitfor 30 "c$n 成为 voter" is_voter 1 "c$n"
 done
-waitfor 20 "三台都是活跃 voter" has_voters 1 3
+waitfor 10 "三台都是活跃 voter" has_voters 1 3
+waitfor 10 "follower 也说有多数派" follower_quorum
 
 say "2.1 同一个地址不能被两个成员占着"
 # 两个成员指向同一个地址会把多数派算虚（leader 发给同一台两次，另一份永远追不上），
@@ -243,7 +255,7 @@ waitfor 20 "剩下的两台选出新 leader" has_leader_other_than "$s1" "$old" 
 	waitfor 20 "剩下的两台选出新 leader" has_leader_other_than "$s2" "$old"
 waitfor 10 "切换期间写还能提交" write_ok smoke-b
 waitfor 10 "写的内容已经复制到另一台" write_matches "$s2" smoke-b
-waitfor 10 "follower 上的写被 307 到 leader" redirected_to_leader
+waitfor 10 "follower 上的写被代理到 leader 并提交成功" write_via_follower
 
 say "4. 把挂掉的那台装回来（命令行里还留着上一次的加入码）"
 # 部署时把 -join 顺手写进 systemd 单元是常见写法。加入码是一次性的、30 分钟过期，

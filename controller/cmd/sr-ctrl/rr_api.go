@@ -442,9 +442,9 @@ func (s *server) handleRRConfig(w http.ResponseWriter, r *http.Request) {
 		peers = append(peers, rrPeer{ID: row.ID, Addr: row.Addr})
 	}
 	now := time.Now().Unix()
-	it.LastFetchAt = now
-	it.LastFetchAddr = remoteHost(r.RemoteAddr)
-	s.save()
+	// 只记在本机内存里：这是"它刚来过"的读数，不是配置。写进硬状态会让集群
+	// 每 5 秒为所有 RR 的轮询提交一轮共识（lab 实测，见 server.rrFetch）。
+	s.noteRRFetchLocked(it.ID, now, remoteHost(r.RemoteAddr))
 
 	writeJSON(w, rrConfigResponse{
 		Tenant: ref.Tenant, RRID: it.ID, Peers: peers, GeneratedAtUnix: now,

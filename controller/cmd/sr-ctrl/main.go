@@ -732,6 +732,10 @@ type server struct {
 	nextSub  int
 	hbSec    int
 	tlsAddrs []string
+	// consoleTLS 是"控制台监听器讲不讲 TLS"。集群里它要写进成员表：follower
+	// 307 时必须知道 leader 的控制台是 https 还是明文，猜错就是把人送到一个
+	// 只讲 TLS 的端口上。
+	consoleTLS bool
 	// reflectors are the STUN endpoints advertised to agents (see serveStun). Set
 	// once at boot before any listener starts and never mutated, so handlers read
 	// it without the mutex. Empty = this controller runs no reflector service.
@@ -757,6 +761,12 @@ type server struct {
 	// Keyed by observer rather than by target because there is no target-wide
 	// answer: under a symmetric NAT every observer sees a different port.
 	obs map[string]observerView
+
+	// rrFetch 是每台 RR 最后一次来取配置的时间与来源地址，**只在本机内存里**。
+	// 它是读数不是配置：RR 每 5 秒来一次，如果把它写进硬状态，集群就会每 5 秒
+	// 为一个"谁刚来过"提交一轮共识、日志因此持续增长（2026-11-14 lab 实测：
+	// 空闲集群 commit 每秒 +1，全部是 RRs 这一行）。和 LastSeen 一个道理。
+	rrFetch map[string]rrFetchInfo
 
 	// pendingObs holds reported sources nothing could be matched to yet, kept per
 	// observer so that a node which declares its addresses AFTER the observation
@@ -2394,7 +2404,10 @@ func (s *server) ttlSweeper(ctx context.Context) {
 			s.expireClaimCodesLocked(now)
 			s.sweepTelemetryGapLocked(now)
 			s.pruneLedgerIfDueLocked(now)
-			s.save()
+			// saveIfLeader 而不是 save：这一轮的结论（谁失联、哪条遥测过期）本来
+			// 就是 leader 定的。follower 提交只会得到"这台不是 leader"，每 2 秒
+			// 往日志里写一行（lab 实测：健康集群里每台 follower 都在刷这句）。
+			s.saveIfLeader()
 			s.mu.Unlock()
 		}
 	}
@@ -2499,12 +2512,14 @@ func main() {
 		subs:          map[int]*subscriber{},
 		hbSec:         *hbSec,
 		tlsAddrs:      []string{*listen},
+		consoleTLS:    *consoleTLS,
 		reflectors:    reflectors,
 		caCert:        ca,
 		caKey:         caKey,
 		caPool:        caPool,
 		dataDir:       *dataDir,
 		obs:           map[string]observerView{},
+		rrFetch:       map[string]rrFetchInfo{},
 		pendingObs:    map[string]map[string]*pendingObs{},
 		tel:           map[string]*nodeTelemetry{},
 		telTTLSec:     *metricsTTL,

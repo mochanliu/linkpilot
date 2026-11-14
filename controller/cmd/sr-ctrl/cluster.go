@@ -70,12 +70,16 @@ type ClusterMember struct {
 	Name     string `json:"name"`
 	Endpoint string `json:"endpoint"`          // mTLS host:port，设备也用它
 	Console  string `json:"console,omitempty"` // 控制台 host:port，用于 follower 307
-	Role     string `json:"role"`              // voter | learner
-	Status   string `json:"status"`            // active | draining | decommissioned
-	JoinedAt int64  `json:"joined_at_unix"`
-	Replaces string `json:"replaces,omitempty"` // 它替换了谁（审计用）
-	Version  string `json:"version,omitempty"`
-	Note     string `json:"note,omitempty"` // 下线原因，给下一个看这个页面的人
+	// ConsoleTLS 是"这个控制台地址是 https 吗"。307 必须带对 scheme：同一台
+	// 机器常常同时开 8443(https) 与 8088(明文回环)，从明文口进来就猜 http 会
+	// 把请求送到一个只讲 TLS 的端口上（2026-11-14 lab 实测，见 ha-plan §9.3）。
+	ConsoleTLS bool   `json:"console_tls,omitempty"`
+	Role       string `json:"role"`   // voter | learner
+	Status     string `json:"status"` // active | draining | decommissioned
+	JoinedAt   int64  `json:"joined_at_unix"`
+	Replaces   string `json:"replaces,omitempty"` // 它替换了谁（审计用）
+	Version    string `json:"version,omitempty"`
+	Note       string `json:"note,omitempty"` // 下线原因，给下一个看这个页面的人
 }
 
 // ClusterConfig 是集群的成员表。Generation 每次变更 +1，控制台拿它判断
@@ -420,6 +424,9 @@ func (s *server) handleClusterSnapshot(w http.ResponseWriter, r *http.Request) {
 type joinRequest struct {
 	Token   string `json:"token"`
 	Version string `json:"version"`
+	// ConsoleTLS 由加入方自报：只有它自己知道自己的控制台是 https 还是明文，
+	// leader 拿它写进成员表，之后 follower 的 307 才知道该用哪个 scheme。
+	ConsoleTLS bool `json:"console_tls,omitempty"`
 }
 
 type joinResponse struct {
@@ -478,7 +485,8 @@ func (s *server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nm := ClusterMember{ID: p.Member, Name: p.Name, Endpoint: p.Endpoint,
-		Console: p.Console, Role: memberLearner, Status: memberActive,
+		Console: p.Console, ConsoleTLS: req.ConsoleTLS,
+		Role: memberLearner, Status: memberActive,
 		JoinedAt: time.Now().Unix(), Replaces: p.Replaces, Version: req.Version}
 	if err := s.applyMembershipChange("add", nm.ID, p.Replaces, func(ms []ClusterMember) []ClusterMember {
 		return upsertMember(ms, nm)
@@ -615,8 +623,17 @@ func (s *server) clusterViewLocked() clusterView {
 		mv := clusterMemberView{ClusterMember: m, Leader: st.Leader == m.ID,
 			Match: peer.Match, Reachable: peer.Reachable, LastHeard: peer.LastHeard,
 			Self: m.ID == s.nodeID}
-		if st.Commit > peer.Match {
-			mv.Behind = st.Commit - peer.Match
+		// matchIndex 只有 leader 在维护：follower 上它是空的，照抄就会让控制台
+		// 在健康集群里显示"每台都落后 43 条"。只有 leader 有资格报落后多少。
+		if st.Role != string(raftLeader) {
+			mv.Match, mv.Behind = 0, 0
+		} else {
+			if mv.Self {
+				mv.Match = st.Commit // leader 自己就是准绳，不看 matchIndex
+			}
+			if st.Commit > mv.Match {
+				mv.Behind = st.Commit - mv.Match
+			}
 		}
 		switch {
 		case m.Status != memberActive:
@@ -625,6 +642,12 @@ func (s *server) clusterViewLocked() clusterView {
 			mv.LiveRole = "leader"
 		case m.Role == memberLearner:
 			mv.LiveRole = "learner"
+		case mv.Self:
+			mv.LiveRole = "follower"
+		case st.Role != string(raftLeader):
+			// follower 只跟 leader 有来往，别的 peer 活没活它根本无从得知。
+			// 这里报"失联"是瞎猜 —— 它会和 leader 视图打架，也会让运维误判。
+			mv.LiveRole = "未知"
 		case !peer.Reachable:
 			mv.LiveRole = "失联"
 		default:
@@ -643,7 +666,18 @@ func (s *server) clusterViewLocked() clusterView {
 			alive++
 		}
 	}
-	v.Quorum = voters > 0 && alive*2 > voters
+	// 多数派只有 leader 算得准：lastHeard 是"收到这个 peer 的 append 应答"时
+	// 打的点，只有 leader 会收到。站在 follower 上按同一套算法数，永远只数到
+	// 自己那一台 —— 3 台集群里一切正常时控制台会喊"无多数派 · 只读"（lab 实测，
+	// 2026-11-14 切主后每台 follower 都是这句）。
+	//
+	// follower 能知道的只有"有没有 leader"：leader 是多数派选出来的，它还在给
+	// 我发心跳就说明多数派刚才还在。写反正会被转给 leader，由它自己那本账判。
+	if v.Role == string(raftLeader) {
+		v.Quorum = voters > 0 && alive*2 > voters
+	} else {
+		v.Quorum = v.Leader != ""
+	}
 	v.Degraded = s.commitErr
 	if s.state.Cluster != nil && s.state.Cluster.ID == "" {
 		v.Reason = "集群配置损坏（cluster id 为空）"
@@ -875,7 +909,8 @@ func (s *server) initCluster(endpoint, console, name, actor string) error {
 		name = "控制器 1"
 	}
 	me := ClusterMember{ID: id, Name: name, Endpoint: endpoint, Console: console,
-		Role: memberVoter, Status: memberActive, JoinedAt: time.Now().Unix()}
+		ConsoleTLS: s.consoleTLS,
+		Role:       memberVoter, Status: memberActive, JoinedAt: time.Now().Unix()}
 	// 初始化不是共识写：集群还不存在，这一份成员表就是共识的起点。直接把
 	// state.json 写盘，然后让 raft 从 [self] 这个配置开始选主（单 voter 的
 	// 集群会立刻选出自己）。
@@ -1063,7 +1098,7 @@ func (s *server) joinCluster(leaderURL, token string, version string) error {
 	} else {
 		return errors.New("加入码里没有 CA，无法安全地验证 leader；请用控制台重新生成")
 	}
-	body, _ := json.Marshal(joinRequest{Token: token, Version: version})
+	body, _ := json.Marshal(joinRequest{Token: token, Version: version, ConsoleTLS: s.consoleTLS})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", url+"/v1/cluster/join", strings.NewReader(string(body)))

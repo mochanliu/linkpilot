@@ -215,20 +215,26 @@ func (s *server) checkToken(presented string) bool {
 
 // session returns the identity behind the request's cookie, if the session is
 // live. The zero identity (Role "") means "not logged in".
+//
+// 集群里还有第二条路：follower 把写请求**代理**给 leader 时，会带一张用集群密钥
+// 签过的身份断言（cluster_session.go）。会话表仍然各节点一份 —— 只有"我是谁"
+// 这一句话跟着请求走，而不是把整张会话表复制出去。
+// （代理是 2026-11-14 真机 lab 之后才换成代理的：原来的 307 反而不成立 —— 跨源
+// 跳转浏览器不带 cookie，follower 上永远 401。）
 func (s *server) session(r *http.Request) consoleIdentity {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
-		return consoleIdentity{}
+		return s.verifySession(r.Header.Get(clusterSessionHeader))
 	}
 	s.admin.mu.Lock()
-	defer s.admin.mu.Unlock()
 	id, ok := s.admin.sess[c.Value]
-	if !ok {
-		return consoleIdentity{}
-	}
-	if time.Now().After(id.expires) {
+	if ok && time.Now().After(id.expires) {
 		delete(s.admin.sess, c.Value)
-		return consoleIdentity{}
+		ok = false
+	}
+	s.admin.mu.Unlock()
+	if !ok {
+		return s.verifySession(r.Header.Get(clusterSessionHeader))
 	}
 	return id
 }
