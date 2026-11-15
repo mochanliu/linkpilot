@@ -40,3 +40,7 @@ controller/out/
 controller/sr-ctrl
 controller/sr-svc
 .statprobe/
+# 换件时给不同代际留的副本（sr-ctrl.lab7 之类）与 SIGQUIT 落下的 core：
+# 2026-11-15 又从工作树里清出去两个，这行是防止下一次再被 git add -A 收进来
+controller/sr-ctrl.*
+/controller/core
