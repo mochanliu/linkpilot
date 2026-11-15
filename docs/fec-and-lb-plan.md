@@ -597,10 +597,60 @@ FEC 关掉（表单总是提交，0 = 关），这类"静默关掉"正是要在�
 成因在 encap 这一侧：冗余包是在**整帧处理完之后**才 `vlib_buffer_enqueue_to_next`
 批量入队的，所以一帧里挤进多个包时，第 N 组的冗余包会排在第 N+1 组的数据包
 后面 → 对端数出来的 `j > n-1`，当组作废。代价只是"这一组的冗余白发了"，
-业务永不受影响（错配最多还原出重复帧，被 WG 反回放吞掉）。**后续优化**：
-在循环里第 k 个成员异或完就立刻把冗余包入队（需配合 `vlib_validate_next_frame`
-保证下一帧空间），顺序就与组内成员一致；这条留作下一棒，判据是 200 pps 下
-错配降到 0。
+业务永不受影响（错配最多还原出重复帧，被 WG 反回放吞掉）。
+
+**2026-11-15 已修（`sr_wg4_encap.c` Step 15）**：不再分两批入队，而是**边处理
+边排一条输出序列** —— 成员包后面紧跟"它触发出来的那个冗余包"，整帧一次
+`vlib_buffer_enqueue_to_next` 走完（`out_bufs[]` / `out_nexts[]`，容量
+`2×VLIB_FRAME_SIZE+64`，+64 是 `VLIB_BUFFER_ENQUEUE_MIN_SIZE` 要求的
+越界读余量）。没有用 `vlib_get_next_frame` + `vlib_validate_next_frame`：
+一条序列就够，还省掉"下一帧还有没有位置"的分支。
+
+**A/B（容器 lab，同一脚本 `SO=<.so>` 换件重跑）**
+
+| 判据 | 旧（`fe4b3fd8`） | 新（`8ef3129e`） |
+| --- | --- | --- |
+| 阶段 0：200 pps、1000 包、无损 | parity 500，complete **229**，错配 **271**（recovered 125 + unrecovered 146） | parity 500，complete **500**，错配 **0** |
+| 阶段 1：50 pps、无损、100 包 | complete 46，错配 4 | complete **50**，错配 **0** |
+| 阶段 2：1:2 + netem 10% | 丢 1%，recovered 18 / unrecovered 12 | 丢 4%，recovered 11 / unrecovered 12 |
+| 阶段 3：1:1 + netem 10% | 丢 0% | 丢 0% |
+| 阶段 4：关 FEC + netem 10% | 丢 11%，parity 增 0 | 丢 10%，parity 增 0 |
+
+容器里旧版错配 54% 远高于之前真机测到的 1.9%：容器是 tap 收包、一次
+`vlib_get_buffers` 能拿到几十个包，一帧里必然跨多组；真机的 `vppctl ping`
+在 200 pps 下单包成帧，所以那条缺陷在真机上只是零星露头。**真机复测
+（CPE1→CPE4 的 t10，200 pps × 1000 包）旧版本来就是 0 错配**，新版同样 0 ——
+这次改动在真机上的价值是消除"突发/高包速时才出现"的那一半，而不是改数字。
+
+**同日撞出的第二只雷：换件重启后 FEC 静默失效。** 换插件必重启 VPP，
+`tx_seq` 是内存态、从 0 重来，而对端 `rx_last_seq` 还停在上代那个大数上
+（实测 789628）→ 接收侧"陈旧即丢"的规则把**每一个**冗余包都判成陈旧：
+发 1000 包 530 个冗余包**全 bad、complete 0**，业务无感，FEC 彻底空转，
+一直到对端也重启为止。两处修法：
+
+- 发送侧：状态创建时把 `tx_seq` 的基址设成**墙上时间（秒）**而不是 0；
+- 接收侧：`seq` 回退**超过 8 组**（`SR_FEC_RESEQ_SLACK`）不再是"重复投递"，
+  而是"对端重启换了基址"→ 丢掉半组、把这个包当新组边界重新同步。
+
+真机两条都验过（CPE1 单侧重启，CPE4 侧计数）：正向跳（新基址更大）→
+`complete` 照常增、`bad` 不动；负向跳（旧流已跑出 600+ 组，新基址更小）→
+`unrecovered +2`（一次重新同步）之后 `complete` 继续增、`bad` 仍为 0。
+改前同样的动作是 `bad +530 / complete 0`。
+
+**仍然存在的边界**：冗余包外层 ToS 与 action 类别位被故意清零（走 BE），
+一旦开了 QoS 整形，成员包与冗余包可能进不同 class 队列，端口调度器仍会把
+它们调换位置 —— 本次消除的是节点内部这个主因，不是"任何配置下都对齐"。
+
+**换件记录（2026-11-15，四台全换完）**：新件 `sr_wg_plugin.so` =
+`8ef3129e350dc58b`（1.2.0，含 Step 15 顺序 + seq 基址/重新同步两处修复）；
+换前四台都是 `fe4b3fd8…`（与仓库 HEAD 构建逐字节相同，所以"仓库 = 在跑"这条
+成立）。纪律照 §2.6：`scp` 到 `/root/sr_wg_plugin.fec2-20261115.so` → 起看门狗
+（CPE1/2/3 用 `qos-guard.sh`，CPE4 用它自己的 unit + `qos4-deploy.sh`）→
+`systemd-run` detached 部署。四台 `result.txt` 全 `OK`、`show plugins` 全
+1.2.0、12 条绑定全 usable、十二方向 `vppctl ping` 前后两轮全 0% 丢。
+CPE4 的 `qos-deploy.sh` 是**另一份**（硬编码 `/tmp/sr_wg_plugin.so.qos`、
+备份写死 `.bak-qos-20261112`）—— 用它换件会静默什么都不装，必须用
+`qos4-deploy.sh` + `SRC=`；这一坑这次踩了，记在这里。
 
 **CPE1 换 agent 又踩了一次 vpp0**：`kill -TERM sr-agent` 之后数据面正常、
 看门狗 60 秒内把新 agent 拉起来了，但 vpp0（管理口 lcp 对）没回来，ssh 失联；

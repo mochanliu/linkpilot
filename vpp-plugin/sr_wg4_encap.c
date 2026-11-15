@@ -187,6 +187,15 @@ typedef enum {
   SR_WG4_ENCAP_N_NEXT,
 } sr_wg4_encap_next_t;
 
+/*
+ * 输出序列的槽位数：一个数据包最多带出一个冗余包（ratio >= 1，见
+ * sr_fec.h 设计 1），所以 2 × 帧长是上界；再按 vlib_buffer_enqueue_to_next
+ * 的约定补 64 —— 该函数自己会读过 count 之后的少量元素
+ * （vlib/buffer_node.h 的 VLIB_BUFFER_ENQUEUE_MIN_SIZE 注释），数组必须容得下，
+ * 否则读到未映射页会段错误。
+ */
+#define SR_WG_ENCAP_OUT_SLOTS  (2 * VLIB_FRAME_SIZE + 64)
+
 /* ==================== Node 注册 ==================== */
 
 VLIB_REGISTER_NODE (sr_wg4_encap_node) = {
@@ -229,21 +238,20 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 n_left = frame->n_vectors;
   u32 *from = vlib_frame_vector_args (frame);
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE];
-  u16 nexts[VLIB_FRAME_SIZE];
-  /* bufs/nexts 是数组，不可自增；用指针游标遍历 */
+  /* bufs 是数组，不可自增；用指针游标遍历 */
   vlib_buffer_t **buf_ptr = bufs;
-  u16 *next_ptr = nexts;
   sr_wg_main_t *sm = &sr_wg_main;
   u32 fib_index = sm->encap_fib_index;
   /* SR Header 时间戳（秒级）。transit/decap 不做时效校验，取 VPP 时钟即可 */
   u32 now = (u32) vlib_time_now (vm);
   /*
-   * FEC 冗余包的收集槽（Step 14.5 可能给每个数据包补发一个冗余包）。
-   * 成员包照常走 nexts；冗余包攒够一批后在循环外补一次入队。
+   * 输出序列（Step 15）：成员包与"它触发出来的那个冗余包"按这个顺序**连续**
+   * 入队，整帧一次 enqueue 走完。为什么不能学老写法分两批入队，见 Step 15。
    */
-  u32 extra[VLIB_FRAME_SIZE];
-  u16 extra_next[VLIB_FRAME_SIZE];
-  u32 extra_n = 0;
+  u32 out_bufs[SR_WG_ENCAP_OUT_SLOTS];
+  u16 out_nexts[SR_WG_ENCAP_OUT_SLOTS];
+  u32 out_n = 0;
+  u32 in_i = 0;   /* 当前包在 from[] 里的下标 */
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
@@ -277,6 +285,7 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       u8 qos_cls = SR_QOS_CLASS_UNMARKED; /* 本包的 QoS 类别（Step 7.5 定） */
       u8 error = SR_WG4_ENCAP_ERROR_NONE;
       u8 bypass = 1;   /* 缺省直通：保证 WG 直连模式不受影响 */
+      u32 parity_bi = (u32) ~0;  /* Step 14.5 造出的冗余包（~0 = 本包没有） */
 
       clib_memset (&orig_dst, 0, sizeof (orig_dst));
       clib_memset (&endpoint, 0, sizeof (endpoint));
@@ -529,23 +538,19 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
        * 走同一条出口路径。数据包本身不被修改、不延迟：组不满时这一步只有
        * 内存异或，流量停在半组时那段就没有冗余（没有定时器，故意）。
        *
+       * 这里只把冗余包的 buffer index 记下来，**入队留到 Step 15 跟成员包
+       * 排在一起** —— 顺序是协议语义（sr_fec.h 设计 4 的计数法配对），
+       * 早一步、晚一步都会让对端数错。
+       *
        * wg_len 从更新过的 udp->length 反推：Step 12 加过 sr_len，所以
        * WG 帧长 = UDP 总长 - 8 - sr_len。
        */
       if (PREDICT_FALSE (bind->fec_ratio > 0))
-	{
-	  u32 parity = sr_fec_tx (vm, sm, bind, b, p, outer_len,
-				  (u16) sr_len,
-				  (u16) (clib_net_to_host_u16 (udp->length) -
-					 8 - sr_len),
-				  fib_index);
-	  if (parity != (u32) ~0 && extra_n < VLIB_FRAME_SIZE)
-	    {
-	      extra[extra_n] = parity;
-	      extra_next[extra_n] = SR_WG4_ENCAP_NEXT_IP4_LOOKUP;
-	      extra_n++;
-	    }
-	}
+	parity_bi = sr_fec_tx (vm, sm, bind, b, p, outer_len,
+			       (u16) sr_len,
+			       (u16) (clib_net_to_host_u16 (udp->length) -
+				      8 - sr_len),
+			       fib_index);
 
     done:
       if (bypass)
@@ -586,18 +591,40 @@ VLIB_NODE_FN (sr_wg4_encap_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
             }
         }
 
-      next_ptr[0] = next_index;
+      /*
+       * Step 15: 按线上顺序入队 —— 成员包，紧接着它触发出来的冗余包。
+       *
+       * 老写法是"成员包整帧入队，冗余包再补一次 enqueue"，一帧里挤进两个
+       * 以上的组时，第 N 组的冗余包就排到第 N+1 组的数据包后面。对端
+       * （sr_fec.c 的计数法配对）是**数**两次冗余包之间的数据帧数 j 的：
+       * 冗余包晚到几个包，j 就多算几个，本来 j == k（全到）或 k-1（丢一
+       * 个可还原）的组被判成"多丢"，这一组的冗余白费。一帧里的包越多错
+       * 得越狠 —— 容器 lab（tap 批量收包）200 pps 下 500 组错 271 次；
+       * 真机 200 pps 因为单包成帧而看不出来，突发/高包速才露头。
+       * 数字见 docs/fec-and-lb-plan.md §9。
+       *
+       * 冗余包的 ToS 与 action 类别位被 sr_fec_tx 清零（走 BE，不抢业务
+       * 类带宽），所以它跟成员包**不一定同一条出口队列**：一旦开了 QoS
+       * 整形，调度器仍可能把它们换个位置。这里消除的是节点内部这个主因，
+       * 不是"任何配置下都对齐"的保证。
+       */
+      out_bufs[out_n] = from[in_i];
+      out_nexts[out_n] = (u16) next_index;
+      out_n++;
 
+      if (PREDICT_FALSE (parity_bi != (u32) ~0))
+        {
+          out_bufs[out_n] = parity_bi;
+          out_nexts[out_n] = SR_WG4_ENCAP_NEXT_IP4_LOOKUP;
+          out_n++;
+        }
+
+      in_i++;
       n_left--;
       buf_ptr++;
-      next_ptr++;
     }
 
-  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
-
-  /* FEC 冗余包补入队（与成员同一条 ip4-lookup 出路） */
-  if (PREDICT_FALSE (extra_n > 0))
-    vlib_buffer_enqueue_to_next (vm, node, extra, extra_next, extra_n);
+  vlib_buffer_enqueue_to_next (vm, node, out_bufs, out_nexts, out_n);
 
   return frame->n_vectors;
 }

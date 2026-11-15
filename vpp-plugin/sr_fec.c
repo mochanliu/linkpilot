@@ -81,6 +81,18 @@ sr_fec_set (sr_wg_main_t *sm, u32 sw_if_index, u8 ratio)
       pool_get_zero (sr_fec_main.states, st);
       bind->fec_idx = (u32) (st - sr_fec_main.states) + 1;
       st->sw_if_index = sw_if_index;
+      /*
+       * 组序号的基址取墙上时间（秒），不是 0。
+       *
+       * 理由：进程重启 / 换件重放之后，如果 tx_seq 从 1 重来，对端的
+       * rx_last_seq 还停在上一代那个大数上，于是**每一个冗余包**都被判
+       * "陈旧"丢掉 —— FEC 在谁也没察觉的情况下整段失效，直到对端也重启
+       * 为止（2026-11-15 换件实测：发端重启后 530 个冗余包全 bad、
+       * complete 0）。取时钟当基址，重启那一侧的序号直接跳到当下，
+       * 对端要么把它当新组边界收下（seq 前进），要么走 rx 侧的大跨度
+       * 回退重新同步（SR_FEC_RESEQ_SLACK）。
+       */
+      st->tx_seq = (u32) unix_time_now ();
       sr_fec_main.active_count++;
     }
   st->ratio = ratio;
@@ -319,11 +331,24 @@ sr_fec_rx_parity (sr_wg_main_t *sm, sr_wg_tunnel_bind_t *bind,
   /*
    * 陈旧冗余包（seq 没有前进）：不做任何配对动作，也不动计数窗口 ——
    * 它是重复投递，不是新组的边界。
+   *
+   * 两个例外都写在 SR_FEC_RESEQ_SLACK 的注释里：
+   *   - d == 0        ：同一个包又到了一遍（重复投递/被镜像），丢。
+   *   - d > -SLACK    ：轻微乱序（后一组的冗余包先到），丢，窗口不动。
+   *   - d <= -SLACK   ：对端重启过、序号换了基址 —— 重新同步（rx_j 归零，
+   *                     这个包当新组边界）。死守旧序号会让 FEC 永久失效。
    */
-  if (st->rx_last_seq != 0 && (i32) (seq - st->rx_last_seq) <= 0)
+  if (st->rx_last_seq != 0)
     {
-      st->bad_parity++;
-      return -1;
+      i32 d = (i32) (seq - st->rx_last_seq);
+
+      if (d == 0 || (d < 0 && d > -SR_FEC_RESEQ_SLACK))
+	{
+	  st->bad_parity++;
+	  return -1;
+	}
+      if (d < 0)
+	st->rx_j = 0;
     }
 
   j = st->rx_j;
