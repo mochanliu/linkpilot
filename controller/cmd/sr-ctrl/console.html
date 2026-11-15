@@ -4950,12 +4950,16 @@
     });
   }
 
+  // o.from 是这条链的起点口径：隧道表单里是「本端」（= 隧道的 A 端），
+  // 模板页没有两端，写「隧道 A 端」。链只存一个方向（A→B），对端拿到的是
+  // 同一条链的镜像——这一点必须在标题里说清，否则改链的人会以为还要给
+  // 回程另配一条。
   function undHopsEditor(doc, key, o) {
     o = o || {};
     var u = undStore();
     var hops = u[key] || [];
     var limit = doc.relay_hop_limit || 1;
-    var h = '<div class="und-box"><h3>中转链 · 第 1 跳先经过</h3>';
+    var h = '<div class="und-box"><h3>中转链 · 从' + esc(o.from || "隧道 A 端") + '出发，第 1 跳先经过</h3>';
     if (!hops.length) {
       h += '<div class="empty">还没有中转设备。加一跳，或把路径改回「直连」。</div>';
     } else {
@@ -5060,7 +5064,9 @@
   // 两个字段），所以它排在 .fields 之外，占满整幅。
   function undPathExtraFields(doc, mode, prefix, key, exclude) {
     if (mode === "inline") {
-      return undHopsEditor(doc, key, { exclude: exclude }) +
+      return undHopsEditor(doc, key, { exclude: exclude, from: "本端" }) +
+        '<div class="hint" style="margin-top:8px">回程不用另配：对端拿到的是同一条链的反向——' +
+        "去程最后经过的盒子，回程最先经过。</div>" +
         '<div class="field" style="margin-top:10px"><label for="' + prefix + '-save-as">存为路径模板（可选）</label>' +
         '<input id="' + prefix + '-save-as" name="save_as" placeholder="留空 = 这条链只给这条隧道用" maxlength="60"></div>';
     }
@@ -5738,8 +5744,9 @@
       '<select id="und-edit-fec" name="fec"' + (t.fec_ratio ? "" : " disabled") + ">" +
       undFecOptions(t.fec_ratio || 2) + "</select></div></div>";
     if (mode === "inline") {
-      h += undHopsEditor(doc, "editHops", { exclude: [t.a.node_id, t.b.node_id] }) +
-        '<div class="hint" style="margin-top:8px">改成另一条链是整条替换：新的顺序会一起下发，旧链不会留下一跳。</div>';
+      h += undHopsEditor(doc, "editHops", { exclude: [t.a.node_id, t.b.node_id], from: "本端" }) +
+        '<div class="hint" style="margin-top:8px">改成另一条链是整条替换：新的顺序会一起下发，旧链不会留下一跳。' +
+        "改动同时决定两端：对端走的顺序自动是这条链的反向。</div>";
     } else if (mode === "template") {
       h += '<div class="field"><label for="und-edit-template">路径模板</label>' +
         '<select id="und-edit-template" name="template">' + undTemplateOptions(doc, tpl) + "</select></div>";

@@ -213,12 +213,19 @@ func enrollExtra(t *testing.T, s *server, id uint16, ip string) {
 	n.InventoryAt = now
 }
 
-// A relay chain reaches the box as one ordered list, each hop paired with THAT
-// hop's transit port. Two things this locks: the order (the agent reverses it into
-// the segment list, so a sorted copy silently changes which box the packet pops
-// first) and the per-hop port (a chain that borrowed one port for every hop would
-// send the packet to a device that is not listening for it).
-func TestBundleRendersEveryHopWithItsOwnTransitPort(t *testing.T) {
+// A relay chain reaches each box as ONE ordered list in that box's walking
+// order, each hop paired with THAT hop's transit port.
+//
+// Three things this locks:
+//   - the mirror image: the chain is stored A→B, the B end must walk it
+//     backwards. Two ends handed the same order means the far end's first
+//     segment points at a relay that is behind it -- a path that happens to work
+//     on a flat L2 lab and blackholes wherever the topology is chained;
+//   - the order itself (the agent reverses it into the segment list, so a sorted
+//     copy silently changes which box the packet pops first);
+//   - the per-hop port (a chain that borrowed one port for every hop would send
+//     the packet to a device that is not listening for it).
+func TestBundleRendersEveryHopInEachEndsOwnOrder(t *testing.T) {
 	s, ten, _ := underlayFixture(t)
 	publishDefault(t, s, ten)
 	// Enrolled AFTER the publish: a late device must still get a transit port the
@@ -236,7 +243,10 @@ func TestBundleRendersEveryHopWithItsOwnTransitPort(t *testing.T) {
 	}
 	giveIdentity(t, s, "t", 1, 2)
 
-	want := []string{"198.51.100.13:15000", "198.51.100.14:15000", "198.51.100.15:15000"}
+	aFirst := []uint16{3, 4, 5}
+	want := map[uint16][]uint16{1: aFirst, 2: {5, 4, 3}}
+	ep := map[uint16]string{3: "198.51.100.13:15000", 4: "198.51.100.14:15000", 5: "198.51.100.15:15000"}
+	delivered := map[uint16][]wire.RelayHop{}
 	for _, node := range []uint16{1, 2} {
 		b := bundleOf(t, s, "t", node)
 		if len(b.Tunnels) != 1 {
@@ -246,11 +256,18 @@ func TestBundleRendersEveryHopWithItsOwnTransitPort(t *testing.T) {
 		if len(relays) != 3 {
 			t.Fatalf("node %d: 中转链应有 3 跳，实际 %+v", node, relays)
 		}
+		delivered[node] = relays
 		for i, r := range relays {
-			if r.NodeID != uint16(i+3) || r.Endpoint != want[i] {
-				t.Fatalf("node %d: 第 %d 跳 = %+v，应是 node %d %s",
-					node, i+1, r, i+3, want[i])
+			if got := want[node][i]; r.NodeID != got || r.Endpoint != ep[got] {
+				t.Fatalf("node %d: 第 %d 跳 = %+v，应是 node %d %s（A 端 3→4→5，B 端必须是 5→4→3）",
+					node, i+1, r, got, ep[got])
 			}
+		}
+	}
+	// 镜像不是"另一条路"：两端合起来必须还是同一条链，只是走的方向相反。
+	for i := range delivered[1] {
+		if a, b := delivered[1][i], delivered[2][len(delivered[2])-1-i]; a != b {
+			t.Fatalf("两端的链不是彼此的镜像：A 端第 %d 跳 %+v，B 端对应位置 %+v", i+1, a, b)
 		}
 	}
 }

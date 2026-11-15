@@ -563,13 +563,17 @@ type TunnelSpec struct {
 	Slot        uint8               `json:"slot"`
 	PeerBinding *keybinding.Binding `json:"peer_binding,omitempty"`
 
-	// Relays is the relay chain, in traversal order: Relays[0] is the FIRST box
-	// the packet touches, and the peer is the destination behind all of them.
-	// Empty means a direct tunnel. Each Endpoint is the hop's outer address plus
-	// its transit port ("ip:port").
+	// Relays is the relay chain in THIS end's walking order: Relays[0] is the
+	// first box a packet leaving this box touches, and the peer is the
+	// destination behind all of them. Empty means a direct tunnel. Each Endpoint
+	// is the hop's outer address plus its transit port ("ip:port").
 	//
-	// The agent puts these into the path's segment list REVERSED, because segment
-	// 0 is the destination; the order here is the order the operator read.
+	// The controller stores one chain per tunnel (A -> B) and renders it per end,
+	// so the two ends of a relayed tunnel receive mirror images of each other --
+	// the return traffic walks the same road backwards. A device must NOT reverse
+	// this list itself: the agent puts it into the path's segment list REVERSED
+	// (segment 0 is the destination), which is a dataplane detail, not a second
+	// flip of direction.
 	Relays []RelayHop `json:"relays,omitempty"`
 
 	// MTU is the overlay MTU; 0 means "not known yet" and the device falls back

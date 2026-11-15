@@ -180,7 +180,7 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	}
 
 	if t.Path != nil {
-		relays, err := relayHops(st, t, views)
+		relays, err := relayHops(st, t, views, self.NodeID)
 		if err != nil {
 			return wire.TunnelSpec{}, err
 		}
@@ -189,15 +189,34 @@ func (s *server) tunnelSpecLocked(tenant string, st *underlay.State, t *underlay
 	return spec, nil
 }
 
-// relayHops names the relay chain as the box must dial it: every hop's outer
-// address plus its transit port, in traversal order. A hop that cannot be named
-// is an error -- the alternative, dropping it or quietly building a direct tunnel,
-// would move the traffic onto a path nobody selected.
+// relayHops names the relay chain as ONE box must dial it: every hop's outer
+// address plus its transit port, in the order THAT box walks them. A hop that
+// cannot be named is an error -- the alternative, dropping it or quietly building
+// a direct tunnel, would move the traffic onto a path nobody selected.
+//
+// The stored chain has one direction: hops[0] is the first box a packet leaving A
+// touches (underlay.PathHop), because that is the way the operator read it on the
+// page. A relayed tunnel is a road with two ends, though -- the return traffic
+// walks the same boxes in the opposite order -- so the B end is handed the mirror
+// image of the same chain. Sending both ends the stored order (what this used to
+// do) makes the far end pop its first segment onto the NEAR end's first relay:
+// on a flat L2 lab that still delivers, on any chained topology the packet is
+// handed to a box that has no route to where it wants to go, and nothing on the
+// page says so.
 //
 // Per hop, not per tunnel: an address fallback (explicit value vs the reflector's
 // observation) and a transit-port lookup are each a hop's own facts, and one hop
-// without them must not borrow another hop's.
-func relayHops(st *underlay.State, t *underlay.Tunnel, views map[uint16]underlay.NodeView) ([]wire.RelayHop, error) {
+// without them must not borrow another hop's. Endpoints are resolved in stored
+// order and only the finished list is flipped, so a skip reason's "第 N 跳" always
+// points at the row the operator sees on the page, whichever end is being served.
+//
+// Deliberately one chain, not two: an asymmetric return path (back through
+// different relays) is not expressible, and inventing a second chain per tunnel
+// would be a data-model change nobody asked for. The tenant topology is a road;
+// if a return path must differ, that is a second tunnel's job.
+func relayHops(st *underlay.State, t *underlay.Tunnel, views map[uint16]underlay.NodeView,
+	from uint16) ([]wire.RelayHop, error) {
+
 	rp, has, err := st.PathFor(t.Path)
 	if err != nil {
 		return nil, fmt.Errorf("中转路径无法解析：%v", err)
@@ -212,6 +231,18 @@ func relayHops(st *underlay.State, t *underlay.Tunnel, views map[uint16]underlay
 			return nil, err
 		}
 		out = append(out, wire.RelayHop{NodeID: h.NodeID, Endpoint: ep})
+	}
+	switch from {
+	case t.A.NodeID:
+		// A 端就是存储顺序，原样下发。
+	case t.B.NodeID:
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	default:
+		// 只有两端能拿到一条隧道的链；别的地方要它，说明调用点把隧道弄错了，
+		// 与其发一份没人验证过的顺序，不如让它显式失败。
+		return nil, fmt.Errorf("隧道 %s 的中转链只能发给它自己的两端，这次要的是设备 %d", t.ID, from)
 	}
 	return out, nil
 }

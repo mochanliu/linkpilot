@@ -803,8 +803,9 @@ func (t *TunnelSync) linkConfig(ctx context.Context, b wire.UnderlayBundle,
 		OverlayTable: b.OverlayTable,
 		LocalOverlay: local, PeerOverlay: peer,
 	}
-	// 中转链按行走顺序原样进 cfg.Relays：倒序是段列表的事，这里翻了顺序就等于
-	// 让控制器和盒子对"第一跳是谁"各有各的理解。
+	// 中转链按行走顺序原样进 cfg.Relays：控制器已经按**本端**的行走顺序渲染好
+	// （对端拿到的是同一条链的镜像），倒序只是段列表的事。这里再翻一次顺序，
+	// 就等于让控制器和盒子对"第一跳是谁"各有各的理解。
 	for i, r := range spec.Relays {
 		ip, port, err := parseAddr(r.Endpoint)
 		if err != nil {
