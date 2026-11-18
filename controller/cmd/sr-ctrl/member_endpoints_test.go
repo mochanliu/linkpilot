@@ -28,6 +28,18 @@ func TestMemberEndpointsUsesTheLocalAdvertiseForSelf(t *testing.T) {
 		t.Fatalf("单机地址表 = %v，应是 %v", got, want)
 	}
 
+	// leader 提示必须和地址表用同一个视角：否则应答里"列表是新地址、leader 还是
+	// 旧地址"，拿到的人（RR/设备）会来回切。部署时就是这么转圈的。
+	if got := s.endpointForLocked("me"); got != "192.168.1.100:8444" {
+		t.Fatalf("自己那条应为宣告地址，得到 %s", got)
+	}
+	if got := s.endpointForLocked("other"); got != "192.168.1.5:8444" {
+		t.Fatalf("别的成员应为成员表原值，得到 %s", got)
+	}
+	if got := s.endpointForLocked("nobody"); got != "" {
+		t.Fatalf("不存在的成员应为空，得到 %s", got)
+	}
+
 	// 推不出宣告地址时不能把列表弄空：退回成员表里的值，宁可给一个可疑地址，
 	// 也不要让设备与 RR 拿到一张空表（空表会让它们锁死在种子/旧地址上）。
 	s.adv = ""

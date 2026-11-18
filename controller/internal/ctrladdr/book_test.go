@@ -163,6 +163,30 @@ func TestBookLoadToleratesBadFile(t *testing.T) {
 	}
 }
 
+// 控制器列表非空时，不在列表里的 leader 一律不采信：那是"旧成员表的 leader +
+// 新地址表"这种自相矛盾的应答。.100 首次部署就撞上了——RR 每轮切到旧 Mac 的
+// 192.168.1.4:8444，下一轮被拉回来，日志里无限循环。
+func TestBookIgnoresLeaderOutsideTheList(t *testing.T) {
+	b := New("a:8444")
+	if got := b.Learn([]string{"b:8444", "c:8444"}, "192.168.1.4:8444"); got != "" {
+		t.Fatalf("列表里的地址才是候选，不该切到列表外的 leader，得到 %q", got)
+	}
+	if cur := b.Current(); cur != "https://a:8444" {
+		t.Fatalf("当前地址不该变，实际 %s", cur)
+	}
+	for _, u := range b.List() {
+		if u == "https://192.168.1.4:8444" {
+			t.Fatalf("列表外的 leader 不该进候选：%v", b.List())
+		}
+	}
+
+	// 列表为空（老控制器只给 leader）时仍然接受：否则升级顺序颠倒就会丢掉
+	// 唯一的切换提示。
+	if got := b.Learn(nil, "c:8444"); got != "https://c:8444" {
+		t.Fatalf("没有地址表时应接受 leader，得到 %q", got)
+	}
+}
+
 func TestNorm(t *testing.T) {
 	cases := map[string]string{
 		"":                         "",

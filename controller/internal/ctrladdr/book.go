@@ -180,6 +180,11 @@ func (b *Book) Size() int {
 // Learn 吸收一次应答里的地址表，返回"应该立刻切过去"的地址（空 = 不动）。
 //
 // 种子永远进列表，就算 addrs 里没有它；通配地址永远不进列表。
+//
+// 控制器列表非空时，leader 必须是列表里的一员：不在列表里的 leader 说明对端给了
+// 两份互相矛盾的信息（旧成员表的 leader + 新的地址表），照它切就是往一个连它自己
+// 都没列出来的地址上撞——部署当场就是这么转圈的（RR 每轮切到旧 Mac 的地址，再被
+// 下一轮拉回来）。列表为空时（老控制器）仍然接受 leader，保持向后兼容。
 func (b *Book) Learn(addrs []string, leader string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -198,13 +203,15 @@ func (b *Book) Learn(addrs []string, leader string) string {
 	for _, a := range addrs {
 		push(a)
 	}
-	push(leader)
+	want := Norm(leader)
+	if want != "" && (len(addrs) == 0 || inList(addrs, want)) {
+		push(want)
+	}
 	if len(merged) == 0 {
 		// 应答里一个可用地址都没有：保留原表，别把候选清空。
 		return ""
 	}
 	b.list = merged
-	want := Norm(leader)
 	if want == "" || want == b.cur || !seen[want] {
 		return ""
 	}
@@ -213,6 +220,16 @@ func (b *Book) Learn(addrs []string, leader string) string {
 	// 表头是"下一次先试的"，leader 就在那儿：重启落盘时也按这个顺序恢复。
 	b.list = front(merged, want)
 	return want
+}
+
+// inList 判断 u（已规范化）在不在 addrs 里。
+func inList(addrs []string, u string) bool {
+	for _, a := range addrs {
+		if Norm(a) == u {
+			return true
+		}
+	}
+	return false
 }
 
 // front 把 u 挪到列表第一个（u 一定在列表里）。

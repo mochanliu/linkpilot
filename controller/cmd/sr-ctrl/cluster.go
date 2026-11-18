@@ -268,13 +268,27 @@ func (s *server) memberEndpointsLocked() []string {
 		if m.Status != memberActive || m.Endpoint == "" {
 			continue
 		}
-		if m.ID == s.nodeID && s.adv != "" {
-			out = append(out, s.adv)
-			continue
-		}
-		out = append(out, m.Endpoint)
+		out = append(out, s.endpointForLocked(m.ID))
 	}
 	return out
+}
+
+// endpointForLocked 是成员 id 在**当前视角**下该被拨的地址：自己那条用本机宣告
+// 地址，别的成员用成员表里的值。成员表的地址表与 leader 提示都必须走这里，否则
+// 会出现"列表是新的、leader 指向旧地址"这种自相矛盾的应答（.100 部署当场复现：
+// RR 每轮都往旧 Mac 的 192.168.1.4:8444 切一次，然后被下一轮拉回来）。
+func (s *server) endpointForLocked(id string) string {
+	if s.state.Cluster == nil {
+		return ""
+	}
+	m := s.state.Cluster.Members[id]
+	if m == nil {
+		return ""
+	}
+	if id == s.nodeID && s.adv != "" {
+		return s.adv
+	}
+	return m.Endpoint
 }
 
 func (s *server) leaderEndpointLocked() string {
@@ -285,10 +299,7 @@ func (s *server) leaderEndpointLocked() string {
 	if id == "" || s.state.Cluster == nil {
 		return ""
 	}
-	if m := s.state.Cluster.Members[id]; m != nil {
-		return m.Endpoint
-	}
-	return ""
+	return s.endpointForLocked(id)
 }
 
 // ---------------------------------------------------------------- 节点间传输
