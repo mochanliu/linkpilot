@@ -82,21 +82,24 @@ sr-frr 应答即降级自己的 `lastSeen`（`localReporter.demote()`），拉�
 
 ---
 
-## 2. 现在这一刻的真实状态（2026-11-07 实测）
+## 2. 现在这一刻的真实状态（2026-11-18 迁移后）
 
-### 2.1 控制面跑在 Mac 上
+### 2.1 控制面跑在 192.168.1.100（原 Mac 单机，2026-11-18 迁入）
 
-| 件 | pid | 参数要点 |
+| 件 | 位置 | 参数要点 |
 | --- | --- | --- |
-| `sr-ctrl` | 52092（2026-11-13 21:06 起，HTTPS 版） | `-data /Users/louis/srvmlab/ctrl/data -listen 0.0.0.0:8444 -tls-san 192.168.1.4 -console 0.0.0.0:8443 -console-tls -console-san 203.0.113.10 -console-http 127.0.0.1:8088 -stun 192.168.1.4:3478,3479 -hb 5` |
-| `sr-rr` ×2 | 40616 / 40618 | `-config /Users/louis/srvmlab/state/rr-a.json`、`rr-b.json`，监听 18446+19446 / 18447+19447 |
+| `sr-ctrl` | .100 systemd `sr-ctrl.service`，数据 `/opt/sdwan/ctrl/data` | `-listen 0.0.0.0:8444 -tls-san 192.168.1.100,192.168.1.4 -console 0.0.0.0:8443 -console-tls -console-san 192.168.1.100,203.0.113.10 -console-http 127.0.0.1:8088 -stun 192.168.1.100:3478,192.168.1.100:3479 -hb 5` |
+| `sr-rr` ×2 | .100 systemd `sr-rr@a/b`，材料 `/opt/sdwan/state/`（迁后重签，SAN=.100） | 18446+19446 / 18447+19447 |
 
-复核：`ps -eo pid,etime,command | grep -E "sr-ctrl|sr-rr" | grep -v grep` 和
-`lsof -nP -iTCP -sTCP:LISTEN | grep -E "sr-ctrl|sr-rr"`。
-**注意**：那条 `ps` 里能看到运营方令牌的值 —— 那个值**不许进任何文件、日志、提交信息**（AGENTS.md §3）。
-需要它的时候从 `/Users/louis/srvmlab/ctrl/data/console-token` 读，或者当场 `ps` 看一眼。
+单机形态（mac-2/mac-6 已按共识下线，成员表只剩 mac-1 一个 voter）；迁移全程、
+设备侧待办（改 `-ctrl` 后要发布一次）、回滚路径见 `docs/ctrl-migration-1921681100.md`。
+Mac 侧 launchd 项 `com.louis.sr-ctrl` 已 disable，数据快照在 `~/srvmlab/data.migrate-snap-20261118/`。
 
-Mac 的 LAN 地址是 `192.168.1.4`。
+复核：`ssh root@192.168.1.100 'systemctl is-active sr-ctrl sr-rr@a sr-rr@b'` 和
+`curl -sk -o /dev/null -w "%{http_code}" https://192.168.1.100:8443/`。
+
+**注意**：operator 令牌的值**不许进任何文件、日志、提交信息**（AGENTS.md §3）。
+需要它的时候从 `/opt/sdwan/ctrl/data/console-token`（.100）读，或看 systemd 单元里的 `-admin-token`。
 
 **2026-11-13 晚（owner 拍板）：控制台改 HTTPS，供外网访问。**
 
