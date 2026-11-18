@@ -9,11 +9,15 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"sdwan/controller/internal/claimcode"
 )
 
 //go:embed console.html
@@ -1095,6 +1099,10 @@ func (s *server) handleAdminClaimCode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	// The envelope rides the CA and the advertised endpoints so the device
+	// needs nothing else typed on its console. Both are public facts; only the
+	// inner secret is confidential, and only the inner secret is stored.
+	caPEM, _ := os.ReadFile(filepath.Join(s.dataDir, "ca.pem"))
 	s.mu.Lock()
 	c := s.state.Claims[req.ID]
 	// Another tenant's grant reports 404, not 403: whether that grant exists is
@@ -1122,13 +1130,18 @@ func (s *server) handleAdminClaimCode(w http.ResponseWriter, r *http.Request) {
 	c.CodeUsedAt = 0
 	s.save()
 	name := c.Name
+	addrs := s.tlsAddrs
 	s.mu.Unlock()
+
+	// What the customer pastes is the envelope; the grant stores only the
+	// inner secret's digest. TTL lives on the grant record exactly as before.
+	presented := claimcode.Wrap(code, string(caPEM), addrs)
 
 	log.Printf("console: tenant %s generated a %ds code for grant %s", id.TenantID, ttl, req.ID)
 	s.admin.publish("claim.updated", id.TenantID, nil)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, claimCodeResponse{
-		ID: req.ID, Name: name, Code: code, IssuedAt: now, ExpiresAt: now + int64(ttl),
+		ID: req.ID, Name: name, Code: presented, IssuedAt: now, ExpiresAt: now + int64(ttl),
 	})
 }
 

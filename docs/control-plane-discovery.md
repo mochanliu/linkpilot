@@ -76,24 +76,49 @@ cluster: 成员表里本机地址是 192.168.1.4:8444，本机宣告的是 192.1
 
 不自动改共识：成员变更是运维动作，静默重写会让"谁改了成员表"没有痕迹。
 
-## 4. CPE 侧（激活码机制不变）
+## 4. CPE 侧（2026-11-19 起激活码自带地址与 CA）
 
-现场只多一个**站点级**文件 `/etc/linkpilot/site.json`（可选；`--ctrl` 也能直接给）：
+出码时控制器把 **tenant CA PEM + 对外地址表（`tlsAddrs`）** 包进激活码信封：
 
 ```
-sr-agent --claim 7K2M-9QX4-3FDT-8WZP
+srs1-<base64url(JSON{code, ctrl[], ca})>
 ```
 
-取值顺序：`--ctrl` 显式参数 > 站点种子 > 报错。激活码里**不放地址**——那会把 19 个
-字符变成 KB 级 blob，现场抄不了。
+- 信封里只有内层 `code`（`srk_…`，形状不变）是秘密；ctrl/CA 是公开事实，**不参与
+  哈希**。控制器存 `/v1` 侧的仍是内层 secret 的 SHA-256。
+- **TTL、吊销、名额完全不动**：到期判定、`expireClaimCodesLocked`、座位记账全部
+  以授权记录为准，与码的形状无关（owner 明确要求保住 TTL 这条安全底线）。
+- 现场装机只剩一条命令、零拷文件（CA 与地址随码走）：
 
-> 站点文件与 `--site` 这一层**尚未落地**。今天的形态就是 `--ctrl` + 激活码，发现语义
-> 完全一样（种子只用于首接触），它属于下一次的易用性改动。
+```
+sr-agent -claim <整段信封>
+```
+
+取值顺序：`--ctrl` 显式参数 > 信封内嵌端点（取第一项，其余随后续应答进候选表）；
+CA：`--ca` 文件 > 信封内嵌 CA > `<id-dir>/pinned_ca.pem`。
+- **向后兼容**：不带 `srs1-` 前缀的旧码按原样 enroll，已有测试钉住
+  （`cmd/sr-ctrl/claim_test.go` 的 `TestPlainLegacyCodeStillEnrolls`）。
+- 站点级 `site.json` 这一层仍未落地——信封已覆盖了它想解决的场景，优先级更低。
 
 ## 5. RR 侧
 
-RR 今天的输入：`-config` 指向的 JSON 里有 `listen`、`status_addr`、三个 PEM 路径，
-以及 `controller.addr`。后者的作用从"唯一的控制器地址"变成"种子"，其余由应答补齐：
+两条启动路径，最终汇进同一份运行时结构：
+
+- **`-config`**（原有）：JSON 里有 `listen`、`status_addr`、三个 PEM 路径与
+  `controller.addr`（种子）。
+- **`-identity`**（2026-11-19 新增）：控制台"下载 rr-identity.json"的文件里现在
+  带 `controller_addr` 字段，一文件即全部输入：
+
+```
+sr-rr -identity rr-identity-<rr_id>.json
+```
+
+证书是权威：文件里的 `rr_id`/`tenant` 只能证实证书、不能改写它（矛盾即拒绝）。
+listen 取文件 `addr` 的端口绑所有接口（host 部分是别人拨的地址，未必本机可绑），
+`-listen`/`-status` 可覆盖。候选表落盘在 identity 文件旁边
+（`ctrl-addrs-<rr_id>.json`），与 `-config` 路径同一规则。
+
+两条路径连上控制器之后的协议完全一样：
 
 ```
 GET /v1/rr/config          （用 RR 自己的客户端证书认证）
@@ -158,19 +183,19 @@ pull）。
 | `-entry`（集群入口名）作为独立概念 | 种子的语义就是"一个地址"；要 DNS/VIP 就把种子写成域名，不必多一个参数 |
 | 把 DNS/VIP 当前提 | 很多现场给不出来。纯 IP 方案下 HA 场景同样能正确收敛 |
 | 证书 SAN 的"名字变更自动重签" | 纯 IP 方案里设备连的是各节点 `Endpoint`，SAN 本来就含它；只在用域名连时才需要 |
-| 激活码携带地址 | 码会变成 KB 级 blob，现场无法手抄 |
+| ~~激活码携带地址~~ → **2026-11-19 推翻并落地** | 原判"KB 级 blob 现场抄不了"的前提是手抄；实际现场是串口粘贴，粘贴一段完全可行，且省掉 pinned_ca.pem 拷贝与 `-ctrl/-ca` 两个参数。信封见 §4，TTL 原样保留 |
 | `/v1/watch` 接成配置推送 | 见 §7 末段 |
 | 两级种子（门厅 + 控制器） | 运维要记两个名字，出错时判断不了该改哪个 |
 
 **已知边界**
 
 - 种子里只有一个地址：装机那一刻它正好下线，就没有第二次机会（已拍板接受）。
+- 信封码太长，无法手抄：现场必须是复制粘贴（串口/web 控制台/ssh）。要手抄的场合
+  用旧式纯 `srk_` 码（控制器仍兼容），代价是 `-ctrl`/`-ca` 要手工给。
 - 种子节点被 `decommission` 后，拿它当种子的设备/RR 要改一次配置；只要候选表还在就
   不受影响（种子会被替换成存活的那台）。
 - 成员表里**其他**节点的 `Endpoint` 仍是"入群时填的"：本机改 IP 会自动对外宣告新地址，
   但别的节点拨它仍按旧值。多机部署改 IP 时要在控制台更新成员地址。
-- RR 的 identity 文件仍不含控制器地址（`sr-rr` 还没有 `--identity`）；种子在 `-config`
-  的 `controller.addr` 里。这是易用性项，不是机制缺口。
 
 ## 9. 怎么验
 
@@ -193,3 +218,14 @@ curl -s --cert <rr.crt> --key <rr.key> --cacert <ca.pem> \
 3. 加第 4 台：设备一个周期内看到 4 项，设备零改动。
 4. 下线一台：一个周期内不再尝试它；RR 侧日志出现 `left the grid`。
 5. 重启一台设备：日志出现 `resuming on ...`，先试上次成功的地址。
+
+信封与单文件（2026-11-19）：
+
+6. 控制台出码：码以 `srs1-` 开头，reveal 框是可滚动的整段文本；旧版纯 `srk_` 码
+   （若有留底）仍能 enroll。
+7. 新盒子只贴一条 `sr-agent -claim <信封>`（不带 `-ctrl/-ca`）：日志依次出现
+   `--ctrl taken from the claim code`、`trust anchor: claim code (embedded CA)`、
+   `enrolled: tenant=… node=…`。
+8. RR 单文件：控制台签发身份 → 下载 rr-identity.json → 盒子上
+   `sr-rr -identity rr-identity-<id>.json`，日志 `tenant … listening on :<port>`、
+   `grid from https://…`；文件与证书字段矛盾时拒绝启动。

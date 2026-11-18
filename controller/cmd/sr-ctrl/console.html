@@ -1372,15 +1372,30 @@
   }
 
   function codeRevealBox(r) {
+    // The code is now a self-describing envelope (srs1-…): the secret plus the
+    // controller endpoints and CA the device needs. That makes it far too long
+    // to hand-copy — it is meant to be pasted, so show it raw and scrollable
+    // instead of the grouped bigcode used for hand-typed secrets.
+    var wrapped = r.code && r.code.indexOf("srs1-") === 0;
+    var body;
+    if (wrapped) {
+      body = '<textarea class="cmd" readonly spellcheck="false" style="width:100%;height:90px;resize:vertical;font-size:12px;word-break:break-all;margin-top:6px">' +
+        esc(r.code) + "</textarea>" +
+        '<div class="copybox"><button class="small" data-act="copy" data-text="' + esc(r.code) + '">复制整段</button></div>' +
+        '<div class="muted" style="font-size:12.5px">这一段自带控制器地址和 CA：设备上只需要下面这一条命令，不用再拷文件、不用再传 -ctrl / -ca。</div>' +
+        '<pre class="cmd">sr-agent -claim ' + esc(r.code) + "</pre>";
+    } else {
+      body = '<div class="copybox"><code class="bigcode">' + esc(groupCode(r.code)) + "</code>" +
+        '<button class="small" data-act="copy" data-text="' + esc(r.code) + '">复制</button></div>' +
+        '<pre class="cmd">sr-agent -claim ' + esc(r.code) + "</pre>";
+    }
     return '<div class="result show" id="code-reveal">' +
       '<div class="ttl">「' + esc(r.name || "入网授权") + '」的入网码已生成</div>' +
-      "<div>只显示这一次。复制到设备上，或立刻手抄下来；离开后无法再查看，只能重新生成。</div>" +
-      '<div class="copybox"><code class="bigcode">' + esc(groupCode(r.code)) + "</code>" +
-      '<button class="small" data-act="copy" data-text="' + esc(r.code) + '">复制</button></div>' +
+      "<div>只显示这一次。复制到设备上；离开后无法再查看，只能重新生成。</div>" +
+      body +
       '<div class="muted" style="font-size:12.5px">有效至 ' + esc(clock(r.expires_at_unix)) +
       '（<span class="ttl-now" data-expires="' + esc(r.expires_at_unix) + '"></span>）。' +
       "重新生成会让这个码立刻失效。</div>" +
-      '<pre class="cmd">test/lab/vcpe.sh up --claim ' + esc(r.code) + "</pre>" +
       '<div style="margin-top:10px"><button class="small" data-act="code-dismiss">我已保存，关闭</button></div>' +
       "</div>";
   }
@@ -6859,6 +6874,8 @@
       '<button class="small" data-act="ov-rr-copy-field" data-field="ov-rr-secret-ca">复制 CA</button>' +
       '<button class="small" data-act="ov-rr-download">下载 rr-identity.json</button>' +
       '<button class="small" data-act="ov-rr-secret-x">已装好，收起</button></div>' +
+      '<div class="hint">把下载的文件放到 RR 盒子上，一个文件就够了：' +
+      '<pre class="cmd">sr-rr --identity rr-identity-' + esc(res.rr_id) + '.json</pre></div>' +
       "</div>";
   }
 
@@ -6867,6 +6884,7 @@
     if (!s) return;
     var doc = {
       rr_id: s.rr_id, tenant: s.tenant, addr: s.addr,
+      controller_addr: s.controller_addr || undefined,
       cert_pem: s.cert_pem, key_pem: s.key_pem, ca_pem: s.ca_pem,
       fingerprint: s.fingerprint, serial: s.serial, issued_at_unix: s.issued_at_unix
     };

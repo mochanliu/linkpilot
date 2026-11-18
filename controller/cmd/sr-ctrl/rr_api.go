@@ -259,18 +259,22 @@ type rrIdentityRequest struct {
 // cached, not logged, and not stored: once this response is gone the controller
 // cannot reproduce it, and losing the box's copy means signing again.
 type rrIdentityResponse struct {
-	OK          bool   `json:"ok"`
-	CertPEM     string `json:"cert_pem"`
-	KeyPEM      string `json:"key_pem"`
-	CAPEM       string `json:"ca_pem"`
-	RRID        string `json:"rr_id"`
-	Tenant      string `json:"tenant"`
-	Addr        string `json:"addr"`
-	Serial      string `json:"serial"`
-	Fingerprint string `json:"fingerprint"`
-	IssuedAt    int64  `json:"issued_at_unix"`
-	Note        string `json:"note"`
-	RR          rrRow  `json:"rr"`
+	OK      bool   `json:"ok"`
+	CertPEM string `json:"cert_pem"`
+	KeyPEM  string `json:"key_pem"`
+	CAPEM   string `json:"ca_pem"`
+	RRID    string `json:"rr_id"`
+	Tenant  string `json:"tenant"`
+	Addr    string `json:"addr"`
+	// ControllerAddr is the device-facing controller endpoint (https://…).
+	// The console folds it into the downloaded rr-identity.json so a box can
+	// boot with `sr-rr --identity <file>` and nothing else typed by hand.
+	ControllerAddr string `json:"controller_addr,omitempty"`
+	Serial         string `json:"serial"`
+	Fingerprint    string `json:"fingerprint"`
+	IssuedAt       int64  `json:"issued_at_unix"`
+	Note           string `json:"note"`
+	RR             rrRow  `json:"rr"`
 }
 
 const rrIdentityNote = "私钥只出现在这一次响应里，关掉就取不回来——控制器不缓存、日志里也没有。" +
@@ -373,9 +377,13 @@ func (s *server) handleTenantRRIdentity(w http.ResponseWriter, r *http.Request) 
 	log.Printf("rrlib: tenant=%s issued identity %s serial=%s fp=%s san=%s by %s",
 		id.TenantID, it.ID, it.Identity.Serial, it.Identity.Fingerprint, host, id.Username)
 
+	ctrlAddr := ""
+	if len(s.tlsAddrs) > 0 && strings.TrimSpace(s.tlsAddrs[0]) != "" {
+		ctrlAddr = "https://" + s.tlsAddrs[0]
+	}
 	writeJSON(w, rrIdentityResponse{
 		OK: true, CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: string(caPEM),
-		RRID: it.ID, Tenant: it.TenantID, Addr: it.Addr,
+		RRID: it.ID, Tenant: it.TenantID, Addr: it.Addr, ControllerAddr: ctrlAddr,
 		Serial: it.Identity.Serial, Fingerprint: it.Identity.Fingerprint,
 		IssuedAt: now, Note: rrIdentityNote, RR: s.rrRowOfLocked(*it),
 	})

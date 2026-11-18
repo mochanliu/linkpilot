@@ -63,6 +63,7 @@ import (
 	"syscall"
 	"time"
 
+	"sdwan/controller/internal/claimcode"
 	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/underlay"
 	"sdwan/controller/internal/wire"
@@ -1346,7 +1347,14 @@ func (s *server) findClaimByCodeLocked(code string) *Claim {
 	if code == "" {
 		return nil
 	}
-	want := hashClaimCode(code)
+	// The presented string may be a self-describing envelope (srs1-…); only
+	// the inner secret is compared. A malformed envelope is refused here — a
+	// typo must fail loudly, not enroll as some other grant.
+	digest, err := claimcode.Hash(code)
+	if err != nil {
+		return nil
+	}
+	want := digest
 	for _, c := range s.state.Claims {
 		if c != nil && c.CodeHash == want {
 			return c

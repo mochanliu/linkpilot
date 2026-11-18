@@ -41,6 +41,7 @@ import (
 
 	"sdwan/controller/internal/agent"
 	"sdwan/controller/internal/apply"
+	"sdwan/controller/internal/claimcode"
 	"sdwan/controller/internal/ctrladdr"
 	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/sla"
@@ -112,10 +113,28 @@ func main() {
 		log.Fatalf("--stun-reflectors must be 0 (no discovery) or more, got %d", *stunN)
 	}
 
-	if strings.TrimSpace(*ctrl) == "" {
+	// A self-describing claim code (srs1-…) carries the controller endpoints
+	// and the pinned CA inside the pasted string, so a factory-fresh box needs
+	// ONE input and zero file copies. The inner secret is what gets enrolled.
+	var claimSecret string
+	var claimEnv *claimcode.Payload
+	if c := strings.TrimSpace(*claim); c != "" {
+		secret, env, err := claimcode.Parse(c)
+		if err != nil {
+			log.Fatalf("--claim: %v", err)
+		}
+		claimSecret, claimEnv = secret, env
+	}
+
+	ctrlSpec := strings.TrimSpace(*ctrl)
+	if ctrlSpec == "" && claimEnv != nil && len(claimEnv.Ctrl) > 0 {
+		ctrlSpec = claimEnv.Ctrl[0]
+		log.Printf("--ctrl taken from the claim code: %s", ctrlSpec)
+	}
+	if ctrlSpec == "" {
 		log.Fatal("--ctrl is required (host:port of the controller's mTLS endpoint)")
 	}
-	base, err := ctrlBase(*ctrl)
+	base, err := ctrlBase(ctrlSpec)
 	if err != nil {
 		log.Fatalf("--ctrl: %v", err)
 	}
@@ -145,17 +164,17 @@ func main() {
 
 	hbSec := 5
 	if !id.Enrolled() {
-		if *claim == "" {
+		if claimSecret == "" {
 			log.Fatalf("device %s has no identity yet: pass --claim (identity dir %s)", idSerial, *idDir)
 		}
-		roots, err := pinnedRoots(*caPath, *idDir)
+		roots, err := pinnedRoots(*caPath, claimEnvCA(claimEnv), *idDir)
 		if err != nil {
 			log.Fatalf("pinned CA: %v", err)
 		}
 		// The reflector count is this agent's own limit, not a request for a
 		// service: it says how many addresses the controller may hand back for
 		// this device to probe. Two is the floor for a symmetric-NAT verdict.
-		req := id.EnrollRequest(*claim, agentVersion, *stunN, *preAuth)
+		req := id.EnrollRequest(claimSecret, agentVersion, *stunN, *preAuth)
 		ectx, ecancel := context.WithTimeout(ctx, 20*time.Second)
 		resp, err := agent.Enroll(ectx, base, roots, req)
 		ecancel()
@@ -713,10 +732,20 @@ func ctrlBase(s string) (string, error) {
 
 // pinnedRoots is the trust anchor for the FIRST enrollment.
 //
-// Order matters: an already-stored CA (from a previous enrollment) wins, because
-// that is the CA the device's own certificate chains to. --ca is for the very
-// first boot, when the only thing on the box is what the operator put there.
-func pinnedRoots(caFlag, idDir string) (*x509.CertPool, error) {
+// Order matters: an explicit --ca file wins (the operator said so), then the CA
+// embedded in the claim code (it came from the very controller that will sign),
+// then an already-stored pinned_ca.pem, then a --ca file found there. That is
+// the CA the device's own certificate will chain to, so trusting it is what
+// makes the first enrollment verifiable.
+func pinnedRoots(caFlag string, embeddedPEM string, idDir string) (*x509.CertPool, error) {
+	if b := []byte(embeddedPEM); len(b) > 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(b) {
+			return nil, errors.New("CA embedded in the claim code contains no PEM certificate")
+		}
+		log.Printf("trust anchor: claim code (embedded CA)")
+		return pool, nil
+	}
 	candidates := []string{}
 	if caFlag != "" {
 		candidates = append(candidates, caFlag)
@@ -734,7 +763,15 @@ func pinnedRoots(caFlag, idDir string) (*x509.CertPool, error) {
 		log.Printf("trust anchor: %s", p)
 		return pool, nil
 	}
-	return nil, fmt.Errorf("no CA bundle: pass --ca or place the controller CA at %s/pinned_ca.pem", idDir)
+	return nil, fmt.Errorf("no CA bundle: pass --ca, use a self-describing claim code, or place the controller CA at %s/pinned_ca.pem", idDir)
+}
+
+// claimEnvCA returns the CA PEM carried by a self-describing claim code, if any.
+func claimEnvCA(p *claimcode.Payload) string {
+	if p == nil {
+		return ""
+	}
+	return p.CA
 }
 
 // ------------------------------------------------------------------ status

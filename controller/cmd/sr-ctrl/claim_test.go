@@ -18,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sdwan/controller/internal/claimcode"
 )
 
 // claimFixture is a console-capable controller: one grant on tenant "t", a
@@ -74,46 +76,74 @@ func mintCode(t *testing.T, s *server, sid, grantID string, ttl int) *claimCodeR
 
 func TestClaimCodeIsShownOnceAndOnlyTheHashIsStored(t *testing.T) {
 	s, grant := claimFixture(t)
+	// The envelope must carry the controller endpoints the device would
+	// otherwise have to be told by hand.
+	s.tlsAddrs = []string{"192.168.1.100:8444"}
 	resp := mintCode(t, s, tenantSession(s, "t"), grant.ID, 300)
 
-	if !strings.HasPrefix(resp.Code, "srk_") || len(resp.Code) != 36 {
-		t.Fatalf("code shape = %q", resp.Code)
+	// What is handed out is the self-describing envelope; the inner secret is
+	// still the classic hand-typeable shape.
+	if !strings.HasPrefix(resp.Code, claimcode.Prefix) {
+		t.Fatalf("code shape = %q", resp.Code[:minInt(24, len(resp.Code))])
+	}
+	secret, env, err := claimcode.Parse(resp.Code)
+	if err != nil {
+		t.Fatalf("parse envelope: %v", err)
+	}
+	if !strings.HasPrefix(secret, "srk_") || len(secret) != 36 {
+		t.Fatalf("inner secret shape = %q", secret)
+	}
+	// The envelope carries the controller endpoints so the device needs no
+	// --ctrl; the CA rides along too when the fixture has one on disk.
+	if env == nil || len(env.Ctrl) != 1 || env.Ctrl[0] != "192.168.1.100:8444" {
+		t.Fatalf("envelope carries the wrong controller endpoint: %+v", env)
+	}
+	if env.CA == "" {
+		t.Fatal("envelope carries no CA; the device would need --ca again")
 	}
 	wantExp := resp.IssuedAt + 300
 	if resp.ExpiresAt != wantExp {
 		t.Fatalf("expires_at = %d, want %d", resp.ExpiresAt, wantExp)
 	}
-	if grant.CodeHash != hashClaimCode(resp.Code) {
-		t.Fatal("stored hash does not match the code handed out")
+	if grant.CodeHash != hashClaimCode(secret) {
+		t.Fatal("stored hash does not match the secret inside the envelope")
 	}
 	if grant.CodeExpiresAt != resp.ExpiresAt || grant.CodeIssuedBy != "t-admin" {
 		t.Fatalf("issue metadata not recorded: %+v", grant)
 	}
 
-	// On disk and in the state API the secret must not exist. A hash is fine; the
-	// code itself is what must never be written.
+	// On disk and in the state API the secret must not exist — and neither may
+	// the envelope as a whole (it carries the secret verbatim). A hash is fine;
+	// anything pasteable is what must never be written.
 	disk, err := os.ReadFile(filepath.Join(s.dataDir, "state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, leak := range []string{resp.Code, "code_hash\":" + resp.Code} {
+	for _, leak := range []string{resp.Code, secret, "code_hash\":" + secret} {
 		if strings.Contains(string(disk), leak) {
 			t.Fatalf("state file contains the code: %s", leak)
 		}
 	}
-	if !strings.Contains(string(disk), hashClaimCode(resp.Code)) {
+	if !strings.Contains(string(disk), hashClaimCode(secret)) {
 		t.Fatal("state file does not carry the hash; the code would not survive a restart")
 	}
 
 	rec := httptest.NewRecorder()
 	s.handleAdminState(rec, consoleReq(http.MethodGet, "/api/state", "", tenantSession(s, "t")))
 	raw := rec.Body.String()
-	if strings.Contains(raw, resp.Code) || strings.Contains(raw, "code_hash") {
+	if strings.Contains(raw, resp.Code) || strings.Contains(raw, secret) || strings.Contains(raw, "code_hash") {
 		t.Fatalf("/api/state leaks the secret or its hash: %s", raw)
 	}
 	if !strings.Contains(raw, `"code_active":true`) {
 		t.Fatalf("tenant cannot see that a code is live: %s", raw)
 	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func TestClaimCodeGenerateIsTenantOnly(t *testing.T) {
@@ -354,5 +384,55 @@ func TestNormalizeStateIsIdempotentForNewRecords(t *testing.T) {
 	}
 	if st.Claims["clm_ok"] == nil || st.Claims["clm_ok"].CodeHash != hashClaimCode("x") {
 		t.Fatalf("normalization damaged a current record: %+v", st.Claims)
+	}
+}
+
+// A code minted before the envelope existed is a plain "srk_" secret. It must
+// keep enrolling unchanged — the upgrade path is "new codes are envelopes",
+// never "old devices must re-mint".
+func TestPlainLegacyCodeStillEnrolls(t *testing.T) {
+	s, grant := claimFixture(t)
+	s.mu.Lock()
+	grant.CodeHash = hashClaimCode("srk_OLDSTYLEPLAIN")
+	grant.CodeExpiresAt = time.Now().Add(time.Minute).Unix()
+	s.mu.Unlock()
+
+	rec := httptest.NewRecorder()
+	s.handleEnroll(rec, enrollReqSerial(t, "srk_OLDSTYLEPLAIN", "sn-plain"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("plain code rejected after the envelope change: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// And the same secret wrapped in an envelope resolves to the same grant.
+	grant2 := &Claim{ID: "clm_env", TenantID: "t", Name: "信封码", CreatedAt: time.Now().Unix(), MaxUses: 2}
+	s.mu.Lock()
+	s.state.Claims[grant2.ID] = grant2
+	presented := claimcode.Wrap("srk_WRAPPEDSECRET", "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n", []string{"ctrl:8444"})
+	grant2.CodeHash = hashClaimCode("srk_WRAPPEDSECRET")
+	grant2.CodeExpiresAt = time.Now().Add(time.Minute).Unix()
+	s.mu.Unlock()
+
+	rec = httptest.NewRecorder()
+	s.handleEnroll(rec, enrollReqSerial(t, presented, "sn-env"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("envelope code rejected: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// A tampered envelope must not enroll as some other grant.
+	tampered := claimcode.Wrap("srk_WRAPPEDSECRET", "", []string{"evil:8444"})
+	rec = httptest.NewRecorder()
+	s.handleEnroll(rec, enrollReqSerial(t, tampered, "sn-tampered"))
+	// Tampering the CA does NOT change the inner secret, so this still
+	// enrolls: the envelope is not authenticated and must not pretend to be.
+	// The device-side trust comes from the CA it pins, not from the envelope.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-wrapped secret stopped resolving: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// A garbage envelope, though, is refused outright.
+	rec = httptest.NewRecorder()
+	s.handleEnroll(rec, enrollReqSerial(t, claimcode.Prefix+"garbage!", "sn-junk"))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("malformed envelope accepted: %d %s", rec.Code, rec.Body.String())
 	}
 }
