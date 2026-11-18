@@ -228,6 +228,23 @@ func (s *server) membersSnapshot() []ClusterMember {
 	return s.state.Cluster.sorted()
 }
 
+// warnStaleSelfEndpoint 在启动时把"成员表里的本机地址"和"本机宣告地址"的差异
+// 说清楚。不自动改共识：成员变更是运维动作，静默重写会让"谁改了成员表"这件事
+// 没有任何痕迹；但也不能不说——别的节点拨本机走的就是表里那份。
+func (s *server) warnStaleSelfEndpoint(adv string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Cluster == nil || s.nodeID == "" || adv == "" {
+		return
+	}
+	m := s.state.Cluster.Members[s.nodeID]
+	if m == nil || m.Endpoint == "" || m.Endpoint == adv {
+		return
+	}
+	log.Printf("cluster: 成员表里本机地址是 %s，本机宣告的是 %s；设备与 RR 会用后者，"+
+		"节点间拨号仍按前者（建议在控制台把成员地址改过来）", m.Endpoint, adv)
+}
+
 // memberEndpoints 是给设备的地址列表。集群没开的时候就是自己的监听地址。
 func (s *server) memberEndpoints() []string {
 	s.mu.Lock()
@@ -235,11 +252,29 @@ func (s *server) memberEndpoints() []string {
 	return s.memberEndpointsLocked()
 }
 
+// memberEndpointsLocked 是设备与 RR 拿到的"控制器在哪"。
+//
+// 自己在成员表里的地址是**入群那一刻填的**，不是这台机器现在的地址：换过 IP、
+// 换过机器之后它还是旧值（.100 迁移完，成员表里仍写着旧 Mac 的 192.168.1.4:8444）。
+// 照旧表发出去，设备与 RR 的候选表里就会多一条必然失败的地址，而且它们会把它
+// 当"另一台控制器"。本机的 -advertise / -tls-san 才是它此刻的真实地址，所以
+// 列表里自己那一条用它，别的成员照旧用成员表（那才是它们各自宣告的）。
 func (s *server) memberEndpointsLocked() []string {
 	if s.state.Cluster == nil {
 		return append([]string{}, s.tlsAddrs...)
 	}
-	return s.state.Cluster.activeEndpoints()
+	out := make([]string, 0, len(s.state.Cluster.Members))
+	for _, m := range s.state.Cluster.sorted() {
+		if m.Status != memberActive || m.Endpoint == "" {
+			continue
+		}
+		if m.ID == s.nodeID && s.adv != "" {
+			out = append(out, s.adv)
+			continue
+		}
+		out = append(out, m.Endpoint)
+	}
+	return out
 }
 
 func (s *server) leaderEndpointLocked() string {

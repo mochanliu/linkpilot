@@ -392,9 +392,20 @@ type rrPeer struct {
 // local interface to listen on and how often to poll are the box's own business
 // and stay out of the controller's answer.
 type rrConfigResponse struct {
-	Tenant          string   `json:"tenant"`
-	RRID            string   `json:"rr_id"`
-	Peers           []rrPeer `json:"peers"`
+	Tenant string   `json:"tenant"`
+	RRID   string   `json:"rr_id"`
+	Peers  []rrPeer `json:"peers"`
+	// Controllers is where this RR can reach the control plane: the same list a
+	// device gets on every heartbeat (the active members' endpoints). Without it
+	// an RR is pinned to the one address in its config file -- the controller it
+	// happens to start against -- and a controller that goes away freezes the
+	// grid: no new rows, no address changes, only the same error every poll.
+	//
+	// Empty means an older controller (or a single node that cannot name
+	// itself); the RR then keeps using its configured address, which is exactly
+	// the old behaviour.
+	Controllers     []string `json:"controllers,omitempty"`
+	Leader          string   `json:"leader,omitempty"`
 	GeneratedAtUnix int64    `json:"generated_at_unix"`
 }
 
@@ -446,8 +457,12 @@ func (s *server) handleRRConfig(w http.ResponseWriter, r *http.Request) {
 	// 每 5 秒为所有 RR 的轮询提交一轮共识（lab 实测，见 server.rrFetch）。
 	s.noteRRFetchLocked(it.ID, now, remoteHost(r.RemoteAddr))
 
+	// 已经持有 s.mu（上面 defer 的就是它），所以取 Locked 变体：memberEndpoints()
+	// 自己会再取一次锁，在这里就是自死锁。
 	writeJSON(w, rrConfigResponse{
-		Tenant: ref.Tenant, RRID: it.ID, Peers: peers, GeneratedAtUnix: now,
+		Tenant: ref.Tenant, RRID: it.ID, Peers: peers,
+		Controllers: s.memberEndpointsLocked(), Leader: s.leaderEndpointLocked(),
+		GeneratedAtUnix: now,
 	})
 }
 

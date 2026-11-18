@@ -34,10 +34,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
 
+	"sdwan/controller/internal/ctrladdr"
 	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/route"
 )
@@ -181,8 +183,20 @@ func main() {
 			Certificates: []tls.Certificate{cert},
 			RootCAs:      pool,
 		}
+		// 种子是配置里的 controller.addr（一个地址）；连上之后全表由控制器带回。
+		// 落盘放在配置文件旁边、按 rr_id 分开：同一台机器上两个 RR 各有各的
+		// 候选表，一份文件写两份会互相覆盖。
+		book, berr := ctrladdr.Load(cfg.Controller.Addr,
+			filepath.Join(filepath.Dir(*configPath), "ctrl-addrs-"+cfg.RRID+".json"))
+		if berr != nil {
+			log.Printf("sr-rr %s: controller address book: %v (starting from %s)", cfg.RRID, berr, cfg.Controller.Addr)
+		}
+		if cur := book.Current(); cur != ctrladdr.Norm(cfg.Controller.Addr) {
+			log.Printf("sr-rr %s: resuming on %s (%d candidate(s), seed %s)",
+				cfg.RRID, cur, book.Size(), book.Seed())
+		}
 		grid = newMesh(meshParams{
-			addr:    cfg.Controller.Addr,
+			book:    book,
 			poll:    poll,
 			tenant:  cfg.Tenant,
 			rrID:    cfg.RRID,
@@ -191,7 +205,7 @@ func main() {
 			ref:     ref,
 			logf:    log.Printf,
 		})
-		log.Printf("sr-rr %s: grid from %s, poll %s", cfg.RRID, cfg.Controller.Addr, poll)
+		log.Printf("sr-rr %s: grid from %s, poll %s", cfg.RRID, book.Current(), poll)
 		go func() {
 			if err := grid.run(context.Background()); err != nil {
 				// 404 means the row is gone; 401/403 mean this certificate is not

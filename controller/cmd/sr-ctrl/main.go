@@ -732,6 +732,9 @@ type server struct {
 	nextSub  int
 	hbSec    int
 	tlsAddrs []string
+	// adv 是本机宣告给设备与 RR 的地址（-advertise，缺省由 -tls-san/-listen 推出）。
+	// 它不会随成员表变化：成员表里自己那条是入群时填的记录，可能已经过时。
+	adv string
 	// consoleTLS 是"控制台监听器讲不讲 TLS"。集群里它要写进成员表：follower
 	// 307 时必须知道 leader 的控制台是 https 还是明文，猜错就是把人送到一个
 	// 只讲 TLS 的端口上。
@@ -2466,10 +2469,11 @@ func (s *server) ttlSweeper(ctx context.Context) {
 
 func main() {
 	var (
-		dataDir  = flag.String("data", "./ctrl-data", "state directory (CA, certs, registry)")
-		listen   = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
-		hbSec    = flag.Int("hb", 5, "heartbeat interval advertised to agents")
-		extraSAN = flag.String("tls-san", "", "comma-separated extra SANs for the server certificate")
+		dataDir   = flag.String("data", "./ctrl-data", "state directory (CA, certs, registry)")
+		listen    = flag.String("listen", "0.0.0.0:8444", "TLS control-plane listen address")
+		advertise = flag.String("advertise", "", "how devices and RRs reach this controller (host:port); default: first -tls-san + the -listen port")
+		hbSec     = flag.Int("hb", 5, "heartbeat interval advertised to agents")
+		extraSAN  = flag.String("tls-san", "", "comma-separated extra SANs for the server certificate")
 		// The console is a SEPARATE listener. A browser cannot present a device
 		// certificate, so it cannot use the mTLS listener without making every
 		// operator install one; the console therefore has its own token session.
@@ -2523,9 +2527,14 @@ func main() {
 	}
 
 	sans := []string{"localhost", "ctrl", "host.docker.internal", "127.0.0.1", "::1", "172.18.0.10"}
+	var explicitSANs []string
 	if *extraSAN != "" {
-		sans = append(sans, strings.Split(*extraSAN, ",")...)
+		explicitSANs = strings.Split(*extraSAN, ",")
+		sans = append(sans, explicitSANs...)
 	}
+	// 设备与 RR 拿到的"控制器地址"必须是它们能拨的地址，不能是 -listen 的绑定值。
+	adv := advertiseAddr(*listen, explicitSANs, *advertise)
+	log.Printf("control plane: listening on %s, devices and RRs should use %s", *listen, adv)
 	srvCert, err := loadOrCreateServerCert(*dataDir, ca, caKey, sans)
 	if err != nil {
 		log.Fatal(err)
@@ -2565,7 +2574,8 @@ func main() {
 		store:         store,
 		subs:          map[int]*subscriber{},
 		hbSec:         *hbSec,
-		tlsAddrs:      []string{*listen},
+		tlsAddrs:      []string{adv},
+		adv:           adv,
 		consoleTLS:    *consoleTLS,
 		reflectors:    reflectors,
 		caCert:        ca,
@@ -2639,6 +2649,10 @@ func main() {
 					"如果是被下线的那台，要重新加入请清空数据目录后换新加入码")
 			}
 			s.tlsAddrs = s.memberEndpoints()
+			// 成员表里自己那条是入群时填的记录，可能已经不是这台机器的地址：
+			// 对外宣告以本机为准（memberEndpointsLocked 已经这么做），但运维要
+			// 知道那张表该改了——别的节点拨本机用的还是表里那份。
+			s.warnStaleSelfEndpoint(adv)
 		}
 	}
 	s.resetHardIndex()

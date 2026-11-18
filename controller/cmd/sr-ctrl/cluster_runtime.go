@@ -206,7 +206,7 @@ func (s *server) wireRaft(r *raftNode) {
 		s.state.Cluster.Members = m
 		// 地址表变了：设备下一拍心跳就能拿到新列表，不需要谁去改配置；
 		// 节点间复制也要立刻按新表发（别让新成员等下一次重启）。
-		s.tlsAddrs = s.state.Cluster.activeEndpoints()
+		s.tlsAddrs = s.memberEndpointsLocked()
 		s.publishPeerAddrsLocked()
 		s.noteApplied()
 		return s.store.Save(s.state)
@@ -222,7 +222,7 @@ func (s *server) wireRaft(r *raftNode) {
 		s.state = &st
 		s.resetHardIndex()
 		if st.Cluster != nil {
-			s.tlsAddrs = st.Cluster.activeEndpoints()
+			s.tlsAddrs = s.memberEndpointsLocked()
 		}
 		s.publishPeerAddrsLocked()
 		s.noteApplied()

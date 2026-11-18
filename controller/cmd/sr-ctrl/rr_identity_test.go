@@ -351,6 +351,38 @@ func TestRRConfigPeersAndLastFetch(t *testing.T) {
 	}
 }
 
+func TestRRConfigCarriesTheControllerList(t *testing.T) {
+	s, ten, _ := rrIdentityFixture(t)
+	rrCreate(t, s, ten, "RR 1", "rr1.example.com:20200")
+	mine := rrCreate(t, s, ten, "RR 2", "rr2.example.com:20200")
+
+	// 单机：没有成员表，宣告地址就是"设备/RR 该用的那个"。以前这里是
+	// -listen 原值，于是 0.0.0.0:8444 被当成控制器地址发出去。
+	s.tlsAddrs = []string{"192.168.1.100:8444"}
+
+	rec := httptest.NewRecorder()
+	s.handleRRConfig(rec, rrCertReq(http.MethodGet, "/v1/rr/config", "t", mine))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rr config = %d (%s)", rec.Code, rec.Body.String())
+	}
+	var out rrConfigResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Controllers) != 1 || out.Controllers[0] != "192.168.1.100:8444" {
+		t.Fatalf("controllers = %v，应是单机的宣告地址", out.Controllers)
+	}
+
+	// 没有可宣告的地址（老控制器/单机推不出来）时字段整个不出现：RR 会继续用
+	// 配置里的地址，也就是旧行为，而不是拿到一张空表把自己锁死。
+	s.tlsAddrs = nil
+	rec = httptest.NewRecorder()
+	s.handleRRConfig(rec, rrCertReq(http.MethodGet, "/v1/rr/config", "t", mine))
+	if strings.Contains(rec.Body.String(), "controllers") {
+		t.Fatalf("没有地址时不该出现 controllers 字段：%s", rec.Body.String())
+	}
+}
+
 func TestRRConfigOtherTenantSeesOnlyItsOwnGrid(t *testing.T) {
 	s, ten, two := rrIdentityFixture(t)
 	rrCreate(t, s, ten, "RR 1", "rr1.example.com:20200")

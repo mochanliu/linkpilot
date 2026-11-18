@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"sdwan/controller/internal/ctrladdr"
 	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/route"
 )
@@ -52,10 +53,18 @@ type rrConfigResponse struct {
 	Tenant string   `json:"tenant"`
 	RRID   string   `json:"rr_id"`
 	Peers  []rrPeer `json:"peers"`
+	// Controllers is the control plane's candidate list, the same one a device
+	// gets on every heartbeat. An older controller leaves it empty and the RR
+	// keeps the address it was configured with.
+	Controllers []string `json:"controllers,omitempty"`
+	Leader      string   `json:"leader,omitempty"`
 }
 
 type meshParams struct {
-	addr    string // controller base URL, https://host:port
+	// book 是控制面的候选表。种子来自配置里的 controller.addr；连上之后每次
+	// 应答都把全表带回来，leader 排在表头。和 sr-agent 用的是同一份实现——
+	// 两个角色对"该连谁"的理解必须是同一套，否则一边会切、一边会冻住。
+	book    *ctrladdr.Book
 	poll    time.Duration
 	tenant  string
 	rrID    string
@@ -68,8 +77,9 @@ type meshParams struct {
 type mesh struct {
 	meshParams
 
-	mu    sync.Mutex
-	peers map[string]*meshPeer
+	mu         sync.Mutex
+	peers      map[string]*meshPeer
+	saveWarned bool // 落盘失败只报一次（它每 poll 都会重试）
 }
 
 type meshPeer struct {
@@ -88,14 +98,19 @@ func newMesh(p meshParams) *mesh {
 	return &mesh{meshParams: p, peers: make(map[string]*meshPeer)}
 }
 
-// run polls until the process stops. A transient failure keeps the current
-// grid and retries with backoff; a fatal answer (401/403/404) returns an error
-// and the caller exits non-zero.
+// run polls until the process stops. 一个控制器连不上就立刻换下一个（不退避），
+// 整张表都试过一轮才退避；致命应答（401/403/404）返回错误，调用方退出非零。
+//
+// 这条规则和 sr-agent 的心跳循环逐字一致：RR 与设备是同一类角色——都被给了一个
+// 种子，靠应答里带回的全表跟着集群走。RR 以前只有配置里的那一个地址，控制器一
+// 挂网格就冻住：既有会话还在，但新增/删除 RR、改 RR 地址都不再生效，日志每轮报
+// 同一个错。
 func (m *mesh) run(ctx context.Context) error {
 	backoff := meshInitialBackoff
 	lastPollErr := ""
 	for {
-		peers, err := m.fetch(ctx)
+		from := m.book.Current()
+		resp, err := m.fetch(ctx, from)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -104,8 +119,13 @@ func (m *mesh) run(ctx context.Context) error {
 				return err
 			}
 			if err.Error() != lastPollErr {
-				m.logf("sr-rr %s: peer list from %s: %v (grid kept; retrying)", m.rrID, m.addr, err)
+				m.logf("sr-rr %s: peer list from %s: %v (grid kept; trying the next controller)", m.rrID, from, err)
 				lastPollErr = err.Error()
+			}
+			// 先换端点，再谈退避：等 2 秒对"那台已经下线"这件事没有任何帮助。
+			if next, ok := m.book.Next(); ok {
+				m.logf("sr-rr %s: controller %s unreachable, switching to %s (%d known)", m.rrID, from, next, m.book.Size())
+				continue
 			}
 			if !sleepCtx(ctx, backoff) {
 				return nil
@@ -115,49 +135,58 @@ func (m *mesh) run(ctx context.Context) error {
 		}
 		lastPollErr = ""
 		backoff = meshInitialBackoff
-		m.reconcile(ctx, peers)
+		m.book.OK()
+		if next := m.book.Learn(resp.Controllers, resp.Leader); next != "" {
+			m.logf("sr-rr %s: controller leader is %s, switching (%d known)", m.rrID, next, m.book.Size())
+		}
+		// 落盘：重启后先试上次成功的那个，而不是回到可能已经下线的种子。
+		if err := m.book.Save(); err != nil && !m.saveWarned {
+			m.saveWarned = true
+			m.logf("sr-rr %s: controller address book not persisted: %v", m.rrID, err)
+		}
+		m.reconcile(ctx, resp.Peers)
 		if !sleepCtx(ctx, m.poll) {
 			return nil
 		}
 	}
 }
 
-func (m *mesh) fetch(ctx context.Context) ([]rrPeer, error) {
+func (m *mesh) fetch(ctx context.Context, base string) (rrConfigResponse, error) {
+	var out rrConfigResponse
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	url := strings.TrimRight(m.addr, "/") + "/v1/rr/config"
+	url := strings.TrimRight(base, "/") + "/v1/rr/config"
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	resp, err := m.hc.Do(req)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
-		return nil, fmt.Errorf("%w: HTTP %d: %s", errMeshFatal, resp.StatusCode,
+		return out, fmt.Errorf("%w: HTTP %d: %s", errMeshFatal, resp.StatusCode,
 			strings.TrimSpace(string(body)))
 	default:
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return out, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	var out rrConfigResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("parse answer: %w", err)
+		return out, fmt.Errorf("parse answer: %w", err)
 	}
 	if out.Tenant != m.tenant || out.RRID != m.rrID {
 		// A controller that names someone else would have us dial and accept
 		// sessions under the wrong identity.
-		return nil, fmt.Errorf("controller answered for tenant %q rr %q, we are %q rr %q",
+		return out, fmt.Errorf("controller answered for tenant %q rr %q, we are %q rr %q",
 			out.Tenant, out.RRID, m.tenant, m.rrID)
 	}
-	return out.Peers, nil
+	return out, nil
 }
 
 // reconcile applies one peer list: gone peers are cancelled, new ones get a

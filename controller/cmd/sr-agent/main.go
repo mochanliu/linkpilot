@@ -33,6 +33,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,6 +41,7 @@ import (
 
 	"sdwan/controller/internal/agent"
 	"sdwan/controller/internal/apply"
+	"sdwan/controller/internal/ctrladdr"
 	"sdwan/controller/internal/keybinding"
 	"sdwan/controller/internal/sla"
 	"sdwan/controller/internal/vppapi"
@@ -435,7 +437,24 @@ func main() {
 	//
 	// 集群之后还有第二条路：换端点。心跳应答带着完整地址表和当前 leader，
 	// 连不上就立刻试下一个（不退避），只有整张表都试过一轮才回到 2s→30s。
-	book := newAddrBook(base)
+	book, bookErr := ctrladdr.Load(base, filepath.Join(*idDir, "ctrl-addrs.json"))
+	if bookErr != nil {
+		log.Printf("controller address book: %v (starting from the seed %s)", bookErr, base)
+	}
+	// 落盘的候选表比 --ctrl 新：上次在用的那台不一定是种子（leader 漂过、种子
+	// 被下线过）。先接着它，别让一次重启把设备从"正常"变成"连不上"。
+	if cur := book.Current(); cur != base {
+		if err := client.SetBase(cur); err == nil {
+			log.Printf("controller: resuming on %s (%d candidate(s), seed %s)", cur, book.Size(), book.Seed())
+		}
+	}
+	var saveWarned bool
+	persist := func() {
+		if err := book.Save(); err != nil && !saveWarned {
+			saveWarned = true
+			log.Printf("controller address book not persisted: %v", err)
+		}
+	}
 	backoff := time.Duration(0)
 	for {
 		hbctx, hbcancel := context.WithTimeout(ctx, 10*time.Second)
@@ -465,7 +484,7 @@ func main() {
 				return
 			}
 			// 先换端点，再谈退避：leader 挂了的情况下，等 2 秒就是白等。
-			if next, ok := book.next(); ok {
+			if next, ok := book.Next(); ok {
 				was := client.Base()
 				if err := client.SetBase(next); err == nil {
 					log.Printf("controller %s unreachable, switching to %s", was, next)
@@ -476,14 +495,15 @@ func main() {
 		} else {
 			st.markOK(resp)
 			backoff = 0
-			book.ok()
+			book.OK()
 			// 地址表 + leader 提示：写只在 leader 上成立，跟着它走少一次 307。
-			if next := book.learn(resp.TLSAddrs, resp.Leader); next != "" {
+			if next := book.Learn(resp.TLSAddrs, resp.Leader); next != "" {
 				if err := client.SetBase(next); err == nil {
 					log.Printf("controller leader is %s, switching (%d endpoint(s) known)",
-						next, book.size())
+						next, book.Size())
 				}
 			}
+			persist()
 			// The controller may start its reflector service after this box already
 			// enrolled, and a restarted agent never enrolls again -- so the list
 			// rides every ack, and a changed list makes the loop take a new round.
