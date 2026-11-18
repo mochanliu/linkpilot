@@ -703,7 +703,10 @@ func (s *server) clusterViewLocked() clusterView {
 		return v
 	}
 	v.Mode, v.ClusterID = "cluster", s.state.Cluster.ID
-	v.TLSAddrs = s.state.Cluster.activeEndpoints()
+	// 这一栏答的是"设备与 RR 现在会拿到哪些地址"，所以必须走 memberEndpointsLocked：
+	// 用 activeEndpoints() 会显示成员表原值，.100 上就是那条已经下线的 192.168.1.4，
+	// 看着像"设备会被指到死地址"，而实际发出去的并不是它。
+	v.TLSAddrs = s.memberEndpointsLocked()
 	if s.raft == nil {
 		v.Reason = "集群配置存在但本进程没有运行共识（检查日志）"
 		return v
