@@ -29,17 +29,30 @@ var world110mJS []byte
 //go:embed assets/world-50m.js
 var world50mJS []byte
 
+//go:embed assets/i18n-en.js
+var i18nEnJS []byte
+
+//go:embed assets/console-i18n.js
+var consoleI18nJS []byte
+
 type worldAsset struct {
 	raw []byte
 	gz  []byte
 }
 
-// worldAssets is built once, at init: compressing 680 KB at startup is far
+// consoleAssets is built once, at init: compressing 680 KB at startup is far
 // cheaper than doing it per request, and these files are served for the whole
 // life of the process.
-var worldAssets = map[string]worldAsset{
-	"world-110m.js": newWorldAsset(world110mJS),
-	"world-50m.js":  newWorldAsset(world50mJS),
+//
+// The two i18n files are here rather than inline in console.html for one
+// reason: the dictionary is ~1,800 lines of "zh": "en" pairs, and keeping it in
+// its own file is what makes it reviewable. The console loads them with plain
+// <script> tags before its own script runs.
+var consoleAssets = map[string]worldAsset{
+	"world-110m.js":    newWorldAsset(world110mJS),
+	"world-50m.js":     newWorldAsset(world50mJS),
+	"i18n-en.js":       newWorldAsset(i18nEnJS),
+	"console-i18n.js":  newWorldAsset(consoleI18nJS),
 }
 
 func newWorldAsset(raw []byte) worldAsset {
@@ -51,15 +64,15 @@ func newWorldAsset(raw []byte) worldAsset {
 	return worldAsset{raw: raw, gz: buf.Bytes()}
 }
 
-// handleConsoleAsset serves /assets/<name>. Only the two basemaps exist, so the
-// lookup against a fixed map is also the whole path check: nothing here touches
-// the filesystem.
+// handleConsoleAsset serves /assets/<name>. Only the names in consoleAssets
+// exist, so the lookup against a fixed map is also the whole path check: nothing
+// here touches the filesystem.
 func (s *server) handleConsoleAsset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		methodNotAllowed(w, "GET, HEAD")
 		return
 	}
-	asset, ok := worldAssets[strings.TrimPrefix(r.URL.Path, "/assets/")]
+	asset, ok := consoleAssets[strings.TrimPrefix(r.URL.Path, "/assets/")]
 	if !ok {
 		http.NotFound(w, r)
 		return

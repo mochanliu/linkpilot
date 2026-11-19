@@ -337,9 +337,24 @@
     aside{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
     aside .foot{position:static;margin-top:12px}
   }
+
+  /* 语言开关：登录页和主界面都要有，所以浮在右上角，不进任何一栏的布局。
+     只切界面语言，不动 <html lang> 以外的东西；选择记在 localStorage。 */
+  #lang-pill{position:fixed;right:14px;top:12px;z-index:60;display:flex;gap:2px;
+    padding:2px;border:1px solid var(--line);border-radius:999px;background:var(--card);
+    box-shadow:0 1px 3px rgba(1,4,9,.4)}
+  #lang-pill button{border:0;background:none;padding:2px 9px;font-size:12px;line-height:1.5;
+    color:var(--muted);border-radius:999px;font-weight:400}
+  #lang-pill button:hover{background:var(--soft);color:var(--ink)}
+  #lang-pill button.on{background:var(--accent-bg);color:var(--accent);font-weight:500}
 </style>
 </head>
 <body>
+
+<div id="lang-pill" role="group" aria-label="Language" data-i18n-skip>
+  <button type="button" data-lang="zh">中文</button>
+  <button type="button" data-lang="en">EN</button>
+</div>
 
 <div id="login">
   <!-- The inline guard matters before the script attaches its submit listener:
@@ -430,6 +445,10 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- 词典在前、引擎在后：引擎读 window.SR_I18N_DICT / SR_I18N_RULES 再挂自己。
+     两个文件都和 sr-ctrl 一起编译进二进制（/assets/ 下，无 CDN、无构建步骤）。 -->
+<script src="/assets/i18n-en.js"></script>
+<script src="/assets/console-i18n.js"></script>
 <script>
 (function () {
   "use strict";
@@ -604,6 +623,23 @@
     }).then(bootSession).catch(function (err) {
       $("login-err").textContent = loginError(err.message);
     });
+  });
+
+  // 这一段是给人抄回去执行的命令，注释也得跟着界面语言走。<pre> 不参与自动翻译
+  // （翻译会把命令行改坏），所以这里留两份文案：切换语言时只换这一个节点，
+  // 不重绘整页 —— 重绘会把还没保存的表单清掉。
+  function enrollCmds() {
+    if (window.SR_I18N && SR_I18N.lang() === "en") {
+      return "test/lab/vcpe.sh up --claim CODE\n\ntest/lab/vcpe.sh logs      # follow the agent log\n" +
+        "test/lab/vcpe.sh status    # local identity (tenant / node_id)\ntest/lab/vcpe.sh down";
+    }
+    return "test/lab/vcpe.sh up --claim CODE\n\ntest/lab/vcpe.sh logs      # 跟进 agent 日志\n" +
+      "test/lab/vcpe.sh status    # 看本地身份（tenant / node_id）\ntest/lab/vcpe.sh down";
+  }
+
+  document.addEventListener("sr-lang", function () {
+    var el = document.getElementById("enroll-cmds");
+    if (el) el.textContent = enrollCmds();
   });
 
   function loginError(m) {
@@ -1492,7 +1528,7 @@
       "<li>大约 5 秒后设备出现在「设备」页；码过期不影响已经入网的设备</li>" +
       "<li>每台新设备占一个名额，重复入网同一台设备不再占名额</li>" +
       "</ol></div>" +
-      "<pre class=\"cmd\">test/lab/vcpe.sh up --claim CODE\n\ntest/lab/vcpe.sh logs      # 跟进 agent 日志\ntest/lab/vcpe.sh status    # 看本地身份（tenant / node_id）\ntest/lab/vcpe.sh down</pre>" +
+      '<pre class="cmd" id="enroll-cmds">' + esc(enrollCmds()) + "</pre>" +
       "</section>";
     return h;
   }
@@ -10555,6 +10591,10 @@
   }
 
   /* ---------------- start ---------------- */
+
+  // 语言必须在第一次渲染之前定下来：登录页是静态 HTML，先翻一遍再发会话请求，
+  // 才不会先闪一下中文。之后每次 innerHTML 换页由 MutationObserver 接。
+  if (window.SR_I18N) SR_I18N.init();
 
   api("GET", "/api/session").then(bootSession).catch(showLogin);
 })();

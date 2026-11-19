@@ -118,12 +118,12 @@ func TestBasemapServesGzipOnlyWhenAsked(t *testing.T) {
 	}
 	// Compression is what makes the detail tier affordable: it is the reason the
 	// 50m file can be fetched at all on a remote console.
-	if cl, want := gz.Header().Get("Content-Length"), strconv.Itoa(len(worldAssets["world-50m.js"].gz)); cl != want {
+	if cl, want := gz.Header().Get("Content-Length"), strconv.Itoa(len(consoleAssets["world-50m.js"].gz)); cl != want {
 		t.Errorf("content length = %q, want the compressed size %s", cl, want)
 	}
-	if len(worldAssets["world-50m.js"].gz)*2 > len(world50mJS) {
+	if len(consoleAssets["world-50m.js"].gz)*2 > len(world50mJS) {
 		t.Errorf("gzip only shrank the 50m file from %d to %d bytes", len(world50mJS),
-			len(worldAssets["world-50m.js"].gz))
+			len(consoleAssets["world-50m.js"].gz))
 	}
 }
 

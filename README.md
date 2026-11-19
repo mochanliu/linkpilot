@@ -38,6 +38,9 @@ overlay and a Go control plane. Linux only.
 
 The console is a single embedded HTML file (`controller/cmd/sr-ctrl/console.html`)
 served by `sr-ctrl`; it has no build step and no runtime CDN or third-party JS.
+It ships in **Chinese and English** — the switch sits in the top-right corner, the
+choice is remembered per browser, and `?lang=en` forces a language for a link.
+Translations live in `controller/cmd/sr-ctrl/assets/i18n-en.js`.
 
 ## Build
 
