@@ -22,7 +22,13 @@
   "use strict";
 
   var DICT = window.SR_I18N_DICT || {};
-  var RULES = window.SR_I18N_RULES || [];
+  // Drop malformed entries instead of trusting the file: a hand-edited rule list
+  // can grow a hole (a missing comma makes the array swallow nothing and leave an
+  // undefined slot), and one bad entry would otherwise throw on every unmatched
+  // string and leave whole views untranslated.
+  var RULES = (window.SR_I18N_RULES || []).filter(function (r) {
+    return r && r[0] instanceof RegExp && typeof r[1] === "string";
+  });
   var CJK = /[\u3400-\u9fff\uf900-\ufaff]/;
   var ATTRS = ["title", "placeholder", "aria-label", "alt"];
   var SKIP = {SCRIPT: 1, STYLE: 1, PRE: 1, CODE: 1, TEXTAREA: 1, KBD: 1, SAMP: 1};
@@ -51,7 +57,12 @@
   function applyRules(s) {
     for (var i = 0; i < RULES.length; i++) {
       var re = RULES[i][0];
-      if (re.test(s)) return s.replace(re, RULES[i][1]);
+      try {
+        if (re.test(s)) return s.replace(re, RULES[i][1]);
+      } catch (e) {
+        // A rule with a bad replacement must not take the whole pass down.
+        continue;
+      }
     }
     return null;
   }

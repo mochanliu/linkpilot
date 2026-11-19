@@ -1663,5 +1663,16 @@ window.SR_I18N_RULES = [
 	[/^(\d+(?:[.,]\d+)*)\ 条$/, "$1"],
 	[/^(\d+(?:[.,]\d+)*)\ 行$/, "$1 rows"],
 	[/^如\ (\d+(?:[.,]\d+)*)$/, "e.g. $1"],
-	[/^槽(\d+(?:[.,]\d+)*)$/, "Slot $1"]
+	[/^槽(\d+(?:[.,]\d+)*)$/, "Slot $1"],
+	// Relative times are assembled by the clock helpers as "<prefix> · 4 秒前", so
+	// the unit word is the only stable part. These come last: a specific sentence
+	// rule above must win over a generic "something · N units ago".
+	[/^(.*) · (\d+(?:[.,]\d+)*) 秒前$/, "$1 · $2s ago"],
+	[/^(.*) · (\d+(?:[.,]\d+)*) 分钟前$/, "$1 · $2m ago"],
+	[/^(.*) · (\d+(?:[.,]\d+)*) 小时前$/, "$1 · $2h ago"],
+	[/^(.*) · (\d+(?:[.,]\d+)*) 天前$/, "$1 · $2d ago"],
+	[/^(\d+(?:[.,]\d+)*) 秒前$/, "$1s ago"],
+	[/^(\d+(?:[.,]\d+)*) 小时前$/, "$1h ago"],
+	[/^last seen (\d+(?:[.,]\d+)*) 秒前$/, "last seen $1s ago"],
+
 ];
