@@ -1,0 +1,30 @@
+LinkPilot SD-WAN
+Copyright 2026 The LinkPilot Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes or links against the following third-party software. Full texts and
+the exact scope of each dependency are listed in THIRD_PARTY_NOTICES.md.
+
+  * FD.io VPP (Vector Packet Processing) — Apache License 2.0
+    The VPP plugin in vpp-plugin/ is built against VPP headers and loaded by a
+    VPP instance at runtime. No VPP source code is vendored in this repository.
+
+  * SipHash-2-4 reference algorithm by Jean-Philippe Aumasson and
+    Daniel J. Bernstein — CC0 1.0 Universal (public domain dedication).
+    vpp-plugin/sr_siphash.c is an independent C implementation of that
+    algorithm following the reference description.
+
+  * Natural Earth (public domain) map data, packaged by world-atlas (ISC),
+    transformed with topojson-client (ISC) and d3-geo / d3-array (ISC).
+    These are build-time-only inputs of controller/tools/world-basemap; the
+    generated basemap files committed under controller/cmd/sr-ctrl/assets/ carry
+    the same public-domain data.
+
+  * The Go standard library (BSD 3-Clause) is statically linked into the Go
+    binaries. The Go module itself has no third-party dependencies.
+
+FRR (FRRouting) is a separate program, licensed under GPL-2.0, that this
+project drives at runtime over vtysh. It is not linked into, nor distributed
+with, any binary in this repository; obtaining and redistributing FRR is
+subject to its own license.

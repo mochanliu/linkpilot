@@ -15,7 +15,7 @@ Ubuntu server 用）。**单机形态**，RR 也在同一台上。全程按共�
 | systemd | `sr-ctrl.service`、`sr-rr@.service`（模板：`sr-rr@a`、`sr-rr@b`），全部 `enable --now` |
 | 监听 | 8444 设备 mTLS / 8443 控制台 TLS（SAN=192.168.1.100 + 公网 203.0.113.10）/ 8088 loopback 明文 / STUN 192.168.1.100:3478+3479 |
 | 集群 | 单 voter（c-0a250321=mac-1 身份，`node-id` 随 data 搬入），leader、quorum=true；mac-2/mac-6 已按 §5.2 共识下线（两台都走了"自退场"流程，日志干净） |
-| 租户账号 | vm-tenant 密码已重置：`<redacted>`（operator token 不变，跟单元里的 -admin-token） |
+| 租户账号 | vm-tenant 密码已重置（口令不写进仓库，见运维口令表；operator token 不变，跟单元里的 -admin-token） |
 
 **搬数据前先删了 `data/server.pem|server.key` 和 `console-tls/`**：`loadOrCreateServerCert`
 只在文件缺失时签发，重启后按 `-tls-san 192.168.1.100,192.168.1.4` 和 `-console-san

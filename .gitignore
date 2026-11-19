@@ -44,3 +44,12 @@ controller/sr-svc
 # 2026-11-15 又从工作树里清出去两个，这行是防止下一次再被 git add -A 收进来
 controller/sr-ctrl.*
 /controller/core
+# 交叉编译落点（arm64 / amd64 CPE 换件用）
+controller/build-arm64/
+controller/build-amd64/
+# 本地环境与凭据：任何 .env 都不入库，只提交 .env.example
+.env
+.env.*
+!.env.example
+*.pem
+*.key
