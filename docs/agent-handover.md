@@ -1069,7 +1069,7 @@ owner 原话：**「我自己测一下再说，lab 先放那里不动。」**
 公开仓库**不是**直接把本仓库推上去。本仓库里有三样东西不该进公开历史：
 
 1. `docs/ctrl-migration-1921681100.md` 早期提交里的 vm-tenant 真实口令（HEAD 已改写，
-   历史里还在）；
+   历史里还在；口令值只存在运维口令表里，文档与提交信息都不写）；
 2. 公网出口 IP（已换成文档保留段 `203.0.113.10`，同样只改了 HEAD）；
 3. 早期原型提交里的 `ipipfree.ipdb`（IP 库，再分发条款有问题，且当前代码不引用）。
 
@@ -1077,12 +1077,13 @@ owner 原话：**「我自己测一下再说，lab 先放那里不动。」**
 只能用 `filter-branch`）：
 
 ```bash
+# 要清洗的字面量写进 replace.txt（一行 "<旧串><TAB><新串>"），别把口令抄进任何文档
 git clone --no-local <working-repo> /tmp/sdwan-public
 cd /tmp/sdwan-public
 FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --prune-empty \
   --index-filter 'git rm -q --cached --ignore-unmatch ipipfree.ipdb' \
-  --tree-filter 'grep -Il "<redacted>\|123\.120\.14\.191" $(git ls-files) 2>/dev/null \
-     | xargs -r perl -pi -e "s/<redacted>/<redacted>/g; s/123\.120\.14\.191/203\.0\.113\.10/g"' \
+  --tree-filter 'grep -IlF -f /tmp/needles.txt $(git ls-files) 2>/dev/null \
+     | xargs -r perl -pi -e "s/<旧串>/<redacted>/g"' \
   -- --all
 # 只留一条主线，删掉远端镜像 ref 与 refs/original，否则旧对象仍可被 fetch 到
 git update-ref -d refs/remotes/origin/HEAD
@@ -1092,7 +1093,7 @@ rm -rf .git/refs/remotes .git/refs/tags
 git reflog expire --expire=now --all && git gc --prune=now -q
 ```
 
-验收口径（三条都要空/零）：`git log --all -S"<old-password>"`、`git log --all -S"203.0.113.10"`、
+验收口径（三条都要空/零）：对每个 needle 跑 `git log --all -S<needle>`、再跑
 `git rev-list --objects --all | grep -c ipipfree`；大小从 281MB（含 master 旧原型）降到 6.4MB，
 366 个提交，`go build ./...` 与 `go test ./cmd/sr-ctrl/` 仍绿。
 
