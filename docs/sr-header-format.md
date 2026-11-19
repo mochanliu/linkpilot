@@ -1,5 +1,15 @@
 # SR-WG 源路由路径头格式规范 v0.1
 
+## 设计渊源
+
+本头的**设计思路**借鉴了 IETF Internet-Draft
+[draft-zartbot-sr-udp](https://datatracker.ietf.org/doc/draft-zartbot-sr-udp/)
+（"Segment Routing over UDP (SRoU)"，K. Fang 等，2020 年提交的个人草案，已过期，
+未被任何工作组采纳）：在 UDP 载荷头部放置带 magic 与段列表的源路由头。
+线上字段排布、段编码（每段 6 字节 ip:port）、HMAC/SipHash 完整性模型与密钥
+管理均为本项目独立设计，未复制草案的任何文字、图示或代码。报文格式与协议
+思路本身不受版权保护，此处致谢仅为溯源透明。
+
 ## 概述
 
 SR（Source Routing）路径头插入在 UDP Header 和 WireGuard 加密数据之间，

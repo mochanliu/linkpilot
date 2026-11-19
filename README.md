@@ -105,6 +105,15 @@ Apache License 2.0 — see [LICENSE](LICENSE). Third-party components and why
 Apache-2.0 is the only sane choice for a VPP plugin: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 The "LinkPilot" name and logo are not covered by the license.
 
+## Acknowledgements
+
+The SR header's *design approach* — a source-routing header with a magic byte
+and a segment list placed at the head of the UDP payload — is inspired by the
+expired Internet-Draft [draft-zartbot-sr-udp](https://datatracker.ietf.org/doc/draft-zartbot-sr-udp/)
+("Segment Routing over UDP (SRoU)", 2020, not adopted). The on-the-wire format
+implemented here is our own: no text, figure or code from the draft is reproduced.
+See [docs/sr-header-format.md](docs/sr-header-format.md) §设计渊源.
+
 ## Contributing
 
 Issues and pull requests are welcome — read [CONTRIBUTING.md](CONTRIBUTING.md)

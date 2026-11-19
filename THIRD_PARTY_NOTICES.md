@@ -71,6 +71,16 @@ VPP, FRR, systemd and the Linux kernel are installed by the operator. Test
 container images referenced under `test/` pull them from their upstream
 registries at test time.
 
+## 7. Design provenance — SR header inspiration (no license obligation)
+
+The SR header's design approach is inspired by the expired Internet-Draft
+[draft-zartbot-sr-udp](https://datatracker.ietf.org/doc/draft-zartbot-sr-udp/)
+("Segment Routing over UDP (SRoU)", K. Fang et al., 2020, expired, never adopted
+by an IETF working group). This entry is an acknowledgement, not a license
+obligation: protocol ideas and wire formats are not copyrightable, and this
+repository reproduces no text, figure or code from the draft — the format in
+`docs/sr-header-format.md` and `vpp-plugin/` is an independent design.
+
 ## Reporting an omission
 
 If you believe something in this tree is unattributed, open an issue or mail the
