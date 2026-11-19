@@ -951,6 +951,8 @@ docker run --rm -v "$PWD/controller":/src -w /src srwg-dev \
 | ~~G-2 隧道表落盘~~ | **产品修复已落地（`cfb3dee` ②）** | sr-agent 心跳节拍自动派生 sr-fib 隧道表（`internal/agent/fibtable.go`），磁盘 0 条是有意设计；残余：agent 启动第一拍推 0 行的瞬态（2026-11-12 实测，见 §5.2/§3 附近那笔），待拍 |
 | **隧道内 FEC（XOR 1:1–1:4）** | **实机开启已验收（2026-11-13）；2026-11-15 换 `8ef3129e…` 收口两处缺陷，四台同代** | 编码点在加密之后（`sr-wg4-encap` Step 14.5）、异或窗口 = SR 头之后的 WG 帧；冗余包复制外层头所以中转跳照常转发；对端用**计数法**配对（两次冗余包之间的 WG 帧数 j：`j==k` 全到、`j==k-1` 还原、其余作废）。2026-11-15 收口两条：①冗余包原先"整帧数据全发完再补一次 enqueue"，一帧跨多组时排到下一组数据后面 → 接收侧 j 数错，容器 A/B 实测 **500 组里 271 次错配 → 0**（真机 200 pps 旧版本就 0，这条只在突发/高包速/批量收包时露头）；②`tx_seq` 是内存态，**换件重启后从 0 重来**、对端 `last_seq` 还停在上代大数上 → 每个冗余包都被判"陈旧"，实测 530 个全 bad、complete 0（业务无感、FEC 彻底空转）——修法是发送侧序号基址取墙上时间、接收侧回退超过 8 组即当"对端重启"重新同步，真机单侧重启两种方向都验过。判据与数字在 `docs/fec-and-lb-plan.md` §9，换件记录在本文 §2.6 |
 | **多跳隧道回程方向** | **已修（2026-11-15，`f965001`）** | 链单向存 A→B，下发按**本端**行走顺序渲染：A 端原序、B 端镜像（`relayHops` 加 `from` 参数；别的 node 来要直接报错）。修掉的 bug 是两端拿同一份顺序 → B 端把包弹给"A 端的第一跳"：平面二层 lab 看不出来（照样通，§15 那轮 trace 就是这么全绿的），分层拓扑 B→A 黑洞。判据：`TestBundleRendersEveryHopInEachEndsOwnOrder` 两端逐位互为镜像（去掉反向逻辑会红，已验）；控制台标题写明起点（本端 / 隧道 A 端）+「回程不用另配」。现网 12 条 binding 全直连，无迁移；双向 trace 未在 lab 复测，对外口径见 `docs/release-0.9-beta.md` §4 |
+| **开源前合规（LICENSE / 第三方 / 仓库卫生）** | **已落地（2026-11-19）**：Apache-2.0 + NOTICE + THIRD_PARTY_NOTICES | 选 Apache-2.0 的唯一硬理由：`vpp-plugin/` 编译时链接 VPP 头文件/库、运行期被 VPP 加载，VPP 是 Apache-2.0，插件必须同族兼容（MIT 也兼容，但丢了专利授权条款且与上游不一致）。清单逐项写清"怎么进入构建"：VPP（依赖，未 vendor）、SipHash 参考算法（CC0，`sr_siphash.c` 是按算法描述自写、未抄上游文件）、Natural Earth + world-atlas/d3/topojson（公有领域/ISC，仅离线生成器输入，生成物入库）、Go 标准库（BSD-3），以及 **FRR 是运行时外部程序（GPL-2.0，不链接、不随仓库分发）**——这一条是"我们开源不受 GPL 传染"的依据，改成静态链接或把 FRR 源码抄进来就不再成立。仓库卫生：`docs/` 里那条 vm-tenant 真实口令与公网 IP 已抹掉（IP 换文档保留段 203.0.113.10），确认从未提交过任何私钥；`.gitignore` 补 `build-arm64/`、`.env`、`*.pem`、`*.key`。工程文件：README（英/中）、CONTRIBUTING（DCO、两条硬规则、i18n 约定）、SECURITY（含"已知非漏洞"清单）、CODE_OF_CONDUCT、Issue/PR 模板。**公开发布的镜像另做了一份历史清洗**（见下方"历史清洗"）。未做：英文文档、CI |
+| **控制台中英切换** | **已落地（2026-11-19，提交 `36d4f74`）**：运行期词典 + 规则 | 控制台按 innerHTML 整页渲染、约 1500 条中文串；给每个节点加 `data-i18n` 要改遍所有渲染函数并从此每处写两遍文案。改为运行期翻译：`console.html` 仍是唯一事实来源，`assets/i18n-en.js` 提供 1528 条精确词条 + 122 条正则规则（覆盖 "3 条隧道" / "22 小时 6 分" 这类运行时拼出的句子），引擎按 **精确 → 规则 → 原样保留** 替换。文本节点 + `title/placeholder/aria-label/alt`；MutationObserver 跟每次重绘（控制台 5s 轮询）；原文存 WeakMap，切回中文逐字节还原（`tools/console-i18n/check.mjs` 用 CDP 驱动无头 Chromium 实测：116 个视图除语言按钮自身"中文"外零残留，26 个视图切回完全一致）。**不翻** `<pre>/<code>`/输入值/`data-i18n-skip`——命令翻了就抄不动；vCPE 那三段带注释的命令单独给两份文案、切换时只换该节点（整页重绘会清未保存的表单）。选择记 `localStorage`，首访按浏览器语言，`?lang=en` 可强置 |
 | **控制面发现（CPE/RR 怎么找到控制器）** | **已落地（2026-11-18）**：`internal/ctrladdr` + `sr-ctrl -advertise` + RR `/v1/rr/config` 的 `controllers[]` | 一个种子 + 一张表：CPE 用激活命令里的地址、RR 用 `controller.addr` 作种子，连上之后每次应答带回全表（`tls_addrs` / `controllers[]`）+ `leader`，leader 优先切、失败按表轮换不退避、整轮试完才退避、种子常驻、通配地址不收，并把候选表落盘（重启先试上次成功的那个）。控制器侧 `-advertise` 决定"设备该用哪个地址找我"（缺省取 `-tls-san` 首项 + `-listen` 端口），单机不再下发 `0.0.0.0:8444`；**成员表里自己那条可能过期**（.100 的 mac-1 还写着 192.168.1.4:8444），所以对外地址表里自己那条用宣告地址、并在启动日志里明确告警，不自动改共识。设计口径与验收见 `docs/control-plane-discovery.md`；轮换与吸收两条做过变异验证。未做：站点 `site.json`、`/v1/watch` 接推送 |
 | **激活码自描述 + RR 单文件启动（装机零拷文件）** | **已落地并部署 .100（2026-11-19，提交 `15a2a1b`）**：`internal/claimcode` + `sr-rr -identity` | 动因：CPE 装机要串口敲三条参数（`-ctrl/-claim/-ca`）还要拷 pinned_ca.pem，RR 要拷三个 PEM 再手写 config。两条都收成"一串/一文件"：①**激活码信封**——出码时把 tenant CA PEM + 控制器地址（`tlsAddrs`）包进 `srs1-<base64url(JSON)>` 信封，CPE 解出内嵌的 ctrl/CA，装机只剩 `sr-agent -claim <一段>`；**TTL/吊销/名额完全不动**（只对内层 secret 做哈希，信封是公开信息），旧纯 `srk_` 码照常 enroll（向后兼容有测试）。②**RR 单文件**——控制台"下载 rr-identity.json"新增 `controller_addr` 字段，`sr-rr -identity <文件>` 一文件启动（cert/key/ca/种子全在文件里；证书是 rr_id/tenant 的权威，文件字段只能证实不能矛盾；listen 取文件 addr 的端口绑所有接口，`-listen`/`-status` 可覆盖）。测试：claimcode 7 条 + claim/enroll 兼容 2 条 + RR identity 5 条 + agent pinned 5 条，全绿含 `-race`；console JS `node --check` 净。**真机验证（.100，`15a2a1b` 构建，md5 sr-ctrl `a761242e`/sr-rr `0073e092`，回滚二进制 `.bak-20261119`）**：真出码解码信封 = 内层 `srk_`（36 字符）+ `ctrl=[192.168.1.100:8444]` + CA PEM + TTL 300s；用控制台 API 给临时 RR 行 rr3 签发身份拼出单文件（1478 字节，`controller_addr=https://192.168.1.100:8444`），`sr-rr -identity` 一文件启动 → listen :8445、grid from 控制器、与 rr1/rr2 mesh 全部 connected；验证完已删行/杀进程/清文件。**sr-agent 新二进制已构建（`build-arm64/`）但 4 台 CPE VM 关机中未换件**：下次开机换件即可获得"一段码入网"；老 agent 不受影响（信封对老版本只是个不认识的 claim 码，旧流程 `-ctrl/-ca` 仍可用） |
 | **QoS 路径 C（隧道 8 队列）** | **挂点已实测通过（2026-11-12），第一阶段节点已落地**；第二阶段（入队+drain+整形）未开工 | owner 已拍 **C**（VPP 内自研节点）+ **直接 8 队列**。对象是 **WireGuard 隧道**，不是网卡：隧道流量不经主机内核，所以 §6 的主机 tc 对隧道无效。判别符在外层 `udp sport`（wg1010/1011/1014 = 20000/20001/20002，FIB rewrite + tcpdump 双证据）。挂点实测：`sr-wg4-qos` 排在 `wg4-output-tun` **之前** ⇒ 加密前、明文、内层 DSCP 可读；三条隧道实测计到 1159 包。方案与取舍：`docs/qos-path-c-plan.md` §9；换件与回退：本文 §2.6 |
@@ -1061,3 +1063,39 @@ owner 原话：**「我自己测一下再说，lab 先放那里不动。」**
 你做完一个增量，如果它改变了本文任何一节的事实（尤其 §2 状态、§3 哈希表、§5 步骤、§9 队列），
 **在同一个提交里改掉本文**，并在句子后面标上"（YYYY-MM-DD 实测）"。
 删掉一条过期结论时，把它指向的原始出处留在原位，别把出处一起删了。
+
+## 14. 开源发布：公开镜像怎么出（2026-11-19）
+
+公开仓库**不是**直接把本仓库推上去。本仓库里有三样东西不该进公开历史：
+
+1. `docs/ctrl-migration-1921681100.md` 早期提交里的 vm-tenant 真实口令（HEAD 已改写，
+   历史里还在）；
+2. 公网出口 IP（已换成文档保留段 `203.0.113.10`，同样只改了 HEAD）；
+3. 早期原型提交里的 `ipipfree.ipdb`（IP 库，再分发条款有问题，且当前代码不引用）。
+
+做法（在**副本**上跑，工作仓库不动；这套 git 是 2.20，装不了 git-filter-repo，
+只能用 `filter-branch`）：
+
+```bash
+git clone --no-local <working-repo> /tmp/sdwan-public
+cd /tmp/sdwan-public
+FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --prune-empty \
+  --index-filter 'git rm -q --cached --ignore-unmatch ipipfree.ipdb' \
+  --tree-filter 'grep -Il "<redacted>\|123\.120\.14\.191" $(git ls-files) 2>/dev/null \
+     | xargs -r perl -pi -e "s/<redacted>/<redacted>/g; s/123\.120\.14\.191/203\.0\.113\.10/g"' \
+  -- --all
+# 只留一条主线，删掉远端镜像 ref 与 refs/original，否则旧对象仍可被 fetch 到
+git update-ref -d refs/remotes/origin/HEAD
+for r in $(git for-each-ref --format="%(refname)" refs/remotes refs/tags); do git update-ref -d "$r"; done
+git branch -m main
+rm -rf .git/refs/remotes .git/refs/tags
+git reflog expire --expire=now --all && git gc --prune=now -q
+```
+
+验收口径（三条都要空/零）：`git log --all -S"<old-password>"`、`git log --all -S"203.0.113.10"`、
+`git rev-list --objects --all | grep -c ipipfree`；大小从 281MB（含 master 旧原型）降到 6.4MB，
+366 个提交，`go build ./...` 与 `go test ./cmd/sr-ctrl/` 仍绿。
+
+**注意**：清洗后所有提交哈希都变了，与 gitee 上那条分支不再是同一棵历史；往后要么
+"公开镜像只从清洗点继续"，要么每次发布重跑上面这套（推荐前者：把清洗后的仓库当公开主线，
+私有仓库只作为内部工作区）。
