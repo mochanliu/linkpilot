@@ -3,6 +3,11 @@
 An SD-WAN CPE data plane on **FD.io VPP**, with a source-routed + WireGuard-encrypted
 overlay and a Go control plane. Linux only.
 
+**Keywords:** open-source SD-WAN · SDWAN · software-defined WAN · SRv6-style
+segment routing · source routing · WireGuard · FD.io VPP · VPP plugin · CPE ·
+route reflector · NAT traversal · STUN · FEC · 开源 SD-WAN · 软件定义广域网 ·
+广域网组网 · 零配置入网
+
 > **Status: 0.9-beta, pre-1.0.** Interfaces, on-disk formats and the console change
 > between builds without deprecation. It runs a live network, but treat it as
 > beta software and read [docs/release-0.9-beta.md](docs/release-0.9-beta.md) for the
@@ -124,7 +129,7 @@ Security reports: [SECURITY.md](SECURITY.md).
 
 ## 中文摘要
 
-LinkPilot 是一套跑在 FD.io VPP 上的 SD-WAN 方案：数据面用自研 VPP 插件在 UDP 与
+**LinkPilot 是一套开源的 SD-WAN（SDWAN，软件定义广域网）方案**：数据面用自研 VPP 插件在 UDP 与
 WireGuard 载荷之间插入源路由头，控制面是纯 Go 的 `sr-ctrl`（入网/CA/配置编译/控制台/集群）、
 `sr-rr`（路由反射器）和 `sr-agent`（CPE 侧代理），三者都不依赖任何第三方 Go 模块。
 
